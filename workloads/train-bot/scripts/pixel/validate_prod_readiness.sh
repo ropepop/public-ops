@@ -142,9 +142,9 @@ elif (( http_timeout <= long_poll )); then
   add_p1 "HTTP_TIMEOUT_SEC must be greater than LONG_POLL_TIMEOUT (got $http_timeout <= $long_poll)"
 fi
 
-profile_dir="${PLAYWRIGHT_PROFILE_DIR:-$HOME/.cache/playwright-cli/telegram-web}"
+profile_dir="${AGENT_BROWSER_PROFILE_DIR:-$HOME/.cache/agent-browser/telegram-web}"
 if [[ ! -d "$profile_dir" || -z "$(find "$profile_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-  add_p1 "Playwright profile missing or empty: $profile_dir"
+  add_p1 "agent-browser profile missing or empty: $profile_dir"
 fi
 
 if (( ${#p1_findings[@]} == 0 )); then
@@ -487,12 +487,12 @@ fi
 declare -a scan_files
 while IFS= read -r f; do
   scan_files+=("$f")
-done < <(find "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/playwright" -type f -newer "$run_marker" 2>/dev/null | sort)
+done < <(find "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/agent-browser" -type f -newer "$run_marker" 2>/dev/null | sort)
 
 declare -a security_scan_files
 for f in "${scan_files[@]}"; do
-  # Playwright DOM snapshots contain unrelated Telegram history text and create OTP false positives.
-  if [[ "$f" == */output/playwright/*/.playwright-cli/*.yml ]]; then
+  # agent-browser auth-state dumps can contain unrelated Telegram login metadata and create OTP false positives.
+  if [[ "$f" == */output/agent-browser/*/*auth-state*.json ]]; then
     continue
   fi
   security_scan_files+=("$f")

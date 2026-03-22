@@ -75,7 +75,7 @@ Use the `pixel-native-*` targets instead.
 | `adb` | Fallback | Recovery transport when SSH readiness fails or Tailscale is unavailable. |
 | Rooted Pixel + Magisk | Yes | Required for the orchestrator-owned runtime. |
 | `sqlite3` | Yes | Used locally to validate the pulled runtime DB. |
-| Node/npm (`npx`) | Yes | Required for Playwright smoke scripts. |
+| `agent-browser` CLI | Yes | Required for browser smoke scripts. |
 | `cloudflared` | Conditional | Required locally when `trainBot.ingressMode=cloudflare_tunnel`. |
 | Telegram bot token | Yes | Set in `.env` as `BOT_TOKEN`. |
 

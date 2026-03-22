@@ -33,8 +33,8 @@ type Service struct {
 }
 
 const (
-	mainOpenMap     = "Atvērt satiksmes karti"
-	mainPublicSite  = "Publiskā karte"
+	mainOpenMap     = "Atvērt satiksmes mapi"
+	mainPublicSite  = "Publiskā mape"
 	mainReportsFeed = "Ziņojumu kanāls"
 )
 
@@ -113,11 +113,11 @@ func (s *Service) handleMessage(ctx context.Context, message telegram.Message) e
 
 func (s *Service) sendWelcome(ctx context.Context, chatID int64) error {
 	lines := []string{
-		"Rīgas Satiksmes kontroles karte.",
+		"Rīgas Satiksmes kontroles mape.",
 		"Mini lietotnē vari redzēt tuvākās pieturas, tiešraides atiešanas laikus un iesniegt kontroles ziņojumus.",
 	}
 	if s.publicURL != "" {
-		lines = append(lines, "Publiskā karte: "+s.publicURL)
+		lines = append(lines, "Publiskā mape: "+s.publicURL)
 	}
 	if s.reportsURL != "" {
 		lines = append(lines, "Ziņojumu kanāls: "+s.reportsURL)
@@ -187,7 +187,7 @@ func (s *Service) newInlineKeyboard() telegram.InlineKeyboardMarkup {
 		})
 	}
 	if s.publicURL != "" {
-		row = append(row, telegram.InlineKeyboardButton{Text: "Publiskā karte", URL: s.publicURL})
+		row = append(row, telegram.InlineKeyboardButton{Text: "Publiskā mape", URL: s.publicURL})
 	}
 	if s.reportsURL != "" {
 		row = append(row, telegram.InlineKeyboardButton{Text: "Ziņojumi", URL: s.reportsURL})

@@ -56,7 +56,7 @@ func TestSendWelcomePrefersInlineWebAppMarkup(t *testing.T) {
 	if len(client.messages) != 1 {
 		t.Fatalf("len(messages) = %d, want 1", len(client.messages))
 	}
-	if !strings.Contains(client.messages[0].text, "Rīgas Satiksmes kontroles karte.") {
+	if !strings.Contains(client.messages[0].text, "Rīgas Satiksmes kontroles mape.") {
 		t.Fatalf("welcome text = %q", client.messages[0].text)
 	}
 	markup, ok := client.messages[0].opts.ReplyMarkup.(telegram.InlineKeyboardMarkup)

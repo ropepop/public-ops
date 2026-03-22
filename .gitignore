@@ -21,7 +21,7 @@ out/
 dist/
 
 # Local runtime scratch
-.playwright-cli/
+.agent-browser/
 .tmp-rootfs/
 .artifacts/
 

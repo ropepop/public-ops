@@ -765,13 +765,13 @@
     app.innerHTML =
       '<div class="shell">' +
       '<header class="hero">' +
-      '<div class="hero-copy"><h1>Kontroles karte</h1><p class="lede">Tiešraides atiešanas laiki, pieturu novērojumi un kontroles ziņojumi vienuviet.</p></div>' +
+      '<div class="hero-copy"><h1>Kontroles mape</h1><p class="lede">Tiešraides atiešanas laiki, pieturu novērojumi un kontroles ziņojumi vienuviet.</p></div>' +
       '<div class="hero-meta"><span id="status-pill" class="pill pill-muted">Ielādē…</span></div>' +
       "</header>" +
       '<section class="layout">' +
       '<div class="map-panel"><div id="map" class="map"></div></div>' +
       '<aside class="sidebar">' +
-      '<section class="card"><h2>Izvēlētā pietura</h2><div id="selected-stop">Izvēlies pieturu kartē.</div></section>' +
+      '<section class="card"><h2>Izvēlētā pietura</h2><div id="selected-stop">Izvēlies pieturu mapē.</div></section>' +
       '<section class="card"><h2>Tuvākie atiešanas laiki</h2><div id="nearby-departures">Gaida atrašanās vietu…</div></section>' +
       '<section class="card"><h2>Jaunākie ziņojumi</h2><div id="recent-sightings">Ielādē…</div></section>' +
       "</aside>" +
@@ -831,7 +831,7 @@
         renderVisibleStops();
         renderLiveVehicles();
         renderSightings();
-        setStatus("Karte gatava");
+        setStatus("Mape gatava");
         return payload;
       })
       .catch(function () {
@@ -937,7 +937,7 @@
     var tg = root.Telegram && root.Telegram.WebApp;
     if (!tg || !tg.initData) {
       state.authState = "telegram_required";
-      setStatus("Karte gatava. Atver Telegram, lai ziņotu par kontroli.");
+      setStatus("Mape gatava. Atver Telegram, lai ziņotu par kontroli.");
       renderSelectedStop();
       return Promise.resolve(null);
     }

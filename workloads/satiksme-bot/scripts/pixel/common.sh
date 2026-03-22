@@ -81,7 +81,7 @@ transport_args() {
 }
 
 ensure_output_dirs() {
-  mkdir -p "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/playwright"
+  mkdir -p "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/agent-browser"
 }
 
 ensure_root() {

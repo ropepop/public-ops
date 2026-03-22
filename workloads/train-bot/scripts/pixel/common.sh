@@ -119,7 +119,7 @@ ensure_local_env() {
 
 ensure_output_dirs() {
   export PIXEL_RUN_ID
-  mkdir -p "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/playwright"
+  mkdir -p "$REPO_ROOT/output/pixel" "$REPO_ROOT/output/agent-browser"
 }
 
 latest_schedule_json() {

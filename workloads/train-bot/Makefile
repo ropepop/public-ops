@@ -79,7 +79,7 @@ pixel-miniapp-smoke:
 	./scripts/pixel/miniapp_smoke.sh
 
 pixel-bot-smoke:
-	./scripts/pixel/e2e_playwright.sh
+	./scripts/pixel/e2e_agent_browser.sh
 
 pixel-e2e:
 	./scripts/pixel/e2e_all.sh
