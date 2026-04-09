@@ -36,7 +36,7 @@ components:
   - id: remote
     start: "true"
     stop: "true"
-    health: ss -ltn 2>/dev/null | grep -E '[:.]443[[:space:]]' >/dev/null
+    health: ss -ltn 2>/dev/null | grep -E '[:.]2789[[:space:]]' >/dev/null
     redeploy:
       mode: derived
       derived_from: dns

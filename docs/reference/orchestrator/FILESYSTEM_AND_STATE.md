@@ -18,7 +18,7 @@
 - `/data/local/pixel-stack/bin/pixel-dns-identityctl` - host-side wrapper for encrypted DNS identity control (`chroot -> /usr/local/bin/adguardhome-doh-identityctl`)
 - `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-render-config` - renders AdGuardHome config plus remote nginx/watchdog runtime inputs
 - `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-launch-core` - starts core AdGuardHome listeners (`53`, `127.0.0.1:8080`, and internal DoT `8853` when nginx fronts public DoT)
-- `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-launch-frontend` - starts the remote frontend on public `443` and `853`
+- `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-launch-frontend` - starts the remote frontend on public HTTPS/DoT listener ports (production contract now `2789` and `853`)
 - `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-start` - high-level runtime helper (`--remote-healthcheck`, `--remote-restart`, `--remote-reload-frontend`, `runtime-status`)
 - `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-doh-identityctl` - encrypted DNS identity CLI entrypoint in chroot
 - `/data/local/pixel-stack/chroots/adguardhome/usr/local/bin/adguardhome-doh-identities.py` - encrypted DNS identity and usage state helper
@@ -27,7 +27,7 @@
 - `/data/local/pixel-stack/chroots/adguardhome/etc/pixel-stack/remote-dns/doh-identities.json` - encrypted DNS identity source of truth for tokenized DoH plus managed DoT hostnames
 - `/data/local/pixel-stack/chroots/adguardhome/etc/pixel-stack/remote-dns/state/doh-usage-events.jsonl` - tokenized DoH usage ledger
 - `/data/local/pixel-stack/chroots/adguardhome/etc/pixel-stack/remote-dns/state/doh-usage-cursor.json` - tokenized DoH access-log cursor
-- `/data/local/pixel-stack/chroots/adguardhome/etc/nginx/pixel-stack-adguardhome-remote-nginx.conf` - rendered nginx frontend config for public `443` and `853`
+- `/data/local/pixel-stack/chroots/adguardhome/etc/nginx/pixel-stack-adguardhome-remote-nginx.conf` - rendered nginx frontend config for the active public HTTPS/DoT listener ports (`2789` and `853` in current production)
 - `/data/local/pixel-stack/chroots/adguardhome/var/log/adguardhome/remote-nginx-access.log` - nginx HTTPS access log
 - `/data/local/pixel-stack/chroots/adguardhome/var/log/adguardhome/remote-nginx-error.log` - nginx frontend error log
 - `/data/local/pixel-stack/chroots/adguardhome/var/log/adguardhome/remote-nginx-doh-access.log` - dedicated DoH access log used by usage rollup

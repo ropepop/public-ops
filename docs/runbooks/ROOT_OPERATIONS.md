@@ -231,7 +231,7 @@ sequenceDiagram
 - Entrypoint: `runtime/entrypoints/pixel-dns-start.sh`, `pixel-dns-stop.sh`
 - Loop template: `runtime/templates/rooted/adguardhome-service-loop`
 - Launch templates: `runtime/templates/rooted/adguardhome-render-config`, `adguardhome-launch-core`, `adguardhome-launch-frontend`, `adguardhome-start`, `adguardhome-stop`
-- Health signal: core health is local listener readiness (`53`, `127.0.0.1:8080`, and internal DoT `8853` when nginx fronts public DoT), with remote listener health delegated to `adguardhome-start --remote-healthcheck` when remote features are enabled
+- Health signal: core health is local listener readiness (`53`, `127.0.0.1:8080`, and internal DoT `8853` when nginx fronts public DoT), with remote listener health delegated to `adguardhome-start --remote-healthcheck` when remote features are enabled. The current production public listener contract is `2789` for HTTPS/DoH and `853` for DoT.
 - Encrypted DNS identity control:
   - Host wrapper: `/data/local/pixel-stack/bin/pixel-dns-identityctl`
   - Chroot entrypoint: `/usr/local/bin/adguardhome-doh-identityctl`
@@ -497,7 +497,7 @@ bash orchestrator/scripts/android/deploy_orchestrator_apk.sh \
 
 ```bash
 bash orchestrator/scripts/android/deploy_orchestrator_apk.sh --device "${ADB_SERIAL}" --action health --skip-build
-adb -s "${ADB_SERIAL}" shell "su -c 'ss -ltn | grep -E \":53 |:2222 |:443 |:853 \" || true'"
+adb -s "${ADB_SERIAL}" shell "su -c 'ss -ltn | grep -E \":53 |:2222 |:2789 |:853 \" || true'"
 ```
 
 <a id="day-2-operations-full--component-scoped-actions"></a>

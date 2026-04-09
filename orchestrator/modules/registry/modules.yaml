@@ -61,7 +61,7 @@ modules:
     component_id: remote
     start_command: true
     stop_command: true
-    health_command: ss -ltn 2>/dev/null | grep -E '[:.]443[[:space:]]' >/dev/null
+    health_command: ss -ltn 2>/dev/null | grep -E '[:.]2789[[:space:]]' >/dev/null
     redeploy:
       mode: derived
       derived_from: dns
