@@ -1,6 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,13 +24,33 @@ func withEnv(key, value string, fn func()) {
 	fn()
 }
 
-func withRequiredEnv(t *testing.T, fn func()) {
+func withRuntimeEnv(t *testing.T, fn func()) {
 	t.Helper()
-	withEnv("BOT_TOKEN", "token", fn)
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "runtime.key")
+	writeRSAPrivateKey(t, keyPath)
+	withEnv("BOT_TOKEN", "token", func() {
+		withEnv("TRAIN_RUNTIME_SPACETIME_HOST", "https://stdb.example.test", func() {
+			withEnv("TRAIN_RUNTIME_SPACETIME_DATABASE", "train-bot", func() {
+				withEnv("TRAIN_RUNTIME_SPACETIME_JWT_PRIVATE_KEY_FILE", keyPath, func() {
+					withEnv("TRAIN_RUNTIME_SPACETIME_OIDC_AUDIENCE", "train-bot-web", fn)
+				})
+			})
+		})
+	})
+}
+
+func TestLoadFailsWithoutBotToken(t *testing.T) {
+	withEnv("BOT_TOKEN", "", func() {
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "BOT_TOKEN") {
+			t.Fatalf("expected BOT_TOKEN error, got %v", err)
+		}
+	})
 }
 
 func TestLoadFailsOnInvalidIntegerEnv(t *testing.T) {
-	withRequiredEnv(t, func() {
+	withRuntimeEnv(t, func() {
 		withEnv("LONG_POLL_TIMEOUT", "abc", func() {
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), "LONG_POLL_TIMEOUT") {
@@ -37,7 +61,7 @@ func TestLoadFailsOnInvalidIntegerEnv(t *testing.T) {
 }
 
 func TestLoadFailsOnInvalidBooleanEnv(t *testing.T) {
-	withRequiredEnv(t, func() {
+	withRuntimeEnv(t, func() {
 		withEnv("FEATURE_STATION_CHECKIN", "not-bool", func() {
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), "FEATURE_STATION_CHECKIN") {
@@ -47,20 +71,9 @@ func TestLoadFailsOnInvalidBooleanEnv(t *testing.T) {
 	})
 }
 
-func TestLoadFailsOnInvalidFeatureInspectionSignalsEnv(t *testing.T) {
-	withRequiredEnv(t, func() {
-		withEnv("FEATURE_INSPECTION_SIGNALS", "bad-value", func() {
-			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "FEATURE_INSPECTION_SIGNALS") {
-				t.Fatalf("expected FEATURE_INSPECTION_SIGNALS parse error, got %v", err)
-			}
-		})
-	})
-}
-
 func TestLoadFailsOnInvalidReportDumpChatID(t *testing.T) {
-	withRequiredEnv(t, func() {
-		withEnv("REPORT_DUMP_CHAT_ID", "not-an-int", func() {
+	withRuntimeEnv(t, func() {
+		withEnv("REPORT_DUMP_CHAT_ID", "bad", func() {
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), "REPORT_DUMP_CHAT_ID") {
 				t.Fatalf("expected REPORT_DUMP_CHAT_ID parse error, got %v", err)
@@ -69,28 +82,138 @@ func TestLoadFailsOnInvalidReportDumpChatID(t *testing.T) {
 	})
 }
 
-func TestLoadAcceptsValidConfiguredValues(t *testing.T) {
-	withRequiredEnv(t, func() {
-		withEnv("LONG_POLL_TIMEOUT", "15", func() {
-			withEnv("HTTP_TIMEOUT_SEC", "45", func() {
-				withEnv("FEATURE_STATION_CHECKIN", "false", func() {
-					withEnv("REPORT_DUMP_CHAT_ID", "-1003867662138", func() {
-						cfg, err := Load()
-						if err != nil {
-							t.Fatalf("expected valid config, got error: %v", err)
-						}
-						if cfg.LongPollTimeout != 15 {
-							t.Fatalf("expected long poll timeout 15, got %d", cfg.LongPollTimeout)
-						}
-						if cfg.HTTPTimeoutSec != 45 {
-							t.Fatalf("expected http timeout 45, got %d", cfg.HTTPTimeoutSec)
-						}
-						if cfg.FeatureStationCheckin {
-							t.Fatalf("expected feature station checkin disabled")
-						}
-						if cfg.ReportDumpChatID != -1003867662138 {
-							t.Fatalf("expected report dump chat id to be parsed, got %d", cfg.ReportDumpChatID)
-						}
+func TestLoadRequiresRuntimeSpacetimeConfig(t *testing.T) {
+	withEnv("BOT_TOKEN", "token", func() {
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "TRAIN_RUNTIME_SPACETIME_HOST") {
+			t.Fatalf("expected runtime spacetime host error, got %v", err)
+		}
+	})
+}
+
+func TestLoadAcceptsRuntimeSpacetimeConfig(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("expected valid runtime config, got %v", err)
+		}
+		if cfg.TrainRuntimeSpacetimeHost != "https://stdb.example.test" {
+			t.Fatalf("unexpected runtime host: %q", cfg.TrainRuntimeSpacetimeHost)
+		}
+		if cfg.TrainRuntimeSpacetimeDatabase != "train-bot" {
+			t.Fatalf("unexpected runtime database: %q", cfg.TrainRuntimeSpacetimeDatabase)
+		}
+		if cfg.TrainRuntimeSpacetimeOIDCAudience != "train-bot-web" {
+			t.Fatalf("unexpected runtime audience: %q", cfg.TrainRuntimeSpacetimeOIDCAudience)
+		}
+		if cfg.SingleInstanceLockPath != filepath.Join(".", "data", "train-bot.lock") {
+			t.Fatalf("unexpected default lock path: %q", cfg.SingleInstanceLockPath)
+		}
+		if cfg.TrainWebPublicEdgeCacheStateFile != filepath.Join(".", "data", "train-bot.public-edge-cache.json") {
+			t.Fatalf("unexpected edge cache state file: %q", cfg.TrainWebPublicEdgeCacheStateFile)
+		}
+		if cfg.TrainWebBundleDir != filepath.Join(".", "data", "public-bundles") {
+			t.Fatalf("unexpected bundle dir: %q", cfg.TrainWebBundleDir)
+		}
+	})
+}
+
+func TestLoadUsesScheduleDirForDerivedPaths(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("SCHEDULE_DIR", "/tmp/train/runtime/data/schedules", func() {
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("expected valid config, got %v", err)
+			}
+			if cfg.SingleInstanceLockPath != "/tmp/train/runtime/data/train-bot.lock" {
+				t.Fatalf("unexpected derived lock path: %q", cfg.SingleInstanceLockPath)
+			}
+			if cfg.TrainWebPublicEdgeCacheStateFile != "/tmp/train/runtime/data/train-bot.public-edge-cache.json" {
+				t.Fatalf("unexpected derived edge cache file: %q", cfg.TrainWebPublicEdgeCacheStateFile)
+			}
+			if cfg.TrainWebBundleDir != "/tmp/train/runtime/data/public-bundles" {
+				t.Fatalf("unexpected derived bundle dir: %q", cfg.TrainWebBundleDir)
+			}
+		})
+	})
+}
+
+func TestLoadBumpsHTTPTimeoutAboveLongPoll(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("LONG_POLL_TIMEOUT", "30", func() {
+			withEnv("HTTP_TIMEOUT_SEC", "30", func() {
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("expected valid config, got %v", err)
+				}
+				if cfg.HTTPTimeoutSec != 40 {
+					t.Fatalf("expected HTTP timeout bump to 40, got %d", cfg.HTTPTimeoutSec)
+				}
+			})
+		})
+	})
+}
+
+func TestLoadRequiresTrainWebFieldsWhenEnabled(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("TRAIN_WEB_ENABLED", "true", func() {
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_PUBLIC_BASE_URL") {
+				t.Fatalf("expected TRAIN_WEB_PUBLIC_BASE_URL error, got %v", err)
+			}
+		})
+	})
+}
+
+func TestLoadRequiresTrainWebSpacetimeFieldsWhenWebEnabled(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		secretPath := filepath.Join(t.TempDir(), "session.secret")
+		if err := os.WriteFile(secretPath, []byte("session-secret-value"), 0o600); err != nil {
+			t.Fatalf("write secret: %v", err)
+		}
+		withEnv("TRAIN_WEB_ENABLED", "true", func() {
+			withEnv("TRAIN_WEB_PUBLIC_BASE_URL", "https://example.test/pixel-stack/train", func() {
+				withEnv("TRAIN_WEB_SESSION_SECRET_FILE", secretPath, func() {
+					_, err := Load()
+					if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_SPACETIME_HOST") {
+						t.Fatalf("expected TRAIN_WEB_SPACETIME_HOST error, got %v", err)
+					}
+				})
+			})
+		})
+	})
+}
+
+func TestLoadAcceptsTrainWebConfigWhenEnabled(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		dir := t.TempDir()
+		secretPath := filepath.Join(dir, "session.secret")
+		if err := os.WriteFile(secretPath, []byte("session-secret-value"), 0o600); err != nil {
+			t.Fatalf("write secret: %v", err)
+		}
+		webKeyPath := filepath.Join(dir, "web.key")
+		writeRSAPrivateKey(t, webKeyPath)
+		withEnv("TRAIN_WEB_ENABLED", "true", func() {
+			withEnv("TRAIN_WEB_PUBLIC_BASE_URL", "https://example.test/pixel-stack/train", func() {
+				withEnv("TRAIN_WEB_SESSION_SECRET_FILE", secretPath, func() {
+					withEnv("TRAIN_WEB_SPACETIME_HOST", "https://stdb.example.test", func() {
+						withEnv("TRAIN_WEB_SPACETIME_DATABASE", "train-bot", func() {
+							withEnv("TRAIN_WEB_SPACETIME_JWT_PRIVATE_KEY_FILE", webKeyPath, func() {
+								cfg, err := Load()
+								if err != nil {
+									t.Fatalf("expected valid web config, got %v", err)
+								}
+								if !cfg.TrainWebEnabled {
+									t.Fatalf("expected train web enabled")
+								}
+								if cfg.TrainWebSpacetimeHost != "https://stdb.example.test" {
+									t.Fatalf("unexpected web spacetime host: %q", cfg.TrainWebSpacetimeHost)
+								}
+								if cfg.TrainWebSpacetimeTokenTTLSec != 86400 {
+									t.Fatalf("unexpected web spacetime ttl: %d", cfg.TrainWebSpacetimeTokenTTLSec)
+								}
+							})
+						})
 					})
 				})
 			})
@@ -98,109 +221,133 @@ func TestLoadAcceptsValidConfiguredValues(t *testing.T) {
 	})
 }
 
-func TestLoadKeepsReportDumpDisabledWhenUnset(t *testing.T) {
-	withRequiredEnv(t, func() {
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("expected valid config, got %v", err)
-		}
-		if cfg.ReportDumpChatID != 0 {
-			t.Fatalf("expected dump sink disabled by default, got %d", cfg.ReportDumpChatID)
-		}
-	})
-}
-
-func TestLoadRequiresTrainWebFieldsWhenEnabled(t *testing.T) {
-	withRequiredEnv(t, func() {
-		withEnv("TRAIN_WEB_ENABLED", "true", func() {
+func TestLoadRejectsTestLoginWithoutWeb(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("TRAIN_WEB_TEST_LOGIN_ENABLED", "true", func() {
 			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_PUBLIC_BASE_URL") {
-				t.Fatalf("expected missing train web base url error, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_TEST_LOGIN_ENABLED requires TRAIN_WEB_ENABLED=true") {
+				t.Fatalf("expected test login web gating error, got %v", err)
 			}
 		})
 	})
 }
 
-func TestLoadAcceptsTrainWebConfigWhenEnabled(t *testing.T) {
-	withRequiredEnv(t, func() {
-		secretPath := filepath.Join(t.TempDir(), "session-secret")
-		if err := os.WriteFile(secretPath, []byte("secret-value"), 0o600); err != nil {
-			t.Fatalf("write secret: %v", err)
+func TestLoadRequiresTestLoginFieldsWhenEnabled(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		dir := t.TempDir()
+		sessionSecretPath := filepath.Join(dir, "session.secret")
+		if err := os.WriteFile(sessionSecretPath, []byte("session-secret-value"), 0o600); err != nil {
+			t.Fatalf("write session secret: %v", err)
 		}
+		webKeyPath := filepath.Join(dir, "web.key")
+		writeRSAPrivateKey(t, webKeyPath)
 		withEnv("TRAIN_WEB_ENABLED", "true", func() {
 			withEnv("TRAIN_WEB_PUBLIC_BASE_URL", "https://example.test/pixel-stack/train", func() {
-				withEnv("TRAIN_WEB_SESSION_SECRET_FILE", secretPath, func() {
-					cfg, err := Load()
-					if err != nil {
-						t.Fatalf("expected valid train web config, got %v", err)
-					}
-					if !cfg.TrainWebEnabled {
-						t.Fatalf("expected train web enabled")
-					}
-					if cfg.TrainWebPort != 9317 {
-						t.Fatalf("expected default train web port, got %d", cfg.TrainWebPort)
-					}
-					if cfg.TrainWebPublicBaseURL != "https://example.test/pixel-stack/train" {
-						t.Fatalf("unexpected train web public base url: %q", cfg.TrainWebPublicBaseURL)
-					}
-					if cfg.TrainWebSessionSecretFile != secretPath {
-						t.Fatalf("unexpected session secret file: %q", cfg.TrainWebSessionSecretFile)
-					}
+				withEnv("TRAIN_WEB_SESSION_SECRET_FILE", sessionSecretPath, func() {
+					withEnv("TRAIN_WEB_SPACETIME_HOST", "https://stdb.example.test", func() {
+						withEnv("TRAIN_WEB_SPACETIME_DATABASE", "train-bot", func() {
+							withEnv("TRAIN_WEB_SPACETIME_JWT_PRIVATE_KEY_FILE", webKeyPath, func() {
+								withEnv("TRAIN_WEB_TEST_LOGIN_ENABLED", "true", func() {
+									_, err := Load()
+									if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_TEST_USER_ID") {
+										t.Fatalf("expected TRAIN_WEB_TEST_USER_ID error, got %v", err)
+									}
+								})
+							})
+						})
+					})
 				})
 			})
 		})
 	})
 }
 
-func TestLoadAcceptsExternalTrainMapDefaults(t *testing.T) {
-	withRequiredEnv(t, func() {
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("expected valid config, got %v", err)
+func TestLoadAcceptsTestLoginConfigWhenEnabled(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		dir := t.TempDir()
+		sessionSecretPath := filepath.Join(dir, "session.secret")
+		if err := os.WriteFile(sessionSecretPath, []byte("session-secret-value"), 0o600); err != nil {
+			t.Fatalf("write session secret: %v", err)
 		}
-		if !cfg.ExternalTrainMapEnabled {
-			t.Fatalf("expected external train map enabled by default")
+		testSecretPath := filepath.Join(dir, "test-ticket.secret")
+		if err := os.WriteFile(testSecretPath, []byte("test-ticket-secret-value"), 0o600); err != nil {
+			t.Fatalf("write test ticket secret: %v", err)
 		}
-		if cfg.ExternalTrainMapBaseURL != "https://trainmap.vivi.lv" {
-			t.Fatalf("unexpected external train map base url: %q", cfg.ExternalTrainMapBaseURL)
-		}
-		if cfg.ExternalTrainMapWsURL != "wss://trainmap.pv.lv/ws" {
-			t.Fatalf("unexpected external train map websocket url: %q", cfg.ExternalTrainMapWsURL)
-		}
+		webKeyPath := filepath.Join(dir, "web.key")
+		writeRSAPrivateKey(t, webKeyPath)
+		withEnv("TRAIN_WEB_ENABLED", "true", func() {
+			withEnv("TRAIN_WEB_PUBLIC_BASE_URL", "https://example.test/pixel-stack/train", func() {
+				withEnv("TRAIN_WEB_SESSION_SECRET_FILE", sessionSecretPath, func() {
+					withEnv("TRAIN_WEB_SPACETIME_HOST", "https://stdb.example.test", func() {
+						withEnv("TRAIN_WEB_SPACETIME_DATABASE", "train-bot", func() {
+							withEnv("TRAIN_WEB_SPACETIME_JWT_PRIVATE_KEY_FILE", webKeyPath, func() {
+								withEnv("TRAIN_WEB_TEST_LOGIN_ENABLED", "true", func() {
+									withEnv("TRAIN_WEB_TEST_USER_ID", "7001", func() {
+										withEnv("TRAIN_WEB_TEST_TICKET_SECRET_FILE", testSecretPath, func() {
+											withEnv("TRAIN_WEB_TEST_TICKET_TTL_SEC", "90", func() {
+												cfg, err := Load()
+												if err != nil {
+													t.Fatalf("expected valid test login config, got %v", err)
+												}
+												if !cfg.TrainWebTestLoginEnabled {
+													t.Fatalf("expected test login enabled")
+												}
+												if cfg.TrainWebTestUserID != 7001 {
+													t.Fatalf("unexpected test user id: %d", cfg.TrainWebTestUserID)
+												}
+												if cfg.TrainWebTestTicketSecretFile != testSecretPath {
+													t.Fatalf("unexpected test ticket secret file: %q", cfg.TrainWebTestTicketSecretFile)
+												}
+												if cfg.TrainWebTestTicketTTLSec != 90 {
+													t.Fatalf("unexpected test ticket ttl: %d", cfg.TrainWebTestTicketTTLSec)
+												}
+											})
+										})
+									})
+								})
+							})
+						})
+					})
+				})
+			})
+		})
 	})
 }
 
-func TestLoadRequiresExternalTrainMapURLsWhenEnabled(t *testing.T) {
-	withRequiredEnv(t, func() {
-		withEnv("EXTERNAL_TRAINMAP_BASE_URL", "   ", func() {
+func TestLoadRejectsEdgeCacheWithoutWeb(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("TRAIN_WEB_PUBLIC_EDGE_CACHE_ENABLED", "true", func() {
 			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "EXTERNAL_TRAINMAP_BASE_URL") {
-				t.Fatalf("expected missing external train map base url error, got %v", err)
-			}
-		})
-		withEnv("EXTERNAL_TRAINMAP_WS_URL", "   ", func() {
-			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "EXTERNAL_TRAINMAP_WS_URL") {
-				t.Fatalf("expected missing external train map websocket url error, got %v", err)
+			if err == nil || !strings.Contains(err.Error(), "TRAIN_WEB_PUBLIC_EDGE_CACHE_ENABLED") {
+				t.Fatalf("expected edge cache gating error, got %v", err)
 			}
 		})
 	})
 }
 
-func TestLoadAllowsExternalTrainMapToBeDisabled(t *testing.T) {
-	withRequiredEnv(t, func() {
+func TestLoadAcceptsDisabledExternalTrainMap(t *testing.T) {
+	withRuntimeEnv(t, func() {
 		withEnv("EXTERNAL_TRAINMAP_ENABLED", "false", func() {
-			withEnv("EXTERNAL_TRAINMAP_BASE_URL", "", func() {
-				withEnv("EXTERNAL_TRAINMAP_WS_URL", "", func() {
-					cfg, err := Load()
-					if err != nil {
-						t.Fatalf("expected valid config with external train map disabled, got %v", err)
-					}
-					if cfg.ExternalTrainMapEnabled {
-						t.Fatalf("expected external train map disabled")
-					}
-				})
-			})
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("expected valid config with external map disabled, got %v", err)
+			}
+			if cfg.ExternalTrainMapEnabled {
+				t.Fatalf("expected external train map to be disabled")
+			}
 		})
 	})
+}
+
+func writeRSAPrivateKey(t *testing.T, path string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	bytes := x509.MarshalPKCS1PrivateKey(key)
+	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: bytes}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
 }

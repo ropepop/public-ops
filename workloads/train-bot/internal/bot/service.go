@@ -25,7 +25,7 @@ type Service struct {
 	client                *Client
 	notifier              *Notifier
 	store                 store.Store
-	schedules             *schedule.Manager
+	schedules             schedule.ReadModel
 	rides                 *ride.Service
 	reports               *reports.Service
 	catalog               *i18n.Catalog
@@ -51,12 +51,13 @@ const (
 )
 
 const (
-	mainMenuActionCheckin  = "checkin"
-	mainMenuActionMyRide   = "my_ride"
-	mainMenuActionReport   = "report"
-	mainMenuActionSettings = "settings"
-	mainMenuActionHelp     = "help"
-	mainMenuActionOpenApp  = "open_app"
+	mainMenuActionCheckin   = "checkin"
+	mainMenuActionMyRide    = "my_ride"
+	mainMenuActionReport    = "report"
+	mainMenuActionSettings  = "settings"
+	mainMenuActionHelp      = "help"
+	mainMenuActionIncidents = "incidents"
+	mainMenuActionOpenApp   = "open_app"
 )
 
 type checkinSession struct {
@@ -71,7 +72,7 @@ func NewService(
 	client *Client,
 	notifier *Notifier,
 	st store.Store,
-	schedules *schedule.Manager,
+	schedules schedule.ReadModel,
 	rides *ride.Service,
 	reportsSvc *reports.Service,
 	catalog *i18n.Catalog,
@@ -144,10 +145,28 @@ func (s *Service) handleMessage(ctx context.Context, m *Message) error {
 	}
 	lang := s.languageFor(ctx, m.From.ID)
 	text := strings.TrimSpace(m.Text)
+	normalizedText := normalizeTelegramMessageText(text)
 
-	switch text {
+	switch normalizedText {
 	case "/start":
-		return s.sendStart(ctx, m.Chat.ID, lang)
+		if err := s.sendStart(ctx, m.Chat.ID, lang); err != nil {
+			return err
+		}
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
+	case "/incidents":
+		return s.send(ctx, m.Chat.ID, s.catalog.T(lang, "incidents_unavailable"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
+	case "/menu":
+		if err := s.send(ctx, m.Chat.ID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)}); err != nil {
+			return err
+		}
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
+	case "/help":
+		if err := s.sendHelp(ctx, m.Chat.ID, lang); err != nil {
+			return err
+		}
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
+	case "":
+		return s.send(ctx, m.Chat.ID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
 	case "/info", "ℹ️ Info", "Info":
 		return s.sendInfo(ctx, m.Chat.ID, lang)
 	case "/health":
@@ -163,15 +182,18 @@ func (s *Service) handleMessage(ctx context.Context, m *Message) error {
 		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	case mainMenuActionCheckin:
 		s.clearCheckinSession(m.From.ID)
-		return s.sendCheckInEntry(ctx, m.Chat.ID, lang)
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	case mainMenuActionMyRide:
-		return s.sendMyRide(ctx, m.Chat.ID, m.From.ID, lang)
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	case mainMenuActionReport:
-		return s.sendReportPrompt(ctx, m.Chat.ID, m.From.ID, lang)
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	case mainMenuActionSettings:
 		return s.sendSettings(ctx, m.Chat.ID, m.From.ID, lang)
 	case mainMenuActionHelp:
-		return s.sendHelp(ctx, m.Chat.ID, lang)
+		if err := s.sendHelp(ctx, m.Chat.ID, lang); err != nil {
+			return err
+		}
+		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	default:
 		return s.send(ctx, m.Chat.ID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
 	}
@@ -207,6 +229,7 @@ func (s *Service) configureBot(ctx context.Context) {
 	commands := []BotCommand{
 		{Command: "start", Description: "Open vivi kontrole"},
 		{Command: "menu", Description: "Show vivi kontrole menu"},
+		{Command: "help", Description: "How to use the train app"},
 	}
 	if err := s.client.SetMyCommands(ctx, commands); err != nil {
 		log.Printf("telegram setMyCommands error: %v", err)
@@ -526,6 +549,9 @@ func (s *Service) sendStart(ctx context.Context, chatID int64, lang domain.Langu
 	if row := s.openAppButtonRow(lang); row != nil {
 		rows = append(rows, row)
 	}
+	if row := s.openIncidentsButtonRow(lang); row != nil {
+		rows = append(rows, row)
+	}
 	kb := InlineKeyboardAny(rows...)
 	return s.send(ctx, chatID, s.catalog.T(lang, "start"), MessageOptions{ReplyMarkup: kb})
 }
@@ -558,6 +584,13 @@ func (s *Service) appLaunchURL() string {
 	return s.webAppURL + "/app"
 }
 
+func (s *Service) incidentsLaunchURL() string {
+	if strings.TrimSpace(s.webAppURL) == "" {
+		return ""
+	}
+	return s.webAppURL + "/incidents"
+}
+
 func (s *Service) mainReplyKeyboard(lang domain.Language) map[string]any {
 	return MainReplyKeyboardWithWebApp(lang, s.catalog, s.appLaunchURL())
 }
@@ -568,6 +601,14 @@ func (s *Service) openAppButtonRow(lang domain.Language) []map[string]any {
 		return nil
 	}
 	return []map[string]any{WebAppInlineButton(s.catalog.T(lang, "btn_open_app"), url)}
+}
+
+func (s *Service) openIncidentsButtonRow(lang domain.Language) []map[string]any {
+	url := s.incidentsLaunchURL()
+	if url == "" {
+		return nil
+	}
+	return []map[string]any{WebAppInlineButton(s.catalog.T(lang, "btn_open_incidents"), url)}
 }
 
 func (s *Service) reportsChannelButtonRow(lang domain.Language) []map[string]any {
@@ -592,7 +633,11 @@ func (s *Service) sendOpenAppPrompt(ctx context.Context, chatID int64, lang doma
 	if len(rows) == 0 {
 		return s.send(ctx, chatID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
 	}
-	return s.send(ctx, chatID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: InlineKeyboardAny(rows...)})
+	return s.send(ctx, chatID, s.catalog.T(lang, "open_app_prompt"), MessageOptions{ReplyMarkup: InlineKeyboardAny(rows...)})
+}
+
+func (s *Service) sendIncidents(ctx context.Context, chatID int64, lang domain.Language) error {
+	return s.send(ctx, chatID, s.catalog.T(lang, "incidents_unavailable"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
 }
 
 func (s *Service) editCheckInEntry(ctx context.Context, cb *CallbackQuery, lang domain.Language) error {
@@ -2064,6 +2109,25 @@ func (s *Service) sendInfo(ctx context.Context, chatID int64, lang domain.Langua
 	}
 	text := strings.Join([]string{s.catalog.T(lang, "info"), info}, "\n")
 	return s.send(ctx, chatID, text, MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
+}
+
+func normalizeTelegramMessageText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return ""
+	}
+	command := fields[0]
+	if !strings.HasPrefix(command, "/") {
+		return text
+	}
+	if at := strings.Index(command, "@"); at >= 0 {
+		command = command[:at]
+	}
+	return command
 }
 
 func (s *Service) sendStatus(ctx context.Context, chatID int64, userID int64, trainID string, lang domain.Language) error {

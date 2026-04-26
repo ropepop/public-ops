@@ -307,6 +307,253 @@ func TestTrainMuteAndRecipientQueries(t *testing.T) {
 	}
 }
 
+func TestResetTestUserClearsInteractiveStateAndRestoresDefaults(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, 2, 25, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-5 * time.Minute)
+	arr := now.Add(40 * time.Minute)
+	trainID := "train-reset"
+	insertTrain(t, st, trainID, dep, arr)
+	userID := int64(77)
+	boardingStationID := "riga"
+	destinationStationID := "jelgava"
+	incidentID := "incident-reset"
+
+	if err := st.SetAlertsEnabled(ctx, userID, false); err != nil {
+		t.Fatalf("disable alerts: %v", err)
+	}
+	if err := st.SetAlertStyle(ctx, userID, domain.AlertStyleDiscreet); err != nil {
+		t.Fatalf("set alert style: %v", err)
+	}
+	if err := st.SetLanguage(ctx, userID, domain.LanguageLV); err != nil {
+		t.Fatalf("set language: %v", err)
+	}
+	if err := st.CheckInUserAtStation(ctx, userID, trainID, &boardingStationID, now.Add(-2*time.Minute), arr.Add(10*time.Minute)); err != nil {
+		t.Fatalf("check in user: %v", err)
+	}
+	if err := st.UndoCheckoutUser(ctx, userID, trainID, &boardingStationID, now.Add(-2*time.Minute), arr.Add(10*time.Minute)); err != nil {
+		t.Fatalf("undo checkout user: %v", err)
+	}
+	if err := st.SetTrainMute(ctx, userID, trainID, now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("set train mute: %v", err)
+	}
+	if err := st.UpsertSubscription(ctx, userID, trainID, now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("upsert subscription: %v", err)
+	}
+	if err := st.UpsertFavoriteRoute(ctx, userID, "riga", "jelgava"); err != nil {
+		t.Fatalf("upsert favorite route: %v", err)
+	}
+	if err := st.InsertReportEvent(ctx, domain.ReportEvent{
+		ID:              "report-reset",
+		TrainInstanceID: trainID,
+		UserID:          userID,
+		Signal:          domain.SignalInspectionStarted,
+		CreatedAt:       now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("insert report event: %v", err)
+	}
+	if err := st.InsertStationSighting(ctx, domain.StationSighting{
+		ID:                     "sighting-reset",
+		StationID:              "riga",
+		DestinationStationID:   &destinationStationID,
+		MatchedTrainInstanceID: &trainID,
+		UserID:                 userID,
+		CreatedAt:              now.Add(-30 * time.Second),
+	}); err != nil {
+		t.Fatalf("insert station sighting: %v", err)
+	}
+	if err := st.UpsertIncidentVote(ctx, domain.IncidentVote{
+		IncidentID: incidentID,
+		UserID:     userID,
+		Nickname:   "Tester",
+		Value:      domain.IncidentVoteOngoing,
+		CreatedAt:  now.Add(-45 * time.Second),
+		UpdatedAt:  now.Add(-15 * time.Second),
+	}); err != nil {
+		t.Fatalf("upsert incident vote: %v", err)
+	}
+	if err := st.InsertIncidentVoteEvent(ctx, domain.IncidentVoteEvent{
+		ID:         "vote-event-reset",
+		IncidentID: incidentID,
+		UserID:     userID,
+		Nickname:   "Tester",
+		Value:      domain.IncidentVoteOngoing,
+		CreatedAt:  now.Add(-15 * time.Second),
+	}); err != nil {
+		t.Fatalf("insert incident vote event: %v", err)
+	}
+	if err := st.InsertIncidentComment(ctx, domain.IncidentComment{
+		ID:         "comment-reset",
+		IncidentID: incidentID,
+		UserID:     userID,
+		Nickname:   "Tester",
+		Body:       "Still there",
+		CreatedAt:  now.Add(-10 * time.Second),
+	}); err != nil {
+		t.Fatalf("insert incident comment: %v", err)
+	}
+
+	if err := st.ResetTestUser(ctx, userID); err != nil {
+		t.Fatalf("reset test user: %v", err)
+	}
+
+	settings, err := st.GetUserSettings(ctx, userID)
+	if err != nil {
+		t.Fatalf("get user settings: %v", err)
+	}
+	if !settings.AlertsEnabled || settings.AlertStyle != domain.AlertStyleDetailed || settings.Language != domain.LanguageEN {
+		t.Fatalf("expected default settings after reset, got %+v", settings)
+	}
+
+	checkIn, err := st.GetActiveCheckIn(ctx, userID, now)
+	if err != nil {
+		t.Fatalf("get active checkin: %v", err)
+	}
+	if checkIn != nil {
+		t.Fatalf("expected active checkin cleared, got %+v", checkIn)
+	}
+
+	var undoCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM undo_checkouts WHERE user_id = ?`, userID).Scan(&undoCount); err != nil {
+		t.Fatalf("count undo checkouts: %v", err)
+	}
+	if undoCount != 0 {
+		t.Fatalf("expected undo checkout cleared, got %d", undoCount)
+	}
+
+	favorites, err := st.ListFavoriteRoutes(ctx, userID)
+	if err != nil {
+		t.Fatalf("list favorite routes: %v", err)
+	}
+	if len(favorites) != 0 {
+		t.Fatalf("expected favorite routes cleared, got %+v", favorites)
+	}
+
+	muted, err := st.IsTrainMuted(ctx, userID, trainID, now)
+	if err != nil {
+		t.Fatalf("check train mute: %v", err)
+	}
+	if muted {
+		t.Fatalf("expected mute cleared")
+	}
+
+	subscribed, err := st.HasActiveSubscription(ctx, userID, trainID, now)
+	if err != nil {
+		t.Fatalf("check active subscription: %v", err)
+	}
+	if subscribed {
+		t.Fatalf("expected subscription cleared")
+	}
+
+	reports, err := st.ListRecentReports(ctx, trainID, 10)
+	if err != nil {
+		t.Fatalf("list recent reports: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("expected reports cleared, got %+v", reports)
+	}
+
+	sightings, err := st.ListRecentStationSightings(ctx, now.Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatalf("list recent station sightings: %v", err)
+	}
+	if len(sightings) != 0 {
+		t.Fatalf("expected station sightings cleared, got %+v", sightings)
+	}
+
+	votes, err := st.ListIncidentVotes(ctx, incidentID)
+	if err != nil {
+		t.Fatalf("list incident votes: %v", err)
+	}
+	if len(votes) != 0 {
+		t.Fatalf("expected incident votes cleared, got %+v", votes)
+	}
+
+	voteEvents, err := st.ListIncidentVoteEvents(ctx, incidentID, now.Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatalf("list incident vote events: %v", err)
+	}
+	if len(voteEvents) != 0 {
+		t.Fatalf("expected incident vote events cleared, got %+v", voteEvents)
+	}
+
+	comments, err := st.ListIncidentComments(ctx, incidentID, 10)
+	if err != nil {
+		t.Fatalf("list incident comments: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("expected incident comments cleared, got %+v", comments)
+	}
+}
+
+func TestConsumeTestLoginTicketIsDurableAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "train-bot.db")
+
+	firstStore, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("new first store: %v", err)
+	}
+	if err := firstStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate first store: %v", err)
+	}
+
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	accepted, err := firstStore.ConsumeTestLoginTicket(ctx, "nonce-hash-1", 7001, expiresAt)
+	if err != nil {
+		t.Fatalf("consume first ticket: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("expected first consume to succeed")
+	}
+	if err := firstStore.Close(); err != nil {
+		t.Fatalf("close first store: %v", err)
+	}
+
+	secondStore, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("new second store: %v", err)
+	}
+	defer secondStore.Close()
+	if err := secondStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate second store: %v", err)
+	}
+
+	accepted, err = secondStore.ConsumeTestLoginTicket(ctx, "nonce-hash-1", 7001, expiresAt)
+	if err != nil {
+		t.Fatalf("consume duplicate ticket: %v", err)
+	}
+	if accepted {
+		t.Fatalf("expected duplicate consume to stay rejected after restart")
+	}
+}
+
+func TestConsumeTestLoginTicketPrunesExpiredRowsBeforeAcceptingANewTicket(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	defer st.Close()
+
+	expiredAt := time.Now().UTC().Add(-time.Minute)
+	accepted, err := st.ConsumeTestLoginTicket(ctx, "nonce-hash-expired", 7001, expiredAt)
+	if err != nil {
+		t.Fatalf("consume expired ticket row: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("expected first insert to succeed even for an already expired row")
+	}
+
+	accepted, err = st.ConsumeTestLoginTicket(ctx, "nonce-hash-expired", 7001, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("consume replacement ticket row: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("expected expired row to be pruned before the next consume")
+	}
+}
+
 func TestStationQueriesUsePassTimeAndCheckinMetadata(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -729,6 +976,75 @@ func TestStationSightingQueriesAndCleanup(t *testing.T) {
 	}
 	if res.StationSightingsDeleted != 1 {
 		t.Fatalf("expected 1 old station sighting deleted, got %+v", res)
+	}
+}
+
+func TestIncidentVoteEventsAppendWhileLatestVoteStaysUpserted(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, 2, 26, 9, 0, 0, 0, time.UTC)
+	incidentID := "station:riga:2026-02-26-station"
+
+	if err := st.UpsertIncidentVote(ctx, domain.IncidentVote{
+		IncidentID: incidentID,
+		UserID:     11,
+		Nickname:   "Quiet Scout 111",
+		Value:      domain.IncidentVoteOngoing,
+		CreatedAt:  now.Add(-2 * time.Minute),
+		UpdatedAt:  now.Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("upsert first incident vote: %v", err)
+	}
+	if err := st.InsertIncidentVoteEvent(ctx, domain.IncidentVoteEvent{
+		ID:         "vote-1",
+		IncidentID: incidentID,
+		UserID:     11,
+		Nickname:   "Quiet Scout 111",
+		Value:      domain.IncidentVoteOngoing,
+		CreatedAt:  now.Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("insert first incident vote event: %v", err)
+	}
+	if err := st.UpsertIncidentVote(ctx, domain.IncidentVote{
+		IncidentID: incidentID,
+		UserID:     11,
+		Nickname:   "Quiet Scout 111",
+		Value:      domain.IncidentVoteCleared,
+		CreatedAt:  now.Add(-2 * time.Minute),
+		UpdatedAt:  now.Add(-1 * time.Minute),
+	}); err != nil {
+		t.Fatalf("upsert second incident vote: %v", err)
+	}
+	if err := st.InsertIncidentVoteEvent(ctx, domain.IncidentVoteEvent{
+		ID:         "vote-2",
+		IncidentID: incidentID,
+		UserID:     11,
+		Nickname:   "Quiet Scout 111",
+		Value:      domain.IncidentVoteCleared,
+		CreatedAt:  now.Add(-1 * time.Minute),
+	}); err != nil {
+		t.Fatalf("insert second incident vote event: %v", err)
+	}
+
+	votes, err := st.ListIncidentVotes(ctx, incidentID)
+	if err != nil {
+		t.Fatalf("list incident votes: %v", err)
+	}
+	if len(votes) != 1 || votes[0].Value != domain.IncidentVoteCleared {
+		t.Fatalf("expected a single latest vote summary, got %+v", votes)
+	}
+
+	events, err := st.ListIncidentVoteEvents(ctx, incidentID, now.Add(-10*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("list incident vote events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected both vote events to be retained, got %+v", events)
+	}
+	if events[0].ID != "vote-2" || events[1].ID != "vote-1" {
+		t.Fatalf("expected vote events in reverse chronological order, got %+v", events)
 	}
 }
 

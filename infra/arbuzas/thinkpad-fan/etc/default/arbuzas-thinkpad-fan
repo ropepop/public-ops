@@ -1,0 +1,8 @@
+# Keep the CPU fan spinning at the lowest manual ThinkPad level during
+# normal temperatures, but hand control back to the embedded controller
+# before the machine reaches the high-temperature band.
+ARBUZAS_FAN_MANUAL_LEVEL=1
+ARBUZAS_FAN_ENTER_AUTO_C=89
+ARBUZAS_FAN_EXIT_AUTO_C=89
+ARBUZAS_FAN_POLL_INTERVAL_SECONDS=2
+ARBUZAS_FAN_WATCHDOG_SECONDS=10

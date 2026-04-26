@@ -1,0 +1,200 @@
+[2026-03-01T14:45:37+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:45:40+0000] local DoH gateway failed to stay running
+[2026-03-01T14:45:40+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:45:40+0000] status:adguardhome pid=12199 alive=yes
+[2026-03-01T14:45:40+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:45:40+0000] status:remote_doh pid=17612 alive=no
+[2026-03-01T14:45:40+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:45:41+0000] status:listen_dns :53 up
+[2026-03-01T14:45:42+0000] status:listen_web :8080 up
+[2026-03-01T14:45:42+0000] status:listen_https :443 up
+[2026-03-01T14:45:42+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 12199 is not a child of this shell
+[2026-03-01T14:45:42+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:48:26+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:48:26+0000] AdGuardHome already running (pid=12199)
+[2026-03-01T14:48:27+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:48:32+0000] remote nginx config validation failed
+[2026-03-01T14:48:32+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:48:32+0000] status:adguardhome pid=12199 alive=yes
+[2026-03-01T14:48:32+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:48:32+0000] status:remote_doh pid=21383 alive=yes
+[2026-03-01T14:48:32+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:48:32+0000] status:listen_dns :53 up
+[2026-03-01T14:48:33+0000] status:listen_web :8080 up
+[2026-03-01T14:48:33+0000] status:listen_https :443 down
+[2026-03-01T14:48:33+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 12199 is not a child of this shell
+[2026-03-01T14:48:33+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:49:20+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:49:20+0000] AdGuardHome already running (pid=12199)
+[2026-03-01T14:49:21+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:49:26+0000] remote nginx config validation failed
+[2026-03-01T14:49:26+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:49:26+0000] status:adguardhome pid=12199 alive=yes
+[2026-03-01T14:49:26+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:49:26+0000] status:remote_doh pid=22771 alive=yes
+[2026-03-01T14:49:26+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:49:26+0000] status:listen_dns :53 up
+[2026-03-01T14:49:27+0000] status:listen_web :8080 up
+[2026-03-01T14:49:27+0000] status:listen_https :443 down
+[2026-03-01T14:49:27+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 12199 is not a child of this shell
+[2026-03-01T14:49:27+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:50:24+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:50:24+0000] AdGuardHome already running (pid=12199)
+[2026-03-01T14:50:25+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:50:30+0000] remote nginx config validation failed
+[2026-03-01T14:50:30+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:50:30+0000] status:adguardhome pid=12199 alive=yes
+[2026-03-01T14:50:30+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:50:30+0000] status:remote_doh pid=23644 alive=yes
+[2026-03-01T14:50:30+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:50:31+0000] status:listen_dns :53 up
+[2026-03-01T14:50:32+0000] status:listen_web :8080 up
+[2026-03-01T14:50:32+0000] status:listen_https :443 down
+[2026-03-01T14:50:32+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 12199 is not a child of this shell
+[2026-03-01T14:50:32+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:51:52+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:51:52+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T14:52:02+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:52:07+0000] remote nginx config validation failed
+[2026-03-01T14:52:07+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:52:07+0000] status:adguardhome pid=24915 alive=yes
+[2026-03-01T14:52:07+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:52:07+0000] status:remote_doh pid=25173 alive=yes
+[2026-03-01T14:52:07+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:52:08+0000] status:listen_dns :53 up
+[2026-03-01T14:52:08+0000] status:listen_web :8080 up
+[2026-03-01T14:52:08+0000] status:listen_https :443 down
+[2026-03-01T14:52:08+0000] status:listen_doh_internal :8053 up
+[2026-03-01T14:53:24+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:53:24+0000] AdGuardHome already running (pid=24915)
+[2026-03-01T14:53:27+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:53:30+0000] remote nginx config validation failed
+[2026-03-01T14:53:30+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:53:31+0000] status:adguardhome pid=24915 alive=yes
+[2026-03-01T14:53:31+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:53:31+0000] status:remote_doh pid=26399 alive=yes
+[2026-03-01T14:53:31+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:53:31+0000] status:listen_dns :53 up
+[2026-03-01T14:53:31+0000] status:listen_web :8080 up
+[2026-03-01T14:53:32+0000] status:listen_https :443 down
+[2026-03-01T14:53:32+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 24915 is not a child of this shell
+[2026-03-01T14:53:32+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:54:31+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:54:31+0000] AdGuardHome already running (pid=24915)
+[2026-03-01T14:54:32+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:54:36+0000] remote nginx config validation failed
+[2026-03-01T14:54:36+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:54:36+0000] status:adguardhome pid=24915 alive=yes
+[2026-03-01T14:54:37+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:54:37+0000] status:remote_doh pid=27239 alive=yes
+[2026-03-01T14:54:37+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:54:37+0000] status:listen_dns :53 up
+[2026-03-01T14:54:37+0000] status:listen_web :8080 up
+[2026-03-01T14:54:37+0000] status:listen_https :443 down
+[2026-03-01T14:54:37+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 24915 is not a child of this shell
+[2026-03-01T14:54:38+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:55:55+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:55:55+0000] AdGuardHome already running (pid=24915)
+[2026-03-01T14:55:56+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:55:59+0000] remote nginx config validation failed
+[2026-03-01T14:55:59+0000] WARN: remote stack failed to start; continuing with local AdGuardHome only
+[2026-03-01T14:55:59+0000] status:adguardhome pid=24915 alive=yes
+[2026-03-01T14:55:59+0000] status:remote_nginx pid=none alive=no
+[2026-03-01T14:55:59+0000] status:remote_doh pid=28445 alive=yes
+[2026-03-01T14:55:59+0000] status:watchdog pid=none alive=no
+[2026-03-01T14:55:59+0000] status:listen_dns :53 up
+[2026-03-01T14:56:00+0000] status:listen_web :8080 up
+[2026-03-01T14:56:00+0000] status:listen_https :443 down
+[2026-03-01T14:56:00+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 24915 is not a child of this shell
+[2026-03-01T14:56:00+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:58:01+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:58:01+0000] AdGuardHome already running (pid=24915)
+[2026-03-01T14:58:05+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:58:18+0000] status:adguardhome pid=24915 alive=yes
+[2026-03-01T14:58:18+0000] status:remote_nginx pid=30316 alive=yes
+[2026-03-01T14:58:18+0000] status:remote_doh pid=30169 alive=yes
+[2026-03-01T14:58:18+0000] status:watchdog pid=30358 alive=yes
+[2026-03-01T14:58:18+0000] status:listen_dns :53 up
+[2026-03-01T14:58:18+0000] status:listen_web :8080 up
+[2026-03-01T14:58:18+0000] status:listen_https :443 up
+[2026-03-01T14:58:18+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 913: wait: pid 24915 is not a child of this shell
+[2026-03-01T14:58:18+0000] adguardhome-start exiting with rc=127; stopping remote sidecars
+[2026-03-01T14:58:34+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T14:58:34+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T14:58:44+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T14:58:51+0000] status:adguardhome pid=30894 alive=yes
+[2026-03-01T14:58:51+0000] status:remote_nginx pid=31294 alive=yes
+[2026-03-01T14:58:51+0000] status:remote_doh pid=31113 alive=yes
+[2026-03-01T14:58:51+0000] status:watchdog pid=31384 alive=yes
+[2026-03-01T14:58:51+0000] status:listen_dns :53 up
+[2026-03-01T14:58:51+0000] status:listen_web :8080 up
+[2026-03-01T14:58:52+0000] status:listen_https :443 up
+[2026-03-01T14:58:52+0000] status:listen_doh_internal :8053 up
+[2026-03-01T15:00:47+0000] WARN: could not build bcrypt password hash (htpasswd missing or password unavailable); keeping existing auth state
+[2026-03-01T15:00:47+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T15:00:51+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T15:01:01+0000] status:adguardhome pid=729 alive=yes
+[2026-03-01T15:01:01+0000] status:remote_nginx pid=1410 alive=yes
+[2026-03-01T15:01:01+0000] status:remote_doh pid=1191 alive=yes
+[2026-03-01T15:01:01+0000] status:watchdog pid=1627 alive=yes
+[2026-03-01T15:01:01+0000] status:listen_dns :53 up
+[2026-03-01T15:01:02+0000] status:listen_web :8080 up
+[2026-03-01T15:01:02+0000] status:listen_https :443 up
+[2026-03-01T15:01:02+0000] status:listen_doh_internal :8053 up
+[2026-03-01T20:00:26+0000] AdGuardHome already running (pid=729)
+[2026-03-01T20:00:26+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T20:00:40+0000] Running one-time Pi-hole -> AdGuard migration import
+[2026-03-01T20:00:41+0000] migration import failed (rc=1)
+[2026-03-01T20:00:41+0000] WARN: migration import did not complete
+[2026-03-01T20:00:42+0000] status:adguardhome pid=729 alive=yes
+[2026-03-01T20:00:42+0000] status:remote_nginx pid=32150 alive=yes
+[2026-03-01T20:00:42+0000] status:remote_doh pid=31989 alive=yes
+[2026-03-01T20:00:42+0000] status:watchdog pid=32191 alive=yes
+[2026-03-01T20:00:42+0000] status:listen_dns :53 up
+[2026-03-01T20:00:42+0000] status:listen_web :8080 up
+[2026-03-01T20:00:42+0000] status:listen_https :443 up
+[2026-03-01T20:00:42+0000] status:listen_doh_internal :8053 up
+/usr/local/bin/adguardhome-start: line 926: wait: pid 729 is not a child of this shell
+[2026-03-01T20:00:43+0000] AdGuardHome pid=729 is not a child process; entering monitor wait loop
+[2026-03-01T20:01:32+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T20:01:35+0000] Starting local DoH gateway on 127.0.0.1:8053 -> 127.0.0.1:53
+[2026-03-01T20:01:39+0000] Running one-time Pi-hole -> AdGuard migration import
+[2026-03-01T20:01:40+0000] status:adguardhome pid=405 alive=yes
+[2026-03-01T20:01:40+0000] status:remote_nginx pid=770 alive=yes
+[2026-03-01T20:01:40+0000] status:remote_doh pid=663 alive=yes
+[2026-03-01T20:01:40+0000] status:watchdog pid=804 alive=yes
+[2026-03-01T20:01:40+0000] status:listen_dns :53 up
+[2026-03-01T20:01:40+0000] status:listen_web :8080 up
+[2026-03-01T20:01:40+0000] status:listen_https :443 up
+[2026-03-01T20:01:40+0000] status:listen_doh_internal :8053 up
+[2026-03-01T22:25:22+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T22:25:27+0000] AdGuardHome exited early
+[2026-03-01T22:25:27+0000] adguardhome-start exiting with rc=1; stopping remote watchdog
+[2026-03-01T22:26:13+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T22:26:19+0000] AdGuardHome exited early
+[2026-03-01T22:26:19+0000] adguardhome-start exiting with rc=1; stopping remote watchdog
+[2026-03-01T22:27:18+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T22:27:23+0000] AdGuardHome exited early
+[2026-03-01T22:27:23+0000] adguardhome-start exiting with rc=1; stopping remote watchdog
+[2026-03-01T22:28:49+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T22:28:55+0000] WARN: AdGuard API login failed while applying DNS upstreams (code=307)
+[2026-03-01T22:28:59+0000] status:adguardhome pid=349 alive=yes
+[2026-03-01T22:28:59+0000] status:watchdog pid=509 alive=yes
+[2026-03-01T22:28:59+0000] status:listen_dns :53 up
+[2026-03-01T22:28:59+0000] status:listen_web :8080 up
+[2026-03-01T22:29:00+0000] status:listen_https :443 up
+[2026-03-01T22:34:08+0000] Starting AdGuardHome (dns=:53, web=:8080)
+[2026-03-01T22:34:11+0000] WARN: AdGuard API login failed while applying DNS upstreams (code=307)
+[2026-03-01T22:34:14+0000] status:adguardhome pid=7490 alive=yes
+[2026-03-01T22:34:14+0000] status:watchdog pid=7687 alive=yes
+[2026-03-01T22:34:14+0000] status:listen_dns :53 up
+[2026-03-01T22:34:14+0000] status:listen_web :8080 up
+[2026-03-01T22:34:14+0000] status:listen_https :443 up

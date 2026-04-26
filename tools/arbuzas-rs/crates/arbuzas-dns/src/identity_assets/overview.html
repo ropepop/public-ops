@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS overview</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #192230;
+      --muted: #667085;
+      --border: #d7deea;
+      --primary: #1f6feb;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .title { margin: 0; font-size: 28px; }
+    .grow { flex: 1; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; }
+    .nav a, .nav button {
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .nav a.active { border-color: var(--primary); color: var(--primary); }
+    .status { min-height: 22px; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+    .status.error { color: var(--danger); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+    .panel h2 { margin: 0 0 12px; font-size: 18px; }
+    .metric-label { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+    .metric-value { font-size: 28px; font-weight: 700; }
+    .list { display: grid; gap: 10px; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding-top: 10px; border-top: 1px solid #eef2f8; font-size: 14px; }
+    .row:first-child { border-top: 0; padding-top: 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    @media (max-width: 980px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 640px) { .wrap { padding: 14px; } .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1 class="title">DNS overview</h1>
+      <div class="grow"></div>
+      <nav class="nav">__ADMIN_NAV__</nav>
+    </div>
+    <div id="status" class="status"></div>
+    <section class="grid">
+      <article class="panel">
+        <div class="metric-label">Requests (7 days)</div>
+        <div class="metric-value" id="requests-total">-</div>
+      </article>
+      <article class="panel">
+        <div class="metric-label">Identities</div>
+        <div class="metric-value" id="identity-count">-</div>
+      </article>
+      <article class="panel">
+        <div class="metric-label">Queries (24h)</div>
+        <div class="metric-value" id="dns-queries">-</div>
+      </article>
+      <article class="panel">
+        <div class="metric-label">Blocked (24h)</div>
+        <div class="metric-value" id="blocked-queries">-</div>
+      </article>
+    </section>
+    <section class="grid" style="margin-top:14px;">
+      <article class="panel">
+        <h2>Health</h2>
+        <div class="list" id="health-list"></div>
+      </article>
+      <article class="panel">
+        <h2>Transport</h2>
+        <div class="list" id="transport-list"></div>
+      </article>
+      <article class="panel">
+        <h2>Top clients</h2>
+        <div class="list" id="clients-list"></div>
+      </article>
+      <article class="panel">
+        <h2>Query log</h2>
+        <div class="list" id="querylog-list"></div>
+      </article>
+    </section>
+  </div>
+  <script>
+    (() => {
+      const status = document.getElementById("status");
+      const byId = (id) => document.getElementById(id);
+      const fmt = new Intl.NumberFormat();
+
+      function row(label, value, mono) {
+        const div = document.createElement("div");
+        div.className = "row";
+        div.innerHTML = `<span class="muted">${label}</span><span class="${mono ? "mono" : ""}">${value}</span>`;
+        return div;
+      }
+
+      function setStatus(message, error) {
+        status.textContent = message || "";
+        status.className = error ? "status error" : "status";
+      }
+
+      async function getJson(path) {
+        const response = await fetch(path, { credentials: "same-origin" });
+        if (response.status === 401) {
+          location.assign(`/dns/login?return=${encodeURIComponent(location.pathname + location.search + location.hash)}`);
+          throw new Error("Unauthorized");
+        }
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Request failed for ${path}`);
+        return payload;
+      }
+
+      async function logout() {
+        await fetch("/dns/api/session", {
+          method: "DELETE",
+          credentials: "same-origin",
+        });
+        location.assign("/dns/login");
+      }
+
+      document.getElementById("logout").addEventListener("click", logout);
+
+      async function load() {
+        setStatus("Loading overview...");
+        const [usage, identities, stats, summary, settings, health, clients] = await Promise.all([
+          getJson("/dns/api/usage?identity=all&window=7d"),
+          getJson("/dns/api/identities"),
+          getJson("/dns/api/stats?interval=24_hours"),
+          getJson("/dns/api/queries?summary=1&limit=200"),
+          getJson("/dns/api/settings"),
+          getJson("/v1/health"),
+          getJson("/dns/api/clients"),
+        ]);
+
+        byId("requests-total").textContent = fmt.format(Number(usage.totalRequestCount || 0));
+        byId("identity-count").textContent = fmt.format((identities.identities || []).length);
+        byId("dns-queries").textContent = fmt.format(Number(stats.dns_queries || 0));
+        byId("blocked-queries").textContent = fmt.format(Number(stats.blocked_filtering || 0));
+
+        const healthList = byId("health-list");
+        healthList.innerHTML = "";
+        healthList.appendChild(row("Status", health.status || "ok"));
+        healthList.appendChild(row("Query log view", health.querylogDefaultView || "-"));
+        healthList.appendChild(row("Retention days", health.usageRetentionDays || "-"));
+        healthList.appendChild(row("Last applied", settings.health.lastAppliedAt || "Never"));
+        healthList.appendChild(row("Policy hash", settings.health.compiledPolicyHash || "-", true));
+
+        const transportList = byId("transport-list");
+        transportList.innerHTML = "";
+        transportList.appendChild(row("Hostname", settings.transport.hostname || "-", true));
+        transportList.appendChild(row("DoT hostname", settings.transport.dotHostname || "-", true));
+        transportList.appendChild(row("HTTPS port", settings.transport.httpsPort || "-"));
+        transportList.appendChild(row("DoT port", settings.transport.dotPort || "-"));
+        transportList.appendChild(row("TLS files", settings.transport.tlsCertPresent && settings.transport.tlsKeyPresent ? "Present" : "Missing"));
+
+        const clientsList = byId("clients-list");
+        clientsList.innerHTML = "";
+        for (const entry of (clients.auto_clients || []).slice(0, 5)) {
+          const label = entry.name || entry.ip || (entry.ids || [])[0] || "client";
+          clientsList.appendChild(row(label, fmt.format(Number(entry.query_count || 0))));
+        }
+        if (!clientsList.children.length) {
+          clientsList.appendChild(row("No clients", "No recent activity"));
+        }
+
+        const querylogList = byId("querylog-list");
+        querylogList.innerHTML = "";
+        querylogList.appendChild(row("Status", summary.querylog_status || "-"));
+        querylogList.appendChild(row("Total rows", fmt.format(Number(summary.total_query_count || 0))));
+        querylogList.appendChild(row("DoH rows", fmt.format(Number(summary.total_doh_count || 0))));
+        querylogList.appendChild(row("Top clients", summary.top_clients || "none", true));
+        querylogList.appendChild(row("Internal rows", fmt.format(Number(summary.internal_total_count || 0))));
+
+        setStatus("");
+      }
+
+      load().catch((error) => setStatus(error.message || "Failed to load overview.", true));
+    })();
+  </script>
+</body>
+</html>

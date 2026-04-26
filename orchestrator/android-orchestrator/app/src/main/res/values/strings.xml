@@ -1,7 +1,0 @@
-<resources>
-  <string name="app_name">Pixel Root Orchestrator</string>
-  <string name="notif_channel_name">Stack Supervision</string>
-  <string name="notif_channel_description">Foreground service supervision for rooted DNS + SSH stack</string>
-  <string name="notif_title">Root Stack Supervision Active</string>
-  <string name="notif_content">Monitoring DNS, SSH, VPN, DDNS, and remote runtime health</string>
-</resources>

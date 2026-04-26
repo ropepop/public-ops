@@ -1,0 +1,105 @@
+user root;
+worker_processes auto;
+pid /run/arbuzas-dns-frontend.pid;
+daemon off;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+  worker_connections 1024;
+}
+
+__STREAM_DOT_GATE_BLOCK__
+http {
+  access_log /var/log/arbuzas/dns/remote-nginx-access.log;
+  error_log /var/log/arbuzas/dns/remote-nginx-error.log warn;
+  log_format arbuzas_doh '$time_iso8601\t$request_uri\t$status\t$request_time\t$doh_client_ip\t$msec';
+  log_format pixel_doh '$time_iso8601\t$request_uri\t$status\t$request_time\t$doh_client_ip\t$msec';
+
+  map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+  }
+__DOH_CLIENT_IP_MAP_BLOCK__
+
+  server {
+    listen __HTTPS_PORT__ ssl http2;
+    listen [::]:__HTTPS_PORT__ ssl http2;
+    server_name __HOSTNAME__;
+
+    ssl_certificate __TLS_CERT_FILE__;
+    ssl_certificate_key __TLS_KEY_FILE__;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+__DOH_BARE_BLOCK__
+__DOH_TOKEN_BLOCK__
+    location ~ ^/[A-Za-z0-9._~-]+/dns-query/?$ {
+      return 404;
+    }
+
+    location = /pixel-stack/identity {
+      proxy_pass http://__IDENTITY_WEB_HOST__:__IDENTITY_WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /pixel-stack/identity/ {
+      proxy_pass http://__IDENTITY_WEB_HOST__:__IDENTITY_WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /pixel-stack/identity/inject.js {
+      proxy_pass http://__IDENTITY_WEB_HOST__:__IDENTITY_WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /pixel-stack/identity/bootstrap.js {
+      proxy_pass http://__IDENTITY_WEB_HOST__:__IDENTITY_WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location ^~ /pixel-stack/identity/api/ {
+      proxy_pass http://__IDENTITY_WEB_HOST__:__IDENTITY_WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /pixel-stack/train {
+      return 404;
+    }
+
+    location ^~ /pixel-stack/train/ {
+      return 404;
+    }
+
+    location / {
+      proxy_pass http://__WEB_HOST__:__WEB_PORT__;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $doh_client_ip;
+      proxy_set_header X-Real-IP $doh_client_ip;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_set_header Accept-Encoding "";
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      sub_filter_types text/html;
+      sub_filter_once off;
+      sub_filter '<head>' '<head><script src="/pixel-stack/identity/bootstrap.js"></script>';
+      sub_filter '</body>' '<script src="/pixel-stack/identity/inject.js"></script></body>';
+    }
+  }
+}

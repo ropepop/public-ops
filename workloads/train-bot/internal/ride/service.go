@@ -32,11 +32,18 @@ func NewService(st store.Store) *Service {
 }
 
 func (s *Service) CheckIn(ctx context.Context, userID int64, trainID string, now, arrival time.Time) error {
-	return s.CheckInAtStation(ctx, userID, trainID, nil, now, arrival)
+	return s.CheckInUntil(ctx, userID, trainID, now, arrival.Add(10*time.Minute))
 }
 
 func (s *Service) CheckInAtStation(ctx context.Context, userID int64, trainID string, boardingStationID *string, now, arrival time.Time) error {
-	autoCheckout := arrival.Add(10 * time.Minute)
+	return s.CheckInUntilAtStation(ctx, userID, trainID, boardingStationID, now, arrival.Add(10*time.Minute))
+}
+
+func (s *Service) CheckInUntil(ctx context.Context, userID int64, trainID string, now, autoCheckout time.Time) error {
+	return s.CheckInUntilAtStation(ctx, userID, trainID, nil, now, autoCheckout)
+}
+
+func (s *Service) CheckInUntilAtStation(ctx context.Context, userID int64, trainID string, boardingStationID *string, now, autoCheckout time.Time) error {
 	return s.store.CheckInUserAtStation(ctx, userID, trainID, boardingStationID, now, autoCheckout)
 }
 

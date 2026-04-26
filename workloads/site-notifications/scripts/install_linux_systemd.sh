@@ -42,6 +42,7 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$REPO_DIR
+Environment=RUNTIME_CONTEXT_POLICY=managed_service
 ExecStart=$PYTHON_BIN $REPO_DIR/app.py daemon
 Restart=always
 RestartSec=5

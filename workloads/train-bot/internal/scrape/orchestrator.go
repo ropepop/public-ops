@@ -14,6 +14,7 @@ type Orchestrator struct {
 }
 
 type RunResult struct {
+	Snapshot   SnapshotFile
 	OutputPath string
 	Stats      Stats
 }
@@ -63,11 +64,16 @@ func (o *Orchestrator) Run(ctx context.Context, serviceDate time.Time) (RunResul
 	if stats.TrainsMerged < o.minTrains {
 		return RunResult{}, fmt.Errorf("merged %d trains below minimum %d", stats.TrainsMerged, o.minTrains)
 	}
-	path, err := WriteSnapshotAtomically(o.outDir, serviceDate, snapshot)
-	if err != nil {
-		return RunResult{}, fmt.Errorf("write snapshot: %w", err)
+	path := ""
+	if strings.TrimSpace(o.outDir) != "" {
+		var err error
+		path, err = WriteSnapshotAtomically(o.outDir, serviceDate, snapshot)
+		if err != nil {
+			return RunResult{}, fmt.Errorf("write snapshot: %w", err)
+		}
 	}
 	return RunResult{
+		Snapshot:   snapshot,
 		OutputPath: path,
 		Stats:      stats,
 	}, nil

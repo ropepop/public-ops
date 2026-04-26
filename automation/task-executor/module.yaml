@@ -1,6 +1,6 @@
 schema: 1
 module_id: task_executor
-owner: pixel-ops
+owner: ops
 runtime:
   type: external
   healthcheck: github_actions_workflow_status
@@ -10,14 +10,10 @@ components:
     start: github workflow dispatch stalled-runner-cron.yml
     stop: n/a
     health: workflow run result
-    redeploy:
-      mode: job
   - id: cache_refresh
     start: github workflow dispatch cache-refresh-cron.yml
     stop: n/a
     health: workflow run result
-    redeploy:
-      mode: job
 observability:
   event_source: task_executor
   evidence_root: ops/evidence/task-executor

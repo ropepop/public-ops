@@ -81,17 +81,20 @@ func (m *Manager) LoadToday(ctx context.Context, now time.Time) error {
 }
 
 func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error {
+	if existing, err := m.store.ListTrainInstancesByDate(ctx, serviceDate); err == nil && len(existing) > 0 {
+		m.mu.Lock()
+		m.available = true
+		m.lastErr = nil
+		m.lastLoaded = time.Now().UTC()
+		m.loadedServiceDate = serviceDate
+		m.mu.Unlock()
+		return nil
+	}
+
 	path := filepath.Join(m.dir, serviceDate+".json")
 	sourceVersion, trains, stopsByTrain, err := LoadSnapshotFile(path, serviceDate)
 	if err != nil {
-		existing, listErr := m.store.ListTrainInstancesByDate(ctx, serviceDate)
-		if listErr == nil && len(existing) > 0 {
-			m.mu.Lock()
-			m.available = true
-			m.lastErr = err
-			m.lastLoaded = time.Now().UTC()
-			m.loadedServiceDate = serviceDate
-			m.mu.Unlock()
+		if m.useExistingServiceDate(ctx, serviceDate, err) {
 			return nil
 		}
 		m.mu.Lock()
@@ -102,6 +105,9 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 		return fmt.Errorf("load schedule %s failed: %w", serviceDate, err)
 	}
 	if err := m.store.UpsertTrainInstances(ctx, serviceDate, sourceVersion, trains); err != nil {
+		if m.useExistingServiceDate(ctx, serviceDate, err) {
+			return nil
+		}
 		m.mu.Lock()
 		m.available = false
 		m.lastErr = err
@@ -110,6 +116,9 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 		return fmt.Errorf("persist schedule: %w", err)
 	}
 	if err := m.store.UpsertTrainStops(ctx, serviceDate, stopsByTrain); err != nil {
+		if m.useExistingServiceDate(ctx, serviceDate, err) {
+			return nil
+		}
 		m.mu.Lock()
 		m.available = false
 		m.lastErr = err
@@ -124,6 +133,20 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 	m.loadedServiceDate = serviceDate
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) useExistingServiceDate(ctx context.Context, serviceDate string, cause error) bool {
+	existing, listErr := m.store.ListTrainInstancesByDate(ctx, serviceDate)
+	if listErr != nil || len(existing) == 0 {
+		return false
+	}
+	m.mu.Lock()
+	m.available = true
+	m.lastErr = cause
+	m.lastLoaded = time.Now().UTC()
+	m.loadedServiceDate = serviceDate
+	m.mu.Unlock()
+	return true
 }
 
 func (m *Manager) DeleteSnapshot(serviceDate string) error {
@@ -215,6 +238,30 @@ func (m *Manager) ListByWindow(ctx context.Context, now time.Time, windowID stri
 	default:
 		return nil, fmt.Errorf("unsupported window %s", windowID)
 	}
+}
+
+func (m *Manager) ListAllTrains(ctx context.Context, now time.Time) ([]domain.TrainInstance, error) {
+	serviceDate, err := m.requireServiceDate(now)
+	if err != nil {
+		return nil, err
+	}
+	return m.store.ListTrainInstancesByDate(ctx, serviceDate)
+}
+
+func (m *Manager) ListAllStops(ctx context.Context, now time.Time) ([]domain.TrainStop, error) {
+	trains, err := m.ListAllTrains(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.TrainStop, 0)
+	for _, train := range trains {
+		stops, stopErr := m.store.ListTrainStops(ctx, train.ID)
+		if stopErr != nil {
+			return nil, stopErr
+		}
+		out = append(out, stops...)
+	}
+	return out, nil
 }
 
 func (m *Manager) GetTrain(ctx context.Context, id string) (*domain.TrainInstance, error) {

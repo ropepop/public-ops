@@ -8,6 +8,8 @@
   "use strict";
 
   var GRAPH_PATH = "/api/trainGraph";
+  var LIVE_POSITION_MEMORY_LIMIT = 9;
+  var LIVE_POSITION_FRESHNESS_MS = 6 * 60 * 1000;
 
   function stringValue(value) {
     if (value === null || value === undefined) {
@@ -152,6 +154,15 @@
     var nextStop = live && live.nextStopObj ? normalizeStop(live.nextStopObj, currentStopIndex !== null ? currentStopIndex + 1 : stops.length) : null;
     var animatedPosition = normalizePoint(live && live.animatedCoord);
     var rawPosition = normalizePoint(live && live.position);
+    var observedSource = live && live.isGpsActive && rawPosition
+      ? "live"
+      : animatedPosition
+        ? "projection"
+        : rawPosition
+          ? live && live.isGpsActive
+            ? "live"
+            : "projection"
+          : "";
     return {
       routeId: stringValue(live && live.id),
       trainNumber: stringValue(live && live.train),
@@ -161,9 +172,15 @@
       arrivalTime: stringValue(live && live.arrivalTime),
       departureMinutes: clockMinutes(live && live.departureTime),
       arrivalMinutes: clockMinutes(live && live.arrivalTime),
-      position: animatedPosition || rawPosition,
+      position: observedSource === "live"
+        ? rawPosition
+        : observedSource === "projection"
+          ? (animatedPosition || rawPosition)
+          : null,
       animatedPosition: animatedPosition,
       rawPosition: rawPosition,
+      displaySource: observedSource,
+      displayUpdatedAt: stringValue(live && live.updaterTimeStamp),
       currentStopIndex: currentStopIndex,
       currentStop: currentStop,
       nextStop: nextStop && nextStop.title ? nextStop : null,
@@ -199,6 +216,303 @@
       });
     }
     return normalizeBackEndEntry(payload);
+  }
+
+  function clonePoint(point) {
+    if (!point || typeof point !== "object") {
+      return null;
+    }
+    return {
+      lat: point.lat,
+      lng: point.lng,
+    };
+  }
+
+  function timestampMs(value) {
+    var numeric = toNumber(value);
+    if (numeric !== null) {
+      return numeric;
+    }
+    var text = stringValue(value);
+    if (!text) {
+      return null;
+    }
+    var parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function isoTimestamp(ms) {
+    return typeof ms === "number" && Number.isFinite(ms)
+      ? new Date(ms).toISOString()
+      : "";
+  }
+
+  function resolvedSampleTime(value, fallbackMs) {
+    var parsedMs = timestampMs(value);
+    var sampleMs = parsedMs !== null ? parsedMs : fallbackMs;
+    return {
+      ms: sampleMs,
+      iso: isoTimestamp(sampleMs),
+    };
+  }
+
+  function observedLiveTrainSource(train) {
+    var hasProjection = Boolean(train && train.animatedPosition);
+    var hasLive = Boolean(train && train.rawPosition);
+    if (train && train.isGpsActive && hasLive) {
+      return "live";
+    }
+    if (hasProjection) {
+      return "projection";
+    }
+    if (hasLive) {
+      return train && train.isGpsActive ? "live" : "projection";
+    }
+    return "";
+  }
+
+  function ensureLiveTrainMemory(store, train) {
+    var key = stableExternalTrainIdentity(train);
+    if (!key) {
+      return null;
+    }
+    var memory = store.get(key);
+    if (memory) {
+      return memory;
+    }
+    memory = {
+      key: key,
+      history: [],
+      lastProjectionPosition: null,
+      lastProjectionUpdatedAt: "",
+      lastProjectionUpdatedAtMs: null,
+      lastLivePosition: null,
+      lastLiveUpdatedAt: "",
+      lastLiveUpdatedAtMs: null,
+      lastDisplaySource: "",
+      lastTrain: null,
+    };
+    store.set(key, memory);
+    return memory;
+  }
+
+  function liveTrainSourceCounts(memory) {
+    return (memory && Array.isArray(memory.history) ? memory.history : []).reduce(function (counts, sample) {
+      if (sample && sample.observedSource === "projection") {
+        counts.projection += 1;
+      }
+      if (sample && sample.observedSource === "live") {
+        counts.live += 1;
+      }
+      return counts;
+    }, { projection: 0, live: 0 });
+  }
+
+  function rememberedSourcePosition(memory, source) {
+    if (source === "projection") {
+      return clonePoint(memory && memory.lastProjectionPosition);
+    }
+    if (source === "live") {
+      return clonePoint(memory && memory.lastLivePosition);
+    }
+    return null;
+  }
+
+  function rememberedSourceUpdatedAt(memory, source) {
+    if (source === "projection") {
+      return {
+        value: stringValue(memory && memory.lastProjectionUpdatedAt),
+        ms: memory && memory.lastProjectionUpdatedAtMs !== undefined
+          ? memory.lastProjectionUpdatedAtMs
+          : null,
+      };
+    }
+    if (source === "live") {
+      return {
+        value: stringValue(memory && memory.lastLiveUpdatedAt),
+        ms: memory && memory.lastLiveUpdatedAtMs !== undefined
+          ? memory.lastLiveUpdatedAtMs
+          : null,
+      };
+    }
+    return { value: "", ms: null };
+  }
+
+  function chooseRememberedDisplaySource(memory, preferredSource) {
+    if (!memory) {
+      return "";
+    }
+    var counts = liveTrainSourceCounts(memory);
+    if (counts.projection > counts.live && memory.lastProjectionPosition) {
+      return "projection";
+    }
+    if (counts.live > counts.projection && memory.lastLivePosition) {
+      return "live";
+    }
+    if (memory.lastDisplaySource === "projection" && memory.lastProjectionPosition) {
+      return "projection";
+    }
+    if (memory.lastDisplaySource === "live" && memory.lastLivePosition) {
+      return "live";
+    }
+    if (preferredSource === "live" && memory.lastLivePosition) {
+      return "live";
+    }
+    if (preferredSource === "projection" && memory.lastProjectionPosition) {
+      return "projection";
+    }
+    if (memory.lastLivePosition) {
+      return "live";
+    }
+    if (memory.lastProjectionPosition) {
+      return "projection";
+    }
+    return "";
+  }
+
+  function buildRememberedTrainSnapshot(memory, train) {
+    var displaySource = chooseRememberedDisplaySource(
+      memory,
+      observedLiveTrainSource(train) || stringValue(train && train.displaySource)
+    );
+    var position = rememberedSourcePosition(memory, displaySource);
+    if (!position) {
+      return null;
+    }
+    var displayUpdated = rememberedSourceUpdatedAt(memory, displaySource);
+    var base = Object.assign({}, memory && memory.lastTrain ? memory.lastTrain : {}, train || {});
+    base.position = position;
+    base.displaySource = displaySource;
+    base.displayUpdatedAt = displayUpdated.value;
+    return base;
+  }
+
+  function isRememberedTrainFresh(memory, nowMs) {
+    var displaySource = chooseRememberedDisplaySource(memory, "");
+    var displayUpdated = rememberedSourceUpdatedAt(memory, displaySource);
+    if (displayUpdated.ms === null) {
+      return false;
+    }
+    return Math.abs(nowMs - displayUpdated.ms) <= LIVE_POSITION_FRESHNESS_MS;
+  }
+
+  function buildLiveDisplaySnapshot(train, nowMs) {
+    var sampleTime = resolvedSampleTime(train && train.updatedAt, nowMs);
+    var observedSource = observedLiveTrainSource(train) || stringValue(train && train.displaySource);
+    var projectionPosition = clonePoint(train && train.animatedPosition);
+    var livePosition = clonePoint(train && train.rawPosition);
+    var rememberedProjectionPosition = projectionPosition
+      || (observedSource === "projection" && livePosition ? clonePoint(livePosition) : null);
+    var memory = {
+      history: observedSource
+        ? [
+          {
+            observedSource: observedSource,
+            shownSource: "",
+            recordedAt: sampleTime.iso,
+          }
+        ]
+        : [],
+      lastProjectionPosition: rememberedProjectionPosition,
+      lastProjectionUpdatedAt: rememberedProjectionPosition ? sampleTime.iso : "",
+      lastProjectionUpdatedAtMs: rememberedProjectionPosition ? sampleTime.ms : null,
+      lastLivePosition: livePosition,
+      lastLiveUpdatedAt: livePosition ? sampleTime.iso : "",
+      lastLiveUpdatedAtMs: livePosition ? sampleTime.ms : null,
+      lastDisplaySource: observedSource || stringValue(train && train.displaySource),
+      lastTrain: Object.assign({}, train || {}),
+    };
+    var snapshot = buildRememberedTrainSnapshot(memory, train);
+    if (memory.history.length && snapshot && snapshot.displaySource) {
+      memory.history[0].shownSource = snapshot.displaySource;
+    }
+    return snapshot;
+  }
+
+  function updateRememberedLiveTrain(memory, train, nowMs) {
+    var sampleTime = resolvedSampleTime(train && train.updatedAt, nowMs);
+    var observedSource = observedLiveTrainSource(train) || stringValue(train && train.displaySource);
+    var projectionPosition = clonePoint(train && train.animatedPosition);
+    var livePosition = clonePoint(train && train.rawPosition);
+    var rememberedProjectionPosition = projectionPosition
+      || (observedSource === "projection" && livePosition ? clonePoint(livePosition) : null);
+    memory.lastTrain = Object.assign({}, memory.lastTrain || {}, train || {});
+    if (rememberedProjectionPosition) {
+      memory.lastProjectionPosition = rememberedProjectionPosition;
+      memory.lastProjectionUpdatedAt = sampleTime.iso;
+      memory.lastProjectionUpdatedAtMs = sampleTime.ms;
+    }
+    if (livePosition) {
+      memory.lastLivePosition = livePosition;
+      memory.lastLiveUpdatedAt = sampleTime.iso;
+      memory.lastLiveUpdatedAtMs = sampleTime.ms;
+    }
+    if (observedSource) {
+      memory.history.push({
+        observedSource: observedSource,
+        shownSource: "",
+        recordedAt: sampleTime.iso,
+      });
+      while (memory.history.length > LIVE_POSITION_MEMORY_LIMIT) {
+        memory.history.shift();
+      }
+    }
+    var snapshot = buildRememberedTrainSnapshot(memory, train);
+    memory.lastDisplaySource = snapshot && snapshot.displaySource
+      ? snapshot.displaySource
+      : memory.lastDisplaySource;
+    if (observedSource && memory.history.length) {
+      memory.history[memory.history.length - 1].shownSource = memory.lastDisplaySource;
+    }
+    return snapshot;
+  }
+
+  function stabilizeLiveTrainPositions(frame, memoryByTrain, nowMs) {
+    var store = memoryByTrain instanceof Map ? memoryByTrain : new Map();
+    var sampleMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+    var incoming = Array.isArray(frame)
+      ? frame
+      : frame
+        ? [frame]
+        : [];
+    var seenKeys = new Set();
+    var nextTrains = [];
+
+    incoming.forEach(function (train) {
+      if (!train) {
+        return;
+      }
+      var memory = ensureLiveTrainMemory(store, train);
+      if (!memory) {
+        var transientSnapshot = buildLiveDisplaySnapshot(train, sampleMs);
+        if (transientSnapshot && transientSnapshot.position) {
+          nextTrains.push(transientSnapshot);
+        }
+        return;
+      }
+      seenKeys.add(memory.key);
+      var snapshot = updateRememberedLiveTrain(memory, train, sampleMs);
+      if (snapshot && snapshot.position) {
+        nextTrains.push(snapshot);
+      }
+    });
+
+    Array.from(store.keys()).forEach(function (key) {
+      if (seenKeys.has(key)) {
+        return;
+      }
+      var memory = store.get(key);
+      if (!memory || !isRememberedTrainFresh(memory, sampleMs)) {
+        store.delete(key);
+        return;
+      }
+      var snapshot = buildRememberedTrainSnapshot(memory, null);
+      if (snapshot && snapshot.position) {
+        nextTrains.push(snapshot);
+      }
+    });
+
+    return nextTrains;
   }
 
   function normalizeActiveStopEntry(entry) {
@@ -418,63 +732,107 @@
     return "";
   }
 
-  function matchLocalTrain(externalTrain, localItems) {
-    var external = Array.isArray(externalTrain) ? extractExternalTrain(localItems) : extractExternalTrain(externalTrain);
-    var locals = Array.isArray(externalTrain) ? externalTrain : localItems;
-    if (!external || !external.serviceDate) {
-      return null;
-    }
-
-    var normalizedLocal = (Array.isArray(locals) ? locals : []).map(extractLocalTrain).filter(Boolean);
-    if (external.trainNumber) {
-      var exactId = external.serviceDate + "-train-" + external.trainNumber;
-      var exact = normalizedLocal.find(function (item) {
-        return item.localTrainId === exactId;
-      });
-      if (exact) {
-        return {
-          match: exact.match,
-          matchType: "exact-id",
-          localTrainId: exact.localTrainId,
-        };
+  function bestLocalTrainMatch(candidates, targetMinutes, maxDeltaMinutes) {
+    var compareMinutes = targetMinutes === null ? 0 : targetMinutes;
+    var best = null;
+    var bestDelta = Infinity;
+    (Array.isArray(candidates) ? candidates : []).forEach(function (item) {
+      if (!item) {
+        return;
       }
-
-      var sameNumber = normalizedLocal.filter(function (item) {
-        return item.serviceDate === external.serviceDate && item.trainNumber === external.trainNumber;
-      }).sort(function (left, right) {
-        return Math.abs((left.departureMinutes || 0) - (external.departureMinutes || 0)) - Math.abs((right.departureMinutes || 0) - (external.departureMinutes || 0));
-      });
-      if (sameNumber.length) {
-        return {
-          match: sameNumber[0].match,
-          matchType: "train-number-same-day",
-          localTrainId: sameNumber[0].localTrainId,
-        };
+      if (maxDeltaMinutes !== null && item.departureMinutes === null) {
+        return;
       }
-    }
+      var itemMinutes = item.departureMinutes === null ? 0 : item.departureMinutes;
+      var delta = Math.abs(itemMinutes - compareMinutes);
+      if (maxDeltaMinutes !== null && delta > maxDeltaMinutes) {
+        return;
+      }
+      if (!best || delta < bestDelta) {
+        best = item;
+        bestDelta = delta;
+      }
+    });
+    return best;
+  }
 
-    if (!external.originKey || !external.destinationKey || external.departureMinutes === null) {
-      return null;
-    }
+  function createLocalTrainMatcher(localItems) {
+    var normalizedLocal = (Array.isArray(localItems) ? localItems : []).map(extractLocalTrain).filter(Boolean);
+    var exactIdIndex = new Map();
+    var sameDayTrainIndex = new Map();
+    var routeTimeIndex = new Map();
 
-    var routeTime = normalizedLocal.filter(function (item) {
-      return item.serviceDate === external.serviceDate &&
-        item.originKey === external.originKey &&
-        item.destinationKey === external.destinationKey &&
-        item.departureMinutes !== null &&
-        Math.abs(item.departureMinutes - external.departureMinutes) <= 2;
-    }).sort(function (left, right) {
-      return Math.abs(left.departureMinutes - external.departureMinutes) - Math.abs(right.departureMinutes - external.departureMinutes);
+    normalizedLocal.forEach(function (item) {
+      if (item.localTrainId && !exactIdIndex.has(item.localTrainId)) {
+        exactIdIndex.set(item.localTrainId, item);
+      }
+      var sameDayKey = item.serviceDate + "\n" + item.trainNumber;
+      if (!sameDayTrainIndex.has(sameDayKey)) {
+        sameDayTrainIndex.set(sameDayKey, []);
+      }
+      sameDayTrainIndex.get(sameDayKey).push(item);
+      var routeTimeKey = item.serviceDate + "\n" + item.originKey + "\n" + item.destinationKey;
+      if (!routeTimeIndex.has(routeTimeKey)) {
+        routeTimeIndex.set(routeTimeKey, []);
+      }
+      routeTimeIndex.get(routeTimeKey).push(item);
     });
 
-    if (!routeTime.length) {
-      return null;
-    }
-    return {
-      match: routeTime[0].match,
-      matchType: "route-time-window",
-      localTrainId: routeTime[0].localTrainId,
+    return function matchPreparedLocalTrain(externalTrain) {
+      var external = extractExternalTrain(externalTrain);
+      if (!external || !external.serviceDate) {
+        return null;
+      }
+
+      if (external.trainNumber) {
+        var exactId = external.serviceDate + "-train-" + external.trainNumber;
+        var exact = exactIdIndex.get(exactId) || null;
+        if (exact) {
+          return {
+            match: exact.match,
+            matchType: "exact-id",
+            localTrainId: exact.localTrainId,
+          };
+        }
+
+        var sameNumber = bestLocalTrainMatch(
+          sameDayTrainIndex.get(external.serviceDate + "\n" + external.trainNumber),
+          external.departureMinutes,
+          null
+        );
+        if (sameNumber) {
+          return {
+            match: sameNumber.match,
+            matchType: "train-number-same-day",
+            localTrainId: sameNumber.localTrainId,
+          };
+        }
+      }
+
+      if (!external.originKey || !external.destinationKey || external.departureMinutes === null) {
+        return null;
+      }
+
+      var routeTime = bestLocalTrainMatch(
+        routeTimeIndex.get(external.serviceDate + "\n" + external.originKey + "\n" + external.destinationKey),
+        external.departureMinutes,
+        2
+      );
+      if (!routeTime) {
+        return null;
+      }
+      return {
+        match: routeTime.match,
+        matchType: "route-time-window",
+        localTrainId: routeTime.localTrainId,
+      };
     };
+  }
+
+  function matchLocalTrain(externalTrain, localItems) {
+    var external = Array.isArray(externalTrain) ? localItems : externalTrain;
+    var locals = Array.isArray(externalTrain) ? externalTrain : localItems;
+    return createLocalTrainMatcher(locals)(external);
   }
 
   function trimTrailingSlash(value) {
@@ -496,14 +854,22 @@
     var setTimer = typeof opts.setTimeoutFn === "function" ? opts.setTimeoutFn : setTimeout;
     var clearTimer = typeof opts.clearTimeoutFn === "function" ? opts.clearTimeoutFn : clearTimeout;
     var onState = typeof opts.onState === "function" ? opts.onState : null;
+    var initialGraphState = opts.enabled === false
+      ? "disabled"
+      : resolveGraphURL()
+        ? "idle"
+        : "disabled";
     var state = {
       enabled: opts.enabled !== false,
       connectionState: opts.enabled === false ? "disabled" : "idle",
+      graphState: initialGraphState,
       routes: [],
       liveTrains: [],
       activeStops: [],
       lastGraphAt: "",
       lastMessageAt: "",
+      connectionError: "",
+      graphError: "",
       error: "",
     };
 
@@ -511,16 +877,32 @@
     var reconnectTimer = null;
     var reconnectDelayMs = 1000;
     var stopped = false;
+    var liveTrainMemory = new Map();
+
+    function resolveGraphURL() {
+      if (!fetchImpl) {
+        return "";
+      }
+      var explicit = stringValue(opts.graphURL);
+      if (explicit) {
+        return explicit;
+      }
+      var baseURL = trimTrailingSlash(opts.baseURL);
+      return baseURL ? (baseURL + GRAPH_PATH) : "";
+    }
 
     function snapshot() {
       return {
         enabled: state.enabled,
         connectionState: state.connectionState,
+        graphState: state.graphState,
         routes: state.routes.slice(),
         liveTrains: state.liveTrains.slice(),
         activeStops: state.activeStops.slice(),
         lastGraphAt: state.lastGraphAt,
         lastMessageAt: state.lastMessageAt,
+        connectionError: state.connectionError,
+        graphError: state.graphError,
         error: state.error,
       };
     }
@@ -528,6 +910,25 @@
     function emit() {
       if (onState) {
         onState(snapshot());
+      }
+    }
+
+    function clearReconnectTimer() {
+      if (!reconnectTimer) {
+        return;
+      }
+      clearTimer(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    function disconnectSocket() {
+      clearReconnectTimer();
+      var currentSocket = socket;
+      socket = null;
+      if (currentSocket && currentSocket.readyState <= 1) {
+        try {
+          currentSocket.close();
+        } catch (_) {}
       }
     }
 
@@ -551,15 +952,25 @@
         return;
       }
       state.connectionState = "connecting";
+      state.connectionError = "";
+      state.error = "";
       emit();
-      socket = new WebSocketCtor(opts.wsURL);
-      socket.addEventListener("open", function () {
+      var currentSocket = new WebSocketCtor(opts.wsURL);
+      socket = currentSocket;
+      currentSocket.addEventListener("open", function () {
+        if (socket !== currentSocket) {
+          return;
+        }
         reconnectDelayMs = 1000;
         state.connectionState = "live";
+        state.connectionError = "";
         state.error = "";
         emit();
       });
-      socket.addEventListener("message", function (event) {
+      currentSocket.addEventListener("message", function (event) {
+        if (socket !== currentSocket) {
+          return;
+        }
         var payload;
         try {
           payload = JSON.parse(event.data);
@@ -567,21 +978,35 @@
           return;
         }
         if (payload && payload.type === "back-end") {
-          state.liveTrains = normalizeBackEndFrame(payload);
+          var nextLiveTrains = normalizeBackEndFrame(payload);
+          state.liveTrains = stabilizeLiveTrainPositions(nextLiveTrains, liveTrainMemory, Date.now());
         }
         if (payload && payload.type === "active-stops") {
-          state.activeStops = normalizeActiveStopsFrame(payload);
+          var nextActiveStops = normalizeActiveStopsFrame(payload);
+          state.activeStops = Array.isArray(nextActiveStops)
+            ? nextActiveStops
+            : nextActiveStops
+              ? [nextActiveStops]
+              : [];
         }
         if (payload && (payload.type === "back-end" || payload.type === "active-stops")) {
           state.lastMessageAt = new Date().toISOString();
           emit();
         }
       });
-      socket.addEventListener("error", function () {
-        state.error = "external websocket error";
+      currentSocket.addEventListener("error", function () {
+        if (socket !== currentSocket) {
+          return;
+        }
+        state.connectionError = "external websocket error";
+        state.error = state.connectionError;
         emit();
       });
-      socket.addEventListener("close", function () {
+      currentSocket.addEventListener("close", function () {
+        if (socket !== currentSocket) {
+          return;
+        }
+        socket = null;
         if (stopped) {
           return;
         }
@@ -592,10 +1017,22 @@
     }
 
     function loadGraph() {
-      if (!state.enabled || !fetchImpl) {
+      if (!state.enabled) {
+        state.graphState = "disabled";
+        state.graphError = "";
+        emit();
         return Promise.resolve(snapshot());
       }
-      var graphURL = stringValue(opts.graphURL) || (trimTrailingSlash(opts.baseURL) + GRAPH_PATH);
+      var graphURL = resolveGraphURL();
+      if (!graphURL) {
+        state.graphState = "disabled";
+        state.graphError = "";
+        emit();
+        return Promise.resolve(snapshot());
+      }
+      state.graphState = "loading";
+      state.graphError = "";
+      emit();
       return fetchImpl(graphURL, { method: "GET" })
         .then(function (response) {
           if (!response.ok) {
@@ -606,7 +1043,14 @@
         .then(function (payload) {
           state.routes = normalizeTrainGraphPayload(payload).routes;
           state.lastGraphAt = new Date().toISOString();
-          state.error = "";
+          state.graphState = "ready";
+          state.graphError = "";
+          emit();
+          return snapshot();
+        })
+        .catch(function (error) {
+          state.graphState = "unavailable";
+          state.graphError = error && error.message ? error.message : String(error);
           emit();
           return snapshot();
         });
@@ -615,35 +1059,49 @@
     function start() {
       if (!state.enabled) {
         state.connectionState = "disabled";
+        state.graphState = "disabled";
         emit();
         return Promise.resolve(snapshot());
       }
-      return loadGraph().catch(function (error) {
-        state.error = error && error.message ? error.message : String(error);
-        emit();
+      stopped = false;
+      connect();
+      return loadGraph().then(function () {
         return snapshot();
-      }).then(function () {
-        connect();
+      });
+    }
+
+    function restart() {
+      if (!state.enabled) {
+        state.connectionState = "disabled";
+        state.graphState = "disabled";
+        emit();
+        return Promise.resolve(snapshot());
+      }
+      stopped = false;
+      disconnectSocket();
+      state.connectionState = "idle";
+      state.connectionError = "";
+      state.error = "";
+      emit();
+      connect();
+      return loadGraph().then(function () {
         return snapshot();
       });
     }
 
     function stop() {
       stopped = true;
-      if (reconnectTimer) {
-        clearTimer(reconnectTimer);
-        reconnectTimer = null;
-      }
-      if (socket && socket.readyState <= 1) {
-        socket.close();
-      }
-      socket = null;
+      disconnectSocket();
       state.connectionState = "disabled";
+      state.graphState = "disabled";
+      state.connectionError = "";
+      state.error = "";
       emit();
     }
 
     return {
       start: start,
+      restart: restart,
       stop: stop,
       snapshot: snapshot,
       loadGraph: loadGraph,
@@ -651,6 +1109,7 @@
   }
 
   return {
+    createLocalTrainMatcher: createLocalTrainMatcher,
     createExternalTrainMapClient: createExternalTrainMapClient,
     mapConfigMarkerSignature: mapConfigMarkerSignature,
     mapConfigSignature: mapConfigSignature,
@@ -659,6 +1118,7 @@
     normalizeBackEndFrame: normalizeBackEndFrame,
     normalizeStationKey: normalizeStationKey,
     normalizeTrainGraphPayload: normalizeTrainGraphPayload,
+    stabilizeLiveTrainPositions: stabilizeLiveTrainPositions,
     planMarkerReconcile: planMarkerReconcile,
     sameExternalFeedState: sameExternalFeedState,
     sameMaterialValue: sameMaterialValue,

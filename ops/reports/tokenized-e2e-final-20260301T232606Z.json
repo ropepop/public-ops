@@ -1,0 +1,55 @@
+{
+  "timestamp": "2026-03-02T01:26:30+0200",
+  "host": "192.168.31.25",
+  "fqdn": "dns.jolkins.id.lv",
+  "reachability": {"ping": "ok"},
+  "ports": {
+    "53": "open",
+    "443": "open",
+    "853": "closed",
+    "2222": "closed",
+    "8080": "closed"
+  },
+  "dns": {
+    "host_53": {"state": "ok", "data": "104.18.26.120,104.18.27.120"}
+  },
+  "https": {
+    "dns_root": "302",
+    "dns_admin": "401",
+    "doh_mode": "tokenized",
+    "doh_primary_url": "https://dns.jolkins.id.lv/2873efbe2015ac05e3ef64a29940af55117a91172caa0b56/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_primary_code": "200",
+    "doh_tokenized_url": "https://dns.jolkins.id.lv/2873efbe2015ac05e3ef64a29940af55117a91172caa0b56/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_tokenized_code": "200",
+    "doh_bare_url": "https://dns.jolkins.id.lv/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_bare_code": "404",
+    "contract_root_ui_reachable": "pass",
+    "contract_root_redirect": "pass",
+    "contract_admin_ui_reachable": "pass",
+    "contract_doh_mode": "pass",
+    "contract_doh_200": "pass",
+    "contract_remote_required": "pass"
+  },
+  "benchmark": {
+    "enabled": 1,
+    "requests": 80,
+    "samples": 80,
+    "success_rate_200_pct": "100.00",
+    "p50_ms": "38.848",
+    "p90_ms": "42.917",
+    "p95_ms": "46.232",
+    "p99_ms": "58.025",
+    "status_distribution": "200:80"
+  },
+  "adb": {
+    "available": 1,
+    "connect_result": "",
+    "target": "192.168.31.25:5555",
+    "device_state": "device"
+  },
+  "rooted": {
+    "adguardhome_service_loop": "running",
+    "listen_53": "open",
+    "listen_2222": "open"
+  }
+}

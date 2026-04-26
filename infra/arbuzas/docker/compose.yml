@@ -1,0 +1,284 @@
+services:
+  portainer:
+    image: ${ARBUZAS_PORTAINER_IMAGE}
+    command:
+      - -H
+      - unix:///var/run/docker.sock
+    ports:
+      - target: 9443
+        published: 9443
+        protocol: tcp
+        mode: host
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/arbuzas/portainer:/data
+
+  train_bot:
+    image: arbuzas/train-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/train-bot.Dockerfile
+    working_dir: /srv/train-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      TRAIN_WEB_ENABLED: "true"
+      TRAIN_WEB_BIND_ADDR: 0.0.0.0
+      TRAIN_WEB_PORT: ${ARBUZAS_TRAIN_BOT_PORT}
+      SCHEDULE_DIR: /srv/train-bot/data/schedules
+      SCRAPER_OUTPUT_DIR: /srv/train-bot/data/schedules
+      TRAIN_WEB_BUNDLE_DIR: /srv/train-bot/data/public-bundles
+      TRAIN_WEB_PUBLIC_EDGE_CACHE_STATE_FILE: /srv/train-bot/state/public-edge-cache.json
+      SINGLE_INSTANCE_LOCK_PATH: /srv/train-bot/run/train-bot.lock
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/train-bot/.env
+        set +a
+        # Keep container-managed runtime settings ahead of legacy host env values.
+        export TRAIN_WEB_ENABLED="true"
+        export TRAIN_WEB_BIND_ADDR="0.0.0.0"
+        export TRAIN_WEB_PORT="${ARBUZAS_TRAIN_BOT_PORT}"
+        export SCHEDULE_DIR="/srv/train-bot/data/schedules"
+        export SCRAPER_OUTPUT_DIR="/srv/train-bot/data/schedules"
+        export TRAIN_WEB_BUNDLE_DIR="/srv/train-bot/data/public-bundles"
+        export TRAIN_WEB_PUBLIC_EDGE_CACHE_STATE_FILE="/srv/train-bot/state/public-edge-cache.json"
+        export SINGLE_INSTANCE_LOCK_PATH="/srv/train-bot/run/train-bot.lock"
+        mkdir -p /srv/train-bot/run /srv/train-bot/state /srv/train-bot/data/schedules /srv/train-bot/data/public-bundles
+        exec /usr/local/bin/train-bot
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/api/v1/health >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - /srv/arbuzas/train-bot:/srv/train-bot
+      - /etc/arbuzas/env/train-bot.env:/srv/train-bot/.env:ro
+      - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
+
+  satiksme_bot:
+    image: arbuzas/satiksme-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/satiksme-bot.Dockerfile
+    working_dir: /srv/satiksme-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      SATIKSME_WEB_ENABLED: "true"
+      SATIKSME_WEB_BIND_ADDR: 0.0.0.0
+      SATIKSME_WEB_PORT: ${ARBUZAS_SATIKSME_BOT_PORT}
+      DB_PATH: /srv/satiksme-bot/state/satiksme_bot.db
+      SINGLE_INSTANCE_LOCK_PATH: /srv/satiksme-bot/run/satiksme-bot.lock
+      SATIKSME_CATALOG_MIRROR_DIR: /srv/satiksme-bot/data/catalog/source
+      SATIKSME_CATALOG_OUTPUT_PATH: /srv/satiksme-bot/data/catalog/generated/catalog.json
+      SATIKSME_WEB_BUNDLE_DIR: /srv/satiksme-bot/data/public-bundles
+      SATIKSME_WEB_LIVE_SNAPSHOT_DIR: /srv/satiksme-bot/state/live-snapshot
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/satiksme-bot/.env
+        set +a
+        # Keep container-managed runtime settings ahead of legacy host env values.
+        export SATIKSME_WEB_ENABLED="true"
+        export SATIKSME_WEB_BIND_ADDR="0.0.0.0"
+        export SATIKSME_WEB_PORT="${ARBUZAS_SATIKSME_BOT_PORT}"
+        export DB_PATH="/srv/satiksme-bot/state/satiksme_bot.db"
+        export SINGLE_INSTANCE_LOCK_PATH="/srv/satiksme-bot/run/satiksme-bot.lock"
+        export SATIKSME_CATALOG_MIRROR_DIR="/srv/satiksme-bot/data/catalog/source"
+        export SATIKSME_CATALOG_OUTPUT_PATH="/srv/satiksme-bot/data/catalog/generated/catalog.json"
+        export SATIKSME_WEB_BUNDLE_DIR="/srv/satiksme-bot/data/public-bundles"
+        export SATIKSME_WEB_LIVE_SNAPSHOT_DIR="/srv/satiksme-bot/state/live-snapshot"
+        mkdir -p \
+          /srv/satiksme-bot/run \
+          /srv/satiksme-bot/state \
+          /srv/satiksme-bot/data/catalog/source \
+          /srv/satiksme-bot/data/catalog/generated \
+          /srv/satiksme-bot/data/public-bundles
+        exec /usr/local/bin/satiksme-bot
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/health >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - /srv/arbuzas/satiksme-bot:/srv/satiksme-bot
+      - /etc/arbuzas/env/satiksme-bot.env:/srv/satiksme-bot/.env:ro
+      - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
+
+  subscription_bot:
+    image: arbuzas/subscription-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/subscription-bot.Dockerfile
+    working_dir: /srv/subscription-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      SUBSCRIPTION_BOT_WEB_ENABLED: "true"
+      SUBSCRIPTION_BOT_WEB_BIND_ADDR: 0.0.0.0
+      SUBSCRIPTION_BOT_WEB_PORT: ${ARBUZAS_SUBSCRIPTION_BOT_PORT}
+      SUBSCRIPTION_BOT_DB_PATH: /srv/subscription-bot/state/subscription_bot.db
+      SUBSCRIPTION_BOT_SINGLE_INSTANCE_LOCK_PATH: /srv/subscription-bot/run/subscription-bot.lock
+      SUBSCRIPTION_BOT_SESSION_SECRET_FILE: /srv/subscription-bot/state/subscription-bot.session.secret
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/subscription-bot/.env
+        set +a
+        # Keep container-managed runtime settings ahead of legacy host env values.
+        export SUBSCRIPTION_BOT_WEB_ENABLED="true"
+        export SUBSCRIPTION_BOT_WEB_BIND_ADDR="0.0.0.0"
+        export SUBSCRIPTION_BOT_WEB_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT}"
+        export SUBSCRIPTION_BOT_DB_PATH="/srv/subscription-bot/state/subscription_bot.db"
+        export SUBSCRIPTION_BOT_SINGLE_INSTANCE_LOCK_PATH="/srv/subscription-bot/run/subscription-bot.lock"
+        export SUBSCRIPTION_BOT_SESSION_SECRET_FILE="/srv/subscription-bot/state/subscription-bot.session.secret"
+        mkdir -p /srv/subscription-bot/run /srv/subscription-bot/state
+        exec /usr/local/bin/subscription-bot
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_SUBSCRIPTION_BOT_PORT}/pixel-stack/subscription/api/v1/health >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    volumes:
+      - /srv/arbuzas/subscription-bot:/srv/subscription-bot
+      - /etc/arbuzas/env/subscription-bot.env:/srv/subscription-bot/.env:ro
+      - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
+
+  train_tunnel:
+    image: ${ARBUZAS_CLOUDFLARED_IMAGE}
+    user: "0:0"
+    command:
+      - tunnel
+      - --config
+      - /etc/cloudflared/config.yml
+      - run
+    depends_on:
+      - train_bot
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - ../../../generated/cloudflared/train-bot.yml:/etc/cloudflared/config.yml:ro
+      - /etc/arbuzas/cloudflared/train-bot.json:/run/arbuzas/cloudflared/credentials.json:ro
+
+  satiksme_tunnel:
+    image: ${ARBUZAS_CLOUDFLARED_IMAGE}
+    user: "0:0"
+    command:
+      - tunnel
+      - --config
+      - /etc/cloudflared/config.yml
+      - run
+    depends_on:
+      - satiksme_bot
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - ../../../generated/cloudflared/satiksme-bot.yml:/etc/cloudflared/config.yml:ro
+      - /etc/arbuzas/cloudflared/satiksme-bot.json:/run/arbuzas/cloudflared/credentials.json:ro
+
+  subscription_tunnel:
+    image: ${ARBUZAS_CLOUDFLARED_IMAGE}
+    user: "0:0"
+    command:
+      - tunnel
+      - --config
+      - /etc/cloudflared/config.yml
+      - run
+    depends_on:
+      - subscription_bot
+    restart: unless-stopped
+    volumes:
+      - ../../../generated/cloudflared/subscription-bot.yml:/etc/cloudflared/config.yml:ro
+      - /etc/arbuzas/cloudflared/subscription-bot.json:/run/arbuzas/cloudflared/credentials.json:ro
+
+  dns_controlplane:
+    image: arbuzas/dns-controlplane:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/dns-controlplane.Dockerfile
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      ARBUZAS_DNS_RUNTIME_ENV_FILE: /etc/arbuzas/dns/runtime.env
+      ARBUZAS_DNS_SOURCE_CONFIG_FILE: /etc/arbuzas/dns/arbuzas-dns.yaml
+      ARBUZAS_DNS_BIND_HOST: 0.0.0.0
+      ARBUZAS_DNS_PORT: "53"
+      ARBUZAS_DNS_CONTROLPLANE_HOST: 0.0.0.0
+      ARBUZAS_DNS_CONTROLPLANE_PORT: "${ARBUZAS_DNS_CONTROLPLANE_PORT}"
+      ARBUZAS_DNS_RUN_DIR: /run/arbuzas/dns
+      ARBUZAS_DNS_STATE_DIR: /srv/arbuzas/dns/state
+      ARBUZAS_DNS_RUNTIME_DIR: /srv/arbuzas/dns/runtime
+      ARBUZAS_DNS_LOG_DIR: /srv/arbuzas/dns/logs
+      ARBUZAS_DNS_CONTROLPLANE_DB_FILE: /srv/arbuzas/dns/state/controlplane.sqlite
+      ARBUZAS_DNS_IDENTITIES_FILE: /etc/arbuzas/dns/doh-identities.json
+      ARBUZAS_DNS_QUERYLOG_VIEW_PREFERENCE_FILE: /srv/arbuzas/dns/state/querylog-view-preference.json
+      ARBUZAS_DNS_HOSTNAME: "${ARBUZAS_DNS_HOSTNAME}"
+      ARBUZAS_DNS_DOT_HOSTNAME: "${ARBUZAS_DNS_HOSTNAME}"
+      ARBUZAS_DNS_TLS_CERT_FILE: /etc/arbuzas/dns/tls/fullchain.pem
+      ARBUZAS_DNS_TLS_KEY_FILE: /etc/arbuzas/dns/tls/privkey.pem
+      ARBUZAS_DNS_HTTPS_PORT: "${ARBUZAS_DNS_HTTPS_PORT}"
+      ARBUZAS_DNS_DOT_PORT: "${ARBUZAS_DNS_DOT_PORT}"
+    ports:
+      - target: ${ARBUZAS_DNS_HTTPS_PORT}
+        published: ${ARBUZAS_DNS_HTTPS_PORT}
+        protocol: tcp
+        mode: host
+      - target: ${ARBUZAS_DNS_DOT_PORT}
+        published: ${ARBUZAS_DNS_DOT_PORT}
+        protocol: tcp
+        mode: host
+      - 127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}:${ARBUZAS_DNS_CONTROLPLANE_PORT}
+      - ${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}:${ARBUZAS_DNS_CONTROLPLANE_PORT}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:$${ARBUZAS_DNS_CONTROLPLANE_PORT:-8097}/dns/login >/dev/null && openssl s_client -brief -connect 127.0.0.1:$${ARBUZAS_DNS_DOT_PORT:-853} -servername $${ARBUZAS_DNS_HOSTNAME:-dns.jolkins.id.lv} </dev/null >/dev/null 2>&1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    volumes:
+      - /etc/arbuzas/dns:/etc/arbuzas/dns
+      - /srv/arbuzas/dns/state:/srv/arbuzas/dns/state
+      - /srv/arbuzas/dns/runtime:/srv/arbuzas/dns/runtime
+      - /srv/arbuzas/dns/logs:/srv/arbuzas/dns/logs
+      - /srv/arbuzas/dns/run:/run/arbuzas/dns

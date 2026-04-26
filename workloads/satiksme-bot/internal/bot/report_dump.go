@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 	"satiksmebot/internal/runtime"
 	"satiksmebot/internal/store"
 	"satiksmebot/internal/telegram"
@@ -22,6 +23,11 @@ type DumpDispatcher struct {
 	loc          *time.Location
 	store        store.Store
 	runtimeState *runtime.State
+
+	pendingMu     sync.Mutex
+	pendingCached int
+	pendingLoaded bool
+	wakeCh        chan struct{}
 }
 
 func NewDumpDispatcher(client MessageClient, st store.Store, runtimeState *runtime.State, chatID string, interval time.Duration, loc *time.Location) *DumpDispatcher {
@@ -32,6 +38,7 @@ func NewDumpDispatcher(client MessageClient, st store.Store, runtimeState *runti
 		loc:          loc,
 		store:        st,
 		runtimeState: runtimeState,
+		wakeCh:       make(chan struct{}, 1),
 	}
 }
 
@@ -44,72 +51,101 @@ func (d *DumpDispatcher) Run(ctx context.Context) error {
 	if interval <= 0 {
 		interval = time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	d.refreshPending(ctx)
+	wakeCh := d.wakeChannel()
+	delay := time.Duration(0)
 	for {
-		select {
-		case <-ctx.Done():
+		if err := waitForDumpWake(ctx, timer, wakeCh, delay); err != nil {
 			return nil
-		case <-ticker.C:
-			if d.store == nil {
-				continue
-			}
-			now := time.Now().UTC()
-			item, err := d.store.NextReportDump(ctx, now)
-			if err != nil {
-				log.Printf("report dump load failed: %v", err)
+		}
+		if d.store == nil {
+			delay = noDumpWakeDelay
+			continue
+		}
+		now := time.Now().UTC()
+		item, err := d.store.NextReportDump(ctx, now)
+		if err != nil {
+			log.Printf("report dump load failed: %v", err)
+			if d.runtimeState != nil {
 				d.runtimeState.RecordDumpError(now, err.Error(), 0)
-				continue
 			}
-			if item == nil {
-				d.refreshPending(ctx)
-				continue
+			delay = interval
+			continue
+		}
+		if item == nil {
+			pending := d.refreshPendingCount(ctx)
+			if d.runtimeState != nil {
+				d.runtimeState.RecordDumpSuccess(now, pending)
+			}
+			delay, err = d.nextWakeDelay(ctx)
+			if err != nil {
+				log.Printf("report dump peek failed: %v", err)
+				if d.runtimeState != nil {
+					d.runtimeState.RecordDumpError(now, err.Error(), pending)
+				}
+				delay = interval
+			}
+			continue
+		}
+		if d.runtimeState != nil {
+			d.runtimeState.RecordDumpAttempt(now)
+		}
+		if d.client == nil || d.chatID == "" {
+			if d.runtimeState != nil {
+				d.runtimeState.SetDumpPending(d.pendingCount(ctx))
+			}
+			delay = noDumpWakeDelay
+			continue
+		}
+		if err := d.client.SendMessage(ctx, d.chatID, item.Payload, telegram.MessageOptions{}); err != nil {
+			log.Printf("report dump send failed: %v", err)
+			nextAttempt := now.Add(reportDumpBackoff(item.Attempts + 1))
+			if updateErr := d.store.UpdateReportDumpFailure(ctx, item.ID, item.Attempts+1, nextAttempt, now, err.Error()); updateErr != nil {
+				log.Printf("report dump failure update failed: %v", updateErr)
 			}
 			if d.runtimeState != nil {
-				d.runtimeState.RecordDumpAttempt(now)
+				d.runtimeState.RecordDumpError(now, err.Error(), d.pendingCount(ctx))
 			}
-			if d.client == nil || d.chatID == "" {
-				d.refreshPending(ctx)
-				continue
+			delay, err = d.nextWakeDelay(ctx)
+			if err != nil {
+				log.Printf("report dump peek failed after send error: %v", err)
+				delay = interval
 			}
-			if err := d.client.SendMessage(ctx, d.chatID, item.Payload, telegram.MessageOptions{}); err != nil {
-				log.Printf("report dump send failed: %v", err)
-				nextAttempt := now.Add(reportDumpBackoff(item.Attempts + 1))
-				if updateErr := d.store.UpdateReportDumpFailure(ctx, item.ID, item.Attempts+1, nextAttempt, now, err.Error()); updateErr != nil {
-					log.Printf("report dump failure update failed: %v", updateErr)
-				}
-				if d.runtimeState != nil {
-					d.runtimeState.RecordDumpError(now, err.Error(), d.pendingCount(ctx))
-				}
-				continue
-			}
-			if err := d.store.DeleteReportDump(ctx, item.ID); err != nil {
-				log.Printf("report dump delete failed: %v", err)
-				if d.runtimeState != nil {
-					d.runtimeState.RecordDumpError(now, err.Error(), d.pendingCount(ctx))
-				}
-				continue
-			}
+			continue
+		}
+		if err := d.store.DeleteReportDump(ctx, item.ID); err != nil {
+			log.Printf("report dump delete failed: %v", err)
 			if d.runtimeState != nil {
-				d.runtimeState.RecordDumpSuccess(now, d.pendingCount(ctx))
+				d.runtimeState.RecordDumpError(now, err.Error(), d.pendingCount(ctx))
 			}
+			delay = interval
+			continue
+		}
+		if d.runtimeState != nil {
+			d.runtimeState.RecordDumpSuccess(now, d.adjustPending(-1))
+		}
+		delay, err = d.nextWakeDelay(ctx)
+		if err != nil {
+			log.Printf("report dump peek failed after delete: %v", err)
+			delay = interval
 		}
 	}
 }
 
-func (d *DumpDispatcher) EnqueueStop(stop domain.Stop, sighting *domain.StopSighting) {
+func (d *DumpDispatcher) EnqueueStop(stop model.Stop, sighting *model.StopSighting) {
 	if d == nil || sighting == nil {
 		return
 	}
 	d.enqueue(d.formatStop(stop, *sighting), sighting.CreatedAt)
 }
 
-func (d *DumpDispatcher) EnqueueVehicle(stop domain.Stop, sighting *domain.VehicleSighting) {
+func (d *DumpDispatcher) EnqueueVehicle(sighting *model.VehicleSighting) {
 	if d == nil || sighting == nil {
 		return
 	}
-	d.enqueue(d.formatVehicle(stop, *sighting), sighting.CreatedAt)
+	d.enqueue(d.formatVehicle(*sighting), sighting.CreatedAt)
 }
 
 func (d *DumpDispatcher) enqueue(message string, createdAt time.Time) {
@@ -134,10 +170,13 @@ func (d *DumpDispatcher) enqueue(message string, createdAt time.Time) {
 		}
 		return
 	}
-	d.refreshPending(context.Background())
+	if d.runtimeState != nil {
+		d.runtimeState.SetDumpPending(d.adjustPending(1))
+	}
+	d.signalWake()
 }
 
-func (d *DumpDispatcher) formatStop(stop domain.Stop, sighting domain.StopSighting) string {
+func (d *DumpDispatcher) formatStop(stop model.Stop, sighting model.StopSighting) string {
 	return strings.Join([]string{
 		fmt.Sprintf("Kontroles novērojums | %s", d.formatTime(sighting.CreatedAt)),
 		fmt.Sprintf("Pietura: %s (%s)", dumpValue(stop.Name), dumpValue(stop.ID)),
@@ -145,10 +184,9 @@ func (d *DumpDispatcher) formatStop(stop domain.Stop, sighting domain.StopSighti
 	}, "\n")
 }
 
-func (d *DumpDispatcher) formatVehicle(stop domain.Stop, sighting domain.VehicleSighting) string {
+func (d *DumpDispatcher) formatVehicle(sighting model.VehicleSighting) string {
 	return strings.Join([]string{
 		fmt.Sprintf("Kontroles novērojums | %s", d.formatTime(sighting.CreatedAt)),
-		fmt.Sprintf("Pietura: %s (%s)", dumpValue(stop.Name), dumpValue(stop.ID)),
 		fmt.Sprintf("Tips: %s %s", localizedModeLabel(sighting.Mode), dumpValue(sighting.RouteLabel)),
 		fmt.Sprintf("Virziens: %s", dumpValue(sighting.Direction)),
 		fmt.Sprintf("Galamērķis: %s", dumpValue(sighting.Destination)),
@@ -193,17 +231,108 @@ func (d *DumpDispatcher) pendingCount(ctx context.Context) int {
 	if d == nil || d.store == nil {
 		return 0
 	}
+	d.pendingMu.Lock()
+	if d.pendingLoaded {
+		pending := d.pendingCached
+		d.pendingMu.Unlock()
+		return pending
+	}
+	d.pendingMu.Unlock()
 	count, err := d.store.PendingReportDumpCount(ctx)
 	if err != nil {
 		return 0
 	}
+	d.pendingMu.Lock()
+	d.pendingCached = count
+	d.pendingLoaded = true
+	d.pendingMu.Unlock()
+	return count
+}
+
+func (d *DumpDispatcher) refreshPendingCount(ctx context.Context) int {
+	if d == nil || d.store == nil {
+		return 0
+	}
+	count, err := d.store.PendingReportDumpCount(ctx)
+	if err != nil {
+		d.pendingMu.Lock()
+		defer d.pendingMu.Unlock()
+		if d.pendingLoaded {
+			return d.pendingCached
+		}
+		return 0
+	}
+	d.pendingMu.Lock()
+	d.pendingCached = count
+	d.pendingLoaded = true
+	d.pendingMu.Unlock()
 	return count
 }
 
 func (d *DumpDispatcher) refreshPending(ctx context.Context) {
 	if d.runtimeState != nil {
-		d.runtimeState.SetDumpPending(d.pendingCount(ctx))
+		d.runtimeState.SetDumpPending(d.refreshPendingCount(ctx))
 	}
+}
+
+func (d *DumpDispatcher) adjustPending(delta int) int {
+	if d == nil {
+		return 0
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if !d.pendingLoaded {
+		d.pendingLoaded = true
+	}
+	d.pendingCached += delta
+	if d.pendingCached < 0 {
+		d.pendingCached = 0
+	}
+	return d.pendingCached
+}
+
+func (d *DumpDispatcher) wakeChannel() chan struct{} {
+	if d == nil {
+		return nil
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	if d.wakeCh == nil {
+		d.wakeCh = make(chan struct{}, 1)
+	}
+	return d.wakeCh
+}
+
+func (d *DumpDispatcher) signalWake() {
+	if d == nil {
+		return
+	}
+	wakeCh := d.wakeChannel()
+	if wakeCh == nil {
+		return
+	}
+	select {
+	case wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (d *DumpDispatcher) nextWakeDelay(ctx context.Context) (time.Duration, error) {
+	if d == nil || d.store == nil {
+		return noDumpWakeDelay, nil
+	}
+	item, err := d.store.PeekNextReportDump(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if item == nil {
+		return noDumpWakeDelay, nil
+	}
+	delay := time.Until(item.NextAttemptAt)
+	if delay < 0 {
+		return 0, nil
+	}
+	return delay, nil
 }
 
 func reportDumpBackoff(attempts int) time.Duration {
@@ -215,6 +344,63 @@ func reportDumpBackoff(attempts int) time.Duration {
 		return 5 * time.Minute
 	}
 	return backoff
+}
+
+const noDumpWakeDelay time.Duration = -1
+
+func resetDumpTimer(timer *time.Timer, delay time.Duration) {
+	if timer == nil {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Second
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
+}
+
+func stopDumpTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+func waitForDumpWake(ctx context.Context, timer *time.Timer, wakeCh <-chan struct{}, delay time.Duration) error {
+	switch {
+	case delay == 0:
+		return nil
+	case delay < 0:
+		stopDumpTimer(timer)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wakeCh:
+			return nil
+		}
+	default:
+		resetDumpTimer(timer, delay)
+		select {
+		case <-ctx.Done():
+			stopDumpTimer(timer)
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		case <-wakeCh:
+			stopDumpTimer(timer)
+			return nil
+		}
+	}
 }
 
 func min(a, b int) int {

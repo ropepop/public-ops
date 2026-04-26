@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS queries</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #192230;
+      --muted: #667085;
+      --border: #d7deea;
+      --primary: #1f6feb;
+      --danger: #b42318;
+      --danger-soft: #fff1f0;
+      --danger-soft-strong: #ffe4e1;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .wrap { max-width: 1320px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .title { margin: 0; font-size: 28px; }
+    .grow { flex: 1; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; }
+    .nav a, .nav button {
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .nav a.active { border-color: var(--primary); color: var(--primary); }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+    .status { min-height: 22px; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+    .status.error { color: var(--danger); }
+    .controls { display: grid; grid-template-columns: minmax(220px, 1fr) 180px 180px 120px auto; gap: 10px; margin-bottom: 14px; }
+    input, select, button { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 8px; border-top: 1px solid #eef2f8; text-align: left; vertical-align: top; }
+    th { border-top: 0; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .scroll { overflow-x: auto; }
+    .actions { display: flex; justify-content: center; margin-top: 14px; }
+    .actions button[hidden] { display: none; }
+    .render-sentinel { width: 100%; height: 1px; }
+    .detail-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      visibility: hidden;
+      pointer-events: none;
+    }
+    .detail-overlay.is-open {
+      display: flex;
+      visibility: visible;
+      pointer-events: auto;
+    }
+    .detail-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(25, 34, 48, 0.55);
+    }
+    .detail-panel {
+      position: relative;
+      width: min(920px, 100%);
+      width: min(760px, calc(100vw - 48px));
+      max-height: min(72vh, 680px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px;
+      background: var(--panel);
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.24);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .detail-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center; }
+    .detail-meta { color: var(--muted); font-size: 13px; }
+    .detail-state {
+      display: none;
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .detail-state.is-visible { display: block; }
+    .detail-state.error { color: var(--danger); }
+    .detail-body {
+      display: none;
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #fbfcff;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      flex: 1;
+    }
+    .detail-body.is-visible { display: block; }
+    tr.selectable { cursor: pointer; }
+    tr.selectable:hover { background: #f7faff; }
+    tr.selected { background: #eef4ff; }
+    tr.row-blocked { background: var(--danger-soft); }
+    tr.selectable.row-blocked:hover,
+    tr.row-blocked.selected { background: var(--danger-soft-strong); }
+    td.status-cell { font-weight: 500; }
+    tr.row-blocked td.status-cell { color: var(--danger); font-weight: 600; }
+    @media (max-width: 980px) {
+      .controls { grid-template-columns: 1fr; }
+      .wrap { padding: 14px; }
+      .detail-overlay { padding: 12px; }
+      .detail-panel { width: 100%; max-height: calc(100vh - 24px); border-radius: 16px; padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1 class="title">DNS queries</h1>
+      <div class="grow"></div>
+      <nav class="nav">__ADMIN_NAV__</nav>
+    </div>
+    <div id="status" class="status"></div>
+    <div class="panel">
+      <div class="controls">
+        <input id="search" placeholder="Search domain or client">
+        <input id="identity-filter" placeholder="Identity (optional)">
+        <select id="response">
+          <option value="all">All statuses</option>
+          <option value="blocked">Blocked</option>
+          <option value="processed">Processed</option>
+          <option value="filtered">Filtered</option>
+        </select>
+        <input id="page-size" type="number" min="1" max="500" value="50">
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Identity</th>
+              <th>Client</th>
+              <th>Query</th>
+              <th>Status</th>
+              <th>Protocol</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="load-more" type="button" hidden>Load more</button>
+      </div>
+      <div id="render-bottom-sentinel" class="render-sentinel" aria-hidden="true"></div>
+    </div>
+  </div>
+  <div id="detail-overlay" class="detail-overlay" aria-hidden="true">
+    <div id="detail-backdrop" class="detail-backdrop" aria-hidden="true"></div>
+    <section id="detail-panel" class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <div class="detail-header">
+        <div>
+          <strong id="detail-title">Row details</strong>
+          <div id="detail-meta" class="detail-meta"></div>
+        </div>
+        <button id="clear-detail" type="button">Close</button>
+      </div>
+      <div id="detail-state" class="detail-state" aria-live="polite"></div>
+      <pre id="detail-output" class="detail-body"></pre>
+    </section>
+  </div>
+  <script>
+    (() => {
+      const AUTO_LOAD_BUFFER_PAGES = 5;
+      const AUTO_LOAD_SCROLL_DELAY_MS = 80;
+      const BOTTOM_REACH_THRESHOLD_PX = 2;
+
+      const status = document.getElementById("status");
+      const rows = document.getElementById("rows");
+      const searchInput = document.getElementById("search");
+      const identityInput = document.getElementById("identity-filter");
+      const responseInput = document.getElementById("response");
+      const pageSizeInput = document.getElementById("page-size");
+      const refreshButton = document.getElementById("refresh");
+      const loadMoreButton = document.getElementById("load-more");
+      const renderBottomSentinel = document.getElementById("render-bottom-sentinel");
+      const detailOverlay = document.getElementById("detail-overlay");
+      const detailBackdrop = document.getElementById("detail-backdrop");
+      const detailPanel = document.getElementById("detail-panel");
+      const detailTitle = document.getElementById("detail-title");
+      const detailMeta = document.getElementById("detail-meta");
+      const detailState = document.getElementById("detail-state");
+      const detailOutput = document.getElementById("detail-output");
+      const clearDetailButton = document.getElementById("clear-detail");
+      const params = new URLSearchParams(location.search);
+
+      searchInput.value = params.get("search") || "";
+      identityInput.value = params.get("identity") || "";
+      responseInput.value = params.get("response_status") || "all";
+      pageSizeInput.value = params.get("page_size") || "50";
+
+      const state = {
+        controller: null,
+        detailController: null,
+        requestId: 0,
+        detailRequestId: 0,
+        queryGeneration: 0,
+        fetchInFlight: false,
+        revealInFlight: false,
+        nextCursor: "",
+        hasMore: false,
+        stagedPages: [],
+        renderedPageCount: 0,
+        selectedFingerprint: "",
+        detailOpen: false,
+        autoLoadObserver: null,
+        autoLoadObservedNode: null,
+        autoLoadScrollTimer: null,
+        autoLoadLoopRunning: false,
+        autoLoadStartScheduled: false,
+        autoLoadRequested: false,
+        revealRequested: false,
+        revealRequestForeground: false,
+        userScrolledSinceLoad: false,
+        bottomReachLock: false,
+        lastBottomReachScrollHeight: 0,
+        activeQuery: {
+          search: searchInput.value.trim(),
+          identity: identityInput.value.trim(),
+          responseStatus: responseInput.value,
+          pageSize: normalizePageSize(pageSizeInput.value || "50"),
+        },
+      };
+
+      function normalizePageSize(value) {
+        const parsed = Number.parseInt(String(value || "").trim(), 10);
+        if (!Number.isFinite(parsed) || parsed < 1) return "50";
+        if (parsed > 500) return "500";
+        return String(parsed);
+      }
+
+      function readQueryInputs() {
+        const search = searchInput.value.trim();
+        const identity = identityInput.value.trim();
+        const responseStatus = responseInput.value;
+        const pageSize = normalizePageSize(pageSizeInput.value || "50");
+        return { search, identity, responseStatus, pageSize };
+      }
+
+      function stagedPageTargetCount() {
+        return AUTO_LOAD_BUFFER_PAGES;
+      }
+
+      function isAbortError(error) {
+        return Boolean(error && (error.name === "AbortError" || String(error.message || "").toLowerCase().includes("abort")));
+      }
+
+      function supportsIntersectionObserver() {
+        return typeof IntersectionObserver === "function";
+      }
+
+      function wait(ms) {
+        return new Promise((resolve) => {
+          setTimeout(resolve, ms);
+        });
+      }
+
+      async function getJson(path, signal) {
+        let lastError = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const response = await fetch(path, { credentials: "same-origin", signal });
+          if (response.status === 401) {
+            location.assign(`/dns/login?return=${encodeURIComponent(location.pathname + location.search + location.hash)}`);
+            throw new Error("Unauthorized");
+          }
+
+          let payload = {};
+          try {
+            payload = await response.json();
+          } catch (error) {
+            lastError = error;
+            if (response.ok && attempt === 0 && !(signal && signal.aborted)) {
+              await wait(80);
+              continue;
+            }
+            if (response.ok) {
+              throw error;
+            }
+          }
+
+          if (!response.ok) throw new Error(payload.error || `Request failed for ${path}`);
+          return payload;
+        }
+        throw lastError || new Error(`Request failed for ${path}`);
+      }
+
+      async function logout() {
+        await fetch("/dns/api/session", { method: "DELETE", credentials: "same-origin" });
+        location.assign("/dns/login");
+      }
+
+      function setStatus(message, error) {
+        status.textContent = message || "";
+        status.className = error ? "status error" : "status";
+      }
+
+      function syncUrl(queryState) {
+        const next = new URLSearchParams();
+        if (queryState.search) next.set("search", queryState.search);
+        if (queryState.identity) next.set("identity", queryState.identity);
+        if (queryState.responseStatus && queryState.responseStatus !== "all") next.set("response_status", queryState.responseStatus);
+        if (queryState.pageSize && queryState.pageSize !== "50") next.set("page_size", queryState.pageSize);
+        const query = next.toString();
+        history.replaceState(null, "", query ? `${location.pathname}?${query}` : location.pathname);
+      }
+
+      function extractRows(payload) {
+        return Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.rows) ? payload.rows : [];
+      }
+
+      function dataRowNodes() {
+        return Array.from(rows.children).filter((row) => Boolean(row?.dataset?.rowFingerprint));
+      }
+
+      function stagedPageCount() {
+        return state.stagedPages.length;
+      }
+
+      function hasStagedPages() {
+        return stagedPageCount() > 0;
+      }
+
+      function createCell(text, className) {
+        const td = document.createElement("td");
+        td.textContent = text || "-";
+        if (className) td.className = className;
+        return td;
+      }
+
+      function normalizeTone(value) {
+        return String(value || "").trim().toLowerCase();
+      }
+
+      function normalizeQueryToken(value) {
+        return String(value || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[_-]+/g, " ")
+          .replace(/\s+/g, " ");
+      }
+
+      function isBlockedRow(row) {
+        const statusTone = normalizeTone(row?.display?.statusTone);
+        if (statusTone) return statusTone === "blocked";
+
+        const blockCategory = normalizeQueryToken(
+          row?.display?.blockCategory || row?.blockCategory || row?.block_category,
+        );
+        if (
+          blockCategory
+          && (
+            blockCategory === "blocked"
+            || blockCategory === "filtered"
+            || blockCategory === "safebrowsing"
+            || blockCategory === "adult"
+            || blockCategory === "parental"
+            || blockCategory === "blocked service"
+            || blockCategory === "blocked services"
+            || blockCategory.startsWith("blocked ")
+          )
+        ) {
+          return true;
+        }
+
+        return [
+          row?.display?.statusLabel,
+          row?.display?.responseStatus,
+          row?.status,
+        ]
+          .map(normalizeQueryToken)
+          .some((token) => (
+            token
+            && (token === "blocked" || token === "filtered" || token.startsWith("blocked ") || token.startsWith("filtered "))
+          ));
+      }
+
+      function rowClassName(fingerprint, rowTone) {
+        const classes = ["selectable"];
+        if (rowTone === "blocked") classes.push("row-blocked");
+        if (fingerprint && fingerprint === state.selectedFingerprint) classes.push("selected");
+        return classes.join(" ");
+      }
+
+      function rerenderSelection() {
+        for (const row of Array.from(rows.children)) {
+          if (!row || !row.dataset) continue;
+          row.className = rowClassName(
+            row.dataset.rowFingerprint || "",
+            row.dataset.rowTone || "",
+          );
+        }
+      }
+
+      function classSet(node, className, enabled) {
+        const classes = String(node.className || "")
+          .split(/\s+/)
+          .filter(Boolean)
+          .filter((item) => item !== className);
+        if (enabled) classes.push(className);
+        node.className = classes.join(" ");
+      }
+
+      function setDetailOutputVisible(visible) {
+        classSet(detailOutput, "is-visible", visible);
+      }
+
+      function setDetailOpen(open) {
+        state.detailOpen = Boolean(open);
+        classSet(detailOverlay, "is-open", state.detailOpen);
+        detailOverlay.setAttribute("aria-hidden", state.detailOpen ? "false" : "true");
+        document.body.style.overflow = open ? "hidden" : "";
+        document.documentElement.style.overflow = open ? "hidden" : "";
+      }
+
+      function clearDetail() {
+        state.selectedFingerprint = "";
+        if (state.detailController) {
+          state.detailController.abort();
+          state.detailController = null;
+        }
+        detailTitle.textContent = "Row details";
+        detailMeta.textContent = "";
+        detailState.textContent = "";
+        detailState.className = "detail-state";
+        detailOutput.textContent = "";
+        setDetailOutputVisible(false);
+        setDetailOpen(false);
+        rerenderSelection();
+      }
+
+      function setDetailStatus(message, { error = false } = {}) {
+        const text = String(message || "").trim();
+        detailState.textContent = text;
+        detailState.className = [
+          "detail-state",
+          error ? "error" : "",
+          text ? "is-visible" : "",
+        ].filter(Boolean).join(" ");
+      }
+
+      function buildRow(row) {
+        const identityId = row.identityId || row.identity?.id || "-";
+        const client = row.originalClient || row.client || row.display?.clientLabel || "-";
+        const queryName = row.question?.name || row.display?.queryName || row.display?.query || "-";
+        const statusLabel = row.status || row.display?.statusLabel || "-";
+        const protocol = row.client_proto || row.protocol || row.display?.protocolLabel || "-";
+        const fingerprint = String(row.rowFingerprint || "").trim();
+        const rowTone = isBlockedRow(row) ? "blocked" : "default";
+        const tr = document.createElement("tr");
+        tr.className = rowClassName(fingerprint, rowTone);
+        tr.dataset.rowFingerprint = fingerprint;
+        tr.dataset.rowTone = rowTone;
+        tr.appendChild(createCell(row.time || "-"));
+        tr.appendChild(createCell(identityId));
+        tr.appendChild(createCell(client, "mono"));
+        tr.appendChild(createCell(queryName, "mono"));
+        tr.appendChild(createCell(statusLabel, "status-cell"));
+        tr.appendChild(createCell(protocol));
+        if (fingerprint) {
+          tr.addEventListener("click", () => {
+            void loadDetail(row);
+          });
+        }
+        return tr;
+      }
+
+      function renderEmptyState(message) {
+        rows.innerHTML = "";
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 6;
+        td.textContent = message;
+        tr.appendChild(td);
+        rows.appendChild(tr);
+      }
+
+      function renderPageRows(items, append) {
+        if (!append) rows.innerHTML = "";
+        if (!items.length) {
+          if (!append) renderEmptyState("No rows match the current filters.");
+          return;
+        }
+        for (const row of items) {
+          rows.appendChild(buildRow(row));
+        }
+        rerenderSelection();
+      }
+
+      function buildQueryString(queryState, cursor) {
+        const query = new URLSearchParams({
+          page_size: queryState.pageSize,
+          detail: "summary",
+          response_status: queryState.responseStatus,
+        });
+        if (queryState.search) query.set("search", queryState.search);
+        if (queryState.identity) query.set("identity", queryState.identity);
+        if (cursor) query.set("cursor", cursor);
+        return query.toString();
+      }
+
+      function stagePage(payload) {
+        const items = extractRows(payload);
+        if (items.length) state.stagedPages.push(items);
+        return items;
+      }
+
+      function updatePagination(payload, requestCursor) {
+        const nextCursor = String(payload?.next_cursor || "").trim();
+        state.nextCursor = nextCursor;
+        state.hasMore = Boolean(nextCursor) && payload?.has_more !== false && nextCursor !== String(requestCursor || "");
+        syncLoadMoreButton();
+      }
+
+      function clearAutoLoadScrollTimer() {
+        if (!state.autoLoadScrollTimer) return;
+        clearTimeout(state.autoLoadScrollTimer);
+        state.autoLoadScrollTimer = null;
+      }
+
+      function disconnectAutoLoadObserver() {
+        if (state.autoLoadObserver) {
+          state.autoLoadObserver.disconnect();
+        }
+        state.autoLoadObservedNode = null;
+      }
+
+      function resetAutoLoadState() {
+        clearAutoLoadScrollTimer();
+        disconnectAutoLoadObserver();
+        state.stagedPages = [];
+        state.renderedPageCount = 0;
+        state.autoLoadStartScheduled = false;
+        state.autoLoadRequested = false;
+        state.revealRequested = false;
+        state.revealRequestForeground = false;
+        state.userScrolledSinceLoad = false;
+        state.bottomReachLock = false;
+        state.lastBottomReachScrollHeight = 0;
+      }
+
+      function viewportMetrics() {
+        const body = document.body || {};
+        const docEl = document.documentElement || {};
+        const viewportHeight = (
+          Number(window.innerHeight || 0)
+          || Number(docEl.clientHeight || 0)
+          || Number(body.clientHeight || 0)
+        );
+        return {
+          viewportHeight,
+          scrollTop: Math.max(
+            Number(window.scrollY || 0),
+            Number(window.pageYOffset || 0),
+            Number(body.scrollTop || 0),
+            Number(docEl.scrollTop || 0),
+          ),
+          scrollHeight: Math.max(
+            Number(body.scrollHeight || 0),
+            Number(docEl.scrollHeight || 0),
+          ),
+        };
+      }
+
+      function pageIsScrollable() {
+        const { viewportHeight, scrollHeight } = viewportMetrics();
+        return viewportHeight > 0 && scrollHeight > viewportHeight + 1;
+      }
+
+      function renderBottomReached() {
+        const { viewportHeight, scrollTop, scrollHeight } = viewportMetrics();
+        return (
+          viewportHeight > 0
+          && scrollHeight > 0
+          && scrollTop + viewportHeight >= scrollHeight - BOTTOM_REACH_THRESHOLD_PX
+        );
+      }
+
+      function syncBottomReachGate() {
+        if (!renderBottomReached()) {
+          state.lastBottomReachScrollHeight = 0;
+        }
+      }
+
+      function syncLoadMoreButton() {
+        const canReveal = hasStagedPages();
+        const canFetch = state.hasMore && !state.fetchInFlight;
+        loadMoreButton.hidden = !(canReveal || state.hasMore || state.fetchInFlight);
+        loadMoreButton.disabled = !(canReveal || canFetch);
+      }
+
+      function syncAutoLoadState() {
+        syncLoadMoreButton();
+        bindAutoLoadObserver();
+      }
+
+      function shouldStageMore() {
+        return state.hasMore && stagedPageCount() < stagedPageTargetCount();
+      }
+
+      function shouldAutoRevealToScrollable() {
+        if (!(hasStagedPages() || state.hasMore)) return false;
+        return !state.userScrolledSinceLoad && !pageIsScrollable();
+      }
+
+      function requestReveal({ foreground = false } = {}) {
+        state.revealRequested = true;
+        state.revealRequestForeground = state.revealRequestForeground || Boolean(foreground);
+        queueAutoLoad();
+      }
+
+      function requestRevealAtBottom({ foreground = false } = {}) {
+        if (!(hasStagedPages() || state.hasMore)) return false;
+        if (!state.userScrolledSinceLoad) return false;
+        if (state.bottomReachLock) return false;
+        if (!renderBottomReached()) return false;
+        const { scrollHeight } = viewportMetrics();
+        if (scrollHeight <= 0 || state.lastBottomReachScrollHeight === scrollHeight) return false;
+        state.bottomReachLock = true;
+        state.lastBottomReachScrollHeight = scrollHeight;
+        requestReveal({ foreground });
+        return true;
+      }
+
+      function ensureAutoLoadObserver() {
+        if (!supportsIntersectionObserver()) return null;
+        if (state.autoLoadObserver) return state.autoLoadObserver;
+        state.autoLoadObserver = new IntersectionObserver((entries) => {
+          if (!Array.isArray(entries) || !entries.some((entry) => entry && entry.isIntersecting)) return;
+          if (state.userScrolledSinceLoad) {
+            syncBottomReachGate();
+            requestRevealAtBottom();
+          }
+        });
+        return state.autoLoadObserver;
+      }
+
+      function bindAutoLoadObserver() {
+        disconnectAutoLoadObserver();
+        if (!renderBottomSentinel || !(hasStagedPages() || state.hasMore || state.fetchInFlight)) return;
+        const observer = ensureAutoLoadObserver();
+        if (!observer) return;
+        observer.observe(renderBottomSentinel);
+        state.autoLoadObservedNode = renderBottomSentinel;
+      }
+
+      function queueAutoLoad() {
+        state.autoLoadRequested = true;
+        if (state.autoLoadLoopRunning || state.autoLoadStartScheduled) return;
+        state.autoLoadStartScheduled = true;
+        setTimeout(() => {
+          state.autoLoadStartScheduled = false;
+          void runAutoLoadLoop();
+        }, 0);
+      }
+
+      function queueScrollAutoLoadCheck() {
+        if (state.autoLoadScrollTimer) return;
+        state.autoLoadScrollTimer = setTimeout(() => {
+          state.autoLoadScrollTimer = null;
+          syncBottomReachGate();
+          requestRevealAtBottom();
+        }, AUTO_LOAD_SCROLL_DELAY_MS);
+      }
+
+      async function fetchInitialPage() {
+        const queryState = readQueryInputs();
+        const requestCursor = "";
+
+        pageSizeInput.value = queryState.pageSize;
+        state.activeQuery = queryState;
+        state.nextCursor = "";
+        state.hasMore = false;
+        state.queryGeneration += 1;
+        if (state.controller) {
+          state.controller.abort();
+          state.controller = null;
+        }
+        state.fetchInFlight = false;
+        resetAutoLoadState();
+        clearDetail();
+        syncUrl(queryState);
+
+        const generation = state.queryGeneration;
+        const requestId = state.requestId + 1;
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        state.requestId = requestId;
+        state.controller = controller;
+        state.fetchInFlight = true;
+        refreshButton.disabled = true;
+        setStatus("Loading queries...");
+        syncAutoLoadState();
+
+        try {
+          const payload = await getJson(
+            `/dns/api/queries?${buildQueryString(queryState, requestCursor)}`,
+            controller ? controller.signal : undefined,
+          );
+          if (generation !== state.queryGeneration || requestId !== state.requestId) return false;
+
+          const items = extractRows(payload);
+          if (!items.length) {
+            renderEmptyState("No rows match the current filters.");
+            state.renderedPageCount = 0;
+          } else {
+            renderPageRows(items, false);
+            state.renderedPageCount = 1;
+          }
+          updatePagination(payload, requestCursor);
+          setStatus("");
+          syncAutoLoadState();
+          queueAutoLoad();
+          return items.length > 0 || state.hasMore;
+        } catch (error) {
+          if (isAbortError(error) || generation !== state.queryGeneration || requestId !== state.requestId) return false;
+          renderEmptyState("No rows match the current filters.");
+          state.renderedPageCount = 0;
+          updatePagination({}, "");
+          setStatus(error.message || "Failed to load queries.", true);
+          syncAutoLoadState();
+          return false;
+        } finally {
+          if (requestId === state.requestId) {
+            state.fetchInFlight = false;
+            if (state.controller === controller) state.controller = null;
+            refreshButton.disabled = false;
+            syncAutoLoadState();
+          }
+        }
+      }
+
+      async function fetchAndStageNextPage({ background = true } = {}) {
+        if (state.fetchInFlight) return false;
+        if (!state.hasMore || !state.nextCursor) return false;
+
+        const requestCursor = state.nextCursor;
+        const previousCursor = state.nextCursor;
+        const previousHasMore = state.hasMore;
+        const generation = state.queryGeneration;
+
+        state.fetchInFlight = true;
+        refreshButton.disabled = true;
+        if (!background) {
+          setStatus("Loading more rows...");
+        }
+        syncAutoLoadState();
+
+        try {
+          const payload = await getJson(
+            `/dns/api/queries?${buildQueryString(state.activeQuery, requestCursor)}`,
+            undefined,
+          );
+          if (generation !== state.queryGeneration) return false;
+
+          stagePage(payload);
+          updatePagination(payload, requestCursor);
+          if (!background) setStatus("");
+          syncAutoLoadState();
+          return hasStagedPages() || state.hasMore;
+        } catch (error) {
+          if (isAbortError(error) || generation !== state.queryGeneration) return false;
+          state.nextCursor = previousCursor;
+          state.hasMore = previousHasMore;
+          setStatus(error.message || "Failed to load queries.", true);
+          syncAutoLoadState();
+          return false;
+        } finally {
+          if (generation === state.queryGeneration) {
+            state.fetchInFlight = false;
+            refreshButton.disabled = false;
+            syncAutoLoadState();
+          }
+        }
+      }
+
+      async function revealNextPage({ background = true } = {}) {
+        if (state.revealInFlight) return false;
+        state.revealInFlight = true;
+        syncAutoLoadState();
+
+        try {
+          if (!hasStagedPages()) {
+            if (!state.hasMore) return false;
+            const loaded = await fetchAndStageNextPage({ background });
+            if (!loaded || !hasStagedPages()) return false;
+          }
+
+          const nextPage = state.stagedPages.shift();
+          if (!Array.isArray(nextPage) || !nextPage.length) return false;
+
+          renderPageRows(nextPage, true);
+          state.renderedPageCount += 1;
+          syncAutoLoadState();
+          queueAutoLoad();
+          return true;
+        } finally {
+          state.bottomReachLock = false;
+          state.revealInFlight = false;
+          syncAutoLoadState();
+        }
+      }
+
+      async function runAutoLoadLoop() {
+        if (state.autoLoadLoopRunning) return;
+        const generation = state.queryGeneration;
+        state.autoLoadLoopRunning = true;
+
+        try {
+          while (generation === state.queryGeneration) {
+            state.autoLoadRequested = false;
+
+            if (shouldAutoRevealToScrollable()) {
+              if (hasStagedPages()) {
+                const revealed = await revealNextPage({ background: true });
+                if (revealed) continue;
+              }
+              if (shouldStageMore()) {
+                const loaded = await fetchAndStageNextPage({ background: true });
+                if (loaded) continue;
+              }
+            }
+
+            if (state.revealRequested) {
+              const foreground = state.revealRequestForeground;
+              state.revealRequested = false;
+              state.revealRequestForeground = false;
+              const revealed = await revealNextPage({ background: !foreground });
+              if (revealed) continue;
+            }
+
+            if (shouldStageMore()) {
+              const loaded = await fetchAndStageNextPage({ background: true });
+              if (loaded) continue;
+            }
+
+            if (!state.autoLoadRequested) break;
+          }
+        } finally {
+          state.autoLoadLoopRunning = false;
+          if (state.autoLoadRequested) {
+            queueAutoLoad();
+          }
+        }
+      }
+
+      async function loadDetail(row) {
+        const fingerprint = String(row?.rowFingerprint || "").trim();
+        if (!fingerprint) return;
+
+        state.selectedFingerprint = fingerprint;
+        rerenderSelection();
+        setDetailOpen(true);
+        detailTitle.textContent = "Row details";
+        detailMeta.textContent = `Fingerprint: ${fingerprint}`;
+        setDetailStatus("Loading row details...");
+        detailOutput.textContent = "";
+        setDetailOutputVisible(false);
+
+        if (state.detailController) state.detailController.abort();
+        const requestId = state.detailRequestId + 1;
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        state.detailRequestId = requestId;
+        state.detailController = controller;
+
+        try {
+          const payload = await getJson(
+            `/dns/api/queries/${encodeURIComponent(fingerprint)}`,
+            controller ? controller.signal : undefined,
+          );
+          if (requestId !== state.detailRequestId || state.selectedFingerprint !== fingerprint) return;
+          setDetailStatus("");
+          setDetailOutputVisible(true);
+          detailOutput.textContent = JSON.stringify(payload, null, 2);
+        } catch (error) {
+          if (isAbortError(error) || requestId !== state.detailRequestId) return;
+          setDetailStatus(error.message || "Failed to load row details.", { error: true });
+          detailOutput.textContent = "";
+          setDetailOutputVisible(false);
+        } finally {
+          if (state.detailController === controller) state.detailController = null;
+        }
+      }
+
+      refreshButton.addEventListener("click", () => {
+        void fetchInitialPage();
+      });
+      responseInput.addEventListener("change", () => {
+        void fetchInitialPage();
+      });
+      pageSizeInput.addEventListener("change", () => {
+        void fetchInitialPage();
+      });
+      identityInput.addEventListener("change", () => {
+        void fetchInitialPage();
+      });
+      loadMoreButton.addEventListener("click", () => {
+        state.userScrolledSinceLoad = true;
+        requestReveal({ foreground: true });
+      });
+      searchInput.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        void fetchInitialPage();
+      });
+      identityInput.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        void fetchInitialPage();
+      });
+      pageSizeInput.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        void fetchInitialPage();
+      });
+      clearDetailButton.addEventListener("click", clearDetail);
+      detailBackdrop.addEventListener("click", clearDetail);
+      document.getElementById("logout").addEventListener("click", logout);
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.detailOpen) {
+          event.preventDefault();
+          clearDetail();
+        }
+      });
+      window.addEventListener("scroll", () => {
+        state.userScrolledSinceLoad = true;
+        syncBottomReachGate();
+        queueScrollAutoLoadCheck();
+      }, { passive: true });
+      window.addEventListener("resize", () => {
+        if (state.userScrolledSinceLoad) {
+          syncBottomReachGate();
+          requestRevealAtBottom();
+        }
+        queueAutoLoad();
+      });
+      void fetchInitialPage();
+    })();
+  </script>
+</body>
+</html>

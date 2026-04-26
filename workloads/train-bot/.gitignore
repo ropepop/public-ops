@@ -3,7 +3,12 @@ local.env
 *.db
 *.db-shm
 *.db-wal
+.artifacts/
 bin/
+data/schedules/*.json
 logs/
 output/
+tmp/
+web-client/src/generated/
+internal/web/static/live-client.js
 .DS_Store

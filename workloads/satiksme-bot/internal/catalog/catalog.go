@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 	"satiksmebot/internal/runtime"
 )
 
@@ -39,9 +39,9 @@ type Manager struct {
 	settings Settings
 
 	mu          sync.RWMutex
-	current     *domain.Catalog
+	current     *model.Catalog
 	status      runtime.CatalogStatus
-	stopIndex   map[string]domain.Stop
+	stopIndex   map[string]model.Stop
 	catalogJSON []byte
 	catalogETag string
 }
@@ -74,7 +74,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) LoadOrRefresh(ctx context.Context, force bool) (*domain.Catalog, error) {
+func (m *Manager) LoadOrRefresh(ctx context.Context, force bool) (*model.Catalog, error) {
 	catalog, err := m.Refresh(ctx, force)
 	if err == nil {
 		return catalog, nil
@@ -99,7 +99,7 @@ func (m *Manager) LoadOrRefresh(ctx context.Context, force bool) (*domain.Catalo
 	return fallback, nil
 }
 
-func (m *Manager) Current() *domain.Catalog {
+func (m *Manager) Current() *model.Catalog {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.current
@@ -111,7 +111,7 @@ func (m *Manager) Status() runtime.CatalogStatus {
 	return m.status
 }
 
-func (m *Manager) FindStop(stopID string) (domain.Stop, bool) {
+func (m *Manager) FindStop(stopID string) (model.Stop, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	stop, ok := m.stopIndex[strings.TrimSpace(stopID)]
@@ -130,7 +130,7 @@ func (m *Manager) CatalogETag() string {
 	return m.catalogETag
 }
 
-func (m *Manager) Refresh(ctx context.Context, force bool) (*domain.Catalog, error) {
+func (m *Manager) Refresh(ctx context.Context, force bool) (*model.Catalog, error) {
 	attemptAt := time.Now().UTC()
 	stopsPath := filepath.Join(m.settings.MirrorDir, "stops.txt")
 	routesPath := filepath.Join(m.settings.MirrorDir, "routes.txt")
@@ -201,19 +201,19 @@ func (m *Manager) recordRefreshError(attemptAt time.Time, err error) {
 	}
 }
 
-func LoadCatalog(path string) (*domain.Catalog, error) {
+func LoadCatalog(path string) (*model.Catalog, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var catalog domain.Catalog
+	var catalog model.Catalog
 	if err := json.Unmarshal(raw, &catalog); err != nil {
 		return nil, err
 	}
 	return &catalog, nil
 }
 
-func (m *Manager) useCatalog(catalog *domain.Catalog, status runtime.CatalogStatus) error {
+func (m *Manager) useCatalog(catalog *model.Catalog, status runtime.CatalogStatus) error {
 	stopIndex, catalogJSON, catalogETag, err := buildCatalogRuntimeSnapshot(catalog)
 	if err != nil {
 		return err
@@ -232,12 +232,12 @@ func (m *Manager) useCatalog(catalog *domain.Catalog, status runtime.CatalogStat
 	return nil
 }
 
-func buildCatalogRuntimeSnapshot(catalog *domain.Catalog) (map[string]domain.Stop, []byte, string, error) {
+func buildCatalogRuntimeSnapshot(catalog *model.Catalog) (map[string]model.Stop, []byte, string, error) {
 	if catalog == nil {
-		return map[string]domain.Stop{}, nil, "", nil
+		return map[string]model.Stop{}, nil, "", nil
 	}
 
-	stopIndex := make(map[string]domain.Stop, len(catalog.Stops))
+	stopIndex := make(map[string]model.Stop, len(catalog.Stops))
 	for _, stop := range catalog.Stops {
 		stopIndex[stop.ID] = stop
 	}
@@ -250,7 +250,7 @@ func buildCatalogRuntimeSnapshot(catalog *domain.Catalog) (map[string]domain.Sto
 	return stopIndex, catalogJSON, `"` + hex.EncodeToString(sum[:]) + `"`, nil
 }
 
-func BuildCatalogFromPaths(stopsPath, routesPath, gtfsPath string) (*domain.Catalog, error) {
+func BuildCatalogFromPaths(stopsPath, routesPath, gtfsPath string) (*model.Catalog, error) {
 	stopsRaw, err := os.ReadFile(stopsPath)
 	if err != nil {
 		return nil, fmt.Errorf("read stops: %w", err)
@@ -266,7 +266,7 @@ func BuildCatalogFromPaths(stopsPath, routesPath, gtfsPath string) (*domain.Cata
 	return BuildCatalog(stopsRaw, routesRaw, gtfsRaw)
 }
 
-func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) {
+func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*model.Catalog, error) {
 	stopRows, err := parseStopsSource(bytes.NewReader(stopsRaw))
 	if err != nil {
 		return nil, err
@@ -284,9 +284,9 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 		return nil, err
 	}
 
-	stopsByID := make(map[string]*domain.Stop, len(stopRows))
+	stopsByID := make(map[string]*model.Stop, len(stopRows))
 	for _, row := range stopRows {
-		stop := domain.Stop{
+		stop := model.Stop{
 			ID:            row.ID,
 			LiveID:        row.LiveID,
 			Name:          row.Name,
@@ -314,7 +314,7 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 		if _, ok := stopsByID[id]; ok {
 			continue
 		}
-		stopsByID[id] = &domain.Stop{
+		stopsByID[id] = &model.Stop{
 			ID:        id,
 			LiveID:    "",
 			Name:      gtfs.Name,
@@ -325,11 +325,11 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 
 	modeByStop := map[string]map[string]struct{}{}
 	routesByStop := map[string]map[string]struct{}{}
-	routesOut := make([]domain.Route, 0, len(routeRows))
-	routeRegistry := map[string]domain.Route{}
+	routesOut := make([]model.Route, 0, len(routeRows))
+	routeRegistry := map[string]model.Route{}
 	matchedGTFSStopRoutes := map[string][]sourceRoute{}
 	for _, route := range routeRows {
-		item := domain.Route{
+		item := model.Route{
 			Label:   route.Label,
 			Mode:    route.Mode,
 			Name:    route.Name,
@@ -377,7 +377,7 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 		}
 	}
 	for _, route := range gtfsRoutes {
-		registerRoute(routeRegistry, domain.Route{
+		registerRoute(routeRegistry, model.Route{
 			Label:   route.Label,
 			Mode:    route.Mode,
 			Name:    route.Name,
@@ -388,7 +388,7 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 		routesOut = append(routesOut, route)
 	}
 
-	stopsOut := make([]domain.Stop, 0, len(stopsByID))
+	stopsOut := make([]model.Stop, 0, len(stopsByID))
 	for _, stop := range stopsByID {
 		stop.Modes = sortedKeys(modeByStop[stop.ID])
 		stop.RouteLabels = sortedKeys(routesByStop[stop.ID])
@@ -407,7 +407,7 @@ func BuildCatalog(stopsRaw, routesRaw, gtfsZip []byte) (*domain.Catalog, error) 
 		return routesOut[i].Mode < routesOut[j].Mode
 	})
 
-	return &domain.Catalog{
+	return &model.Catalog{
 		GeneratedAt: time.Now().UTC(),
 		Stops:       stopsOut,
 		Routes:      routesOut,
@@ -705,7 +705,7 @@ func mirrorFile(ctx context.Context, client *http.Client, sourceURL, dst string,
 	return os.Rename(tmpPath, dst)
 }
 
-func writeCatalog(path string, catalog *domain.Catalog) error {
+func writeCatalog(path string, catalog *model.Catalog) error {
 	raw, err := json.MarshalIndent(catalog, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal catalog: %w", err)
@@ -907,7 +907,7 @@ func normalizeGTFSMode(raw string) string {
 	}
 }
 
-func registerRoute(registry map[string]domain.Route, route domain.Route) {
+func registerRoute(registry map[string]model.Route, route model.Route) {
 	key := routeKey(route.Label, route.Mode, route.Name)
 	if existing, ok := registry[key]; ok {
 		if len(existing.StopIDs) == 0 && len(route.StopIDs) > 0 {
@@ -923,7 +923,7 @@ func routeKey(label, mode, name string) string {
 	return strings.TrimSpace(mode) + "|" + strings.TrimSpace(label) + "|" + strings.TrimSpace(name)
 }
 
-func nearestGTFSRoutes(stop domain.Stop, gtfsStops map[string]gtfsStop, gtfsStopRoutes map[string][]sourceRoute, maxDistanceMeters float64) []sourceRoute {
+func nearestGTFSRoutes(stop model.Stop, gtfsStops map[string]gtfsStop, gtfsStopRoutes map[string][]sourceRoute, maxDistanceMeters float64) []sourceRoute {
 	if stop.Latitude == 0 || stop.Longitude == 0 {
 		return nil
 	}

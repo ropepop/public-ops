@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -14,13 +15,14 @@ import (
 )
 
 type releaseInfo struct {
-	Commit     string
-	BuildTime  string
-	Dirty      string
-	Instance   string
-	AppJSHash  string
-	AppCSSHash string
-	assetHash  map[string]string
+	Commit         string
+	BuildTime      string
+	Dirty          string
+	Instance       string
+	AppJSHash      string
+	AppCSSHash     string
+	LiveClientHash string
+	assetHash      map[string]string
 }
 
 func newReleaseInfo(static fs.FS) (releaseInfo, error) {
@@ -32,27 +34,48 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 	if err != nil {
 		return releaseInfo{}, err
 	}
+	liveClientHash, err := hashOptionalStaticAsset(static, "live-client.js")
+	if err != nil {
+		return releaseInfo{}, err
+	}
 	instanceID, err := randomInstanceID()
 	if err != nil {
 		return releaseInfo{}, err
 	}
-	return releaseInfo{
-		Commit:     strings.TrimSpace(appversion.Commit),
-		BuildTime:  strings.TrimSpace(appversion.BuildTime),
-		Dirty:      strings.TrimSpace(appversion.Dirty),
-		Instance:   instanceID,
-		AppJSHash:  appJSHash,
-		AppCSSHash: appCSSHash,
+	info := releaseInfo{
+		Commit:         strings.TrimSpace(appversion.Commit),
+		BuildTime:      strings.TrimSpace(appversion.BuildTime),
+		Dirty:          strings.TrimSpace(appversion.Dirty),
+		Instance:       instanceID,
+		AppJSHash:      appJSHash,
+		AppCSSHash:     appCSSHash,
+		LiveClientHash: liveClientHash,
 		assetHash: map[string]string{
 			"app.js":  appJSHash,
 			"app.css": appCSSHash,
 		},
-	}, nil
+	}
+	if liveClientHash != "" {
+		info.assetHash["live-client.js"] = liveClientHash
+	}
+	return info, nil
 }
 
 func hashStaticAsset(static fs.FS, name string) (string, error) {
 	body, err := fs.ReadFile(static, name)
 	if err != nil {
+		return "", fmt.Errorf("read static asset %s: %w", name, err)
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func hashOptionalStaticAsset(static fs.FS, name string) (string, error) {
+	body, err := fs.ReadFile(static, name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", nil
+		}
 		return "", fmt.Errorf("read static asset %s: %w", name, err)
 	}
 	sum := sha256.Sum256(body)

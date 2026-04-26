@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS clients</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #192230;
+      --muted: #667085;
+      --border: #d7deea;
+      --primary: #1f6feb;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .title { margin: 0; font-size: 28px; }
+    .grow { flex: 1; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; }
+    .nav a, .nav button {
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .nav a.active { border-color: var(--primary); color: var(--primary); }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+    .status { min-height: 22px; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+    .status.error { color: var(--danger); }
+    .controls { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; margin-bottom: 14px; }
+    input, button { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 8px; border-top: 1px solid #eef2f8; text-align: left; vertical-align: top; }
+    th { border-top: 0; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .scroll { overflow-x: auto; }
+    @media (max-width: 900px) { .controls { grid-template-columns: 1fr; } .wrap { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1 class="title">DNS clients</h1>
+      <div class="grow"></div>
+      <nav class="nav">__ADMIN_NAV__</nav>
+    </div>
+    <div id="status" class="status"></div>
+    <div class="panel">
+      <div class="controls">
+        <input id="search" placeholder="Search client, IP, country, or org">
+        <button id="refresh" type="button">Refresh</button>
+        <button id="clear" type="button">Clear</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Client</th>
+              <th>Address</th>
+              <th>Queries</th>
+              <th>Country</th>
+              <th>Provider</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <script>
+    (() => {
+      const status = document.getElementById("status");
+      const rows = document.getElementById("rows");
+      const searchInput = document.getElementById("search");
+      const query = new URLSearchParams(location.search);
+      searchInput.value = query.get("search") || "";
+
+      async function getJson(path) {
+        const response = await fetch(path, { credentials: "same-origin" });
+        if (response.status === 401) {
+          location.assign(`/dns/login?return=${encodeURIComponent(location.pathname + location.search + location.hash)}`);
+          throw new Error("Unauthorized");
+        }
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Request failed for ${path}`);
+        return payload;
+      }
+
+      async function logout() {
+        await fetch("/dns/api/session", { method: "DELETE", credentials: "same-origin" });
+        location.assign("/dns/login");
+      }
+
+      function setStatus(message, error) {
+        status.textContent = message || "";
+        status.className = error ? "status error" : "status";
+      }
+
+      function syncUrl(search) {
+        const next = new URLSearchParams();
+        if (search) next.set("search", search);
+        const value = next.toString();
+        history.replaceState(null, "", value ? `${location.pathname}?${value}` : location.pathname);
+      }
+
+      async function load() {
+        setStatus("Loading clients...");
+        const search = searchInput.value.trim();
+        syncUrl(search);
+        const path = search
+          ? `/dns/api/clients?search=${encodeURIComponent(search)}`
+          : "/dns/api/clients";
+        const payload = await getJson(path);
+        rows.innerHTML = "";
+        for (const entry of payload.auto_clients || []) {
+          const tr = document.createElement("tr");
+          const name = entry.name || entry.ip || (entry.ids || [])[0] || "client";
+          const ip = entry.ip || entry.id || (entry.ids || [])[0] || "-";
+          const country = entry.whois_info?.country || "-";
+          const provider = entry.whois_info?.orgname || entry.whois_info?.org || "-";
+          tr.innerHTML = `
+            <td>${name}</td>
+            <td class="mono">${ip}</td>
+            <td>${entry.query_count || 0}</td>
+            <td>${country}</td>
+            <td class="muted">${provider}</td>
+          `;
+          rows.appendChild(tr);
+        }
+        if (!rows.children.length) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="5">No clients match the current search.</td>`;
+          rows.appendChild(tr);
+        }
+        setStatus("");
+      }
+
+      document.getElementById("refresh").addEventListener("click", () => load().catch((error) => setStatus(error.message || "Failed to load clients.", true)));
+      document.getElementById("clear").addEventListener("click", () => {
+        searchInput.value = "";
+        load().catch((error) => setStatus(error.message || "Failed to load clients.", true));
+      });
+      searchInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          load().catch((error) => setStatus(error.message || "Failed to load clients.", true));
+        }
+      });
+      document.getElementById("logout").addEventListener("click", logout);
+      load().catch((error) => setStatus(error.message || "Failed to load clients.", true));
+    })();
+  </script>
+</body>
+</html>

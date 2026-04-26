@@ -1,0 +1,17 @@
+.git
+.gitignore
+.codex-tmp
+.DS_Store
+
+**/.artifacts
+**/output
+**/node_modules
+**/__pycache__
+**/*.pyc
+
+docs/public-ops
+ops/evidence
+ops/reports
+state/pixel-diagnostics
+workloads/site-notifications/state
+

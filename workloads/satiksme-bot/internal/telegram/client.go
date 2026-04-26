@@ -159,6 +159,27 @@ func (c *Client) SetChatMenuButton(ctx context.Context, button MenuButtonWebApp)
 	return c.post(ctx, "/setChatMenuButton", payload)
 }
 
+func (c *Client) SetMyName(ctx context.Context, name string) error {
+	payload := map[string]any{
+		"name": name,
+	}
+	return c.post(ctx, "/setMyName", payload)
+}
+
+func (c *Client) SetMyShortDescription(ctx context.Context, description string) error {
+	payload := map[string]any{
+		"short_description": description,
+	}
+	return c.post(ctx, "/setMyShortDescription", payload)
+}
+
+func (c *Client) SetMyDescription(ctx context.Context, description string) error {
+	payload := map[string]any{
+		"description": description,
+	}
+	return c.post(ctx, "/setMyDescription", payload)
+}
+
 func (c *Client) post(ctx context.Context, path string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {

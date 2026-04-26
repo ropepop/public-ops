@@ -1,9 +1,0 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
-  <style name="Theme.PixelRootOrchestrator" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-    <item name="colorPrimary">#145A32</item>
-    <item name="colorPrimaryVariant">#0E4024</item>
-    <item name="colorSecondary">#D35400</item>
-    <item name="android:statusBarColor">#0E4024</item>
-    <item name="android:navigationBarColor">#0E4024</item>
-  </style>
-</resources>

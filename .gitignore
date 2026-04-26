@@ -19,12 +19,26 @@ node_modules/
 build/
 out/
 dist/
+tools/arbuzas-rs/target/
 
 # Local runtime scratch
 .browser-use/
 .playwright-cli/
+.codex-tmp/
 .tmp-rootfs/
 .artifacts/
+orchestrator/.artifacts/
+output/
+workloads/*/.artifacts/
+workloads/*/output/
+workloads/*/tmp/
+orchestrator/android-orchestrator/.kotlin/
+orchestrator/android-orchestrator/runtime-tests/debug-helper.*.sh
+"$TMP"
+
+# Stable local browser session exports
+state/browser-use/
 
 # Keep evidence tracked by default under ops/evidence
 # Keep secrets tracked by explicit user decision.
+workloads/subscription-bot/.env

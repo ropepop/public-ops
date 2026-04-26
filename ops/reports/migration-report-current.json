@@ -1,0 +1,22 @@
+{
+  "adlists": {
+    "added": 3,
+    "failed": 0,
+    "skipped": 0
+  },
+  "dns": {
+    "status": "applied",
+    "upstreams": [
+      "https://1.1.1.1/dns-query",
+      "https://1.0.0.1/dns-query"
+    ]
+  },
+  "error": null,
+  "rules": {
+    "applied": 0,
+    "failed": 0
+  },
+  "source_payload": "/etc/pixel-stack/remote-dns/state/pihole-migration-payload.json",
+  "status": "ok",
+  "target": "https://127.0.0.1:443"
+}

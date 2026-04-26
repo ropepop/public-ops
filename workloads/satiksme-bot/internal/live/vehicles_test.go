@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -55,6 +55,9 @@ func TestFetchVehiclesForcesFreshNoCacheRequest(t *testing.T) {
 	if !vehicles[0].UpdatedAt.Equal(now) {
 		t.Fatalf("vehicle updatedAt = %s, want %s", vehicles[0].UpdatedAt, now)
 	}
+	if vehicles[0].LiveRowID != "67133" {
+		t.Fatalf("vehicle liveRowId = %q, want 67133", vehicles[0].LiveRowID)
+	}
 
 	req := <-requests
 	if req.originCustom != "saraksti.lv" {
@@ -77,8 +80,8 @@ func TestParseVehiclesResolvesStopNameThroughStopAlias(t *testing.T) {
 	now := time.Date(2026, 3, 11, 12, 0, 0, 0, time.UTC)
 	vehicles := ParseVehicles(
 		"2,15,24121150,56948109,,270,I,67133,a-b-b2,432,22,\n",
-		&domain.Catalog{
-			Stops: []domain.Stop{{ID: "0432", Name: "Slavu iela"}},
+		&model.Catalog{
+			Stops: []model.Stop{{ID: "0432", Name: "Slavu iela"}},
 		},
 		now,
 	)

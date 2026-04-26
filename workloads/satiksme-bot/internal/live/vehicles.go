@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 )
 
 const VehicleFeedURL = "https://www.saraksti.lv/gpsdata.ashx?gps"
 
-func FetchVehicles(ctx context.Context, client *http.Client, sourceURL string, catalog *domain.Catalog, now time.Time) ([]domain.LiveVehicle, error) {
+func FetchVehicles(ctx context.Context, client *http.Client, sourceURL string, catalog *model.Catalog, now time.Time) ([]model.LiveVehicle, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
@@ -48,8 +48,8 @@ func FetchVehicles(ctx context.Context, client *http.Client, sourceURL string, c
 	return ParseVehicles(string(body), catalog, now), nil
 }
 
-func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.LiveVehicle {
-	stopNames := domain.StopNameLookup(catalog)
+func ParseVehicles(raw string, catalog *model.Catalog, now time.Time) []model.LiveVehicle {
+	stopNames := model.StopNameLookup(catalog)
 
 	current := now
 	if current.IsZero() {
@@ -58,7 +58,7 @@ func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.
 	currentSeconds := current.Hour()*3600 + current.Minute()*60 + current.Second()
 
 	lines := strings.Split(strings.ReplaceAll(raw, "\r", ""), "\n")
-	out := make([]domain.LiveVehicle, 0, len(lines))
+	out := make([]model.LiveVehicle, 0, len(lines))
 	seen := make(map[string]struct{})
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -91,6 +91,7 @@ func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.
 		if rawCode == "" {
 			rawCode = strings.TrimSpace(parts[1])
 		}
+		liveRowID := rawCode
 		id := fmt.Sprintf("%s:%s:%s", mode, routeLabel, rawCode)
 		if _, exists := seen[id]; exists {
 			continue
@@ -110,12 +111,13 @@ func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.
 		}
 
 		heading, _ := parseOptionalInt(parts[5])
-		out = append(out, domain.LiveVehicle{
+		out = append(out, model.LiveVehicle{
 			ID:             id,
 			VehicleCode:    rawCode,
 			Mode:           mode,
 			RouteLabel:     routeLabel,
 			Direction:      direction,
+			Destination:    "",
 			Latitude:       latitude,
 			Longitude:      longitude,
 			UpdatedAt:      current,
@@ -124,6 +126,7 @@ func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.
 			StopName:       stopNames[stopID],
 			ArrivalSeconds: arrivalSeconds,
 			LowFloor:       strings.Contains(strings.ToUpper(strings.TrimSpace(parts[6])), "L"),
+			LiveRowID:      liveRowID,
 		})
 	}
 
@@ -142,7 +145,7 @@ func ParseVehicles(raw string, catalog *domain.Catalog, now time.Time) []domain.
 	return out
 }
 
-func ApplyVehicleSightingCounts(vehicles []domain.LiveVehicle, sightings []domain.PublicVehicleSighting) {
+func ApplyVehicleSightingCounts(vehicles []model.LiveVehicle, sightings []model.PublicVehicleSighting) {
 	for _, sighting := range sightings {
 		index := bestVehicleMatch(vehicles, sighting)
 		if index >= 0 {
@@ -151,7 +154,35 @@ func ApplyVehicleSightingCounts(vehicles []domain.LiveVehicle, sightings []domai
 	}
 }
 
-func bestVehicleMatch(vehicles []domain.LiveVehicle, sighting domain.PublicVehicleSighting) int {
+func ApplyVehicleIncidents(vehicles []model.LiveVehicle, incidents []model.IncidentSummary) {
+	for index := range vehicles {
+		vehicles[index].Incidents = nil
+	}
+	for _, incident := range incidents {
+		if incident.Scope != "vehicle" || incident.Resolved || incident.Vehicle == nil {
+			continue
+		}
+		index := bestVehicleMatch(vehicles, model.PublicVehicleSighting{
+			StopID:           incident.Vehicle.StopID,
+			Mode:             incident.Vehicle.Mode,
+			RouteLabel:       incident.Vehicle.RouteLabel,
+			Direction:        incident.Vehicle.Direction,
+			Destination:      incident.Vehicle.Destination,
+			DepartureSeconds: incident.Vehicle.DepartureSeconds,
+			LiveRowID:        incident.Vehicle.LiveRowID,
+		})
+		if index >= 0 {
+			vehicles[index].Incidents = append(vehicles[index].Incidents, incident)
+		}
+	}
+	for index := range vehicles {
+		sort.SliceStable(vehicles[index].Incidents, func(left, right int) bool {
+			return vehicles[index].Incidents[left].LastReportAt.After(vehicles[index].Incidents[right].LastReportAt)
+		})
+	}
+}
+
+func bestVehicleMatch(vehicles []model.LiveVehicle, sighting model.PublicVehicleSighting) int {
 	bestIndex := -1
 	bestScore := int(^uint(0) >> 1)
 
@@ -169,7 +200,7 @@ func bestVehicleMatch(vehicles []domain.LiveVehicle, sighting domain.PublicVehic
 		score := 0
 		if stopID := strings.TrimSpace(sighting.StopID); stopID != "" {
 			switch {
-			case domain.StopAliasEqual(vehicle.StopID, stopID):
+			case model.StopAliasEqual(vehicle.StopID, stopID):
 			case vehicle.StopID == "":
 				score += 40
 			default:

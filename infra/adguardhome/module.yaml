@@ -1,18 +1,18 @@
 schema: 1
 module_id: adguardhome
-owner: pixel-ops
+owner: arbuzas
 runtime:
   type: external
-  healthcheck: orchestrator/scripts/ops/service-availability-report.sh
-  run_id_env: PIXEL_RUN_ID
+  healthcheck: "curl -skf -H 'Host: dns.jolkins.id.lv' https://127.0.0.1:443/dns/login >/dev/null && nc -z 127.0.0.1 853"
+  run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: dns_runtime
-    start: sh /data/local/pixel-stack/bin/pixel-dns-start.sh
-    stop: sh /data/local/pixel-stack/bin/pixel-dns-stop.sh
-    health: dns and listener probes
+    start: "docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml build dns_controlplane && docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml run --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json && docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml run --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json && docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d dns_controlplane"
+    stop: "docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop dns_controlplane"
+    health: "curl -skf -H 'Host: dns.jolkins.id.lv' https://127.0.0.1:443/dns/login >/dev/null && nc -z 127.0.0.1 853"
     redeploy:
-      mode: artifact_release
-      artifact_id: adguardhome-rootfs
+      mode: compose_release
+      release_root: /etc/arbuzas/releases
 observability:
-  event_source: adguardhome
-  evidence_root: ops/evidence/adguardhome
+  event_source: arbuzas-dns
+  evidence_root: ops/evidence/arbuzas-dns

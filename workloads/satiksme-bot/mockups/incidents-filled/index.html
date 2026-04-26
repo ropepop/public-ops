@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Satiksme Bot incidents mockup</title>
+  <link rel="stylesheet" href="./mock.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Lokālais makets</p>
+        <h1>Kontroles plūsma</h1>
+        <p class="lede">Aizpildīts incidents skats ar drošiem parauga ziņojumiem, balsojumiem un komentāriem lokālai apskatei.</p>
+      </div>
+      <div class="hero-meta">
+        <span class="pill">Lokālais incidents makets</span>
+        <span id="status-pill" class="pill pill-muted">Gatavs apskatei</span>
+      </div>
+    </header>
+
+    <section class="layout">
+      <section class="card">
+        <h2>Notiekošais</h2>
+        <div id="incident-list" class="card-list"></div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="card">
+          <h2>Detalizēti</h2>
+          <div id="incident-detail"></div>
+        </section>
+      </aside>
+    </section>
+  </div>
+
+  <script src="./mock.js" defer></script>
+</body>
+</html>

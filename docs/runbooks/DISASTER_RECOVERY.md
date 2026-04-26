@@ -1,4 +1,0 @@
-# DISASTER RECOVERY
-
-Compatibility pointer:
-- [ROOT_OPERATIONS](./ROOT_OPERATIONS.md)

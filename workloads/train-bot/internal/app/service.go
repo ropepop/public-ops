@@ -18,7 +18,7 @@ import (
 
 type Service struct {
 	store                 store.Store
-	schedules             *schedule.Manager
+	schedules             schedule.ReadModel
 	rides                 *ride.Service
 	reports               *reports.Service
 	loc                   *time.Location
@@ -29,6 +29,8 @@ const (
 	authStationDeparturePastWindow   = 2 * time.Hour
 	authStationDepartureFutureWindow = 2 * time.Hour
 	stationSightingContextWindow     = 30 * time.Minute
+	networkMapRelevantSightingWindow = 30 * time.Minute
+	mapCheckInFallbackWindow         = 6 * time.Hour
 )
 
 type TrainCard struct {
@@ -79,6 +81,7 @@ type FavoriteRouteView struct {
 type PublicTrainView struct {
 	Train            domain.TrainInstance     `json:"train"`
 	Status           domain.TrainStatus       `json:"status"`
+	Riders           int                      `json:"riders"`
 	Timeline         []reports.TimelineEvent  `json:"timeline"`
 	StationSightings []domain.StationSighting `json:"stationSightings"`
 }
@@ -104,13 +107,22 @@ type TrainStopsView struct {
 }
 
 type NetworkMapView struct {
-	Stations        []domain.Station         `json:"stations"`
-	RecentSightings []domain.StationSighting `json:"recentSightings"`
+	Stations         []domain.Station         `json:"stations"`
+	RecentSightings  []domain.StationSighting `json:"recentSightings"`
+	SameDaySightings []domain.StationSighting `json:"sameDaySightings"`
+}
+
+type StaticBundleBase struct {
+	ServiceDate   string                 `json:"serviceDate"`
+	SourceVersion string                 `json:"sourceVersion"`
+	Stations      []domain.Station       `json:"stations"`
+	Trains        []domain.TrainInstance `json:"trains"`
+	Stops         []domain.TrainStop     `json:"stops"`
 }
 
 func NewService(
 	st store.Store,
-	schedules *schedule.Manager,
+	schedules schedule.ReadModel,
 	rides *ride.Service,
 	reportsSvc *reports.Service,
 	loc *time.Location,
@@ -131,14 +143,26 @@ func (s *Service) StationCheckinEnabled() bool {
 }
 
 func (s *Service) ScheduleAvailability() (bool, error) {
+	if s == nil || s.schedules == nil {
+		return false, schedule.ErrUnavailable
+	}
 	return s.schedules.Availability()
 }
 
 func (s *Service) LoadedServiceDate() string {
+	if s == nil || s.schedules == nil {
+		return ""
+	}
 	return s.schedules.LoadedServiceDate()
 }
 
 func (s *Service) ScheduleContext(now time.Time) schedule.AccessContext {
+	if s == nil || s.schedules == nil {
+		return schedule.AccessContext{Available: false}
+	}
+	if s.loc == nil {
+		return s.schedules.AccessContext(now)
+	}
 	return s.schedules.AccessContext(now.In(s.loc))
 }
 
@@ -154,6 +178,28 @@ func (s *Service) UserSettings(ctx context.Context, userID int64) (domain.UserSe
 	return s.store.GetUserSettings(ctx, userID)
 }
 
+func (s *Service) ResolveSignedInLanguage(ctx context.Context, userID int64, preferred string) (domain.Language, error) {
+	lang := ParseLanguage(preferred)
+	if s.store == nil {
+		return lang, nil
+	}
+	hasSettings, err := s.store.HasUserSettings(ctx, userID)
+	if err != nil {
+		return domain.LanguageEN, err
+	}
+	if !hasSettings {
+		if err := s.store.SetLanguage(ctx, userID, lang); err != nil {
+			return domain.LanguageEN, err
+		}
+		return lang, nil
+	}
+	settings, err := s.store.GetUserSettings(ctx, userID)
+	if err != nil {
+		return domain.LanguageEN, err
+	}
+	return settings.Language, nil
+}
+
 func (s *Service) SetAlertsEnabled(ctx context.Context, userID int64, enabled bool) error {
 	return s.store.SetAlertsEnabled(ctx, userID, enabled)
 }
@@ -162,8 +208,26 @@ func (s *Service) SetLanguage(ctx context.Context, userID int64, lang domain.Lan
 	return s.store.SetLanguage(ctx, userID, lang)
 }
 
+func (s *Service) ResetTestUser(ctx context.Context, userID int64) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.ResetTestUser(ctx, userID)
+}
+
+func (s *Service) ConsumeTestLoginTicket(ctx context.Context, nonceHash string, userID int64, expiresAt time.Time) (bool, error) {
+	if s == nil || s.store == nil {
+		return true, nil
+	}
+	return s.store.ConsumeTestLoginTicket(ctx, nonceHash, userID, expiresAt)
+}
+
 func (s *Service) SetAlertStyle(ctx context.Context, userID int64, style domain.AlertStyle) error {
 	return s.store.SetAlertStyle(ctx, userID, style)
+}
+
+func (s *Service) Nickname(userID int64) string {
+	return domain.GenericNickname(userID)
 }
 
 func (s *Service) WindowTrains(ctx context.Context, userID int64, now time.Time, windowID string) ([]TrainCard, error) {
@@ -318,6 +382,26 @@ func (s *Service) CheckIn(ctx context.Context, userID int64, trainID string, boa
 	return s.rides.CheckIn(ctx, userID, trainID, localNow, train.ArrivalAt.In(s.loc))
 }
 
+func (s *Service) CheckInMap(ctx context.Context, userID int64, trainID string, boardingStationID *string, now time.Time) error {
+	train, err := s.schedules.GetTrain(ctx, trainID)
+	if err != nil {
+		return err
+	}
+	if train == nil {
+		return ErrNotFound
+	}
+	localNow := now.In(s.loc)
+	autoCheckoutAt := train.ArrivalAt.In(s.loc).Add(10 * time.Minute)
+	fallbackCheckoutAt := localNow.Add(mapCheckInFallbackWindow)
+	if autoCheckoutAt.Before(fallbackCheckoutAt) {
+		autoCheckoutAt = fallbackCheckoutAt
+	}
+	if boardingStationID != nil {
+		return s.rides.CheckInUntilAtStation(ctx, userID, trainID, boardingStationID, localNow, autoCheckoutAt)
+	}
+	return s.rides.CheckInUntil(ctx, userID, trainID, localNow, autoCheckoutAt)
+}
+
 func (s *Service) Checkout(ctx context.Context, userID int64, now time.Time) error {
 	return s.rides.Checkout(ctx, userID, now.In(s.loc))
 }
@@ -331,11 +415,11 @@ func (s *Service) MuteTrain(ctx context.Context, userID int64, trainID string, n
 }
 
 func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string, signal domain.SignalType, now time.Time) (reports.SubmitResult, error) {
-	active, err := s.rides.ActiveCheckIn(ctx, userID, now.In(s.loc))
+	train, err := s.schedules.GetTrain(ctx, trainID)
 	if err != nil {
 		return reports.SubmitResult{}, err
 	}
-	if active == nil || active.TrainInstanceID != trainID {
+	if train == nil {
 		return reports.SubmitResult{}, ErrNotFound
 	}
 	return s.reports.SubmitReport(ctx, userID, trainID, signal, now.In(s.loc))
@@ -430,6 +514,37 @@ func (s *Service) TrainStatus(ctx context.Context, userID int64, trainID string,
 	return &TrainStatusView{TrainCard: card, Timeline: timeline, StationSightings: stationSightings}, nil
 }
 
+func (s *Service) OngoingIncidents(ctx context.Context, now time.Time, viewerID int64, limit int) ([]domain.IncidentSummary, error) {
+	return s.reports.ListActiveIncidents(ctx, now.In(s.loc), viewerID, limit)
+}
+
+func (s *Service) IncidentDetail(ctx context.Context, incidentID string, now time.Time, viewerID int64) (*domain.IncidentDetail, error) {
+	item, err := s.reports.IncidentDetail(ctx, incidentID, now.In(s.loc), viewerID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return item, nil
+}
+
+func (s *Service) VoteIncident(ctx context.Context, incidentID string, userID int64, value domain.IncidentVoteValue, now time.Time) (domain.IncidentVoteSummary, error) {
+	item, err := s.reports.VoteIncident(ctx, incidentID, userID, value, now.In(s.loc))
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return domain.IncidentVoteSummary{}, ErrNotFound
+	}
+	return item, err
+}
+
+func (s *Service) AddIncidentComment(ctx context.Context, incidentID string, userID int64, body string, now time.Time) (*domain.IncidentComment, error) {
+	item, err := s.reports.AddIncidentComment(ctx, incidentID, userID, body, now.In(s.loc))
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return nil, ErrNotFound
+	}
+	return item, err
+}
+
 func (s *Service) PublicDashboard(ctx context.Context, now time.Time, limit int) ([]PublicTrainView, error) {
 	trains, err := s.schedules.ListByWindow(ctx, now.In(s.loc), "today")
 	if err != nil {
@@ -438,9 +553,25 @@ func (s *Service) PublicDashboard(ctx context.Context, now time.Time, limit int)
 	if limit > 0 && len(trains) > limit {
 		trains = trains[:limit]
 	}
+	return s.buildPublicTrainViews(ctx, trains, now)
+}
+
+func (s *Service) PublicServiceDay(ctx context.Context, now time.Time) ([]PublicTrainView, error) {
+	trains, err := s.schedules.ListAllTrains(ctx, now.In(s.loc))
+	if err != nil {
+		return nil, err
+	}
+	return s.buildPublicTrainViews(ctx, trains, now)
+}
+
+func (s *Service) buildPublicTrainViews(ctx context.Context, trains []domain.TrainInstance, now time.Time) ([]PublicTrainView, error) {
 	out := make([]PublicTrainView, 0, len(trains))
 	for _, train := range trains {
 		status, err := s.reports.BuildStatus(ctx, train.ID, now.In(s.loc))
+		if err != nil {
+			return nil, err
+		}
+		riders, err := s.store.CountActiveCheckins(ctx, train.ID, now.In(s.loc))
 		if err != nil {
 			return nil, err
 		}
@@ -451,6 +582,7 @@ func (s *Service) PublicDashboard(ctx context.Context, now time.Time, limit int)
 		out = append(out, PublicTrainView{
 			Train:            train,
 			Status:           status,
+			Riders:           riders,
 			Timeline:         timeline,
 			StationSightings: nil,
 		})
@@ -461,6 +593,77 @@ func (s *Service) PublicDashboard(ctx context.Context, now time.Time, limit int)
 	return out, nil
 }
 
+func (s *Service) PublicDashboardPayload(ctx context.Context, now time.Time, limit int) (map[string]any, error) {
+	items, err := s.PublicDashboard(ctx, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"generatedAt": now.UTC(),
+		"trains":      items,
+		"schedule":    s.ScheduleContext(now),
+	}, nil
+}
+
+func (s *Service) PublicServiceDayPayload(ctx context.Context, now time.Time) (map[string]any, error) {
+	items, err := s.PublicServiceDay(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"generatedAt": now.UTC(),
+		"trains":      items,
+		"schedule":    s.ScheduleContext(now),
+	}, nil
+}
+
+func (s *Service) StaticBundleBase(ctx context.Context, now time.Time) (*StaticBundleBase, error) {
+	localNow := now.In(s.loc)
+	access := s.ScheduleContext(localNow)
+	if !access.Available || strings.TrimSpace(access.EffectiveServiceDate) == "" {
+		return nil, schedule.ErrUnavailable
+	}
+	stations, err := s.schedules.ListStations(ctx, localNow)
+	if err != nil {
+		return nil, err
+	}
+	trains, err := s.schedules.ListAllTrains(ctx, localNow)
+	if err != nil {
+		return nil, err
+	}
+	stops, err := s.schedules.ListAllStops(ctx, localNow)
+	if err != nil {
+		return nil, err
+	}
+	sourceVersions := make([]string, 0, len(trains))
+	seenSourceVersions := make(map[string]struct{}, len(trains))
+	for _, train := range trains {
+		version := strings.TrimSpace(train.SourceVersion)
+		if version == "" {
+			continue
+		}
+		if _, ok := seenSourceVersions[version]; ok {
+			continue
+		}
+		seenSourceVersions[version] = struct{}{}
+		sourceVersions = append(sourceVersions, version)
+	}
+	sort.Strings(sourceVersions)
+	sourceVersion := "snapshot-unknown"
+	if len(sourceVersions) == 1 {
+		sourceVersion = sourceVersions[0]
+	} else if len(sourceVersions) > 1 {
+		sourceVersion = strings.Join(sourceVersions, ",")
+	}
+	return &StaticBundleBase{
+		ServiceDate:   access.EffectiveServiceDate,
+		SourceVersion: sourceVersion,
+		Stations:      stations,
+		Trains:        trains,
+		Stops:         stops,
+	}, nil
+}
+
 func (s *Service) PublicTrain(ctx context.Context, trainID string, now time.Time) (*PublicTrainView, error) {
 	view, err := s.TrainStatus(ctx, 0, trainID, now)
 	if err != nil {
@@ -469,6 +672,7 @@ func (s *Service) PublicTrain(ctx context.Context, trainID string, now time.Time
 	return &PublicTrainView{
 		Train:            view.TrainCard.Train,
 		Status:           view.TrainCard.Status,
+		Riders:           view.TrainCard.Riders,
 		Timeline:         view.Timeline,
 		StationSightings: view.StationSightings,
 	}, nil
@@ -572,10 +776,20 @@ func (s *Service) NetworkMap(ctx context.Context, now time.Time) (*NetworkMapVie
 	if err != nil {
 		return nil, err
 	}
-	recentSightings, err := s.reports.RecentStationSightings(ctx, localNow, 100)
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, s.loc)
+	sameDaySightings, err := s.reports.StationSightingsSince(ctx, dayStart, 500)
 	if err != nil {
 		return nil, err
 	}
+	visibleTrains, err := s.schedules.ListByWindow(ctx, localNow, "today")
+	if err != nil {
+		return nil, err
+	}
+	visibleTrainIDs := make(map[string]struct{}, len(visibleTrains))
+	for _, train := range visibleTrains {
+		visibleTrainIDs[train.ID] = struct{}{}
+	}
+	recentSightings := filterRelevantNetworkMapSightings(sameDaySightings, localNow, visibleTrainIDs)
 	filtered := make([]domain.Station, 0, len(stations))
 	for _, station := range stations {
 		if station.Latitude == nil || station.Longitude == nil {
@@ -584,8 +798,9 @@ func (s *Service) NetworkMap(ctx context.Context, now time.Time) (*NetworkMapVie
 		filtered = append(filtered, station)
 	}
 	return &NetworkMapView{
-		Stations:        filtered,
-		RecentSightings: recentSightings,
+		Stations:         filtered,
+		RecentSightings:  recentSightings,
+		SameDaySightings: sameDaySightings,
 	}, nil
 }
 
@@ -709,6 +924,27 @@ func (s *Service) selectedStationDeparture(ctx context.Context, now time.Time, s
 		}
 	}
 	return nil, ErrNotFound
+}
+
+func filterRelevantNetworkMapSightings(items []domain.StationSighting, now time.Time, visibleTrainIDs map[string]struct{}) []domain.StationSighting {
+	if len(items) == 0 || len(visibleTrainIDs) == 0 {
+		return nil
+	}
+	cutoff := now.Add(-networkMapRelevantSightingWindow)
+	out := make([]domain.StationSighting, 0, len(items))
+	for _, item := range items {
+		if item.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if item.MatchedTrainInstanceID == nil {
+			continue
+		}
+		if _, ok := visibleTrainIDs[strings.TrimSpace(*item.MatchedTrainInstanceID)]; !ok {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (s *Service) trainTerminalStop(ctx context.Context, trainID string) (*domain.TrainStop, error) {

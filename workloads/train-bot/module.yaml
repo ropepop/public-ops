@@ -1,19 +1,18 @@
 schema: 1
 module_id: train_bot
-owner: pixel-ops
+owner: arbuzas
 runtime:
-  type: service
-  healthcheck: /data/local/pixel-stack/apps/train-bot/run/train-bot.pid
-  run_id_env: PIXEL_RUN_ID
+  type: external
+  healthcheck: curl -fsS https://train-bot.jolkins.id.lv/api/v1/ready >/dev/null
+  run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: train_bot
-    start: sh /data/local/pixel-stack/bin/pixel-train-start.sh
-    stop: sh /data/local/pixel-stack/bin/pixel-train-stop.sh
-    health: pid=$(cat /data/local/pixel-stack/apps/train-bot/run/train-bot.pid 2>/dev/null || true); [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d train_bot train_tunnel
+    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop train_tunnel train_bot
+    health: curl -fsS http://127.0.0.1:9317/api/v1/ready >/dev/null
     redeploy:
-      mode: artifact_release
-      artifact_id: train-bot-bundle
-      release_root: /data/local/pixel-stack/apps/train-bot/releases
+      mode: compose_release
+      release_root: /etc/arbuzas/releases
 observability:
   event_source: train_bot
   evidence_root: ops/evidence/train-bot

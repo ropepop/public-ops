@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+
+HELPER="/usr/local/bin/arbuzas-dns"
+
+if [[ ! -x "${HELPER}" ]]; then
+  echo "missing helper: ${HELPER}" >&2
+  exit 1
+fi
+
+exec "${HELPER}" compat-identityctl "$@"

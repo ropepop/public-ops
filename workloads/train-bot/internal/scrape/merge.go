@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"telegramtrainapp/internal/domain"
 )
 
 func BuildSnapshotFile(serviceDate time.Time, schedules []RawSchedule) (SnapshotFile, Stats, error) {
@@ -161,6 +163,63 @@ func BuildSnapshotFile(serviceDate time.Time, schedules []RawSchedule) (Snapshot
 	return out, stats, nil
 }
 
+func SnapshotToDomain(snapshot SnapshotFile) ([]domain.TrainInstance, map[string][]domain.TrainStop, error) {
+	trains := make([]domain.TrainInstance, 0, len(snapshot.Trains))
+	stopsByTrain := make(map[string][]domain.TrainStop, len(snapshot.Trains))
+	for _, t := range snapshot.Trains {
+		dep, err := time.Parse(time.RFC3339, t.DepartureAt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse departure for %s: %w", t.ID, err)
+		}
+		arr, err := time.Parse(time.RFC3339, t.ArrivalAt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse arrival for %s: %w", t.ID, err)
+		}
+		if strings.TrimSpace(t.ID) == "" || strings.TrimSpace(t.ServiceDate) == "" {
+			return nil, nil, fmt.Errorf("invalid train with empty id/service_date")
+		}
+		trains = append(trains, domain.TrainInstance{
+			ID:            strings.TrimSpace(t.ID),
+			ServiceDate:   strings.TrimSpace(t.ServiceDate),
+			FromStation:   strings.TrimSpace(t.FromStation),
+			ToStation:     strings.TrimSpace(t.ToStation),
+			DepartureAt:   dep,
+			ArrivalAt:     arr,
+			SourceVersion: strings.TrimSpace(snapshot.SourceVersion),
+		})
+		trainStops := make([]domain.TrainStop, 0, len(t.Stops))
+		for _, s := range t.Stops {
+			if strings.TrimSpace(s.StationName) == "" {
+				continue
+			}
+			stop := domain.TrainStop{
+				TrainInstanceID: strings.TrimSpace(t.ID),
+				StationName:     strings.TrimSpace(s.StationName),
+				Seq:             s.Seq,
+				Latitude:        s.Latitude,
+				Longitude:       s.Longitude,
+			}
+			if s.ArrivalAt != "" {
+				at, err := time.Parse(time.RFC3339, s.ArrivalAt)
+				if err != nil {
+					return nil, nil, fmt.Errorf("parse stop arrival for %s: %w", t.ID, err)
+				}
+				stop.ArrivalAt = &at
+			}
+			if s.DepartureAt != "" {
+				dt, err := time.Parse(time.RFC3339, s.DepartureAt)
+				if err != nil {
+					return nil, nil, fmt.Errorf("parse stop departure for %s: %w", t.ID, err)
+				}
+				stop.DepartureAt = &dt
+			}
+			trainStops = append(trainStops, stop)
+		}
+		stopsByTrain[stopTrainKey(t.ID)] = trainStops
+	}
+	return trains, stopsByTrain, nil
+}
+
 func mergeKey(t RawTrain) string {
 	if strings.TrimSpace(t.ServiceDate) == "" {
 		return trainID(t)
@@ -220,4 +279,8 @@ func stopKey(s RawStop) string {
 		return fmt.Sprintf("%04d:%s", s.Seq, strings.ToLower(strings.TrimSpace(s.StationName)))
 	}
 	return strings.ToLower(strings.TrimSpace(s.StationName))
+}
+
+func stopTrainKey(trainID string) string {
+	return strings.TrimSpace(trainID)
 }

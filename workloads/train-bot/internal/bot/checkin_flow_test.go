@@ -305,10 +305,24 @@ func TestStartCommandBypassesActiveCheckInSession(t *testing.T) {
 		t.Fatalf("handle message: %v", err)
 	}
 
-	req := h.recorder.lastRequest(t, "/sendMessage")
-	text, _ := req.payload["text"].(string)
-	if !strings.Contains(text, "This bot shares real-time alerts") {
-		t.Fatalf("expected start message, got %q", text)
+	h.recorder.mu.Lock()
+	defer h.recorder.mu.Unlock()
+	sendMessages := make([]recordedRequest, 0)
+	for _, request := range h.recorder.requests {
+		if request.path == "/sendMessage" {
+			sendMessages = append(sendMessages, request)
+		}
+	}
+	if len(sendMessages) != 2 {
+		t.Fatalf("expected 2 sendMessage requests, got %d", len(sendMessages))
+	}
+	startText, _ := sendMessages[0].payload["text"].(string)
+	if !strings.Contains(startText, "This bot shares real-time alerts") {
+		t.Fatalf("expected start message, got %q", startText)
+	}
+	openAppText, _ := sendMessages[1].payload["text"].(string)
+	if !strings.Contains(openAppText, "Open the train app") {
+		t.Fatalf("expected open app prompt after start, got %q", openAppText)
 	}
 }
 

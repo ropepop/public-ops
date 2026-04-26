@@ -5,6 +5,27 @@ var assert = require("node:assert/strict");
 
 var externalFeed = require("./external-feed.js");
 
+function isoAt(baseMs, offsetMs) {
+  return new Date(baseMs + (offsetMs || 0)).toISOString();
+}
+
+function liveTrainSample(overrides) {
+  return Object.assign({
+    routeId: "route-6326",
+    serviceDate: "2026-03-10",
+    trainNumber: "6326",
+    updatedAt: "2026-03-10T10:00:00.000Z",
+    animatedPosition: null,
+    rawPosition: null,
+    position: null,
+    isGpsActive: false,
+    stops: [],
+    polyline: [],
+    origin: "Riga",
+    destination: "Majori",
+  }, overrides || {});
+}
+
 test("normalizeTrainGraphPayload strips source-only fields and keeps join data", function () {
   var payload = [
     {
@@ -117,7 +138,8 @@ test("normalizeBackEndFrame keeps live movement fields only", function () {
   var normalized = externalFeed.normalizeBackEndFrame(payload);
   assert.equal(normalized.routeId, "748081");
   assert.equal(normalized.trainNumber, "804");
-  assert.deepEqual(normalized.position, { lat: 56.95, lng: 24.11 });
+  assert.deepEqual(normalized.position, { lat: 56.94, lng: 24.1 });
+  assert.equal(normalized.displaySource, "live");
   assert.equal(normalized.isGpsActive, true);
   assert.equal(normalized.currentStop.title, "Rīga");
   assert.equal(normalized.nextStop.title, "Ogre");
@@ -125,6 +147,268 @@ test("normalizeBackEndFrame keeps live movement fields only", function () {
   assert.equal(normalized.destination, "Daugavpils");
   assert.equal(normalized.polyline.length, 2);
   assert.ok(!("stationNotes" in normalized.nextStop));
+});
+
+test("normalizeBackEndFrame falls back to the raw point as projection when GPS is inactive", function () {
+  var normalized = externalFeed.normalizeBackEndFrame({
+    type: "back-end",
+    returnValue: {
+      id: "748082",
+      train: "805",
+      position: [56.941, 24.101],
+      isGpsActive: false,
+      updaterTimeStamp: 1710000001000,
+    }
+  });
+
+  assert.equal(normalized.displaySource, "projection");
+  assert.deepEqual(normalized.position, { lat: 56.941, lng: 24.101 });
+});
+
+test("stabilizeLiveTrainPositions keeps the majority source across the last 9 samples", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:00:00Z");
+  var snapshot = null;
+
+  for (var projectionIndex = 0; projectionIndex < 5; projectionIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, projectionIndex * 1000),
+        animatedPosition: { lat: 56.95 + (projectionIndex * 0.001), lng: 24.10 + (projectionIndex * 0.001) },
+      })
+    ], memory, baseMs + (projectionIndex * 1000))[0];
+  }
+
+  for (var liveIndex = 0; liveIndex < 4; liveIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, (5 + liveIndex) * 1000),
+        rawPosition: { lat: 56.80 + (liveIndex * 0.001), lng: 24.30 + (liveIndex * 0.001) },
+        isGpsActive: true,
+      })
+    ], memory, baseMs + ((5 + liveIndex) * 1000))[0];
+  }
+
+  assert.equal(snapshot.displaySource, "projection");
+  assert.equal(snapshot.position.lat, 56.954);
+  assert.ok(Math.abs(snapshot.position.lng - 24.104) < 1e-9);
+
+  snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 9000),
+      rawPosition: { lat: 56.91, lng: 24.41 },
+      isGpsActive: true,
+    })
+  ], memory, baseMs + 9000)[0];
+
+  assert.equal(snapshot.displaySource, "live");
+  assert.deepEqual(snapshot.position, { lat: 56.91, lng: 24.41 });
+});
+
+test("stabilizeLiveTrainPositions uses the observed GPS mode when both coordinate sets are present", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:02:00Z");
+  var snapshot = null;
+
+  for (var projectionIndex = 0; projectionIndex < 5; projectionIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, projectionIndex * 1000),
+        animatedPosition: { lat: 56.90 + (projectionIndex * 0.001), lng: 24.50 + (projectionIndex * 0.001) },
+        rawPosition: { lat: 56.70 + (projectionIndex * 0.001), lng: 24.10 + (projectionIndex * 0.001) },
+        isGpsActive: false,
+      })
+    ], memory, baseMs + (projectionIndex * 1000))[0];
+  }
+
+  for (var liveIndex = 0; liveIndex < 4; liveIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, (5 + liveIndex) * 1000),
+        animatedPosition: { lat: 56.91 + (liveIndex * 0.001), lng: 24.51 + (liveIndex * 0.001) },
+        rawPosition: { lat: 56.80 + (liveIndex * 0.001), lng: 24.20 + (liveIndex * 0.001) },
+        isGpsActive: true,
+      })
+    ], memory, baseMs + ((5 + liveIndex) * 1000))[0];
+  }
+
+  assert.equal(snapshot.displaySource, "projection");
+  assert.deepEqual(snapshot.position, { lat: 56.913, lng: 24.513 });
+
+  snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 9000),
+      animatedPosition: { lat: 56.95, lng: 24.55 },
+      rawPosition: { lat: 56.85, lng: 24.25 },
+      isGpsActive: true,
+    })
+  ], memory, baseMs + 9000)[0];
+
+  assert.equal(snapshot.displaySource, "live");
+  assert.deepEqual(snapshot.position, { lat: 56.85, lng: 24.25 });
+});
+
+test("stabilizeLiveTrainPositions switches between projection and live without one-sample flicker", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:05:00Z");
+  var snapshot = null;
+
+  for (var liveIndex = 0; liveIndex < 5; liveIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, liveIndex * 1000),
+        rawPosition: { lat: 56.70 + (liveIndex * 0.001), lng: 24.10 + (liveIndex * 0.001) },
+        isGpsActive: true,
+      })
+    ], memory, baseMs + (liveIndex * 1000))[0];
+  }
+  assert.equal(snapshot.displaySource, "live");
+
+  for (var projectionIndex = 0; projectionIndex < 4; projectionIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, (5 + projectionIndex) * 1000),
+        animatedPosition: { lat: 56.90 + (projectionIndex * 0.001), lng: 24.50 + (projectionIndex * 0.001) },
+      })
+    ], memory, baseMs + ((5 + projectionIndex) * 1000))[0];
+  }
+  assert.equal(snapshot.displaySource, "live");
+
+  snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 9000),
+      animatedPosition: { lat: 56.95, lng: 24.55 },
+    })
+  ], memory, baseMs + 9000)[0];
+  assert.equal(snapshot.displaySource, "projection");
+
+  snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 10000),
+      rawPosition: { lat: 56.75, lng: 24.15 },
+      isGpsActive: true,
+    })
+  ], memory, baseMs + 10000)[0];
+  assert.equal(snapshot.displaySource, "projection");
+
+  for (var returnIndex = 0; returnIndex < 4; returnIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, (11 + returnIndex) * 1000),
+        rawPosition: { lat: 56.76 + (returnIndex * 0.001), lng: 24.16 + (returnIndex * 0.001) },
+        isGpsActive: true,
+      })
+    ], memory, baseMs + ((11 + returnIndex) * 1000))[0];
+  }
+
+  assert.equal(snapshot.displaySource, "live");
+});
+
+test("stabilizeLiveTrainPositions uses the raw point as a projection fallback when GPS is inactive", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:07:00Z");
+  var snapshot = null;
+
+  for (var projectionIndex = 0; projectionIndex < 5; projectionIndex += 1) {
+    snapshot = externalFeed.stabilizeLiveTrainPositions([
+      liveTrainSample({
+        updatedAt: isoAt(baseMs, projectionIndex * 1000),
+        animatedPosition: { lat: 56.40 + (projectionIndex * 0.001), lng: 24.40 + (projectionIndex * 0.001) },
+        rawPosition: { lat: 56.20 + (projectionIndex * 0.001), lng: 24.20 + (projectionIndex * 0.001) },
+        isGpsActive: false,
+      })
+    ], memory, baseMs + (projectionIndex * 1000))[0];
+  }
+
+  snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 6000),
+      rawPosition: { lat: 56.99, lng: 24.99 },
+      isGpsActive: false,
+    })
+  ], memory, baseMs + 6000)[0];
+
+  assert.equal(snapshot.displaySource, "projection");
+  assert.deepEqual(snapshot.position, { lat: 56.99, lng: 24.99 });
+  assert.equal(snapshot.displayUpdatedAt, isoAt(baseMs, 6000));
+});
+
+test("stabilizeLiveTrainPositions keeps the last location when the current sample has no usable point", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:10:00Z");
+
+  externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 0),
+      rawPosition: { lat: 56.88, lng: 24.22 },
+      isGpsActive: true,
+    })
+  ], memory, baseMs);
+
+  var snapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 60000),
+    })
+  ], memory, baseMs + 60000)[0];
+
+  assert.equal(snapshot.displaySource, "live");
+  assert.deepEqual(snapshot.position, { lat: 56.88, lng: 24.22 });
+  assert.equal(snapshot.displayUpdatedAt, isoAt(baseMs, 0));
+});
+
+test("stabilizeLiveTrainPositions keeps the last location through a short full-frame gap", function () {
+  var memory = new Map();
+  var baseMs = Date.parse("2026-03-10T10:15:00Z");
+
+  externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 0),
+      animatedPosition: { lat: 56.99, lng: 24.33 },
+    })
+  ], memory, baseMs);
+
+  var remembered = externalFeed.stabilizeLiveTrainPositions([], memory, baseMs + 120000);
+  assert.equal(remembered.length, 1);
+  assert.equal(remembered[0].displaySource, "projection");
+  assert.deepEqual(remembered[0].position, { lat: 56.99, lng: 24.33 });
+
+  var expired = externalFeed.stabilizeLiveTrainPositions([], memory, baseMs + (7 * 60 * 1000));
+  assert.deepEqual(expired, []);
+});
+
+test("stabilizeLiveTrainPositions keeps ties stable and prefers live when there is no prior source", function () {
+  var baseMs = Date.parse("2026-03-10T10:20:00Z");
+
+  var firstMemory = new Map();
+  var firstSnapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 0),
+      animatedPosition: { lat: 56.60, lng: 24.60 },
+      rawPosition: { lat: 56.61, lng: 24.61 },
+      isGpsActive: true,
+    })
+  ], firstMemory, baseMs)[0];
+  assert.equal(firstSnapshot.displaySource, "live");
+  assert.deepEqual(firstSnapshot.position, { lat: 56.61, lng: 24.61 });
+
+  var secondMemory = new Map();
+  externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 0),
+      animatedPosition: { lat: 56.70, lng: 24.70 },
+    })
+  ], secondMemory, baseMs);
+
+  var tiedSnapshot = externalFeed.stabilizeLiveTrainPositions([
+    liveTrainSample({
+      updatedAt: isoAt(baseMs, 1000),
+      rawPosition: { lat: 56.71, lng: 24.71 },
+      isGpsActive: true,
+    })
+  ], secondMemory, baseMs + 1000)[0];
+
+  assert.equal(tiedSnapshot.displaySource, "projection");
+  assert.deepEqual(tiedSnapshot.position, { lat: 56.70, lng: 24.70 });
 });
 
 test("normalizeActiveStopsFrame strips source-only station metadata", function () {
@@ -261,6 +545,65 @@ test("matchLocalTrain falls back to route and departure window when ids miss", f
   assert.ok(result);
   assert.equal(result.matchType, "route-time-window");
   assert.equal(result.match, localTrains[1]);
+});
+
+test("createLocalTrainMatcher reuses prepared local data without changing match results", function () {
+  var localTrains = [
+    {
+      id: "2026-03-06-train-6101",
+      serviceDate: "2026-03-06",
+      trainNumber: "6101",
+      origin: "Rīga",
+      destination: "Daugavpils",
+      departureTime: "09:10"
+    },
+    {
+      id: "shadow-train",
+      serviceDate: "2026-03-06",
+      trainNumber: "804",
+      origin: "Rīga",
+      destination: "Jelgava",
+      departureTime: "08:45"
+    },
+    {
+      id: "route-window",
+      serviceDate: "2026-03-06",
+      trainNumber: "9999",
+      origin: "Rīga",
+      destination: "Valmiera",
+      departureTime: "10:01"
+    }
+  ];
+  var matcher = externalFeed.createLocalTrainMatcher(localTrains);
+  var exactExternal = {
+    serviceDate: "2026-03-06",
+    trainNumber: "6101",
+    origin: "Rīga",
+    destination: "Daugavpils",
+    departureTime: "09:10"
+  };
+  var sameNumberExternal = {
+    serviceDate: "2026-03-06",
+    trainNumber: "804",
+    origin: "Rīga",
+    destination: "Jelgava",
+    departureTime: "08:46"
+  };
+  var routeWindowExternal = {
+    serviceDate: "2026-03-06",
+    trainNumber: "6102",
+    origin: "Riga",
+    destination: "Valmiera",
+    departureTime: "10:00"
+  };
+
+  assert.deepEqual(matcher(exactExternal), externalFeed.matchLocalTrain(exactExternal, localTrains));
+  assert.deepEqual(matcher(sameNumberExternal), externalFeed.matchLocalTrain(sameNumberExternal, localTrains));
+  assert.deepEqual(matcher(routeWindowExternal), externalFeed.matchLocalTrain(routeWindowExternal, localTrains));
+  assert.deepEqual(
+    externalFeed.matchLocalTrain(localTrains, exactExternal),
+    externalFeed.matchLocalTrain(exactExternal, localTrains)
+  );
 });
 
 test("stableExternalTrainIdentity prefers route ids when available", function () {
@@ -485,4 +828,186 @@ test("planMarkerReconcile updates an in-place selected popup and clears it when 
   assert.deepEqual(removePlan.removeKeys, ["train-stop:6326:majori"]);
   assert.equal(removePlan.clearPopup, true);
   assert.equal(removePlan.retainPopupKey, "");
+});
+
+test("createExternalTrainMapClient starts websocket even when the direct graph fetch fails", async function () {
+  function FakeSocket(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.listeners = {};
+    sockets.push(this);
+  }
+  FakeSocket.prototype.addEventListener = function (type, handler) {
+    this.listeners[type] = this.listeners[type] || [];
+    this.listeners[type].push(handler);
+  };
+  FakeSocket.prototype.close = function () {
+    this.readyState = 3;
+  };
+  FakeSocket.prototype.emit = function (type, payload) {
+    (this.listeners[type] || []).forEach(function (handler) {
+      handler(payload || {});
+    });
+  };
+
+  var sockets = [];
+  var requestedURL = "";
+  var client = externalFeed.createExternalTrainMapClient({
+    enabled: true,
+    baseURL: "https://trainmap.vivi.lv",
+    wsURL: "wss://trainmap.pv.lv/ws",
+    fetchImpl: function (url) {
+      requestedURL = url;
+      return Promise.reject(new Error("blocked by cors"));
+    },
+    WebSocketCtor: FakeSocket,
+  });
+
+  await client.start();
+
+  assert.equal(requestedURL, "https://trainmap.vivi.lv/api/trainGraph");
+  assert.equal(sockets.length, 1);
+  assert.equal(client.snapshot().connectionState, "connecting");
+  assert.equal(client.snapshot().graphState, "unavailable");
+
+  sockets[0].emit("open");
+
+  assert.equal(client.snapshot().connectionState, "live");
+  assert.equal(client.snapshot().graphState, "unavailable");
+});
+
+test("createExternalTrainMapClient uses direct graph data as optional enrichment", async function () {
+  function FakeSocket() {
+    this.readyState = 0;
+    this.listeners = {};
+  }
+  FakeSocket.prototype.addEventListener = function (type, handler) {
+    this.listeners[type] = this.listeners[type] || [];
+    this.listeners[type].push(handler);
+  };
+  FakeSocket.prototype.close = function () {
+    this.readyState = 3;
+  };
+
+  var client = externalFeed.createExternalTrainMapClient({
+    enabled: true,
+    baseURL: "https://trainmap.vivi.lv",
+    wsURL: "wss://trainmap.pv.lv/ws",
+    fetchImpl: function () {
+      return Promise.resolve({
+        ok: true,
+        json: function () {
+          return Promise.resolve({
+            data: [
+              {
+                id: "route-6326",
+                train: "6326",
+                schDate: "2026-03-10",
+                departure: "18:55",
+                stops: [
+                  { id: "riga", title: "Rīga", departure: "18:55", coords: [56.946285, 24.105078] },
+                  { id: "majori", title: "Majori", departure: "19:23", coords: [56.970354, 23.770267] }
+                ]
+              }
+            ]
+          });
+        }
+      });
+    },
+    WebSocketCtor: FakeSocket,
+  });
+
+  await client.start();
+
+  var snapshot = client.snapshot();
+  assert.equal(snapshot.graphState, "ready");
+  assert.equal(snapshot.routes.length, 1);
+  assert.equal(snapshot.routes[0].routeId, "route-6326");
+  assert.equal(snapshot.routes[0].polyline.length, 2);
+});
+
+test("createExternalTrainMapClient keeps websocket-only train geometry usable without graph routes", async function () {
+  function FakeSocket() {
+    this.readyState = 0;
+    this.listeners = {};
+    sockets.push(this);
+  }
+  FakeSocket.prototype.addEventListener = function (type, handler) {
+    this.listeners[type] = this.listeners[type] || [];
+    this.listeners[type].push(handler);
+  };
+  FakeSocket.prototype.close = function () {
+    this.readyState = 3;
+  };
+  FakeSocket.prototype.emit = function (type, payload) {
+    (this.listeners[type] || []).forEach(function (handler) {
+      handler(payload || {});
+    });
+  };
+
+  var sockets = [];
+  var client = externalFeed.createExternalTrainMapClient({
+    enabled: true,
+    baseURL: "https://trainmap.vivi.lv",
+    wsURL: "wss://trainmap.pv.lv/ws",
+    fetchImpl: function () {
+      return Promise.reject(new Error("blocked by cors"));
+    },
+    WebSocketCtor: FakeSocket,
+  });
+
+  await client.start();
+  sockets[0].emit("open");
+  sockets[0].emit("message", {
+    data: JSON.stringify({
+      type: "back-end",
+      name: "Riga - Majori",
+      stopCoordArray: [
+        [56.946285, 24.105078],
+        [56.970354, 23.770267]
+      ],
+      returnValue: {
+        id: "748081",
+        train: "6326",
+        animatedCoord: [56.95, 24.11],
+        departureTime: "2026-03-10T18:55:00Z",
+        arrivalTime: "2026-03-10T19:23:00Z",
+        currentStopIndex: 0,
+        nextStopObj: {
+          id: "majori",
+          title: "Majori",
+          departure: "2026-03-10T19:23:00Z",
+          coords: [56.970354, 23.770267]
+        },
+        stopObjArray: [
+          { id: "riga", title: "Rīga", departure: "2026-03-10T18:55:00Z", coords: [56.946285, 24.105078] },
+          { id: "majori", title: "Majori", departure: "2026-03-10T19:23:00Z", coords: [56.970354, 23.770267] }
+        ]
+      }
+    })
+  });
+  sockets[0].emit("message", {
+    data: JSON.stringify({
+      type: "active-stops",
+      data: [
+        {
+          id: "majori",
+          title: "Majori",
+          coords: [56.970354, 23.770267],
+          train: "6326",
+          routes_id: "748081",
+          departure: "2026-03-10T19:23:00Z"
+        }
+      ]
+    })
+  });
+
+  var snapshot = client.snapshot();
+  assert.equal(snapshot.connectionState, "live");
+  assert.equal(snapshot.routes.length, 0);
+  assert.equal(snapshot.liveTrains.length, 1);
+  assert.equal(snapshot.liveTrains[0].stops.length, 2);
+  assert.equal(snapshot.liveTrains[0].nextStop.title, "Majori");
+  assert.equal(snapshot.liveTrains[0].polyline.length, 2);
+  assert.equal(snapshot.activeStops.length, 1);
 });

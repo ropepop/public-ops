@@ -1,0 +1,37 @@
+{
+  "timestamp": "2026-03-01T17:16:15+0200",
+  "host": "192.168.31.25",
+  "fqdn": "dns.jolkins.id.lv",
+  "reachability": {"ping": "ok"},
+  "ports": {
+    "53": "open",
+    "443": "open",
+    "853": "closed",
+    "2222": "closed",
+    "8080": "closed"
+  },
+  "dns": {
+    "host_53": {"state": "ok", "data": "104.18.26.120,104.18.27.120"}
+  },
+  "https": {
+    "dns_root": "302",
+    "dns_admin": "401",
+    "doh_url": "https://dns.jolkins.id.lv/2873efbe2015ac05e3ef64a29940af55117a91172caa0b56/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_code": "200",
+    "contract_root_redirect": "pass",
+    "contract_admin_ui_reachable": "pass",
+    "contract_doh_200": "pass",
+    "contract_remote_required": "pass"
+  },
+  "adb": {
+    "available": 1,
+    "connect_result": "",
+    "target": "192.168.31.25:5555",
+    "device_state": "device"
+  },
+  "rooted": {
+    "adguardhome_service_loop": "running",
+    "listen_53": "open",
+    "listen_2222": "open"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://pixel-ops.local/schemas/observability-health.v1.schema.json",
+  "$id": "https://ops.local/schemas/observability-health.v1.schema.json",
   "title": "Observability Health Snapshot v1",
   "type": "object",
   "required": [

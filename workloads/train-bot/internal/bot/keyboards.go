@@ -10,14 +10,19 @@ func MainReplyKeyboard(lang domain.Language, catalog *i18n.Catalog) map[string]a
 }
 
 func MainReplyKeyboardWithWebApp(lang domain.Language, catalog *i18n.Catalog, appLaunchURL string) map[string]any {
+	return MainReplyKeyboardWithWebAppAndIncidents(lang, catalog, appLaunchURL, "")
+}
+
+func MainReplyKeyboardWithWebAppAndIncidents(lang domain.Language, catalog *i18n.Catalog, appLaunchURL, incidentsURL string) map[string]any {
 	rows := make([][]map[string]any, 0, 4)
 	if appLaunchURL != "" {
 		rows = append(rows, []map[string]any{WebAppInlineButton(catalog.T(lang, "btn_open_app"), appLaunchURL)})
 	}
+	if incidentsURL != "" {
+		rows = append(rows, []map[string]any{WebAppInlineButton(catalog.T(lang, "btn_open_incidents"), incidentsURL)})
+	}
 	rows = append(rows,
-		[]map[string]any{{"text": catalog.T(lang, "btn_main_checkin")}, {"text": catalog.T(lang, "btn_main_my_ride")}},
-		[]map[string]any{{"text": catalog.T(lang, "btn_main_report")}, {"text": catalog.T(lang, "btn_main_settings")}},
-		[]map[string]any{{"text": catalog.T(lang, "btn_main_help")}},
+		[]map[string]any{{"text": catalog.T(lang, "btn_main_settings")}, {"text": catalog.T(lang, "btn_main_help")}},
 	)
 	return map[string]any{
 		"keyboard":                rows,

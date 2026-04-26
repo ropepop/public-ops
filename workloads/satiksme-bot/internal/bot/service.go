@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,13 +20,17 @@ type MessageClient interface {
 type BotConfigurator interface {
 	SetMyCommands(ctx context.Context, commands []telegram.BotCommand) error
 	SetChatMenuButton(ctx context.Context, button telegram.MenuButtonWebApp) error
+	SetMyName(ctx context.Context, name string) error
+	SetMyShortDescription(ctx context.Context, description string) error
+	SetMyDescription(ctx context.Context, description string) error
 }
 
 type Service struct {
 	client       MessageClient
 	pollTimeout  int
-	miniAppURL   string
+	appURL       string
 	publicURL    string
+	incidentsURL string
 	reportsURL   string
 	runtimeState *runtime.State
 	replyMarkup  telegram.ReplyKeyboardMarkup
@@ -33,20 +38,36 @@ type Service struct {
 }
 
 const (
-	mainOpenMap     = "Atvērt satiksmes mapi"
-	mainPublicSite  = "Publiskā mape"
-	mainReportsFeed = "Ziņojumu kanāls"
+	mapCommand             = "/karte"
+	incidentsCommand       = "/notiek"
+	legacyIncidentsCommand = "/incidents"
+	legacyPublicSite       = "Publiskā mape"
+	mainOpenMap            = "Atvērt Kontroli"
+	mainIncidents          = "Kontroles plūsma"
+	mainReportsFeed        = "Ziņojumu kanāls"
+	botName                = "Kontrole"
+	botShortDescription    = "Satiksmes karte un kontroles ziņojumi Rīgā."
+	botDescription         = "Kontrole parāda Rīgas satiksmes karti, aktīvo transportu un kontroles ziņojumus. Telegram sesija ļauj anonīmi ziņot, balsot un komentēt."
 )
 
-func NewService(client MessageClient, pollTimeout int, miniAppURL, publicURL, reportsURL string, runtimeState *runtime.State) *Service {
+type menuDestination struct {
+	replyLabel  string
+	inlineLabel string
+	lineLabel   string
+	url         string
+	webApp      bool
+}
+
+func NewService(client MessageClient, pollTimeout int, appURL, publicURL, reportsURL string, runtimeState *runtime.State) *Service {
 	service := &Service{
 		client:       client,
 		pollTimeout:  pollTimeout,
-		miniAppURL:   strings.TrimSpace(miniAppURL),
+		appURL:       strings.TrimSpace(appURL),
 		publicURL:    strings.TrimSpace(publicURL),
 		reportsURL:   strings.TrimSpace(reportsURL),
 		runtimeState: runtimeState,
 	}
+	service.incidentsURL = resolveIncidentsURL(service.appURL, service.publicURL)
 	service.replyMarkup = service.newReplyKeyboard()
 	service.inlineMarkup = service.newInlineKeyboard()
 	return service
@@ -93,19 +114,12 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) handleMessage(ctx context.Context, message telegram.Message) error {
-	text := strings.TrimSpace(message.Text)
+	text := normalizeTelegramMessageText(message.Text)
 	switch text {
-	case "/start", "/menu", "":
+	case "/start", "/menu", "", mapCommand, mainOpenMap, legacyPublicSite, mainReportsFeed:
 		return s.sendWelcome(ctx, message.Chat.ID)
-	case mainPublicSite:
-		return s.client.SendMessage(ctx, message.Chat.ID, s.publicURL, telegram.MessageOptions{ReplyMarkup: s.replyMarkup})
-	case mainReportsFeed:
-		if s.reportsURL == "" {
-			return s.client.SendMessage(ctx, message.Chat.ID, "Ziņojumu kanāls nav konfigurēts.", telegram.MessageOptions{ReplyMarkup: s.replyMarkup})
-		}
-		return s.client.SendMessage(ctx, message.Chat.ID, s.reportsURL, telegram.MessageOptions{ReplyMarkup: s.replyMarkup})
-	case mainOpenMap:
-		return s.sendWelcome(ctx, message.Chat.ID)
+	case incidentsCommand, legacyIncidentsCommand, "/-incidents", mainIncidents:
+		return s.sendIncidents(ctx, message.Chat.ID)
 	default:
 		return s.sendWelcome(ctx, message.Chat.ID)
 	}
@@ -113,18 +127,23 @@ func (s *Service) handleMessage(ctx context.Context, message telegram.Message) e
 
 func (s *Service) sendWelcome(ctx context.Context, chatID int64) error {
 	lines := []string{
-		"Rīgas Satiksmes kontroles mape.",
-		"Mini lietotnē vari redzēt tuvākās pieturas, tiešraides atiešanas laikus un iesniegt kontroles ziņojumus.",
+		"Kontrole — satiksmes karte un kontroles ziņojumi Rīgā.",
+		"Atver Kontroli, lai redzētu pieturas, aktīvo transportu un jaunākos ziņojumus vienuviet.",
 	}
-	if s.publicURL != "" {
-		lines = append(lines, "Publiskā mape: "+s.publicURL)
+	return s.sendMenuMessage(ctx, chatID, lines...)
+}
+
+func (s *Service) sendIncidents(ctx context.Context, chatID int64) error {
+	incidents, ok := s.menuDestination(mainIncidents)
+	if !ok {
+		return s.sendMessageLines(ctx, chatID, "Pēdējo 24 stundu incidentu skats nav konfigurēts.")
 	}
-	if s.reportsURL != "" {
-		lines = append(lines, "Ziņojumu kanāls: "+s.reportsURL)
+	lines := []string{
+		"Kontroles plūsma rāda pēdējo 24 stundu ziņojumus, anonīmus balsojumus un komentārus.",
+		"Komanda: " + incidentsCommand,
+		"Atvērt: " + incidents.url,
 	}
-	return s.client.SendMessage(ctx, chatID, strings.Join(lines, "\n"), telegram.MessageOptions{
-		ReplyMarkup: s.welcomeMarkup(),
-	})
+	return s.sendMessageLines(ctx, chatID, lines...)
 }
 
 func (s *Service) configureBot(ctx context.Context) {
@@ -133,21 +152,32 @@ func (s *Service) configureBot(ctx context.Context) {
 		return
 	}
 	commands := []telegram.BotCommand{
-		{Command: "start", Description: "Atvērt satiksmes mini lietotni"},
-		{Command: "menu", Description: "Parādīt satiksmes saites"},
+		{Command: "start", Description: "Atvērt Kontroli"},
+		{Command: strings.TrimPrefix(mapCommand, "/"), Description: "Atvērt satiksmes karti"},
+		{Command: strings.TrimPrefix(incidentsCommand, "/"), Description: "Skatīt kontroles plūsmu"},
+		{Command: "menu", Description: "Parādīt saites"},
 	}
 	if err := configurator.SetMyCommands(ctx, commands); err != nil {
 		log.Printf("telegram setMyCommands error: %v", err)
 	}
-	if s.miniAppURL == "" {
-		return
+	if s.appURL != "" {
+		button := telegram.MenuButtonWebApp{
+			Type:   "web_app",
+			Text:   mainOpenMap,
+			WebApp: &telegram.WebAppInfo{URL: s.appURL},
+		}
+		if err := configurator.SetChatMenuButton(ctx, button); err != nil {
+			log.Printf("telegram setChatMenuButton error: %v", err)
+		}
 	}
-	if err := configurator.SetChatMenuButton(ctx, telegram.MenuButtonWebApp{
-		Type:   "web_app",
-		Text:   "Atvērt mini lietotni",
-		WebApp: &telegram.WebAppInfo{URL: s.miniAppURL},
-	}); err != nil {
-		log.Printf("telegram setChatMenuButton error: %v", err)
+	if err := configurator.SetMyName(ctx, botName); err != nil {
+		log.Printf("telegram setMyName error: %v", err)
+	}
+	if err := configurator.SetMyShortDescription(ctx, botShortDescription); err != nil {
+		log.Printf("telegram setMyShortDescription error: %v", err)
+	}
+	if err := configurator.SetMyDescription(ctx, botDescription); err != nil {
+		log.Printf("telegram setMyDescription error: %v", err)
 	}
 }
 
@@ -159,43 +189,186 @@ func (s *Service) welcomeMarkup() any {
 }
 
 func (s *Service) newReplyKeyboard() telegram.ReplyKeyboardMarkup {
-	firstRow := []telegram.KeyboardButton{}
-	if s.miniAppURL != "" {
-		firstRow = append(firstRow, telegram.KeyboardButton{
-			Text:   mainOpenMap,
-			WebApp: &telegram.WebAppInfo{URL: s.miniAppURL},
-		})
-	} else {
-		firstRow = append(firstRow, telegram.KeyboardButton{Text: mainOpenMap})
+	firstRow := s.replyRow(mainOpenMap)
+	secondRow := s.replyRow(mainIncidents)
+	thirdRow := s.replyRow(mainReportsFeed)
+	rows := make([][]telegram.KeyboardButton, 0, 3)
+	for _, row := range [][]telegram.KeyboardButton{firstRow, secondRow, thirdRow} {
+		if len(row) == 0 {
+			continue
+		}
+		rows = append(rows, row)
 	}
 	return telegram.ReplyKeyboardMarkup{
-		Keyboard: [][]telegram.KeyboardButton{
-			firstRow,
-			{{Text: mainPublicSite}, {Text: mainReportsFeed}},
-		},
+		Keyboard:       rows,
 		ResizeKeyboard: true,
 		IsPersistent:   true,
 	}
 }
 
 func (s *Service) newInlineKeyboard() telegram.InlineKeyboardMarkup {
-	row := []telegram.InlineKeyboardButton{}
-	if s.miniAppURL != "" {
-		row = append(row, telegram.InlineKeyboardButton{
-			Text:   "Mini lietotne",
-			WebApp: &telegram.WebAppInfo{URL: s.miniAppURL},
-		})
+	firstRow := s.inlineRow(mainOpenMap, mainIncidents)
+	secondRow := s.inlineRow(mainReportsFeed)
+	rows := make([][]telegram.InlineKeyboardButton, 0, 2)
+	for _, row := range [][]telegram.InlineKeyboardButton{firstRow, secondRow} {
+		if len(row) == 0 {
+			continue
+		}
+		rows = append(rows, row)
 	}
-	if s.publicURL != "" {
-		row = append(row, telegram.InlineKeyboardButton{Text: "Publiskā mape", URL: s.publicURL})
-	}
-	if s.reportsURL != "" {
-		row = append(row, telegram.InlineKeyboardButton{Text: "Ziņojumi", URL: s.reportsURL})
-	}
-	if len(row) == 0 {
+	if len(rows) == 0 {
 		return telegram.InlineKeyboardMarkup{}
 	}
-	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{row}}
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func (s *Service) sendMenuMessage(ctx context.Context, chatID int64, prefixLines ...string) error {
+	lines := append([]string{}, prefixLines...)
+	lines = append(lines, s.menuSummaryLines()...)
+	return s.sendMessageLines(ctx, chatID, lines...)
+}
+
+func (s *Service) sendMessageLines(ctx context.Context, chatID int64, lines ...string) error {
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return s.client.SendMessage(ctx, chatID, strings.Join(filtered, "\n"), telegram.MessageOptions{
+		ReplyMarkup: s.welcomeMarkup(),
+	})
+}
+
+func (s *Service) menuSummaryLines() []string {
+	lines := []string{
+		"Komanda kartei: " + mapCommand,
+		"Komanda plūsmai: " + incidentsCommand,
+	}
+	for _, action := range []string{mainOpenMap, mainIncidents, mainReportsFeed} {
+		destination, ok := s.menuDestination(action)
+		if !ok {
+			continue
+		}
+		lines = append(lines, destination.lineLabel+": "+destination.url)
+	}
+	return lines
+}
+
+func (s *Service) replyRow(actions ...string) []telegram.KeyboardButton {
+	row := make([]telegram.KeyboardButton, 0, len(actions))
+	for _, action := range actions {
+		destination, ok := s.menuDestination(action)
+		if !ok {
+			continue
+		}
+		button := telegram.KeyboardButton{Text: destination.replyLabel}
+		if destination.webApp {
+			button.WebApp = &telegram.WebAppInfo{URL: destination.url}
+		}
+		row = append(row, button)
+	}
+	return row
+}
+
+func (s *Service) inlineRow(actions ...string) []telegram.InlineKeyboardButton {
+	row := make([]telegram.InlineKeyboardButton, 0, len(actions))
+	for _, action := range actions {
+		destination, ok := s.menuDestination(action)
+		if !ok {
+			continue
+		}
+		button := telegram.InlineKeyboardButton{Text: destination.inlineLabel}
+		if destination.webApp {
+			button.WebApp = &telegram.WebAppInfo{URL: destination.url}
+		} else {
+			button.URL = destination.url
+		}
+		row = append(row, button)
+	}
+	return row
+}
+
+func (s *Service) menuDestination(action string) (menuDestination, bool) {
+	switch action {
+	case mainOpenMap:
+		if s.appURL == "" {
+			return menuDestination{}, false
+		}
+		return menuDestination{
+			replyLabel:  mainOpenMap,
+			inlineLabel: mainOpenMap,
+			lineLabel:   "Kontrole",
+			url:         s.appURL,
+			webApp:      true,
+		}, true
+	case mainIncidents:
+		if s.incidentsURL == "" {
+			return menuDestination{}, false
+		}
+		return menuDestination{
+			replyLabel:  mainIncidents,
+			inlineLabel: mainIncidents,
+			lineLabel:   mainIncidents,
+			url:         s.incidentsURL,
+			webApp:      true,
+		}, true
+	case mainReportsFeed:
+		if s.reportsURL == "" {
+			return menuDestination{}, false
+		}
+		return menuDestination{
+			replyLabel:  mainReportsFeed,
+			inlineLabel: "Ziņojumi",
+			lineLabel:   mainReportsFeed,
+			url:         s.reportsURL,
+		}, true
+	default:
+		return menuDestination{}, false
+	}
+}
+
+func normalizeTelegramMessageText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return ""
+	}
+	command := fields[0]
+	if !strings.HasPrefix(command, "/") {
+		return text
+	}
+	if at := strings.Index(command, "@"); at >= 0 {
+		command = command[:at]
+	}
+	return command
+}
+
+func resolveIncidentsURL(appURL, publicURL string) string {
+	publicURL = strings.TrimSpace(publicURL)
+	if publicURL != "" {
+		return strings.TrimRight(publicURL, "/") + "/incidents"
+	}
+	appURL = strings.TrimSpace(appURL)
+	if appURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(appURL)
+	if err != nil {
+		return ""
+	}
+	if !strings.HasSuffix(parsed.Path, "/app") {
+		return ""
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/app") + "/incidents"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func nextTelegramBackoff(current time.Duration) time.Duration {

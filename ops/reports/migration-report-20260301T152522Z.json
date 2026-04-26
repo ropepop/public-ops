@@ -1,0 +1,19 @@
+{
+  "source_payload": "/etc/pixel-stack/remote-dns/state/pihole-migration-payload.json",
+  "target": "http://127.0.0.1:8080",
+  "status": "ok",
+  "error": null,
+  "adlists": {
+    "added": 0,
+    "skipped": 0,
+    "failed": 0
+  },
+  "rules": {
+    "applied": 0,
+    "failed": 0
+  },
+  "dns": {
+    "upstreams": ["https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"],
+    "status": "applied"
+  }
+}

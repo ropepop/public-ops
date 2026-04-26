@@ -86,7 +86,7 @@ def test_watchdog_detects_missing_heartbeat():
 
 
 def test_run_daemon_lock_held_is_non_recoverable(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "orchestrator_root")
+    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "managed_service")
     config = _make_config(tmp_path)
     lock = ProcessLock(config.daemon_lock_file)
     lock.acquire()
@@ -101,7 +101,7 @@ def test_run_daemon_lock_held_is_non_recoverable(tmp_path: Path, monkeypatch):
 
 
 def test_run_daemon_retries_recoverable_worker_exits_with_backoff(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "orchestrator_root")
+    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "managed_service")
     config = _make_config(tmp_path)
     worker_exits = [
         DAEMON_EXIT_THREAD_DIED,
@@ -126,7 +126,7 @@ def test_run_daemon_retries_recoverable_worker_exits_with_backoff(tmp_path: Path
 
 
 def test_backoff_resets_after_stable_window(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "orchestrator_root")
+    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "managed_service")
     config = _make_config(tmp_path)
     run_outcomes = [DAEMON_EXIT_THREAD_DIED, DAEMON_EXIT_THREAD_DIED, DAEMON_EXIT_THREAD_DIED, 0]
     sleep_calls: list[float] = []

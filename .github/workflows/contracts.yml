@@ -6,33 +6,30 @@ on:
   pull_request:
 
 jobs:
-  contracts:
+  docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyyaml jsonschema
-      - name: Validate contracts
-        run: |
-          ./tools/import/validate_contracts.py
       - name: Validate docs links
         run: |
           ./tools/docs/check_links.sh
 
   go-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - workloads/train-bot
+          - workloads/satiksme-bot
+          - workloads/subscription-bot
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: workloads/train-bot/go.mod
-      - name: Run train-bot tests
-        working-directory: workloads/train-bot
+          go-version-file: ${{ matrix.module }}/go.mod
+      - name: Run Go tests
+        working-directory: ${{ matrix.module }}
         run: |
           go test ./...
 
@@ -42,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
       - name: Install site-notifications test deps
         working-directory: workloads/site-notifications
         run: |
@@ -59,10 +56,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shell syntax check
         run: |
-          find automation/task-executor/scripts tools/import -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          find automation/task-executor/scripts tools/arbuzas infra/adguardhome/debian -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          bash -n workloads/site-notifications/scripts/install_linux_systemd.sh
+      - name: Deploy helper smoke check
+        run: |
+          ./tools/arbuzas/deploy.sh --help >/dev/null
       - name: Run automation smoke test
         run: |
           ./automation/task-executor/scripts/drain_runner_smoke_test.sh
-      - name: Check runtime template parity
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose configuration
         run: |
-          ./tools/import/check_runtime_template_parity.sh
+          docker compose -f infra/arbuzas/docker/compose.yml --env-file infra/arbuzas/docker/env/arbuzas.example.env config >/tmp/arbuzas-compose-config.txt
+      - name: Build active Docker images
+        run: |
+          for dockerfile in infra/arbuzas/docker/images/*.Dockerfile; do
+            image_name="arbuzas/$(basename "${dockerfile}" .Dockerfile):ci"
+            docker build -f "${dockerfile}" -t "${image_name}" .
+          done

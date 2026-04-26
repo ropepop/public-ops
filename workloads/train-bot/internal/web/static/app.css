@@ -423,6 +423,43 @@ input[type="checkbox"] {
   background: rgba(255, 255, 255, 0.45);
 }
 
+.map-loading-card {
+  gap: 12px;
+}
+
+.map-loading-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.map-loading-header h3 {
+  margin: 0;
+}
+
+.map-loading-value {
+  color: var(--rail);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.map-loading-progress {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(31, 27, 22, 0.08);
+  overflow: hidden;
+}
+
+.map-loading-progress-bar {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(135deg, var(--rail), var(--accent));
+  transition: width 160ms ease;
+}
+
 .split {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -441,8 +478,35 @@ input[type="checkbox"] {
   font-weight: 600;
 }
 
+.map-history-toggle-row {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.map-history-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.map-history-toggle input[type="checkbox"] {
+  margin: 0;
+}
+
+.train-card > .badge {
+  margin-bottom: 12px;
+}
+
 .detail-card > .badge {
   margin-top: 12px;
+}
+
+#mini-map-train-actions:empty {
+  display: none;
 }
 
 .checkin-single-menu {
@@ -581,14 +645,60 @@ input[type="checkbox"] {
   width: 100%;
   min-height: 360px;
   border-radius: 20px;
-  overflow: hidden;
-  border: 1px solid rgba(31, 27, 22, 0.08);
+  overflow: visible;
+  isolation: isolate;
+  position: relative;
 }
 
 .train-map {
   width: 100%;
   min-height: 360px;
   height: 100%;
+}
+
+.train-map-viewport {
+  border: 1px solid rgba(31, 27, 22, 0.08);
+  border-radius: 20px;
+  min-height: 360px;
+  overflow: hidden;
+  position: relative;
+  z-index: 0;
+}
+
+.train-map-detail-layer {
+  bottom: 14px;
+  display: grid;
+  justify-items: center;
+  left: 14px;
+  pointer-events: auto;
+  position: absolute;
+  right: 14px;
+  z-index: 800;
+}
+
+.train-map-detail-layer[hidden] {
+  display: none;
+}
+
+.train-map-detail-card {
+  background: rgba(255, 251, 243, 0.98);
+  border: 1px solid rgba(31, 27, 22, 0.08);
+  border-radius: 20px;
+  box-shadow: 0 22px 48px rgba(31, 27, 22, 0.22);
+  display: grid;
+  gap: 10px;
+  max-width: min(420px, 100%);
+  min-width: min(320px, 100%);
+  padding: 14px;
+  pointer-events: auto;
+}
+
+.train-map-detail-close {
+  justify-self: end;
+}
+
+.train-map-detail-content {
+  min-width: 0;
 }
 
 .map-html-marker {
@@ -620,18 +730,34 @@ input[type="checkbox"] {
 }
 
 .map-station-marker {
-  width: 20px;
-  height: 20px;
+  --map-station-size: 20px;
+  --map-station-core-size: 8px;
+  width: var(--map-station-size);
+  height: var(--map-station-size);
   border-radius: 999px;
   border: 2px solid rgba(31, 27, 22, 0.14);
 }
 
 .map-station-marker::after {
   content: "";
-  width: 8px;
-  height: 8px;
+  width: var(--map-station-core-size);
+  height: var(--map-station-core-size);
   border-radius: 999px;
   background: currentColor;
+}
+
+.map-station-marker-far {
+  backdrop-filter: none;
+  border-width: 1.5px;
+  box-shadow: 0 5px 12px rgba(31, 27, 22, 0.16);
+}
+
+.map-station-marker-compact {
+  box-shadow: 0 7px 16px rgba(31, 27, 22, 0.18);
+}
+
+.map-station-marker-detail {
+  box-shadow: 0 10px 22px rgba(31, 27, 22, 0.2);
 }
 
 .map-station-marker.idle {
@@ -666,31 +792,98 @@ input[type="checkbox"] {
 }
 
 .map-train-marker {
-  min-width: 34px;
-  height: 22px;
-  padding: 0 9px;
+  --map-train-height: 22px;
+  --map-train-min-width: 34px;
+  --map-train-padding-x: 9px;
+  --map-train-bg: rgba(255, 251, 244, 0.98);
+  --map-train-border: rgba(31, 27, 22, 0.18);
+  --map-train-text: rgba(31, 27, 22, 0.96);
+  --map-train-label-shadow: rgba(255, 255, 255, 0.8);
+  min-width: var(--map-train-min-width);
+  height: var(--map-train-height);
+  padding: 0 var(--map-train-padding-x);
   border-radius: 999px;
-  border: 1px solid rgba(31, 27, 22, 0.12);
+  color: var(--map-train-text);
+  background: var(--map-train-bg);
+  border: 1px solid var(--map-train-border);
+  box-shadow: 0 8px 18px rgba(31, 27, 22, 0.18);
+}
+
+.map-train-marker-far {
+  backdrop-filter: none;
+  border-width: 1.5px;
+  box-shadow: 0 5px 12px rgba(31, 27, 22, 0.16);
+}
+
+.map-train-marker-compact {
+  box-shadow: 0 7px 16px rgba(31, 27, 22, 0.18);
+}
+
+.map-train-marker-far .map-marker-label {
+  font-size: 9px;
+  letter-spacing: 0;
+}
+
+.map-train-marker-compact .map-marker-label {
+  font-size: 10px;
+}
+
+.map-train-marker-detail {
+  box-shadow: 0 10px 22px rgba(31, 27, 22, 0.2);
 }
 
 .map-train-marker.gps-fresh {
-  border-color: rgba(15, 107, 98, 0.44);
-  background: rgba(15, 107, 98, 0.12);
+  --map-train-bg: rgba(15, 107, 98, 0.94);
+  --map-train-border: rgba(8, 71, 65, 0.96);
+  --map-train-text: rgba(255, 251, 244, 0.98);
+  --map-train-label-shadow: rgba(5, 37, 34, 0.55);
+  box-shadow: 0 10px 22px rgba(15, 107, 98, 0.28);
 }
 
 .map-train-marker.gps-warm {
-  background: rgba(15, 107, 98, 0.1);
+  --map-train-bg: rgba(228, 244, 241, 0.98);
+  --map-train-border: rgba(15, 107, 98, 0.5);
+  --map-train-text: rgba(9, 71, 65, 0.98);
+  --map-train-label-shadow: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 10px 22px rgba(15, 107, 98, 0.22);
+}
+
+.map-train-marker.gps-projection {
+  --map-train-bg: linear-gradient(135deg, rgba(252, 242, 221, 0.98), rgba(246, 227, 187, 0.98));
+  --map-train-border: rgba(174, 115, 29, 0.54);
+  --map-train-text: rgba(111, 71, 18, 0.98);
+  --map-train-label-shadow: rgba(255, 255, 255, 0.85);
+  border-style: dashed;
+  box-shadow: 0 10px 22px rgba(174, 115, 29, 0.2);
+}
+
+.map-train-marker.gps-projection::before {
+  content: "~";
+  margin-right: 4px;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.map-train-marker-far.gps-projection::before {
+  margin-right: 3px;
+  font-size: 8px;
 }
 
 .map-train-marker.crew-active {
-  background: rgba(21, 86, 132, 0.12);
+  --map-train-border: rgba(21, 86, 132, 0.72);
+  box-shadow: 0 0 0 1px rgba(21, 86, 132, 0.12), 0 10px 22px rgba(21, 86, 132, 0.24);
 }
 
 .map-train-marker.gps-stale,
 .map-train-marker.gps-scheduled {
-  opacity: 0.78;
+  --map-train-bg: rgba(246, 242, 236, 0.98);
+  --map-train-border: rgba(108, 95, 82, 0.36);
+  --map-train-text: rgba(73, 64, 56, 0.98);
+  --map-train-label-shadow: rgba(255, 255, 255, 0.78);
+  opacity: 1;
   border-style: dashed;
-  border-color: rgba(108, 95, 82, 0.22);
+  box-shadow: 0 8px 18px rgba(108, 95, 82, 0.18);
 }
 
 .map-marker-label {
@@ -701,8 +894,13 @@ input[type="checkbox"] {
 }
 
 .map-train-marker .map-marker-label {
+  color: inherit;
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-shadow: 0 1px 0 var(--map-train-label-shadow);
   text-align: center;
+  white-space: nowrap;
 }
 
 .map-marker-count {
@@ -724,20 +922,40 @@ input[type="checkbox"] {
   box-shadow: 0 2px 6px rgba(31, 27, 22, 0.22);
 }
 
+.map-station-marker-far .map-marker-count,
+.map-train-marker-far .map-marker-count {
+  top: -4px;
+  right: -4px;
+  min-width: 12px;
+  height: 12px;
+  font-size: 8px;
+  padding: 0 3px;
+}
+
+.map-station-marker-compact .map-marker-count,
+.map-train-marker-compact .map-marker-count {
+  top: -5px;
+  right: -5px;
+  min-width: 14px;
+  height: 14px;
+  font-size: 8px;
+  padding: 0 3px;
+}
+
 .map-tag {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 40px;
-  min-height: 24px;
-  padding: 4px 10px;
+  min-width: 34px;
+  min-height: 20px;
+  padding: 3px 8px;
   border-radius: 999px;
   border: 1px solid rgba(31, 27, 22, 0.14);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;
   color: #fff;
-  box-shadow: 0 8px 18px rgba(31, 27, 22, 0.18);
+  box-shadow: 0 6px 14px rgba(31, 27, 22, 0.16);
   pointer-events: none;
 }
 
@@ -795,6 +1013,26 @@ input[type="checkbox"] {
 .map-popup-sections {
   display: grid;
   gap: 8px;
+}
+
+.map-popup-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.map-popup-actions button {
+  width: 100%;
+  justify-content: center;
+}
+
+.map-popup-actions button,
+.train-map-detail-close {
+  transition: none;
+}
+
+.map-popup-actions button:hover,
+.train-map-detail-close:hover {
+  transform: none;
 }
 
 .map-popup-row {
@@ -1120,6 +1358,19 @@ input[type="checkbox"] {
 @media (max-width: 920px) {
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .train-map-detail-layer {
+    left: 10px;
+    right: 10px;
+  }
+
+  .train-map-detail-card {
+    min-width: 0;
+    max-height: calc(100svh - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
 }
 

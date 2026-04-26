@@ -1,0 +1,17 @@
+[Unit]
+Description=Arbuzas ThinkPad fan controller
+After=local-fs.target systemd-modules-load.service
+ConditionPathExists=/proc/acpi/ibm/fan
+ConditionPathExists=/sys/module/thinkpad_acpi/parameters/fan_control
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/arbuzas-thinkpad-fan
+ExecStart=/usr/local/libexec/arbuzas-thinkpad-fan.py
+ExecStopPost=/bin/sh -lc 'printf "watchdog 0\n" > /proc/acpi/ibm/fan || true; printf "level auto\n" > /proc/acpi/ibm/fan || true'
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -34,7 +34,7 @@ func TestBuildSnapshotFileMergesPrimaryTimesAndSecondaryStops(t *testing.T) {
 				ToStation:   "Jelgava",
 				DepartureAt: depB,
 				ArrivalAt:   arrB,
-				Stops: []RawStop{{StationName: "Riga", Seq: 1}, {StationName: "Jelgava", Seq: 2}},
+				Stops:       []RawStop{{StationName: "Riga", Seq: 1}, {StationName: "Jelgava", Seq: 2}},
 			}},
 		},
 	}
@@ -102,5 +102,42 @@ func TestBuildSnapshotFileMergesByTrainNumberAcrossSources(t *testing.T) {
 	}
 	if !strings.Contains(snapshot.Trains[0].ID, "train-6501") {
 		t.Fatalf("expected service-date scoped train number id, got %s", snapshot.Trains[0].ID)
+	}
+}
+
+func TestSnapshotToDomainPreservesTrainStopsByTrain(t *testing.T) {
+	snapshot := SnapshotFile{
+		SourceVersion: "snapshot-test",
+		Trains: []SnapshotTrain{
+			{
+				ID:          "train-1",
+				ServiceDate: "2026-02-26",
+				FromStation: "Riga",
+				ToStation:   "Jelgava",
+				DepartureAt: "2026-02-26T08:00:00Z",
+				ArrivalAt:   "2026-02-26T09:00:00Z",
+				Stops: []SnapshotStop{
+					{StationName: "Riga", Seq: 1, DepartureAt: "2026-02-26T08:00:00Z"},
+					{StationName: "Jelgava", Seq: 2, ArrivalAt: "2026-02-26T09:00:00Z"},
+				},
+			},
+		},
+	}
+
+	trains, stopsByTrain, err := SnapshotToDomain(snapshot)
+	if err != nil {
+		t.Fatalf("convert snapshot: %v", err)
+	}
+	if len(trains) != 1 {
+		t.Fatalf("expected 1 train, got %d", len(trains))
+	}
+	if trains[0].ID != "train-1" || trains[0].SourceVersion != "snapshot-test" {
+		t.Fatalf("unexpected train conversion: %+v", trains[0])
+	}
+	if len(stopsByTrain["train-1"]) != 2 {
+		t.Fatalf("expected 2 stops for train-1, got %d", len(stopsByTrain["train-1"]))
+	}
+	if stopsByTrain["train-1"][0].TrainInstanceID != "train-1" {
+		t.Fatalf("expected train id to be preserved on stops")
 	}
 }

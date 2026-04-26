@@ -1,0 +1,9 @@
+{
+  "adlists": {},
+  "dns": {},
+  "error": "password file not found: /etc/pixel-stack/remote-dns/secrets/admin-password",
+  "rules": {},
+  "source_payload": "/etc/pixel-stack/remote-dns/state/pihole-migration-payload.json",
+  "status": "failed",
+  "target": "http://127.0.0.1:8080"
+}

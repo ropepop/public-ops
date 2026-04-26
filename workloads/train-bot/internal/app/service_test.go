@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,6 +39,131 @@ type testSnapshotStop struct {
 	DepartureAt string   `json:"departure_at,omitempty"`
 	Latitude    *float64 `json:"latitude,omitempty"`
 	Longitude   *float64 `json:"longitude,omitempty"`
+}
+
+func TestPublicDashboardPayloadBuildsFromScheduleStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, loc)
+	serviceDate := now.Format("2006-01-02")
+
+	baseStore, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "train-bot.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer baseStore.Close()
+	if err := baseStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	snapshotDir := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDir, serviceDate+".json")
+	payload, err := json.Marshal(testSnapshot{
+		SourceVersion: "service-test-dashboard-provider",
+		Trains: []testSnapshotTrain{
+			buildSnapshotTrain("snapshot-train-1", serviceDate, "Riga", "Jelgava", now.Add(10*time.Minute)),
+			buildSnapshotTrain("snapshot-train-2", serviceDate, "Riga", "Liepaja", now.Add(20*time.Minute)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapshotPath, payload, 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	manager := schedule.NewManager(baseStore, snapshotDir, loc, 3)
+	if err := manager.LoadToday(ctx, now); err != nil {
+		t.Fatalf("load today: %v", err)
+	}
+
+	service := NewService(
+		baseStore,
+		manager,
+		ride.NewService(baseStore),
+		reports.NewService(baseStore, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+
+	publicPayload, err := service.PublicDashboardPayload(ctx, now, 1)
+	if err != nil {
+		t.Fatalf("public dashboard payload: %v", err)
+	}
+
+	body, err := json.Marshal(publicPayload)
+	if err != nil {
+		t.Fatalf("marshal public dashboard payload: %v", err)
+	}
+	var decoded struct {
+		GeneratedAt time.Time `json:"generatedAt"`
+		Trains      []struct {
+			Riders int `json:"riders"`
+			Train  struct {
+				ID string `json:"id"`
+			} `json:"train"`
+		} `json:"trains"`
+		Schedule schedule.AccessContext `json:"schedule"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode public dashboard payload: %v", err)
+	}
+	if got := len(decoded.Trains); got != 1 {
+		t.Fatalf("expected 1 dashboard train after limit, got %d", got)
+	}
+	if got := decoded.Trains[0].Train.ID; got != "snapshot-train-1" {
+		t.Fatalf("expected first snapshot train payload, got %q", got)
+	}
+	if got := decoded.Trains[0].Riders; got != 0 {
+		t.Fatalf("expected rider count 0 from store-backed dashboard, got %d", got)
+	}
+	if !decoded.GeneratedAt.Equal(now.UTC()) {
+		t.Fatalf("expected generatedAt %s, got %s", now.UTC(), decoded.GeneratedAt)
+	}
+	if !decoded.Schedule.Available || decoded.Schedule.EffectiveServiceDate != serviceDate {
+		t.Fatalf("unexpected schedule payload: %+v", decoded.Schedule)
+	}
+}
+
+func TestPublicDashboardPayloadReturnsScheduleErrors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, loc)
+
+	baseStore, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "train-bot.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer baseStore.Close()
+	if err := baseStore.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	manager := schedule.NewManager(baseStore, t.TempDir(), loc, 3)
+
+	service := NewService(
+		baseStore,
+		manager,
+		ride.NewService(baseStore),
+		reports.NewService(baseStore, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+
+	_, err = service.PublicDashboardPayload(ctx, now, 0)
+	if !errors.Is(err, schedule.ErrUnavailable) {
+		t.Fatalf("expected schedule unavailable error, got %v", err)
+	}
 }
 
 func TestPublicStationDeparturesSplitsLastAndUpcoming(t *testing.T) {
@@ -127,6 +253,64 @@ func TestPublicStationDeparturesSplitsLastAndUpcoming(t *testing.T) {
 	}
 	if len(view.RecentSightings) != 1 || view.RecentSightings[0].StationID != "riga" {
 		t.Fatalf("expected recent station sighting in public response, got %+v", view.RecentSightings)
+	}
+}
+
+func TestSubmitReportAllowsDirectSignedInTrainContext(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.March, 6, 12, 0, 0, 0, loc)
+	serviceDate := now.Format("2006-01-02")
+
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "train-bot.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	snapshotDir := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDir, serviceDate+".json")
+	payload, err := json.Marshal(testSnapshot{
+		SourceVersion: "service-test-direct-report",
+		Trains: []testSnapshotTrain{
+			buildSnapshotTrain("train-direct-report", serviceDate, "Riga", "Jelgava", now.Add(15*time.Minute)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapshotPath, payload, 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	manager := schedule.NewManager(st, snapshotDir, loc, 3)
+	if err := manager.LoadToday(ctx, now); err != nil {
+		t.Fatalf("load today: %v", err)
+	}
+
+	service := NewService(
+		st,
+		manager,
+		ride.NewService(st),
+		reports.NewService(st, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+
+	result, err := service.SubmitReport(ctx, 55, "train-direct-report", domain.SignalInspectionStarted, now)
+	if err != nil {
+		t.Fatalf("submit report: %v", err)
+	}
+	if !result.Accepted {
+		t.Fatalf("expected direct report to be accepted, got %+v", result)
 	}
 }
 
@@ -300,6 +484,155 @@ func TestCheckInRejectsExpiredBoardingStationDeparture(t *testing.T) {
 	}
 	if currentRide != nil {
 		t.Fatalf("expected no active ride after rejected station check-in, got %+v", currentRide)
+	}
+}
+
+func TestCheckInMapAllowsExpiredDepartureAndKeepsRideActive(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.March, 6, 12, 0, 0, 0, loc)
+	serviceDate := now.Format("2006-01-02")
+
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "train-bot.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	snapshotDir := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDir, serviceDate+".json")
+	payload, err := json.Marshal(testSnapshot{
+		SourceVersion: "service-test-map-expired-checkin",
+		Trains: []testSnapshotTrain{
+			buildSnapshotTrain("train-expired-map", serviceDate, "Riga", "Jelgava", now.Add(-90*time.Minute)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapshotPath, payload, 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	manager := schedule.NewManager(st, snapshotDir, loc, 3)
+	if err := manager.LoadToday(ctx, now); err != nil {
+		t.Fatalf("load today: %v", err)
+	}
+
+	service := NewService(
+		st,
+		manager,
+		ride.NewService(st),
+		reports.NewService(st, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+
+	if err := service.CheckInMap(ctx, 77, "train-expired-map", nil, now); err != nil {
+		t.Fatalf("map check-in should allow expired departure: %v", err)
+	}
+
+	currentRide, err := service.CurrentRide(ctx, 77, now)
+	if err != nil {
+		t.Fatalf("current ride after map check-in: %v", err)
+	}
+	if currentRide == nil || currentRide.CheckIn == nil {
+		t.Fatalf("expected active ride after relaxed map check-in, got %+v", currentRide)
+	}
+	if currentRide.CheckIn.TrainInstanceID != "train-expired-map" {
+		t.Fatalf("expected train-expired-map current ride, got %+v", currentRide.CheckIn)
+	}
+	if !currentRide.CheckIn.AutoCheckoutAt.After(now.Add(5 * time.Hour)) {
+		t.Fatalf("expected relaxed map check-in to use a fallback auto checkout, got %+v", currentRide.CheckIn)
+	}
+}
+
+func TestCheckInMapAllowsExpiredBoardingStationDepartureAndPreservesStation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.March, 6, 12, 0, 0, 0, loc)
+	serviceDate := now.Format("2006-01-02")
+
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "train-bot.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	snapshotDir := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDir, serviceDate+".json")
+	payload, err := json.Marshal(testSnapshot{
+		SourceVersion: "service-test-map-expired-station-checkin",
+		Trains: []testSnapshotTrain{
+			{
+				ID:          "train-station-window-map",
+				ServiceDate: serviceDate,
+				FromStation: "Aizkraukle",
+				ToStation:   "Tukums",
+				DepartureAt: now.Add(-70 * time.Minute).Format(time.RFC3339),
+				ArrivalAt:   now.Add(30 * time.Minute).Format(time.RFC3339),
+				Stops: []testSnapshotStop{
+					{StationName: "Aizkraukle", Seq: 1, DepartureAt: now.Add(-70 * time.Minute).Format(time.RFC3339)},
+					{StationName: "Riga", Seq: 2, ArrivalAt: now.Add(-20 * time.Minute).Format(time.RFC3339), DepartureAt: now.Add(-18 * time.Minute).Format(time.RFC3339)},
+					{StationName: "Tukums", Seq: 3, ArrivalAt: now.Add(30 * time.Minute).Format(time.RFC3339)},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapshotPath, payload, 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	manager := schedule.NewManager(st, snapshotDir, loc, 3)
+	if err := manager.LoadToday(ctx, now); err != nil {
+		t.Fatalf("load today: %v", err)
+	}
+
+	service := NewService(
+		st,
+		manager,
+		ride.NewService(st),
+		reports.NewService(st, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+
+	boardingStationID := "riga"
+	if err := service.CheckInMap(ctx, 77, "train-station-window-map", &boardingStationID, now); err != nil {
+		t.Fatalf("map check-in should allow an expired boarding station departure: %v", err)
+	}
+
+	currentRide, err := service.CurrentRide(ctx, 77, now)
+	if err != nil {
+		t.Fatalf("current ride after relaxed station check-in: %v", err)
+	}
+	if currentRide == nil || currentRide.CheckIn == nil {
+		t.Fatalf("expected active ride after relaxed station check-in, got %+v", currentRide)
+	}
+	if currentRide.BoardingStationID != "riga" {
+		t.Fatalf("expected boarding station to stay riga, got %+v", currentRide)
+	}
+	if currentRide.BoardingStationName != "Riga" {
+		t.Fatalf("expected boarding station name Riga, got %+v", currentRide)
 	}
 }
 
@@ -714,7 +1047,7 @@ func TestTrainStopsIncludesCoordinatesAndMatchedSightings(t *testing.T) {
 	}
 }
 
-func TestNetworkMapIncludesCoordinateStationsAndRecentSightings(t *testing.T) {
+func TestNetworkMapIncludesCoordinateStationsAndSameDaySightings(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -779,6 +1112,14 @@ func TestNetworkMapIncludesCoordinateStationsAndRecentSightings(t *testing.T) {
 	if _, err := service.SubmitStationSighting(ctx, 19, "riga", &destinationID, nil, now); err != nil {
 		t.Fatalf("submit station sighting: %v", err)
 	}
+	if err := st.InsertStationSighting(ctx, domain.StationSighting{
+		ID:        "station-sighting-hidden",
+		StationID: "riga",
+		UserID:    20,
+		CreatedAt: now.Add(-90 * time.Minute),
+	}); err != nil {
+		t.Fatalf("insert older same-day sighting: %v", err)
+	}
 
 	view, err := service.NetworkMap(ctx, now)
 	if err != nil {
@@ -789,6 +1130,9 @@ func TestNetworkMapIncludesCoordinateStationsAndRecentSightings(t *testing.T) {
 	}
 	if len(view.RecentSightings) != 1 || view.RecentSightings[0].StationID != "riga" {
 		t.Fatalf("expected recent sightings in network map, got %+v", view.RecentSightings)
+	}
+	if len(view.SameDaySightings) != 2 {
+		t.Fatalf("expected same-day sightings in network map, got %+v", view.SameDaySightings)
 	}
 }
 

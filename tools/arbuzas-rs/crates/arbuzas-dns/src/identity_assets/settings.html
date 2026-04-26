@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS settings</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #192230;
+      --muted: #667085;
+      --border: #d7deea;
+      --primary: #1f6feb;
+      --danger: #b42318;
+      --success: #0f8f5b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .title { margin: 0; font-size: 28px; }
+    .grow { flex: 1; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; }
+    .nav a, .nav button {
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .nav a.active { border-color: var(--primary); color: var(--primary); }
+    .status { min-height: 22px; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+    .status.error { color: var(--danger); }
+    .status.ok { color: var(--success); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px; }
+    .panel h2 { margin: 0 0 12px; font-size: 18px; }
+    .panel p { margin: 0; color: var(--muted); line-height: 1.5; }
+    .stack { display: grid; gap: 12px; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      background: #fff;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 2fr auto auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .row button, .actions button { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: #fff; cursor: pointer; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .actions .primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .kv { display: grid; gap: 10px; }
+    .kv div { display: flex; justify-content: space-between; gap: 12px; padding-top: 10px; border-top: 1px solid #eef2f8; font-size: 14px; }
+    .kv div:first-child { border-top: 0; padding-top: 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .placeholder { background: #fbfdff; border: 1px dashed var(--border); border-radius: 12px; padding: 14px; }
+    .anchors { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .anchors a { font-size: 13px; color: var(--primary); text-decoration: none; }
+    @media (max-width: 880px) {
+      .grid { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+      .wrap { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <h1 class="title">DNS settings</h1>
+      <div class="grow"></div>
+      <nav class="nav">__ADMIN_NAV__</nav>
+    </div>
+
+    <div class="anchors">
+      <a href="#dns">DNS</a>
+      <a href="#filters">Filters</a>
+      <a href="#encryption">Encryption</a>
+      <a href="#access">Access</a>
+      <a href="#rewrites">Rewrites</a>
+      <a href="#dhcp">DHCP</a>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div class="grid">
+      <section class="panel" id="dns">
+        <h2>DNS</h2>
+        <div class="stack">
+          <div>
+            <label for="upstreams">Upstreams (one URL per line)</label>
+            <textarea id="upstreams"></textarea>
+          </div>
+          <div>
+            <label for="retention">Usage retention days</label>
+            <input id="retention" type="number" min="1" max="3650">
+          </div>
+          <div>
+            <label for="querylog-view">Default query log view</label>
+            <select id="querylog-view">
+              <option value="improved">Improved</option>
+              <option value="native">Native</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="filters">
+        <h2>Filters</h2>
+        <div class="stack">
+          <div>
+            <label>Block lists</label>
+            <div id="filters-list"></div>
+            <button id="add-filter" type="button">Add filter</button>
+          </div>
+          <div>
+            <label>Allow lists</label>
+            <div id="whitelist-filters"></div>
+            <button id="add-whitelist-filter" type="button">Add allow list</button>
+          </div>
+          <div>
+            <label for="user-rules">User rules (one rule per line)</label>
+            <textarea id="user-rules"></textarea>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="encryption">
+        <h2>Encryption</h2>
+        <div id="transport" class="kv"></div>
+      </section>
+
+      <section class="panel" id="access">
+        <h2>Access</h2>
+        <div class="placeholder">
+          <p>The admin surface stays private-only on localhost, the configured LAN address, and Tailscale. DNS client allow and deny lists are not implemented yet.</p>
+        </div>
+      </section>
+
+      <section class="panel" id="rewrites">
+        <h2>Rewrites</h2>
+        <div class="placeholder">
+          <p>Native DNS rewrite editing is planned. This release keeps filtering and user rules, but does not yet expose a separate rewrite editor.</p>
+        </div>
+      </section>
+
+      <section class="panel" id="dhcp">
+        <h2>DHCP</h2>
+        <div class="placeholder">
+          <p>DHCP is not implemented in the native Arbuzas service and remains disabled.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Health</h2>
+        <div id="health" class="kv"></div>
+      </section>
+    </div>
+
+    <div class="actions">
+      <button id="reload" type="button">Reload current settings</button>
+      <button id="validate" type="button">Validate</button>
+      <button id="apply" class="primary" type="button">Apply</button>
+    </div>
+  </div>
+  <script>
+    (() => {
+      const status = document.getElementById("status");
+      const filtersEl = document.getElementById("filters-list");
+      const whitelistEl = document.getElementById("whitelist-filters");
+      const transport = document.getElementById("transport");
+      const health = document.getElementById("health");
+
+      function setStatus(message, tone) {
+        status.textContent = message || "";
+        status.className = tone ? `status ${tone}` : "status";
+      }
+
+      function syncTopNavActiveState() {
+        const activeHref = (() => {
+          const hash = String(location.hash || "").toLowerCase();
+          if (hash.startsWith("#filters")) return "/dns/filters";
+          if (hash.startsWith("#encryption")) return "/dns/encryption";
+          if (hash.startsWith("#access")) return "/dns/access";
+          if (hash.startsWith("#rewrites")) return "/dns/rewrites";
+          if (hash.startsWith("#dhcp")) return "/dns/dhcp";
+          return "/dns/settings";
+        })();
+        for (const link of document.querySelectorAll(".nav a")) {
+          link.classList.toggle("active", link.getAttribute("href") === activeHref);
+        }
+      }
+
+      async function getJson(path) {
+        const response = await fetch(path, { credentials: "same-origin" });
+        if (response.status === 401) {
+          location.assign(`/dns/login?return=${encodeURIComponent(location.pathname + location.search + location.hash)}`);
+          throw new Error("Unauthorized");
+        }
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Request failed for ${path}`);
+        return payload;
+      }
+
+      async function sendJson(path, body) {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify(body),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || `Request failed for ${path}`);
+        return payload;
+      }
+
+      async function logout() {
+        await fetch("/dns/api/session", { method: "DELETE", credentials: "same-origin" });
+        location.assign("/dns/login");
+      }
+
+      function kvRow(label, value) {
+        const div = document.createElement("div");
+        div.innerHTML = `<span>${label}</span><span class="mono">${value ?? "-"}</span>`;
+        return div;
+      }
+
+      function renderTransport(entries) {
+        transport.innerHTML = "";
+        [
+          ["Hostname", entries.hostname],
+          ["DoT hostname", entries.dotHostname],
+          ["HTTPS port", entries.httpsPort],
+          ["DoT port", entries.dotPort],
+          ["TLS files", entries.tlsCertPresent && entries.tlsKeyPresent ? "Present" : "Missing"],
+          ["Source config", entries.sourceConfigFile],
+          ["Compiled policy", entries.compiledPolicyFile],
+        ].forEach(([label, value]) => transport.appendChild(kvRow(label, value)));
+      }
+
+      function renderHealth(entries) {
+        health.innerHTML = "";
+        [
+          ["Compiled at", entries.compiledAt],
+          ["Compiled policy hash", entries.compiledPolicyHash],
+          ["Source config hash", entries.sourceConfigHash],
+          ["Last applied", entries.lastAppliedAt || "Never"],
+          ["Last applied policy hash", entries.lastAppliedPolicyHash || "Never"],
+        ].forEach(([label, value]) => health.appendChild(kvRow(label, value)));
+      }
+
+      function filterRow(entry) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML = `
+          <input data-field="name" placeholder="Name" value="${entry.name || ""}">
+          <input data-field="url" placeholder="URL or file path" value="${entry.url || ""}">
+          <label><input data-field="enabled" type="checkbox" ${entry.enabled === false ? "" : "checked"}> enabled</label>
+          <button type="button">Remove</button>
+        `;
+        row.querySelector("button").addEventListener("click", () => row.remove());
+        return row;
+      }
+
+      function renderFilterList(node, entries) {
+        node.innerHTML = "";
+        for (const entry of entries) {
+          node.appendChild(filterRow(entry));
+        }
+      }
+
+      function readFilterList(node) {
+        return Array.from(node.children).map((row) => ({
+          name: row.querySelector('[data-field="name"]').value.trim(),
+          url: row.querySelector('[data-field="url"]').value.trim(),
+          enabled: row.querySelector('[data-field="enabled"]').checked,
+        }));
+      }
+
+      function gatherPayload() {
+        return {
+          policy: {
+            upstreams: document.getElementById("upstreams").value.split("\n").map((line) => line.trim()).filter(Boolean),
+            filters: readFilterList(filtersEl),
+            whitelistFilters: readFilterList(whitelistEl),
+            userRules: document.getElementById("user-rules").value.split("\n").map((line) => line.trim()).filter(Boolean),
+          },
+          runtime: {
+            usageRetentionDays: Number(document.getElementById("retention").value || 30),
+            querylogDefaultView: document.getElementById("querylog-view").value,
+          },
+        };
+      }
+
+      function fill(payload) {
+        document.getElementById("upstreams").value = (payload.policy.upstreams || []).join("\n");
+        document.getElementById("user-rules").value = (payload.policy.userRules || []).join("\n");
+        document.getElementById("retention").value = payload.runtime.usageRetentionDays || 30;
+        document.getElementById("querylog-view").value = payload.runtime.querylogDefaultView || "improved";
+        renderFilterList(filtersEl, payload.policy.filters || []);
+        renderFilterList(whitelistEl, payload.policy.whitelistFilters || []);
+        renderTransport(payload.transport || {});
+        renderHealth(payload.health || {});
+      }
+
+      async function load() {
+        setStatus("Loading settings...");
+        const payload = await getJson("/dns/api/settings");
+        fill(payload);
+        setStatus("");
+      }
+
+      document.getElementById("add-filter").addEventListener("click", () => filtersEl.appendChild(filterRow({ enabled: true })));
+      document.getElementById("add-whitelist-filter").addEventListener("click", () => whitelistEl.appendChild(filterRow({ enabled: true })));
+      document.getElementById("reload").addEventListener("click", () => load().catch((error) => setStatus(error.message || "Failed to load settings.", true)));
+      document.getElementById("logout").addEventListener("click", logout);
+      window.addEventListener("hashchange", syncTopNavActiveState);
+      syncTopNavActiveState();
+      document.getElementById("validate").addEventListener("click", async () => {
+        setStatus("Validating...");
+        try {
+          const payload = await sendJson("/dns/api/settings/validate", gatherPayload());
+          renderHealth(Object.assign({}, payload.health || {}, {
+            compiledAt: "Pending apply",
+            lastAppliedAt: "Validation only",
+            lastAppliedPolicyHash: payload.health?.managedPolicyHash || "Pending apply",
+            compiledPolicyHash: payload.health?.managedPolicyHash || "Pending apply",
+          }));
+          setStatus("Settings validated.", "ok");
+        } catch (error) {
+          setStatus(error.message || "Settings validation failed.", "error");
+        }
+      });
+      document.getElementById("apply").addEventListener("click", async () => {
+        setStatus("Applying settings...");
+        try {
+          const payload = await sendJson("/dns/api/settings/apply", gatherPayload());
+          fill(payload);
+          setStatus("Settings applied.", "ok");
+        } catch (error) {
+          setStatus(error.message || "Settings apply failed.", "error");
+        }
+      });
+
+      load().catch((error) => setStatus(error.message || "Failed to load settings.", true));
+    })();
+  </script>
+</body>
+</html>

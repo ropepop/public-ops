@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 	"satiksmebot/internal/runtime"
 )
 
@@ -61,10 +61,10 @@ func testGTFSZip(t *testing.T, fileName, content string) []byte {
 
 func TestManagerCachesCatalogLookupsAndPayload(t *testing.T) {
 	manager := NewManager(Settings{})
-	catalog := &domain.Catalog{
+	catalog := &model.Catalog{
 		GeneratedAt: time.Date(2026, 3, 10, 15, 0, 0, 0, time.UTC),
-		Stops:       []domain.Stop{{ID: "3012", Name: "Centrāltirgus"}},
-		Routes:      []domain.Route{{Label: "1", Mode: "tram", Name: "Imanta"}},
+		Stops:       []model.Stop{{ID: "3012", Name: "Centrāltirgus"}},
+		Routes:      []model.Route{{Label: "1", Mode: "tram", Name: "Imanta"}},
 	}
 	status := runtime.CatalogStatus{
 		Loaded:      true,
@@ -91,7 +91,7 @@ func TestManagerCachesCatalogLookupsAndPayload(t *testing.T) {
 	if len(cachedJSON) == 0 {
 		t.Fatalf("CatalogJSON() = empty")
 	}
-	var decoded domain.Catalog
+	var decoded model.Catalog
 	if err := json.Unmarshal(cachedJSON, &decoded); err != nil {
 		t.Fatalf("Unmarshal(CatalogJSON()) error = %v", err)
 	}

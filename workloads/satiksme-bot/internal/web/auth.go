@@ -2,6 +2,7 @@ package web
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -10,180 +11,176 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-	"os"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"pixelops/shared/telegramweb"
 )
 
 const (
-	sessionCookieName  = "satiksme_app_session"
-	sessionTTL         = 12 * time.Hour
-	defaultAppLanguage = "lv"
+	sessionCookieName    = "satiksme_app_session"
+	loginStateCookieName = "satiksme_login_state"
+	loginNonceCookieName = "satiksme_login_nonce"
+	sessionTTL           = 12 * time.Hour
+	defaultAppLanguage   = "lv"
 )
 
-type telegramUser struct {
-	ID           int64  `json:"id"`
-	FirstName    string `json:"first_name"`
-	LanguageCode string `json:"language_code"`
+type telegramUser = telegramweb.User
+
+type telegramAuth = telegramweb.Auth
+
+type sessionClaims = telegramweb.SessionClaims
+
+type loginStateClaims struct {
+	State        string `json:"state"`
+	Nonce        string `json:"nonce"`
+	CodeVerifier string `json:"code_verifier"`
+	ReturnTo     string `json:"return_to"`
+	ExpiresAt    int64  `json:"exp"`
 }
 
-type telegramAuth struct {
-	QueryID  string
-	AuthDate time.Time
-	User     telegramUser
-}
-
-type sessionClaims struct {
-	UserID    int64  `json:"user_id"`
-	IssuedAt  int64  `json:"iat"`
+type loginNonceClaims struct {
+	Nonce     string `json:"nonce"`
 	ExpiresAt int64  `json:"exp"`
-	Language  string `json:"language,omitempty"`
 }
 
 func loadSessionSecret(path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read satiksme web session secret: %w", err)
-	}
-	secret := strings.TrimSpace(string(raw))
-	if len(secret) < 16 {
-		return nil, fmt.Errorf("satiksme web session secret must be at least 16 characters")
-	}
-	return []byte(secret), nil
+	return telegramweb.LoadSessionSecret(path, "satiksme web session secret")
 }
 
-func validateTelegramInitData(initData string, botToken string, maxAge time.Duration, now time.Time) (telegramAuth, error) {
-	values, err := url.ParseQuery(initData)
-	if err != nil {
-		return telegramAuth{}, fmt.Errorf("parse initData: %w", err)
+func verifyTelegramAuthAge(auth telegramAuth, maxAge time.Duration, now time.Time) error {
+	if maxAge <= 0 || auth.AuthDate.IsZero() {
+		return nil
 	}
-	hashHex := strings.TrimSpace(values.Get("hash"))
-	if hashHex == "" {
-		return telegramAuth{}, errors.New("missing hash")
+	if now.UTC().Sub(auth.AuthDate.UTC()) > maxAge {
+		return errors.New("Telegram login is too old")
 	}
-	values.Del("hash")
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	lines := make([]string, 0, len(keys))
-	for _, key := range keys {
-		lines = append(lines, fmt.Sprintf("%s=%s", key, values.Get(key)))
-	}
-	dataCheckString := strings.Join(lines, "\n")
-	secret := hmacSHA256([]byte("WebAppData"), []byte(botToken))
-	expected := hmacSHA256(secret, []byte(dataCheckString))
-	actual, err := hex.DecodeString(hashHex)
-	if err != nil {
-		return telegramAuth{}, fmt.Errorf("decode hash: %w", err)
-	}
-	if len(actual) != len(expected) || subtle.ConstantTimeCompare(actual, expected) != 1 {
-		return telegramAuth{}, errors.New("invalid Telegram initData signature")
-	}
+	return nil
+}
 
-	authRaw := strings.TrimSpace(values.Get("auth_date"))
-	if authRaw == "" {
-		return telegramAuth{}, errors.New("missing auth_date")
-	}
-	authUnix, err := strconv.ParseInt(authRaw, 10, 64)
-	if err != nil {
-		return telegramAuth{}, fmt.Errorf("invalid auth_date: %w", err)
-	}
-	authAt := time.Unix(authUnix, 0).UTC()
-	if now.UTC().Sub(authAt) > maxAge {
-		return telegramAuth{}, errors.New("Telegram initData expired")
-	}
-
-	userRaw := values.Get("user")
-	if strings.TrimSpace(userRaw) == "" {
-		return telegramAuth{}, errors.New("missing Telegram user")
-	}
-	var user telegramUser
-	if err := json.Unmarshal([]byte(userRaw), &user); err != nil {
-		return telegramAuth{}, fmt.Errorf("decode Telegram user: %w", err)
-	}
-	if user.ID <= 0 {
-		return telegramAuth{}, errors.New("invalid Telegram user id")
-	}
-	return telegramAuth{
-		QueryID:  values.Get("query_id"),
-		AuthDate: authAt,
-		User:     user,
-	}, nil
+func normalizeTelegramBotUsername(raw string) string {
+	return strings.TrimSpace(strings.TrimPrefix(raw, "@"))
 }
 
 func issueSessionCookie(secret []byte, auth telegramAuth, now time.Time) (*http.Cookie, error) {
-	claims := sessionClaims{
-		UserID:    auth.User.ID,
-		IssuedAt:  now.UTC().Unix(),
-		ExpiresAt: now.UTC().Add(sessionTTL).Unix(),
-		Language:  sessionLanguageCode(auth.User.LanguageCode),
-	}
-	token, err := signSessionClaims(secret, claims)
-	if err != nil {
-		return nil, err
-	}
-	return &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   int(sessionTTL.Seconds()),
-		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
-	}, nil
+	return telegramweb.IssueSessionCookie(secret, telegramweb.SessionConfig{
+		CookieName:       sessionCookieName,
+		SessionTTL:       sessionTTL,
+		LanguageResolver: sessionLanguageCode,
+	}, auth, now)
 }
 
 func parseSession(secret []byte, raw string, now time.Time) (sessionClaims, error) {
-	if strings.TrimSpace(raw) == "" {
-		return sessionClaims{}, errors.New("missing session")
+	return telegramweb.ParseSession(secret, raw, now)
+}
+
+func issueLoginStateCookie(secret []byte, returnTo string, ttl time.Duration, now time.Time) (loginStateClaims, *http.Cookie, error) {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
 	}
-	parts := strings.Split(raw, ".")
-	if len(parts) != 2 {
-		return sessionClaims{}, errors.New("invalid session format")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	state, err := randomHexToken(16)
 	if err != nil {
-		return sessionClaims{}, fmt.Errorf("decode session payload: %w", err)
+		return loginStateClaims{}, nil, err
 	}
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	nonce, err := randomHexToken(16)
 	if err != nil {
-		return sessionClaims{}, fmt.Errorf("decode session signature: %w", err)
+		return loginStateClaims{}, nil, err
 	}
-	expected := hmacSHA256(secret, payload)
-	if len(signature) != len(expected) || subtle.ConstantTimeCompare(signature, expected) != 1 {
-		return sessionClaims{}, errors.New("invalid session signature")
+	codeVerifier, err := randomBase64URLToken(32)
+	if err != nil {
+		return loginStateClaims{}, nil, err
 	}
-	var claims sessionClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return sessionClaims{}, fmt.Errorf("decode session claims: %w", err)
+	claims := loginStateClaims{
+		State:        state,
+		Nonce:        nonce,
+		CodeVerifier: codeVerifier,
+		ReturnTo:     strings.TrimSpace(returnTo),
+		ExpiresAt:    now.UTC().Add(ttl).Unix(),
 	}
-	if claims.UserID <= 0 {
-		return sessionClaims{}, errors.New("invalid session user")
+	value, err := signLoginStateClaims(secret, claims)
+	if err != nil {
+		return loginStateClaims{}, nil, err
+	}
+	return claims, &http.Cookie{
+		Name:     loginStateCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   int(ttl.Seconds()),
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
+}
+
+func parseLoginState(secret []byte, raw string, now time.Time) (loginStateClaims, error) {
+	claims, err := parseLoginStateClaims(secret, raw)
+	if err != nil {
+		return loginStateClaims{}, err
 	}
 	if now.UTC().Unix() > claims.ExpiresAt {
-		return sessionClaims{}, errors.New("session expired")
+		return loginStateClaims{}, errors.New("login state expired")
+	}
+	if strings.TrimSpace(claims.State) == "" || strings.TrimSpace(claims.Nonce) == "" || strings.TrimSpace(claims.CodeVerifier) == "" {
+		return loginStateClaims{}, errors.New("invalid login state")
 	}
 	return claims, nil
 }
 
-func signSessionClaims(secret []byte, claims sessionClaims) (string, error) {
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		return "", fmt.Errorf("marshal session claims: %w", err)
+func issueLoginNonceCookie(secret []byte, ttl time.Duration, now time.Time) (loginNonceClaims, *http.Cookie, error) {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
 	}
-	signature := hmacSHA256(secret, payload)
-	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+	nonce, err := randomHexToken(16)
+	if err != nil {
+		return loginNonceClaims{}, nil, err
+	}
+	claims := loginNonceClaims{
+		Nonce:     nonce,
+		ExpiresAt: now.UTC().Add(ttl).Unix(),
+	}
+	value, err := signLoginNonceClaims(secret, claims)
+	if err != nil {
+		return loginNonceClaims{}, nil, err
+	}
+	return claims, &http.Cookie{
+		Name:     loginNonceCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   int(ttl.Seconds()),
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	}, nil
 }
 
-func hmacSHA256(key []byte, data []byte) []byte {
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write(data)
-	return mac.Sum(nil)
+func parseLoginNonce(secret []byte, raw string, now time.Time) (loginNonceClaims, error) {
+	claims, err := parseLoginNonceClaims(secret, raw)
+	if err != nil {
+		return loginNonceClaims{}, err
+	}
+	if now.UTC().Unix() > claims.ExpiresAt {
+		return loginNonceClaims{}, errors.New("login nonce expired")
+	}
+	if strings.TrimSpace(claims.Nonce) == "" {
+		return loginNonceClaims{}, errors.New("invalid login nonce")
+	}
+	return claims, nil
+}
+
+func clearSessionCookie(path string) *http.Cookie {
+	return expiredCookie(sessionCookieName, path)
+}
+
+func clearLoginStateCookie(path string) *http.Cookie {
+	return expiredCookie(loginStateCookieName, path)
+}
+
+func clearLoginNonceCookie(path string) *http.Cookie {
+	return expiredCookie(loginNonceCookieName, path)
+}
+
+func clearLegacyLoginNonceCookie(path string) *http.Cookie {
+	return clearLoginNonceCookie(path)
 }
 
 func sessionLanguageCode(raw string) string {
@@ -192,4 +189,121 @@ func sessionLanguageCode(raw string) string {
 		return defaultAppLanguage
 	}
 	return language
+}
+
+func signLoginStateClaims(secret []byte, claims loginStateClaims) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("marshal login state claims: %w", err)
+	}
+	signature := authHMACSHA256(secret, payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+}
+
+func parseLoginStateClaims(secret []byte, raw string) (loginStateClaims, error) {
+	if strings.TrimSpace(raw) == "" {
+		return loginStateClaims{}, errors.New("missing login state")
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) != 2 {
+		return loginStateClaims{}, errors.New("invalid login state format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return loginStateClaims{}, fmt.Errorf("decode login state payload: %w", err)
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return loginStateClaims{}, fmt.Errorf("decode login state signature: %w", err)
+	}
+	expected := authHMACSHA256(secret, payload)
+	if len(signature) != len(expected) || subtle.ConstantTimeCompare(signature, expected) != 1 {
+		return loginStateClaims{}, errors.New("invalid login state signature")
+	}
+	var claims loginStateClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return loginStateClaims{}, fmt.Errorf("decode login state claims: %w", err)
+	}
+	return claims, nil
+}
+
+func signLoginNonceClaims(secret []byte, claims loginNonceClaims) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("marshal login nonce claims: %w", err)
+	}
+	signature := authHMACSHA256(secret, payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+}
+
+func parseLoginNonceClaims(secret []byte, raw string) (loginNonceClaims, error) {
+	if strings.TrimSpace(raw) == "" {
+		return loginNonceClaims{}, errors.New("missing login nonce")
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) != 2 {
+		return loginNonceClaims{}, errors.New("invalid login nonce format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return loginNonceClaims{}, fmt.Errorf("decode login nonce payload: %w", err)
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return loginNonceClaims{}, fmt.Errorf("decode login nonce signature: %w", err)
+	}
+	expected := authHMACSHA256(secret, payload)
+	if len(signature) != len(expected) || subtle.ConstantTimeCompare(signature, expected) != 1 {
+		return loginNonceClaims{}, errors.New("invalid login nonce signature")
+	}
+	var claims loginNonceClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return loginNonceClaims{}, fmt.Errorf("decode login nonce claims: %w", err)
+	}
+	return claims, nil
+}
+
+func randomHexToken(size int) (string, error) {
+	if size <= 0 {
+		size = 16
+	}
+	raw := make([]byte, size)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate login token: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+func randomBase64URLToken(size int) (string, error) {
+	if size <= 0 {
+		size = 32
+	}
+	raw := make([]byte, size)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate PKCE token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func expiredCookie(name string, path string) *http.Cookie {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/"
+	}
+	return &http.Cookie{
+		Name:     name,
+		Value:    "",
+		Path:     path,
+		HttpOnly: true,
+		MaxAge:   -1,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Unix(0, 0).UTC(),
+	}
+}
+
+func authHMACSHA256(key []byte, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(data)
+	return mac.Sum(nil)
 }

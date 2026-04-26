@@ -1,19 +1,18 @@
 schema: 1
 module_id: satiksme_bot
-owner: pixel-ops
+owner: arbuzas
 runtime:
-  type: service
-  healthcheck: sh /data/local/pixel-stack/bin/pixel-satiksme-health.sh
-  run_id_env: PIXEL_RUN_ID
+  type: external
+  healthcheck: curl -fsS https://kontrole.info/api/v1/health >/dev/null
+  run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: satiksme_bot
-    start: sh /data/local/pixel-stack/bin/pixel-satiksme-start.sh
-    stop: sh /data/local/pixel-stack/bin/pixel-satiksme-stop.sh
-    health: sh /data/local/pixel-stack/bin/pixel-satiksme-health.sh
+    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d satiksme_bot satiksme_tunnel
+    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop satiksme_tunnel satiksme_bot
+    health: curl -fsS http://127.0.0.1:9318/api/v1/health >/dev/null
     redeploy:
-      mode: artifact_release
-      artifact_id: satiksme-bot-bundle
-      release_root: /data/local/pixel-stack/apps/satiksme-bot/releases
+      mode: compose_release
+      release_root: /etc/arbuzas/releases
 observability:
   event_source: satiksme_bot
   evidence_root: ops/evidence/satiksme-bot

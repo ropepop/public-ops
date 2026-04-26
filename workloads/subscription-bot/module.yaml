@@ -1,0 +1,18 @@
+schema: 1
+module_id: subscription_bot
+owner: arbuzas
+runtime:
+  type: external
+  healthcheck: curl -fsS https://farel-subscription-bot.jolkins.id.lv/pixel-stack/subscription/api/v1/health >/dev/null
+  run_id_env: ARBUZAS_RELEASE_ID
+components:
+  - id: subscription_bot
+    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d subscription_bot subscription_tunnel
+    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop subscription_tunnel subscription_bot
+    health: curl -fsS http://127.0.0.1:9320/pixel-stack/subscription/api/v1/health >/dev/null
+    redeploy:
+      mode: compose_release
+      release_root: /etc/arbuzas/releases
+observability:
+  event_source: subscription_bot
+  evidence_root: ops/evidence/subscription-bot

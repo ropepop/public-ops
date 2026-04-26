@@ -1,19 +1,18 @@
 schema: 1
 module_id: site_notifier
-owner: pixel-ops
+owner: arbuzas
 runtime:
-  type: service
-  healthcheck: /data/local/pixel-stack/apps/site-notifications/run/site-notifier.pid
-  run_id_env: PIXEL_RUN_ID
+  type: external
+  healthcheck: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T site_notifications python /opt/site-notifications/app.py healthcheck >/dev/null
+  run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: site_notifier
-    start: sh /data/local/pixel-stack/bin/pixel-notifier-start.sh
-    stop: sh /data/local/pixel-stack/bin/pixel-notifier-stop.sh
-    health: pid=$(cat /data/local/pixel-stack/apps/site-notifications/run/site-notifier.pid 2>/dev/null || true); [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d site_notifications
+    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop site_notifications
+    health: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T site_notifications python /opt/site-notifications/app.py healthcheck >/dev/null
     redeploy:
-      mode: artifact_release
-      artifact_id: site-notifier-bundle
-      release_root: /data/local/pixel-stack/apps/site-notifications/releases
+      mode: compose_release
+      release_root: /etc/arbuzas/releases
 observability:
   event_source: site_notifications
   evidence_root: ops/evidence/site-notifications

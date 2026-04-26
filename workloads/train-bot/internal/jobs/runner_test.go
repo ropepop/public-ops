@@ -12,10 +12,39 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"telegramtrainapp/internal/domain"
 	"telegramtrainapp/internal/schedule"
 	"telegramtrainapp/internal/scrape"
+	"telegramtrainapp/internal/spacetime"
 	"telegramtrainapp/internal/store"
 )
+
+type countingStore struct {
+	*store.SQLiteStore
+	upsertTrainInstancesCalls int
+	upsertTrainStopsCalls     int
+}
+
+func (s *countingStore) UpsertTrainInstances(ctx context.Context, serviceDate string, sourceVersion string, trains []domain.TrainInstance) error {
+	s.upsertTrainInstancesCalls++
+	return s.SQLiteStore.UpsertTrainInstances(ctx, serviceDate, sourceVersion, trains)
+}
+
+func (s *countingStore) UpsertTrainStops(ctx context.Context, serviceDate string, stopsByTrain map[string][]domain.TrainStop) error {
+	s.upsertTrainStopsCalls++
+	return s.SQLiteStore.UpsertTrainStops(ctx, serviceDate, stopsByTrain)
+}
+
+type cleanupFailingStore struct {
+	*store.SQLiteStore
+	cleanupCalls int
+	cleanupErr   error
+}
+
+func (s *cleanupFailingStore) CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (store.CleanupResult, error) {
+	s.cleanupCalls++
+	return store.CleanupResult{}, s.cleanupErr
+}
 
 type scriptedProvider struct {
 	calls    int
@@ -71,7 +100,7 @@ func (p *scriptedProvider) Fetch(_ context.Context, serviceDate time.Time) (scra
 
 func TestRunnerTriggersDailyCatchupAfterCutoff(t *testing.T) {
 	ctx := context.Background()
-	_, _, scheduleDir, runner, manager, provider := setupRunnerFixture(t, nil)
+	_, _, _, runner, reader, provider := setupRunnerFixture(t, nil)
 	now := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 3, 5)
 
 	runner.tick(ctx, now)
@@ -79,10 +108,10 @@ func TestRunnerTriggersDailyCatchupAfterCutoff(t *testing.T) {
 	if provider.calls != 1 {
 		t.Fatalf("expected 1 scrape call, got %d", provider.calls)
 	}
-	if !manager.IsFreshFor(now) {
-		t.Fatalf("expected manager to be fresh after catch-up scrape")
+	if !reader.IsFreshFor(now) {
+		t.Fatalf("expected read model to be fresh after catch-up scrape")
 	}
-	if got := manager.LoadedServiceDate(); got != now.Format("2006-01-02") {
+	if got := reader.AccessContext(now).LoadedServiceDate; got != now.Format("2006-01-02") {
 		t.Fatalf("expected loaded service date %s, got %s", now.Format("2006-01-02"), got)
 	}
 	if runner.lastDailyScrapeAttemptDate != "" {
@@ -94,24 +123,21 @@ func TestRunnerTriggersDailyCatchupAfterCutoff(t *testing.T) {
 	if runner.dailyRetryBackoff != 0 {
 		t.Fatalf("expected retry backoff to reset after success, got %s", runner.dailyRetryBackoff)
 	}
-	if got := manager.LoadedServiceDate(); got != now.Format("2006-01-02") {
+	if got := reader.AccessContext(now).LoadedServiceDate; got != now.Format("2006-01-02") {
 		t.Fatalf("expected loaded service date %s, got %s", now.Format("2006-01-02"), got)
 	}
-	staleTrain, err := manager.GetTrain(ctx, "t1")
+	staleTrain, err := reader.GetTrain(ctx, "t1")
 	if err != nil {
 		t.Fatalf("get stale train: %v", err)
 	}
 	if staleTrain != nil {
 		t.Fatalf("expected yesterday fallback train to be garbage collected after successful catch-up")
 	}
-	if _, err := os.Stat(filepath.Join(scheduleDir, "2026-02-27.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected yesterday snapshot to be removed, got err=%v", err)
-	}
 }
 
 func TestRunnerRetriesDailyCatchupAfterFailure(t *testing.T) {
 	ctx := context.Background()
-	_, _, _, runner, manager, provider := setupRunnerFixture(t, []error{errors.New("boom"), nil})
+	_, _, _, runner, reader, provider := setupRunnerFixture(t, []error{errors.New("boom"), nil})
 	firstAttempt := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 3, 5)
 	beforeRetry := firstAttempt.Add(14 * time.Minute)
 	retryAt := firstAttempt.Add(15 * time.Minute)
@@ -122,8 +148,8 @@ func TestRunnerRetriesDailyCatchupAfterFailure(t *testing.T) {
 	if provider.calls != 1 {
 		t.Fatalf("expected 1 scrape call after initial failure, got %d", provider.calls)
 	}
-	if manager.IsFreshFor(firstAttempt) {
-		t.Fatalf("expected manager to remain stale after failed catch-up")
+	if reader.IsFreshFor(firstAttempt) {
+		t.Fatalf("expected read model to remain stale after failed catch-up")
 	}
 	if runner.lastDailyScrapeAttemptDate != serviceDate {
 		t.Fatalf("expected attempt date %s, got %s", serviceDate, runner.lastDailyScrapeAttemptDate)
@@ -144,8 +170,8 @@ func TestRunnerRetriesDailyCatchupAfterFailure(t *testing.T) {
 	if provider.calls != 2 {
 		t.Fatalf("expected retry at backoff deadline, got %d calls", provider.calls)
 	}
-	if !manager.IsFreshFor(retryAt) {
-		t.Fatalf("expected manager to be fresh after successful retry")
+	if !reader.IsFreshFor(retryAt) {
+		t.Fatalf("expected read model to be fresh after successful retry")
 	}
 	if runner.lastDailyScrapeAttemptDate != "" {
 		t.Fatalf("expected attempt state to reset after retry success, got %q", runner.lastDailyScrapeAttemptDate)
@@ -201,7 +227,7 @@ func TestRunnerCapsDailyRetryBackoffAtSixtyMinutes(t *testing.T) {
 
 func TestRunnerDoesNotRescrapeWhileScheduleIsFresh(t *testing.T) {
 	ctx := context.Background()
-	_, _, _, runner, manager, provider := setupRunnerFixture(t, nil)
+	_, _, _, runner, reader, provider := setupRunnerFixture(t, nil)
 	firstAttempt := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 3, 5)
 	laterSameDay := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 4, 5)
 
@@ -209,8 +235,8 @@ func TestRunnerDoesNotRescrapeWhileScheduleIsFresh(t *testing.T) {
 	if provider.calls != 1 {
 		t.Fatalf("expected initial catch-up scrape, got %d calls", provider.calls)
 	}
-	if !manager.IsFreshFor(laterSameDay) {
-		t.Fatalf("expected manager to stay fresh later the same day")
+	if !reader.IsFreshFor(laterSameDay) {
+		t.Fatalf("expected read model to stay fresh later the same day")
 	}
 
 	runner.tick(ctx, laterSameDay)
@@ -232,9 +258,173 @@ func TestRunnerPublishesTrainStopsCleanupMetric(t *testing.T) {
 	if got := queryDailyMetric(t, dbPath, now.Format("2006-01-02"), "cleanup_train_stops_deleted"); got != 0 {
 		t.Fatalf("expected cleanup_train_stops_deleted=0 before successful same-day load, got %d", got)
 	}
+	if got := queryDailyMetric(t, dbPath, now.Format("2006-01-02"), "cleanup_feed_events_deleted"); got != 0 {
+		t.Fatalf("expected cleanup_feed_events_deleted=0 before successful same-day load, got %d", got)
+	}
+	if got := queryDailyMetric(t, dbPath, now.Format("2006-01-02"), "cleanup_feed_imports_deleted"); got != 0 {
+		t.Fatalf("expected cleanup_feed_imports_deleted=0 before successful same-day load, got %d", got)
+	}
+	if got := queryDailyMetric(t, dbPath, now.Format("2006-01-02"), "cleanup_import_chunks_deleted"); got != 0 {
+		t.Fatalf("expected cleanup_import_chunks_deleted=0 before successful same-day load, got %d", got)
+	}
 }
 
-func setupRunnerFixture(t *testing.T, outcomes []error) (string, *store.SQLiteStore, string, *Runner, *schedule.Manager, *scriptedProvider) {
+func TestRunnerBacksOffCleanupAfterFailure(t *testing.T) {
+	ctx := context.Background()
+	_, baseStore, _, _, reader, _ := setupRunnerFixture(t, nil)
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	st := &cleanupFailingStore{
+		SQLiteStore: baseStore,
+		cleanupErr:  errors.New("boom"),
+	}
+	runner := NewRunner(st, reader, nil, 24*time.Hour, loc, nil, 3, true)
+	firstTick := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 2, 30)
+
+	runner.tick(ctx, firstTick)
+	if st.cleanupCalls != 1 {
+		t.Fatalf("expected 1 cleanup attempt after first failure, got %d", st.cleanupCalls)
+	}
+
+	runner.tick(ctx, firstTick.Add(time.Minute))
+	if st.cleanupCalls != 1 {
+		t.Fatalf("expected cleanup failure to respect cleanup interval backoff, got %d calls", st.cleanupCalls)
+	}
+}
+
+func TestRunnerReturnsFatalSchemaErrorForCleanup(t *testing.T) {
+	ctx := context.Background()
+	_, baseStore, _, _, reader, _ := setupRunnerFixture(t, nil)
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	st := &cleanupFailingStore{
+		SQLiteStore: baseStore,
+		cleanupErr:  spacetime.ErrLiveSchemaOutdated,
+	}
+	runner := NewRunner(st, reader, nil, 24*time.Hour, loc, nil, 3, true)
+	firstTick := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 2, 30)
+
+	err = runner.tick(ctx, firstTick)
+	if st.cleanupCalls != 1 {
+		t.Fatalf("expected first cleanup attempt, got %d", st.cleanupCalls)
+	}
+	if !errors.Is(err, spacetime.ErrLiveSchemaOutdated) {
+		t.Fatalf("expected live schema error, got %v", err)
+	}
+}
+
+func TestRunnerRunSuccessfulStartupScrapeSkipsFollowupLoad(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+
+	baseStore, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "runner-start.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := baseStore.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = baseStore.Close()
+	})
+
+	counting := &countingStore{SQLiteStore: baseStore}
+	scheduleDir := t.TempDir()
+	provider := &scriptedProvider{}
+	orchestrator := scrape.NewOrchestrator([]scrape.Provider{provider}, scheduleDir, 1)
+	reader := schedule.NewProjectionReader(counting, loc, 3)
+	runner := NewRunner(counting, reader, nil, 24*time.Hour, loc, orchestrator, 3, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	expectedDate := time.Now().In(loc).Format("2006-01-02")
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+	waitForRunnerStartup(t, func() bool {
+		return provider.calls == 1
+	})
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("runner run: %v", err)
+	}
+
+	if provider.calls != 1 {
+		t.Fatalf("expected one startup scrape, got %d", provider.calls)
+	}
+	if counting.upsertTrainInstancesCalls != 1 {
+		t.Fatalf("expected one train instance import, got %d", counting.upsertTrainInstancesCalls)
+	}
+	if counting.upsertTrainStopsCalls != 1 {
+		t.Fatalf("expected one train stop import, got %d", counting.upsertTrainStopsCalls)
+	}
+	if got := reader.LoadedServiceDate(); got != expectedDate {
+		t.Fatalf("expected loaded service date %s, got %s", expectedDate, got)
+	}
+}
+
+func TestRunnerRunDoesNotFallbackToSnapshotLoadAfterStartupScrapeFailure(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+
+	baseStore, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "runner-start-fallback.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := baseStore.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = baseStore.Close()
+	})
+
+	counting := &countingStore{SQLiteStore: baseStore}
+	scheduleDir := t.TempDir()
+	now := time.Now().In(loc)
+	writeSnapshotFile(t, scheduleDir, now)
+	provider := &scriptedProvider{outcomes: []error{errors.New("startup scrape failed")}}
+	orchestrator := scrape.NewOrchestrator([]scrape.Provider{provider}, scheduleDir, 1)
+	reader := schedule.NewProjectionReader(counting, loc, 3)
+	runner := NewRunner(counting, reader, nil, 24*time.Hour, loc, orchestrator, 3, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+	waitForRunnerStartup(t, func() bool {
+		return provider.calls == 1
+	})
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("runner run: %v", err)
+	}
+
+	if provider.calls != 1 {
+		t.Fatalf("expected one failed startup scrape, got %d", provider.calls)
+	}
+	if counting.upsertTrainInstancesCalls != 0 {
+		t.Fatalf("expected no fallback train import from snapshot file, got %d", counting.upsertTrainInstancesCalls)
+	}
+	if counting.upsertTrainStopsCalls != 0 {
+		t.Fatalf("expected no fallback stop import from snapshot file, got %d", counting.upsertTrainStopsCalls)
+	}
+	if got := reader.LoadedServiceDate(); got != "" {
+		t.Fatalf("expected no loaded service date after failed startup scrape, got %s", got)
+	}
+}
+
+func setupRunnerFixture(t *testing.T, outcomes []error) (string, *store.SQLiteStore, string, *Runner, *schedule.ProjectionReader, *scriptedProvider) {
 	t.Helper()
 
 	loc, err := time.LoadLocation("Europe/Riga")
@@ -262,12 +452,13 @@ func setupRunnerFixture(t *testing.T, outcomes []error) (string, *store.SQLiteSt
 	if err := manager.LoadToday(context.Background(), yesterday); err != nil {
 		t.Fatalf("load yesterday snapshot: %v", err)
 	}
+	reader := schedule.NewProjectionReader(st, loc, 3)
 
 	provider := &scriptedProvider{outcomes: append([]error(nil), outcomes...)}
 	orchestrator := scrape.NewOrchestrator([]scrape.Provider{provider}, scheduleDir, 1)
-	runner := NewRunner(st, manager, 24*time.Hour, loc, orchestrator, 3, true)
+	runner := NewRunner(st, reader, nil, 24*time.Hour, loc, orchestrator, 3, true)
 
-	return dbPath, st, scheduleDir, runner, manager, provider
+	return dbPath, st, scheduleDir, runner, reader, provider
 }
 
 func writeSnapshotFile(t *testing.T, dir string, now time.Time) {
@@ -332,4 +523,17 @@ func queryDailyMetric(t *testing.T, dbPath string, metricDate string, key string
 		t.Fatalf("query daily metric %s/%s: %v", metricDate, key, err)
 	}
 	return value
+}
+
+func waitForRunnerStartup(t *testing.T, ready func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for runner startup")
 }

@@ -25,15 +25,7 @@ type releaseInfo struct {
 }
 
 func newReleaseInfo(static fs.FS) (releaseInfo, error) {
-	appJSHash, err := hashStaticAsset(static, "app.js")
-	if err != nil {
-		return releaseInfo{}, err
-	}
-	appCSSHash, err := hashStaticAsset(static, "app.css")
-	if err != nil {
-		return releaseInfo{}, err
-	}
-	feedJSHash, err := hashStaticAsset(static, "external-feed.js")
+	assetHashes, err := hashStaticAssets(static)
 	if err != nil {
 		return releaseInfo{}, err
 	}
@@ -46,14 +38,10 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 		BuildTime:  strings.TrimSpace(appversion.BuildTime),
 		Dirty:      strings.TrimSpace(appversion.Dirty),
 		Instance:   instanceID,
-		AppJSHash:  appJSHash,
-		AppCSSHash: appCSSHash,
-		FeedJSHash: feedJSHash,
-		assetHash: map[string]string{
-			"app.js":           appJSHash,
-			"app.css":          appCSSHash,
-			"external-feed.js": feedJSHash,
-		},
+		AppJSHash:  assetHashes["app.js"],
+		AppCSSHash: assetHashes["app.css"],
+		FeedJSHash: assetHashes["external-feed.js"],
+		assetHash:  assetHashes,
 	}, nil
 }
 
@@ -64,6 +52,27 @@ func hashStaticAsset(static fs.FS, name string) (string, error) {
 	}
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func hashStaticAssets(static fs.FS) (map[string]string, error) {
+	hashes := make(map[string]string)
+	if err := fs.WalkDir(static, ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		sum, err := hashStaticAsset(static, path)
+		if err != nil {
+			return err
+		}
+		hashes[path] = sum
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("hash static assets: %w", err)
+	}
+	return hashes, nil
 }
 
 func randomInstanceID() (string, error) {

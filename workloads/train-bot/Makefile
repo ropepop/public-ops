@@ -1,16 +1,17 @@
 .PHONY: run test build tidy scrape \
-	pixel-native-test pixel-native-build pixel-native-deploy pixel-native-validate pixel-native-all \
-	pixel-bootstrap pixel-sync pixel-test pixel-build pixel-deploy pixel-autostart \
-	pixel-refresh-runtime pixel-restart-train pixel-isolation-check \
-	pixel-release-check pixel-public-smoke pixel-miniapp-smoke pixel-bot-smoke pixel-e2e \
-	pixel-rollback-last pixel-rollback pixel-validate pixel-all
+	spacetime-install spacetime-build spacetime-publish-local \
+	web-client-install web-client-build web-static-test clean-local \
+	test-login-link docker-image-build
 
 LDFLAGS := $(shell bash ./scripts/ldflags.sh)
+SPACETIME ?= $(HOME)/.local/bin/spacetime
+SPACETIME_SERVER ?= http://127.0.0.1:3100
+SPACETIME_ENV ?= local
 
 run:
 	go run -ldflags "$(LDFLAGS)" ./cmd/bot
 
-test:
+test: web-static-test
 	go test ./...
 
 build:
@@ -22,78 +23,30 @@ tidy:
 scrape:
 	go run ./cmd/scrape
 
-pixel-native-test:
-	./scripts/pixel/run_native_tests.sh
+test-login-link:
+	go run ./cmd/test-login-link
 
-pixel-native-build:
-	./scripts/pixel/prepare_native_release.sh
+spacetime-install:
+	cd ./spacetimedb && npm install
 
-pixel-native-deploy:
-	../../tools/pixel/redeploy.sh --scope train_bot
+spacetime-build:
+	$(SPACETIME) build
 
-pixel-native-validate:
-	./scripts/pixel/validate_prod_readiness.sh
+spacetime-publish-local:
+	$(SPACETIME) publish --server $(SPACETIME_SERVER) --yes --env $(SPACETIME_ENV)
 
-pixel-native-all:
-	./scripts/pixel/pixel_native_all.sh
+web-client-install:
+	cd ./web-client && npm install
 
-pixel-bootstrap:
-	@echo "pixel-bootstrap retired: use ../../tools/pixel/redeploy.sh --scope train_bot." >&2
-	@exit 1
+web-client-build:
+	./scripts/build_web_client.sh
 
-pixel-sync:
-	@echo "pixel-sync retired: train-bot no longer syncs source to the device. Use make pixel-native-build." >&2
-	@exit 1
+web-static-test:
+	node --test ./internal/web/static/app.test.js ./internal/web/static/external-feed.test.js
 
-pixel-test:
-	@echo "pixel-test retired: use make pixel-native-test." >&2
-	@exit 1
+clean-local:
+	rm -rf ./.artifacts ./output ./bin ./tmp ./node_modules ./web-client/node_modules ./spacetimedb/node_modules ./spacetimedb/dist
+	find ./data/schedules -maxdepth 1 -type f -name '*.json' -delete
 
-pixel-build:
-	@echo "pixel-build retired: use make pixel-native-build." >&2
-	@exit 1
-
-pixel-deploy:
-	@echo "pixel-deploy retired: use ../../tools/pixel/redeploy.sh --scope train_bot." >&2
-	@exit 1
-
-pixel-refresh-runtime:
-	./scripts/pixel/refresh_runtime_assets.sh
-
-pixel-restart-train:
-	./scripts/pixel/restart_train_bot_runtime.sh
-
-pixel-isolation-check:
-	./scripts/pixel/restart_isolation_acceptance.sh
-
-pixel-autostart:
-	@echo "Autostart is orchestrator-owned. Run ../../tools/pixel/redeploy.sh --scope train_bot instead."
-
-pixel-release-check:
-	./scripts/pixel/release_check.sh
-
-pixel-public-smoke:
-	./scripts/pixel/public_smoke.sh
-
-pixel-miniapp-smoke:
-	./scripts/pixel/miniapp_smoke.sh
-
-pixel-bot-smoke:
-	./scripts/pixel/e2e_browser_use.sh
-
-pixel-e2e:
-	./scripts/pixel/e2e_all.sh
-
-pixel-rollback-last:
-	./scripts/pixel/rollback_release.sh --last
-
-pixel-rollback:
-	./scripts/pixel/rollback_release.sh --sha "$$SHA"
-
-pixel-validate:
-	@echo "pixel-validate retired: use make pixel-native-validate." >&2
-	@exit 1
-
-pixel-all:
-	@echo "pixel-all retired: use make pixel-native-all." >&2
-	@exit 1
+docker-image-build:
+	docker build -f ../../infra/arbuzas/docker/images/train-bot.Dockerfile -t arbuzas/train-bot:dev ../../

@@ -1,34 +1,14 @@
 # Adding A Module
 
-This monorepo uses a manifest-driven onboarding contract.
+This monorepo keeps module onboarding simple: add the module where it lives, document how to run it, and make sure it has a place for evidence.
 
 ## Required Outputs
 
-- module directory in a domain (`workloads/`, `automation/`, `infra/`, or `orchestrator/`)
-- module manifest (`module.yaml`) conforming to schema, including redeploy ownership metadata for every managed component
+- module directory in a domain (`workloads/`, `automation/`, or `infra/`)
+- module manifest (`module.yaml`) describing the managed component IDs and the health command you expect operators to use
 - module runbook overlay under `docs/runbooks/`
 - module evidence archive directory under `ops/evidence/`
-- module entry in `orchestrator/modules/registry/modules.yaml` with matching redeploy metadata
-
-## Redeploy Contract
-
-Every managed component must declare a `redeploy` block in its manifest metadata:
-
-```yaml
-redeploy:
-  mode: artifact_release | asset_refresh | job | derived
-  artifact_id: <artifact-id-when-applicable>
-  derived_from: <owner-component-when-derived>
-  release_root: <immutable-release-root-when-applicable>
-```
-
-Rules:
-- `bootstrap` is reserved for clean-room provisioning and shared-platform changes.
-- `redeploy_component` is the default release/update path for one service or job.
-- `restart_component` is runtime control only and is not a release mechanism.
-- New apps must own a dedicated mutable runtime root and should default to immutable releases with `releases/<releaseId>/` plus `current`.
-- Derived components must declare their owner and cannot pretend to be independently isolated.
-- Shared mutable runtime dependencies between sibling apps are not acceptable for new module onboarding.
+- any module-specific tests or validation steps added to the right test or deploy workflow
 
 ## Steps
 
@@ -36,23 +16,17 @@ Rules:
 ```bash
 ./tools/import/new_module_scaffold.sh <module_id> <domain_dir> <component_a,component_b>
 ```
-2. Choose a redeploy mode for each managed component and define its runtime ownership boundary.
-3. Add/update module in registry file with matching redeploy metadata.
-4. Validate manifest against schema.
-5. Add module-specific health command(s).
-6. Add observability emission integration with `PIXEL_RUN_ID` propagation.
-7. Add tests and compatibility checks.
-8. Update root README module map.
-9. Update the module runbook so `restart_component` and `redeploy_component` are documented separately.
+2. Fill in the manifest with the real component IDs and health commands.
+3. Add or update the module runbook with local checks, deploy steps, and validation steps.
+4. Create the evidence directory under `ops/evidence/` if the scaffold did not already cover it.
+5. Add tests and validation checks that match the module's stack.
+6. Update the root docs when the module changes the operator-facing shape of the repo.
 
 ## Acceptance Gates
 
-- registry entry exists and IDs are unique
-- manifest validates against `orchestrator/modules/schemas/module-manifest.v1.schema.json`
-- every managed component declares redeploy ownership metadata
-- any derived component declares `derived_from`
-- any app-style service has a dedicated runtime root; new apps default to immutable releases with `current`
-- module runbook distinguishes `restart_component` from `redeploy_component`
+- module directory and `module.yaml` exist in the right domain
+- module runbook explains how to check, deploy, and validate it
+- evidence directory exists under `ops/evidence/`
 - docs link check passes (`./tools/docs/check_links.sh`)
 - evidence validation passes (`./tools/observability/validate_evidence.sh`)
-- compatibility API unchanged for existing components/actions
+- tests or local validation pass for the module you added

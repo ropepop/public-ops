@@ -18,7 +18,7 @@ import (
 
 func main() {
 	dateFlag := flag.String("date", "", "service date in YYYY-MM-DD (default: today in Europe/Riga)")
-	outDirFlag := flag.String("out-dir", envOr("SCRAPER_OUTPUT_DIR", "./data/schedules"), "output directory for snapshot files")
+	outDirFlag := flag.String("out-dir", envOr("SCRAPER_OUTPUT_DIR", "./data/schedules"), "optional output directory for debug snapshot files")
 	minTrainsFlag := flag.Int("min-trains", envOrInt("SCRAPER_MIN_TRAINS", 1), "minimum merged trains required for success")
 	timeoutFlag := flag.Int("timeout-sec", 20, "HTTP timeout seconds per provider")
 	viviPageURLFlag := flag.String("vivi-page-url", envOr("SCRAPER_VIVI_PAGE_URL", "https://www.vivi.lv/lv/informacija-pasazieriem/"), "Vivi passenger info page URL")
@@ -46,8 +46,8 @@ func main() {
 	timeout := time.Duration(*timeoutFlag) * time.Second
 
 	providers := []scrape.Provider{
-		scrape.NewViviPDFProvider("vivi_pdf", viviPageURL, ua, timeout),
 		scrape.NewViviGTFSProvider("vivi_gtfs", viviGTFSURL, ua, timeout),
+		scrape.NewViviPDFProvider("vivi_pdf", viviPageURL, ua, timeout),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

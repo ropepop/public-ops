@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"satiksmebot/internal/domain"
+	"satiksmebot/internal/model"
 
 	_ "modernc.org/sqlite"
 )
@@ -97,32 +97,64 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	return nil
 }
 
-func (s *SQLiteStore) InsertStopSighting(ctx context.Context, sighting domain.StopSighting) error {
+func (s *SQLiteStore) InsertStopSighting(ctx context.Context, sighting model.StopSighting) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO stop_sightings(id, stop_id, user_id, created_at)
-		VALUES (?, ?, ?, ?)
-	`, sighting.ID, sighting.StopID, sighting.UserID, sighting.CreatedAt.UTC().Format(time.RFC3339))
+		INSERT INTO stop_sightings(id, stop_id, user_id, is_hidden, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, sighting.ID, sighting.StopID, sighting.UserID, boolToInt(sighting.Hidden), sighting.CreatedAt.UTC().Format(time.RFC3339))
 	return err
 }
 
-func (s *SQLiteStore) GetLastStopSightingByUserScope(ctx context.Context, userID int64, stopID string) (*domain.StopSighting, error) {
+func (s *SQLiteStore) InsertStopSightingWithVote(ctx context.Context, sighting model.StopSighting, vote model.IncidentVote, event model.IncidentVoteEvent, dedupeWindow time.Duration) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if !sighting.Hidden {
+		claimed, err := claimReportDedupeTx(ctx, tx, "stop", sighting.UserID, sighting.StopID, sighting.CreatedAt, dedupeWindow)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if !claimed {
+			_ = tx.Rollback()
+			return ErrDuplicateReport
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO stop_sightings(id, stop_id, user_id, is_hidden, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, sighting.ID, sighting.StopID, sighting.UserID, boolToInt(sighting.Hidden), sighting.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := recordIncidentVoteTx(ctx, tx, vote, event); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) GetLastStopSightingByUserScope(ctx context.Context, userID int64, stopID string) (*model.StopSighting, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, stop_id, user_id, created_at
+		SELECT id, stop_id, user_id, is_hidden, created_at
 		FROM stop_sightings
 		WHERE user_id = ? AND stop_id = ?
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, userID, stopID)
 	var (
-		item domain.StopSighting
-		at   string
+		item   model.StopSighting
+		hidden int
+		at     string
 	)
-	if err := row.Scan(&item.ID, &item.StopID, &item.UserID, &at); err != nil {
+	if err := row.Scan(&item.ID, &item.StopID, &item.UserID, &hidden, &at); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
 	}
+	item.Hidden = hidden != 0
 	parsedAt, err := time.Parse(time.RFC3339, at)
 	if err != nil {
 		return nil, err
@@ -131,12 +163,9 @@ func (s *SQLiteStore) GetLastStopSightingByUserScope(ctx context.Context, userID
 	return &item, nil
 }
 
-func (s *SQLiteStore) ListStopSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]domain.StopSighting, error) {
-	if limit <= 0 {
-		limit = 200
-	}
+func (s *SQLiteStore) ListStopSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]model.StopSighting, error) {
 	query := `
-		SELECT id, stop_id, user_id, created_at
+		SELECT id, stop_id, user_id, is_hidden, created_at
 		FROM stop_sightings
 		WHERE created_at >= ?
 	`
@@ -145,8 +174,11 @@ func (s *SQLiteStore) ListStopSightingsSince(ctx context.Context, since time.Tim
 		query += ` AND stop_id = ?`
 		args = append(args, stopID)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
+	query += ` ORDER BY created_at DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -154,15 +186,17 @@ func (s *SQLiteStore) ListStopSightingsSince(ctx context.Context, since time.Tim
 	}
 	defer rows.Close()
 
-	out := make([]domain.StopSighting, 0)
+	out := make([]model.StopSighting, 0)
 	for rows.Next() {
 		var (
-			item domain.StopSighting
-			at   string
+			item   model.StopSighting
+			hidden int
+			at     string
 		)
-		if err := rows.Scan(&item.ID, &item.StopID, &item.UserID, &at); err != nil {
+		if err := rows.Scan(&item.ID, &item.StopID, &item.UserID, &hidden, &at); err != nil {
 			return nil, err
 		}
+		item.Hidden = hidden != 0
 		parsedAt, err := time.Parse(time.RFC3339, at)
 		if err != nil {
 			return nil, err
@@ -173,36 +207,94 @@ func (s *SQLiteStore) ListStopSightingsSince(ctx context.Context, since time.Tim
 	return out, rows.Err()
 }
 
-func (s *SQLiteStore) InsertVehicleSighting(ctx context.Context, sighting domain.VehicleSighting) error {
+func (s *SQLiteStore) InsertVehicleSighting(ctx context.Context, sighting model.VehicleSighting) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO vehicle_sightings(
 			id, stop_id, user_id, mode, route_label, direction, destination,
-			departure_seconds, live_row_id, scope_key, created_at
+			departure_seconds, live_row_id, scope_key, is_hidden, created_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, sighting.ID, sighting.StopID, sighting.UserID, sighting.Mode, sighting.RouteLabel, sighting.Direction, sighting.Destination, sighting.DepartureSeconds, sighting.LiveRowID, sighting.ScopeKey, sighting.CreatedAt.UTC().Format(time.RFC3339))
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, sighting.ID, sighting.StopID, sighting.UserID, sighting.Mode, sighting.RouteLabel, sighting.Direction, sighting.Destination, sighting.DepartureSeconds, sighting.LiveRowID, sighting.ScopeKey, boolToInt(sighting.Hidden), sighting.CreatedAt.UTC().Format(time.RFC3339))
 	return err
 }
 
-func (s *SQLiteStore) GetLastVehicleSightingByUserScope(ctx context.Context, userID int64, scopeKey string) (*domain.VehicleSighting, error) {
+func (s *SQLiteStore) InsertVehicleSightingWithVote(ctx context.Context, sighting model.VehicleSighting, vote model.IncidentVote, event model.IncidentVoteEvent, dedupeWindow time.Duration) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if !sighting.Hidden {
+		claimed, err := claimReportDedupeTx(ctx, tx, "vehicle", sighting.UserID, sighting.ScopeKey, sighting.CreatedAt, dedupeWindow)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if !claimed {
+			_ = tx.Rollback()
+			return ErrDuplicateReport
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO vehicle_sightings(
+			id, stop_id, user_id, mode, route_label, direction, destination,
+			departure_seconds, live_row_id, scope_key, is_hidden, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, sighting.ID, sighting.StopID, sighting.UserID, sighting.Mode, sighting.RouteLabel, sighting.Direction, sighting.Destination, sighting.DepartureSeconds, sighting.LiveRowID, sighting.ScopeKey, boolToInt(sighting.Hidden), sighting.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := recordIncidentVoteTx(ctx, tx, vote, event); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func claimReportDedupeTx(ctx context.Context, tx *sql.Tx, reportKind string, userID int64, scopeKey string, reportAt time.Time, window time.Duration) (bool, error) {
+	if window <= 0 {
+		return true, nil
+	}
+	reportAt = reportAt.UTC()
+	cutoff := reportAt.Add(-window).UTC()
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO report_dedupe_claims(report_kind, user_id, scope_key, last_report_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(report_kind, user_id, scope_key) DO UPDATE SET
+			last_report_at = excluded.last_report_at
+		WHERE report_dedupe_claims.last_report_at <= ?
+	`, strings.TrimSpace(reportKind), userID, strings.TrimSpace(scopeKey), reportAt.Format(time.RFC3339), cutoff.Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+func (s *SQLiteStore) GetLastVehicleSightingByUserScope(ctx context.Context, userID int64, scopeKey string) (*model.VehicleSighting, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, stop_id, user_id, mode, route_label, direction, destination,
-		       departure_seconds, live_row_id, scope_key, created_at
+		       departure_seconds, live_row_id, scope_key, is_hidden, created_at
 		FROM vehicle_sightings
 		WHERE user_id = ? AND scope_key = ?
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, userID, scopeKey)
 	var (
-		item domain.VehicleSighting
-		at   string
+		item   model.VehicleSighting
+		hidden int
+		at     string
 	)
-	if err := row.Scan(&item.ID, &item.StopID, &item.UserID, &item.Mode, &item.RouteLabel, &item.Direction, &item.Destination, &item.DepartureSeconds, &item.LiveRowID, &item.ScopeKey, &at); err != nil {
+	if err := row.Scan(&item.ID, &item.StopID, &item.UserID, &item.Mode, &item.RouteLabel, &item.Direction, &item.Destination, &item.DepartureSeconds, &item.LiveRowID, &item.ScopeKey, &hidden, &at); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
 	}
+	item.Hidden = hidden != 0
 	parsedAt, err := time.Parse(time.RFC3339, at)
 	if err != nil {
 		return nil, err
@@ -211,13 +303,10 @@ func (s *SQLiteStore) GetLastVehicleSightingByUserScope(ctx context.Context, use
 	return &item, nil
 }
 
-func (s *SQLiteStore) ListVehicleSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]domain.VehicleSighting, error) {
-	if limit <= 0 {
-		limit = 200
-	}
+func (s *SQLiteStore) ListVehicleSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]model.VehicleSighting, error) {
 	query := `
 		SELECT id, stop_id, user_id, mode, route_label, direction, destination,
-		       departure_seconds, live_row_id, scope_key, created_at
+		       departure_seconds, live_row_id, scope_key, is_hidden, created_at
 		FROM vehicle_sightings
 		WHERE created_at >= ?
 	`
@@ -226,8 +315,11 @@ func (s *SQLiteStore) ListVehicleSightingsSince(ctx context.Context, since time.
 		query += ` AND stop_id = ?`
 		args = append(args, stopID)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
+	query += ` ORDER BY created_at DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -235,20 +327,247 @@ func (s *SQLiteStore) ListVehicleSightingsSince(ctx context.Context, since time.
 	}
 	defer rows.Close()
 
-	out := make([]domain.VehicleSighting, 0)
+	out := make([]model.VehicleSighting, 0)
 	for rows.Next() {
 		var (
-			item domain.VehicleSighting
-			at   string
+			item   model.VehicleSighting
+			hidden int
+			at     string
 		)
-		if err := rows.Scan(&item.ID, &item.StopID, &item.UserID, &item.Mode, &item.RouteLabel, &item.Direction, &item.Destination, &item.DepartureSeconds, &item.LiveRowID, &item.ScopeKey, &at); err != nil {
+		if err := rows.Scan(&item.ID, &item.StopID, &item.UserID, &item.Mode, &item.RouteLabel, &item.Direction, &item.Destination, &item.DepartureSeconds, &item.LiveRowID, &item.ScopeKey, &hidden, &at); err != nil {
 			return nil, err
 		}
+		item.Hidden = hidden != 0
 		parsedAt, err := time.Parse(time.RFC3339, at)
 		if err != nil {
 			return nil, err
 		}
 		item.CreatedAt = parsedAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) UpsertIncidentVote(ctx context.Context, vote model.IncidentVote) error {
+	createdAt := vote.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = vote.UpdatedAt
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := vote.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO incident_votes(incident_id, user_id, nickname, vote_value, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(incident_id, user_id) DO UPDATE SET
+			nickname = excluded.nickname,
+			vote_value = excluded.vote_value,
+			updated_at = excluded.updated_at
+	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.UTC().Format(time.RFC3339), updatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) RecordIncidentVote(ctx context.Context, vote model.IncidentVote, event model.IncidentVoteEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := recordIncidentVoteTx(ctx, tx, vote, event); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func recordIncidentVoteTx(ctx context.Context, tx *sql.Tx, vote model.IncidentVote, event model.IncidentVoteEvent) error {
+	createdAt := vote.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = vote.UpdatedAt
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := vote.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	eventAt := event.CreatedAt
+	if eventAt.IsZero() {
+		eventAt = updatedAt
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_votes(incident_id, user_id, nickname, vote_value, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(incident_id, user_id) DO UPDATE SET
+			nickname = excluded.nickname,
+			vote_value = excluded.vote_value,
+			updated_at = excluded.updated_at
+	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.UTC().Format(time.RFC3339), updatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_vote_events(id, incident_id, user_id, nickname, vote_value, source, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, event.ID, event.IncidentID, event.UserID, strings.TrimSpace(event.Nickname), string(event.Value), string(event.Source), eventAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListIncidentVotes(ctx context.Context, incidentID string) ([]model.IncidentVote, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT incident_id, user_id, nickname, vote_value, created_at, updated_at
+		FROM incident_votes
+		WHERE incident_id = ?
+		ORDER BY updated_at DESC, user_id ASC
+	`, strings.TrimSpace(incidentID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]model.IncidentVote, 0)
+	for rows.Next() {
+		var (
+			item         model.IncidentVote
+			valueRaw     string
+			createdAtRaw string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&item.IncidentID, &item.UserID, &item.Nickname, &valueRaw, &createdAtRaw, &updatedAtRaw); err != nil {
+			return nil, err
+		}
+		item.Value = model.IncidentVoteValue(valueRaw)
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		updatedAt, err := time.Parse(time.RFC3339, updatedAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		item.UpdatedAt = updatedAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) ListIncidentVoteEvents(ctx context.Context, incidentID string, since time.Time, limit int) ([]model.IncidentVoteEvent, error) {
+	query := `
+		SELECT id, incident_id, user_id, nickname, vote_value, source, created_at
+		FROM incident_vote_events
+	`
+	args := make([]any, 0, 2)
+	clauses := make([]string, 0, 2)
+	if strings.TrimSpace(incidentID) != "" {
+		clauses = append(clauses, `incident_id = ?`)
+		args = append(args, strings.TrimSpace(incidentID))
+	}
+	if !since.IsZero() {
+		clauses = append(clauses, `created_at >= ?`)
+		args = append(args, since.UTC().Format(time.RFC3339))
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]model.IncidentVoteEvent, 0)
+	for rows.Next() {
+		var (
+			item         model.IncidentVoteEvent
+			valueRaw     string
+			sourceRaw    string
+			createdAtRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.IncidentID, &item.UserID, &item.Nickname, &valueRaw, &sourceRaw, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		item.Value = model.IncidentVoteValue(valueRaw)
+		item.Source = model.IncidentVoteSource(sourceRaw)
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) CountMapReportsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM stop_sightings WHERE user_id = ? AND is_hidden = 0 AND created_at >= ?) +
+			(SELECT COUNT(*) FROM vehicle_sightings WHERE user_id = ? AND is_hidden = 0 AND created_at >= ?)
+	`, userID, since.UTC().Format(time.RFC3339), userID, since.UTC().Format(time.RFC3339)).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *SQLiteStore) CountIncidentVoteEventsByUserSince(ctx context.Context, userID int64, source model.IncidentVoteSource, since time.Time) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_vote_events
+		WHERE user_id = ? AND source = ? AND created_at >= ?
+	`, userID, string(source), since.UTC().Format(time.RFC3339)).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *SQLiteStore) InsertIncidentComment(ctx context.Context, comment model.IncidentComment) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO incident_comments(id, incident_id, user_id, nickname, body, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, comment.ID, comment.IncidentID, comment.UserID, strings.TrimSpace(comment.Nickname), strings.TrimSpace(comment.Body), comment.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]model.IncidentComment, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, incident_id, user_id, nickname, body, created_at
+		FROM incident_comments
+		WHERE incident_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, strings.TrimSpace(incidentID), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]model.IncidentComment, 0)
+	for rows.Next() {
+		var (
+			item         model.IncidentComment
+			createdAtRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.IncidentID, &item.UserID, &item.Nickname, &item.Body, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -262,6 +581,12 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, cutoff time.Time) (Cle
 	}
 	vehicleRes, err := s.db.ExecContext(ctx, `DELETE FROM vehicle_sightings WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339))
 	if err != nil {
+		return result, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM incident_vote_events WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
+		return result, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM report_dedupe_claims WHERE last_report_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
 		return result, err
 	}
 	result.StopSightingsDeleted, _ = stopRes.RowsAffected()
@@ -285,6 +610,20 @@ func (s *SQLiteStore) NextReportDump(ctx context.Context, now time.Time) (*Repor
 		ORDER BY next_attempt_at ASC, created_at ASC
 		LIMIT 1
 	`, now.UTC().Format(time.RFC3339))
+	return scanReportDumpItem(row)
+}
+
+func (s *SQLiteStore) PeekNextReportDump(ctx context.Context) (*ReportDumpItem, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, payload, attempts, created_at, next_attempt_at, last_attempt_at, last_error
+		FROM report_dump_queue
+		ORDER BY next_attempt_at ASC, created_at ASC
+		LIMIT 1
+	`)
+	return scanReportDumpItem(row)
+}
+
+func scanReportDumpItem(row *sql.Row) (*ReportDumpItem, error) {
 	var (
 		item           ReportDumpItem
 		createdAtRaw   string
@@ -348,4 +687,11 @@ func parseOptionalTime(raw string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, raw)
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

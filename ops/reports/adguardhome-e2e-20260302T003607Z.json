@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-03-02T02:36:39+0200",
+  "host": "192.168.31.25",
+  "fqdn": "dns.jolkins.id.lv",
+  "reachability": {"ping": "ok"},
+  "ports": {
+    "53": "open",
+    "443": "open",
+    "853": "closed",
+    "2222": "closed",
+    "8080": "closed"
+  },
+  "dns": {
+    "host_53": {"state": "ok", "data": "104.18.26.120,104.18.27.120"}
+  },
+  "https": {
+    "dns_root": "302",
+    "dns_admin": "401",
+    "doh_mode": "tokenized",
+    "doh_primary_url": "https://dns.jolkins.id.lv/2873efbe2015ac05e3ef64a29940af55117a91172caa0b56/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_primary_code": "200",
+    "doh_tokenized_url": "https://dns.jolkins.id.lv/2873efbe2015ac05e3ef64a29940af55117a91172caa0b56/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_tokenized_code": "200",
+    "doh_bare_url": "https://dns.jolkins.id.lv/dns-query?dns=EjQBAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE",
+    "doh_bare_code": "404",
+    "contract_root_ui_reachable": "pass",
+    "contract_root_redirect": "pass",
+    "contract_admin_ui_reachable": "pass",
+    "contract_doh_mode": "pass",
+    "contract_doh_200": "pass",
+    "contract_remote_required": "pass"
+  },
+  "benchmark": {
+    "enabled": 0,
+    "requests": 0,
+    "samples": 0,
+    "success_rate_200_pct": "0.00",
+    "p50_ms": "0.000",
+    "p90_ms": "0.000",
+    "p95_ms": "0.000",
+    "p99_ms": "0.000",
+    "status_distribution": ""
+  },
+  "lan": {
+    "querylog_source": "adb",
+    "querylog_status": "ok",
+    "querylog_limit": 1500,
+    "expected_client_ip": "",
+    "expected_client_seen": "skipped",
+    "gateway_ip": "192.168.31.1",
+    "gateway_doh_count": 1317,
+    "total_doh_count": 1493,
+    "gateway_share_pct": "88.21",
+    "router_lan_ip": "192.168.31.1",
+    "router_public_ip": "62.205.193.194",
+    "router_lan_ip_doh_count": 1317,
+    "router_public_ip_doh_count": 0,
+    "router_public_attribution_contract": "fail",
+    "top_clients": "192.168.31.1:doh:1317;212.3.197.35:doh:130;127.0.0.1:doh:46;192.168.31.39:plain:7",
+    "contract_lan_visibility": "skipped"
+  },
+  "adb": {
+    "available": 1,
+    "connect_result": "",
+    "target": "192.168.31.25:5555",
+    "device_state": "device"
+  },
+  "rooted": {
+    "adguardhome_service_loop": "running",
+    "listen_53": "open",
+    "listen_2222": "open"
+  }
+}

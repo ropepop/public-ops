@@ -596,6 +596,22 @@ func (s *SQLiteStore) GetUserSettings(ctx context.Context, userID int64) (domain
 	return us, nil
 }
 
+func (s *SQLiteStore) HasUserSettings(ctx context.Context, userID int64) (bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM user_settings
+		WHERE user_id = ?
+	`, userID)
+	var exists int
+	if err := row.Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) SetAlertsEnabled(ctx context.Context, userID int64, enabled bool) error {
 	if _, err := s.EnsureUserSettings(ctx, userID); err != nil {
 		return err
@@ -643,6 +659,99 @@ func (s *SQLiteStore) SetLanguage(ctx context.Context, userID int64, lang domain
 		UPDATE user_settings SET language = ?, updated_at = ? WHERE user_id = ?
 	`, string(lang), time.Now().UTC().Format(time.RFC3339), userID)
 	return err
+}
+
+func (s *SQLiteStore) ResetTestUser(ctx context.Context, userID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, statement := range []string{
+		`DELETE FROM undo_checkouts WHERE user_id = ?`,
+		`DELETE FROM checkins WHERE user_id = ?`,
+		`DELETE FROM train_mutes WHERE user_id = ?`,
+		`DELETE FROM subscriptions WHERE user_id = ?`,
+		`DELETE FROM favorite_routes WHERE user_id = ?`,
+		`DELETE FROM report_events WHERE user_id = ?`,
+		`DELETE FROM station_sighting_events WHERE user_id = ?`,
+		`DELETE FROM incident_votes WHERE user_id = ?`,
+		`DELETE FROM incident_vote_events WHERE user_id = ?`,
+		`DELETE FROM incident_comments WHERE user_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, userID); err != nil {
+			return err
+		}
+	}
+
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO user_settings (user_id, alerts_enabled, global_station_sightings_enabled, alert_style, language, updated_at)
+		VALUES (?, 1, 0, 'DETAILED', 'EN', ?)
+		ON CONFLICT(user_id) DO UPDATE SET
+			alerts_enabled = excluded.alerts_enabled,
+			global_station_sightings_enabled = excluded.global_station_sightings_enabled,
+			alert_style = excluded.alert_style,
+			language = excluded.language,
+			updated_at = excluded.updated_at
+	`, userID, updatedAt); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	tx = nil
+	return nil
+}
+
+func (s *SQLiteStore) ConsumeTestLoginTicket(ctx context.Context, nonceHash string, userID int64, expiresAt time.Time) (bool, error) {
+	cleanNonceHash := strings.TrimSpace(nonceHash)
+	if cleanNonceHash == "" {
+		return false, errors.New("test login ticket nonce hash is required")
+	}
+	if expiresAt.IsZero() {
+		return false, errors.New("test login ticket expiry is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM test_login_tickets WHERE expires_at <= ?
+	`, now.Format(time.RFC3339)); err != nil {
+		return false, err
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO test_login_tickets (nonce_hash, user_id, expires_at, consumed_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(nonce_hash) DO NOTHING
+	`, cleanNonceHash, userID, expiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	tx = nil
+	return rowsAffected > 0, nil
 }
 
 func (s *SQLiteStore) CheckInUser(ctx context.Context, userID int64, trainID string, checkedInAt, autoCheckoutAt time.Time) error {
@@ -1004,6 +1113,24 @@ func (s *SQLiteStore) ListRecentReports(ctx context.Context, trainID string, lim
 	return scanReportRows(rows)
 }
 
+func (s *SQLiteStore) ListRecentReportEvents(ctx context.Context, since time.Time, limit int) ([]domain.ReportEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, train_instance_id, user_id, signal, created_at
+		FROM report_events
+		WHERE created_at >= ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, since.UTC().Format(time.RFC3339), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanReportRows(rows)
+}
+
 func (s *SQLiteStore) InsertStationSighting(ctx context.Context, e domain.StationSighting) error {
 	var destinationStationID any
 	var matchedTrainID any
@@ -1117,6 +1244,153 @@ func (s *SQLiteStore) ListRecentStationSightingsByTrain(ctx context.Context, tra
 	return scanStationSightingRows(rows)
 }
 
+func (s *SQLiteStore) UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error {
+	createdAt := vote.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = vote.UpdatedAt
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := vote.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO incident_votes(incident_id, user_id, nickname, vote_value, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(incident_id, user_id) DO UPDATE SET
+			nickname = excluded.nickname,
+			vote_value = excluded.vote_value,
+			updated_at = excluded.updated_at
+	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.UTC().Format(time.RFC3339), updatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) InsertIncidentVoteEvent(ctx context.Context, vote domain.IncidentVoteEvent) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO incident_vote_events(id, incident_id, user_id, nickname, vote_value, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, vote.ID, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), vote.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT incident_id, user_id, nickname, vote_value, created_at, updated_at
+		FROM incident_votes
+		WHERE incident_id = ?
+		ORDER BY updated_at DESC, user_id ASC
+	`, strings.TrimSpace(incidentID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.IncidentVote, 0)
+	for rows.Next() {
+		var (
+			item         domain.IncidentVote
+			valueRaw     string
+			createdAtRaw string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&item.IncidentID, &item.UserID, &item.Nickname, &valueRaw, &createdAtRaw, &updatedAtRaw); err != nil {
+			return nil, err
+		}
+		item.Value = domain.IncidentVoteValue(valueRaw)
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		updatedAt, err := time.Parse(time.RFC3339, updatedAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		item.UpdatedAt = updatedAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) ListIncidentVoteEvents(ctx context.Context, incidentID string, since time.Time, limit int) ([]domain.IncidentVoteEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, incident_id, user_id, nickname, vote_value, created_at
+		FROM incident_vote_events
+		WHERE incident_id = ? AND created_at >= ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, strings.TrimSpace(incidentID), since.UTC().Format(time.RFC3339), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.IncidentVoteEvent, 0)
+	for rows.Next() {
+		var (
+			item         domain.IncidentVoteEvent
+			valueRaw     string
+			createdAtRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.IncidentID, &item.UserID, &item.Nickname, &valueRaw, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		item.Value = domain.IncidentVoteValue(valueRaw)
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) InsertIncidentComment(ctx context.Context, comment domain.IncidentComment) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO incident_comments(id, incident_id, user_id, nickname, body, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, comment.ID, comment.IncidentID, comment.UserID, strings.TrimSpace(comment.Nickname), strings.TrimSpace(comment.Body), comment.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]domain.IncidentComment, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, incident_id, user_id, nickname, body, created_at
+		FROM incident_comments
+		WHERE incident_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, strings.TrimSpace(incidentID), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.IncidentComment, 0)
+	for rows.Next() {
+		var (
+			item         domain.IncidentComment
+			createdAtRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.IncidentID, &item.UserID, &item.Nickname, &item.Body, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		createdAt, err := time.Parse(time.RFC3339, createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (CleanupResult, error) {
 	if loc == nil {
 		loc = time.UTC
@@ -1126,6 +1400,7 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retenti
 	_, _ = s.db.ExecContext(ctx, `UPDATE checkins SET is_active = 0 WHERE is_active = 1 AND auto_checkout_at < ?`, now.UTC().Format(time.RFC3339))
 	_, _ = s.db.ExecContext(ctx, `UPDATE subscriptions SET is_active = 0 WHERE is_active = 1 AND expires_at < ?`, now.UTC().Format(time.RFC3339))
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM train_mutes WHERE muted_until < ?`, now.UTC().Format(time.RFC3339))
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM test_login_tickets WHERE expires_at <= ?`, now.UTC().Format(time.RFC3339))
 
 	resCheckins, err := s.db.ExecContext(ctx, `DELETE FROM checkins WHERE auto_checkout_at < ?`, cutoff.UTC().Format(time.RFC3339))
 	if err != nil {

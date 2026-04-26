@@ -1,198 +1,79 @@
-# Telegram Ride Status Alerts Bot (Latvia MVP)
+# Train App
 
-Legal, crowdsourced train ride-status bot for Telegram.
+Train bot, public web app, and Telegram entrypoints for the Arbuzas production stack.
 
-The train-bot Pixel flow is now:
-- build and test on the workstation
-- package a component release locally
-- deploy and run only in the rooted orchestrator runtime at `/data/local/pixel-stack/apps/train-bot`
+## Runtime Shape
 
-There is no Termux build, repo sync, or schedule-prep path in the supported train-bot workflow.
+The active production runtime is Docker on Arbuzas:
 
-## Supported Commands
+1. A daily importer writes validated schedule snapshots.
+2. The Go runtime serves the web app and Telegram bot.
+3. Persistent state and snapshots live under `/srv/arbuzas/train-bot`.
 
-### Local Development
-
-```bash
-cp .env.example .env
-# set BOT_TOKEN
-
-go test ./...
-go run ./cmd/bot
-```
-
-### Pixel Native Pipeline
+## Local Development
 
 ```bash
-make pixel-native-test
-make pixel-native-build
-../../tools/pixel/redeploy.sh --scope train_bot
-make pixel-release-check
-make pixel-e2e
+make test
+make scrape
+make run
+make build
+make docker-image-build
 ```
 
-`make pixel-native-build` packages a train-bot component release locally and prints the staged release dir.
-
-`../../tools/pixel/redeploy.sh --scope train_bot`:
-- syncs `.env` to the root-owned train-bot env files
-- runs orchestrator bootstrap/preflight
-- builds the Android binary on the workstation
-- generates the same-day Riga schedule locally
-- stages the component release
-- redeploys `train_bot`
-- runs the release parity check
-
-### Full Native Pass
+## Important Runtime Config
 
 ```bash
-make pixel-native-all
+SCHEDULE_DIR=/srv/arbuzas/train-bot/data/schedules
+SCRAPER_OUTPUT_DIR=/srv/arbuzas/train-bot/data/schedules
+TRAIN_WEB_ENABLED=true
+TRAIN_WEB_PUBLIC_BASE_URL=https://train-bot.jolkins.id.lv
+TRAIN_WEB_BUNDLE_DIR=/srv/arbuzas/train-bot/data/public-bundles
+TRAIN_WEB_PUBLIC_EDGE_CACHE_STATE_FILE=/srv/arbuzas/train-bot/state/public-edge-cache.json
+SINGLE_INSTANCE_LOCK_PATH=/srv/arbuzas/train-bot/run/train-bot.lock
 ```
 
-This runs:
-- host-side tests
-- native deploy
-- public, miniapp, and bot e2e smoke checks
+## Agent Testing Login
 
-## Retired Commands
+TrainBot now has a fixed-user test login path for browser agents. It is opt-in, one-time, short-lived, and resets that fixed test user back to a clean baseline before the session is created.
 
-These old train-bot commands now fail intentionally:
-- `make pixel-bootstrap`
-- `make pixel-sync`
-- `make pixel-test`
-- `make pixel-build`
-- `../../tools/pixel/redeploy.sh --scope train_bot`
-- `make pixel-validate`
-- `make pixel-all`
-
-Use the `pixel-native-*` targets instead.
-
-## Prerequisites
-
-| Component | Required | Notes |
-|---|---|---|
-| Go 1.22+ | Yes | Local test, build, and scraper execution. |
-| Tailscale CLI + SSH password env | Preferred | Primary rooted Pixel transport for deploy/release checks. |
-| `adb` | Fallback | Recovery transport when SSH readiness fails or Tailscale is unavailable. |
-| Rooted Pixel + Magisk | Yes | Required for the orchestrator-owned runtime. |
-| `sqlite3` | Yes | Used locally to validate the pulled runtime DB. |
-| [`browser-use`](/Users/aleksandrsdaniilsjolkins/Documents/pixel-ops/.agents/skills/browser-use/SKILL.md) CLI | Yes | Required for browser smoke scripts; set `BROWSER_USE_PROFILE` to a detected Chrome profile name. |
-| `cloudflared` | Conditional | Required locally when `trainBot.ingressMode=cloudflare_tunnel`. |
-| Telegram bot token | Yes | Set in `.env` as `BOT_TOKEN`. |
-
-SSH-first environment:
+Enable it with these runtime settings:
 
 ```bash
-export PIXEL_TRANSPORT=ssh
-export PIXEL_SSH_HOST="<tailnet-ip>"
-export PIXEL_SSH_PORT=2222
-export PIXEL_DEVICE_SSH_PASSWORD="<root-ssh-password>"
-
-bash ../../tools/pixel/check_ssh_ready.sh --ssh-host "${PIXEL_SSH_HOST}"
+TRAIN_WEB_TEST_LOGIN_ENABLED=true
+TRAIN_WEB_TEST_USER_ID=7001
+TRAIN_WEB_TEST_TICKET_SECRET_FILE=/etc/arbuzas/secrets/train-bot-test-ticket.secret
+TRAIN_WEB_TEST_TICKET_TTL_SEC=60
 ```
 
-Fallback ADB target in scripts:
-- `192.168.31.25:5555`
-
-Override at runtime:
+Mint the one-time link from the workload root:
 
 ```bash
-export ADB_SERIAL=<your-device-serial>
+make test-login-link
 ```
 
-## Environment and Runtime Paths
+The command prints a `/app?test_ticket=...` URL. Agents should open that minted URL directly. They do not need Telegram for this path.
 
-Copy `.env.example` to `.env`:
+Full setup and troubleshooting steps live in [Agent test login](./docs/agent-test-login.md).
 
-```bash
-cp .env.example .env
-```
+## Canonical Release Flow
 
-The supported Pixel env sync targets are:
-- `/data/local/pixel-stack/conf/apps/train-bot.env`
-- `/data/local/pixel-stack/apps/train-bot/env/train-bot.env`
+1. Run `make test`.
+2. Run `make scrape`.
+3. Run `make build` or `make docker-image-build`.
+4. Deploy with `../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"`.
+5. Validate with `../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"`.
+6. Confirm the public incidents homepage renders real content instead of the live-data outage screen.
 
-The rooted runtime lives under:
-- `/data/local/pixel-stack/apps/train-bot`
+## Runbooks
 
-Important runtime paths:
-- binary symlink: `/data/local/pixel-stack/apps/train-bot/bin/train-bot.current`
-- schedules: `/data/local/pixel-stack/apps/train-bot/data/schedules`
-- database: `/data/local/pixel-stack/apps/train-bot/train_bot.db`
-- logs: `/data/local/pixel-stack/apps/train-bot/logs`
-
-## Daily Operations
-
-### Deploy Current Train-Bot Build
-
-```bash
-../../tools/pixel/redeploy.sh --scope train_bot --transport ssh --ssh-host "${PIXEL_SSH_HOST}"
-```
-
-Expected result:
-- `train-bot.current` points to a fresh release under `releases/`
-- the same-day schedule exists in the runtime schedule dir
-- `make pixel-release-check` passes
-
-### Validate Production Readiness
-
-```bash
-make pixel-native-validate
-```
-
-This runs:
-- runtime asset freshness checks
-- host-side test/build/deploy gates
-- release check
-- public/miniapp/bot smoke checks
-- runtime DB and schedule validation
-
-### Restart Runtime Without Repackaging
-
-```bash
-make pixel-restart-train
-```
-
-### Refresh Orchestrator Runtime Assets
-
-```bash
-make pixel-refresh-runtime
-```
-
-Use this when orchestrator runtime templates or entrypoints changed locally.
-
-## Troubleshooting
-
-| Symptom | Likely Cause | Action |
-|---|---|---|
-| `pixel-native-build` fails | local Go build or local scrape failed | inspect `output/pixel/train-bot-native-build-*.log` |
-| `pixel-native-test` fails | app regression | inspect `output/pixel/train-bot-native-test-*.log` |
-| `tools/pixel/redeploy.sh --scope train_bot` fails before redeploy | bootstrap/env/tunnel preflight failure | rerun with the logged error, then retry |
-| release check fails | public origin is stale or tunnel mismatch | run `make pixel-release-check`, inspect the generated JSON report |
-| miniapp smoke fails | browser-use profile drift | rerun `make pixel-miniapp-smoke` after confirming Telegram Web auth in the configured `BROWSER_USE_PROFILE` |
-| runtime shows no trains | same-day snapshot missing or not loaded | rerun `tools/pixel/redeploy.sh --scope train_bot`, then inspect runtime schedule dir and DB rows |
-
-## Useful Checks
-
-Current runtime process:
-
-```bash
-bash scripts/pixel/validate_prod_readiness.sh --transport ssh --ssh-host "${PIXEL_SSH_HOST}"
-```
-
-Current runtime logs:
-
-```bash
-bash scripts/pixel/release_check.sh --transport ssh --ssh-host "${PIXEL_SSH_HOST}"
-```
-
-Runtime DB and schedule validation:
-
-```bash
-bash scripts/pixel/redeploy_release.sh --validate-only --transport ssh --ssh-host "${PIXEL_SSH_HOST}"
-```
+- [Release checklist](./docs/release-checklist.md)
+- [Rollback checklist](./docs/rollback-checklist.md)
+- [Daily freshness check](./docs/daily-freshness-check.md)
+- [Missing schedule recovery](./docs/missing-schedule-recovery.md)
+- [Agent test login](./docs/agent-test-login.md)
 
 ## Notes
 
-- The orchestrator component-release contract is unchanged.
-- The train-bot bundle remains a tar artifact with the built binary and schedule data.
-- The supported deploy entrypoint is `../../tools/pixel/redeploy.sh --scope train_bot`.
+- Public URLs stay unchanged.
+- The old rooted Pixel deploy flow is rollback-only legacy material now.
+- If train-bot loses outbound name resolution in Docker, fix the train-bot stack first before changing host-wide DNS.

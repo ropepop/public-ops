@@ -65,7 +65,7 @@ def _make_config(tmp_path: Path) -> Config:
 
 
 def test_run_daemon_exits_when_lock_already_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "orchestrator_root")
+    monkeypatch.setenv("RUNTIME_CONTEXT_POLICY", "managed_service")
     config = _make_config(tmp_path)
     lock = ProcessLock(config.daemon_lock_file)
     lock.acquire()
@@ -77,10 +77,10 @@ def test_run_daemon_exits_when_lock_already_held(tmp_path: Path, monkeypatch: py
         lock.release()
 
 
-def test_is_orchestrator_owned_runtime_accepts_orchestrator_policy():
-    owned, reason = is_orchestrator_owned_runtime(runtime_context_policy="orchestrator_root")
+def test_is_orchestrator_owned_runtime_accepts_managed_policy():
+    owned, reason = is_orchestrator_owned_runtime(runtime_context_policy="managed_service")
     assert owned is True
-    assert reason == "orchestrator_runtime_confirmed"
+    assert reason == "managed_runtime_confirmed"
 
 
 def test_run_daemon_rejects_when_policy_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -142,6 +142,18 @@ def test_healthcheck_fails_for_uninitialized_state(tmp_path: Path, capsys):
     assert "unhealthy" in captured
 
 
+def test_healthcheck_stays_unhealthy_after_corrupt_state_recovery(tmp_path: Path, capsys):
+    config = _make_config(tmp_path)
+    config.state_file.write_bytes(b"\0" * 24)
+
+    assert run_healthcheck(config) == 1
+
+    captured = capsys.readouterr().out
+    assert "daemon_not_initialized" in captured
+    corrupt_paths = sorted(tmp_path.glob("state.json.corrupt.*"))
+    assert len(corrupt_paths) == 1
+
+
 def test_healthcheck_fails_for_stale_heartbeat(tmp_path: Path, capsys):
     config = _make_config(tmp_path)
     state_store = StateStore(config.state_file)
@@ -163,18 +175,18 @@ def test_healthcheck_fails_for_stale_heartbeat(tmp_path: Path, capsys):
 def test_runtime_context_warning_detects_magisk_context():
     warning = build_runtime_context_warning("u:r:magisk:s0")
     assert warning is not None
-    assert "orchestrator component 'site_notifier'" in warning
+    assert "managed Arbuzas service" in warning
 
 
 def test_runtime_context_warning_not_set_for_normal_context():
     assert build_runtime_context_warning("u:r:untrusted_app:s0:c123,c456") is None
 
 
-def test_runtime_context_warning_disabled_for_orchestrator_root_policy():
+def test_runtime_context_warning_disabled_for_managed_policy():
     assert (
         build_runtime_context_warning(
             "u:r:magisk:s0",
-            runtime_context_policy="orchestrator_root",
+            runtime_context_policy="managed_service",
         )
         is None
     )

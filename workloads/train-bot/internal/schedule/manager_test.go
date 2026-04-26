@@ -24,6 +24,18 @@ func setupScheduleStore(t *testing.T) *store.SQLiteStore {
 	return st
 }
 
+type failingScheduleStore struct {
+	*store.SQLiteStore
+	failStops error
+}
+
+func (s *failingScheduleStore) UpsertTrainStops(ctx context.Context, serviceDate string, stopsByTrain map[string][]domain.TrainStop) error {
+	if s.failStops != nil {
+		return s.failStops
+	}
+	return s.SQLiteStore.UpsertTrainStops(ctx, serviceDate, stopsByTrain)
+}
+
 func TestManagerListStationsAndStationWindow(t *testing.T) {
 	ctx := context.Background()
 	st := setupScheduleStore(t)
@@ -149,6 +161,73 @@ func TestLoadTodayFallbackToStoredData(t *testing.T) {
 	}
 	if len(list) != 1 {
 		t.Fatalf("expected one train, got %d", len(list))
+	}
+}
+
+func TestLoadTodayKeepsExistingServiceDateWhenStopPublishFails(t *testing.T) {
+	ctx := context.Background()
+	baseStore := setupScheduleStore(t)
+	defer baseStore.Close()
+
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, 3, 25, 9, 0, 0, 0, loc)
+	serviceDate := now.Format("2006-01-02")
+	train := domain.TrainInstance{
+		ID:            "train-2026-03-25-1",
+		ServiceDate:   serviceDate,
+		FromStation:   "Riga",
+		ToStation:     "Jelgava",
+		DepartureAt:   now.Add(30 * time.Minute),
+		ArrivalAt:     now.Add(90 * time.Minute),
+		SourceVersion: "seed",
+	}
+	if err := baseStore.UpsertTrainInstances(ctx, serviceDate, "seed", []domain.TrainInstance{train}); err != nil {
+		t.Fatalf("seed train instances: %v", err)
+	}
+
+	failingStore := &failingScheduleStore{
+		SQLiteStore: baseStore,
+		failStops:   errors.New("spacetime staged import failed"),
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, serviceDate+".json")
+	payload := `{
+  "source_version":"snapshot-test",
+  "trains":[
+    {
+      "id":"train-2026-03-25-1",
+      "service_date":"` + serviceDate + `",
+      "from_station":"Riga",
+      "to_station":"Jelgava",
+      "departure_at":"2026-03-25T09:30:00+02:00",
+      "arrival_at":"2026-03-25T10:45:00+02:00",
+      "stops":[
+        {"station_name":"Riga","seq":1,"departure_at":"2026-03-25T09:30:00+02:00"},
+        {"station_name":"Jelgava","seq":2,"arrival_at":"2026-03-25T10:45:00+02:00"}
+      ]
+    }
+  ]
+}`
+	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	mgr := NewManager(failingStore, dir, loc, 3)
+	if err := mgr.LoadToday(ctx, now); err != nil {
+		t.Fatalf("expected stored service date to stay available, got %v", err)
+	}
+	available, lastErr := mgr.Availability()
+	if !available {
+		t.Fatalf("expected schedule availability to stay true")
+	}
+	if lastErr != nil {
+		t.Fatalf("expected store-first load to skip snapshot reload errors, got %v", lastErr)
+	}
+	if got := mgr.LoadedServiceDate(); got != serviceDate {
+		t.Fatalf("expected loaded service date %s, got %s", serviceDate, got)
 	}
 }
 
@@ -320,6 +399,112 @@ func TestManagerAllowsYesterdayFallbackBeforeCutoff(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].ID != "t1" {
 		t.Fatalf("unexpected fallback departures: %+v", list)
+	}
+}
+
+func TestManagerAccessContextRespectsRigaCutoffBoundaries(t *testing.T) {
+	ctx := context.Background()
+	st := setupScheduleStore(t)
+	defer st.Close()
+
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	yesterday := time.Date(2026, 2, 27, 23, 30, 0, 0, loc)
+	serviceDate := yesterday.Format("2006-01-02")
+	dir := t.TempDir()
+	path := filepath.Join(dir, serviceDate+".json")
+	payload := `{
+  "source_version":"snapshot-test",
+  "trains":[
+    {
+      "id":"t1",
+      "service_date":"` + serviceDate + `",
+      "from_station":"Riga",
+      "to_station":"Jelgava",
+      "departure_at":"2026-02-28T01:30:00+02:00",
+      "arrival_at":"2026-02-28T02:15:00+02:00",
+      "stops":[
+        {"station_name":"Riga","seq":1,"departure_at":"2026-02-28T01:30:00+02:00"},
+        {"station_name":"Jelgava","seq":2,"arrival_at":"2026-02-28T02:15:00+02:00"}
+      ]
+    }
+  ]
+}`
+	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	mgr := NewManager(st, dir, loc, 3)
+	if err := mgr.LoadToday(ctx, yesterday); err != nil {
+		t.Fatalf("load yesterday: %v", err)
+	}
+
+	cases := []struct {
+		name          string
+		now           time.Time
+		wantAvailable bool
+		wantFallback  bool
+		wantSameDay   bool
+		wantEffective string
+		wantRequested string
+	}{
+		{
+			name:          "0030",
+			now:           time.Date(2026, 2, 28, 0, 30, 0, 0, loc),
+			wantAvailable: true,
+			wantFallback:  true,
+			wantSameDay:   false,
+			wantEffective: serviceDate,
+			wantRequested: "2026-02-28",
+		},
+		{
+			name:          "0259",
+			now:           time.Date(2026, 2, 28, 2, 59, 0, 0, loc),
+			wantAvailable: true,
+			wantFallback:  true,
+			wantSameDay:   false,
+			wantEffective: serviceDate,
+			wantRequested: "2026-02-28",
+		},
+		{
+			name:          "0300",
+			now:           time.Date(2026, 2, 28, 3, 0, 0, 0, loc),
+			wantAvailable: false,
+			wantFallback:  false,
+			wantSameDay:   false,
+			wantEffective: "",
+			wantRequested: "2026-02-28",
+		},
+		{
+			name:          "0400",
+			now:           time.Date(2026, 2, 28, 4, 0, 0, 0, loc),
+			wantAvailable: false,
+			wantFallback:  false,
+			wantSameDay:   false,
+			wantEffective: "",
+			wantRequested: "2026-02-28",
+		},
+	}
+
+	for _, tc := range cases {
+		access := mgr.AccessContext(tc.now)
+		if access.RequestedServiceDate != tc.wantRequested {
+			t.Fatalf("%s requested service date: got %s want %s", tc.name, access.RequestedServiceDate, tc.wantRequested)
+		}
+		if access.LoadedServiceDate != serviceDate {
+			t.Fatalf("%s loaded service date: got %s want %s", tc.name, access.LoadedServiceDate, serviceDate)
+		}
+		if access.Available != tc.wantAvailable || access.FallbackActive != tc.wantFallback || access.SameDayFresh != tc.wantSameDay {
+			t.Fatalf("%s unexpected access flags: %+v", tc.name, access)
+		}
+		if access.EffectiveServiceDate != tc.wantEffective {
+			t.Fatalf("%s effective service date: got %s want %s", tc.name, access.EffectiveServiceDate, tc.wantEffective)
+		}
+		if access.CutoffHour != 3 {
+			t.Fatalf("%s cutoff hour: got %d want 3", tc.name, access.CutoffHour)
+		}
 	}
 }
 

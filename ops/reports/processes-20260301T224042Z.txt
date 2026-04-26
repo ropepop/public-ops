@@ -1,0 +1,14 @@
+ 2602     1 root         sh                          sh /data/local/pixel-stack/vpn/bin/pixel-vpn-service-loop
+ 4251     1 root         sh                          sh /data/local/pixel-stack/ssh/bin/pixel-ssh-service-loop
+ 4501     1 root         sh                          sh /data/local/pixel-stack/apps/site-notifications/bin/site-notifier-service-loop
+ 7387     1 root         sh                          sh /data/local/pixel-stack/bin/adguardhome-service-loop
+ 7450  7387 root         bash                        bash /usr/local/bin/adguardhome-start
+ 7490  7450 root         AdGuardHome                 AdGuardHome --no-check-update -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work
+ 7687  7450 root         bash                        bash /usr/local/bin/adguardhome-remote-watchdog
+10358     1 root         sh                          sh /data/local/pixel-stack/apps/train-bot/bin/train-bot-service-loop
+10473     1 root         sh                          sh /data/local/pixel-stack/apps/train-bot/bin/train-bot-service-loop
+14519  3374 shell        sh                          sh -c su -c 'ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null | grep -E "AdGuardHome|adguardhome|nginx|service-loop|doh" || true'
+14521 14519 shell        su                          su -c ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null | grep -E "AdGuardHome|adguardhome|nginx|service-loop|doh" || true
+14524 14523 root         app_process                 app_process /system/bin com.android.commands.content.Content call --uri content://giilmkonhuutj.ih.wb.provider --user 0 --method log --extra from.uid:i:2000 --extra to.uid:i:0 --extra pid:i:14521 --extra policy:i:2 --extra target:i:-1 --extra context:s: --extra gids:s: --extra command:s:ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null | grep -E "AdGuardHome|adguardhome|nginx|service-loop|doh" || true --extra notify:b:true
+14525   805 root         sh                          sh -c ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null | grep -E "AdGuardHome|adguardhome|nginx|service-loop|doh" || true
+14527 14525 root         grep                        grep -E AdGuardHome|adguardhome|nginx|service-loop|doh

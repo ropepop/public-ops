@@ -18,10 +18,12 @@ import (
 	"telegramtrainapp/internal/domain"
 	"telegramtrainapp/internal/i18n"
 	"telegramtrainapp/internal/jobs"
+	"telegramtrainapp/internal/recovery"
 	"telegramtrainapp/internal/reports"
 	"telegramtrainapp/internal/ride"
 	"telegramtrainapp/internal/schedule"
 	"telegramtrainapp/internal/scrape"
+	"telegramtrainapp/internal/spacetime"
 	"telegramtrainapp/internal/store"
 	"telegramtrainapp/internal/util"
 	appversion "telegramtrainapp/internal/version"
@@ -49,17 +51,33 @@ func main() {
 
 	loc := util.MustLoadLocation(cfg.Timezone)
 
-	st, err := store.NewSQLiteStore(cfg.DBPath)
+	runtime, err := openRuntime(cfg, loc)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		log.Fatalf("runtime: %v", err)
 	}
-	defer st.Close()
+	st := runtime.store
+	schedules := runtime.schedules
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Printf("store close failed: %v", err)
+		}
+	}()
 
 	if err := st.Migrate(ctx); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
-
-	schedules := schedule.NewManager(st, cfg.ScheduleDir, loc, cfg.ScraperDailyHour)
+	if runtime.stateStore != nil {
+		if err := runtime.stateStore.PublishRuntimeConfig(ctx, cfg.ScraperDailyHour); err != nil {
+			log.Printf("publish spacetime runtime config failed: %v", err)
+		}
+	}
+	if loader, ok := schedules.(interface {
+		LoadForAccess(context.Context, time.Time) error
+	}); ok {
+		if err := loader.LoadForAccess(ctx, time.Now().In(loc)); err != nil {
+			log.Printf("initial schedule bootstrap deferred: %v", err)
+		}
+	}
 
 	reportsSvc := reports.NewService(
 		st,
@@ -68,37 +86,58 @@ func main() {
 	)
 	rides := ride.NewService(st)
 	appSvc := trainapp.NewService(st, schedules, rides, reportsSvc, loc, cfg.FeatureStationCheckin)
+	if runtime.stateStore != nil {
+		result, healErr := recovery.MaybeSelfHeal(ctx, appSvc, runtime.stateStore, time.Now().In(loc))
+		switch {
+		case healErr == nil && result.Synced:
+			log.Printf(
+				"spacetime schedule self-heal restored serviceDate=%s stations=%d trains=%d stops=%d",
+				result.ServiceDate,
+				result.Stations,
+				result.Trains,
+				result.Stops,
+			)
+		case healErr != nil && !errors.Is(healErr, schedule.ErrUnavailable):
+			log.Printf("spacetime schedule self-heal failed serviceDate=%s: %v", result.ServiceDate, healErr)
+		}
+	}
 	catalog := i18n.NewCatalog()
 	client := bot.NewClient(cfg.BotToken, time.Duration(cfg.HTTPTimeoutSec)*time.Second)
 	webBaseURL := strings.TrimRight(strings.TrimSpace(cfg.TrainWebPublicBaseURL), "/")
 	notifier := bot.NewNotifier(client, st, catalog, loc, webBaseURL, cfg.ReportDumpChatID)
-
-	if cfg.FeatureInspectionSignalsConfigured {
-		log.Printf("FEATURE_INSPECTION_SIGNALS is deprecated and ignored (value=%v)", cfg.FeatureInspectionSignals)
-	}
 
 	var scraperJob *scrape.Orchestrator
 	timeout := time.Duration(cfg.HTTPTimeoutSec) * time.Second
 	if strings.TrimSpace(cfg.ScraperViviPageURL) == "" || strings.TrimSpace(cfg.ScraperViviGTFSURL) == "" {
 		log.Printf("vivi scraper URLs are empty; runtime scraper disabled")
 	} else {
-		providers := []scrape.Provider{
-			scrape.NewViviPDFProvider("vivi_pdf", cfg.ScraperViviPageURL, cfg.ScraperUserAgent, timeout),
-			scrape.NewViviGTFSProvider("vivi_gtfs", cfg.ScraperViviGTFSURL, cfg.ScraperUserAgent, timeout),
+		scraperOutputDir := strings.TrimSpace(cfg.ScraperOutputDir)
+		if scraperOutputDir == "" {
+			scraperOutputDir = cfg.ScheduleDir
 		}
-		scraperJob = scrape.NewOrchestrator(providers, cfg.ScraperOutputDir, cfg.ScraperMinTrains)
+		providers := []scrape.Provider{
+			scrape.NewViviGTFSProvider("vivi_gtfs", cfg.ScraperViviGTFSURL, cfg.ScraperUserAgent, timeout),
+			scrape.NewViviPDFProvider("vivi_pdf", cfg.ScraperViviPageURL, cfg.ScraperUserAgent, timeout),
+		}
+		scraperJob = scrape.NewOrchestrator(providers, scraperOutputDir, cfg.ScraperMinTrains)
 	}
+
+	var bundleSync interface {
+		PublishActiveBundle(ctx context.Context, version string, serviceDate string, generatedAt time.Time, sourceVersion string) error
+	}
+	bundleSync = st
+	bundlePublisher := web.NewStaticBundlePublisher(cfg.TrainWebBundleDir, appSvc, loc, bundleSync)
 
 	jobRunner := jobs.NewRunner(
 		st,
 		schedules,
+		bundlePublisher,
 		time.Duration(cfg.DataRetentionHrs)*time.Hour,
 		loc,
 		scraperJob,
 		cfg.ScraperDailyHour,
 		cfg.RuntimeSnapshotGCEnabled,
 	)
-	jobRunner.Start(ctx)
 
 	service := bot.NewService(
 		client,
@@ -135,7 +174,7 @@ func main() {
 		err  error
 	}
 
-	results := make(chan componentResult, 3)
+	results := make(chan componentResult, 4)
 	components := 0
 	startComponent := func(name string, fn func(context.Context) error) {
 		components++
@@ -144,6 +183,7 @@ func main() {
 		}()
 	}
 
+	startComponent("jobs", jobRunner.Run)
 	startComponent("bot", service.Start)
 	startComponent("notifier", notifier.Run)
 	if webServer != nil {
@@ -167,7 +207,7 @@ func main() {
 }
 
 type trainWebRideNotifier struct {
-	schedules *schedule.Manager
+	schedules schedule.ReadModel
 	notifier  trainAlertNotifier
 }
 
@@ -209,10 +249,51 @@ func (n trainWebRideNotifier) NotifyStationSighting(ctx context.Context, event d
 }
 
 func resolveSingleInstanceLockPath(cfg config.Config) string {
-	if strings.TrimSpace(cfg.SingleInstanceLockPath) != "" {
-		return cfg.SingleInstanceLockPath
+	return strings.TrimSpace(cfg.SingleInstanceLockPath)
+}
+
+type runtimeComponents struct {
+	store      *store.RoutedStore
+	stateStore *store.SpacetimeStore
+	schedules  schedule.ReadModel
+}
+
+func openRuntime(cfg config.Config, loc *time.Location) (runtimeComponents, error) {
+	client, err := spacetime.NewSyncer(spacetime.SyncConfig{
+		Host:              cfg.TrainRuntimeSpacetimeHost,
+		Database:          cfg.TrainRuntimeSpacetimeDatabase,
+		Issuer:            cfg.TrainRuntimeSpacetimeOIDCIssuer,
+		Audience:          cfg.TrainRuntimeSpacetimeOIDCAudience,
+		JWTPrivateKeyFile: cfg.TrainRuntimeSpacetimeJWTPrivateKeyFile,
+		ServiceSubject:    cfg.TrainRuntimeSpacetimeServiceSubject,
+		ServiceRoles:      cfg.TrainRuntimeSpacetimeServiceRoles,
+		TokenTTL:          time.Duration(cfg.TrainRuntimeSpacetimeTokenTTLSec) * time.Second,
+		HTTPTimeout:       time.Duration(cfg.HTTPTimeoutSec) * time.Second,
+	})
+	if err != nil {
+		return runtimeComponents{}, err
 	}
-	return cfg.DBPath + ".lock"
+	stateStore := store.NewSpacetimeStore(client)
+	scheduleCachePath := deriveScheduleCachePath(cfg.ScheduleDir)
+	scheduleStore, err := store.NewSQLiteStore(scheduleCachePath)
+	if err != nil {
+		return runtimeComponents{}, fmt.Errorf("schedule cache sqlite: %w", err)
+	}
+	routedStore := store.NewRoutedStore(scheduleStore, stateStore)
+	readModel := schedule.NewManager(routedStore, cfg.ScheduleDir, loc, cfg.ScraperDailyHour)
+	return runtimeComponents{
+		store:      routedStore,
+		stateStore: stateStore,
+		schedules:  readModel,
+	}, nil
+}
+
+func deriveScheduleCachePath(scheduleDir string) string {
+	dir := strings.TrimSpace(scheduleDir)
+	if dir == "" {
+		return filepath.Clean("train-runtime-cache.db")
+	}
+	return filepath.Join(filepath.Dir(dir), "train-runtime-cache.db")
 }
 
 func acquireSingleInstanceLock(lockPath string) (*os.File, error) {

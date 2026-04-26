@@ -25,6 +25,7 @@ type SubmitResult struct {
 	Accepted          bool
 	Deduped           bool
 	CooldownRemaining time.Duration
+	IncidentID        string
 	Event             *domain.ReportEvent
 }
 
@@ -32,6 +33,7 @@ type StationSightingSubmitResult struct {
 	Accepted          bool
 	Deduped           bool
 	CooldownRemaining time.Duration
+	IncidentID        string
 	Event             *domain.StationSighting
 }
 
@@ -70,7 +72,16 @@ func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string
 	if err := s.store.InsertReportEvent(ctx, event); err != nil {
 		return SubmitResult{}, err
 	}
-	return SubmitResult{Accepted: true, Event: &event}, nil
+	train, err := s.store.GetTrainInstanceByID(ctx, trainID)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	stops, err := s.store.ListTrainStops(ctx, trainID)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	contextKey, _ := resolveTrainIncidentContext(train, stops, event.CreatedAt)
+	return SubmitResult{Accepted: true, IncidentID: TrainIncidentID(trainID, incidentDayKey(now), contextKey), Event: &event}, nil
 }
 
 func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stationID string, destinationStationID *string, matchedTrainID *string, now time.Time) (StationSightingSubmitResult, error) {
@@ -99,7 +110,8 @@ func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stati
 	if err := s.store.InsertStationSighting(ctx, event); err != nil {
 		return StationSightingSubmitResult{}, err
 	}
-	return StationSightingSubmitResult{Accepted: true, Event: &event}, nil
+	contextKey, _ := stationIncidentContext(event)
+	return StationSightingSubmitResult{Accepted: true, IncidentID: StationIncidentID(stationID, incidentDayKey(now), contextKey), Event: &event}, nil
 }
 
 func (s *Service) BuildStatus(ctx context.Context, trainID string, now time.Time) (domain.TrainStatus, error) {
@@ -205,6 +217,10 @@ func (s *Service) StationSightingsByStationSince(ctx context.Context, stationID 
 
 func (s *Service) RecentStationSightings(ctx context.Context, now time.Time, limit int) ([]domain.StationSighting, error) {
 	return s.store.ListRecentStationSightings(ctx, now.Add(-stationSightingVisibilityWindow), limit)
+}
+
+func (s *Service) StationSightingsSince(ctx context.Context, since time.Time, limit int) ([]domain.StationSighting, error) {
+	return s.store.ListRecentStationSightings(ctx, since, limit)
 }
 
 func (s *Service) RecentStationSightingsByTrain(ctx context.Context, trainID string, now time.Time, limit int) ([]domain.StationSighting, error) {

@@ -1,62 +1,38 @@
-# Satiksme Bot
+# Kontrole
 
-Standalone Riga Satiksme mini app and public map workload.
-
-This workload is intentionally self-contained under `workloads/satiksme-bot`. It does not modify orchestrator wiring. The runtime includes:
-- a Telegram bot with a minimal `/start` menu
-- a web app with Telegram-authenticated report submission
-- a public read-only map and sightings feed
-- local mirroring of Riga Satiksme `stops.txt`, `routes.txt`, and GTFS fallback data
-- SQLite-backed stop and vehicle sightings with cooldown, dedupe, visibility, retention, and report-dump queueing
+Web-first Riga Satiksme control map and incident feed workload for the Arbuzas production stack.
 
 ## Local Development
 
 ```bash
 cp .env.example .env
-go test ./...
+make test
+make build
+make spacetime-build
+make docker-image-build
 go run ./cmd/catalogsync
 go run ./cmd/bot
 ```
 
-The web app serves:
-- public site: `SATIKSME_WEB_PUBLIC_BASE_URL`
-- mini app shell: `SATIKSME_WEB_PUBLIC_BASE_URL/app`
+## Active Deployment
 
-## Key Environment Variables
-
-Required:
-- `BOT_TOKEN`
-
-Important:
-- `SATIKSME_WEB_ENABLED=true`
-- `SATIKSME_WEB_PUBLIC_BASE_URL=https://satiksme-bot.jolkins.id.lv`
-- `SATIKSME_WEB_SESSION_SECRET_FILE=/absolute/path/to/session.secret`
-- `REPORT_DUMP_CHAT=@satiksme_bot_reports`
-
-Catalog defaults:
-- `SATIKSME_SOURCE_STOPS_URL=https://saraksti.rigassatiksme.lv/riga/stops.txt`
-- `SATIKSME_SOURCE_ROUTES_URL=https://saraksti.rigassatiksme.lv/riga/routes.txt`
-- `SATIKSME_SOURCE_GTFS_URL=https://data.gov.lv/dati/dataset/6d78358a-0095-4ce3-b119-6cde5d0ac54f/resource/c576c770-a01b-49b0-bdc4-0005a1ec5838/download/marsrutusaraksti02_2026.zip`
-
-## Pixel-Oriented Commands
+The active production runtime is Docker on Arbuzas. Local workload commands stop at build and image preparation; deployment happens through the shared operator script:
 
 ```bash
-make pixel-native-test
-make pixel-native-build
-make pixel-release-check
-make pixel-public-smoke
-make pixel-miniapp-smoke
+../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
 ```
 
-`make pixel-native-build` produces a local satiksme-bot artifact bundle with:
-- `bin/satiksme-bot`
-- mirrored source files under `data/catalog/source`
-- generated compact catalog JSON under `data/catalog/generated/catalog.json`
+## Important Runtime Paths
+
+- Catalog source mirror: `/srv/arbuzas/satiksme-bot/data/catalog/source`
+- Generated catalog: `/srv/arbuzas/satiksme-bot/data/catalog/generated/catalog.json`
+- Public bundles: `/srv/arbuzas/satiksme-bot/data/public-bundles`
+- State: `/srv/arbuzas/satiksme-bot/state`
 
 ## Notes
 
-- Public mode is read-only. Report endpoints require a valid Telegram init-data session.
-- Live departures are fetched via server proxy from `departures2.php` when
-  `SATIKSME_WEB_DIRECT_PROXY_ENABLED=true` (default in this repo), with the
-  browser-direct mode available as a fallback when disabled.
-- `REPORT_DUMP_CHAT` accepts either `@channel_username` or a numeric Telegram chat id.
+- Anonymous visitors can browse the map and incidents; Telegram login unlocks reporting, voting, and commenting.
+- The website now uses Telegram's official popup login callback flow: the page fetches `/api/v1/auth/telegram/config`, receives an `id_token` from Telegram in place, and finishes the site session through `/api/v1/auth/telegram/complete`.
+- Browser pages no longer talk to Spacetime directly; the site uses its own JSON API while the backend keeps Spacetime as the live data store.
+- The old Pixel deploy helpers are rollback-only legacy material.

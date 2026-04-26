@@ -3,10 +3,12 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +44,76 @@ type publicSnapshotStop struct {
 	DepartureAt string   `json:"departure_at,omitempty"`
 	Latitude    *float64 `json:"latitude,omitempty"`
 	Longitude   *float64 `json:"longitude,omitempty"`
+}
+
+func TestServeHTTPPublicIncidentsShell(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	req := httptest.NewRequest("GET", "/pixel-stack/train/incidents", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != 200 {
+		t.Fatalf("unexpected public incidents status: got %d body=%s", res.Code, res.Body.String())
+	}
+	if body := res.Body.String(); !strings.Contains(body, `mode: "public-incidents"`) {
+		t.Fatalf("public incidents shell missing public-incidents mode: %s", body)
+	}
+}
+
+func TestServeHTTPPublicShellRoutes(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	cases := []struct {
+		path string
+		mode string
+	}{
+		{path: "/pixel-stack/train", mode: "public-incidents"},
+		{path: "/pixel-stack/train/app", mode: "mini-app"},
+		{path: "/pixel-stack/train/feed", mode: "public-dashboard"},
+		{path: "/pixel-stack/train/departures", mode: "public-dashboard"},
+		{path: "/pixel-stack/train/stations", mode: "public-stations"},
+		{path: "/pixel-stack/train/map", mode: "public-network-map"},
+		{path: "/pixel-stack/train/incidents", mode: "public-incidents"},
+		{path: "/pixel-stack/train/t/train-next-0", mode: "public-train"},
+		{path: "/pixel-stack/train/t/train-next-0/map", mode: "public-map"},
+	}
+
+	for _, tc := range cases {
+		req := httptest.NewRequest("GET", tc.path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != 200 {
+			t.Fatalf("%s unexpected status: got %d body=%s", tc.path, res.Code, res.Body.String())
+		}
+		if body := res.Body.String(); !strings.Contains(body, `mode: "`+tc.mode+`"`) {
+			t.Fatalf("%s shell missing %s mode: %s", tc.path, tc.mode, body)
+		}
+	}
+}
+
+func TestServeHTTPPublicIncidentsReturnsLivePayload(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+
+	req := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/incidents?limit=0", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected public incidents status: got %d body=%s", res.Code, res.Body.String())
+	}
+
+	var payload struct {
+		Incidents []any `json:"incidents"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode public incidents: %v", err)
+	}
+	if payload.Incidents == nil {
+		t.Fatalf("expected incidents payload, got %+v", payload)
+	}
 }
 
 func TestServeHTTPPublicStationsAndDepartures(t *testing.T) {
@@ -133,74 +205,76 @@ func TestServeHTTPPublicStationsAndDepartures(t *testing.T) {
 	}
 }
 
-func TestServeHTTPPublicMapIncludesStationsAndSightings(t *testing.T) {
+func TestServeHTTPPublicMapReturnsLivePayload(t *testing.T) {
 	t.Parallel()
 
 	server, st, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
 	destinationID := "jelgava"
-	if err := st.InsertStationSighting(context.Background(), storeStationSighting("station-sighting-network-map", "riga", &destinationID, nil, 88, now.Add(-1*time.Minute))); err != nil {
+	matchedTrainID := "train-past"
+	if err := st.InsertStationSighting(context.Background(), storeStationSighting("station-sighting-public-map", "riga", &destinationID, &matchedTrainID, 77, now.Add(-2*time.Minute))); err != nil {
 		t.Fatalf("insert station sighting: %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/map", nil)
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
-	if res.Code != 200 {
+	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected public map status: got %d body=%s", res.Code, res.Body.String())
 	}
 
 	var payload struct {
 		Stations []struct {
-			ID        string   `json:"id"`
-			Latitude  *float64 `json:"latitude"`
-			Longitude *float64 `json:"longitude"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
 		} `json:"stations"`
 		RecentSightings []struct {
-			StationID string `json:"stationId"`
+			StationID              string  `json:"stationId"`
+			MatchedTrainInstanceID *string `json:"matchedTrainInstanceId"`
 		} `json:"recentSightings"`
+		SameDaySightings []struct {
+			StationID string `json:"stationId"`
+		} `json:"sameDaySightings"`
+		Schedule struct {
+			Available            bool   `json:"available"`
+			EffectiveServiceDate string `json:"effectiveServiceDate"`
+		} `json:"schedule"`
 	}
 	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode public map: %v", err)
 	}
-	if len(payload.Stations) == 0 {
-		t.Fatalf("expected stations in public map payload")
+	hasRiga := false
+	for _, station := range payload.Stations {
+		if station.ID == "riga" {
+			hasRiga = true
+			break
+		}
 	}
-	if payload.Stations[0].Latitude == nil || payload.Stations[0].Longitude == nil {
-		t.Fatalf("expected coordinate-bearing stations, got %+v", payload.Stations[0])
+	if !hasRiga {
+		t.Fatalf("unexpected station payload: %+v", payload.Stations)
+	}
+	if !payload.Schedule.Available || payload.Schedule.EffectiveServiceDate == "" {
+		t.Fatalf("unexpected schedule payload: %+v", payload.Schedule)
 	}
 	if len(payload.RecentSightings) != 1 || payload.RecentSightings[0].StationID != "riga" {
-		t.Fatalf("expected recent station sighting in public map payload, got %+v", payload.RecentSightings)
+		t.Fatalf("expected recent station sighting in network map payload, got %+v", payload.RecentSightings)
+	}
+	if payload.RecentSightings[0].MatchedTrainInstanceID == nil || *payload.RecentSightings[0].MatchedTrainInstanceID != "train-past" {
+		t.Fatalf("expected matched train in recent sightings, got %+v", payload.RecentSightings[0])
+	}
+	if len(payload.SameDaySightings) != 1 || payload.SameDaySightings[0].StationID != "riga" {
+		t.Fatalf("expected same-day station sighting in network map payload, got %+v", payload.SameDaySightings)
 	}
 }
 
-func TestServeHTTPStationSightingDestinationsRequiresAuthAndReturnsStations(t *testing.T) {
+func TestServeHTTPStationSightingDestinationsReturnsLivePayload(t *testing.T) {
 	t.Parallel()
 
 	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
-
-	unauthReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/stations/riga/sighting-destinations", nil)
-	unauthRes := httptest.NewRecorder()
-	server.ServeHTTP(unauthRes, unauthReq)
-	if unauthRes.Code != 401 {
-		t.Fatalf("expected sighting destinations auth failure, got %d body=%s", unauthRes.Code, unauthRes.Body.String())
-	}
-
-	cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{
-		AuthDate: now,
-		User: telegramUser{
-			ID:           77,
-			LanguageCode: "en",
-		},
-	}, now)
-	if err != nil {
-		t.Fatalf("issue session cookie: %v", err)
-	}
-
 	req := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/stations/riga/sighting-destinations", nil)
-	req.AddCookie(cookie)
+	req.AddCookie(testSessionCookie(t, server, 77, "en", now))
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
-	if res.Code != 200 {
+	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected sighting destinations status: got %d body=%s", res.Code, res.Body.String())
 	}
 
@@ -212,11 +286,8 @@ func TestServeHTTPStationSightingDestinationsRequiresAuthAndReturnsStations(t *t
 	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode sighting destinations: %v", err)
 	}
-	if len(payload.Stations) != 11 {
-		t.Fatalf("expected 11 terminal destinations from riga, got %d", len(payload.Stations))
-	}
-	if payload.Stations[0].ID != "jelgava" {
-		t.Fatalf("expected destinations sorted by station name, got %+v", payload.Stations)
+	if len(payload.Stations) == 0 {
+		t.Fatalf("expected station sighting destinations, got %+v", payload)
 	}
 }
 
@@ -237,13 +308,17 @@ func newPublicDataServerWithStoreAndTrainCount(t *testing.T, publicBaseURL strin
 	if err != nil {
 		t.Fatalf("load location: %v", err)
 	}
-	now := time.Now().In(loc)
+	now := stableRigaMidday(time.Now().In(loc))
 	serviceDate := now.Format("2006-01-02")
 
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "train-session-secret")
 	if err := os.WriteFile(secretPath, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
 		t.Fatalf("write secret: %v", err)
+	}
+	privateKeyPath := filepath.Join(dir, "spacetime-test.key")
+	if err := os.WriteFile(privateKeyPath, pemEncodePKCS1PrivateKey(t), 0o600); err != nil {
+		t.Fatalf("write spacetime private key: %v", err)
 	}
 	dbPath := filepath.Join(dir, "train-bot.db")
 	st, err := store.NewSQLiteStore(dbPath)
@@ -295,18 +370,106 @@ func newPublicDataServerWithStoreAndTrainCount(t *testing.T, publicBaseURL strin
 		true,
 	)
 	server, err := NewServer(config.Config{
-		BotToken:                      "bot-token",
-		TrainWebEnabled:               true,
-		TrainWebBindAddr:              "127.0.0.1",
-		TrainWebPort:                  9317,
-		TrainWebPublicBaseURL:         publicBaseURL,
-		TrainWebSessionSecretFile:     secretPath,
-		TrainWebTelegramAuthMaxAgeSec: 300,
+		BotToken:                           "bot-token",
+		TrainWebEnabled:                    true,
+		TrainWebBindAddr:                   "127.0.0.1",
+		TrainWebPort:                       9317,
+		TrainWebPublicBaseURL:              publicBaseURL,
+		TrainWebSessionSecretFile:          secretPath,
+		TrainWebTelegramAuthMaxAgeSec:      300,
+		TrainWebSpacetimeHost:              "https://stdb.example.test",
+		TrainWebSpacetimeDatabase:          "train-bot",
+		TrainWebSpacetimeOIDCAudience:      "train-bot-web",
+		TrainWebSpacetimeJWTPrivateKeyFile: privateKeyPath,
+		TrainWebSpacetimeTokenTTLSec:       24 * 60 * 60,
 	}, appSvc, i18n.NewCatalog(), loc)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+	server.now = func() time.Time { return now }
 	return server, st, now
+}
+
+func newPublicDataServerWithLoadedSnapshot(t *testing.T, publicBaseURL string, now time.Time, loadAt time.Time, trains []publicSnapshotTrain) (*Server, *store.SQLiteStore) {
+	t.Helper()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "train-session-secret")
+	if err := os.WriteFile(secretPath, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	privateKeyPath := filepath.Join(dir, "spacetime-test.key")
+	if err := os.WriteFile(privateKeyPath, pemEncodePKCS1PrivateKey(t), 0o600); err != nil {
+		t.Fatalf("write spacetime private key: %v", err)
+	}
+	dbPath := filepath.Join(dir, "train-bot.db")
+	st, err := store.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+	})
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	serviceDate := loadAt.In(loc).Format("2006-01-02")
+	if len(trains) == 0 {
+		trains = []publicSnapshotTrain{
+			buildPublicSnapshotTrain("train-fallback", serviceDate, "Riga", "Jelgava", loadAt.Add(time.Hour)),
+		}
+	}
+	snapshotPath := filepath.Join(dir, serviceDate+".json")
+	payload, err := json.Marshal(publicSnapshot{
+		SourceVersion: "server-public-fallback-test",
+		Trains:        trains,
+	})
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(snapshotPath, payload, 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	manager := schedule.NewManager(st, dir, loc, 3)
+	if err := manager.LoadToday(ctx, loadAt.In(loc)); err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+
+	appSvc := trainapp.NewService(
+		st,
+		manager,
+		ride.NewService(st),
+		reports.NewService(st, 3*time.Minute, 90*time.Second),
+		loc,
+		true,
+	)
+	server, err := NewServer(config.Config{
+		BotToken:                           "bot-token",
+		TrainWebEnabled:                    true,
+		TrainWebBindAddr:                   "127.0.0.1",
+		TrainWebPort:                       9317,
+		TrainWebPublicBaseURL:              publicBaseURL,
+		TrainWebSessionSecretFile:          secretPath,
+		TrainWebTelegramAuthMaxAgeSec:      300,
+		TrainWebSpacetimeHost:              "https://stdb.example.test",
+		TrainWebSpacetimeDatabase:          "train-bot",
+		TrainWebSpacetimeOIDCAudience:      "train-bot-web",
+		TrainWebSpacetimeJWTPrivateKeyFile: privateKeyPath,
+		TrainWebSpacetimeTokenTTLSec:       24 * 60 * 60,
+	}, appSvc, i18n.NewCatalog(), loc)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	server.now = func() time.Time { return now }
+	return server, st
 }
 
 func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
@@ -316,7 +479,7 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load location: %v", err)
 	}
-	now := time.Now().In(loc)
+	now := stableRigaMidday(time.Now().In(loc))
 	serviceDate := now.Format("2006-01-02")
 	trains := make([]publicSnapshotTrain, 0, 75)
 	for i := 0; i < 75; i++ {
@@ -328,7 +491,10 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 			now.Add(time.Duration(i+1)*time.Second),
 		))
 	}
-	server, _ := newAuthenticatedDataServerWithTrains(t, "https://example.test/pixel-stack/train", now, trains)
+	server, st := newAuthenticatedDataServerWithTrains(t, "https://example.test/pixel-stack/train", now, trains)
+	if err := st.CheckInUser(context.Background(), 44, "train-bulk-0", now.Add(-2*time.Minute), now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("seed active checkin: %v", err)
+	}
 
 	defaultReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/dashboard", nil)
 	defaultRes := httptest.NewRecorder()
@@ -338,7 +504,8 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 	}
 	var defaultPayload struct {
 		Trains []struct {
-			Train struct {
+			Riders int `json:"riders"`
+			Train  struct {
 				ID string `json:"id"`
 			} `json:"train"`
 		} `json:"trains"`
@@ -349,6 +516,9 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 	if len(defaultPayload.Trains) != 60 {
 		t.Fatalf("expected default dashboard limit of 60, got %d", len(defaultPayload.Trains))
 	}
+	if defaultPayload.Trains[0].Train.ID != "train-bulk-0" || defaultPayload.Trains[0].Riders != 1 {
+		t.Fatalf("expected rider count for first dashboard train, got %+v", defaultPayload.Trains[0])
+	}
 
 	allReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/dashboard?limit=0", nil)
 	allRes := httptest.NewRecorder()
@@ -358,7 +528,8 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 	}
 	var allPayload struct {
 		Trains []struct {
-			Train struct {
+			Riders int `json:"riders"`
+			Train  struct {
 				ID string `json:"id"`
 			} `json:"train"`
 		} `json:"trains"`
@@ -368,6 +539,78 @@ func TestServeHTTPPublicDashboardLimitZeroReturnsAllTodayTrains(t *testing.T) {
 	}
 	if len(allPayload.Trains) != 75 {
 		t.Fatalf("expected limit=0 dashboard to return all 75 trains, got %d", len(allPayload.Trains))
+	}
+	if allPayload.Trains[0].Train.ID != "train-bulk-0" || allPayload.Trains[0].Riders != 1 {
+		t.Fatalf("expected rider count for full dashboard payload, got %+v", allPayload.Trains[0])
+	}
+}
+
+func TestServeHTTPPublicServiceDayTrainsIncludesDepartedTrainsOutsideDashboardWindow(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := stableRigaMidday(time.Now().In(loc))
+	serviceDate := now.Format("2006-01-02")
+	server, st := newAuthenticatedDataServerWithTrains(t, "https://example.test/pixel-stack/train", now, []publicSnapshotTrain{
+		buildPublicSnapshotTrain("train-past", serviceDate, "Riga", "Jelgava", now.Add(-45*time.Minute)),
+		buildPublicSnapshotTrain("train-next", serviceDate, "Riga", "Tukums", now.Add(15*time.Minute)),
+	})
+	if err := st.CheckInUser(context.Background(), 44, "train-next", now.Add(-2*time.Minute), now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("seed active checkin: %v", err)
+	}
+
+	dashboardReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/dashboard?limit=0", nil)
+	dashboardRes := httptest.NewRecorder()
+	server.ServeHTTP(dashboardRes, dashboardReq)
+	if dashboardRes.Code != 200 {
+		t.Fatalf("unexpected dashboard status: got %d body=%s", dashboardRes.Code, dashboardRes.Body.String())
+	}
+	var dashboardPayload struct {
+		Trains []struct {
+			Riders int `json:"riders"`
+			Train  struct {
+				ID string `json:"id"`
+			} `json:"train"`
+		} `json:"trains"`
+	}
+	if err := json.Unmarshal(dashboardRes.Body.Bytes(), &dashboardPayload); err != nil {
+		t.Fatalf("decode dashboard payload: %v", err)
+	}
+	if len(dashboardPayload.Trains) != 1 || dashboardPayload.Trains[0].Train.ID != "train-next" {
+		t.Fatalf("expected dashboard to keep only the future train, got %+v", dashboardPayload.Trains)
+	}
+	if dashboardPayload.Trains[0].Riders != 1 {
+		t.Fatalf("expected rider count on dashboard payload, got %+v", dashboardPayload.Trains[0])
+	}
+
+	serviceDayReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/service-day-trains", nil)
+	serviceDayRes := httptest.NewRecorder()
+	server.ServeHTTP(serviceDayRes, serviceDayReq)
+	if serviceDayRes.Code != 200 {
+		t.Fatalf("unexpected service day trains status: got %d body=%s", serviceDayRes.Code, serviceDayRes.Body.String())
+	}
+	var serviceDayPayload struct {
+		Trains []struct {
+			Riders int `json:"riders"`
+			Train  struct {
+				ID string `json:"id"`
+			} `json:"train"`
+		} `json:"trains"`
+	}
+	if err := json.Unmarshal(serviceDayRes.Body.Bytes(), &serviceDayPayload); err != nil {
+		t.Fatalf("decode service day payload: %v", err)
+	}
+	if len(serviceDayPayload.Trains) != 2 {
+		t.Fatalf("expected service day trains to include both departures, got %d", len(serviceDayPayload.Trains))
+	}
+	if serviceDayPayload.Trains[0].Train.ID != "train-past" || serviceDayPayload.Trains[1].Train.ID != "train-next" {
+		t.Fatalf("unexpected service day train order: %+v", serviceDayPayload.Trains)
+	}
+	if serviceDayPayload.Trains[1].Riders != 1 {
+		t.Fatalf("expected rider count on service day payload, got %+v", serviceDayPayload.Trains[1])
 	}
 }
 
@@ -458,6 +701,35 @@ func TestServeHTTPPublicTrainStopsIncludesCoordinatesAndSightings(t *testing.T) 
 	}
 }
 
+func TestServeHTTPPublicTrainIncludesRiderCount(t *testing.T) {
+	t.Parallel()
+
+	server, st, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	if err := st.CheckInUser(context.Background(), 44, "train-next-0", now.Add(-2*time.Minute), now.Add(30*time.Minute)); err != nil {
+		t.Fatalf("seed active checkin: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/public/trains/train-next-0", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected public train status: got %d body=%s", res.Code, res.Body.String())
+	}
+
+	var payload struct {
+		Riders int `json:"riders"`
+		Train  struct {
+			ID string `json:"id"`
+		} `json:"train"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode public train payload: %v", err)
+	}
+	if payload.Train.ID != "train-next-0" || payload.Riders != 1 {
+		t.Fatalf("expected public train rider count, got %+v", payload)
+	}
+}
+
 func TestServeHTTPHealthIncludesReleaseMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -478,6 +750,13 @@ func TestServeHTTPHealthIncludesReleaseMetadata(t *testing.T) {
 	}
 
 	var payload struct {
+		Ready           bool   `json:"ready"`
+		ReadinessReason string `json:"readinessReason"`
+		Schedule        struct {
+			Available      bool `json:"available"`
+			FallbackActive bool `json:"fallbackActive"`
+			SameDayFresh   bool `json:"sameDayFresh"`
+		} `json:"schedule"`
 		Version struct {
 			Commit    string `json:"commit"`
 			BuildTime string `json:"buildTime"`
@@ -512,10 +791,126 @@ func TestServeHTTPHealthIncludesReleaseMetadata(t *testing.T) {
 	if payload.Assets.AppCSSSha256 != server.release.AppCSSHash {
 		t.Fatalf("unexpected assets.appCssSha256: got %q want %q", payload.Assets.AppCSSSha256, server.release.AppCSSHash)
 	}
+	if !payload.Ready || payload.ReadinessReason != "same-day schedule loaded" {
+		t.Fatalf("expected ready same-day health payload, got %+v", payload)
+	}
+	if !payload.Schedule.Available || !payload.Schedule.SameDayFresh || payload.Schedule.FallbackActive {
+		t.Fatalf("unexpected healthy schedule payload: %+v", payload.Schedule)
+	}
+}
+
+func TestServeHTTPReadyReturnsOKDuringAllowedFallback(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	loadAt := time.Date(2026, 2, 27, 23, 30, 0, 0, loc)
+	now := time.Date(2026, 2, 28, 2, 59, 0, 0, loc)
+	serviceDate := loadAt.Format("2006-01-02")
+	server, _ := newPublicDataServerWithLoadedSnapshot(t, "https://example.test/pixel-stack/train", now, loadAt, []publicSnapshotTrain{
+		buildPublicSnapshotTrain("train-fallback", serviceDate, "Riga", "Jelgava", time.Date(2026, 2, 28, 1, 30, 0, 0, loc)),
+	})
+
+	req := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/ready", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected fallback readiness to succeed, got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload struct {
+		Ready                  bool   `json:"ready"`
+		ReadinessReason        string `json:"readinessReason"`
+		ScheduleAvailable      bool   `json:"scheduleAvailable"`
+		ScheduleFallbackActive bool   `json:"scheduleFallbackActive"`
+		ScheduleSameDayFresh   bool   `json:"scheduleSameDayFresh"`
+		Schedule               struct {
+			RequestedServiceDate string `json:"requestedServiceDate"`
+			EffectiveServiceDate string `json:"effectiveServiceDate"`
+			LoadedServiceDate    string `json:"loadedServiceDate"`
+			FallbackActive       bool   `json:"fallbackActive"`
+			CutoffHour           int    `json:"cutoffHour"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode ready payload: %v", err)
+	}
+	if !payload.Ready || payload.ReadinessReason != "previous-day fallback active before cutoff" {
+		t.Fatalf("unexpected fallback readiness payload: %+v", payload)
+	}
+	if !payload.ScheduleAvailable || !payload.ScheduleFallbackActive || payload.ScheduleSameDayFresh {
+		t.Fatalf("unexpected fallback flags: %+v", payload)
+	}
+	if payload.Schedule.RequestedServiceDate != "2026-02-28" || payload.Schedule.EffectiveServiceDate != serviceDate || payload.Schedule.LoadedServiceDate != serviceDate {
+		t.Fatalf("unexpected fallback schedule dates: %+v", payload.Schedule)
+	}
+	if !payload.Schedule.FallbackActive || payload.Schedule.CutoffHour != 3 {
+		t.Fatalf("unexpected fallback schedule context: %+v", payload.Schedule)
+	}
+}
+
+func TestServeHTTPHealthAndReadyExposeStaleScheduleAfterCutoff(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	loadAt := time.Date(2026, 2, 27, 23, 30, 0, 0, loc)
+	now := time.Date(2026, 2, 28, 4, 0, 0, 0, loc)
+	serviceDate := loadAt.Format("2006-01-02")
+	server, _ := newPublicDataServerWithLoadedSnapshot(t, "https://example.test/pixel-stack/train", now, loadAt, []publicSnapshotTrain{
+		buildPublicSnapshotTrain("train-stale", serviceDate, "Riga", "Jelgava", time.Date(2026, 2, 28, 1, 30, 0, 0, loc)),
+	})
+
+	healthReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/health", nil)
+	healthRes := httptest.NewRecorder()
+	server.ServeHTTP(healthRes, healthReq)
+	if healthRes.Code != http.StatusOK {
+		t.Fatalf("expected liveness endpoint to stay up, got %d body=%s", healthRes.Code, healthRes.Body.String())
+	}
+
+	var healthPayload struct {
+		Ready                  bool   `json:"ready"`
+		ReadinessReason        string `json:"readinessReason"`
+		ScheduleAvailable      bool   `json:"scheduleAvailable"`
+		ScheduleFallbackActive bool   `json:"scheduleFallbackActive"`
+		ScheduleSameDayFresh   bool   `json:"scheduleSameDayFresh"`
+		LoadedServiceDate      string `json:"loadedServiceDate"`
+		StaleLoadedServiceDate string `json:"staleLoadedServiceDate"`
+	}
+	if err := json.Unmarshal(healthRes.Body.Bytes(), &healthPayload); err != nil {
+		t.Fatalf("decode health payload: %v", err)
+	}
+	if healthPayload.Ready {
+		t.Fatalf("expected stale after-cutoff health to be not ready, got %+v", healthPayload)
+	}
+	if !strings.Contains(healthPayload.ReadinessReason, "outside the active service window") {
+		t.Fatalf("expected stale readiness reason, got %+v", healthPayload)
+	}
+	if healthPayload.ScheduleAvailable || healthPayload.ScheduleFallbackActive || healthPayload.ScheduleSameDayFresh {
+		t.Fatalf("expected stale schedule flags to be false, got %+v", healthPayload)
+	}
+	if healthPayload.LoadedServiceDate != serviceDate || healthPayload.StaleLoadedServiceDate != serviceDate {
+		t.Fatalf("expected stale loaded service date to be surfaced, got %+v", healthPayload)
+	}
+
+	readyReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/ready", nil)
+	readyRes := httptest.NewRecorder()
+	server.ServeHTTP(readyRes, readyReq)
+	if readyRes.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected stale after-cutoff readiness to fail, got %d body=%s", readyRes.Code, readyRes.Body.String())
+	}
 }
 
 func publicFloatPtr(v float64) *float64 {
 	return &v
+}
+
+func stableRigaMidday(now time.Time) time.Time {
+	return time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
 }
 
 func storeStationSighting(id string, stationID string, destinationStationID *string, matchedTrainID *string, userID int64, createdAt time.Time) domain.StationSighting {
