@@ -67,3 +67,25 @@ func TestConfigHasNoPublicMediaPortConfig(t *testing.T) {
 		t.Fatalf("Config must not expose public media port settings")
 	}
 }
+
+func TestCloudflareAccessAuthModeRequiresAccessConfig(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "cloudflare")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected Cloudflare Access auth mode to require Access settings")
+	}
+}
+
+func TestCloudflareAccessAuthModeLoads(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "cloudflare")
+	t.Setenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", "team.example.cloudflareaccess.com")
+	t.Setenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", "audience-tag")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Access.TeamDomain != "team.example.cloudflareaccess.com" || cfg.Access.Audience != "audience-tag" {
+		t.Fatalf("access config = %#v", cfg.Access)
+	}
+}

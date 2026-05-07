@@ -38,6 +38,8 @@ func main() {
 		PhoneBackendID:  cfg.Phone.BackendID,
 		PhoneBaseURL:    cfg.Phone.BaseURL,
 		PhoneAttachName: cfg.Phone.AttachName,
+		AuthIssuer:      cfg.Access.OIDCIssuer,
+		AuthAudience:    cfg.Access.OIDCClientID,
 	}); err != nil {
 		log.Fatalf("bootstrap state: %v", err)
 	}

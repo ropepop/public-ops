@@ -88,14 +88,19 @@ func Load() (Config, error) {
 		CookieName:          getenv("TICKET_REMOTE_COOKIE_NAME", "ticket_remote_session"),
 		CookieTTL:           getenvDuration("TICKET_REMOTE_COOKIE_TTL", 30*24*time.Hour),
 		Access: auth.AccessConfig{
-			Mode:       getenv("TICKET_REMOTE_AUTH_MODE", "cloudflare"),
-			TeamDomain: strings.TrimRight(getenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", ""), "/"),
-			Audience:   getenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", ""),
-			DevEmail:   normalizeEmail(getenv("TICKET_REMOTE_DEV_EMAIL", "ticket@jolkins.id.lv")),
+			Mode:     getenv("TICKET_REMOTE_AUTH_MODE", "spacetime"),
+			DevEmail: normalizeEmail(getenv("TICKET_REMOTE_DEV_EMAIL", "ticket@jolkins.id.lv")),
 			HTTPTimeout: getenvDuration(
-				"TICKET_REMOTE_CF_ACCESS_CERTS_TIMEOUT",
+				"TICKET_REMOTE_AUTH_HTTP_TIMEOUT",
 				10*time.Second,
 			),
+			AuthCookieName: getenv("TICKET_REMOTE_AUTH_COOKIE_NAME", "ticket_remote_auth"),
+			TeamDomain:     strings.TrimRight(getenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", ""), "/"),
+			Audience:       getenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", ""),
+			OIDCIssuer:     strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
+			OIDCClientID:   getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
+			OIDCScope:      getenv("TICKET_REMOTE_SPACETIME_AUTH_SCOPE", "openid profile email"),
+			OIDCRedirect:   strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL", ""), "/"),
 		},
 		State: state.StoreConfig{
 			Backend:              getenv("TICKET_REMOTE_STATE_BACKEND", "auto"),
@@ -110,6 +115,8 @@ func Load() (Config, error) {
 			ServiceRoles:         splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", "ticketremote_service")),
 			TokenTTL:             getenvDuration("TICKET_REMOTE_SPACETIME_TOKEN_TTL", 5*time.Minute),
 			HTTPTimeout:          getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", 10*time.Second),
+			AuthIssuer:           strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
+			AuthAudience:         getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
 		},
 		Phone: PhoneConfig{
 			BackendID:         activePhone.ID,
@@ -118,11 +125,11 @@ func Load() (Config, error) {
 			Backends:          phoneBackends,
 			DefaultBackendID:  defaultPhoneID,
 			ActiveBackendFile: activeBackendFile,
-				RequestTimeout:    getenvDuration("TICKET_REMOTE_PHONE_REQUEST_TIMEOUT", 10*time.Second),
-				ReconnectMinDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MIN_DELAY", 500*time.Millisecond),
-				ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", 5*time.Second),
-				NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", 2*time.Second),
-			},
+			RequestTimeout:    getenvDuration("TICKET_REMOTE_PHONE_REQUEST_TIMEOUT", 10*time.Second),
+			ReconnectMinDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MIN_DELAY", 500*time.Millisecond),
+			ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", 5*time.Second),
+			NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", 20*time.Second),
+		},
 		SimulatorSetup: SimulatorSetupConfig{
 			BackendID: getenv("TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID", "android-sim"),
 			ADBTarget: getenv("TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET", "ticket_android_sim:5555"),
@@ -138,6 +145,28 @@ func Load() (Config, error) {
 	}
 	if cfg.BootstrapAdminEmail == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL is required")
+	}
+	if cfg.Access.OIDCRedirect == "" {
+		cfg.Access.OIDCRedirect = cfg.PublicBaseURL + "/auth/callback"
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Access.Mode)) {
+	case "", "spacetime", "spacetimeauth", "oidc":
+		if cfg.Access.OIDCClientID == "" {
+			return Config{}, fmt.Errorf("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID is required when SpacetimeAuth is enabled")
+		}
+		if cfg.Access.OIDCIssuer == "" {
+			return Config{}, fmt.Errorf("TICKET_REMOTE_SPACETIME_AUTH_ISSUER is required when SpacetimeAuth is enabled")
+		}
+	case "cloudflare", "cloudflare-access", "cf-access":
+		if cfg.Access.TeamDomain == "" {
+			return Config{}, fmt.Errorf("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN is required when Cloudflare Access auth is enabled")
+		}
+		if cfg.Access.Audience == "" {
+			return Config{}, fmt.Errorf("TICKET_REMOTE_CF_ACCESS_AUDIENCE is required when Cloudflare Access auth is enabled")
+		}
+	case "dev", "development", "none":
+	default:
+		return Config{}, fmt.Errorf("unsupported TICKET_REMOTE_AUTH_MODE %q", cfg.Access.Mode)
 	}
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")

@@ -6,6 +6,21 @@
     history.scrollRestoration = 'manual';
   }
 
+  const spacetimeTokenKey = 'ticket_remote_spacetime_token';
+  const spacetimeTokenExpiryKey = 'ticket_remote_spacetime_token_expires_at';
+  const pkceVerifierKey = 'ticket_remote_pkce_verifier';
+  const pkceStateKey = 'ticket_remote_pkce_state';
+  const pkceVerifierSharedKey = 'ticket_remote_pkce_verifier_shared';
+  const pkceStateSharedKey = 'ticket_remote_pkce_state_shared';
+
+  if (!cfg.authenticated) {
+    startAuthShell();
+    return;
+  }
+
+  let spacetimeClient = null;
+  let spacetimeClientStatus = 'idle';
+
   if (document.querySelector('[data-admin="true"]')) {
     startAdmin();
     return;
@@ -17,8 +32,7 @@
   const emptyState = document.getElementById('emptyState');
   const startStreamButton = document.getElementById('startStream');
   const emptyMessage = document.getElementById('emptyMessage');
-  const privacyOverlay = document.getElementById('privacyOverlay');
-  const privacyText = document.getElementById('privacyText');
+  const quickClaimSpinner = document.getElementById('quickClaimSpinner');
   const connectionState = document.getElementById('connectionState');
   const statusLine = document.getElementById('statusLine');
   const panel = document.getElementById('panel');
@@ -38,34 +52,67 @@
   let serverClockSkewMs = 0;
   let pointerStart = null;
   let connectedAt = 0;
+  let videoConnectedAt = 0;
   let configuredAt = 0;
   let lastFrameAt = 0;
+  let lastDecodedFrameAt = 0;
+  let lastPacketAt = 0;
+  let lastPacketSequenceAdvancedAt = 0;
   let lastRestartAt = 0;
-  let lastFirstFrameNudgeAt = 0;
+  let lastRecoveryKeyframeAt = 0;
+  let lastRecoveryDecoderResetAt = 0;
+  let lastRecoveryVideoReconnectAt = 0;
+  let lastRecoveryServerRecoverAt = 0;
   let decoder = null;
   let decoderConfigured = false;
+  let decoderMode = 'annexb';
+  let avcAdapterTried = false;
+  let avcDescription = null;
+  let avcSps = null;
+  let avcPps = null;
+  let lastDecoderConfig = null;
   let needsKeyFrame = true;
   let currentStreamEpoch = 0;
+  let lastPacketSequence = 0;
+  let lastPacketTimestamp = 0;
   let lastAcceptedFrameSequence = 0;
+  let lastAcceptedFrameTimestamp = 0;
   let firstFrameReceived = false;
+  let hasRenderedFrame = false;
+  let latestStreamStatus = null;
+  let lastStreamStatusAt = 0;
   let claimPromise = null;
+  let quickClaimSpinnerInputId = '';
+  let quickClaimSpinnerTimeout = null;
+  let quickClaimSpinnerPending = false;
+  let ticketInUseSpinnerActive = false;
+  let lastSelfControl = false;
+  let lastActiveControlEmail = '';
+  let localControlSendGraceUntil = 0;
   let inputSeq = 0;
   let inputInFlight = null;
   const inputQueue = [];
   const inputQueueLimit = 20;
   const inputAckTimeoutMs = 1800;
   const inputRetryLimit = 1;
+  const quickClaimSpinnerTimeoutMs = 8000;
   let lastTouchEndAt = 0;
   let lastTouchEndX = 0;
   let lastTouchEndY = 0;
   const maxTapDurationMs = 450;
   const maxTapTravelPx = 14;
-  const streamVerticalPanThresholdPx = 18;
-  const streamVerticalPanDominance = 1.25;
-  const streamWatchdogMs = 4500;
-  const streamStaleRestartMs = 20000;
-  const streamStartupGraceMs = 2000;
-  const streamStartupHardErrorMs = 12000;
+  const streamVerticalPanThresholdPx = 6;
+  const streamVerticalPanDominance = 1.1;
+  const streamFirstFrameKeyframeMs = 2000;
+  const streamStaleKeyframeMs = 2500;
+  const streamStaleDecoderResetMs = 5000;
+  const streamStaleVideoReconnectMs = 8000;
+  const streamStaleServerRecoverMs = 12000;
+  const streamDecoderStartupGraceMs = 3500;
+  const recoveryKeyframeDebounceMs = 2000;
+  const recoveryDecoderResetDebounceMs = 5000;
+  const recoveryVideoReconnectDebounceMs = 8000;
+  const recoveryServerRecoverDebounceMs = 12000;
   const FRAME_ENVELOPE_MAGIC = 0x54534632;
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
   const doubleTapSuppressMs = 420;
@@ -188,8 +235,193 @@
     return text;
   }
 
+  function randomBase64Url(bytes) {
+    const data = new Uint8Array(bytes);
+    crypto.getRandomValues(data);
+    return base64Url(data);
+  }
+
+  function base64Url(data) {
+    let text = '';
+    for (let i = 0; i < data.length; i += 1) {
+      text += String.fromCharCode(data[i]);
+    }
+    return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  async function pkceChallenge(verifier) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    return base64Url(new Uint8Array(digest));
+  }
+
+  function authConfig() {
+    const auth = cfg.auth || {};
+    return {
+      mode: auth.mode || 'spacetime',
+      authorizeUrl: auth.authorizeUrl || `${String(auth.issuer || 'https://auth.spacetimedb.com/oidc').replace(/\/$/, '')}/auth`,
+      tokenUrl: auth.tokenUrl || `${String(auth.issuer || 'https://auth.spacetimedb.com/oidc').replace(/\/$/, '')}/token`,
+      clientId: auth.clientId || '',
+      scope: auth.scope || 'openid profile email',
+      redirectUrl: auth.redirectUrl || `${location.origin}/auth/callback`
+    };
+  }
+
+  function usesDirectSpacetimeAuth() {
+    const mode = String((cfg.auth && cfg.auth.mode) || 'spacetime').toLowerCase();
+    return !['cloudflare', 'cloudflare-access', 'cf-access', 'dev', 'development', 'none'].includes(mode);
+  }
+
+  async function beginSpacetimeLogin() {
+    const auth = authConfig();
+    if (!auth.clientId) {
+      throw new Error('SpacetimeAuth client is not configured.');
+    }
+    const verifier = randomBase64Url(32);
+    const state = randomBase64Url(16);
+    sessionStorage.setItem(pkceVerifierKey, verifier);
+    sessionStorage.setItem(pkceStateKey, state);
+    localStorage.setItem(pkceVerifierSharedKey, verifier);
+    localStorage.setItem(pkceStateSharedKey, state);
+    const challenge = await pkceChallenge(verifier);
+    const next = new URL(auth.authorizeUrl);
+    next.searchParams.set('response_type', 'code');
+    next.searchParams.set('client_id', auth.clientId);
+    next.searchParams.set('redirect_uri', auth.redirectUrl);
+    next.searchParams.set('scope', auth.scope);
+    next.searchParams.set('state', state);
+    next.searchParams.set('code_challenge', challenge);
+    next.searchParams.set('code_challenge_method', 'S256');
+    location.assign(next.toString());
+  }
+
+  async function finishSpacetimeCallback(statusEl) {
+    const params = new URLSearchParams(location.search);
+    const code = params.get('code') || '';
+    const receivedState = params.get('state') || '';
+    const expectedState = sessionStorage.getItem(pkceStateKey) || localStorage.getItem(pkceStateSharedKey) || '';
+    const verifier = sessionStorage.getItem(pkceVerifierKey) || localStorage.getItem(pkceVerifierSharedKey) || '';
+    if (!code || !verifier || !expectedState || receivedState !== expectedState) {
+      throw new Error('Login callback did not match this browser. Open the newest email link in the same browser you started from, or start sign-in again.');
+    }
+    const auth = authConfig();
+    const body = new URLSearchParams();
+    body.set('grant_type', 'authorization_code');
+    body.set('client_id', auth.clientId);
+    body.set('code', code);
+    body.set('redirect_uri', auth.redirectUrl);
+    body.set('code_verifier', verifier);
+    statusEl.textContent = 'Pabeidz pierakstīšanos...';
+    const tokenResponse = await fetch(auth.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    const tokenPayload = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok || !tokenPayload.id_token) {
+      throw new Error(tokenPayload.error_description || tokenPayload.error || 'SpacetimeAuth token exchange failed.');
+    }
+    const sessionResponse = await fetch('/api/v1/auth/session', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: tokenPayload.id_token })
+    });
+    const sessionPayload = await sessionResponse.json().catch(() => ({}));
+    if (!sessionResponse.ok || !sessionPayload.ok) {
+      throw new Error(sessionPayload.message || sessionPayload.error || 'Ticket session was rejected.');
+    }
+    localStorage.setItem(spacetimeTokenKey, tokenPayload.id_token);
+    if (sessionPayload.spacetime && sessionPayload.spacetime.expiresAt) {
+      localStorage.setItem(spacetimeTokenExpiryKey, sessionPayload.spacetime.expiresAt);
+    }
+    sessionStorage.removeItem(pkceVerifierKey);
+    sessionStorage.removeItem(pkceStateKey);
+    localStorage.removeItem(pkceVerifierSharedKey);
+    localStorage.removeItem(pkceStateSharedKey);
+    location.replace('/');
+  }
+
+  function startAuthShell() {
+    document.body.className = 'auth-page';
+    document.body.innerHTML = [
+      '<main class="auth-shell">',
+      '<section class="auth-panel">',
+      '<h1>Biļete</h1>',
+      '<p class="auth-copy">Pieraksties ar e-pastu, lai redzētu tiešraides biļeti.</p>',
+      '<p class="auth-copy">Ja e-pasta saite atveras jaunā cilnē, pēc apstiprināšanas atgriezies šajā pārlūkā.</p>',
+      '<button id="spacetimeLogin" class="primary" type="button">Pierakstīties ar e-pastu</button>',
+      '<p id="authStatus" class="auth-status" role="status"></p>',
+      '</section>',
+      '</main>'
+    ].join('');
+    const button = document.getElementById('spacetimeLogin');
+    const statusEl = document.getElementById('authStatus');
+    const isCallback = location.pathname === '/auth/callback';
+    if (isCallback) {
+      button.disabled = true;
+      finishSpacetimeCallback(statusEl)
+        .catch((error) => {
+          button.disabled = false;
+          statusEl.textContent = error && error.message ? error.message : 'Pierakstīšanās neizdevās.';
+        });
+      return;
+    }
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      statusEl.textContent = 'Atver SpacetimeAuth. Atver jaunāko e-pasta saiti šajā pašā pārlūkā vai jaunā cilnē.';
+      beginSpacetimeLogin().catch((error) => {
+        button.disabled = false;
+        statusEl.textContent = error && error.message ? error.message : 'Pierakstīšanās neizdevās.';
+      });
+    });
+  }
+
   function setStatus(text) {
     statusLine.textContent = localizePublicMessage(text);
+  }
+
+  function sameEmail(left, right) {
+    const cleanLeft = String(left || '').trim().toLowerCase();
+    const cleanRight = String(right || '').trim().toLowerCase();
+    return Boolean(cleanLeft && cleanRight && cleanLeft === cleanRight);
+  }
+
+  function currentUserOwnsControl(control) {
+    return Boolean(control && sameEmail(control.email, cfg.email));
+  }
+
+  function refreshQuickClaimSpinner() {
+    if (quickClaimSpinner) {
+      quickClaimSpinner.hidden = !(quickClaimSpinnerPending || ticketInUseSpinnerActive);
+    }
+  }
+
+  function setTicketInUseSpinner(active) {
+    ticketInUseSpinnerActive = Boolean(active);
+    refreshQuickClaimSpinner();
+  }
+
+  function showQuickClaimSpinner(inputId) {
+    quickClaimSpinnerPending = true;
+    if (typeof inputId === 'string') {
+      quickClaimSpinnerInputId = inputId;
+    }
+    refreshQuickClaimSpinner();
+    if (quickClaimSpinnerTimeout) {
+      clearTimeout(quickClaimSpinnerTimeout);
+    }
+    quickClaimSpinnerTimeout = setTimeout(() => hideQuickClaimSpinner('', 'timeout'), quickClaimSpinnerTimeoutMs);
+  }
+
+  function hideQuickClaimSpinner(inputId, reason) {
+    if (inputId && quickClaimSpinnerInputId && inputId !== quickClaimSpinnerInputId) return;
+    quickClaimSpinnerPending = false;
+    quickClaimSpinnerInputId = '';
+    if (quickClaimSpinnerTimeout) {
+      clearTimeout(quickClaimSpinnerTimeout);
+      quickClaimSpinnerTimeout = null;
+    }
+    refreshQuickClaimSpinner();
   }
 
   function clientLog(event, detail) {
@@ -218,11 +450,24 @@
   }
 
   function showEmpty(message, showStart) {
+    hideQuickClaimSpinner('', 'stream_empty');
+    setTicketInUseSpinner(false);
     emptyMessage.textContent = localizePublicMessage(message);
     startStreamButton.hidden = true;
     emptyState.hidden = false;
     document.body.dataset.streamReady = 'false';
     keepFirstScreenPinned();
+  }
+
+  function showStreamWaiting(message) {
+    if (hasRenderedFrame) {
+      emptyState.hidden = true;
+      document.body.dataset.streamReady = 'true';
+      setStatus(message);
+      keepFirstScreenPinned();
+      return;
+    }
+    showEmpty(message, false);
   }
 
   function hideEmpty() {
@@ -244,8 +489,12 @@
     const maxWidth = Math.max(1, stage.clientWidth);
     const maxHeight = Math.max(1, stage.clientHeight);
     const scale = Math.min(maxWidth / streamSize.width, maxHeight / streamSize.height);
-    stage.style.setProperty('--stream-width', `${Math.max(1, Math.floor(streamSize.width * scale))}px`);
-    stage.style.setProperty('--stream-height', `${Math.max(1, Math.floor(streamSize.height * scale))}px`);
+    const displayWidth = Math.max(1, Math.floor(streamSize.width * scale));
+    const displayHeight = Math.max(1, Math.floor(streamSize.height * scale));
+    stage.style.setProperty('--stream-width', `${displayWidth}px`);
+    stage.style.setProperty('--stream-height', `${displayHeight}px`);
+    stage.style.setProperty('--stream-left', `${Math.max(0, Math.floor((maxWidth - displayWidth) / 2))}px`);
+    stage.style.setProperty('--stream-top', `${Math.max(0, Math.floor((maxHeight - displayHeight) / 2))}px`);
   }
 
   function connect() {
@@ -259,9 +508,10 @@
     ws.onopen = () => {
       setConnected('Savienots');
       if (!streamUnsupported) {
-        showEmpty(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...', false);
+        showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
-      send({ type: 'heartbeat' });
+      connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
+      send({ type: 'activity', reason: 'public_connected' });
       connectDirectVideo();
       processInputQueue();
     };
@@ -272,40 +522,57 @@
       streamUnsupported = false;
       keepFirstScreenPinned();
       closeDirectVideo();
-      showEmpty('Atjauno straumi...', false);
+      showStreamWaiting('Atjauno straumi...');
       reconnectTimer = setTimeout(connect, 1000);
     };
     ws.onerror = () => {
       setConnected('Savienojuma kļūme');
       if (!streamUnsupported) {
-        showEmpty('Atjauno straumi...', false);
+        showStreamWaiting('Atjauno straumi...');
       }
       clientLog('websocket_error', 'socket error');
     };
     connectDirectVideo();
   }
 
-  function resetStreamState() {
+  function resetStreamState(options) {
+    const preserveFrame = Boolean(options && options.preserveFrame);
     configured = false;
     configuredAt = 0;
+    videoConnectedAt = 0;
     lastFrameAt = 0;
-    lastFirstFrameNudgeAt = 0;
+    lastDecodedFrameAt = 0;
+    lastPacketAt = 0;
+    lastPacketSequenceAdvancedAt = 0;
     firstFrameReceived = false;
     needsKeyFrame = true;
     currentStreamEpoch = 0;
+    lastPacketSequence = 0;
+    lastPacketTimestamp = 0;
     lastAcceptedFrameSequence = 0;
+    lastAcceptedFrameTimestamp = 0;
+    latestStreamStatus = null;
+    lastStreamStatusAt = 0;
+    decoderMode = 'annexb';
+    avcAdapterTried = false;
+    avcDescription = null;
+    avcSps = null;
+    avcPps = null;
+    if (!preserveFrame) {
+      hasRenderedFrame = false;
+    }
     closeDecoder();
   }
 
-  function restartStream(reason) {
+  function restartStream(reason, options) {
     if (streamUnsupported) return;
     const now = performance.now();
     if (now - lastRestartAt < 5000) return;
     lastRestartAt = now;
     clientLog('video_stream_restart', reason);
     closeDirectVideo();
-    resetStreamState();
-    showEmpty('Atjauno straumi...', false);
+    resetStreamState({ preserveFrame: Boolean(options && options.preserveFrame) });
+    showStreamWaiting('Atjauno straumi...');
     setTimeout(connectDirectVideo, 250);
   }
 
@@ -324,7 +591,8 @@
     videoWs = new WebSocket(streamURL());
     videoWs.binaryType = 'arraybuffer';
     videoWs.onopen = () => {
-      showEmpty('Saņem video konfigurāciju...', false);
+      videoConnectedAt = performance.now();
+      showStreamWaiting('Saņem video konfigurāciju...');
       requestKeyframe('video_socket_open');
     };
     videoWs.onmessage = handleVideoSocketMessage;
@@ -367,12 +635,42 @@
     }
   }
 
+  function requestKeyframeDebounced(reason, minIntervalMs) {
+    const now = performance.now();
+    if (now - lastRecoveryKeyframeAt < minIntervalMs) return false;
+    lastRecoveryKeyframeAt = now;
+    requestKeyframe(reason);
+    return true;
+  }
+
+  function requestServerRecoveryDebounced(reason) {
+    const now = performance.now();
+    if (now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
+    lastRecoveryServerRecoverAt = now;
+    sendVideoClientLog('h264_server_recover_requested', reason);
+    if (!sendVideoSignal({ type: 'recover_stream', reason })) {
+      send({ type: 'keyframe', reason });
+    }
+    return true;
+  }
+
   function closeDecoder() {
     if (decoder) {
       try { decoder.close(); } catch (_) {}
       decoder = null;
     }
     decoderConfigured = false;
+  }
+
+  function resetDecoderForRecovery(reason) {
+    if (!lastDecoderConfig) return false;
+    const now = performance.now();
+    if (now - lastRecoveryDecoderResetAt < recoveryDecoderResetDebounceMs) return false;
+    lastRecoveryDecoderResetAt = now;
+    sendVideoClientLog('h264_decoder_recovery_reset', reason);
+    configureDecoder(lastDecoderConfig, { preserveFrame: true, preserveSequence: true, requestReason: reason, preferAvc: decoderMode === 'avc' })
+      .catch((error) => sendVideoClientLog('decoder_recovery_config_failed', error && error.message || 'decoder recovery failed'));
+    return true;
   }
 
   function publishStreamDebug() {
@@ -382,10 +680,17 @@
       streamReady: document.body.dataset.streamReady,
       transport: 'https-websocket-h264',
       codec: decoderConfigured ? 'h264' : '',
+      decoderMode,
       currentStreamEpoch,
+      lastPacketAt,
+      lastDecodedFrameAt,
+      lastPacketSequence,
       lastAcceptedFrameSequence,
+      lastAcceptedFrameTimestamp,
       needsKeyFrame,
-      firstFrameReceived
+      firstFrameReceived,
+      hasRenderedFrame,
+      latestStreamStatus
     };
   }
 
@@ -412,8 +717,98 @@
     return null;
   }
 
+  function isAppleWebKit() {
+    const ua = navigator.userAgent || '';
+    return /\b(iPad|iPhone|iPod)\b/.test(ua) || (/\bSafari\b/.test(ua) && !/\bChrome|Chromium|CriOS|FxiOS|Edg\//.test(ua));
+  }
+
+  function findStartCode(data, from) {
+    for (let i = from; i + 3 < data.length; i += 1) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) return { index: i, length: 3 };
+      if (i + 4 < data.length && data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) return { index: i, length: 4 };
+    }
+    return null;
+  }
+
+  function annexBNalUnits(data) {
+    const units = [];
+    let start = findStartCode(data, 0);
+    while (start) {
+      const nalStart = start.index + start.length;
+      const next = findStartCode(data, nalStart);
+      const nalEnd = next ? next.index : data.length;
+      if (nalEnd > nalStart) {
+        units.push(data.slice(nalStart, nalEnd));
+      }
+      start = next;
+    }
+    return units;
+  }
+
+  function avcDescriptionFromParameterSets(sps, pps) {
+    if (!sps || sps.length < 4 || !pps || pps.length < 1) return null;
+    const size = 11 + sps.length + pps.length;
+    const out = new Uint8Array(size);
+    let offset = 0;
+    out[offset++] = 1;
+    out[offset++] = sps[1];
+    out[offset++] = sps[2];
+    out[offset++] = sps[3];
+    out[offset++] = 0xff;
+    out[offset++] = 0xe1;
+    out[offset++] = (sps.length >> 8) & 0xff;
+    out[offset++] = sps.length & 0xff;
+    out.set(sps, offset);
+    offset += sps.length;
+    out[offset++] = 1;
+    out[offset++] = (pps.length >> 8) & 0xff;
+    out[offset++] = pps.length & 0xff;
+    out.set(pps, offset);
+    return out;
+  }
+
+  function annexBToAvcSample(data) {
+    const units = annexBNalUnits(data);
+    if (!units.length) return null;
+    let total = 0;
+    for (const unit of units) total += 4 + unit.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const unit of units) {
+      out[offset++] = (unit.length >>> 24) & 0xff;
+      out[offset++] = (unit.length >>> 16) & 0xff;
+      out[offset++] = (unit.length >>> 8) & 0xff;
+      out[offset++] = unit.length & 0xff;
+      out.set(unit, offset);
+      offset += unit.length;
+    }
+    return { sample: out, units };
+  }
+
+  function rememberAvcParameterSets(units) {
+    for (const unit of units) {
+      if (!unit.length) continue;
+      const type = unit[0] & 0x1f;
+      if (type === 7) avcSps = unit;
+      if (type === 8) avcPps = unit;
+    }
+    if (!avcDescription && avcSps && avcPps) {
+      avcDescription = avcDescriptionFromParameterSets(avcSps, avcPps);
+    }
+    return avcDescription;
+  }
+
   function acceptFreshFrame(frame) {
     if (!frame) return false;
+    const now = performance.now();
+    lastPacketAt = now;
+    if (frame.sequence && frame.sequence > lastPacketSequence) {
+      lastPacketSequence = frame.sequence;
+      lastPacketSequenceAdvancedAt = now;
+    }
+    if (frame.timestamp) {
+      lastPacketTimestamp = frame.timestamp;
+    }
     if (currentStreamEpoch && frame.epoch && frame.epoch !== currentStreamEpoch) {
       return false;
     }
@@ -425,6 +820,7 @@
     }
     if (frame.kind === 'key') needsKeyFrame = false;
     if (frame.sequence) lastAcceptedFrameSequence = frame.sequence;
+    if (frame.timestamp) lastAcceptedFrameTimestamp = frame.timestamp;
     return true;
   }
 
@@ -435,24 +831,69 @@
       if (!checkServerVersion(msg)) return;
       if (msg.type === 'config') {
         await configureDecoder(msg);
+      } else if (msg.type === 'stream_status') {
+        handleStreamStatus(msg);
       } else if (msg.type === 'state' || msg.type === 'phone' || msg.type === 'health') {
         handleMessage({ data: event.data });
       }
       return;
     }
-    if (!configured || !decoder) return;
+    if (!configured) return;
     const frame = parseFrameEnvelope(event.data);
     if (!acceptFreshFrame(frame)) return;
+    if (decoderMode === 'avc') {
+      decodeAvcFrame(frame);
+      return;
+    }
     try {
       decoder.decode(new EncodedVideoChunk({ type: frame.kind, timestamp: frame.timestamp, data: frame.data }));
     } catch (error) {
       sendVideoClientLog('decoder_decode_failed', error && error.message || 'decode failed');
       needsKeyFrame = true;
-      requestKeyframe('decoder_decode_failed');
+      if (!avcAdapterTried) {
+        switchToAvcAdapter('decoder_decode_failed');
+      } else {
+        requestKeyframe('decoder_decode_failed');
+      }
     }
   }
 
-  async function configureDecoder(config) {
+  function decodeAvcFrame(frame) {
+    const converted = annexBToAvcSample(frame.data);
+    if (!converted) {
+      sendVideoClientLog('h264_avc_adapter_empty_frame', `sequence=${frame.sequence || 0}`);
+      needsKeyFrame = true;
+      requestKeyframe('h264_avc_adapter_empty_frame');
+      return;
+    }
+    if (frame.kind === 'key') {
+      rememberAvcParameterSets(converted.units);
+    }
+    if (!decoder) {
+      if (frame.kind !== 'key' || !avcDescription) {
+        needsKeyFrame = true;
+        requestKeyframe('h264_avc_adapter_waiting_sps_pps');
+        return;
+      }
+      configureAvcDecoderFromDescription(lastDecoderConfig || {}, avcDescription);
+    }
+    try {
+      decoder.decode(new EncodedVideoChunk({ type: frame.kind, timestamp: frame.timestamp, data: converted.sample }));
+    } catch (error) {
+      sendVideoClientLog('decoder_decode_failed', error && error.message || 'decode failed');
+      needsKeyFrame = true;
+      requestKeyframe('h264_avc_decode_failed');
+    }
+  }
+
+  function handleStreamStatus(msg) {
+    latestStreamStatus = msg;
+    lastStreamStatusAt = performance.now();
+    publishStreamDebug();
+  }
+
+  async function configureDecoder(config, options) {
+    options = options || {};
     if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
       showUnsupported('Šī pārlūkprogramma neatbalsta H.264 video dekodēšanu šajā lapā.');
       return;
@@ -470,36 +911,61 @@
       showUnsupported('Video konfigurācija nav pilnīga.');
       return;
     }
+    const preferAvc = Boolean(options.preferAvc) || isAppleWebKit();
     const decoderConfig = { codec, codedWidth: width, codedHeight: height, avc: { format: 'annexb' } };
     let supported = false;
-    try {
-      const result = await VideoDecoder.isConfigSupported(decoderConfig);
-      supported = Boolean(result && result.supported);
-    } catch (error) {
-      supported = false;
+    if (!preferAvc) {
+      try {
+        const result = await VideoDecoder.isConfigSupported(decoderConfig);
+        supported = Boolean(result && result.supported);
+      } catch (error) {
+        supported = false;
+      }
     }
-    if (!supported) {
+    if (!supported && !preferAvc) {
       showUnsupported('Šī pārlūkprogramma nevar atvērt H.264 biļetes video.');
       return;
     }
+    const previousSequence = lastAcceptedFrameSequence;
+    const previousTimestamp = lastAcceptedFrameTimestamp;
+    lastDecoderConfig = { ...config };
     closeDecoder();
+    decoderMode = preferAvc ? 'avc' : 'annexb';
+    if (preferAvc) {
+      avcAdapterTried = true;
+      avcDescription = null;
+      avcSps = null;
+      avcPps = null;
+    }
     canvas.width = width;
     canvas.height = height;
     ctx.imageSmoothingEnabled = false;
     streamSize = { width, height };
     currentStreamEpoch = Number(config.streamEpoch || 0);
-    lastAcceptedFrameSequence = 0;
+    lastAcceptedFrameSequence = options.preserveSequence ? previousSequence : 0;
+    lastAcceptedFrameTimestamp = options.preserveSequence ? previousTimestamp : 0;
     needsKeyFrame = true;
     configured = true;
     configuredAt = performance.now();
     firstFrameReceived = false;
     resizeCanvasBox();
+    if (preferAvc) {
+      decoderConfigured = false;
+      publishStreamDebug();
+      showStreamWaiting('Gaida pirmo video kadru...');
+      requestKeyframe(options.requestReason || 'config_received_avc');
+      keepFirstScreenPinned();
+      sendVideoClientLog('h264_decoder_mode', 'avc_adapter');
+      return;
+    }
     decoder = new VideoDecoder({
       output: (frame) => {
         try {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           lastFrameAt = performance.now();
+          lastDecodedFrameAt = lastFrameAt;
           firstFrameReceived = true;
+          hasRenderedFrame = true;
           hideEmpty();
           publishStreamDebug();
         } finally {
@@ -509,15 +975,75 @@
       error: (error) => {
         sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
         needsKeyFrame = true;
-        restartStream('decoder_error');
+        switchToAvcAdapter('decoder_error');
       }
     });
     decoder.configure(decoderConfig);
     decoderConfigured = true;
     publishStreamDebug();
-    showEmpty('Gaida pirmo video kadru...', false);
-    requestKeyframe('config_received');
+    showStreamWaiting('Gaida pirmo video kadru...');
+    requestKeyframe(options.requestReason || 'config_received');
     keepFirstScreenPinned();
+  }
+
+  function configureAvcDecoderFromDescription(config, description) {
+    const width = Number(config.width || canvas.width || 0);
+    const height = Number(config.height || canvas.height || 0);
+    const codec = String(config.codec || 'avc1.42C028');
+    closeDecoder();
+    decoderMode = 'avc';
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        try {
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          lastFrameAt = performance.now();
+          lastDecodedFrameAt = lastFrameAt;
+          firstFrameReceived = true;
+          hasRenderedFrame = true;
+          hideEmpty();
+          publishStreamDebug();
+        } finally {
+          frame.close();
+        }
+      },
+      error: (error) => {
+        sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
+        needsKeyFrame = true;
+        resetDecoderForRecovery('decoder_error_avc');
+        requestKeyframe('decoder_error_avc');
+      }
+    });
+    try {
+      decoder.configure({ codec, codedWidth: width, codedHeight: height, description });
+    } catch (error) {
+      closeDecoder();
+      showUnsupported('Šī pārlūkprogramma nevar atvērt H.264 biļetes video.');
+      sendVideoClientLog('h264_avc_config_failed', error && error.message || 'avc config failed');
+      return;
+    }
+    decoderConfigured = true;
+    sendVideoClientLog('h264_decoder_mode', 'avc_adapter_configured');
+    publishStreamDebug();
+  }
+
+  function switchToAvcAdapter(reason) {
+    if (!lastDecoderConfig) {
+      requestKeyframe(reason);
+      return;
+    }
+    if (avcAdapterTried && decoderMode === 'avc') {
+      resetDecoderForRecovery(reason);
+      requestKeyframe(reason);
+      return;
+    }
+    avcAdapterTried = true;
+    sendVideoClientLog('h264_decoder_recovery_avc_adapter', reason);
+    configureDecoder(lastDecoderConfig, {
+      preserveFrame: true,
+      preserveSequence: false,
+      preferAvc: true,
+      requestReason: `${reason}_avc_adapter`
+    }).catch((error) => sendVideoClientLog('decoder_recovery_config_failed', error && error.message || 'decoder recovery failed'));
   }
 
   function send(value) {
@@ -526,6 +1052,75 @@
       return true;
     }
     return false;
+  }
+
+  async function fetchAuthSessionToken() {
+    if (!usesDirectSpacetimeAuth()) {
+      throw new Error('Direct SpacetimeAuth is disabled for this ticket session.');
+    }
+    const response = await fetch('/api/v1/auth/session', { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok || !payload.spacetime || !payload.spacetime.token) {
+      throw new Error(payload.message || payload.error || 'SpacetimeAuth session is unavailable.');
+    }
+    localStorage.setItem(spacetimeTokenKey, payload.spacetime.token);
+    if (payload.spacetime.expiresAt) {
+      localStorage.setItem(spacetimeTokenExpiryKey, payload.spacetime.expiresAt);
+    }
+    return payload.spacetime.token;
+  }
+
+  async function spacetimeToken() {
+    const existing = localStorage.getItem(spacetimeTokenKey) || '';
+    if (existing) return existing;
+    return fetchAuthSessionToken();
+  }
+
+  async function connectSpacetimeState() {
+    if (!usesDirectSpacetimeAuth() || spacetimeClient || !window.TicketSpacetime) return;
+    const token = await spacetimeToken();
+    const st = cfg.spacetime || {};
+    spacetimeClient = window.TicketSpacetime.create({
+      host: st.host || 'https://maincloud.spacetimedb.com',
+      database: st.database || '',
+      token,
+      ticketId: cfg.ticketId || 'vivi-default',
+      sessionId: cfg.sessionId || '',
+      email: cfg.email || ''
+    }, {
+      onState: (state) => {
+        currentState = state;
+        rememberServerClock(currentState);
+        renderState();
+      },
+      onStatus: (status, detail) => {
+        spacetimeClientStatus = status;
+        if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
+      }
+    });
+    spacetimeClient.connect();
+  }
+
+  async function syncServerState(reason) {
+    send({ type: 'state_refresh', reason: reason || 'spacetime_mutation' });
+    const response = await fetch('/api/v1/state', { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (response.ok && payload.ok && payload.state) {
+      currentState = payload.state;
+      rememberServerClock(currentState);
+      renderState();
+    }
+  }
+
+  async function runSpacetimeMutation(action, reason) {
+    await connectSpacetimeState();
+    if (!spacetimeClient) throw new Error('Spacetime connection is unavailable.');
+    await action(spacetimeClient);
+    await syncServerState(reason);
+  }
+
+  async function runControlMutation(reason, fallbackPath, fallbackBody) {
+    return postJSON(fallbackPath, fallbackBody || {});
   }
 
   function nextInputId() {
@@ -540,15 +1135,16 @@
   function queueInput(value) {
     if (inputQueueSize() >= inputQueueLimit) {
       setStatus('Pieskārienu rinda ir pilna. Uzgaidi mirkli un mēģini vēlreiz.');
-      return false;
+      return '';
     }
+    const inputId = value.inputId || nextInputId();
     inputQueue.push({
       ...value,
-      inputId: value.inputId || nextInputId(),
+      inputId,
       retryCount: value.retryCount || 0
     });
     processInputQueue();
-    return true;
+    return inputId;
   }
 
   function queueTap(screenPoint, options) {
@@ -563,8 +1159,45 @@
     return queueInput(value);
   }
 
+  function queueQuickClaimTap(screenPoint, options) {
+    return queueInput({
+      type: 'quick_claim_tap',
+      x: screenPoint.x,
+      y: screenPoint.y,
+      snapTarget: options && options.snapTarget ? options.snapTarget : 'control_code_button'
+    });
+  }
+
+  function inputCanStartWithoutControl(input) {
+    return input && input.type === 'quick_claim_tap';
+  }
+
+  function currentUserCanSendInput() {
+    return currentUserOwnsControl(currentControl(currentState)) || performance.now() < localControlSendGraceUntil;
+  }
+
+  function cancelPendingInputs(reason) {
+    if (inputInFlight && inputInFlight.timeout) {
+      clearTimeout(inputInFlight.timeout);
+    }
+    const hadPending = Boolean(inputInFlight) || inputQueue.length > 0 || quickClaimSpinnerPending;
+    inputInFlight = null;
+    inputQueue.length = 0;
+    localControlSendGraceUntil = 0;
+    hideQuickClaimSpinner('', reason || 'input_cancelled');
+    if (hadPending) {
+      clientLog('input_queue_cancelled', reason || 'control_lost');
+    }
+  }
+
   function processInputQueue() {
     if (inputInFlight || inputQueue.length === 0) return;
+    const nextInput = inputQueue[0];
+    if (!currentUserCanSendInput() && !inputCanStartWithoutControl(nextInput)) {
+      cancelPendingInputs('control_lost_before_send');
+      setStatus('Ievade atcelta, jo kontroles režīms vairs nav aktīvs.');
+      return;
+    }
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setStatus('Gaida savienojumu, lai nosūtītu pieskārienu.');
       return;
@@ -581,6 +1214,11 @@
 
   function retryOrDropInput(inputId) {
     if (!inputInFlight || inputInFlight.inputId !== inputId) return;
+    if (!currentUserCanSendInput() && !inputCanStartWithoutControl(inputInFlight)) {
+      cancelPendingInputs('control_lost_retry');
+      setStatus('Ievade atcelta, jo kontroles režīms vairs nav aktīvs.');
+      return;
+    }
     const timedOut = inputInFlight;
     inputInFlight = null;
     if (timedOut.retryCount < inputRetryLimit) {
@@ -591,6 +1229,7 @@
       processInputQueue();
       return;
     }
+    hideQuickClaimSpinner(inputId, 'input_timeout');
     setStatus('Pieskāriens netika apstiprināts.');
     processInputQueue();
   }
@@ -600,6 +1239,7 @@
     if (inputInFlight.timeout) {
       clearTimeout(inputInFlight.timeout);
     }
+    hideQuickClaimSpinner(inputId, accepted ? 'input_result' : 'input_rejected');
     inputInFlight = null;
     if (!accepted) {
       setStatus(reason === 'not_active_controller'
@@ -640,7 +1280,7 @@
         if (msg.data && msg.data.message) {
           setStatus(msg.data.message);
           if (msg.data.streamActive === false && !streamUnsupported) {
-            showEmpty(`${localizePublicMessage(msg.data.message)} Restartē...`, false);
+            showStreamWaiting(`${localizePublicMessage(msg.data.message)} Restartē...`);
           }
         }
       } else if (msg.type === 'phone') {
@@ -670,8 +1310,17 @@
     if (!state) return;
     rememberServerClock(state);
     const control = currentControl(state);
-    const selfControl = control && control.sessionId === cfg.sessionId && control.email === cfg.email;
+    const selfControl = currentUserOwnsControl(control);
     const otherControl = control && !selfControl;
+    const activeControlEmail = control && control.email ? String(control.email).trim().toLowerCase() : '';
+
+    if ((lastSelfControl && !selfControl) || (lastActiveControlEmail && lastActiveControlEmail !== activeControlEmail && !selfControl)) {
+      cancelPendingInputs('control_lost_state_update');
+    }
+    lastSelfControl = Boolean(selfControl);
+    lastActiveControlEmail = activeControlEmail;
+
+    setTicketInUseSpinner(Boolean(otherControl));
 
     claimButton.hidden = Boolean(control);
     extendButton.hidden = !selfControl || control.extended;
@@ -687,13 +1336,6 @@
       timer.hidden = true;
       timer.classList.remove('urgent');
       setStatus('Vispārīga skatīšanās');
-    }
-
-    if (otherControl) {
-      privacyOverlay.hidden = false;
-      privacyText.textContent = `${control.email} izmanto privātu kontroles koda sesiju vēl ${timer.textContent}. Tu paliec pieslēgts un automātiski atgriezīsies kopīgajā skatā.`;
-    } else {
-      privacyOverlay.hidden = true;
     }
 
     renderPresence(state.viewers || []);
@@ -737,11 +1379,6 @@
     });
   }
 
-  function isPrivacyCovered() {
-    const control = currentControl(currentState);
-    return Boolean(control && (control.sessionId !== cfg.sessionId || control.email !== cfg.email));
-  }
-
   async function postJSON(path, body) {
     const response = await fetch(path, {
       method: 'POST',
@@ -767,26 +1404,41 @@
 
   async function ensureControl() {
     const control = currentControl(currentState);
-    const selfControl = control && control.sessionId === cfg.sessionId && control.email === cfg.email;
+    const selfControl = currentUserOwnsControl(control);
     if (selfControl) return;
     if (!claimPromise) {
-      claimPromise = postJSON('/api/v1/control/claim').finally(() => {
+      claimPromise = runControlMutation('control_claim', '/api/v1/control/claim').finally(() => {
         claimPromise = null;
       });
     }
     await claimPromise;
+    localControlSendGraceUntil = performance.now() + 4000;
+  }
+
+  function quickClaimControl(options) {
+    if (options && options.tap) {
+      setStatus('Atver kontroles kodu...');
+      return queueQuickClaimTap(options.tap, { snapTarget: options.snapTarget });
+    }
+    return '';
   }
 
   async function claimControl(options) {
     await ensureControl();
     if (options && options.tap) {
-      queueTap(options.tap, { snapTarget: options.snapTarget });
+      return queueTap(options.tap, { snapTarget: options.snapTarget });
     }
+    return '';
   }
 
   claimButton.addEventListener('click', () => claimControl().catch((error) => setStatus(error.message)));
-  extendButton.addEventListener('click', () => postJSON('/api/v1/control/extend').catch((error) => setStatus(error.message)));
-  releaseButton.addEventListener('click', () => postJSON('/api/v1/control/release').catch((error) => setStatus(error.message)));
+  extendButton.addEventListener('click', () => runControlMutation('control_extend', '/api/v1/control/extend').catch((error) => setStatus(error.message)));
+  releaseButton.addEventListener('click', () => {
+    cancelPendingInputs('control_release_requested');
+    runControlMutation('control_release', '/api/v1/control/release')
+      .then(() => cancelPendingInputs('control_release_confirmed'))
+      .catch((error) => setStatus(error.message));
+  });
   startStreamButton.addEventListener('click', () => restartStream('manual_start'));
 
   function point(event) {
@@ -819,11 +1471,11 @@
   }
 
   canvas.addEventListener('pointerdown', (event) => {
-    if (!configured || isPrivacyCovered()) return;
+    if (!configured) return;
     if (event.button != null && event.button !== 0) return;
     const control = currentControl(currentState);
     const start = point(event);
-    const selfControl = control && control.sessionId === cfg.sessionId && control.email === cfg.email;
+    const selfControl = currentUserOwnsControl(control);
     pointerStart = {
       ...start,
       clientX: event.clientX,
@@ -831,6 +1483,7 @@
       pointerId: event.pointerId,
       pointerType: event.pointerType || 'mouse',
       selfControl: Boolean(selfControl),
+      otherControl: Boolean(control && !selfControl),
       claimZone: !control ? firstClaimCandidateZone(start) : '',
       at: performance.now()
     };
@@ -852,7 +1505,7 @@
   });
 
   canvas.addEventListener('pointerup', (event) => {
-    if (!pointerStart || !configured || isPrivacyCovered()) return;
+    if (!pointerStart || !configured) return;
     if (pointerStart.pointerId !== event.pointerId) return;
     const end = point(event);
     const distance = Math.hypot(end.x - pointerStart.x, end.y - pointerStart.y);
@@ -861,8 +1514,16 @@
       event.preventDefault();
       if (pointerStart.selfControl) {
         queueTap(end);
+      } else if (pointerStart.otherControl) {
+        setStatus('Biļete pašlaik tiek izmantota.');
       } else if (pointerStart.claimZone) {
-        claimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' }).catch((error) => setStatus(error.message));
+        showQuickClaimSpinner('');
+        const inputId = quickClaimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' });
+        if (inputId) {
+          showQuickClaimSpinner(inputId);
+        } else {
+          hideQuickClaimSpinner('', 'claim_not_queued');
+        }
       } else {
         setStatus('Pirms pieskaries tālrunim, pārņem kontroles koda režīmu.');
       }
@@ -902,6 +1563,109 @@
     canvas.addEventListener(eventName, blockStreamGesture, { passive: false });
     document.addEventListener(eventName, blockStreamGesture, { passive: false });
   }
+
+  function freshStreamStatus(now) {
+    if (!latestStreamStatus || lastStreamStatusAt <= 0) return null;
+    if (now - lastStreamStatusAt > 3500) return null;
+    return latestStreamStatus;
+  }
+
+  function backendLooksRecoverable(status) {
+    if (!status || status.phoneDesired === false) return false;
+    if (status.phoneConnected === false) return true;
+    const streamState = String(status.phoneStreamState || '');
+    return streamState !== '' && streamState !== 'streaming';
+  }
+
+  function serverFrameAge(status) {
+    if (!status) return -1;
+    const value = Number(status.lastFrameAgoMillis);
+    return Number.isFinite(value) ? value : -1;
+  }
+
+  function reconnectVideoForRecovery(reason) {
+    const now = performance.now();
+    if (now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs) return false;
+    lastRecoveryVideoReconnectAt = now;
+    restartStream(reason, { preserveFrame: true });
+    return true;
+  }
+
+  function decoderStartupGraceActive(now) {
+    if (hasRenderedFrame || configuredAt <= 0) return false;
+    if (now - configuredAt > streamDecoderStartupGraceMs) return false;
+    return decoderMode === 'avc' || avcAdapterTried || lastPacketAt > 0;
+  }
+
+  function chaseLiveStream() {
+    if (streamUnsupported) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      connect();
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    const status = freshStreamStatus(now);
+    const serverAge = serverFrameAge(status);
+    const serverStale = serverAge > streamStaleKeyframeMs && status && status.activeVideoClients > 0;
+    const backendInactive = backendLooksRecoverable(status);
+
+    if (!configured) {
+      const pendingSince = videoConnectedAt || connectedAt;
+      const pendingAge = pendingSince > 0 ? now - pendingSince : 0;
+      if (pendingAge > streamFirstFrameKeyframeMs) {
+        if (requestKeyframeDebounced('h264_first_frame_nudge', recoveryKeyframeDebounceMs)) {
+          clientLog('loading_over_2s', 'h264_first_frame_pending');
+        }
+      }
+      if (pendingAge > streamStaleServerRecoverMs || backendInactive) {
+        requestServerRecoveryDebounced('h264_start_pending');
+      }
+      return;
+    }
+
+    if (lastDecodedFrameAt === 0 && configuredAt > 0) {
+      const firstFrameAge = now - configuredAt;
+      if (firstFrameAge > streamFirstFrameKeyframeMs) {
+        requestKeyframeDebounced('first_frame_timeout', recoveryKeyframeDebounceMs);
+      }
+      if (decoderStartupGraceActive(now)) {
+        return;
+      }
+      if (firstFrameAge > streamStaleDecoderResetMs) {
+        resetDecoderForRecovery('first_frame_decoder_reset');
+      }
+      if (firstFrameAge > streamStaleVideoReconnectMs) {
+        reconnectVideoForRecovery('first_frame_video_reconnect');
+      }
+      if (firstFrameAge > streamStaleServerRecoverMs || backendInactive) {
+        requestServerRecoveryDebounced('first_frame_server_recover');
+      }
+      return;
+    }
+
+    const decodedAge = lastDecodedFrameAt > 0 ? now - lastDecodedFrameAt : 0;
+    const sequenceStalledAge = lastPacketSequenceAdvancedAt > 0 ? now - lastPacketSequenceAdvancedAt : 0;
+    const sequenceStalled = lastPacketAt > 0 && sequenceStalledAge > streamStaleKeyframeMs && decodedAge > streamStaleKeyframeMs;
+    const visibleStaleAge = Math.max(decodedAge, serverStale ? serverAge : 0, sequenceStalled ? sequenceStalledAge : 0);
+    if (visibleStaleAge <= streamStaleKeyframeMs && !backendInactive) return;
+
+    if (visibleStaleAge > streamStaleKeyframeMs) {
+      if (requestKeyframeDebounced('stale_video_frames', recoveryKeyframeDebounceMs)) {
+        clientLog('stale_video_frames', 'fresh_frame_requested');
+      }
+    }
+    if (visibleStaleAge > streamStaleDecoderResetMs || (lastPacketAt > lastDecodedFrameAt && decodedAge > streamStaleDecoderResetMs)) {
+      resetDecoderForRecovery('stale_decoder_recovery');
+    }
+    if (visibleStaleAge > streamStaleVideoReconnectMs) {
+      reconnectVideoForRecovery('stale_video_frames');
+    }
+    if (visibleStaleAge > streamStaleServerRecoverMs || backendInactive) {
+      requestServerRecoveryDebounced('stale_frames_server_recover');
+    }
+  }
+
   window.addEventListener('resize', resizeCanvasBox);
   window.addEventListener('scroll', updateDetailsReveal, { passive: true });
   if (window.visualViewport) {
@@ -912,58 +1676,35 @@
     if (document.visibilityState === 'visible') {
       scheduleFirstScreenPin(false);
       refreshHealth();
+      connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
       connect();
     }
   });
   window.addEventListener('pageshow', () => scheduleFirstScreenPin(true));
+  window.addEventListener('pagehide', () => {
+    if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {
+      spacetimeClient.disconnectPresence();
+    }
+  });
   window.addEventListener('load', () => scheduleFirstScreenPin(true));
-  setInterval(() => send({ type: 'heartbeat' }), 15000);
+  setInterval(() => {
+    if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
+      spacetimeClient.heartbeat(true);
+    }
+    send({ type: 'activity', reason: 'public_heartbeat' });
+  }, 15000);
   setInterval(refreshHealth, 15000);
   setInterval(() => {
     if (currentState && currentState.activeControl) renderState();
   }, 1000);
-  setInterval(() => {
-    if (streamUnsupported) return;
-    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-      connect();
-      return;
-    }
-    if (ws.readyState !== WebSocket.OPEN) return;
-    const now = performance.now();
-    if (!configured && connectedAt > 0 && now - connectedAt > streamStartupGraceMs) {
-      if (now - lastFirstFrameNudgeAt > streamStartupGraceMs) {
-        lastFirstFrameNudgeAt = now;
-        requestKeyframe('h264_first_frame_nudge');
-        clientLog('loading_over_2s', 'h264_first_frame_pending');
-      }
-      if (now - connectedAt > streamStartupHardErrorMs) {
-        sendVideoClientLog('h264_start_timeout', 'missing_h264_config_or_frame');
-        showUnsupported('Video straume neatnāca laikā. Tālrunim vajag uzmanību.');
-      }
-      return;
-    }
-    if (configured && lastFrameAt === 0 && configuredAt > 0 && now - configuredAt > streamStartupGraceMs) {
-      requestKeyframe('first_frame_timeout');
-      restartStream('first_frame_timeout');
-      return;
-    }
-    if (lastFrameAt > 0 && now - lastFrameAt > streamWatchdogMs) {
-      if (now - lastFirstFrameNudgeAt > streamWatchdogMs) {
-        lastFirstFrameNudgeAt = now;
-        requestKeyframe('stale_video_frames');
-        clientLog('stale_video_frames', 'fresh_frame_requested');
-      }
-      if (now - lastFrameAt > streamStaleRestartMs) {
-        restartStream('stale_video_frames');
-      }
-    }
-  }, 1000);
+  setInterval(chaseLiveStream, 1000);
   updateViewportVars();
   scheduleFirstScreenPin(true);
   updateDetailsReveal();
   resizeCanvasBox();
   showEmpty('Savienojas...', false);
   refreshHealth();
+  connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
   connect();
 
   async function startAdmin() {
@@ -1039,7 +1780,11 @@
         remove.disabled = member.role === 'owner';
         remove.addEventListener('click', async () => {
           await runAdminAction(remove, 'Removing member...', async () => {
-            await apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`, { method: 'DELETE' });
+            if (usesDirectSpacetimeAuth()) {
+              await runSpacetimeMutation((client) => client.removeMember(member.email), 'admin_member_remove');
+            } else {
+              await apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`, { method: 'DELETE', cache: 'no-store' });
+            }
             showNotice('Member removed');
             await load();
           });
@@ -1053,11 +1798,16 @@
     memberForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       await runAdminAction(memberForm.querySelector('button[type="submit"]'), 'Adding member...', async () => {
-        await apiFetch('/api/v1/admin/members', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: memberEmail.value, role: memberRole.value })
-        });
+        if (usesDirectSpacetimeAuth()) {
+          await runSpacetimeMutation((client) => client.upsertMember(memberEmail.value, memberRole.value), 'admin_member_upsert');
+        } else {
+          await apiFetch('/api/v1/admin/members', {
+            method: 'POST',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: memberEmail.value, role: memberRole.value })
+          });
+        }
         memberEmail.value = '';
         showNotice('Member saved');
         await load();
@@ -1066,7 +1816,7 @@
 
     revokeButton.addEventListener('click', async () => {
       await runAdminAction(revokeButton, 'Revoking control...', async () => {
-        await apiFetch('/api/v1/admin/control/revoke', { method: 'POST' });
+        await apiFetch('/api/v1/admin/control/revoke', { method: 'POST', cache: 'no-store' });
         showNotice('Control revoked');
         await load();
       });

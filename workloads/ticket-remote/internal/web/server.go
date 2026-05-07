@@ -49,6 +49,9 @@ type Server struct {
 	stateMu     sync.RWMutex
 	cachedState state.Snapshot
 
+	quickClaimMu   sync.RWMutex
+	lastQuickClaim quickClaimDiagnostic
+
 	phoneStartMu          sync.Mutex
 	lastPhoneStartAttempt time.Time
 
@@ -72,6 +75,16 @@ type controlGate struct {
 	expiresAt time.Time
 }
 
+type quickClaimDiagnostic struct {
+	At        string `json:"at,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	Email     string `json:"email,omitempty"`
+	InputID   string `json:"inputId,omitempty"`
+	Action    string `json:"action,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Forwarded bool   `json:"forwarded"`
+}
+
 type apiResponse struct {
 	OK      bool           `json:"ok"`
 	Error   string         `json:"error,omitempty"`
@@ -80,7 +93,7 @@ type apiResponse struct {
 	Phone   phone.Health   `json:"phone,omitempty"`
 }
 
-const serverVersion = "ticket-remote-2026-05-06-https-h264-video-v18"
+const serverVersion = "ticket-remote-2026-05-07-spacetimeauth-login-v1"
 
 func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Server, error) {
 	if cfg.SimulatorSetup.BackendID == "" {
@@ -133,9 +146,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case path == "/api/v1/livez":
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "serverVersion": serverVersion})
+	case path == "/api/v1/auth/config":
+		s.handleAuthConfig(w, r)
+	case path == "/api/v1/auth/session":
+		s.handleAuthSession(w, r)
+	case path == "/api/v1/auth/logout":
+		s.handleAuthLogout(w, r)
 	case path == "/api/v1/health":
-		s.handleHealth(w, r)
-	case path == "/static/app.css" || path == "/static/app.js":
+		s.withMember(w, r, func(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
+			s.handleHealth(w, r)
+		})
+	case strings.HasPrefix(path, "/static/"):
 		writeNoStoreHeaders(w)
 		http.StripPrefix("/static/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
 	case path == "/api/v1/session":
@@ -174,11 +197,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.withOwnerSimulatorSetup(w, r, s.handleAdminPhoneSetupOpen)
 	case path == "/admin":
 		s.withAdmin(w, r, s.handleAdminPage)
+	case path == "/auth/callback":
+		s.handleIndexShell(w, r)
 	case path == "/":
-		s.withMember(w, r, s.handleIndex)
+		s.handleIndexShell(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
+	if s.usesSpacetimeAuth() {
+		id, sessionID, snapshot, ok := s.optionalMember(r)
+		if ok {
+			if sessionID == "" {
+				sessionID = s.sessionID(w, r)
+			}
+			s.handleIndex(w, r, id, sessionID, snapshot)
+			return
+		}
+		writeNoStoreHeaders(w)
+		_ = s.indexTmpl.Execute(w, map[string]any{
+			"AssetVersion": assetVersion(),
+			"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false))),
+		})
+		return
+	}
+	s.withMember(w, r, s.handleIndex)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +249,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"phone":              phoneHealth,
 		"activePhoneBackend": s.activePhoneBackend(),
 		"directStream":       s.direct.snapshot(time.Now(), phoneHealth),
+		"controlGate":        s.controlGateSnapshot(time.Now()),
+		"quickClaim":         s.quickClaimSnapshot(),
 	})
 }
 
@@ -211,14 +258,37 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Ide
 	writeNoStoreHeaders(w)
 	_ = s.indexTmpl.Execute(w, map[string]any{
 		"AssetVersion": assetVersion(),
-		"ConfigJSON": template.JS(mustJSON(map[string]any{
-			"publicBaseUrl": s.cfg.PublicBaseURL,
-			"email":         id.Email,
-			"sessionId":     sessionID,
-			"stateBackend":  snapshot.StateBackend,
-			"pageVersion":   serverVersion,
-		})),
+		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(id, sessionID, snapshot, true))),
 	})
+}
+
+func (s *Server) publicBrowserConfig(id auth.Identity, sessionID string, snapshot state.Snapshot, authenticated bool) map[string]any {
+	email := id.Email
+	authMode := s.publicAuthMode()
+	return map[string]any{
+		"publicBaseUrl": s.cfg.PublicBaseURL,
+		"authenticated": authenticated,
+		"email":         email,
+		"sessionId":     sessionID,
+		"stateBackend":  snapshot.StateBackend,
+		"ticketId":      s.cfg.TicketID,
+		"pageVersion":   serverVersion,
+		"auth": map[string]any{
+			"mode":           authMode,
+			"issuer":         strings.TrimRight(s.cfg.Access.OIDCIssuer, "/"),
+			"clientId":       s.cfg.Access.OIDCClientID,
+			"scope":          strings.TrimSpace(s.cfg.Access.OIDCScope),
+			"redirectUrl":    s.cfg.Access.OIDCRedirect,
+			"authorizeUrl":   strings.TrimRight(s.cfg.Access.OIDCIssuer, "/") + "/auth",
+			"tokenUrl":       strings.TrimRight(s.cfg.Access.OIDCIssuer, "/") + "/token",
+			"logoutUrl":      strings.TrimRight(s.cfg.Access.OIDCIssuer, "/") + "/session/end",
+			"authCookieName": s.cfg.Access.AuthCookieName,
+		},
+		"spacetime": map[string]any{
+			"host":     s.cfg.State.SpacetimeHost,
+			"database": s.cfg.State.SpacetimeDatabase,
+		},
+	}
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
@@ -228,7 +298,102 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 		"AssetVersion": assetVersion(),
 		"Email":        id.Email,
 		"IsOwner":      member.Role == state.RoleOwner,
+		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(id, sessionID, snapshot, true))),
 	})
+}
+
+func (s *Server) handleAuthConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeNoStoreHeaders(w)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"auth":      s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false)["auth"],
+		"spacetime": s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false)["spacetime"],
+	})
+}
+
+func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		id, sessionID, snapshot, ok := s.optionalMember(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, apiResponse{OK: false, Error: "auth_required", Message: "SpacetimeAuth login is required."})
+			return
+		}
+		if sessionID == "" {
+			sessionID = s.sessionID(w, r)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"authenticated": true,
+			"email":         id.Email,
+			"sessionId":     sessionID,
+			"state":         snapshot,
+			"spacetime": map[string]any{
+				"host":     s.cfg.State.SpacetimeHost,
+				"database": s.cfg.State.SpacetimeDatabase,
+				"token":    s.authTokenFromRequest(r),
+			},
+		})
+	case http.MethodPost:
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 32*1024))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: "Auth payload was too large."})
+			return
+		}
+		var req struct {
+			IDToken string `json:"idToken"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: "Auth payload was invalid."})
+			return
+		}
+		token := strings.TrimSpace(req.IDToken)
+		id, err := s.auth.ValidateOIDCJWT(r.Context(), token)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, apiResponse{OK: false, Error: "auth_invalid", Message: err.Error()})
+			return
+		}
+		snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, time.Now())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "state_unavailable", Message: "Ticket state is unavailable."})
+			return
+		}
+		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
+		s.cacheSnapshot(snapshot)
+		if _, ok := snapshot.Member(id.Email); !ok {
+			writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "not_member", Message: "This email is not linked to this ticket."})
+			return
+		}
+		s.setAuthCookie(w, token, int(s.cfg.CookieTTL.Seconds()))
+		sessionID := s.sessionID(w, r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"authenticated": true,
+			"email":         id.Email,
+			"sessionId":     sessionID,
+			"state":         snapshot,
+			"spacetime": map[string]any{
+				"host":     s.cfg.State.SpacetimeHost,
+				"database": s.cfg.State.SpacetimeDatabase,
+				"token":    token,
+			},
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	s.setAuthCookie(w, "", -1)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
@@ -476,7 +641,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 	if video {
 		if configFrame, keyFrame := s.direct.warmStart(); len(configFrame) > 0 {
 			c.sendText(context.Background(), configFrame)
-			if len(keyFrame) > 0 && s.controlGateAllows(c.sessionID, c.email, time.Now()) {
+			if len(keyFrame) > 0 {
 				c.sendBinary(context.Background(), keyFrame)
 			} else {
 				s.requestPhoneKeyframe("browser_video_warm_start")
@@ -485,7 +650,12 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 			s.requestPhoneKeyframe("browser_video_config_needed")
 		}
 	}
+	statusCtx, stopStatus := context.WithCancel(r.Context())
+	if video {
+		go s.streamStatusLoop(statusCtx, c)
+	}
 	defer func() {
+		stopStatus()
 		s.removeClient(c)
 		if video {
 			s.direct.removeVideoClient()
@@ -526,12 +696,28 @@ func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data [
 	switch msgType {
 	case "keyframe":
 		s.requestPhoneKeyframe("browser_h264_request")
+	case "recover_stream":
+		reason, _ := msg["reason"].(string)
+		s.requestPhoneRecovery(reason)
 	case "client_log":
 		event, _ := msg["event"].(string)
 		detail, _ := msg["detail"].(string)
 		s.direct.recordClientTelemetry(event, detail)
 	default:
 		s.handleClientMessage(ctx, c, data)
+	}
+}
+
+func (s *Server) streamStatusLoop(ctx context.Context, c *client) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			c.sendJSON(ctx, s.direct.streamStatus(now, s.relay.Snapshot()))
+		}
 	}
 }
 
@@ -565,6 +751,18 @@ func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte
 		s.rememberControlGate(snapshot, now)
 		_ = s.relay.SendJSON(ctx, map[string]any{"type": "activity", "reason": "public_heartbeat"})
 		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot, "phone": s.relay.Snapshot()})
+	case "state_refresh":
+		snapshot, err := s.store.Snapshot(ctx, s.cfg.TicketID, now)
+		if err != nil {
+			if cached, ok := s.cachedSnapshot(now); ok {
+				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached, "phone": s.relay.Snapshot()})
+			}
+			return
+		}
+		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
+		s.cacheSnapshot(snapshot)
+		s.rememberControlGate(snapshot, now)
+		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot, "phone": s.relay.Snapshot()})
 	case "tap":
 		active, allowed := s.activeControlGateAllows(c.sessionID, c.email, now)
 		if !active || !allowed {
@@ -576,6 +774,8 @@ func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte
 		}
 		_ = s.relay.SendText(ctx, data)
 		c.sendJSON(ctx, map[string]any{"type": "input", "inputId": inputID, "accepted": true})
+	case "quick_claim_tap":
+		s.handleQuickClaimTap(ctx, c, msg, inputID, now)
 	case "activity":
 		_ = s.relay.SendText(ctx, data)
 	case "keyframe":
@@ -605,6 +805,100 @@ func (s *Server) handlePhoneDisconnect(err error) {
 	}
 	s.direct.recordPhoneReconnect()
 	s.broadcastPhoneStatus("reconnecting", "Phone stream reconnecting")
+}
+
+func (s *Server) handleQuickClaimTap(ctx context.Context, c *client, msg map[string]any, inputID string, now time.Time) {
+	if strings.TrimSpace(inputID) == "" {
+		inputID = fmt.Sprintf("%s-%d", c.sessionID, now.UnixNano())
+		msg["inputId"] = inputID
+	}
+	if strings.TrimSpace(fmt.Sprint(msg["snapTarget"])) != "control_code_button" {
+		s.rejectQuickClaim(ctx, c, inputID, "remote_snap_target_unsupported", "unsupported_snap_target", now)
+		return
+	}
+	if _, ok := msg["x"].(float64); !ok {
+		s.rejectQuickClaim(ctx, c, inputID, "bad_request", "missing_x", now)
+		return
+	}
+	if _, ok := msg["y"].(float64); !ok {
+		s.rejectQuickClaim(ctx, c, inputID, "bad_request", "missing_y", now)
+		return
+	}
+
+	active, allowed := s.activeControlGateAllows(c.sessionID, c.email, now)
+	if active && !allowed {
+		_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "quick_claim_ignored", map[string]any{"reason": "not_controller"}, now)
+		s.rejectQuickClaim(ctx, c, inputID, "not_controller", "active_control_other_email", now)
+		return
+	}
+
+	action := "active_same_email"
+	if !active {
+		snapshot, err := s.store.ClaimControl(ctx, s.cfg.TicketID, c.sessionID, c.email, now)
+		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
+		if snapshot.Ticket.ID != "" {
+			s.cacheSnapshot(snapshot)
+			s.rememberControlGate(snapshot, now)
+			s.broadcastSnapshot(snapshot)
+		}
+		if err != nil {
+			if snapshot.IsController(c.sessionID, c.email, now) {
+				action = "claimed_elsewhere_same_email"
+			} else {
+				reason := errorCode(err)
+				if reason == "error" {
+					reason = "control_claim_failed"
+				}
+				s.rejectQuickClaim(ctx, c, inputID, reason, "claim_failed", now)
+				return
+			}
+		} else {
+			action = "claimed"
+		}
+	}
+
+	msg["type"] = "tap"
+	body, err := json.Marshal(msg)
+	if err != nil {
+		s.rejectQuickClaim(ctx, c, inputID, "bad_request", "marshal_failed", now)
+		return
+	}
+	if err := s.relay.SendText(ctx, body); err != nil {
+		_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "quick_claim_ignored", map[string]any{"reason": "phone_unavailable", "error": err.Error()}, now)
+		s.rejectQuickClaim(ctx, c, inputID, "phone_unavailable", "phone_unavailable", now)
+		return
+	}
+	s.recordQuickClaim(quickClaimDiagnostic{
+		At:        now.UTC().Format(time.RFC3339),
+		SessionID: c.sessionID,
+		Email:     c.email,
+		InputID:   inputID,
+		Action:    action,
+		Reason:    "forwarded",
+		Forwarded: true,
+	})
+}
+
+func (s *Server) rejectQuickClaim(ctx context.Context, c *client, inputID string, reason string, action string, now time.Time) {
+	if reason == "" {
+		reason = "quick_claim_rejected"
+	}
+	s.recordQuickClaim(quickClaimDiagnostic{
+		At:        now.UTC().Format(time.RFC3339),
+		SessionID: c.sessionID,
+		Email:     c.email,
+		InputID:   inputID,
+		Action:    action,
+		Reason:    reason,
+		Forwarded: false,
+	})
+	c.sendJSON(ctx, map[string]any{
+		"type":     "input_result",
+		"inputId":  inputID,
+		"kind":     "tap",
+		"accepted": false,
+		"reason":   reason,
+	})
 }
 
 func (s *Server) handlePhoneText(raw []byte) {
@@ -707,7 +1001,7 @@ func (s *Server) withOwnerSimulatorSetup(w http.ResponseWriter, r *http.Request,
 func (s *Server) identifyMember(w http.ResponseWriter, r *http.Request) (auth.Identity, string, state.Snapshot, bool) {
 	id, err := s.auth.IdentityFromRequest(r.Context(), r)
 	if err != nil {
-		writeErrorPage(w, http.StatusUnauthorized, "Cloudflare Access identity is required.")
+		writeErrorPage(w, http.StatusUnauthorized, "SpacetimeAuth login is required.")
 		return auth.Identity{}, "", state.Snapshot{}, false
 	}
 	sessionID := s.sessionID(w, r)
@@ -733,6 +1027,30 @@ func (s *Server) identifyMember(w http.ResponseWriter, r *http.Request) (auth.Id
 	return id, sessionID, snapshot, true
 }
 
+func (s *Server) optionalMember(r *http.Request) (auth.Identity, string, state.Snapshot, bool) {
+	id, err := s.auth.IdentityFromRequest(r.Context(), r)
+	if err != nil {
+		return auth.Identity{}, "", state.Snapshot{}, false
+	}
+	now := time.Now()
+	snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, now)
+	if err != nil {
+		if cached, ok := s.cachedSnapshot(now); ok {
+			snapshot = cached
+		} else {
+			return auth.Identity{}, "", state.Snapshot{}, false
+		}
+	} else {
+		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
+		s.cacheSnapshot(snapshot)
+		s.rememberControlGate(snapshot, now)
+	}
+	if _, ok := snapshot.Member(id.Email); !ok {
+		return auth.Identity{}, "", snapshot, false
+	}
+	return id, s.sessionIDNoWrite(r), snapshot, true
+}
+
 func (s *Server) sessionID(w http.ResponseWriter, r *http.Request) string {
 	if cookie, err := r.Cookie(s.cfg.CookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
 		return cookie.Value
@@ -748,6 +1066,57 @@ func (s *Server) sessionID(w http.ResponseWriter, r *http.Request) string {
 		SameSite: http.SameSiteLaxMode,
 	})
 	return sessionID
+}
+
+func (s *Server) sessionIDNoWrite(r *http.Request) string {
+	if cookie, err := r.Cookie(s.cfg.CookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
+		return cookie.Value
+	}
+	return ""
+}
+
+func (s *Server) setAuthCookie(w http.ResponseWriter, token string, maxAge int) {
+	cookieName := strings.TrimSpace(s.cfg.Access.AuthCookieName)
+	if cookieName == "" {
+		cookieName = "ticket_remote_auth"
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(s.cfg.PublicBaseURL, "https://"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (s *Server) authTokenFromRequest(r *http.Request) string {
+	cookieName := strings.TrimSpace(s.cfg.Access.AuthCookieName)
+	if cookieName == "" {
+		cookieName = "ticket_remote_auth"
+	}
+	if cookie, err := r.Cookie(cookieName); err == nil {
+		return strings.TrimSpace(cookie.Value)
+	}
+	return ""
+}
+
+func (s *Server) usesSpacetimeAuth() bool {
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.Access.Mode))
+	return mode == "" || mode == "spacetime" || mode == "spacetimeauth" || mode == "oidc"
+}
+
+func (s *Server) publicAuthMode() string {
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.Access.Mode))
+	switch mode {
+	case "cloudflare", "cloudflare-access", "cf-access":
+		return "cloudflare"
+	case "dev", "development", "none":
+		return mode
+	default:
+		return "spacetime"
+	}
 }
 
 func (s *Server) addClient(c *client) {
@@ -779,12 +1148,8 @@ func (s *Server) broadcastText(data []byte) {
 }
 
 func (s *Server) broadcastFrame(data []byte) {
-	now := time.Now()
 	for _, c := range s.clientSnapshot() {
 		if !c.video {
-			continue
-		}
-		if !s.controlGateAllows(c.sessionID, c.email, now) {
 			continue
 		}
 		c.sendBinary(context.Background(), data)
@@ -806,6 +1171,14 @@ func (s *Server) broadcastState() {
 	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 	s.cacheSnapshot(snapshot)
 	s.rememberControlGate(snapshot, now)
+	payload, _ := json.Marshal(map[string]any{"type": "state", "state": snapshot, "phone": s.relay.Snapshot()})
+	s.broadcastText(payload)
+}
+
+func (s *Server) broadcastSnapshot(snapshot state.Snapshot) {
+	if snapshot.Ticket.ID == "" {
+		return
+	}
 	payload, _ := json.Marshal(map[string]any{"type": "state", "state": snapshot, "phone": s.relay.Snapshot()})
 	s.broadcastText(payload)
 }
@@ -843,6 +1216,19 @@ func (s *Server) cachedSnapshot(now time.Time) (state.Snapshot, bool) {
 	}
 	adjustSnapshotTime(&snapshot, now)
 	return snapshot, true
+}
+
+func (s *Server) recordQuickClaim(diag quickClaimDiagnostic) {
+	s.quickClaimMu.Lock()
+	s.lastQuickClaim = diag
+	s.quickClaimMu.Unlock()
+}
+
+func (s *Server) quickClaimSnapshot() quickClaimDiagnostic {
+	s.quickClaimMu.RLock()
+	diag := s.lastQuickClaim
+	s.quickClaimMu.RUnlock()
+	return diag
 }
 
 func adjustSnapshotTime(snapshot *state.Snapshot, now time.Time) {
@@ -916,7 +1302,7 @@ func (s *Server) controlGateAllows(sessionID string, email string, now time.Time
 	if gate == nil || !now.Before(gate.expiresAt) {
 		return true
 	}
-	return gate.sessionID == sessionID && gate.email == strings.ToLower(strings.TrimSpace(email))
+	return strings.ToLower(strings.TrimSpace(gate.email)) == strings.ToLower(strings.TrimSpace(email))
 }
 
 func (s *Server) activeControlGateAllows(sessionID string, email string, now time.Time) (bool, bool) {
@@ -926,7 +1312,22 @@ func (s *Server) activeControlGateAllows(sessionID string, email string, now tim
 	if gate == nil || !now.Before(gate.expiresAt) {
 		return false, false
 	}
-	return true, gate.sessionID == sessionID && gate.email == strings.ToLower(strings.TrimSpace(email))
+	return true, strings.ToLower(strings.TrimSpace(gate.email)) == strings.ToLower(strings.TrimSpace(email))
+}
+
+func (s *Server) controlGateSnapshot(now time.Time) map[string]any {
+	s.gateMu.RLock()
+	gate := s.gate
+	s.gateMu.RUnlock()
+	if gate == nil || !now.Before(gate.expiresAt) {
+		return map[string]any{"active": false}
+	}
+	return map[string]any{
+		"active":    true,
+		"sessionId": gate.sessionID,
+		"email":     gate.email,
+		"expiresAt": gate.expiresAt.UTC().Format(time.RFC3339),
+	}
 }
 
 func (s *Server) requestOriginAllowed(r *http.Request) bool {
@@ -1087,6 +1488,33 @@ func (s *Server) requestPhoneKeyframe(reason string) {
 	}()
 }
 
+func (s *Server) requestPhoneRecovery(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "browser_stream_recovery"
+	}
+	s.requestPhoneKeyframe(reason)
+	relayHealth := s.relay.Snapshot()
+	if relayHealth.Viewers <= 0 || !relayHealth.Desired || !relayHealth.Connected {
+		return
+	}
+	now := time.Now()
+	s.phoneStartMu.Lock()
+	if !s.lastPhoneStartAttempt.IsZero() && now.Sub(s.lastPhoneStartAttempt) < 10*time.Second {
+		s.phoneStartMu.Unlock()
+		return
+	}
+	s.lastPhoneStartAttempt = now
+	s.phoneStartMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.relay.SendJSON(ctx, map[string]any{"type": "start", "reason": reason}); err != nil {
+			log.Printf("ticket phone stream recovery request failed: %v", err)
+		}
+	}()
+}
+
 func (s *Server) maybeRequestPhoneStartFromSnapshot(snapshot state.Snapshot) {
 	if snapshot.Phone == nil || strings.TrimSpace(snapshot.Phone.HealthJSON) == "" {
 		return
@@ -1225,6 +1653,7 @@ const indexHTML = `<!doctype html>
   <script>
     window.TICKET_REMOTE_CONFIG = {{.ConfigJSON}};
   </script>
+  <script defer src="/static/spacetime-client.js?v={{.AssetVersion}}"></script>
   <script defer src="/static/app.js?v={{.AssetVersion}}"></script>
 </head>
 <body>
@@ -1232,15 +1661,12 @@ const indexHTML = `<!doctype html>
     <section class="stage-page" aria-label="Pixel straume">
       <div class="stage">
         <canvas id="screen" width="540" height="1080" aria-label="ViVi biļetes straume"></canvas>
+        <img id="quickClaimSpinner" class="quick-claim-spinner" src="/static/quick-claim-spinner.svg?v={{.AssetVersion}}" alt="" aria-hidden="true" draggable="false" hidden>
         <div id="emptyState" class="empty-state">
           <div class="empty-inner">
             <button id="startStream" class="primary" type="button" hidden>Sākt</button>
             <div id="emptyMessage" class="empty-message" aria-live="polite"></div>
           </div>
-        </div>
-        <div id="privacyOverlay" class="privacy-overlay" hidden>
-          <div class="overlay-title">Kontroles koda režīms</div>
-          <div id="privacyText" class="overlay-text"></div>
         </div>
       </div>
     </section>
@@ -1270,6 +1696,10 @@ const adminHTML = `<!doctype html>
   <title>Ticket Admin</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script>
+    window.TICKET_REMOTE_CONFIG = {{.ConfigJSON}};
+  </script>
+  <script defer src="/static/spacetime-client.js?v={{.AssetVersion}}"></script>
   <script defer src="/static/app.js?v={{.AssetVersion}}"></script>
 </head>
 <body class="admin-page">

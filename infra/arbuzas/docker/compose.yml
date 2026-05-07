@@ -311,6 +311,12 @@ services:
       TICKET_REMOTE_BIND_ADDR: 0.0.0.0
       TICKET_REMOTE_PORT: ${ARBUZAS_TICKET_REMOTE_PORT}
       TICKET_REMOTE_PUBLIC_BASE_URL: https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}
+      TICKET_REMOTE_AUTH_MODE: ${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}
+      TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN: ${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}
+      TICKET_REMOTE_CF_ACCESS_AUDIENCE: ${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}
+      TICKET_REMOTE_SPACETIME_AUTH_ISSUER: ${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
+      TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID: ${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID}
+      TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL: https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback
       TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL: ticket@jolkins.id.lv
       TICKET_REMOTE_COOKIE_TTL: 720h
       TICKET_REMOTE_PHONE_BACKENDS: android-sim|Android simulator|http://ticket_android_sim_bridge:9388;pixel|Pixel|http://ticket_phone_bridge:9388
@@ -331,23 +337,29 @@ services:
         export TICKET_REMOTE_BIND_ADDR="0.0.0.0"
         export TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT}"
         export TICKET_REMOTE_PUBLIC_BASE_URL="https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}"
-        export TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL="${TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL:-ticket@jolkins.id.lv}"
-        export TICKET_REMOTE_COOKIE_TTL="${TICKET_REMOTE_COOKIE_TTL:-720h}"
-        export TICKET_REMOTE_PHONE_BACKENDS="${TICKET_REMOTE_PHONE_BACKENDS:-android-sim|Android simulator|http://ticket_android_sim_bridge:9388;pixel|Pixel|http://ticket_phone_bridge:9388}"
-        export TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID="${TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID:-android-sim}"
-        export TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE="${TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE:-/srv/ticket-remote/state/active-phone-backend.json}"
-        export TICKET_REMOTE_PHONE_BACKEND_ID="${TICKET_REMOTE_PHONE_BACKEND_ID:-android-sim}"
-        export TICKET_REMOTE_PHONE_ATTACH_NAME="${TICKET_REMOTE_PHONE_ATTACH_NAME:-Android simulator}"
-        export TICKET_REMOTE_PHONE_BASE_URL="${TICKET_REMOTE_PHONE_BASE_URL:-http://ticket_android_sim_bridge:9388}"
-        export TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID="${TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID:-android-sim}"
-        export TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET="${TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET:-ticket_android_sim:5555}"
+        export TICKET_REMOTE_AUTH_MODE="$${TICKET_REMOTE_AUTH_MODE:-spacetime}"
+        export TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN="$${TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}"
+        export TICKET_REMOTE_CF_ACCESS_AUDIENCE="$${TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}"
+        export TICKET_REMOTE_SPACETIME_AUTH_ISSUER="$${TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}"
+        export TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID="$${TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}"
+        export TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL="$${TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL:-https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback}"
+        export TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL="$${TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL:-ticket@jolkins.id.lv}"
+        export TICKET_REMOTE_COOKIE_TTL="$${TICKET_REMOTE_COOKIE_TTL:-720h}"
+        export TICKET_REMOTE_PHONE_BACKENDS="$${TICKET_REMOTE_PHONE_BACKENDS:-android-sim|Android simulator|http://ticket_android_sim_bridge:9388;pixel|Pixel|http://ticket_phone_bridge:9388}"
+        export TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID="$${TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID:-android-sim}"
+        export TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE="$${TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE:-/srv/ticket-remote/state/active-phone-backend.json}"
+        export TICKET_REMOTE_PHONE_BACKEND_ID="$${TICKET_REMOTE_PHONE_BACKEND_ID:-android-sim}"
+        export TICKET_REMOTE_PHONE_ATTACH_NAME="$${TICKET_REMOTE_PHONE_ATTACH_NAME:-Android simulator}"
+        export TICKET_REMOTE_PHONE_BASE_URL="$${TICKET_REMOTE_PHONE_BASE_URL:-http://ticket_android_sim_bridge:9388}"
+        export TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID="$${TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID:-android-sim}"
+        export TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET="$${TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET:-ticket_android_sim:5555}"
         mkdir -p /srv/ticket-remote/run /srv/ticket-remote/state
         exec /usr/local/bin/ticket-remote
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/health >/dev/null",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null",
         ]
       interval: 30s
       timeout: 10s

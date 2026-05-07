@@ -33,6 +33,43 @@ body {
   touch-action: manipulation;
 }
 
+.auth-page {
+  background: #f6f7fb;
+  color: #111827;
+}
+
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-panel {
+  width: min(360px, 100%);
+  display: grid;
+  gap: 16px;
+  text-align: center;
+}
+
+.auth-panel h1 {
+  margin: 0;
+  font-size: 32px;
+  font-weight: 750;
+}
+
+.auth-copy,
+.auth-status {
+  margin: 0;
+  color: #4b5563;
+  line-height: 1.45;
+}
+
+.auth-status {
+  min-height: 20px;
+  font-size: 14px;
+}
+
 button,
 input,
 select {
@@ -126,6 +163,35 @@ body.details-visible .stage {
   -webkit-tap-highlight-color: transparent;
 }
 
+.quick-claim-spinner {
+  position: absolute;
+  z-index: 3;
+  left: calc(var(--stream-left, 0px) + 20px);
+  top: calc(var(--stream-top, 0px) + 20px);
+  width: 34px;
+  height: 34px;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  animation: quickClaimSpinnerRotate 760ms linear infinite;
+}
+
+.quick-claim-spinner[hidden] {
+  display: none;
+}
+
+@keyframes quickClaimSpinnerRotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quick-claim-spinner {
+    animation: none;
+  }
+}
+
 .empty-state {
   position: absolute;
   inset: 0;
@@ -160,33 +226,6 @@ body.details-visible .stage {
 
 .empty-message:empty {
   display: none;
-}
-
-.privacy-overlay {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  align-content: center;
-  justify-items: center;
-  gap: 10px;
-  padding: 24px;
-  background: rgba(4, 7, 11, .92);
-  text-align: center;
-}
-
-.privacy-overlay[hidden] {
-  display: none;
-}
-
-.overlay-title {
-  font-size: 18px;
-  font-weight: 750;
-}
-
-.overlay-text {
-  max-width: 440px;
-  color: #b9c6d6;
-  line-height: 1.45;
 }
 
 .panel {

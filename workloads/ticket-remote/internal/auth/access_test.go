@@ -15,44 +15,52 @@ import (
 	"time"
 )
 
-func TestValidatorAcceptsCloudflareAccessJWT(t *testing.T) {
+func TestValidatorAcceptsSpacetimeAuthJWT(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
 	kid := "test-key"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON := map[string]any{
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jwks_uri": "http://" + r.Host + "/jwks.json"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]any{{
 				"kid": kid,
 				"kty": "RSA",
 				"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
 				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
 			}},
-		}
-		_ = json.NewEncoder(w).Encode(writeJSON)
+		})
 	}))
 	defer server.Close()
 
 	token := signTestJWT(t, key, kid, map[string]any{
-		"iss":   server.URL,
-		"aud":   []string{"audience-a"},
-		"email": "Member@Example.com",
-		"iat":   time.Now().Add(-time.Minute).Unix(),
-		"nbf":   time.Now().Add(-time.Minute).Unix(),
-		"exp":   time.Now().Add(time.Hour).Unix(),
+		"iss":            server.URL,
+		"aud":            []string{"client-a"},
+		"email":          "Member@Example.com",
+		"email_verified": true,
+		"sub":            "user_123",
+		"iat":            time.Now().Add(-time.Minute).Unix(),
+		"nbf":            time.Now().Add(-time.Minute).Unix(),
+		"exp":            time.Now().Add(time.Hour).Unix(),
 	})
 	validator := NewValidator(AccessConfig{
-		Mode:       "cloudflare",
-		TeamDomain: server.URL,
-		Audience:   "audience-a",
+		Mode:         "spacetime",
+		OIDCIssuer:   server.URL,
+		OIDCClientID: "client-a",
 	})
-	identity, err := validator.ValidateJWT(context.Background(), token)
+	identity, err := validator.ValidateOIDCJWT(context.Background(), token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if identity.Email != "member@example.com" {
 		t.Fatalf("email = %q", identity.Email)
+	}
+	if !identity.EmailVerified || identity.Subject != "user_123" {
+		t.Fatalf("identity = %#v", identity)
 	}
 }
 
@@ -63,6 +71,10 @@ func TestValidatorRejectsAudienceMismatch(t *testing.T) {
 	}
 	kid := "test-key"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jwks_uri": "http://" + r.Host + "/jwks.json"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]any{{
 				"kid": kid,
@@ -74,14 +86,67 @@ func TestValidatorRejectsAudienceMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 	token := signTestJWT(t, key, kid, map[string]any{
+		"iss":            server.URL,
+		"aud":            []string{"other"},
+		"email":          "member@example.com",
+		"email_verified": true,
+		"exp":            time.Now().Add(time.Hour).Unix(),
+	})
+	validator := NewValidator(AccessConfig{Mode: "spacetime", OIDCIssuer: server.URL, OIDCClientID: "wanted"})
+	if _, err := validator.ValidateOIDCJWT(context.Background(), token); err == nil {
+		t.Fatal("expected audience mismatch")
+	}
+}
+
+func TestValidatorAcceptsCloudflareAccessJWT(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid := "cf-key"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cdn-cgi/access/certs" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"keys": []map[string]any{{
+				"kid": kid,
+				"kty": "RSA",
+				"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
+			}},
+		})
+	}))
+	defer server.Close()
+
+	token := signTestJWT(t, key, kid, map[string]any{
 		"iss":   server.URL,
-		"aud":   []string{"other"},
-		"email": "member@example.com",
+		"aud":   []string{"ticket-aud"},
+		"email": "Ticket@Jolkins.ID.LV",
+		"sub":   "ticket@jolkins.id.lv",
+		"iat":   time.Now().Add(-time.Minute).Unix(),
+		"nbf":   time.Now().Add(-time.Minute).Unix(),
 		"exp":   time.Now().Add(time.Hour).Unix(),
 	})
-	validator := NewValidator(AccessConfig{Mode: "cloudflare", TeamDomain: server.URL, Audience: "wanted"})
-	if _, err := validator.ValidateJWT(context.Background(), token); err == nil {
-		t.Fatal("expected audience mismatch")
+	validator := NewValidator(AccessConfig{
+		Mode:       "cloudflare",
+		TeamDomain: server.URL,
+		Audience:   "ticket-aud",
+	})
+	identity, err := validator.IdentityFromRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/", nil))
+	if err == nil || identity.Email != "" {
+		t.Fatal("expected request without assertion to be rejected")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Cf-Access-Jwt-Assertion", token)
+	identity, err = validator.IdentityFromRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Email != "ticket@jolkins.id.lv" {
+		t.Fatalf("email = %q", identity.Email)
 	}
 }
 

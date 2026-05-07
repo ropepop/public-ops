@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -252,11 +253,20 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	spinnerBody, err := staticFS.ReadFile("static/quick-claim-spinner.svg")
+	if err != nil {
+		t.Fatal(err)
+	}
 	js := string(jsBody)
 	css := string(cssBody)
+	spinner := string(spinnerBody)
 	for _, snippet := range []string{
-		"claimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' })",
-		"postJSON('/api/v1/control/claim')",
+		"const inputId = quickClaimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' })",
+		"runControlMutation('control_claim', '/api/v1/control/claim')",
+		"return postJSON(fallbackPath, fallbackBody || {})",
+		"window.TicketSpacetime.create",
+		"/api/v1/auth/session",
+		"beginSpacetimeLogin",
 		"const quickClaimMaxX = 0.25",
 		"const quickClaimMaxY = 0.25",
 		"const controlCodeButtonMinX = 0.04",
@@ -269,23 +279,78 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"claimZone: !control ? firstClaimCandidateZone(start) : ''",
 		"else if (pointerStart.claimZone)",
 		"queueTap(options.tap, { snapTarget: options.snapTarget })",
+		"function queueQuickClaimTap(screenPoint, options)",
+		"type: 'quick_claim_tap'",
+		"function inputCanStartWithoutControl(input)",
+		"return input && input.type === 'quick_claim_tap'",
+		"setStatus('Atver kontroles kodu...')",
 		"const inputQueue = []",
 		"inputQueueLimit = 20",
-		"inputId: value.inputId || nextInputId()",
+		"const inputId = value.inputId || nextInputId()",
 		"msg.type === 'input_result'",
 		"retryOrDropInput(inputInFlight.inputId)",
+		"function cancelPendingInputs(reason)",
+		"let localControlSendGraceUntil = 0",
+		"localControlSendGraceUntil = performance.now() + 4000",
+		"cancelPendingInputs('control_lost_state_update')",
+		"cancelPendingInputs('control_lost_retry')",
+		"cancelPendingInputs('control_release_requested')",
+		"control_lost_before_send",
+		"const quickClaimSpinner = document.getElementById('quickClaimSpinner')",
+		"const quickClaimSpinnerTimeoutMs = 8000",
+		"let ticketInUseSpinnerActive = false",
+		"function setTicketInUseSpinner(active)",
+		"function sameEmail(left, right)",
+		"function currentUserOwnsControl(control)",
+		"const selfControl = currentUserOwnsControl(control)",
+		"function showQuickClaimSpinner(inputId)",
+		"quickClaimSpinner.hidden = !(quickClaimSpinnerPending || ticketInUseSpinnerActive)",
+		"stage.style.setProperty('--stream-left'",
+		"stage.style.setProperty('--stream-top'",
+		"hideQuickClaimSpinner(inputId, accepted ? 'input_result' : 'input_rejected')",
+		"hideQuickClaimSpinner(inputId, 'input_timeout')",
+		"showQuickClaimSpinner('')",
+		"showQuickClaimSpinner(inputId)",
+		"hideQuickClaimSpinner('', 'claim_not_queued')",
+		"setTicketInUseSpinner(Boolean(otherControl))",
+		"setStatus('Biļete pašlaik tiek izmantota.')",
+		"const streamVerticalPanThresholdPx = 6",
+		"const streamVerticalPanDominance = 1.1",
 		"const FRAME_ENVELOPE_MAGIC = 0x54534632",
 		"const FRAME_ENVELOPE_HEADER_BYTES = 29",
 		"invalid_tsf2_frame",
+		"function annexBNalUnits(data)",
+		"function annexBToAvcSample(data)",
+		"function configureAvcDecoderFromDescription(config, description)",
+		"sendVideoClientLog('h264_decoder_recovery_avc_adapter', reason)",
 		"new VideoDecoder({",
 		"new EncodedVideoChunk({ type: frame.kind",
 		"avc: { format: 'annexb' }",
 		"ctx.drawImage(frame, 0, 0, canvas.width, canvas.height)",
 		"String(serverVersion).startsWith('ticket-remote-')",
-		"const streamStartupGraceMs = 2000",
-		"const streamStartupHardErrorMs = 12000",
-		"requestKeyframe('h264_first_frame_nudge')",
-		"showUnsupported('Video straume neatnāca laikā. Tālrunim vajag uzmanību.')",
+		"let lastPacketAt = 0",
+		"let lastDecodedFrameAt = 0",
+		"let lastPacketSequenceAdvancedAt = 0",
+		"let latestStreamStatus = null",
+		"const streamStaleKeyframeMs = 2500",
+		"const streamStaleDecoderResetMs = 5000",
+		"const streamStaleVideoReconnectMs = 8000",
+		"const streamStaleServerRecoverMs = 12000",
+		"const streamDecoderStartupGraceMs = 3500",
+		"function showStreamWaiting(message)",
+		"function handleStreamStatus(msg)",
+		"function resetDecoderForRecovery(reason)",
+		"function decoderStartupGraceActive(now)",
+		"function requestServerRecoveryDebounced(reason)",
+		"function chaseLiveStream()",
+		"msg.type === 'stream_status'",
+		"sendVideoSignal({ type: 'recover_stream', reason })",
+		"restartStream(reason, { preserveFrame: true })",
+		"setInterval(chaseLiveStream, 1000)",
+		"requestKeyframeDebounced('h264_first_frame_nudge'",
+		"if (decoderStartupGraceActive(now))",
+		"ticket_remote_pkce_verifier_shared",
+		"Ja e-pasta saite atveras jaunā cilnē",
 		"streamVerticalPanThresholdPx",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
@@ -302,9 +367,34 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"overscroll-behavior: none",
 		"-webkit-touch-callout: none",
 		"-webkit-tap-highlight-color: transparent",
+		".quick-claim-spinner",
+		"left: calc(var(--stream-left, 0px) + 20px)",
+		"top: calc(var(--stream-top, 0px) + 20px)",
+		"pointer-events: none",
+		"quickClaimSpinnerRotate",
 	} {
 		if !strings.Contains(css, snippet) {
 			t.Fatalf("ticket viewer CSS missing %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		`id="quickClaimSpinner"`,
+		`/static/quick-claim-spinner.svg`,
+		`aria-hidden="true"`,
+		`draggable="false" hidden`,
+	} {
+		if !strings.Contains(indexHTML, snippet) {
+			t.Fatalf("ticket viewer HTML missing %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		"<svg",
+		"viewBox=\"0 0 64 64\"",
+		"fill=\"none\"",
+		"feDropShadow",
+	} {
+		if !strings.Contains(spinner, snippet) {
+			t.Fatalf("quick-claim spinner asset missing %q", snippet)
 		}
 	}
 	if !strings.Contains(indexHTML, "maximum-scale=1, user-scalable=no") {
@@ -327,6 +417,8 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 			"claim-dialog",
 			"confirmClaim",
 			"Priv\u0101ta kontroles koda sesija",
+			"privacyOverlay",
+			"isPrivacyCovered",
 			"send({ type: 'tap', x: options.tap.x",
 			"RTCPeerConnection",
 			"webrtc_ice_config",
@@ -335,6 +427,8 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 			"TURN",
 			"renderPngFrame",
 			"isPngStream",
+			"claimControl({ tap: { x: pointerStart.x, y: pointerStart.y }",
+			"control.sessionId === cfg.sessionId && control.email === cfg.email",
 			"createImageBitmap",
 			"legacy_frame_in_tsf2_stream",
 			"version: 'legacy'",
@@ -343,6 +437,7 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 			"left = '-10000px'",
 			"MediaProjection fallback",
 			"AV1",
+			"showUnsupported('Video straume neatnāca laikā. Tālrunim vajag uzmanību.')",
 		} {
 			if strings.Contains(forbidden.body, snippet) {
 				t.Fatalf("%s should not contain stale control dialog snippet %q", forbidden.label, snippet)
@@ -351,6 +446,90 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 	}
 	if strings.Contains(indexHTML, `id="webrtcVideo"`) || !strings.Contains(indexHTML, `id="screen"`) {
 		t.Fatalf("ticket viewer must render HTTPS H.264 on the canvas, not WebRTC video")
+	}
+}
+
+func TestSpacetimeReducersUseEmailWideControlOwnership(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, snippet := range []string{
+		"if (active.email !== cleanEmail(args.email)) return stateError(tx, ticket.id, 'not_controller', now);",
+		"const actorEmail = cleanEmail(args.email);",
+		"if (actorEmail && active.email !== actorEmail) return stateError(tx, ticket.id, 'not_controller', now);",
+	} {
+		if !strings.Contains(source, snippet) {
+			t.Fatalf("SpacetimeDB reducer missing email-wide ownership snippet %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		"active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email)",
+		"args.sessionId && (active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email))",
+	} {
+		if strings.Contains(source, snippet) {
+			t.Fatalf("SpacetimeDB reducer should not require same browser session: %q", snippet)
+		}
+	}
+}
+
+func TestSpacetimeAuthDirectClientContract(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, snippet := range []string{
+		"{ name: named('live_state'), public: true }",
+		"clientEmailFromAuth(ctx, ticketId)",
+		"payload.email_verified !== true",
+		"export const memberClaimControl",
+		"export const memberHeartbeatPresence",
+		"export const memberReleaseControl",
+		"writeLiveState(ctx, ticket.id, now)",
+	} {
+		if !strings.Contains(source, snippet) {
+			t.Fatalf("SpacetimeDB auth/direct-client contract missing %q", snippet)
+		}
+	}
+	jsBody, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientBody, err := staticFS.ReadFile("static/spacetime-client.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snippet := range []string{
+		"startAuthShell()",
+		"beginSpacetimeLogin",
+		"/api/v1/auth/session",
+		"runControlMutation('control_claim', '/api/v1/control/claim')",
+		"usesDirectSpacetimeAuth()",
+		"runSpacetimeMutation((client) => client.upsertMember(memberEmail.value, memberRole.value), 'admin_member_upsert')",
+		"runSpacetimeMutation((client) => client.removeMember(member.email), 'admin_member_remove')",
+		"apiFetch('/api/v1/admin/control/revoke', { method: 'POST', cache: 'no-store' })",
+		"send({ type: 'state_refresh'",
+	} {
+		if !strings.Contains(string(jsBody), snippet) {
+			t.Fatalf("ticket viewer SpacetimeAuth JS missing %q", snippet)
+		}
+	}
+	if strings.Contains(string(jsBody), "runSpacetimeMutation((client) => client.revokeControl") {
+		t.Fatalf("admin revoke must go through ticket_remote so phone cleanup stays synchronized")
+	}
+	for _, snippet := range []string{
+		"DbConnection.builder()",
+		"memberClaimControl",
+		"ticketremoteLiveState",
+	} {
+		if !strings.Contains(string(clientBody), snippet) {
+			t.Fatalf("ticket Spacetime browser bundle missing %q", snippet)
+		}
+	}
+	if strings.Contains(indexHTML, "Cloudflare Access") || strings.Contains(string(jsBody), "Cloudflare Access") {
+		t.Fatalf("ticket viewer must not mention Cloudflare Access login")
 	}
 }
 

@@ -40,6 +40,9 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	if snapshot["browserMediaError"] != "bad keyframe" {
 		t.Fatalf("media error = %q", snapshot["browserMediaError"])
 	}
+	if snapshot["streamVerdict"] != "browser_decode_recovering" {
+		t.Fatalf("stream verdict = %q", snapshot["streamVerdict"])
+	}
 	if snapshot["phoneConnected"] != true || snapshot["phoneStreamState"] != "streaming" {
 		t.Fatalf("phone state missing %#v", snapshot)
 	}
@@ -83,6 +86,9 @@ func TestHealthReportsHTTPSH264Stream(t *testing.T) {
 	direct, ok := health["directStream"].(map[string]any)
 	if !ok || direct["path"] != "https_websocket_h264" {
 		t.Fatalf("unexpected directStream health: %#v", health)
+	}
+	if _, ok := direct["streamVerdict"]; !ok {
+		t.Fatalf("directStream missing streamVerdict: %#v", direct)
 	}
 }
 

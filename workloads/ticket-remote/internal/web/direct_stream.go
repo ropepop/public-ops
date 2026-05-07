@@ -149,8 +149,10 @@ func (h *directStreamHub) recordClientTelemetry(event, detail string) {
 func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[string]any {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	verdict := h.streamVerdictLocked(now, phoneHealth)
 	return map[string]any{
 		"path":                     "https_websocket_h264",
+		"streamVerdict":            verdict,
 		"codec":                    h.codec,
 		"transport":                h.transport,
 		"width":                    h.width,
@@ -177,6 +179,49 @@ func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[
 		"browserMediaError":        h.lastBrowserMediaError,
 		"lastBrowserEvent":         h.lastBrowserEvent,
 		"recentBrowserEvents":      append([]clientTelemetryEvent(nil), h.recentBrowserEvents...),
+	}
+}
+
+func (h *directStreamHub) streamStatus(now time.Time, phoneHealth phone.Health) map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	verdict := h.streamVerdictLocked(now, phoneHealth)
+	return map[string]any{
+		"type":                  "stream_status",
+		"streamVerdict":         verdict,
+		"serverTime":            now.UTC().Format(time.RFC3339),
+		"framesForwarded":       h.framesForwarded,
+		"keyframesForwarded":    h.keyframesForwarded,
+		"lastFrameAgoMillis":    ageSinceMillis(now, h.lastFrameAt),
+		"lastKeyFrameAgoMillis": ageSinceMillis(now, h.lastKeyFrameAt),
+		"activeVideoClients":    h.activeVideoClients,
+		"phoneConnected":        phoneHealth.Connected,
+		"phoneDesired":          phoneHealth.Desired,
+		"phoneStreamState":      phoneHealth.StreamState,
+		"phoneViewers":          phoneHealth.Viewers,
+		"phoneLastError":        phoneHealth.LastError,
+	}
+}
+
+func (h *directStreamHub) streamVerdictLocked(now time.Time, phoneHealth phone.Health) string {
+	frameAge := ageSinceMillis(now, h.lastFrameAt)
+	keyFrameAge := ageSinceMillis(now, h.lastKeyFrameAt)
+	hasMediaError := strings.TrimSpace(h.lastBrowserMediaError) != ""
+	switch {
+	case h.activeVideoClients == 0:
+		return "idle"
+	case hasMediaError:
+		return "browser_decode_recovering"
+	case !phoneHealth.Desired || !phoneHealth.Connected:
+		return "preparing_phone"
+	case frameAge >= 0 && frameAge <= 2500:
+		return "live"
+	case keyFrameAge < 0:
+		return "waiting_keyframe"
+	case frameAge > 2500:
+		return "stale_recovering"
+	default:
+		return "waiting_keyframe"
 	}
 }
 

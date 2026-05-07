@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Loading">
+  <defs>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.4" flood-color="#000000" flood-opacity="0.22"/>
+    </filter>
+    <linearGradient id="seg00" x1="32" y1="7" x2="32" y2="57" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f1f3f5"/>
+      <stop offset="1" stop-color="#d9dde1"/>
+    </linearGradient>
+    <linearGradient id="seg01" x1="32" y1="7" x2="57" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#dfe3e7"/>
+      <stop offset="1" stop-color="#c7ccd2"/>
+    </linearGradient>
+    <linearGradient id="seg02" x1="57" y1="32" x2="32" y2="57" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#c2c7ce"/>
+      <stop offset="1" stop-color="#9fa6af"/>
+    </linearGradient>
+    <linearGradient id="seg03" x1="32" y1="57" x2="7" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#929aa4"/>
+      <stop offset="1" stop-color="#606975"/>
+    </linearGradient>
+    <linearGradient id="seg04" x1="7" y1="32" x2="32" y2="7" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4a535f"/>
+      <stop offset="1" stop-color="#202833"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-width="8" filter="url(#softShadow)">
+    <path d="M32 9a23 23 0 0 1 16.26 6.74" stroke="url(#seg00)"/>
+    <path d="M48.26 15.74A23 23 0 0 1 55 32" stroke="url(#seg01)"/>
+    <path d="M55 32a23 23 0 0 1-6.74 16.26" stroke="url(#seg02)"/>
+    <path d="M48.26 48.26A23 23 0 0 1 32 55" stroke="#8d95a0"/>
+    <path d="M32 55a23 23 0 0 1-16.26-6.74" stroke="url(#seg03)"/>
+    <path d="M15.74 48.26A23 23 0 0 1 9 32" stroke="#59626d"/>
+    <path d="M9 32a23 23 0 0 1 6.74-16.26" stroke="url(#seg04)"/>
+    <path d="M15.74 15.74A23 23 0 0 1 32 9" stroke="#222b36"/>
+  </g>
+</svg>

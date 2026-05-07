@@ -1876,6 +1876,11 @@ ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
 ARBUZAS_SATIKSME_BOT_HOSTNAME=${ARBUZAS_SATIKSME_BOT_HOSTNAME}
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME=${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}
 ARBUZAS_TICKET_REMOTE_HOSTNAME=${ARBUZAS_TICKET_REMOTE_HOSTNAME}
+ARBUZAS_TICKET_REMOTE_AUTH_MODE=${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}
+ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}
+ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}
+ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
+ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}
 ARBUZAS_DNS_HOSTNAME=${ARBUZAS_DNS_HOSTNAME}
 ARBUZAS_PORTAINER_IMAGE=${ARBUZAS_PORTAINER_IMAGE}
 ARBUZAS_CLOUDFLARED_IMAGE=${ARBUZAS_CLOUDFLARED_IMAGE}
@@ -2745,7 +2750,7 @@ validate_remote_ticket_remote_workload_health() {
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
-    "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket Android simulator ADB ready" \
     "wait_until_ok compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; adb -s ticket_android_sim:5555 get-state >/dev/null 2>/dev/null'" \
@@ -2778,15 +2783,16 @@ validate_remote_ticket_remote_workload_health() {
         android-sim|pixel) ;;
         *) return 1 ;;
       esac
-      json=\$(compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/health') || return 1
-      printf %s \"\${json}\" | grep -F \"\\\"activePhoneBackend\\\":{\\\"id\\\":\\\"\${active}\\\"\" >/dev/null &&
-        printf %s \"\${json}\" | grep -F \"\\\"phone\\\":{\\\"backendId\\\":\\\"\${active}\\\"\" >/dev/null
+      compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
     }
     wait_until_ok active_configured_backend_ok" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_remote
-  validate_remote_probe "${remote_release_dir}" "ticket-remote public health" \
-    "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/api/v1/health 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
+  validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
+    "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote auth configured" \
+    "auth_configured_ok() { mode=\$(sed -n 's/^TICKET_REMOTE_AUTH_MODE=//p' /etc/arbuzas/env/ticket-remote.env | tail -1); case \"\${mode}\" in cloudflare|cloudflare-access|cf-access) grep -Eq '^TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_CF_ACCESS_AUDIENCE=.+' /etc/arbuzas/env/ticket-remote.env ;; spacetime|spacetimeauth|oidc) grep -Eq '^TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=.+' /etc/arbuzas/env/ticket-remote.env ;; dev|development|none) ;; *) return 1 ;; esac; }; wait_until_ok auth_configured_ok" \
+    ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e; binary=/usr/local/bin/ticket-remote; grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null; grep -aF \"inputQueueLimit = 20\" \"\${binary}\" >/dev/null; grep -aF \"input_result\" \"\${binary}\" >/dev/null; grep -aF \"gesturechange\" \"\${binary}\" >/dev/null; grep -aF \"dblclick\" \"\${binary}\" >/dev/null; grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null; grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null; grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null; grep -aF \"ctx.drawImage\" \"\${binary}\" >/dev/null; grep -aF \"invalid_tsf2_frame\" \"\${binary}\" >/dev/null'" \
     ticket_remote

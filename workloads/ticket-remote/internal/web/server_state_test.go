@@ -46,7 +46,7 @@ func TestAdjustSnapshotTimeUpdatesRemainingControlTime(t *testing.T) {
 	}
 }
 
-func TestActiveControlGateAllowsOnlyController(t *testing.T) {
+func TestActiveControlGateAllowsSameEmailController(t *testing.T) {
 	now := time.Date(2026, 4, 30, 15, 0, 0, 0, time.UTC)
 	server := &Server{}
 	server.gate = &controlGate{
@@ -61,8 +61,13 @@ func TestActiveControlGateAllowsOnlyController(t *testing.T) {
 	}
 
 	active, allowed = server.activeControlGateAllows("other-session", "ticket@jolkins.id.lv", now)
+	if !active || !allowed {
+		t.Fatalf("same-email other session active=%v allowed=%v", active, allowed)
+	}
+
+	active, allowed = server.activeControlGateAllows("other-session", "other@example.com", now)
 	if !active || allowed {
-		t.Fatalf("other session active=%v allowed=%v", active, allowed)
+		t.Fatalf("different email active=%v allowed=%v", active, allowed)
 	}
 }
 

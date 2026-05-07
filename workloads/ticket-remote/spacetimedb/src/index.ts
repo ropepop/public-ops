@@ -95,6 +95,35 @@ const ticketremote_audit_event = table(
   }
 );
 
+const ticketremote_audit_counter = table(
+  { name: named('audit_counter') },
+  {
+    ticketId: t.string().primaryKey(),
+    nextOrdinal: t.string(),
+    updatedAt: t.string(),
+  }
+);
+
+const ticketremote_auth_config = table(
+  { name: named('auth_config') },
+  {
+    ticketId: t.string().primaryKey(),
+    issuer: t.string(),
+    audience: t.string(),
+    updatedAt: t.string(),
+  }
+);
+
+const ticketremote_live_state = table(
+  { name: named('live_state'), public: true },
+  {
+    id: t.string().primaryKey(),
+    ticketId: t.string().index(),
+    stateJson: t.string(),
+    updatedAt: t.string().index(),
+  }
+);
+
 const spacetimedb: any = schema(
   {
     ticketremote_ticket,
@@ -103,6 +132,9 @@ const spacetimedb: any = schema(
     ticketremote_control_session,
     ticketremote_phone_backend,
     ticketremote_audit_event,
+    ticketremote_audit_counter,
+    ticketremote_auth_config,
+    ticketremote_live_state,
   },
   { CASE_CONVERSION_POLICY: CaseConversionPolicy.None }
 );
@@ -142,11 +174,53 @@ function memberId(ticketId: string, email: string): string {
 }
 
 function requireService(tx: any): void {
+  if (hasServiceRole(tx)) return;
+  throw new SenderError('service role required');
+}
+
+function hasServiceRole(tx: any): boolean {
   const auth = tx.senderAuth;
   const roles = auth?.jwt?.fullPayload?.roles;
-  if (!auth?.hasJWT || !Array.isArray(roles) || !roles.includes('ticketremote_service')) {
-    throw new SenderError('service role required');
+  return Boolean(auth?.hasJWT && Array.isArray(roles) && roles.includes('ticketremote_service'));
+}
+
+function authConfig(tx: any, ticketId: string): any | null {
+  return tx.db.ticketremote_auth_config.ticketId.find(String(ticketId || '').trim() || 'vivi-default') || null;
+}
+
+function jwtAudienceIncludes(jwt: any, expected: string): boolean {
+  const clean = String(expected || '').trim();
+  if (!clean) return false;
+  const audiences = jwt?.audience || jwt?.fullPayload?.aud;
+  if (Array.isArray(audiences)) return audiences.some((item) => String(item || '').trim() === clean);
+  return String(audiences || '').trim() === clean;
+}
+
+function clientEmailFromAuth(tx: any, ticketId: string): string {
+  const auth = tx.senderAuth;
+  const jwt = auth?.jwt;
+  if (!auth?.hasJWT || !jwt) {
+    throw new SenderError('auth required');
   }
+  const config = authConfig(tx, ticketId);
+  if (!config || !String(config.issuer || '').trim() || !String(config.audience || '').trim()) {
+    throw new SenderError('auth config required');
+  }
+  if (String(jwt.issuer || '').trim().replace(/\/$/, '') !== String(config.issuer || '').trim().replace(/\/$/, '')) {
+    throw new SenderError('invalid auth issuer');
+  }
+  if (!jwtAudienceIncludes(jwt, config.audience)) {
+    throw new SenderError('invalid auth audience');
+  }
+  const payload = jwt.fullPayload || {};
+  const email = cleanEmail(payload.email);
+  if (!email || payload.email_verified !== true) {
+    throw new SenderError('verified email required');
+  }
+  if (!isMember(tx, ticketId, email)) {
+    throw new SenderError('ticket membership required');
+  }
+  return email;
 }
 
 function ensureTicket(tx: any, ticketId: string, displayName: string, now: string): any {
@@ -282,13 +356,196 @@ function snapshot(tx: any, ticketId: string, now: string): string {
   });
 }
 
+function writeLiveState(tx: any, ticketId: string, now: string): void {
+  const ticket = ensureTicket(tx, ticketId, '', now);
+  const id = ticket.id;
+  const existing = tx.db.ticketremote_live_state.id.find(id);
+  if (existing) tx.db.ticketremote_live_state.id.delete(id);
+  const statePayload = JSON.parse(snapshot(tx, id, now)).state;
+  tx.db.ticketremote_live_state.insert({
+    id,
+    ticketId: id,
+    stateJson: serialize(statePayload),
+    updatedAt: now,
+  });
+}
+
 function stateError(tx: any, ticketId: string, code: string, now: string): string {
   return serialize({ ok: false, error: code, state: JSON.parse(snapshot(tx, ticketId, now)).state });
 }
 
+function configuredTicketId(tx: any): string {
+  const rows = rowsFrom(tx.db.ticketremote_auth_config.iter());
+  return String(rows[0]?.ticketId || 'vivi-default').trim() || 'vivi-default';
+}
+
+export const clientConnected = spacetimedb.clientConnected((ctx) => {
+  if (hasServiceRole(ctx)) return;
+  const ticketId = configuredTicketId(ctx);
+  clientEmailFromAuth(ctx, ticketId);
+});
+
+export const memberHeartbeatPresence = spacetimedb.reducer(
+  { name: named('member_heartbeat_presence') },
+  { ticketId: t.string(), sessionId: t.string(), displayName: t.string(), page: t.string(), connected: t.bool(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const email = clientEmailFromAuth(ctx, ticket.id);
+    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(args.sessionId);
+    if (existing) ctx.db.ticketremote_viewer_presence.sessionId.delete(args.sessionId);
+    ctx.db.ticketremote_viewer_presence.insert({
+      sessionId: args.sessionId,
+      ticketId: ticket.id,
+      email,
+      displayName: String(args.displayName || '').trim() || email,
+      page: String(args.page || '').trim() || 'ticket',
+      connected: args.connected === true,
+      createdAt: existing?.createdAt || now,
+      lastSeenAt: now,
+    });
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberDisconnectPresence = spacetimedb.reducer(
+  { name: named('member_disconnect_presence') },
+  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    clientEmailFromAuth(ctx, ticket.id);
+    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(args.sessionId);
+    if (existing) {
+      ctx.db.ticketremote_viewer_presence.sessionId.delete(args.sessionId);
+      ctx.db.ticketremote_viewer_presence.insert({ ...existing, connected: false, lastSeenAt: now });
+    }
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberClaimControl = spacetimedb.reducer(
+  { name: named('member_claim_control') },
+  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const email = clientEmailFromAuth(ctx, ticket.id);
+    if (activeControl(ctx, ticket.id, now)) throw new SenderError('control_claimed');
+    const nowMs = parseTime(now);
+    ctx.db.ticketremote_control_session.insert({
+      id: `${args.sessionId}-${nowMs}`,
+      ticketId: ticket.id,
+      sessionId: args.sessionId,
+      email,
+      state: 'active',
+      claimedAt: now,
+      expiresAt: new Date(nowMs + CONTROL_MS).toISOString(),
+      extended: false,
+      endedAt: '',
+      endReason: '',
+    });
+    audit(ctx, ticket.id, email, 'control_claimed', serialize({ sessionId: args.sessionId, source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberExtendControl = spacetimedb.reducer(
+  { name: named('member_extend_control') },
+  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const email = clientEmailFromAuth(ctx, ticket.id);
+    const active = rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
+    if (!active) throw new SenderError('no_control');
+    if (active.email !== email) throw new SenderError('not_controller');
+    if (active.extended === true) throw new SenderError('already_extended');
+    ctx.db.ticketremote_control_session.id.delete(active.id);
+    ctx.db.ticketremote_control_session.insert({ ...active, extended: true, expiresAt: new Date(parseTime(active.claimedAt) + CONTROL_EXTENDED_MS).toISOString() });
+    audit(ctx, ticket.id, email, 'control_extended', serialize({ sessionId: args.sessionId, source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberReleaseControl = spacetimedb.reducer(
+  { name: named('member_release_control') },
+  { ticketId: t.string(), sessionId: t.string(), reason: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const email = clientEmailFromAuth(ctx, ticket.id);
+    const active = rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
+    if (!active) {
+      writeLiveState(ctx, ticket.id, now);
+      return;
+    }
+    if (active.email !== email) throw new SenderError('not_controller');
+    ctx.db.ticketremote_control_session.id.delete(active.id);
+    ctx.db.ticketremote_control_session.insert({ ...active, state: 'released', endedAt: now, endReason: String(args.reason || 'released') });
+    audit(ctx, ticket.id, email, 'control_released', serialize({ reason: args.reason, source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberRevokeControl = spacetimedb.reducer(
+  { name: named('member_revoke_control') },
+  { ticketId: t.string(), reason: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const email = clientEmailFromAuth(ctx, ticket.id);
+    if (!isAdmin(ctx, ticket.id, email)) throw new SenderError('forbidden');
+    for (const active of rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).filter((row) => row.state === 'active')) {
+      ctx.db.ticketremote_control_session.id.delete(active.id);
+      ctx.db.ticketremote_control_session.insert({ ...active, state: 'revoked', endedAt: now, endReason: String(args.reason || 'admin_revoked') });
+    }
+    audit(ctx, ticket.id, email, 'control_revoked', serialize({ reason: args.reason, source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberUpsertMember = spacetimedb.reducer(
+  { name: named('member_upsert_member') },
+  { ticketId: t.string(), email: t.string(), role: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const actor = clientEmailFromAuth(ctx, ticket.id);
+    if (!isAdmin(ctx, ticket.id, actor)) throw new SenderError('forbidden');
+    const email = cleanEmail(args.email);
+    if (!email) throw new SenderError('email required');
+    const id = memberId(ticket.id, email);
+    const existing = ctx.db.ticketremote_ticket_member.id.find(id);
+    if (existing) ctx.db.ticketremote_ticket_member.id.delete(id);
+    ctx.db.ticketremote_ticket_member.insert({ id, ticketId: ticket.id, email, role: cleanRole(args.role), active: true, createdAt: existing?.createdAt || now, updatedAt: now });
+    audit(ctx, ticket.id, actor, 'member_upserted', serialize({ email, role: cleanRole(args.role), source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
+export const memberRemoveMember = spacetimedb.reducer(
+  { name: named('member_remove_member') },
+  { ticketId: t.string(), email: t.string(), now: t.string() },
+  (ctx, args) => {
+    const now = nowOr(args.now);
+    const ticket = ensureTicket(ctx, args.ticketId, '', now);
+    const actor = clientEmailFromAuth(ctx, ticket.id);
+    if (!isAdmin(ctx, ticket.id, actor)) throw new SenderError('forbidden');
+    const id = memberId(ticket.id, args.email);
+    const existing = ctx.db.ticketremote_ticket_member.id.find(id);
+    if (existing) {
+      ctx.db.ticketremote_ticket_member.id.delete(id);
+      ctx.db.ticketremote_ticket_member.insert({ ...existing, active: false, updatedAt: now });
+    }
+    audit(ctx, ticket.id, actor, 'member_removed', serialize({ email: cleanEmail(args.email), source: 'spacetime_client' }), now);
+    writeLiveState(ctx, ticket.id, now);
+  }
+);
+
 export const serviceBootstrap = spacetimedb.reducer(
   { name: named('service_bootstrap') },
-  { ticketId: t.string(), displayName: t.string(), adminEmail: t.string(), phoneBackendId: t.string(), phoneBaseUrl: t.string(), phoneAttachName: t.string() },
+  { ticketId: t.string(), displayName: t.string(), adminEmail: t.string(), phoneBackendId: t.string(), phoneBaseUrl: t.string(), phoneAttachName: t.string(), authIssuer: t.string(), authAudience: t.string() },
   (ctx, args) => {
     const tx = ctx;
     requireService(tx);
@@ -316,6 +573,14 @@ export const serviceBootstrap = spacetimedb.reducer(
         lastSeenAt: now,
       });
     }
+    const issuer = String(args.authIssuer || '').trim();
+    const audience = String(args.authAudience || '').trim();
+    if (issuer && audience) {
+      const existingAuth = tx.db.ticketremote_auth_config.ticketId.find(ticket.id);
+      if (existingAuth) tx.db.ticketremote_auth_config.ticketId.delete(ticket.id);
+      tx.db.ticketremote_auth_config.insert({ ticketId: ticket.id, issuer, audience, updatedAt: now });
+    }
+    writeLiveState(tx, ticket.id, now);
   }
 );
 
@@ -344,6 +609,7 @@ export const upsertMember = spacetimedb.procedure(
     if (existing) tx.db.ticketremote_ticket_member.id.delete(id);
     tx.db.ticketremote_ticket_member.insert({ id, ticketId: ticket.id, email, role: cleanRole(args.role), active: true, createdAt: existing?.createdAt || now, updatedAt: now });
     audit(tx, ticket.id, args.actorEmail, 'member_upserted', serialize({ email, role: cleanRole(args.role) }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -364,6 +630,7 @@ export const removeMember = spacetimedb.procedure(
       tx.db.ticketremote_ticket_member.insert({ ...existing, active: false, updatedAt: now });
     }
     audit(tx, ticket.id, args.actorEmail, 'member_removed', serialize({ email: cleanEmail(args.email) }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -389,6 +656,7 @@ export const heartbeatPresence = spacetimedb.procedure(
       createdAt: existing?.createdAt || now,
       lastSeenAt: now,
     });
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -405,6 +673,7 @@ export const disconnectPresence = spacetimedb.procedure(
       tx.db.ticketremote_viewer_presence.sessionId.delete(args.sessionId);
       tx.db.ticketremote_viewer_presence.insert({ ...existing, connected: false, lastSeenAt: now });
     }
+    writeLiveState(tx, args.ticketId, now);
     return snapshot(tx, args.ticketId, now);
   })
 );
@@ -434,6 +703,7 @@ export const claimControl = spacetimedb.procedure(
       endReason: '',
     });
     audit(tx, ticket.id, args.email, 'control_claimed', serialize({ sessionId: args.sessionId }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -448,11 +718,12 @@ export const extendControl = spacetimedb.procedure(
     const ticket = ensureTicket(tx, args.ticketId, '', now);
     const active = rowsFrom(tx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
     if (!active) return stateError(tx, ticket.id, 'no_control', now);
-    if (active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email)) return stateError(tx, ticket.id, 'not_controller', now);
+    if (active.email !== cleanEmail(args.email)) return stateError(tx, ticket.id, 'not_controller', now);
     if (active.extended === true) return stateError(tx, ticket.id, 'already_extended', now);
     tx.db.ticketremote_control_session.id.delete(active.id);
     tx.db.ticketremote_control_session.insert({ ...active, extended: true, expiresAt: new Date(parseTime(active.claimedAt) + CONTROL_EXTENDED_MS).toISOString() });
     audit(tx, ticket.id, args.email, 'control_extended', serialize({ sessionId: args.sessionId }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -467,10 +738,12 @@ export const releaseControl = spacetimedb.procedure(
     const ticket = ensureTicket(tx, args.ticketId, '', now);
     const active = rowsFrom(tx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
     if (!active) return snapshot(tx, ticket.id, now);
-    if (args.sessionId && (active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email))) return stateError(tx, ticket.id, 'not_controller', now);
+    const actorEmail = cleanEmail(args.email);
+    if (actorEmail && active.email !== actorEmail) return stateError(tx, ticket.id, 'not_controller', now);
     tx.db.ticketremote_control_session.id.delete(active.id);
     tx.db.ticketremote_control_session.insert({ ...active, state: 'released', endedAt: now, endReason: String(args.reason || 'released') });
     audit(tx, ticket.id, args.email || active.email, 'control_released', serialize({ reason: args.reason }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -489,6 +762,7 @@ export const revokeControl = spacetimedb.procedure(
       tx.db.ticketremote_control_session.insert({ ...active, state: 'revoked', endedAt: now, endReason: String(args.reason || 'admin_revoked') });
     }
     audit(tx, ticket.id, args.actorEmail, 'control_revoked', serialize({ reason: args.reason }), now);
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );
@@ -513,6 +787,7 @@ export const updatePhone = spacetimedb.procedure(
       lastError: String(args.lastError || ''),
       lastSeenAt: now,
     });
+    writeLiveState(tx, ticket.id, now);
     return snapshot(tx, ticket.id, now);
   })
 );

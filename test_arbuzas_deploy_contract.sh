@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${REPO_ROOT}/tools/arbuzas/deploy.sh"
+COMPOSE_PATH="${REPO_ROOT}/infra/arbuzas/docker/compose.yml"
 NETDATA_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/netdata.conf"
 NETDATA_DOCKER_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/docker.conf"
 NETDATA_DOCKER_SD_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/sd/docker.conf"
@@ -16,6 +17,21 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
   echo "FAIL: missing Arbuzas deploy script at ${SCRIPT_PATH}" >&2
   exit 1
 fi
+
+if [[ ! -f "${COMPOSE_PATH}" ]]; then
+  echo "FAIL: missing Arbuzas compose file at ${COMPOSE_PATH}" >&2
+  exit 1
+fi
+
+for ticket_remote_runtime_snippet in \
+  'export TICKET_REMOTE_AUTH_MODE="$${TICKET_REMOTE_AUTH_MODE:-spacetime}"' \
+  'export TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN="$${TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}"' \
+  'export TICKET_REMOTE_CF_ACCESS_AUDIENCE="$${TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}"'; do
+  if ! grep -F "${ticket_remote_runtime_snippet}" "${COMPOSE_PATH}" >/dev/null; then
+    echo "FAIL: ticket_remote auth env must be resolved at container runtime, not during Compose rendering: ${ticket_remote_runtime_snippet}" >&2
+    exit 1
+  fi
+done
 
 if [[ ! -f "${NETDATA_CONFIG_PATH}" ]]; then
   echo "FAIL: missing Arbuzas Netdata config at ${NETDATA_CONFIG_PATH}" >&2
@@ -160,6 +176,11 @@ required_snippets = [
     "Memory=6442450944",
     "MemorySwap=6442450944",
     "ticket-remote stale viewer code absent",
+    "ARBUZAS_TICKET_REMOTE_AUTH_MODE=${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}",
+    "ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}",
+    "ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}",
+    "TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID",
+    "/api/v1/livez",
     "claim-dialog|showModal|confirmClaim",
     "options.tap.x",
     "control_code_button",
