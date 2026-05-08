@@ -26,7 +26,7 @@ This is the detailed operator runbook for the active Arbuzas runtime.
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
-5. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Docker Compose owns those runtime values on Arbuzas.
+5. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on Arbuzas.
 6. DNS on Arbuzas binds directly to host ports `443` and `853`.
 
 ## Normal Release Flow

@@ -76,6 +76,29 @@ func TestCloudflareAccessAuthModeRequiresAccessConfig(t *testing.T) {
 	}
 }
 
+func TestSpacetimeAuthModeRequiresSessionSigningKey(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", "client_test")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected SpacetimeAuth mode to require a session signing key")
+	}
+}
+
+func TestSpacetimeAuthModeLoadsWithSessionSigningKey(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", "client_test")
+	t.Setenv("TICKET_REMOTE_SESSION_SIGNING_KEY", "test-signing-key")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Access.SessionSigningKey != "test-signing-key" {
+		t.Fatalf("session signing key was not loaded")
+	}
+}
+
 func TestCloudflareAccessAuthModeLoads(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "cloudflare")
 	t.Setenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", "team.example.cloudflareaccess.com")

@@ -37,7 +37,7 @@ func TestOpenAppButtonRowUsesRootHostedMiniAppURL(t *testing.T) {
 
 	service := &Service{
 		catalog:   i18n.NewCatalog(),
-		webAppURL: "https://train-bot.jolkins.id.lv",
+		webAppURL: "https://vilciens.kontrole.info",
 	}
 
 	row := service.openAppButtonRow(domain.LanguageEN)
@@ -49,7 +49,7 @@ func TestOpenAppButtonRowUsesRootHostedMiniAppURL(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected web_app payload, got %#v", row[0]["web_app"])
 	}
-	if webApp["url"] != "https://train-bot.jolkins.id.lv/app" {
+	if webApp["url"] != "https://vilciens.kontrole.info/app" {
 		t.Fatalf("unexpected web app url: %q", webApp["url"])
 	}
 }
@@ -68,7 +68,7 @@ func TestOpenIncidentsButtonRowUsesConfiguredPublicURL(t *testing.T) {
 
 	service := &Service{
 		catalog:   i18n.NewCatalog(),
-		webAppURL: "https://train-bot.jolkins.id.lv",
+		webAppURL: "https://vilciens.kontrole.info",
 	}
 
 	row := service.openIncidentsButtonRow(domain.LanguageEN)
@@ -80,7 +80,7 @@ func TestOpenIncidentsButtonRowUsesConfiguredPublicURL(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected web_app payload, got %#v", row[0]["web_app"])
 	}
-	if webApp["url"] != "https://train-bot.jolkins.id.lv/incidents" {
+	if webApp["url"] != "https://vilciens.kontrole.info/incidents" {
 		t.Fatalf("unexpected incidents url: %q", webApp["url"])
 	}
 }
@@ -102,7 +102,7 @@ func TestConfigureBotSetsCommandsAndMenuButton(t *testing.T) {
 		time.UTC,
 		1,
 		true,
-		"https://train-bot.jolkins.id.lv",
+		"https://vilciens.kontrole.info",
 	)
 
 	service.configureBot(context.Background())
@@ -132,7 +132,7 @@ func TestConfigureBotSetsCommandsAndMenuButton(t *testing.T) {
 	if !ok {
 		t.Fatalf("menu_button.web_app missing or wrong type: %T", menuButton["web_app"])
 	}
-	if webApp["url"] != "https://train-bot.jolkins.id.lv/app" {
+	if webApp["url"] != "https://vilciens.kontrole.info/app" {
 		t.Fatalf("unexpected menu button url: %#v", webApp["url"])
 	}
 }
@@ -143,7 +143,7 @@ func TestHandleMessageSupportsAddressedCommandVariantsAndIncidentsNotice(t *test
 	h := newCheckinHarness(t)
 	defer h.close()
 	h.ensureEnglish(t, 7)
-	h.service.webAppURL = "https://train-bot.jolkins.id.lv"
+	h.service.webAppURL = "https://vilciens.kontrole.info"
 
 	for _, text := range []string{"/incidents", "/incidents@vivi_kontrole_bot"} {
 		if err := h.service.handleMessage(context.Background(), &Message{
@@ -232,7 +232,7 @@ func TestHandleMessageHelpSendsHelpAndOpenAppPrompt(t *testing.T) {
 	h := newCheckinHarness(t)
 	defer h.close()
 	h.ensureEnglish(t, 7)
-	h.service.webAppURL = "https://train-bot.jolkins.id.lv"
+	h.service.webAppURL = "https://vilciens.kontrole.info"
 
 	if err := h.service.handleMessage(context.Background(), &Message{
 		Text: "❓ Help",
@@ -280,7 +280,7 @@ func TestOpenAppPromptAndHelpMentionTelegramDeepLink(t *testing.T) {
 		time.UTC,
 		1,
 		true,
-		"https://train-bot.jolkins.id.lv",
+		"https://vilciens.kontrole.info",
 	)
 
 	if err := service.sendOpenAppPrompt(context.Background(), 42, domain.LanguageEN); err != nil {

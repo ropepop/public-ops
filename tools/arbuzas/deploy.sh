@@ -72,7 +72,7 @@ ARBUZAS_TAILSCALE_IPV4="${ARBUZAS_TAILSCALE_IPV4:-}"
 ARBUZAS_FAN_ENTER_AUTO_C="${ARBUZAS_FAN_ENTER_AUTO_C:-89}"
 ARBUZAS_FAN_EXIT_AUTO_C="${ARBUZAS_FAN_EXIT_AUTO_C:-89}"
 
-ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-train-bot.jolkins.id.lv}"
+ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"
 ARBUZAS_SATIKSME_BOT_HOSTNAME="${ARBUZAS_SATIKSME_BOT_HOSTNAME:-kontrole.info}"
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME="${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME:-farel-subscription-bot.jolkins.id.lv}"
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
@@ -872,10 +872,27 @@ compose_target_service_args_without_dns() {
   local service_args=""
   local service_name
   for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
-    if [[ "${service_name}" == "dns_controlplane" ]]; then
-      continue
-    fi
-    service_args+=" ${service_name}"
+    case "${service_name}" in
+      dns_controlplane|train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+        continue
+        ;;
+      *)
+        service_args+=" ${service_name}"
+        ;;
+    esac
+  done
+  printf '%s' "${service_args}"
+}
+
+compose_target_tunnel_service_args() {
+  local service_args=""
+  local service_name
+  for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
+    case "${service_name}" in
+      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+        service_args+=" ${service_name}"
+        ;;
+    esac
   done
   printf '%s' "${service_args}"
 }
@@ -893,15 +910,15 @@ compose_all_non_dns_service_args() {
     ticket_android_sim_bridge
     ticket_phone_bridge
     ticket_remote
-    train_tunnel
-    satiksme_tunnel
-    subscription_tunnel
-    ticket_remote_tunnel
   )
   for service_name in "${non_dns_services[@]}"; do
     service_args+=" ${service_name}"
   done
   printf '%s' "${service_args}"
+}
+
+compose_all_tunnel_service_args() {
+  printf '%s' " train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel"
 }
 
 targeted_service_selected() {
@@ -1994,52 +2011,28 @@ copy_release_to_remote() {
 
 render_remote_cloudflared_configs() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
-  local render_train=false
-  local render_satiksme=false
-  local render_subscription=false
-  local render_ticket_remote=false
-  if targeted_service_selected train_tunnel; then
-    render_train=true
-  fi
-  if targeted_service_selected satiksme_tunnel; then
-    render_satiksme=true
-  fi
-  if targeted_service_selected subscription_tunnel; then
-    render_subscription=true
-  fi
-  if targeted_service_selected ticket_remote_tunnel; then
-    render_ticket_remote=true
-  fi
   remote_shell "
     mkdir -p '${remote_release_dir}/generated/cloudflared'
-    if ${render_train}; then
-      python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
-        --credentials-file '/etc/arbuzas/cloudflared/train-bot.json' \
-        --hostname '${ARBUZAS_TRAIN_BOT_HOSTNAME}' \
-        --upstream 'http://train_bot:${ARBUZAS_TRAIN_BOT_PORT}' \
-        --out '${remote_release_dir}/generated/cloudflared/train-bot.yml'
-    fi
-    if ${render_satiksme}; then
-      python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
-        --credentials-file '/etc/arbuzas/cloudflared/satiksme-bot.json' \
-        --hostname '${ARBUZAS_SATIKSME_BOT_HOSTNAME}' \
-        --upstream 'http://satiksme_bot:${ARBUZAS_SATIKSME_BOT_PORT}' \
-        --out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'
-    fi
-    if ${render_subscription}; then
-      python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
-        --credentials-file '/etc/arbuzas/cloudflared/subscription-bot.json' \
-        --hostname '${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}' \
-        --upstream 'http://subscription_bot:${ARBUZAS_SUBSCRIPTION_BOT_PORT}' \
-        --out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'
-    fi
-    if ${render_ticket_remote}; then
-      python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
-        --credentials-file '/etc/arbuzas/cloudflared/ticket-remote.json' \
-        --hostname '${ARBUZAS_TICKET_REMOTE_HOSTNAME}' \
-        --upstream 'http://ticket_remote:${ARBUZAS_TICKET_REMOTE_PORT}' \
-        --out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'
-    fi
+    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+      --credentials-file '/etc/arbuzas/cloudflared/train-bot.json' \
+      --hostname '${ARBUZAS_TRAIN_BOT_HOSTNAME}' \
+      --upstream 'http://train_bot:${ARBUZAS_TRAIN_BOT_PORT}' \
+      --out '${remote_release_dir}/generated/cloudflared/train-bot.yml'
+    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+      --credentials-file '/etc/arbuzas/cloudflared/satiksme-bot.json' \
+      --hostname '${ARBUZAS_SATIKSME_BOT_HOSTNAME}' \
+      --upstream 'http://satiksme_bot:${ARBUZAS_SATIKSME_BOT_PORT}' \
+      --out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'
+    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+      --credentials-file '/etc/arbuzas/cloudflared/subscription-bot.json' \
+      --hostname '${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}' \
+      --upstream 'http://subscription_bot:${ARBUZAS_SUBSCRIPTION_BOT_PORT}' \
+      --out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'
+    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+      --credentials-file '/etc/arbuzas/cloudflared/ticket-remote.json' \
+      --hostname '${ARBUZAS_TICKET_REMOTE_HOSTNAME}' \
+      --upstream 'http://ticket_remote:${ARBUZAS_TICKET_REMOTE_PORT}' \
+      --out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'
   "
 }
 
@@ -2056,9 +2049,15 @@ remote_compose_up() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
   local non_dns_service_args=""
   local all_non_dns_service_args=""
+  local tunnel_service_args=""
   local dns_release_prepare_needed="false"
   non_dns_service_args="$(compose_target_service_args_without_dns)"
   all_non_dns_service_args="$(compose_all_non_dns_service_args)"
+  if (( TARGETED_MODE == 1 )); then
+    tunnel_service_args="$(compose_target_tunnel_service_args)"
+  else
+    tunnel_service_args="$(compose_all_tunnel_service_args)"
+  fi
 
   if requires_dns_release_prepare; then
     dns_release_prepare_needed="true"
@@ -2084,6 +2083,9 @@ remote_compose_up() {
       if [[ -n '${non_dns_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --no-deps${non_dns_service_args}
       fi
+      if [[ -n '${tunnel_service_args}' ]]; then
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+      fi
     "
     return
   fi
@@ -2099,6 +2101,9 @@ remote_compose_up() {
     ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${all_non_dns_service_args}
+    if [[ -n '${tunnel_service_args}' ]]; then
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+    fi
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
   "
 }
@@ -2213,7 +2218,7 @@ setup_remote_ticket_android_sim() {
 set -euo pipefail
 container="${1:-arbuzas-ticket_android_sim_bridge-1}"
 adb_target="${2:-ticket_android_sim:5555}"
-docker exec "${container}" sh -s -- "${adb_target}" <<'BRIDGE'
+docker exec "${container}" sh -c 'cat > /tmp/restore-aggressive-packages-inner.sh && sh /tmp/restore-aggressive-packages-inner.sh "$@"' sh "${adb_target}" <<'BRIDGE'
 set -eu
 adb_target="$1"
 adb connect "${adb_target}" >/dev/null 2>&1 || true
@@ -2255,7 +2260,7 @@ BRIDGE
 RESTORE
     chmod 0755 /srv/arbuzas/android-sim/restore-aggressive-packages.sh
 
-    compose exec -T ticket_android_sim_bridge sh -s <<'BRIDGE'
+    compose exec -T ticket_android_sim_bridge sh -c 'cat > /tmp/ticket-android-sim-setup.sh && sh /tmp/ticket-android-sim-setup.sh' <<'BRIDGE'
 set -eu
 adb_target='ticket_android_sim:5555'
 adb connect "${adb_target}" >/dev/null 2>&1 || true
@@ -2420,10 +2425,22 @@ install_or_update() {
   label="$1"
   package="$2"
   apk="$3"
+  install_log=/tmp/ticket-android-sim-install.log
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if adb -s "${adb_target}" install -r "${apk}"; then
+    if adb -s "${adb_target}" install -r "${apk}" >"${install_log}" 2>&1; then
       echo "store_client label=${label} package=${package} result=updated"
       return 0
+    fi
+    cat "${install_log}" >&2 || true
+    if grep -F 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' "${install_log}" >/dev/null 2>&1; then
+      echo "store_client label=${label} package=${package} result=signature-mismatch-uninstall"
+      adb -s "${adb_target}" uninstall "${package}" >/dev/null 2>&1 || true
+      if adb -s "${adb_target}" install -r "${apk}" >"${install_log}" 2>&1; then
+        echo "store_client label=${label} package=${package} result=reinstalled"
+        return 0
+      fi
+      cat "${install_log}" >&2 || true
+      return 1
     fi
     if [ "${attempt}" = "12" ]; then
       return 1
@@ -2437,7 +2454,9 @@ install_if_missing Aurora com.aurora.store /srv/android-sim/apks/aurora-store.ap
 
 phone_service_apk=/srv/android-sim/apks/pixel-orchestrator-debug.apk
 if [ -s "${phone_service_apk}" ]; then
-  install_or_update TicketPhoneService lv.jolkins.pixelorchestrator "${phone_service_apk}"
+  if ! install_or_update TicketPhoneService lv.jolkins.pixelorchestrator "${phone_service_apk}"; then
+    echo "ticket_phone_service package=lv.jolkins.pixelorchestrator result=install-failed"
+  fi
   adb -s "${adb_target}" shell pm grant lv.jolkins.pixelorchestrator android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
   adb -s "${adb_target}" shell pm grant lv.jolkins.pixelorchestrator android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1 || true
   adb -s "${adb_target}" shell am start -n lv.jolkins.pixelorchestrator/.app.MainActivity >/dev/null 2>&1 || true
@@ -2623,6 +2642,9 @@ validate_remote_train_workload_health() {
   validate_remote_probe "${remote_release_dir}" "train public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
+  validate_remote_probe "${remote_release_dir}" "train public OIDC metadata" \
+    "wait_until_ok sh -lc 'body=\$(curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc/.well-known/openid-configuration) && printf %s \"\${body}\" | grep -F \"\\\"issuer\\\":\\\"https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc\\\"\" >/dev/null && printf %s \"\${body}\" | grep -F \"\\\"jwks_uri\\\":\\\"https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc/jwks.json\\\"\" >/dev/null'" \
+    train_bot train_tunnel
   validate_remote_probe "${remote_release_dir}" "train public dashboard feed" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/public/dashboard?limit=3 >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
@@ -2791,10 +2813,27 @@ validate_remote_ticket_remote_workload_health() {
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote auth configured" \
-    "auth_configured_ok() { mode=\$(sed -n 's/^TICKET_REMOTE_AUTH_MODE=//p' /etc/arbuzas/env/ticket-remote.env | tail -1); case \"\${mode}\" in cloudflare|cloudflare-access|cf-access) grep -Eq '^TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_CF_ACCESS_AUDIENCE=.+' /etc/arbuzas/env/ticket-remote.env ;; spacetime|spacetimeauth|oidc) grep -Eq '^TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=.+' /etc/arbuzas/env/ticket-remote.env ;; dev|development|none) ;; *) return 1 ;; esac; }; wait_until_ok auth_configured_ok" \
+    "auth_configured_ok() { mode=\$(sed -n 's/^TICKET_REMOTE_AUTH_MODE=//p' /etc/arbuzas/env/ticket-remote.env | tail -1); case \"\${mode}\" in cloudflare|cloudflare-access|cf-access) grep -Eq '^TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_CF_ACCESS_AUDIENCE=.+' /etc/arbuzas/env/ticket-remote.env ;; spacetime|spacetimeauth|oidc) grep -Eq '^TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_SESSION_SIGNING_KEY=.+' /etc/arbuzas/env/ticket-remote.env ;; dev|development|none) ;; *) return 1 ;; esac; }; wait_until_ok auth_configured_ok" \
+    ticket_remote
+  validate_remote_probe "${remote_release_dir}" "ticket-remote runtime OIDC issuer" \
+    "runtime_oidc_ok() {
+      backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
+      case \"\${backend}\" in
+        ''|spacetime) ;;
+        *) return 0 ;;
+      esac
+      expected='https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc'
+      issuer=\$(sed -n 's/^TICKET_REMOTE_SPACETIME_OIDC_ISSUER=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
+      [[ \"\${issuer}\" = \"\${expected}\" ]] || return 1
+      body=\$(curl -fsS \"\${issuer}/.well-known/openid-configuration\") || return 1
+      printf %s \"\${body}\" | grep -F \"\\\"issuer\\\":\\\"\${expected}\\\"\" >/dev/null || return 1
+      printf %s \"\${body}\" | grep -F \"\\\"jwks_uri\\\":\\\"\${expected}/jwks.json\\\"\" >/dev/null || return 1
+      jwks=\$(curl -fsS \"\${expected}/jwks.json\") || return 1
+      printf %s \"\${jwks}\" | grep -F '\"keys\"' >/dev/null
+    }; wait_until_ok runtime_oidc_ok" \
     ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
-    "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e; binary=/usr/local/bin/ticket-remote; grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null; grep -aF \"inputQueueLimit = 20\" \"\${binary}\" >/dev/null; grep -aF \"input_result\" \"\${binary}\" >/dev/null; grep -aF \"gesturechange\" \"\${binary}\" >/dev/null; grep -aF \"dblclick\" \"\${binary}\" >/dev/null; grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null; grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null; grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null; grep -aF \"ctx.drawImage\" \"\${binary}\" >/dev/null; grep -aF \"invalid_tsf2_frame\" \"\${binary}\" >/dev/null'" \
+    "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e; binary=/usr/local/bin/ticket-remote; grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null; grep -aF \"inputQueueLimit = 30\" \"\${binary}\" >/dev/null; grep -aF \"inputDrainDelayMs = 35\" \"\${binary}\" >/dev/null; grep -aF \"input_result\" \"\${binary}\" >/dev/null; grep -aF \"gesturechange\" \"\${binary}\" >/dev/null; grep -aF \"dblclick\" \"\${binary}\" >/dev/null; grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null; grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null; grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null; grep -aF \"ctx.drawImage\" \"\${binary}\" >/dev/null; grep -aF \"invalid_tsf2_frame\" \"\${binary}\" >/dev/null'" \
     ticket_remote
 }
 

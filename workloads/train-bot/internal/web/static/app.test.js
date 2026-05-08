@@ -242,6 +242,159 @@ test("authenticateMiniApp consumes a test ticket before loading the signed-in se
   assert.equal(app.__test__.getState().me.userId, 7001);
 });
 
+test("mini-app anonymous fallback loads the public network map surface", async function () {
+  var previousFetch = global.fetch;
+  var originalLeaflet = global.window.L;
+  var originalMode = global.window.TRAIN_APP_CONFIG.mode;
+  var originalSync = app.__test__.mapController.sync;
+  var originalDocumentQuerySelector = global.document.querySelector;
+  var originalDocumentQuerySelectorAll = global.document.querySelectorAll;
+  var fetchCalls = [];
+  var syncCalls = [];
+  var retryResult = null;
+
+  try {
+    setWindowLocation({
+      href: "https://example.test/pixel-stack/train/app",
+      pathname: "/pixel-stack/train/app",
+      search: "",
+      hash: "",
+    });
+
+    await withAppConfig({
+      basePath: "/pixel-stack/train",
+        mode: "mini-app",
+        publicRefreshMs: 60000,
+      }, async function () {
+      global.window.L = {};
+      global.document.querySelector = function () {
+        return null;
+      };
+      global.document.querySelectorAll = function () {
+        return [];
+      };
+      app.__test__.mapController.sync = function (containerId, mapModel) {
+        syncCalls.push({ containerId: containerId, mapModel: mapModel });
+      };
+      app.__test__.resetState({
+        lang: "EN",
+        authenticated: false,
+      });
+      global.fetch = async function (url) {
+        fetchCalls.push(url);
+        if (url === "/pixel-stack/train/api/v1/session") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({ authenticated: false });
+            },
+          };
+        }
+        if (url === "/pixel-stack/train/api/v1/public/map") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({
+                stations: [
+                  {
+                    id: "riga",
+                    name: "Rīga",
+                    latitude: 56.9467,
+                    longitude: 24.1192,
+                  },
+                ],
+                recentSightings: [],
+                sameDaySightings: [],
+                schedule: { available: true },
+              });
+            },
+          };
+        }
+        if (url === "/pixel-stack/train/api/v1/public/dashboard?limit=0") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({
+                trains: [
+                  { train: { id: "train-1" }, status: { state: "NO_REPORTS" } },
+                ],
+                schedule: { available: true },
+              });
+            },
+          };
+        }
+	        if (url === "/pixel-stack/train/api/v1/public/service-day-trains") {
+	          return {
+	            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({
+                trains: [
+                  { train: { id: "train-1" }, status: { state: "NO_REPORTS" } },
+                ],
+                schedule: { available: true },
+              });
+	            },
+	          };
+	        }
+        if (url === "/pixel-stack/train/api/v1/public/incidents?limit=60") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({ incidents: [] });
+            },
+          };
+        }
+	        throw new Error("unexpected fetch " + url);
+	      };
+
+      await app.__test__.bootMiniAppAnonymousFallback({
+        render: function () {},
+        activateLiveRefresh: async function () {
+          return false;
+        },
+        setInterval: function () {
+          return 0;
+        },
+      });
+      app.__test__.syncActivePublicMap();
+      retryResult = await app.__test__.retryCurrentView();
+    });
+  } finally {
+    global.fetch = previousFetch;
+    global.window.L = originalLeaflet;
+    global.window.TRAIN_APP_CONFIG.mode = originalMode;
+    app.__test__.mapController.sync = originalSync;
+    global.document.querySelector = originalDocumentQuerySelector;
+    global.document.querySelectorAll = originalDocumentQuerySelectorAll;
+    setWindowLocation();
+  }
+
+  assert.deepEqual(fetchCalls, [
+    "/pixel-stack/train/api/v1/session",
+	    "/pixel-stack/train/api/v1/public/map",
+	    "/pixel-stack/train/api/v1/public/dashboard?limit=0",
+	    "/pixel-stack/train/api/v1/public/service-day-trains",
+    "/pixel-stack/train/api/v1/public/incidents?limit=60",
+	    "/pixel-stack/train/api/v1/public/map",
+    "/pixel-stack/train/api/v1/public/dashboard?limit=0",
+    "/pixel-stack/train/api/v1/public/service-day-trains",
+  ]);
+  assert.equal(app.__test__.getState().authenticated, false);
+  assert.equal(app.__test__.getState().miniAppPublicMapFallback, true);
+  assert.equal(retryResult, true);
+  assert.equal(app.__test__.getState().networkMapData.stations[0].name, "Rīga");
+  assert.equal(app.__test__.getState().publicDashboardAll[0].train.id, "train-1");
+  assert.equal(app.__test__.getState().statusText, "Public read-only view.");
+  assert.deepEqual(syncCalls.map(function (call) {
+    return call.containerId;
+  }), ["public-network-map"]);
+});
+
 test("loadMiniAppInitialData runs primary loaders before background loaders", async function () {
   var calls = [];
 
@@ -1670,7 +1823,7 @@ test("publicApi resolves bundle slices from a relative manifest URL", async func
 
   try {
     await withAppConfig({
-      publicBaseURL: "https://train-bot.jolkins.id.lv",
+      publicBaseURL: "https://vilciens.kontrole.info",
       bundleManifestURL: "/assets/bundles/bundle-2026-03-27/manifest.json",
     }, async function () {
       app.__test__.resetState();
@@ -1688,7 +1841,7 @@ test("publicApi resolves bundle slices from a relative manifest URL", async func
             },
           };
         }
-        if (url === "https://train-bot.jolkins.id.lv/assets/bundles/bundle-2026-03-27/stations.json") {
+        if (url === "https://vilciens.kontrole.info/assets/bundles/bundle-2026-03-27/stations.json") {
           return {
             ok: true,
             json: async function () {
@@ -1711,7 +1864,7 @@ test("publicApi resolves bundle slices from a relative manifest URL", async func
 
   assert.deepEqual(fetchCalls, [
     "/assets/bundles/bundle-2026-03-27/manifest.json",
-    "https://train-bot.jolkins.id.lv/assets/bundles/bundle-2026-03-27/stations.json",
+    "https://vilciens.kontrole.info/assets/bundles/bundle-2026-03-27/stations.json",
   ]);
 });
 
@@ -1743,7 +1896,7 @@ test("publicApi returns the bundle-backed schedule when the same-day bundle is p
 
   try {
     await withAppConfig({
-      publicBaseURL: "https://train-bot.jolkins.id.lv",
+      publicBaseURL: "https://vilciens.kontrole.info",
       bundleManifestURL: "/assets/bundles/bundle-2026-03-30/manifest.json",
       bundleServiceDate: "2026-03-30",
       schedule: {
@@ -1769,7 +1922,7 @@ test("publicApi returns the bundle-backed schedule when the same-day bundle is p
             },
           };
         }
-        if (url === "https://train-bot.jolkins.id.lv/assets/bundles/bundle-2026-03-30/trains.json") {
+        if (url === "https://vilciens.kontrole.info/assets/bundles/bundle-2026-03-30/trains.json") {
           return {
             ok: true,
             json: async function () {
@@ -2072,7 +2225,7 @@ test("telegramLoginAuthURL includes the required origin and current return path"
   await withAppConfig({ basePath: "/pixel-stack/train" }, async function () {
     app.__test__.resetState({ lang: "LV" });
     setWindowLocation({
-      href: "https://train-bot.jolkins.id.lv/app?view=map#selected",
+      href: "https://vilciens.kontrole.info/app?view=map#selected",
       pathname: "/app",
       search: "?view=map",
       hash: "#selected",
@@ -2081,8 +2234,8 @@ test("telegramLoginAuthURL includes the required origin and current return path"
     var url = new URL(app.__test__.telegramLoginAuthURL({
       clientId: "8792187636",
       nonce: "nonce-1",
-      origin: "https://train-bot.jolkins.id.lv",
-      redirectUri: "https://train-bot.jolkins.id.lv/",
+      origin: "https://vilciens.kontrole.info",
+      redirectUri: "https://vilciens.kontrole.info/",
       requestAccess: ["write", "phone"],
     }));
 
@@ -2090,8 +2243,8 @@ test("telegramLoginAuthURL includes the required origin and current return path"
     assert.equal(url.pathname, "/auth");
     assert.equal(url.searchParams.get("response_type"), "post_message");
     assert.equal(url.searchParams.get("client_id"), "8792187636");
-    assert.equal(url.searchParams.get("origin"), "https://train-bot.jolkins.id.lv");
-    assert.equal(url.searchParams.get("redirect_uri"), "https://train-bot.jolkins.id.lv/app");
+    assert.equal(url.searchParams.get("origin"), "https://vilciens.kontrole.info");
+    assert.equal(url.searchParams.get("redirect_uri"), "https://vilciens.kontrole.info/app");
     assert.equal(url.searchParams.get("scope"), "openid profile telegram:bot_access phone");
     assert.equal(url.searchParams.get("nonce"), "nonce-1");
     assert.equal(url.searchParams.get("lang"), "lv");
@@ -2110,7 +2263,7 @@ test("runTelegramLoginPopup opens Telegram with explicit origin and reads the po
     await withAppConfig({ basePath: "/pixel-stack/train" }, async function () {
       app.__test__.resetState({ lang: "EN" });
       setWindowLocation({
-        href: "https://train-bot.jolkins.id.lv/app",
+        href: "https://vilciens.kontrole.info/app",
         pathname: "/app",
       });
       global.window.addEventListener = function (eventName, handler) {
@@ -2127,13 +2280,13 @@ test("runTelegramLoginPopup opens Telegram with explicit origin and reads the po
       var tokenPromise = app.__test__.runTelegramLoginPopup({
         clientId: "123456",
         nonce: "nonce-1",
-        origin: "https://train-bot.jolkins.id.lv",
-        redirectUri: "https://train-bot.jolkins.id.lv/",
+        origin: "https://vilciens.kontrole.info",
+        redirectUri: "https://vilciens.kontrole.info/",
         requestAccess: ["write"],
       });
 
-      assert.equal(new URL(popupURL).searchParams.get("origin"), "https://train-bot.jolkins.id.lv");
-      assert.equal(new URL(popupURL).searchParams.get("redirect_uri"), "https://train-bot.jolkins.id.lv/app");
+      assert.equal(new URL(popupURL).searchParams.get("origin"), "https://vilciens.kontrole.info");
+      assert.equal(new URL(popupURL).searchParams.get("redirect_uri"), "https://vilciens.kontrole.info/app");
       handlers.message({
         origin: "https://oauth.telegram.org",
         source: popup,
@@ -2418,7 +2571,7 @@ test("renderMiniSidebar hides duplicate active ride actions on my ride tab", fun
   assert.doesNotMatch(html, /data-action="checkout"/);
 });
 
-test("buildStationPopupHTML stays informational in the simplified mini app", function () {
+test("buildStationPopupHTML exposes station reports for signed-in map users", function () {
   global.window.TRAIN_APP_CONFIG.mode = "mini-app";
   global.window.TRAIN_APP_CONFIG.stationCheckinEnabled = true;
   app.__test__.resetState({
@@ -2426,14 +2579,16 @@ test("buildStationPopupHTML stays informational in the simplified mini app", fun
     currentRide: null,
     messages: {
       btn_checkin_confirm: "Check in",
+      btn_report_inspection: "Report inspection",
       app_report_sighting: "Report sighting",
     },
   });
 
-  var html = app.__test__.buildStationPopupHTML({
+  var station = {
     id: "riga",
     name: "Riga",
-  }, {
+  };
+  var bucket = {
     stationId: "riga",
     name: "Riga",
     sightings: [],
@@ -2445,18 +2600,192 @@ test("buildStationPopupHTML stays informational in the simplified mini app", fun
       },
       status: null,
     }],
-  });
+  };
 
-  assert.doesNotMatch(html, /popup-(checkin-train|open-station-sightings)/);
+  var appHtml = app.__test__.buildStationPopupHTML(station, bucket, { allowReports: true });
+  var publicHtml = app.__test__.buildStationPopupHTML(station, bucket, { allowReports: false });
+
+  assert.match(appHtml, /popup-report-station/);
+  assert.match(appHtml, /data-station-id="riga"/);
+  assert.doesNotMatch(publicHtml, /popup-report-station/);
+  assert.doesNotMatch(appHtml, /popup-(checkin-train|open-station-sightings)/);
 });
 
-test("buildTrainStopPopupHTML stays informational when there is no live marker", function () {
+test("buildStationPopupHTML labels stop reports as controle sighted", function () {
+  global.window.TRAIN_APP_CONFIG.mode = "public-network-map";
+  app.__test__.resetState({
+    authenticated: true,
+  });
+
+  var html = app.__test__.buildStationPopupHTML({
+    id: "riga",
+    name: "Riga",
+  }, {
+    stationId: "riga",
+    name: "Riga",
+    sightings: [],
+    liveItems: [],
+  }, { allowReports: true });
+
+  assert.match(html, /Controle sighted/);
+  assert.doesNotMatch(html, /Report inspection/);
+});
+
+test("mapReportsEnabled allows reports on signed-in public maps only", function () {
+  global.window.TRAIN_APP_CONFIG.mode = "public-network-map";
+  app.__test__.resetState({
+    authenticated: true,
+  });
+
+  assert.equal(app.__test__.mapReportsEnabled(), true);
+
+  app.__test__.resetState({
+    authenticated: false,
+  });
+
+  assert.equal(app.__test__.mapReportsEnabled(), false);
+});
+
+test("report mutations re-render the active public map surface", function () {
+  global.window.TRAIN_APP_CONFIG.mode = "public-network-map";
+  app.__test__.resetState({
+    authenticated: true,
+  });
+  assert.equal(app.__test__.reportMutationRenderTarget(), "public-network-map");
+
+  global.window.TRAIN_APP_CONFIG.mode = "public-map";
+  app.__test__.resetState({
+    authenticated: true,
+  });
+  assert.equal(app.__test__.reportMutationRenderTarget(), "public-map");
+
+  global.window.TRAIN_APP_CONFIG.mode = "mini-app";
+  app.__test__.resetState({
+    authenticated: true,
+  });
+  assert.equal(app.__test__.reportMutationRenderTarget(), "mini-app");
+});
+
+test("handleMapPopupAction submits a direct station report from a popup button", async function () {
+  var reportCall = null;
+  var runUserActionCalled = false;
+
+  var handled = app.__test__.handleMapPopupAction({
+    getAttribute: function (name) {
+      if (name === "data-action") {
+        return "popup-report-station";
+      }
+      if (name === "data-station-id") {
+        return "riga";
+      }
+      return "";
+    },
+    closest: function (selector) {
+      return selector === ".leaflet-popup" ? {} : null;
+    },
+  }, {
+    runUserAction: async function (action) {
+      runUserActionCalled = true;
+      await action();
+    },
+    submitStationReport: async function (stationId) {
+      reportCall = { stationId: stationId };
+      return { message: "Reported.", kind: "success" };
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(runUserActionCalled, true);
+  assert.deepEqual(reportCall, { stationId: "riga" });
+});
+
+test("buildLocationReportDraftHTML defaults vague map reports to 100 meters", function () {
+  app.__test__.resetState({
+    authenticated: true,
+    messages: {
+      btn_report_inspection: "Report inspection",
+    },
+  });
+
+  assert.equal(typeof app.__test__.buildLocationReportDraftHTML, "function");
+  var html = app.__test__.buildLocationReportDraftHTML({
+    latitude: 56.94672,
+    longitude: 24.10589,
+  });
+
+  assert.match(html, /data-action="popup-submit-location-report"/);
+  assert.match(html, /data-radius-meters="100"/);
+  assert.match(html, /maxlength="160"/);
+  assert.match(html, /data-role="location-report-radius"/);
+  assert.match(html, /<option value="100" selected>100 m<\/option>/);
+  assert.match(html, /<option value="250">250 m<\/option>/);
+  assert.match(html, /<option value="500">500 m<\/option>/);
+  assert.match(html, /textarea/);
+});
+
+test("handleMapPopupAction submits the selected vague report radius", async function () {
+  var reportCall = null;
+  var runUserActionCalled = false;
+  var popupRoot = {
+    querySelector: function (selector) {
+      if (selector === "[data-role='location-report-description']") {
+        return { value: "near the tunnel" };
+      }
+      if (selector === "[data-role='location-report-radius']") {
+        return { value: "250" };
+      }
+      return null;
+    },
+  };
+
+  var handled = app.__test__.handleMapPopupAction({
+    getAttribute: function (name) {
+      if (name === "data-action") {
+        return "popup-submit-location-report";
+      }
+      if (name === "data-latitude") {
+        return "56.94672";
+      }
+      if (name === "data-longitude") {
+        return "24.10589";
+      }
+      if (name === "data-radius-meters") {
+        return "100";
+      }
+      return "";
+    },
+    closest: function (selector) {
+      return selector === ".leaflet-popup" ? popupRoot : null;
+    },
+  }, {
+    runUserAction: async function (action) {
+      runUserActionCalled = true;
+      await action();
+    },
+    submitLocationReport: async function (payload) {
+      reportCall = payload;
+      return { message: "Reported.", kind: "success" };
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.equal(runUserActionCalled, true);
+  assert.deepEqual(reportCall, {
+    latitude: 56.94672,
+    longitude: 24.10589,
+    radiusMeters: 250,
+    description: "near the tunnel",
+  });
+});
+
+test("buildTrainStopPopupHTML exposes stop station reports when there is no live marker", function () {
   global.window.TRAIN_APP_CONFIG.mode = "mini-app";
   global.window.TRAIN_APP_CONFIG.stationCheckinEnabled = true;
   app.__test__.resetState({
     authenticated: true,
     messages: {
       btn_checkin_confirm: "Check in",
+      btn_report_inspection: "Report inspection",
     },
   });
 
@@ -2473,15 +2802,18 @@ test("buildTrainStopPopupHTML stays informational when there is no live marker",
   }, [], false);
 
   assert.doesNotMatch(html, /popup-checkin-train/);
+  assert.match(html, /popup-report-station/);
+  assert.match(html, /data-station-id="riga"/);
 });
 
-test("buildTrainStopPopupHTML stays informational when a live marker is available", function () {
+test("buildTrainStopPopupHTML exposes stop station reports when a live marker is available", function () {
   global.window.TRAIN_APP_CONFIG.mode = "mini-app";
   global.window.TRAIN_APP_CONFIG.stationCheckinEnabled = true;
   app.__test__.resetState({
     authenticated: true,
     messages: {
       btn_checkin_confirm: "Check in",
+      btn_report_inspection: "Report inspection",
     },
   });
 
@@ -2498,15 +2830,18 @@ test("buildTrainStopPopupHTML stays informational when a live marker is availabl
   }, [], true);
 
   assert.doesNotMatch(html, /popup-checkin-train/);
+  assert.match(html, /popup-report-station/);
+  assert.match(html, /data-station-id="riga"/);
 });
 
-test("buildTrainStopPopupHTML stays informational for expired stops on the map", function () {
+test("buildTrainStopPopupHTML exposes stop station reports for expired stops on the map", function () {
   global.window.TRAIN_APP_CONFIG.mode = "mini-app";
   global.window.TRAIN_APP_CONFIG.stationCheckinEnabled = true;
   app.__test__.resetState({
     authenticated: true,
     messages: {
       btn_checkin_confirm: "Check in",
+      btn_report_inspection: "Report inspection",
     },
   });
 
@@ -2523,6 +2858,8 @@ test("buildTrainStopPopupHTML stays informational for expired stops on the map",
   }, [], false);
 
   assert.doesNotMatch(html, /popup-checkin-train/);
+  assert.match(html, /popup-report-station/);
+  assert.match(html, /data-station-id="riga"/);
 });
 
 test("alignMiniMapToSelectedTrain pins the map target and resumes follow", function () {
@@ -2780,7 +3117,315 @@ test("network map config renders only live train markers in live-only mode", fun
   }
 });
 
-test("train map config renders only the selected live train marker in live-only mode", function () {
+test("network map config combines station, sighting, and live train markers from the public map payload", function () {
+  var originalNow = Date.now;
+  var originalFeedApi = global.window.TrainExternalFeed;
+  Date.now = function () {
+    return Date.parse("2026-03-10T10:00:00Z");
+  };
+  global.window.TrainExternalFeed = {
+    createLocalTrainMatcher: function (localItems) {
+      return function (externalTrain) {
+        var match = localItems.find(function (item) {
+          var train = item && item.train ? item.train : item;
+          return train && train.trainNumber === externalTrain.trainNumber;
+        }) || null;
+        if (!match) {
+          return null;
+        }
+        return {
+          match: match,
+          localTrainId: match.train.id,
+          matchType: "exact-id",
+        };
+      };
+    },
+    normalizeStationKey: function (value) {
+      return String(value || "").trim().toLowerCase();
+    },
+    stableExternalTrainIdentity: function (value) {
+      return String((value && value.routeId) || (value && value.trainNumber) || "");
+    },
+  };
+
+  app.__test__.resetState({
+    publicDashboardAll: [
+      {
+        train: {
+          id: "train-6321",
+          serviceDate: "2026-03-10",
+          trainNumber: "6321",
+          fromStation: "Riga",
+          toStation: "Jelgava",
+          departureAt: "2026-03-10T09:10:00Z",
+        },
+        status: {
+          state: "INSPECTION_STARTED",
+          uniqueReporters: 2,
+        },
+        timeline: [
+          { at: "2026-03-10T09:57:00Z", signal: "INSPECTION_STARTED" },
+        ],
+        stationSightings: [],
+      },
+    ],
+    externalFeed: {
+      enabled: true,
+      connectionState: "live",
+      routes: [],
+      liveTrains: [
+        {
+          routeId: "route-6321",
+          serviceDate: "2026-03-10",
+          trainNumber: "6321",
+          position: { lat: 56.95, lng: 24.1 },
+          updatedAt: "2026-03-10T09:59:00Z",
+          isGpsActive: true,
+          currentStop: { title: "Riga", stationId: "riga" },
+          nextStop: { title: "Jelgava", stationId: "jelgava" },
+        },
+      ],
+      activeStops: [],
+      lastGraphAt: "",
+      lastMessageAt: "",
+      error: "",
+    },
+  });
+
+  try {
+    var config = app.__test__.buildNetworkMapConfig({
+      stations: [
+        { id: "riga", name: "Riga", latitude: 56.95, longitude: 24.1 },
+        { id: "jelgava", name: "Jelgava", latitude: 56.65, longitude: 23.72 },
+      ],
+      recentSightings: [
+        {
+          stationId: "riga",
+          stationName: "Riga",
+          matchedTrainInstanceId: "train-6321",
+          createdAt: "2026-03-10T09:58:00Z",
+        },
+      ],
+    }, { zoom: 14, visibleHeightMeters: 500 });
+
+    assert.deepEqual(config.baseMarkers.map(function (marker) {
+      return marker.markerKey;
+    }), ["network-station:riga", "network-station:jelgava"]);
+    assert.equal(config.sightingMarkers.length, 1);
+    assert.match(config.sightingMarkers[0].markerKey, /^sighting:riga:/);
+    assert.equal(config.trainMarkers.length, 1);
+    assert.equal(config.trainMarkers[0].markerKey, "live-train:route-6321");
+    assert.match(config.baseMarkers[0].popupHTML, /Recent sightings/);
+    assert.ok(config.bounds.length >= 3);
+  } finally {
+    Date.now = originalNow;
+    global.window.TrainExternalFeed = originalFeedApi;
+  }
+});
+
+test("network map config renders active vague location incidents", function () {
+  app.__test__.resetState({
+    publicMapMode: "all",
+    publicIncidents: [{
+      id: "area:5694672,2410589,100,tunnel:2026-05-08",
+      scope: "area",
+      subjectName: "near the station tunnel",
+      active: true,
+      location: {
+        kind: "area",
+        latitude: 56.94672,
+        longitude: 24.10589,
+        radiusMeters: 100,
+        description: "near the station tunnel",
+      },
+    }],
+  });
+
+  var config = app.__test__.buildNetworkMapConfig({
+    stations: [],
+    recentSightings: [],
+    sameDaySightings: [],
+  }, { zoom: 14 });
+
+  var marker = config.sightingMarkers.find(function (item) {
+    return item.markerKey === "area-incident:area:5694672,2410589,100,tunnel:2026-05-08";
+  });
+  var circle = config.sightingMarkers.find(function (item) {
+    return item.markerKey === "area-circle:area:5694672,2410589,100,tunnel:2026-05-08";
+  });
+  assert.ok(circle);
+  assert.equal(circle.kind, "circle");
+  assert.equal(circle.options.radius, 100);
+  assert.ok(marker);
+  assert.deepEqual(marker.latLng, [56.94672, 24.10589]);
+  assert.match(marker.popupHTML, /near the station tunnel/);
+  assert.match(marker.popupHTML, /100 m/);
+});
+
+test("network map config attaches active station and train incidents to matching markers", function () {
+  var originalNow = Date.now;
+  var originalFeedApi = global.window.TrainExternalFeed;
+  Date.now = function () {
+    return Date.parse("2026-03-10T10:00:00Z");
+  };
+  global.window.TrainExternalFeed = {
+    createLocalTrainMatcher: function (localItems) {
+      return function (externalTrain) {
+        var match = localItems.find(function (item) {
+          var train = item && item.train ? item.train : item;
+          return train && train.trainNumber === externalTrain.trainNumber;
+        }) || null;
+        return match ? {
+          match: match,
+          localTrainId: match.train.id,
+          matchType: "exact-id",
+        } : null;
+      };
+    },
+    normalizeStationKey: function (value) {
+      return String(value || "").trim().toLowerCase();
+    },
+    stableExternalTrainIdentity: function (value) {
+      return String((value && value.routeId) || (value && value.trainNumber) || "");
+    },
+  };
+
+  app.__test__.resetState({
+    publicDashboardAll: [{
+      train: {
+        id: "train-6321",
+        serviceDate: "2026-03-10",
+        trainNumber: "6321",
+        fromStation: "Riga",
+        toStation: "Jelgava",
+        departureAt: "2026-03-10T09:10:00Z",
+      },
+      status: { state: "NO_REPORTS", uniqueReporters: 0 },
+      timeline: [],
+      stationSightings: [],
+    }],
+    publicIncidents: [
+      {
+        id: "station:riga:2026-03-10-report",
+        scope: "station",
+        subjectId: "riga",
+        subjectName: "Riga station",
+        lastActivityName: "Controle sighted",
+        lastActivityAt: "2026-03-10T09:58:00Z",
+        active: true,
+        votes: { ongoing: 1, cleared: 0 },
+      },
+      {
+        id: "station:riga:2026-03-10-train-train-6321",
+        scope: "station",
+        subjectId: "riga",
+        subjectName: "Riga platform",
+        lastActivityName: "Controle sighted",
+        lastActivityAt: "2026-03-10T09:58:30Z",
+        active: true,
+        mapTarget: {
+          type: "train",
+          trainInstanceId: "train-6321",
+        },
+        votes: { ongoing: 1, cleared: 0 },
+      },
+      {
+        id: "train:train-6321:2026-03-10-route",
+        scope: "train",
+        subjectId: "route:riga-jelgava",
+        subjectName: "Train incident",
+        lastActivityName: "Inspection started",
+        lastActivityAt: "2026-03-10T09:59:00Z",
+        active: true,
+        votes: { ongoing: 2, cleared: 1 },
+      },
+    ],
+    externalFeed: {
+      enabled: true,
+      connectionState: "live",
+      routes: [],
+      liveTrains: [{
+        routeId: "route-6321",
+        serviceDate: "2026-03-10",
+        trainNumber: "6321",
+        position: { lat: 56.95, lng: 24.1 },
+        updatedAt: "2026-03-10T09:59:00Z",
+        isGpsActive: true,
+        currentStop: { title: "Riga", stationId: "riga" },
+        nextStop: { title: "Jelgava", stationId: "jelgava" },
+      }],
+      activeStops: [],
+      lastGraphAt: "",
+      lastMessageAt: "",
+      error: "",
+    },
+  });
+
+  try {
+    var config = app.__test__.buildNetworkMapConfig({
+      stations: [
+        { id: "riga", name: "Riga", latitude: 56.95, longitude: 24.1 },
+      ],
+      recentSightings: [],
+      sameDaySightings: [],
+    }, { zoom: 14, visibleHeightMeters: 500 });
+
+    var stationMarker = config.baseMarkers.find(function (marker) {
+      return marker.markerKey === "network-station:riga";
+    });
+    assert.ok(stationMarker);
+    assert.match(stationMarker.html, /map-marker-count/);
+    assert.match(stationMarker.popupHTML, /Riga station/);
+    assert.match(stationMarker.popupHTML, /popup-open-incident/);
+
+    assert.equal(config.trainMarkers.length, 1);
+    assert.match(config.trainMarkers[0].html, /map-marker-count/);
+    assert.match(config.trainMarkers[0].popupHTML, /Train incident/);
+    assert.match(config.trainMarkers[0].popupHTML, /Riga platform/);
+    assert.match(config.trainMarkers[0].popupHTML, /popup-open-incident/);
+    assert.deepEqual(config.trainMarkers[0].incidentIds, [
+      "station:riga:2026-03-10-train-train-6321",
+      "train:train-6321:2026-03-10-route",
+    ]);
+  } finally {
+    Date.now = originalNow;
+    global.window.TrainExternalFeed = originalFeedApi;
+  }
+});
+
+test("network map config keeps active vague location incidents visible at detail zoom", function () {
+  app.__test__.resetState({
+    publicMapMode: "all",
+    publicIncidents: [{
+      id: "area:5694672,2410589,tunnel:2026-05-08",
+      scope: "area",
+      subjectName: "near the station tunnel",
+      active: true,
+      location: {
+        kind: "area",
+        latitude: 56.94672,
+        longitude: 24.10589,
+        radiusMeters: 250,
+        description: "near the station tunnel",
+      },
+    }],
+  });
+
+  var config = app.__test__.buildNetworkMapConfig({
+    stations: [],
+    recentSightings: [],
+    sameDaySightings: [],
+  }, { zoom: 15 });
+
+  var circle = config.sightingMarkers.find(function (item) {
+    return item.markerKey === "area-circle:area:5694672,2410589,tunnel:2026-05-08";
+  });
+  assert.ok(circle);
+  assert.equal(circle.kind, "circle");
+  assert.equal(circle.options.radius, 250);
+});
+
+test("train map config renders stop context with the selected live train marker", function () {
   var originalNow = Date.now;
   var originalFeedApi = global.window.TrainExternalFeed;
   Date.now = function () {
@@ -2862,12 +3507,123 @@ test("train map config renders only the selected live train marker in live-only 
       ],
     }, { zoom: 14, visibleHeightMeters: 525 });
 
-    assert.equal(config.baseMarkers.length, 0);
-    assert.equal(config.sightingMarkers.length, 0);
-    assert.deepEqual(config.polyline, []);
+    assert.deepEqual(config.baseMarkers.map(function (marker) {
+      return marker.markerKey;
+    }), ["train-stop:2026-03-10-train-7104:riga:0"]);
+    assert.equal(config.sightingMarkers.length, 1);
+    assert.deepEqual(config.polyline, [[56.95, 24.1]]);
     assert.equal(config.trainMarkers.length, 1);
     assert.equal(config.trainMarkers[0].markerKey, "live-train:route-7104");
     assert.equal(config.trainMarkers[0].animateMovement, false);
+  } finally {
+    Date.now = originalNow;
+    global.window.TrainExternalFeed = originalFeedApi;
+  }
+});
+
+test("train map config renders the selected train route, stop markers, sighting events, and live train marker", function () {
+  var originalNow = Date.now;
+  var originalFeedApi = global.window.TrainExternalFeed;
+  Date.now = function () {
+    return Date.parse("2026-03-10T10:00:00Z");
+  };
+  global.window.TrainExternalFeed = {
+    createLocalTrainMatcher: function (localItems) {
+      return function (externalTrain) {
+        var match = localItems.find(function (item) {
+          var train = item && item.train ? item.train : item;
+          return train && train.trainNumber === externalTrain.trainNumber;
+        }) || null;
+        if (!match) {
+          return null;
+        }
+        return {
+          match: match,
+          localTrainId: match.id,
+          matchType: "exact-id",
+        };
+      };
+    },
+    normalizeStationKey: function (value) {
+      return String(value || "").trim().toLowerCase();
+    },
+    stableExternalTrainIdentity: function (value) {
+      return String((value && value.routeId) || (value && value.trainNumber) || "");
+    },
+  };
+
+  app.__test__.resetState({
+    mapTrainDetail: null,
+    externalFeed: {
+      enabled: true,
+      connectionState: "live",
+      routes: [],
+      liveTrains: [
+        {
+          routeId: "route-7104",
+          serviceDate: "2026-03-10",
+          trainNumber: "7104",
+          position: { lat: 56.95, lng: 24.1 },
+          updatedAt: "2026-03-10T09:59:00Z",
+          isGpsActive: true,
+        },
+      ],
+      activeStops: [],
+      lastGraphAt: "",
+      lastMessageAt: "",
+      error: "",
+    },
+  });
+
+  try {
+    var config = app.__test__.buildTrainMapConfig({
+      train: {
+        id: "2026-03-10-train-7104",
+        serviceDate: "2026-03-10",
+        trainNumber: "7104",
+        fromStation: "Riga",
+        toStation: "Jelgava",
+        departureAt: "2026-03-10T09:10:00Z",
+      },
+      stops: [
+        {
+          stationId: "riga",
+          stationName: "Riga",
+          latitude: 56.95,
+          longitude: 24.1,
+          departureAt: "2026-03-10T09:10:00Z",
+        },
+        {
+          stationId: "jelgava",
+          stationName: "Jelgava",
+          latitude: 56.65,
+          longitude: 23.72,
+          arrivalAt: "2026-03-10T10:05:00Z",
+        },
+      ],
+      stationSightings: [
+        {
+          stationId: "riga",
+          stationName: "Riga",
+          matchedTrainInstanceId: "2026-03-10-train-7104",
+          createdAt: "2026-03-10T09:58:00Z",
+        },
+      ],
+    }, { zoom: 14, visibleHeightMeters: 500 });
+
+    assert.deepEqual(config.baseMarkers.map(function (marker) {
+      return marker.markerKey;
+    }), [
+      "train-stop:2026-03-10-train-7104:riga:0",
+      "train-stop:2026-03-10-train-7104:jelgava:1",
+    ]);
+    assert.deepEqual(config.polyline, [[56.95, 24.1], [56.65, 23.72]]);
+    assert.equal(config.sightingMarkers.length, 1);
+    assert.match(config.sightingMarkers[0].markerKey, /^sighting:riga:/);
+    assert.equal(config.trainMarkers.length, 1);
+    assert.equal(config.trainMarkers[0].markerKey, "live-train:route-7104");
+    assert.match(config.baseMarkers[0].popupHTML, /Riga/);
+    assert.ok(config.bounds.length >= 3);
   } finally {
     Date.now = originalNow;
     global.window.TrainExternalFeed = originalFeedApi;
@@ -3399,7 +4155,9 @@ test("selected train map keeps projection-majority trains visible with projectio
       stationSightings: [],
     }, { zoom: 14, visibleHeightMeters: 400 });
 
-    assert.equal(config.baseMarkers.length, 0);
+    assert.deepEqual(config.baseMarkers.map(function (marker) {
+      return marker.markerKey;
+    }), ["train-stop:2026-03-10-train-7104:riga:0"]);
     assert.equal(config.trainMarkers.length, 1);
     assert.equal(config.trainMarkers[0].markerKey, "live-train:route-scheduled");
     assert.match(config.trainMarkers[0].html, /gps-projection/);
@@ -3612,6 +4370,56 @@ test("map controller rebuilds only when the map shell changes", function () {
   assert.equal(resetCalls, 1);
   assert.equal(updateCalls, 2);
   assert.equal(scheduleCalls, 3);
+});
+
+test("public map sync retries when Leaflet loads after the shell renders", function () {
+  var originalLeaflet = global.window.L;
+  var originalSetTimeout = global.window.setTimeout;
+  var originalClearTimeout = global.window.clearTimeout;
+  var originalMode = global.window.TRAIN_APP_CONFIG.mode;
+  var originalSync = app.__test__.mapController.sync;
+  var originalApplyPublicMapFollow = app.__test__.applyPublicMapFollow;
+  var timers = [];
+  var syncCalls = [];
+
+  global.window.TRAIN_APP_CONFIG.mode = "public-network-map";
+  global.window.L = undefined;
+  global.window.setTimeout = function (fn) {
+    timers.push(fn);
+    return timers.length;
+  };
+  global.window.clearTimeout = function () {};
+  app.__test__.mapController.sync = function (containerId, mapModel) {
+    syncCalls.push({ containerId: containerId, mapModel: mapModel });
+  };
+
+  try {
+    app.__test__.resetState({
+      networkMapData: {
+        stations: [
+          { id: "riga", name: "Rīga", latitude: 56.95, longitude: 24.1 },
+        ],
+      },
+    });
+
+    app.__test__.syncActivePublicMap();
+    assert.equal(syncCalls.length, 0);
+    assert.equal(timers.length, 1);
+
+    global.window.L = {};
+    timers.shift()();
+
+    assert.deepEqual(syncCalls.map(function (call) {
+      return call.containerId;
+    }), ["public-network-map"]);
+  } finally {
+    global.window.L = originalLeaflet;
+    global.window.setTimeout = originalSetTimeout;
+    global.window.clearTimeout = originalClearTimeout;
+    global.window.TRAIN_APP_CONFIG.mode = originalMode;
+    app.__test__.mapController.sync = originalSync;
+    app.__test__.applyPublicMapFollow = originalApplyPublicMapFollow;
+  }
 });
 
 test("map controller pans focused markers to the map center", function () {
@@ -4999,6 +5807,7 @@ test("renderPublicDashboardStatusBar keeps map, incidents, and station exits", f
   assert.match(html, /href="\/map"/);
   assert.match(html, /href="\/events"/);
   assert.match(html, /href="\/stations"/);
+  assert.match(html, /href="https:\/\/kontrole\.info\/"/);
   assert.match(html, /Station search/);
   assert.ok(html.indexOf('href="/map"') < html.indexOf('href="/events"'));
   assert.ok(html.indexOf('href="/events"') < html.indexOf('href="/stations"'));
@@ -5023,6 +5832,7 @@ test("renderPublicMapStatusBar keeps status, departures, and incidents exits tog
   assert.match(html, /href="\/map"/);
   assert.match(html, /href="\/t\/train-1"/);
   assert.match(html, /href="\/events"/);
+  assert.match(html, /href="https:\/\/kontrole\.info\/"/);
   assert.doesNotMatch(html, /href="\/feed"/);
   assert.doesNotMatch(html, /href="\/stations"/);
   assert.match(html, /data-action="telegram-login"/);
@@ -5039,6 +5849,7 @@ test("renderPublicTrainStatusBar links back to the selected train map", function
   assert.match(html, /href="\/events"/);
   assert.match(html, /href="\/feed"/);
   assert.match(html, /href="\/stations"/);
+  assert.match(html, /href="https:\/\/kontrole\.info\/"/);
 });
 
 test("renderPublicStationStatusBar keeps map, incidents, departures, and refresh actions", function () {
@@ -5051,6 +5862,7 @@ test("renderPublicStationStatusBar keeps map, incidents, departures, and refresh
   assert.match(html, /href="\/map"/);
   assert.match(html, /href="\/events"/);
   assert.match(html, /href="\/feed"/);
+  assert.match(html, /href="https:\/\/kontrole\.info\/"/);
 });
 
 test("renderPublicIncidentsStatusBar exposes exits back to main public views", function () {
@@ -5061,6 +5873,7 @@ test("renderPublicIncidentsStatusBar exposes exits back to main public views", f
   assert.match(html, /href="\/feed"/);
   assert.match(html, /href="\/stations"/);
   assert.match(html, /href="\/map"/);
+  assert.match(html, /href="https:\/\/kontrole\.info\/"/);
   assert.doesNotMatch(html, /href="\/incidents"/);
 });
 
@@ -5079,6 +5892,8 @@ test("public status bars expose Telegram auth controls", function () {
   assert.match(signedOut, /data-action="site-language"/);
   assert.match(signedOut, /<option value="LV" selected>LV<\/option>/);
   assert.match(signedOut, /data-action="route-checkin-login"/);
+  assert.match(signedOut, /href="https:\/\/kontrole\.info\/"/);
+  assert.match(signedOut, /Classic control/);
   assert.match(signedOut, /href="\/events"/);
   assert.doesNotMatch(signedOut, /href="\/feed"/);
   assert.doesNotMatch(signedOut, /href="\/stations"/);
@@ -5107,6 +5922,8 @@ test("public status bars expose Telegram auth controls", function () {
   var signedIn = app.__test__.renderPublicNetworkMapStatusBar();
   assert.match(signedIn, /Amber Scout 101/);
   assert.match(signedIn, /data-action="telegram-logout"/);
+  assert.match(signedIn, /href="https:\/\/kontrole\.info\/"/);
+  assert.match(signedIn, /Classic control/);
   assert.match(signedIn, /Rīga - Jelgava - Liepāja/);
   assert.match(signedIn, /data-action="route-checkin-toggle"/);
   assert.doesNotMatch(signedIn, /data-action="route-checkin-route"/);
@@ -5165,6 +5982,272 @@ test("renderIncidentDetailPanel keeps the draft comment and clearer empty copy",
   assert.match(html, /No activity yet for this incident\./);
   assert.match(html, /No comments yet for this incident\./);
   assert.match(html, /button class="secondary small" data-action="incident-vote" data-incident-id="train:abc:ctx" data-value="ONGOING"/);
+  assert.match(html, /Not present/);
+  assert.doesNotMatch(html, /Cleared/);
+  assert.match(html, /data-action="open-incident-map"[^>]+data-incident-id="train:abc:ctx"/);
+  assert.match(html, /Show on map/);
+});
+
+test("navigateToIncidentMap sends station and train incidents to their map views", function () {
+  var originalLocation = global.window.location;
+  var assigned = [];
+
+  try {
+    global.window.TRAIN_APP_CONFIG.basePath = "";
+    global.window.location = {
+      href: "https://vilciens.kontrole.info/events?incident=station%3Ariga%3Actx",
+      pathname: "/events",
+      search: "?incident=station%3Ariga%3Actx",
+      hash: "",
+      assign: function (href) {
+        assigned.push(href);
+      },
+    };
+
+    app.__test__.resetState({
+      publicIncidentDetail: {
+        summary: {
+          id: "station:riga:ctx",
+          scope: "station",
+          subjectId: "riga",
+          subjectName: "Rīga",
+        },
+      },
+    });
+    app.__test__.navigateToIncidentMap("station:riga:ctx");
+    assert.equal(assigned.pop(), "/map?incident=station%3Ariga%3Actx");
+
+    app.__test__.resetState({
+      publicIncidentDetail: {
+        summary: {
+          id: "train:train-6321:ctx",
+          scope: "train",
+          subjectId: "train-6321",
+          subjectName: "Rīga -> Jelgava",
+        },
+      },
+    });
+    app.__test__.navigateToIncidentMap("train:train-6321:ctx");
+    assert.equal(assigned.pop(), "/map?incident=train%3Atrain-6321%3Actx");
+  } finally {
+    global.window.location = originalLocation;
+  }
+});
+
+test("focusRequestedIncidentFromURL opens a matching train incident marker on the network map", function () {
+  var originalLocation = global.window.location;
+  var controller = app.__test__.mapController;
+  var panCalls = [];
+
+  try {
+    global.window.location = {
+      href: "https://vilciens.kontrole.info/map?incident=train%3Atrain-6321%3Actx",
+      pathname: "/map",
+      search: "?incident=train%3Atrain-6321%3Actx",
+      hash: "",
+    };
+    app.__test__.resetState({
+      publicIncidents: [{
+        id: "train:train-6321:ctx",
+        scope: "train",
+        subjectId: "route:riga-jelgava",
+        subjectName: "Train incident",
+      }],
+    });
+    controller.map = {
+      panTo: function (latLng, options) {
+        panCalls.push({ latLng: latLng, options: options });
+      },
+      getZoom: function () {
+        return 13;
+      },
+    };
+    controller.detailLayerEl = {
+      innerHTML: "",
+      hidden: true,
+    };
+    controller.markerState.set("live-train:route-6321", {
+      item: {
+        markerKey: "live-train:route-6321",
+        latLng: [56.95, 24.1],
+        incidentIds: ["train:train-6321:ctx"],
+        popupHTML: "<strong>Train incident</strong>",
+        interaction: {
+          entityKey: "live-train:route-6321",
+          detailHTML: "<strong>Train incident</strong>",
+          selectionOptions: {},
+        },
+      },
+      marker: {
+        getLatLng: function () {
+          return [56.95, 24.1];
+        },
+      },
+    });
+
+    assert.equal(app.__test__.focusRequestedIncidentFromURL({ animate: false }), true);
+    assert.equal(app.__test__.getState().mapOpenDetailKey, "live-train:route-6321");
+    assert.deepEqual(panCalls[0], {
+      latLng: [56.95, 24.1],
+      options: { animate: false },
+    });
+  } finally {
+    global.window.location = originalLocation;
+    controller.map = null;
+    controller.detailLayerEl = null;
+  }
+});
+
+test("focusRequestedIncidentFromURL prefers an explicit train target over the station marker", function () {
+  var originalLocation = global.window.location;
+  var controller = app.__test__.mapController;
+  var panCalls = [];
+
+  try {
+    global.window.location = {
+      href: "https://vilciens.kontrole.info/map?incident=station%3Ariga%3Actx",
+      pathname: "/map",
+      search: "?incident=station%3Ariga%3Actx",
+      hash: "",
+    };
+    app.__test__.resetState({
+      publicIncidents: [{
+        id: "station:riga:ctx",
+        scope: "station",
+        subjectId: "riga",
+        subjectName: "Riga platform",
+        mapTarget: {
+          type: "train",
+          trainInstanceId: "train-6321",
+        },
+      }],
+    });
+    controller.map = {
+      panTo: function (latLng, options) {
+        panCalls.push({ latLng: latLng, options: options });
+      },
+      getZoom: function () {
+        return 13;
+      },
+    };
+    controller.detailLayerEl = {
+      innerHTML: "",
+      hidden: true,
+    };
+    controller.markerState.set("network-station:riga", {
+      item: {
+        markerKey: "network-station:riga",
+        latLng: [56.95, 24.1],
+        incidentIds: ["station:riga:ctx"],
+        popupHTML: "<strong>Riga platform</strong>",
+        interaction: {
+          entityKey: "network-station:riga",
+          detailHTML: "<strong>Riga platform</strong>",
+          selectionOptions: {},
+        },
+      },
+      marker: {
+        getLatLng: function () {
+          return [56.95, 24.1];
+        },
+      },
+    });
+    controller.markerState.set("live-train:route-6321", {
+      item: {
+        markerKey: "live-train:route-6321",
+        latLng: [56.96, 24.12],
+        incidentIds: ["station:riga:ctx"],
+        popupHTML: "<strong>Riga platform</strong>",
+        interaction: {
+          entityKey: "live-train:route-6321",
+          detailHTML: "<strong>Riga platform</strong>",
+          selectionOptions: {},
+        },
+      },
+      marker: {
+        getLatLng: function () {
+          return [56.96, 24.12];
+        },
+      },
+    });
+    controller.baseMarkerKeys.add("network-station:riga");
+    controller.trainMarkerKeys.add("live-train:route-6321");
+
+    assert.equal(app.__test__.focusRequestedIncidentFromURL({ animate: false }), true);
+    assert.equal(app.__test__.getState().mapOpenDetailKey, "live-train:route-6321");
+    assert.deepEqual(panCalls[0], {
+      latLng: [56.96, 24.12],
+      options: { animate: false },
+    });
+  } finally {
+    global.window.location = originalLocation;
+    controller.map = null;
+    controller.detailLayerEl = null;
+  }
+});
+
+test("focusRequestedIncidentFromURL opens the matching station marker on the network map", function () {
+  var originalLocation = global.window.location;
+  var controller = app.__test__.mapController;
+  var panCalls = [];
+
+  try {
+    global.window.location = {
+      href: "https://vilciens.kontrole.info/map?incident=station%3Ariga%3Actx",
+      pathname: "/map",
+      search: "?incident=station%3Ariga%3Actx",
+      hash: "",
+    };
+    app.__test__.resetState({
+      networkMapData: {
+        stations: [
+          { id: "riga", name: "Rīga", latitude: 56.95, longitude: 24.1 },
+        ],
+      },
+    });
+    controller.map = {
+      panTo: function (latLng, options) {
+        panCalls.push({ latLng: latLng, options: options });
+      },
+      getZoom: function () {
+        return 13;
+      },
+    };
+    controller.detailLayerEl = {
+      innerHTML: "",
+      hidden: true,
+    };
+    controller.markerState.set("network-station:riga", {
+      item: {
+        markerKey: "network-station:riga",
+        latLng: [56.95, 24.1],
+        popupHTML: "<strong>Rīga</strong>",
+        interaction: {
+          entityKey: "network-station:riga",
+          detailHTML: "<strong>Rīga</strong>",
+          selectionOptions: {},
+        },
+      },
+      marker: {
+        getLatLng: function () {
+          return [56.95, 24.1];
+        },
+      },
+    });
+
+    assert.equal(app.__test__.focusRequestedIncidentFromURL({ animate: false }), true);
+    assert.equal(app.__test__.getState().mapOpenDetailKey, "network-station:riga");
+    assert.equal(app.__test__.getState().mapIncidentFocusAppliedId, "station:riga:ctx");
+    assert.deepEqual(panCalls[0], {
+      latLng: [56.95, 24.1],
+      options: { animate: false },
+    });
+    assert.equal(app.__test__.focusRequestedIncidentFromURL({ animate: false }), false);
+  } finally {
+    global.window.location = originalLocation;
+    controller.map = null;
+    controller.detailLayerEl = null;
+  }
 });
 
 test("public incident list and detail show loaders before empty copy", function () {
@@ -5392,6 +6475,71 @@ test("submitReport returns affirmative success feedback for normal report button
   ]);
 });
 
+test("submitReport keeps accepted feedback when selected train status is not found", async function () {
+  var originalFetch = global.fetch;
+  var fetchCalls = [];
+
+  try {
+    await withAppConfig({ basePath: "/pixel-stack/train" }, async function () {
+      global.fetch = async function (url, options) {
+        fetchCalls.push({ url: url, method: options && options.method });
+        if (url === "/pixel-stack/train/api/v1/trains/live-only-6321/reports" && options && options.method === "POST") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({ accepted: true, incidentId: "train:live-only-6321:ctx" });
+            },
+          };
+        }
+        if (url === "/pixel-stack/train/api/v1/me") {
+          return {
+            ok: true,
+            status: 200,
+            text: async function () {
+              return JSON.stringify({ nickname: "Amber Scout 101" });
+            },
+          };
+        }
+        if (url === "/pixel-stack/train/api/v1/trains/live-only-6321/status") {
+          return {
+            ok: false,
+            status: 404,
+            text: async function () {
+              return JSON.stringify({ error: "not found" });
+            },
+          };
+        }
+        throw new Error("unexpected fetch " + url);
+      };
+
+      app.__test__.resetState({
+        authenticated: true,
+        selectedTrain: {
+          trainCard: {
+            train: { id: "live-only-6321" },
+          },
+        },
+      });
+      await app.__test__.runUserAction(function () {
+        return app.__test__.submitReport("INSPECTION_STARTED", "live-only-6321");
+      }, function (result) {
+        return result;
+      });
+
+      assert.match(app.__test__.renderToast(), /Report accepted\./);
+    });
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.deepEqual(fetchCalls.map(function (entry) { return entry.url; }), [
+    "/pixel-stack/train/api/v1/trains/live-only-6321/reports",
+    "/pixel-stack/train/api/v1/me",
+    "/pixel-stack/train/api/v1/trains/live-only-6321/status",
+  ]);
+});
+
 test("incident vote and comment use specific success toasts", async function () {
   var originalFetch = global.fetch;
   var fetchCalls = [];
@@ -5574,6 +6722,31 @@ test("public network map panel omits sighting controls in live-only mode", funct
   assert.doesNotMatch(html, /public-network-map-sightings-card/);
 });
 
+test("public network map panel shows station event controls when station data is loaded", function () {
+  global.window.TRAIN_APP_CONFIG.mode = "public-network-map";
+
+  app.__test__.resetState({
+    networkMapData: {
+      stations: [
+        { id: "riga", name: "Riga", latitude: 56.95, longitude: 24.1 },
+      ],
+      recentSightings: [
+        {
+          stationId: "riga",
+          stationName: "Riga",
+          createdAt: "2026-03-10T09:58:00Z",
+        },
+      ],
+      sameDaySightings: [],
+    },
+  });
+  var html = app.__test__.renderPublicNetworkMapPanel();
+
+  assert.match(html, /Show older and unrelated sightings/);
+  assert.match(html, /Recent platform sightings/);
+  assert.match(html, /public-network-map-sightings-card/);
+});
+
 test("mini network map content omits sighting controls in live-only mode", function () {
   global.window.TRAIN_APP_CONFIG.mode = "mini-app";
 
@@ -5599,22 +6772,40 @@ test("mini network map content omits sighting controls in live-only mode", funct
   assert.doesNotMatch(html, /mini-network-map-sightings-card/);
 });
 
-test("refreshNetworkMapData no longer fetches the legacy public map payload", async function () {
+test("refreshNetworkMapData loads the public map payload for station and sighting context", async function () {
   var originalFetch = global.fetch;
   global.fetch = function () {
-    throw new Error("legacy public map should not be fetched");
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: function () {
+        return Promise.resolve(JSON.stringify({
+          stations: [
+            { id: "riga", name: "Riga", latitude: 56.95, longitude: 24.1 },
+          ],
+          recentSightings: [
+            { stationId: "riga", stationName: "Riga", createdAt: "2026-03-10T09:58:00Z" },
+          ],
+          sameDaySightings: [],
+          schedule: { available: true },
+        }));
+      },
+    });
   };
 
   try {
-    app.__test__.resetState({
-      networkMapData: null,
-    });
+    await withAppConfig({ basePath: "/pixel-stack/train" }, async function () {
+      app.__test__.resetState({
+        networkMapData: null,
+      });
 
-    var changed = await app.__test__.refreshNetworkMapData(true);
+      var changed = await app.__test__.refreshNetworkMapData(true);
 
-    assert.equal(changed, true);
-    assert.deepEqual(app.__test__.getState().networkMapData, {
-      liveOnly: true,
+      assert.equal(changed, true);
+      assert.deepEqual(app.__test__.getState().networkMapData.stations.map(function (station) {
+        return station.id;
+      }), ["riga"]);
+      assert.equal(app.__test__.getState().networkMapData.recentSightings.length, 1);
     });
   } finally {
     global.fetch = originalFetch;
@@ -5770,24 +6961,45 @@ test("refreshMapData starts the server stop and status requests in parallel", as
   }
 });
 
-test("refreshNetworkMapData clears the loader immediately after seeding live-only state", async function () {
-  await withAppConfig({
-    mode: "mini-app",
-    spacetimeHost: "https://stdb.example",
-    spacetimeDatabase: "train-db",
-  }, async function () {
-    app.__test__.resetState({
-      networkMapData: null,
+test("refreshNetworkMapData clears the loader after loading station context", async function () {
+  var originalFetch = global.fetch;
+  global.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: function () {
+        return Promise.resolve(JSON.stringify({
+          stations: [
+            { id: "riga", name: "Riga", latitude: 56.95, longitude: 24.1 },
+          ],
+          recentSightings: [],
+          sameDaySightings: [],
+          schedule: { available: true },
+        }));
+      },
     });
+  };
 
-    var changed = await app.__test__.refreshNetworkMapData(true);
+  try {
+    await withAppConfig({
+      mode: "mini-app",
+      basePath: "/pixel-stack/train",
+      spacetimeHost: "https://stdb.example",
+      spacetimeDatabase: "train-db",
+    }, async function () {
+      app.__test__.resetState({
+        networkMapData: null,
+      });
 
-    assert.equal(changed, true);
-    assert.equal(app.__test__.getState().mapLoadState.active, false);
-    assert.deepEqual(app.__test__.getState().networkMapData, {
-      liveOnly: true,
+      var changed = await app.__test__.refreshNetworkMapData(true);
+
+      assert.equal(changed, true);
+      assert.equal(app.__test__.getState().mapLoadState.active, false);
+      assert.equal(app.__test__.getState().networkMapData.stations[0].id, "riga");
     });
-  });
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("refreshPublicIncidents loads incidents from the server and refreshes the selected detail", async function () {

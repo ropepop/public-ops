@@ -1202,6 +1202,94 @@ func (s *SpacetimeStore) ListRecentStationSightingsByTrain(ctx context.Context, 
 	}, limit)
 }
 
+func (s *SpacetimeStore) InsertLocationReport(ctx context.Context, e domain.LocationReport) error {
+	var (
+		activity *spacetime.TrainbotActivityRow
+		err      error
+	)
+	scope := strings.TrimSpace(e.Scope)
+	if scope == "area" {
+		activity, err = s.ensureAreaActivity(ctx, e.SubjectID, e.SubjectName, e.CreatedAt)
+	} else {
+		activity, err = s.ensureStationActivity(ctx, e.SubjectID, e.SubjectName, e.CreatedAt)
+	}
+	if err != nil {
+		return err
+	}
+	rider, err := s.ensureRider(ctx, e.UserID)
+	if err != nil {
+		return err
+	}
+	stationID := ""
+	stationName := ""
+	if scope != "area" {
+		stationID = strings.TrimSpace(e.SubjectID)
+		stationName = firstNonEmpty(strings.TrimSpace(e.SubjectName), s.stationName(ctx, stationID))
+	}
+	activity.Timeline = append(activity.Timeline, spacetime.TrainbotActivityEvent{
+		ID:                  strings.TrimSpace(e.ID),
+		Kind:                "location_report",
+		StableID:            spacetime.StableIDForTelegramUser(e.UserID),
+		Nickname:            rider.Nickname,
+		Name:                locationReportName(scope),
+		Detail:              strings.TrimSpace(e.Description),
+		CreatedAt:           e.CreatedAt.UTC().Format(time.RFC3339),
+		Signal:              encodeLocationReportSignal(e.Latitude, e.Longitude, e.RadiusMeters),
+		StationID:           stationID,
+		StationName:         stationName,
+		Latitude:            copyFloatPtr(e.Latitude),
+		Longitude:           copyFloatPtr(e.Longitude),
+		RadiusMeters:        e.RadiusMeters,
+		LocationDescription: strings.TrimSpace(e.Description),
+	})
+	return s.client.ServicePutActivity(ctx, *activity)
+}
+
+func (s *SpacetimeStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
+	activity, err := s.findLocationActivity(ctx, scope, subjectID, nil)
+	if err != nil || activity == nil {
+		return nil, err
+	}
+	stableID := spacetime.StableIDForTelegramUser(userID)
+	for _, event := range sortActivityTimeline(activity.Timeline) {
+		if event.Kind != "location_report" || event.StableID != stableID {
+			continue
+		}
+		item, err := locationReportEventToDomain(*activity, event)
+		if err != nil {
+			return nil, err
+		}
+		item.UserID = userID
+		return &item, nil
+	}
+	return nil, nil
+}
+
+func (s *SpacetimeStore) ListRecentLocationReports(ctx context.Context, since time.Time, limit int) ([]domain.LocationReport, error) {
+	stationItems, err := s.listLocationReports(ctx, spacetime.ListActivitiesFilter{
+		Since:     &since,
+		ScopeType: "station",
+	}, since, 0)
+	if err != nil {
+		return nil, err
+	}
+	areaItems, err := s.listLocationReports(ctx, spacetime.ListActivitiesFilter{
+		Since:     &since,
+		ScopeType: "area",
+	}, since, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := append(stationItems, areaItems...)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if limit <= 0 || limit >= len(out) {
+		return out, nil
+	}
+	return out[:limit], nil
+}
+
 func (s *SpacetimeStore) UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error {
 	activity, err := s.ensureIncidentActivity(ctx, vote.IncidentID, vote.UpdatedAt)
 	if err != nil {
@@ -1381,6 +1469,36 @@ func (s *SpacetimeStore) listStationSightings(ctx context.Context, filter spacet
 	return out[:limit], nil
 }
 
+func (s *SpacetimeStore) listLocationReports(ctx context.Context, filter spacetime.ListActivitiesFilter, since time.Time, limit int) ([]domain.LocationReport, error) {
+	activities, err := s.client.ServiceListActivities(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.LocationReport, 0)
+	for _, activity := range activities {
+		for _, event := range sortActivityTimeline(activity.Timeline) {
+			if event.Kind != "location_report" {
+				continue
+			}
+			item, err := locationReportEventToDomain(activity, event)
+			if err != nil {
+				return nil, err
+			}
+			if !since.IsZero() && item.CreatedAt.Before(since.UTC()) {
+				continue
+			}
+			out = append(out, item)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if limit <= 0 || limit >= len(out) {
+		return out, nil
+	}
+	return out[:limit], nil
+}
+
 func (s *SpacetimeStore) ensureRider(ctx context.Context, userID int64) (spacetime.TrainbotRiderRow, error) {
 	if rider, err := s.loadRider(ctx, userID); err != nil {
 		return spacetime.TrainbotRiderRow{}, err
@@ -1510,6 +1628,46 @@ func (s *SpacetimeStore) findStationActivity(ctx context.Context, stationID stri
 	return &activities[0], nil
 }
 
+func (s *SpacetimeStore) ensureAreaActivity(ctx context.Context, subjectID string, subjectName string, at time.Time) (*spacetime.TrainbotActivityRow, error) {
+	if activity, err := s.findLocationActivity(ctx, "area", subjectID, &at); err != nil {
+		return nil, err
+	} else if activity != nil {
+		return activity, nil
+	}
+	serviceDate := at.UTC().Format("2006-01-02")
+	row := &spacetime.TrainbotActivityRow{
+		ID:          fmt.Sprintf("area:%s:%s", strings.TrimSpace(subjectID), serviceDate),
+		ScopeType:   "area",
+		SubjectID:   strings.TrimSpace(subjectID),
+		SubjectName: firstNonEmpty(strings.TrimSpace(subjectName), strings.TrimSpace(subjectID)),
+		ServiceDate: serviceDate,
+		Summary:     spacetime.TrainbotActivitySummary{},
+		Timeline:    []spacetime.TrainbotActivityEvent{},
+		Comments:    []spacetime.TrainbotActivityComment{},
+		Votes:       []spacetime.TrainbotActivityVote{},
+	}
+	return row, nil
+}
+
+func (s *SpacetimeStore) findLocationActivity(ctx context.Context, scope string, subjectID string, at *time.Time) (*spacetime.TrainbotActivityRow, error) {
+	scope = strings.TrimSpace(scope)
+	if scope != "area" {
+		return s.findStationActivity(ctx, subjectID, at)
+	}
+	filter := spacetime.ListActivitiesFilter{
+		ScopeType: "area",
+		SubjectID: strings.TrimSpace(subjectID),
+	}
+	if at != nil {
+		filter.ServiceDate = at.UTC().Format("2006-01-02")
+	}
+	activities, err := s.client.ServiceListActivities(ctx, filter)
+	if err != nil || len(activities) == 0 {
+		return nil, err
+	}
+	return &activities[0], nil
+}
+
 func (s *SpacetimeStore) ensureIncidentActivity(ctx context.Context, incidentID string, at time.Time) (*spacetime.TrainbotActivityRow, error) {
 	if activity, err := s.findIncidentActivity(ctx, incidentID, &at); err != nil {
 		return nil, err
@@ -1522,6 +1680,8 @@ func (s *SpacetimeStore) ensureIncidentActivity(ctx context.Context, incidentID 
 		return s.ensureTrainActivity(ctx, subjectID, at)
 	case "station":
 		return s.ensureStationActivity(ctx, subjectID, s.stationName(ctx, subjectID), at)
+	case "area":
+		return s.ensureAreaActivity(ctx, subjectID, subjectID, at)
 	default:
 		return nil, fmt.Errorf("unsupported incident id %q", incidentID)
 	}
@@ -1547,6 +1707,8 @@ func (s *SpacetimeStore) findIncidentActivity(ctx context.Context, incidentID st
 		}
 	case "station":
 		return s.findStationActivity(ctx, subjectID, at)
+	case "area":
+		return s.findLocationActivity(ctx, "area", subjectID, at)
 	}
 	return nil, nil
 }
@@ -1755,6 +1917,99 @@ func stationSightingEventToDomain(event spacetime.TrainbotActivityEvent) (domain
 		item.MatchedTrainInstanceID = &matchedTrainID
 	}
 	return item, nil
+}
+
+func locationReportEventToDomain(activity spacetime.TrainbotActivityRow, event spacetime.TrainbotActivityEvent) (domain.LocationReport, error) {
+	createdAt, err := time.Parse(time.RFC3339, strings.TrimSpace(event.CreatedAt))
+	if err != nil {
+		return domain.LocationReport{}, err
+	}
+	var userID int64
+	if parsed, ok := spacetime.TelegramUserIDFromStableID(event.StableID); ok {
+		userID = parsed
+	}
+	scope := strings.TrimSpace(activity.ScopeType)
+	if scope != "area" {
+		scope = "station"
+	}
+	subjectID := strings.TrimSpace(activity.SubjectID)
+	subjectName := strings.TrimSpace(activity.SubjectName)
+	if scope == "station" {
+		subjectID = firstNonEmpty(strings.TrimSpace(event.StationID), subjectID)
+		subjectName = firstNonEmpty(strings.TrimSpace(event.StationName), subjectName)
+	}
+	description := firstNonEmpty(strings.TrimSpace(event.LocationDescription), strings.TrimSpace(event.Detail))
+	latitude := copyFloatPtr(event.Latitude)
+	longitude := copyFloatPtr(event.Longitude)
+	radiusMeters := event.RadiusMeters
+	if signal, ok := decodeLocationReportSignal(event.Signal); ok {
+		if latitude == nil {
+			latitude = copyFloatPtr(signal.Latitude)
+		}
+		if longitude == nil {
+			longitude = copyFloatPtr(signal.Longitude)
+		}
+		if radiusMeters <= 0 {
+			radiusMeters = signal.RadiusMeters
+		}
+	}
+	return domain.LocationReport{
+		ID:           strings.TrimSpace(event.ID),
+		Scope:        scope,
+		SubjectID:    subjectID,
+		SubjectName:  firstNonEmpty(subjectName, description, subjectID),
+		Latitude:     latitude,
+		Longitude:    longitude,
+		RadiusMeters: radiusMeters,
+		Description:  description,
+		UserID:       userID,
+		CreatedAt:    createdAt,
+	}, nil
+}
+
+type locationReportSignal struct {
+	Latitude     *float64
+	Longitude    *float64
+	RadiusMeters int
+}
+
+func encodeLocationReportSignal(latitude *float64, longitude *float64, radiusMeters int) string {
+	if latitude == nil || longitude == nil {
+		return ""
+	}
+	if radiusMeters < 0 {
+		radiusMeters = 0
+	}
+	return "LOC:" + strconv.FormatFloat(*latitude, 'f', -1, 64) + "," +
+		strconv.FormatFloat(*longitude, 'f', -1, 64) + "," +
+		strconv.Itoa(radiusMeters)
+}
+
+func decodeLocationReportSignal(raw string) (locationReportSignal, bool) {
+	value := strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToUpper(value), "LOC:") {
+		return locationReportSignal{}, false
+	}
+	parts := strings.Split(value[4:], ",")
+	if len(parts) < 2 {
+		return locationReportSignal{}, false
+	}
+	latitude, latErr := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	longitude, lngErr := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if latErr != nil || lngErr != nil {
+		return locationReportSignal{}, false
+	}
+	radiusMeters := 0
+	if len(parts) >= 3 {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && parsed > 0 {
+			radiusMeters = parsed
+		}
+	}
+	return locationReportSignal{
+		Latitude:     &latitude,
+		Longitude:    &longitude,
+		RadiusMeters: radiusMeters,
+	}, true
 }
 
 func voteToDomain(incidentID string, vote spacetime.TrainbotActivityVote) (domain.IncidentVote, error) {
@@ -1966,6 +2221,21 @@ func stationSightingLabel(destination string) string {
 		return "Platform sighting"
 	}
 	return "Platform sighting to " + destination
+}
+
+func locationReportName(scope string) string {
+	if strings.TrimSpace(scope) == "area" {
+		return "Inspection near this location"
+	}
+	return "Inspection at station"
+}
+
+func copyFloatPtr(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }
 
 func spacetimeNormalizeStationKey(value string) string {

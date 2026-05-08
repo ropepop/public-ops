@@ -26,7 +26,7 @@ make docker-image-build
 SCHEDULE_DIR=/srv/arbuzas/train-bot/data/schedules
 SCRAPER_OUTPUT_DIR=/srv/arbuzas/train-bot/data/schedules
 TRAIN_WEB_ENABLED=true
-TRAIN_WEB_PUBLIC_BASE_URL=https://train-bot.jolkins.id.lv
+TRAIN_WEB_PUBLIC_BASE_URL=https://vilciens.kontrole.info
 TRAIN_WEB_BUNDLE_DIR=/srv/arbuzas/train-bot/data/public-bundles
 TRAIN_WEB_PUBLIC_EDGE_CACHE_STATE_FILE=/srv/arbuzas/train-bot/state/public-edge-cache.json
 SINGLE_INSTANCE_LOCK_PATH=/srv/arbuzas/train-bot/run/train-bot.lock
@@ -74,7 +74,7 @@ Full setup and troubleshooting steps live in [Agent test login](./docs/agent-tes
 
 ## Notes
 
-- Public URLs stay unchanged.
+- Public TrainBot URLs are served from `https://vilciens.kontrole.info`.
 - Browser sign-in uses Telegram's current Login library (`telegram-login.js?3`) and server-verified Telegram `id_token` values; Mini App sessions still use Telegram Web App init data.
 - The old rooted Pixel deploy flow is rollback-only legacy material now.
 - If train-bot loses outbound name resolution in Docker, fix the train-bot stack first before changing host-wide DNS.

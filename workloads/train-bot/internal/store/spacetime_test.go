@@ -45,3 +45,36 @@ func TestIsSpacetimePrivateRiderTableError(t *testing.T) {
 		})
 	}
 }
+
+func TestLocationReportSignalRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	latitude := 56.95721
+	longitude := 23.68939
+	encoded := encodeLocationReportSignal(&latitude, &longitude, 250)
+	if encoded != "LOC:56.95721,23.68939,250" {
+		t.Fatalf("encodeLocationReportSignal() = %q", encoded)
+	}
+
+	decoded, ok := decodeLocationReportSignal(encoded)
+	if !ok {
+		t.Fatalf("decodeLocationReportSignal() ok = false")
+	}
+	if decoded.Latitude == nil || *decoded.Latitude != latitude {
+		t.Fatalf("decoded latitude = %v, want %v", decoded.Latitude, latitude)
+	}
+	if decoded.Longitude == nil || *decoded.Longitude != longitude {
+		t.Fatalf("decoded longitude = %v, want %v", decoded.Longitude, longitude)
+	}
+	if decoded.RadiusMeters != 250 {
+		t.Fatalf("decoded radius = %d, want 250", decoded.RadiusMeters)
+	}
+}
+
+func TestLocationReportSignalIgnoresOtherSignals(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := decodeLocationReportSignal("INSPECTION_STARTED"); ok {
+		t.Fatalf("decodeLocationReportSignal() ok = true for report signal")
+	}
+}

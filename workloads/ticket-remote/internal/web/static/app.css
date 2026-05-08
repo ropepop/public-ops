@@ -33,9 +33,14 @@ body {
   touch-action: manipulation;
 }
 
-.auth-page {
+.auth-error-page {
   background: #f6f7fb;
   color: #111827;
+}
+
+.auth-redirect-page {
+  background: #070b10;
+  color: #eef3f8;
 }
 
 .auth-shell {
@@ -52,13 +57,6 @@ body {
   text-align: center;
 }
 
-.auth-panel h1 {
-  margin: 0;
-  font-size: 32px;
-  font-weight: 750;
-}
-
-.auth-copy,
 .auth-status {
   margin: 0;
   color: #4b5563;
@@ -163,9 +161,9 @@ body.details-visible .stage {
   -webkit-tap-highlight-color: transparent;
 }
 
-.quick-claim-spinner {
+.quick-claim-spinner,
+.stream-resume-spinner {
   position: absolute;
-  z-index: 3;
   left: calc(var(--stream-left, 0px) + 20px);
   top: calc(var(--stream-top, 0px) + 20px);
   width: 34px;
@@ -176,7 +174,16 @@ body.details-visible .stage {
   animation: quickClaimSpinnerRotate 760ms linear infinite;
 }
 
-.quick-claim-spinner[hidden] {
+.quick-claim-spinner {
+  z-index: 3;
+}
+
+.stream-resume-spinner {
+  z-index: 4;
+}
+
+.quick-claim-spinner[hidden],
+.stream-resume-spinner[hidden] {
   display: none;
 }
 
@@ -187,7 +194,8 @@ body.details-visible .stage {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .quick-claim-spinner {
+  .quick-claim-spinner,
+  .stream-resume-spinner {
     animation: none;
   }
 }
@@ -238,10 +246,10 @@ body.details-visible .stage {
   border-top: 1px solid #1c2735;
   background: #0d121a;
   display: grid;
-  align-content: center;
+  align-content: start;
   justify-items: center;
   gap: 14px;
-  padding: 32px max(20px, env(safe-area-inset-left)) calc(32px + env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-right));
+  padding: 28px max(20px, env(safe-area-inset-left)) calc(32px + env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-right));
   scroll-snap-align: start;
 }
 
@@ -263,6 +271,7 @@ body:not(.details-visible) .panel > * {
 
 .identity {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
   color: #b9c6d6;
@@ -281,12 +290,61 @@ body:not(.details-visible) .panel > * {
   gap: 8px;
 }
 
+.panel-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.panel-summary-item {
+  min-width: 0;
+  min-height: 88px;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  border: 1px solid #1f2c3d;
+  border-radius: 8px;
+  padding: 12px;
+  background: #0b1119;
+}
+
+.control-summary,
+.stream-summary {
+  grid-column: 1 / -1;
+}
+
+.panel-label {
+  color: #8190a3;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.panel-summary-item strong {
+  min-width: 0;
+  color: #f4f8fc;
+  font-size: 19px;
+  line-height: 1.14;
+  overflow-wrap: anywhere;
+}
+
+.panel-detail {
+  min-width: 0;
+  color: #9eacbf;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .timer {
   width: fit-content;
-  padding: 6px 10px;
+  min-width: 58px;
+  padding: 5px 9px;
   border-radius: 999px;
   border: 1px solid #385073;
   background: #101a28;
+  text-align: center;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
 }
@@ -305,17 +363,62 @@ body:not(.details-visible) .panel > * {
 
 .presence {
   display: grid;
-  gap: 6px;
+  gap: 10px;
+  border: 1px solid #1f2c3d;
+  border-radius: 8px;
+  padding: 12px;
+  background: #0b1119;
   color: #aeb9c9;
-  font-size: 12px;
+  font-size: 13px;
+}
+
+.presence-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #d6deea;
+}
+
+.presence-header strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.presence-list {
+  display: grid;
+  gap: 8px;
 }
 
 .presence-item {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   border-top: 1px solid #1d2837;
-  padding-top: 6px;
+  padding-top: 8px;
+}
+
+.presence-email {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.presence-mark {
+  flex: 0 0 auto;
+  border: 1px solid #2a3a50;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #c5cfdd;
+  background: #101720;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.presence-mark.control {
+  border-color: #4f8cff;
+  color: #dbe8ff;
+  background: #10254a;
 }
 
 .admin-page {

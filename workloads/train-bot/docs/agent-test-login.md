@@ -14,7 +14,7 @@ It exists so an agent can open TrainBot the same way a signed-in user sees it, b
 The only browser entry point an agent needs is a minted URL shaped like:
 
 ```text
-https://train-bot.jolkins.id.lv/app?test_ticket=...
+https://vilciens.kontrole.info/app?test_ticket=...
 ```
 
 ## Required Config

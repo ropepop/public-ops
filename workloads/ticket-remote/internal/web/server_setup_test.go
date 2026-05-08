@@ -18,6 +18,34 @@ import (
 	"ticketremote/internal/state"
 )
 
+func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
+	server, _ := newSimulatorSetupTestServer(t, "pixel")
+
+	server.addRelayViewer("session-a")
+	server.addRelayViewer("session-a")
+	server.addRelayViewer("session-b")
+
+	if got := server.relay.Snapshot().Viewers; got != 2 {
+		t.Fatalf("relay viewers after two unique sessions = %d, want 2", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 2 {
+		t.Fatalf("relay viewers after closing one socket from session-a = %d, want 2", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after closing session-a = %d, want 1", got)
+	}
+	server.removeRelayViewer("missing-session")
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after closing an unknown session = %d, want 1", got)
+	}
+	server.removeRelayViewer("session-b")
+	if got := server.relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after closing all sessions = %d, want 0", got)
+	}
+}
+
 func TestOwnerSimulatorSetupWorksWhenViviMissing(t *testing.T) {
 	server, runner := newSimulatorSetupTestServer(t, "android-sim")
 
@@ -222,6 +250,32 @@ func TestAdminPageShowsSimulatorSetupOnlyForOwner(t *testing.T) {
 	}
 }
 
+func TestTicketViewerAdminLinkOnlyShowsForAdmins(t *testing.T) {
+	server, _ := newSimulatorSetupTestServer(t, "pixel")
+
+	memberReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	memberReq.Header.Set("X-Ticket-Remote-Email", "member@example.com")
+	memberRec := httptest.NewRecorder()
+	server.ServeHTTP(memberRec, memberReq)
+	if memberRec.Code != http.StatusOK {
+		t.Fatalf("member page status = %d body = %s", memberRec.Code, memberRec.Body.String())
+	}
+	if strings.Contains(memberRec.Body.String(), `class="admin-link"`) {
+		t.Fatalf("member viewer should not render an unusable admin link: %s", memberRec.Body.String())
+	}
+
+	ownerReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	ownerReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	ownerRec := httptest.NewRecorder()
+	server.ServeHTTP(ownerRec, ownerReq)
+	if ownerRec.Code != http.StatusOK {
+		t.Fatalf("owner page status = %d body = %s", ownerRec.Code, ownerRec.Body.String())
+	}
+	if !strings.Contains(ownerRec.Body.String(), `class="admin-link"`) {
+		t.Fatalf("owner viewer should render admin link: %s", ownerRec.Body.String())
+	}
+}
+
 func TestAdminSimulatorControlStaticAssetsWirePointerAndKeyboard(t *testing.T) {
 	body, err := staticFS.ReadFile("static/app.js")
 	if err != nil {
@@ -266,7 +320,23 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"return postJSON(fallbackPath, fallbackBody || {})",
 		"window.TicketSpacetime.create",
 		"/api/v1/auth/session",
+		"startAuthRedirect()",
 		"beginSpacetimeLogin",
+		"const authReturnToKey = 'ticket_remote_auth_return_to'",
+		"window.addEventListener('error'",
+		"window.addEventListener('unhandledrejection'",
+		"function browserStorage(kind, key)",
+		"function storageGet(kind, key)",
+		"function requireElement(selector, label)",
+		"function showFatalPage(message)",
+		"function safeWebSocket(url, label)",
+		"function renderDecodedFrame(frame, source)",
+		"control_message_failed",
+		"video_message_failed",
+		"decoded_frame_render_failed",
+		"missing_admin_dom",
+		"finishSpacetimeCallback().catch(showAuthError)",
+		"location.replace(returnTo)",
 		"const quickClaimMaxX = 0.25",
 		"const quickClaimMaxY = 0.25",
 		"const controlCodeButtonMinX = 0.04",
@@ -285,9 +355,12 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"return input && input.type === 'quick_claim_tap'",
 		"setStatus('Atver kontroles kodu...')",
 		"const inputQueue = []",
-		"inputQueueLimit = 20",
+		"inputQueueLimit = 30",
+		"const inputDrainDelayMs = 35",
 		"const inputId = value.inputId || nextInputId()",
+		"inputQueue.shift()",
 		"msg.type === 'input_result'",
+		"scheduleInputQueueDrain(inputDrainDelayMs)",
 		"retryOrDropInput(inputInFlight.inputId)",
 		"function cancelPendingInputs(reason)",
 		"let localControlSendGraceUntil = 0",
@@ -297,14 +370,37 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"cancelPendingInputs('control_release_requested')",
 		"control_lost_before_send",
 		"const quickClaimSpinner = document.getElementById('quickClaimSpinner')",
+		"const streamResumeSpinner = document.getElementById('streamResumeSpinner')",
 		"const quickClaimSpinnerTimeoutMs = 8000",
 		"let ticketInUseSpinnerActive = false",
 		"function setTicketInUseSpinner(active)",
 		"function sameEmail(left, right)",
 		"function currentUserOwnsControl(control)",
 		"const selfControl = currentUserOwnsControl(control)",
+		"const controlOwner = document.getElementById('controlOwner')",
+		"function renderPanelSummary(state, control, selfControl, viewers)",
+		"function renderControlSummary(control, selfControl)",
+		"function renderViewerSummary(viewers)",
+		"function renderStreamSummary()",
+		"const streamLive = rootCapture.active || phoneHealth.streamVerdict === 'live' || pipeline.streamVerdict === 'live'",
+		"streamState.textContent = streamLive ? 'Live'",
+		"streamLive ? 'Ticket stream is live'",
+		"function activeViewers(viewers)",
+		"timer.textContent = `${remaining} s`",
+		"mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu kontrolē' : 'kontrolē'",
 		"function showQuickClaimSpinner(inputId)",
 		"quickClaimSpinner.hidden = !(quickClaimSpinnerPending || ticketInUseSpinnerActive)",
+		"function preserveCurrentFrame(reason)",
+		"function redrawPreservedFrame()",
+		"function showStreamResumeSpinner()",
+		"function streamStatusStale(status)",
+		"preserveCurrentFrame('stream_status_stale')",
+		"streamResumeSpinnerVisible() || (hasRenderedFrame && streamStatusStale(status))",
+		"if (!streamStatusStale(freshStreamStatus(performance.now()) || latestStreamStatus))",
+		"streamResumeSpinnerVisible: streamResumeSpinnerVisible()",
+		"hasFallbackFrame: fallbackFrameAvailable",
+		"preserveCurrentFrame('configure_decoder')",
+		"redrawPreservedFrame()",
 		"stage.style.setProperty('--stream-left'",
 		"stage.style.setProperty('--stream-top'",
 		"hideQuickClaimSpinner(inputId, accepted ? 'input_result' : 'input_rejected')",
@@ -337,6 +433,10 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"const streamStaleVideoReconnectMs = 8000",
 		"const streamStaleServerRecoverMs = 12000",
 		"const streamDecoderStartupGraceMs = 3500",
+		"const hiddenVideoCloseDelayMs = 3000",
+		"function pauseVideoWhileHidden(reason)",
+		"video_stream_paused_hidden",
+		"document.visibilityState === 'hidden'",
 		"function showStreamWaiting(message)",
 		"function handleStreamStatus(msg)",
 		"function resetDecoderForRecovery(reason)",
@@ -350,7 +450,8 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"requestKeyframeDebounced('h264_first_frame_nudge'",
 		"if (decoderStartupGraceActive(now))",
 		"ticket_remote_pkce_verifier_shared",
-		"Ja e-pasta saite atveras jaunā cilnē",
+		"send({ type: 'heartbeat', reason: 'public_connected' })",
+		"send({ type: 'heartbeat', reason: 'public_heartbeat' })",
 		"streamVerticalPanThresholdPx",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
@@ -368,9 +469,15 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"-webkit-touch-callout: none",
 		"-webkit-tap-highlight-color: transparent",
 		".quick-claim-spinner",
+		".stream-resume-spinner",
+		".panel-summary",
+		".panel-summary-item",
+		".presence-header",
+		".presence-mark.control",
 		"left: calc(var(--stream-left, 0px) + 20px)",
 		"top: calc(var(--stream-top, 0px) + 20px)",
 		"pointer-events: none",
+		"font-variant-numeric: tabular-nums",
 		"quickClaimSpinnerRotate",
 	} {
 		if !strings.Contains(css, snippet) {
@@ -378,8 +485,28 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		}
 	}
 	for _, snippet := range []string{
+		"left: 50%",
+		"top: 50%",
+		"margin-left: -27px",
+		"margin-top: -27px",
+		"background: rgba(2, 3, 4",
+		"streamResumeSpinnerRotate",
+	} {
+		if strings.Contains(css, snippet) {
+			t.Fatalf("ticket viewer stream resume spinner should use top-left quick-spinner styling, found %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
 		`id="quickClaimSpinner"`,
 		`/static/quick-claim-spinner.svg`,
+		`id="streamResumeSpinner"`,
+		`id="controlOwner"`,
+		`id="controlMode"`,
+		`id="controlTimeDetail"`,
+		`id="viewerCount"`,
+		`id="viewerCountDetail"`,
+		`id="streamStateLabel"`,
+		`id="streamStateDetail"`,
 		`aria-hidden="true"`,
 		`draggable="false" hidden`,
 	} {
@@ -402,6 +529,18 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 	}
 	if strings.Contains(js, "['touchstart', 'touchmove']") {
 		t.Fatalf("ticket viewer should not block all touch movement; vertical scroll must remain available")
+	}
+	for _, snippet := range []string{
+		"spacetimeLogin",
+		"Pieraksties ar e-pastu",
+		"Pierakstīties ar e-pastu",
+		"Ja e-pasta saite atveras",
+		"send({ type: 'activity', reason: 'public_connected' })",
+		"send({ type: 'activity', reason: 'public_heartbeat' })",
+	} {
+		if strings.Contains(js, snippet) {
+			t.Fatalf("ticket viewer must auto-start SpacetimeAuth instead of showing the old login panel: %q", snippet)
+		}
 	}
 	for _, forbidden := range []struct {
 		label string
@@ -438,6 +577,13 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 			"MediaProjection fallback",
 			"AV1",
 			"showUnsupported('Video straume neatnāca laikā. Tālrunim vajag uzmanību.')",
+			"Atbalstīti ir tikai pieskārieni.",
+			"localStorage.getItem",
+			"localStorage.setItem",
+			"localStorage.removeItem",
+			"sessionStorage.getItem",
+			"sessionStorage.setItem",
+			"sessionStorage.removeItem",
 		} {
 			if strings.Contains(forbidden.body, snippet) {
 				t.Fatalf("%s should not contain stale control dialog snippet %q", forbidden.label, snippet)
@@ -501,23 +647,42 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	js := string(jsBody)
 	for _, snippet := range []string{
-		"startAuthShell()",
+		"startAuthRedirect()",
 		"beginSpacetimeLogin",
+		"authReturnToKey",
+		"clearLocalAuthState({ keepReturnTo: true })",
 		"/api/v1/auth/session",
 		"runControlMutation('control_claim', '/api/v1/control/claim')",
 		"usesDirectSpacetimeAuth()",
-		"runSpacetimeMutation((client) => client.upsertMember(memberEmail.value, memberRole.value), 'admin_member_upsert')",
-		"runSpacetimeMutation((client) => client.removeMember(member.email), 'admin_member_remove')",
+		"apiFetch('/api/v1/admin/members'",
+		"apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`",
 		"apiFetch('/api/v1/admin/control/revoke', { method: 'POST', cache: 'no-store' })",
+		"activeMembers(state)",
 		"send({ type: 'state_refresh'",
+		"adminRefreshMs = 5000",
 	} {
-		if !strings.Contains(string(jsBody), snippet) {
+		if !strings.Contains(js, snippet) {
 			t.Fatalf("ticket viewer SpacetimeAuth JS missing %q", snippet)
 		}
 	}
-	if strings.Contains(string(jsBody), "runSpacetimeMutation((client) => client.revokeControl") {
-		t.Fatalf("admin revoke must go through ticket_remote so phone cleanup stays synchronized")
+	authRedirectIndex := strings.Index(js, "if (!cfg.authenticated)")
+	spacetimeUnavailableIndex := strings.Index(js, "let spacetimeDirectUnavailable = false")
+	if authRedirectIndex < 0 || spacetimeUnavailableIndex < 0 {
+		t.Fatalf("ticket viewer SpacetimeAuth JS missing auth redirect or direct state initialization")
+	}
+	if spacetimeUnavailableIndex > authRedirectIndex {
+		t.Fatalf("SpacetimeAuth callback state must be initialized before unauthenticated redirect starts")
+	}
+	for _, forbidden := range []string{
+		"runSpacetimeMutation((client) => client.upsertMember",
+		"runSpacetimeMutation((client) => client.removeMember",
+		"runSpacetimeMutation((client) => client.revokeControl",
+	} {
+		if strings.Contains(string(jsBody), forbidden) {
+			t.Fatalf("admin mutations must go through ticket_remote so server state stays synchronized: %q", forbidden)
+		}
 	}
 	for _, snippet := range []string{
 		"DbConnection.builder()",
@@ -530,6 +695,220 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	}
 	if strings.Contains(indexHTML, "Cloudflare Access") || strings.Contains(string(jsBody), "Cloudflare Access") {
 		t.Fatalf("ticket viewer must not mention Cloudflare Access login")
+	}
+	if strings.Contains(string(jsBody), "spacetimeLogin") || strings.Contains(string(jsBody), "Pierakstīties ar e-pastu") {
+		t.Fatalf("ticket viewer must auto-start SpacetimeAuth instead of showing a local login panel")
+	}
+}
+
+func TestAdminMembersRouteAddsAndRemovesMember(t *testing.T) {
+	server, _ := newSimulatorSetupTestServer(t, "pixel")
+
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"new.member@example.com","role":"member"}`))
+	addReq.Header.Set("Content-Type", "application/json")
+	addReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	addRec := httptest.NewRecorder()
+	server.ServeHTTP(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("add status = %d body = %s", addRec.Code, addRec.Body.String())
+	}
+	var added apiResponse
+	if err := json.NewDecoder(addRec.Body).Decode(&added); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := added.State.Member("new.member@example.com"); !ok {
+		t.Fatalf("added member missing from state: %#v", added.State.Members)
+	}
+
+	removeReq := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/members?email=new.member%40example.com", nil)
+	removeReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	removeRec := httptest.NewRecorder()
+	server.ServeHTTP(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("remove status = %d body = %s", removeRec.Code, removeRec.Body.String())
+	}
+	var removed apiResponse
+	if err := json.NewDecoder(removeRec.Body).Decode(&removed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := removed.State.Member("new.member@example.com"); ok {
+		t.Fatalf("removed member still active in state: %#v", removed.State.Members)
+	}
+}
+
+func TestAdminMembersRouteRequiresAdmin(t *testing.T) {
+	server, _ := newSimulatorSetupTestServer(t, "pixel")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"blocked@example.com","role":"member"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Ticket-Remote-Email", "member@example.com")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin add status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDevAdminMemberDeleteUsesConfiguredIdentityNotTargetEmailQuery(t *testing.T) {
+	server, _ := newSimulatorSetupTestServer(t, "pixel")
+
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"delete.target@example.com","role":"member"}`))
+	addReq.Header.Set("Content-Type", "application/json")
+	addRec := httptest.NewRecorder()
+	server.ServeHTTP(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("add status = %d body = %s", addRec.Code, addRec.Body.String())
+	}
+
+	removeReq := httptest.NewRequest(http.MethodDelete, "/api/v1/admin/members?email=delete.target%40example.com", nil)
+	removeRec := httptest.NewRecorder()
+	server.ServeHTTP(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("remove status = %d body = %s", removeRec.Code, removeRec.Body.String())
+	}
+	var removed apiResponse
+	if err := json.NewDecoder(removeRec.Body).Decode(&removed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := removed.State.Member("delete.target@example.com"); ok {
+		t.Fatalf("removed member still active in state: %#v", removed.State.Members)
+	}
+}
+
+func TestSpacetimeAuthUnauthenticatedAdminServesRedirectShell(t *testing.T) {
+	store := state.NewMemoryStore()
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		DisplayName:     "ViVi timed ticket",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://pixel.test",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:           "spacetime",
+			OIDCIssuer:     "https://auth.spacetimedb.com/oidc",
+			OIDCClientID:   "client_test",
+			OIDCScope:      "openid profile email",
+			OIDCRedirect:   "http://ticket.test/auth/callback",
+			AuthCookieName: "ticket_remote_auth",
+		},
+		Phone: config.PhoneConfig{
+			BackendID:         "pixel",
+			AttachName:        "Pixel",
+			BaseURL:           "http://pixel.test",
+			DefaultBackendID:  "pixel",
+			ActiveBackendFile: filepath.Join(t.TempDir(), "active-phone-backend.json"),
+		},
+	}, store, phone.NewRelay(phone.RelayConfig{
+		BackendID:  "pixel",
+		AttachName: "Pixel",
+		BaseURL:    "http://pixel.test",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin unauth status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		`window.TICKET_REMOTE_CONFIG`,
+		`"authenticated":false`,
+		`/static/app.js`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("admin unauth shell missing %q in %s", expected, body)
+		}
+	}
+	if strings.Contains(body, "Admin access is required") || strings.Contains(body, `class="admin-shell"`) {
+		t.Fatalf("unauthenticated admin should receive auth redirect shell, got %s", body)
+	}
+}
+
+func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
+	store := state.NewMemoryStore()
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		DisplayName:     "ViVi timed ticket",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://pixel.test",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:              "spacetime",
+			OIDCIssuer:        "https://auth.spacetimedb.com/oidc",
+			OIDCClientID:      "client_test",
+			OIDCScope:         "openid profile email",
+			OIDCRedirect:      "http://ticket.test/auth/callback",
+			AuthCookieName:    "ticket_remote_auth",
+			SessionSigningKey: "test-signing-key",
+		},
+		Phone: config.PhoneConfig{
+			BackendID:         "pixel",
+			AttachName:        "Pixel",
+			BaseURL:           "http://pixel.test",
+			DefaultBackendID:  "pixel",
+			ActiveBackendFile: filepath.Join(t.TempDir(), "active-phone-backend.json"),
+		},
+	}, store, phone.NewRelay(phone.RelayConfig{
+		BackendID:  "pixel",
+		AttachName: "Pixel",
+		BaseURL:    "http://pixel.test",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := server.auth.IssueServerSession(auth.Identity{
+		Email:         "ticket@jolkins.id.lv",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	spacetimePayload, _ := payload["spacetime"].(map[string]any)
+	if spacetimePayload["token"] != nil {
+		t.Fatalf("server session token must not be exposed as direct Spacetime token: %#v", spacetimePayload)
+	}
+
+	healthReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	healthReq.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	healthRec := httptest.NewRecorder()
+	server.ServeHTTP(healthRec, healthReq)
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("health status = %d body = %s", healthRec.Code, healthRec.Body.String())
 	}
 }
 

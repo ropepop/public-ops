@@ -53,6 +53,9 @@ class TicketSpacetimeClient {
   private conn: DbConnection | null = null;
   private subscription: { unsubscribe: () => void } | null = null;
   private reconnectTimer = 0;
+  private reconnectDelayMs = 1000;
+  private connected = false;
+  private connectionGeneration = 0;
   private manuallyDisconnected = false;
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
@@ -62,25 +65,40 @@ class TicketSpacetimeClient {
 
   connect(): void {
     this.disconnect(false);
+    const generation = this.connectionGeneration + 1;
+    this.connectionGeneration = generation;
     this.manuallyDisconnected = false;
+    this.connected = false;
     this.handlers.onStatus?.("connecting");
     const builder = DbConnection.builder()
       .withUri(this.websocketURL())
       .withDatabaseName(this.cfg.database)
       .withToken(this.cfg.token)
       .onConnect((connection) => {
+        if (generation !== this.connectionGeneration) {
+          try { connection.disconnect(); } catch (_) {}
+          return;
+        }
         this.conn = connection;
+        this.connected = true;
+        this.reconnectDelayMs = 1000;
         this.handlers.onStatus?.("live");
         this.attachStateListeners(connection);
         this.subscribeState(connection);
         this.heartbeat(true);
       })
       .onDisconnect(() => {
+        if (generation !== this.connectionGeneration) return;
+        this.connected = false;
+        this.conn = null;
         if (this.manuallyDisconnected) return;
         this.handlers.onStatus?.("reconnecting");
         this.scheduleReconnect();
       })
       .onConnectError((_ctx, error) => {
+        if (generation !== this.connectionGeneration) return;
+        this.connected = false;
+        this.conn = null;
         this.handlers.onStatus?.("offline", error && String(error));
         this.scheduleReconnect();
       });
@@ -88,6 +106,7 @@ class TicketSpacetimeClient {
   }
 
   disconnect(markDisconnected = true): void {
+    this.connectionGeneration += 1;
     if (this.reconnectTimer) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = 0;
@@ -95,6 +114,7 @@ class TicketSpacetimeClient {
     if (markDisconnected && this.conn) {
       this.heartbeat(false);
     }
+    this.connected = false;
     if (this.subscription) {
       try { this.subscription.unsubscribe(); } catch (_) {}
       this.subscription = null;
@@ -111,6 +131,7 @@ class TicketSpacetimeClient {
   }
 
   heartbeat(connected = true): void {
+    if (!this.isReady()) return;
     const reducer = this.reducer("memberHeartbeatPresence");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
@@ -123,6 +144,7 @@ class TicketSpacetimeClient {
   }
 
   disconnectPresence(): void {
+    if (!this.isReady()) return;
     Promise.resolve(this.reducer("memberDisconnectPresence")({
       ticketId: this.cfg.ticketId,
       sessionId: this.cfg.sessionId,
@@ -188,10 +210,12 @@ class TicketSpacetimeClient {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
+    const delayMs = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = 0;
       this.connect();
-    }, 1000);
+    }, delayMs);
   }
 
   private attachStateListeners(connection: DbConnection): void {
@@ -214,6 +238,7 @@ class TicketSpacetimeClient {
   }
 
   private publishCurrentState(): void {
+    if (!this.isReady()) return;
     const table = this.liveStateTable(this.requireConnection().db);
     const rows = Array.from(table.iter ? table.iter() : []) as any[];
     const wanted = rows.find((row) => String(row.ticketId || row.ticket_id || "") === this.cfg.ticketId) || rows[0];
@@ -243,10 +268,14 @@ class TicketSpacetimeClient {
   }
 
   private requireConnection(): DbConnection {
-    if (!this.conn) {
-      throw new Error("Spacetime connection unavailable");
+    if (!this.isReady() || !this.conn) {
+      throw new Error("Spacetime connection is not ready");
     }
     return this.conn;
+  }
+
+  private isReady(): boolean {
+    return Boolean(this.conn && this.connected);
   }
 }
 

@@ -1,6 +1,7 @@
 (function () {
   const cfg = window.TRAIN_APP_CONFIG || {};
   const reportsChannelURL = "https://t.me/vivi_kontrole_reports";
+  const classicControlSiteURL = "https://kontrole.info/";
   const languageStorageKey = "trainAppLanguage";
   const debugTrainStateTransitions = (() => {
     try {
@@ -68,10 +69,11 @@
       publicIncidentHistoryNavigating: false,
       publicIncidentListScrollY: 0,
       publicIncidentMobileLayout: false,
-      publicIncidentCommentDrafts: {},
-      publicIncidentVoteSelections: {},
-      publicNetworkMapShowAllSightings: false,
-      miniNetworkMapShowAllSightings: false,
+	      publicIncidentCommentDrafts: {},
+	      publicIncidentVoteSelections: {},
+	      miniAppPublicMapFallback: false,
+	      publicNetworkMapShowAllSightings: false,
+	      miniNetworkMapShowAllSightings: false,
       publicStationSelected: null,
       mapData: null,
       networkMapData: null,
@@ -83,6 +85,7 @@
       publicMapPopupKey: "",
       publicMapSelectedMarkerKey: "",
       publicMapFollowPaused: false,
+      mapIncidentFocusAppliedId: "",
       stations: [],
       selectedStation: null,
       stationDepartures: [],
@@ -174,6 +177,8 @@
   let liveClient = null;
   let releaseLiveInvalidation = null;
   let liveRenderTimer = null;
+  let publicMapLibraryRetryTimer = null;
+  let publicMapLibraryRetryCount = 0;
 
   function waitMs(ms) {
     return new Promise((resolve) => {
@@ -311,6 +316,247 @@
     try {
       window.history.replaceState(window.history.state || null, "", url.pathname + url.search + url.hash);
     } catch (_) {}
+  }
+
+  function incidentIdParts(incidentId) {
+    const parts = String(incidentId || "").trim().split(":");
+    return {
+      scope: String(parts[0] || "").trim().toLowerCase(),
+      subjectId: String(parts[1] || "").trim(),
+    };
+  }
+
+  function trainIdFromIncidentId(incidentId) {
+    const parts = incidentIdParts(incidentId);
+    return parts.scope === "train" ? parts.subjectId : "";
+  }
+
+  function stationIdFromIncident(item) {
+    const location = item && item.location ? item.location : null;
+    const parts = incidentIdParts(item && item.id);
+    return String(
+      (item && item.subjectId) ||
+      (location && location.stationId) ||
+      (location && location.subjectId) ||
+      (parts.scope === "station" ? parts.subjectId : "") ||
+      ""
+    ).trim();
+  }
+
+  function incidentMapTargetInfo(summaryOrId) {
+    const summary = typeof summaryOrId === "object" && summaryOrId ? summaryOrId : null;
+    const id = summary ? String(summary.id || "").trim() : String(summaryOrId || "").trim();
+    const parts = incidentIdParts(id);
+    const rawTarget = summary && summary.mapTarget ? summary.mapTarget : null;
+    const explicitType = String(rawTarget && rawTarget.type || "").trim().toLowerCase();
+    const scope = String((summary && summary.scope) || parts.scope || "").trim().toLowerCase();
+    const subjectId = String((summary && summary.subjectId) || parts.subjectId || "").trim();
+    const fallbackType = scope === "train" || scope === "station" || scope === "area" ? scope : "";
+    const type = explicitType === "train" || explicitType === "station" || explicitType === "area"
+      ? explicitType
+      : fallbackType;
+    if (type === "train") {
+      const trainInstanceId = String(
+        (rawTarget && rawTarget.trainInstanceId) ||
+        trainIdFromIncidentId(id) ||
+        (scope === "train" ? subjectId : "") ||
+        ""
+      ).trim();
+      return trainInstanceId ? { type, trainInstanceId } : null;
+    }
+    if (type === "station") {
+      const stationId = String(
+        (rawTarget && rawTarget.stationId) ||
+        (scope === "station" ? subjectId : "") ||
+        ""
+      ).trim();
+      return stationId ? { type, stationId } : null;
+    }
+    if (type === "area") {
+      const incidentId = String((rawTarget && rawTarget.incidentId) || id || "").trim();
+      return incidentId ? { type, incidentId } : null;
+    }
+    return null;
+  }
+
+  function incidentIdsFromMarkerItem(item) {
+    return Array.isArray(item && item.incidentIds)
+      ? item.incidentIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+  }
+
+  function incidentMarkerKeyInSet(incidentId, markerKeys) {
+    const nextIncidentId = String(incidentId || "").trim();
+    if (!nextIncidentId || !markerKeys || typeof markerKeys[Symbol.iterator] !== "function" || !mapController.markerState) {
+      return "";
+    }
+    for (const markerKey of markerKeys) {
+      const entry = mapController.markerState.get(markerKey);
+      if (incidentIdsFromMarkerItem(entry && entry.item).includes(nextIncidentId)) {
+        return markerKey;
+      }
+    }
+    return "";
+  }
+
+  function incidentMarkerKeyMatching(incidentId, predicate) {
+    const nextIncidentId = String(incidentId || "").trim();
+    if (!nextIncidentId || !mapController.markerState || typeof mapController.markerState.forEach !== "function") {
+      return "";
+    }
+    let foundKey = "";
+    mapController.markerState.forEach((entry, markerKey) => {
+      if (foundKey || (typeof predicate === "function" && !predicate(markerKey, entry))) {
+        return;
+      }
+      if (incidentIdsFromMarkerItem(entry && entry.item).includes(nextIncidentId)) {
+        foundKey = markerKey;
+      }
+    });
+    return foundKey;
+  }
+
+  function incidentTrainMarkerKey(incidentId) {
+    return incidentMarkerKeyInSet(incidentId, mapController.trainMarkerKeys)
+      || incidentMarkerKeyMatching(incidentId, (markerKey) => String(markerKey || "").startsWith("live-train:"));
+  }
+
+  function existingIncidentMarkerKey(incidentId) {
+    const nextIncidentId = String(incidentId || "").trim();
+    if (!nextIncidentId || !mapController.markerState || typeof mapController.markerState.forEach !== "function") {
+      return "";
+    }
+    return incidentTrainMarkerKey(nextIncidentId)
+      || incidentMarkerKeyInSet(nextIncidentId, mapController.baseMarkerKeys)
+      || incidentMarkerKeyInSet(nextIncidentId, mapController.sightingMarkerKeys)
+      || incidentMarkerKeyMatching(nextIncidentId);
+  }
+
+  function incidentSummaryForMap(incidentId) {
+    const id = String(incidentId || "").trim();
+    if (!id) {
+      return null;
+    }
+    if (state.publicIncidentDetail && state.publicIncidentDetail.summary && state.publicIncidentDetail.summary.id === id) {
+      return state.publicIncidentDetail.summary;
+    }
+    return (Array.isArray(state.publicIncidents) ? state.publicIncidents : [])
+      .find((item) => item && item.id === id) || null;
+  }
+
+  function incidentMapTarget(summaryOrId) {
+    const summary = typeof summaryOrId === "object" && summaryOrId ? summaryOrId : null;
+    const id = summary ? summary.id : String(summaryOrId || "").trim();
+    const target = incidentMapTargetInfo(summary || id);
+    if (target && target.type === "train") {
+      return {
+        href: publicNetworkMapRoot(),
+        markerKey: "",
+      };
+    }
+    if (target && target.type === "station" && target.stationId) {
+      return {
+        href: publicNetworkMapRoot(),
+        markerKey: networkStationMarkerKey({ id: target.stationId }),
+      };
+    }
+    if (target && target.type === "area" && target.incidentId) {
+      return {
+        href: publicNetworkMapRoot(),
+        markerKey: `area-incident:${target.incidentId}`,
+      };
+    }
+    return {
+      href: publicNetworkMapRoot(),
+      markerKey: "",
+    };
+  }
+
+  function urlWithIncidentParam(href, incidentId) {
+    const rawHref = String(href || "").trim() || publicNetworkMapRoot();
+    const base = currentURL() || new URL("https://train-bot.local/");
+    const url = new URL(rawHref, base);
+    url.searchParams.set("incident", String(incidentId || "").trim());
+    if (/^https?:\/\//i.test(rawHref)) {
+      return url.toString();
+    }
+    return url.pathname + url.search + url.hash;
+  }
+
+  function incidentMapURL(incidentId) {
+    const nextIncidentId = String(incidentId || "").trim();
+    if (!nextIncidentId) {
+      return publicNetworkMapRoot();
+    }
+    const target = incidentMapTarget(incidentSummaryForMap(nextIncidentId) || nextIncidentId);
+    return urlWithIncidentParam(target.href, nextIncidentId);
+  }
+
+  function navigateToIncidentMap(incidentId) {
+    const nextIncidentId = String(incidentId || "").trim();
+    if (!nextIncidentId || !window.location) {
+      return;
+    }
+    const href = incidentMapURL(nextIncidentId);
+    if (typeof window.location.assign === "function") {
+      window.location.assign(href);
+      return;
+    }
+    window.location.href = href;
+  }
+
+  function incidentMapFocusMarkerKey(incidentId) {
+    const nextIncidentId = String(incidentId || "").trim();
+    const summary = incidentSummaryForMap(nextIncidentId);
+    const target = incidentMapTarget(summary || nextIncidentId);
+    const targetInfo = incidentMapTargetInfo(summary || nextIncidentId);
+    if (targetInfo && targetInfo.type === "train") {
+      const trainMarkerKey = incidentTrainMarkerKey(nextIncidentId);
+      if (trainMarkerKey) {
+        return trainMarkerKey;
+      }
+    }
+    if (target.markerKey) {
+      return target.markerKey;
+    }
+    const existingMarkerKey = existingIncidentMarkerKey(nextIncidentId);
+    if (existingMarkerKey) {
+      return existingMarkerKey;
+    }
+    const parts = incidentIdParts((summary && summary.id) || nextIncidentId);
+    const subjectId = String((summary && summary.subjectId) || parts.subjectId || "").trim();
+    if (parts.scope === "train" && usesPublicTrainMap() && subjectId && state.mapData && state.mapData.train && state.mapData.train.id === subjectId) {
+      const trainMarker = Array.from(mapController.trainMarkerKeys || [])[0] || "";
+      if (trainMarker) {
+        return trainMarker;
+      }
+      return Array.from(mapController.baseMarkerKeys || [])[0] || "";
+    }
+    return "";
+  }
+
+  function focusIncidentOnMap(incidentId, options) {
+    const markerKey = incidentMapFocusMarkerKey(incidentId);
+    if (!markerKey || !mapController.markerState || !mapController.markerState.has(markerKey)) {
+      return false;
+    }
+    return mapController.handleMarkerInteraction(markerKey, options || {});
+  }
+
+  function focusRequestedIncidentFromURL(options) {
+    const incidentId = selectedIncidentIdFromURL();
+    if (!incidentId) {
+      state.mapIncidentFocusAppliedId = "";
+      return false;
+    }
+    if (state.mapIncidentFocusAppliedId === incidentId) {
+      return false;
+    }
+    if (!focusIncidentOnMap(incidentId, options)) {
+      return false;
+    }
+    state.mapIncidentFocusAppliedId = incidentId;
+    return true;
   }
 
   function readTestTicketFromLocation() {
@@ -1323,6 +1569,14 @@
     return pathFor("/events");
   }
 
+  function classicControlRoot() {
+    return classicControlSiteURL;
+  }
+
+  function classicControlLink() {
+    return publicStatusLink(classicControlRoot(), t("app_open_classic_control"));
+  }
+
   function publicTrainMapRoot(trainId) {
     return pathFor(`/t/${encodeURIComponent(trainId)}/map`);
   }
@@ -1402,6 +1656,8 @@
     app_open_public: "Open public page",
     app_open_departures: "Live feed",
     app_open_station_search: "Station search",
+    app_open_classic_control: "Classic control",
+    app_public_incidents_show_on_map: "Show on map",
     app_refresh: "Refresh",
     app_search: "Search",
     app_search_placeholder: "Type a station prefix",
@@ -1413,9 +1669,20 @@
     app_status_empty: "No departure selected.",
     app_current_ride_none: "You are not checked into a ride.",
     app_saved_routes: "Saved routes",
-    app_report_success: "Report accepted.",
-    app_report_deduped: "Already captured. No duplicate report sent.",
-    app_report_cooldown: "You can report again in %s min.",
+	    app_report_success: "Report accepted.",
+	    app_report_deduped: "Already captured. No duplicate report sent.",
+	    app_report_cooldown: "You can report again in %s min.",
+	    app_station_report_action: "Controle sighted",
+	    app_station_report_success: "Controle sighting accepted.",
+    app_location_report_title: "Report location",
+    app_location_report_description_label: "What is the location?",
+    app_location_report_description_placeholder: "Short description",
+    app_location_report_radius_label: "Radius",
+    app_location_report_submit: "Report inspection here",
+    app_location_report_success: "Location report accepted.",
+    app_location_report_deduped: "That location report was already captured.",
+    app_location_report_cooldown: "You can report this location again in %s min.",
+    app_location_report_description_required: "Add a short location description.",
     app_report_notice: "Only report what you personally observe on this train.",
     app_settings_saved: "Settings saved.",
     app_checked_in: "Checked in.",
@@ -1454,7 +1721,7 @@
     app_public_deferred_map_message: "The train map is temporarily unavailable while the simplified train app release is being rebuilt.",
     app_public_deferred_incidents_message: "Live incident threads are temporarily unavailable while the simplified train app release is being rebuilt.",
     app_public_incidents_vote_ongoing: "Still there",
-    app_public_incidents_vote_cleared: "Cleared",
+    app_public_incidents_vote_cleared: "Not present",
     app_public_incidents_comment_label: "Comment anonymously",
     app_public_incidents_comment_placeholder: "Add a short anonymous update",
     app_public_incidents_comment_submit: "Post comment",
@@ -1757,6 +2024,70 @@
     return String(cfg.mode || "").indexOf("public-") === 0;
   }
 
+  function isMiniAppPublicMapFallback() {
+    return cfg.mode === "mini-app" && Boolean(state.miniAppPublicMapFallback);
+  }
+
+  async function bootPublicNetworkMapSurface(options = {}) {
+    const render = typeof options.render === "function" ? options.render : renderPublicNetworkMap;
+    const activate = typeof options.activateLiveRefresh === "function" ? options.activateLiveRefresh : activateLiveRefresh;
+    const intervalFn = typeof options.setInterval === "function" ? options.setInterval : setInterval;
+
+    try {
+      await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
+      handleCurrentViewLoadSuccess();
+    } catch (err) {
+      if (handleInitialLoadError(err)) {
+        return true;
+      }
+      throw err;
+	    }
+	    render();
+    void refreshPublicNetworkMapIncidentOverlay(render);
+	    if (await activate(async () => {
+	      const results = await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
+	      if (results.some(Boolean)) {
+	        render();
+	      }
+      void refreshPublicNetworkMapIncidentOverlay(render);
+	    }, () => render())) {
+	      return true;
+	    }
+    intervalFn(async () => {
+      try {
+        const results = await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
+        handleCurrentViewLoadSuccess();
+	        if (results.some(Boolean)) {
+	          render();
+	        }
+        void refreshPublicNetworkMapIncidentOverlay(render);
+	      } catch (err) {
+	        handleCurrentViewRefreshError(err);
+	      }
+    }, cfg.publicRefreshMs || 30000);
+	    return true;
+	  }
+
+  async function refreshPublicNetworkMapIncidentOverlay(render) {
+    try {
+      const changed = await refreshPublicIncidents();
+      if (changed && typeof render === "function") {
+        render();
+      }
+      focusRequestedIncidentFromURL({ animate: false });
+      return changed;
+    } catch (err) {
+      handleCurrentViewRefreshError(err);
+      return false;
+    }
+  }
+
+		  async function bootMiniAppAnonymousFallback(options = {}) {
+	    await ensurePublicSession();
+	    state.miniAppPublicMapFallback = true;
+	    return bootPublicNetworkMapSurface(options);
+	  }
+
   async function boot() {
     bindGlobalDocumentEvents();
     bindMapRelayoutListeners();
@@ -1876,34 +2207,7 @@
     }
 
     if (cfg.mode === "public-network-map") {
-      try {
-        await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
-        handleCurrentViewLoadSuccess();
-      } catch (err) {
-        if (handleInitialLoadError(err)) {
-          return;
-        }
-      }
-      renderPublicNetworkMap();
-      if (await activateLiveRefresh(async () => {
-        const results = await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
-        if (results.some(Boolean)) {
-          renderPublicNetworkMap();
-        }
-      }, () => renderPublicNetworkMap())) {
-        return;
-      }
-      setInterval(async () => {
-        try {
-          const results = await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
-          handleCurrentViewLoadSuccess();
-          if (results.some(Boolean)) {
-            renderPublicNetworkMap();
-          }
-        } catch (err) {
-          handleCurrentViewRefreshError(err);
-        }
-      }, cfg.publicRefreshMs || 30000);
+      await bootPublicNetworkMapSurface();
       return;
     }
 
@@ -1988,7 +2292,7 @@
     try {
       await authenticateMiniApp();
       if (!state.authenticated) {
-        renderAuthRequired();
+        await bootMiniAppAnonymousFallback();
         return;
       }
       await loadMiniAppInitialData({
@@ -2207,20 +2511,35 @@
     await finalizeMiniAppAuthentication(payload, null);
   }
 
-  async function applyAuthenticatedSession(payload, options) {
-    const settings = options || {};
-    persistSpacetimeSession(payload && payload.spacetime ? payload.spacetime : null);
-    state.authenticated = Boolean(payload && (payload.ok || payload.authenticated));
-    state.authState = state.authenticated ? "authenticated" : "anonymous";
-    state.authFeedback = null;
-    state.authInProgress = false;
+	  async function applyAuthenticatedSession(payload, options) {
+	    const settings = options || {};
+	    persistSpacetimeSession(payload && payload.spacetime ? payload.spacetime : null);
+	    state.authenticated = Boolean(payload && (payload.ok || payload.authenticated));
+	    state.authState = state.authenticated ? "authenticated" : "anonymous";
+	    state.miniAppPublicMapFallback = false;
+	    state.authFeedback = null;
+	    state.authInProgress = false;
     if (!state.authenticated) {
       return false;
     }
     let me = null;
-    try {
-      me = await api("/me", {}, true);
-    } catch (_) {
+    if (payload && payload.authenticated === true && payload.settings && typeof payload.userId !== "undefined") {
+      me = payload;
+    } else {
+      try {
+        me = await api("/me", {}, true);
+      } catch (_) {
+        me = {
+          authenticated: true,
+          userId: payload && payload.userId,
+          stableUserId: payload && payload.stableUserId,
+          nickname: payload && (payload.nickname || payload.firstName),
+          settings: { language: payload && (payload.lang || payload.language) },
+          currentRide: null,
+        };
+      }
+    }
+    if (!me) {
       me = {
         authenticated: true,
         userId: payload && payload.userId,
@@ -2245,11 +2564,12 @@
     return true;
   }
 
-  function applyAnonymousSession(reason) {
-    clearSpacetimeSession();
-    state.authenticated = false;
-    state.authState = reason || "anonymous";
-	    state.me = null;
+	  function applyAnonymousSession(reason) {
+	    clearSpacetimeSession();
+	    state.authenticated = false;
+	    state.authState = reason || "anonymous";
+	    state.miniAppPublicMapFallback = false;
+		    state.me = null;
 	    state.currentRide = null;
 	    state.routeCheckIn = null;
 	    closeSiteMenus();
@@ -2264,16 +2584,11 @@
       return true;
     }
     try {
-      const me = await api("/me", {}, true);
-      await applyAuthenticatedSession({
-        ok: true,
-        authenticated: true,
-        userId: me.userId,
-        stableUserId: me.stableUserId,
-        nickname: me.nickname,
-        lang: me.lang || me.language,
-      });
-      return true;
+      const session = await api("/session", {}, true);
+      if (session && session.authenticated === true) {
+        return await applyAuthenticatedSession(session);
+      }
+      clearSpacetimeSession();
     } catch (_) {
       clearSpacetimeSession();
     }
@@ -2895,10 +3210,15 @@
     };
   }
 
+  async function loadPublicNetworkMapData() {
+    const payload = await publicApi("/public/map");
+    return Object.assign({ liveOnly: false }, payload || {});
+  }
+
   async function refreshPublicNetworkMap() {
     const previousSchedule = state.scheduleMeta;
     const previousMapData = state.networkMapData;
-    const nextMapData = liveOnlyNetworkMapData();
+    const nextMapData = await loadPublicNetworkMapData();
     const dataChanged = !sameNetworkMapPayload(previousMapData, nextMapData);
     const scheduleChanged = !sameMaterialValue(previousSchedule, state.scheduleMeta);
     if (dataChanged) {
@@ -2973,10 +3293,16 @@
   }
 
   function defaultNetworkMapSightings(mapData) {
+    if (mapData && mapData.liveOnly) {
+      return [];
+    }
     return Array.isArray(mapData && mapData.recentSightings) ? mapData.recentSightings : [];
   }
 
   function sameDayNetworkMapSightings(mapData) {
+    if (mapData && mapData.liveOnly) {
+      return [];
+    }
     if (Array.isArray(mapData && mapData.sameDaySightings)) {
       return mapData.sameDaySightings;
     }
@@ -3670,7 +3996,7 @@
       notifyLoadStateChange();
     }
     try {
-      const nextMapData = liveOnlyNetworkMapData();
+      const nextMapData = await loadPublicNetworkMapData();
       const dataChanged = !sameNetworkMapPayload(previousMapData, nextMapData);
       const scheduleChanged = !sameMaterialValue(previousSchedule, state.scheduleMeta);
       if (dataChanged) {
@@ -3999,7 +4325,10 @@
   }
 
   function usesPublicNetworkMap() {
-    return cfg.mode === "public-network-map" || cfg.mode === "public-dashboard" || cfg.mode === "public-stations";
+    return cfg.mode === "public-network-map"
+      || cfg.mode === "public-dashboard"
+      || cfg.mode === "public-stations"
+      || isMiniAppPublicMapFallback();
   }
 
   function usesPublicTrainMap() {
@@ -4039,12 +4368,36 @@
     if (!isPublicMapMode()) {
       return;
     }
+    if (!window.L) {
+      schedulePublicMapLibraryRetry();
+      return;
+    }
+    publicMapLibraryRetryCount = 0;
+    if (publicMapLibraryRetryTimer && typeof window.clearTimeout === "function") {
+      window.clearTimeout(publicMapLibraryRetryTimer);
+      publicMapLibraryRetryTimer = null;
+    }
     if (usesPublicTrainMap()) {
       syncMapFromDOM("public-train-map", state.mapData);
     } else {
       syncMapFromDOM("public-network-map", state.networkMapData);
     }
     applyPublicMapFollow();
+  }
+
+  function schedulePublicMapLibraryRetry() {
+    if (publicMapLibraryRetryTimer || publicMapLibraryRetryCount >= 40) {
+      return;
+    }
+    publicMapLibraryRetryCount += 1;
+    const delayMs = Math.min(1000, 50 * publicMapLibraryRetryCount);
+    const setTimer = window && typeof window.setTimeout === "function"
+      ? window.setTimeout.bind(window)
+      : setTimeout;
+    publicMapLibraryRetryTimer = setTimer(() => {
+      publicMapLibraryRetryTimer = null;
+      syncActivePublicMap();
+    }, delayMs);
   }
 
   function applyPublicMapFollow(controller) {
@@ -4315,12 +4668,24 @@
     state.statusText = message;
     await refreshMe();
     if (state.selectedTrain && state.selectedTrain.trainCard && state.selectedTrain.trainCard.train.id === trainId) {
-      state.selectedTrain = await api(`/trains/${encodeURIComponent(trainId)}/status`);
+      try {
+        state.selectedTrain = await api(`/trains/${encodeURIComponent(trainId)}/status`);
+      } catch (err) {
+        if (!err || err.status !== 404) {
+          throw err;
+        }
+      }
     }
     if (state.mapTrainId === trainId) {
-      await refreshMapData(trainId);
+      try {
+        await refreshMapData(trainId);
+      } catch (err) {
+        if (!err || err.status !== 404) {
+          throw err;
+        }
+      }
     }
-    renderMiniApp();
+    renderAfterReportMutation();
     return { message, kind };
   }
 
@@ -4367,6 +4732,127 @@
     state.statusText = message;
     renderMiniApp();
     return { message, kind };
+  }
+
+  function locationReportFeedback(payload, successKey) {
+    let message = t(successKey || "app_location_report_success");
+    let kind = "success";
+    if (payload && payload.deduped) {
+      message = t("app_location_report_deduped");
+      kind = "info";
+    } else if (payload && payload.cooldownRemaining > 0) {
+      const mins = Math.max(1, Math.ceil(Number(payload.cooldownRemaining) / 60000000000));
+      message = t("app_location_report_cooldown", mins);
+      kind = "info";
+    }
+    return { message, kind };
+  }
+
+  async function refreshAfterLocationReport() {
+    try {
+      await refreshPublicIncidents();
+    } catch (_) {}
+    try {
+      if (state.mapTrainId) {
+        await refreshMapData(state.mapTrainId);
+      } else {
+        await refreshNetworkMapData(true);
+      }
+    } catch (_) {}
+  }
+
+  function reportMutationRenderTarget() {
+    if (isMiniAppPublicMapFallback()) {
+      return "public-network-map";
+    }
+    if (cfg.mode === "public-network-map") {
+      return "public-network-map";
+    }
+    if (cfg.mode === "public-map") {
+      return "public-map";
+    }
+    if (cfg.mode === "public-train") {
+      return "public-train";
+    }
+    if (cfg.mode === "public-incidents") {
+      return "public-incidents";
+    }
+    if (cfg.mode === "public-dashboard") {
+      return "public-dashboard";
+    }
+    if (cfg.mode === "public-stations") {
+      return "public-stations";
+    }
+    return "mini-app";
+  }
+
+  function renderAfterReportMutation() {
+    const target = reportMutationRenderTarget();
+    if (target === "public-network-map") {
+      renderPublicNetworkMap();
+      return;
+    }
+    if (target === "public-map") {
+      renderPublicMap();
+      return;
+    }
+    if (target === "public-train") {
+      renderPublicTrain();
+      return;
+    }
+    if (target === "public-incidents") {
+      renderPublicIncidents();
+      return;
+    }
+    if (target === "public-dashboard") {
+      renderPublicDashboard();
+      return;
+    }
+    if (target === "public-stations") {
+      renderPublicStationSearch({ preserveInputFocus: true });
+      return;
+    }
+    renderMiniApp();
+  }
+
+  async function submitStationReport(stationId) {
+    const normalizedStationId = String(stationId || "").trim();
+    if (!normalizedStationId) {
+      throw new Error(t("app_public_station_prompt"));
+    }
+    const payload = await api(`/stations/${encodeURIComponent(normalizedStationId)}/reports`, {
+      method: "POST",
+    });
+    const feedback = locationReportFeedback(payload, "app_station_report_success");
+    state.statusText = feedback.message;
+    await refreshAfterLocationReport();
+    renderAfterReportMutation();
+    return feedback;
+  }
+
+  async function submitLocationReport(input) {
+    const data = input || {};
+    const latitude = Number(data.latitude);
+    const longitude = Number(data.longitude);
+    const radiusMeters = Number(data.radiusMeters) || 100;
+    const description = String(data.description || "").trim();
+    if (!description) {
+      throw new Error(t("app_location_report_description_required"));
+    }
+    const payload = await api("/location-reports", {
+      method: "POST",
+      body: JSON.stringify({
+        latitude,
+        longitude,
+        radiusMeters,
+        description,
+      }),
+    });
+    const feedback = locationReportFeedback(payload, "app_location_report_success");
+    state.statusText = feedback.message;
+    await refreshAfterLocationReport();
+    renderAfterReportMutation();
+    return feedback;
   }
 
   async function muteTrain(trainId) {
@@ -4718,6 +5204,12 @@
       if (isPublicMode()) {
         await ensurePublicSession();
       }
+      if (isMiniAppPublicMapFallback()) {
+        await Promise.all([refreshPublicNetworkMap(), refreshPublicDashboardAll()]);
+        handleCurrentViewLoadSuccess();
+        renderPublicNetworkMap();
+        return true;
+      }
       if (cfg.mode === "public-dashboard") {
         await refreshPublicDashboard();
         handleCurrentViewLoadSuccess();
@@ -4796,6 +5288,10 @@
   }
 
   function rerenderCurrent(options) {
+    if (isMiniAppPublicMapFallback()) {
+      renderPublicNetworkMap();
+      return;
+    }
     if (cfg.mode === "mini-app") {
       if (options && options.preserveDetail) {
         renderMiniApp({ preserveDetail: true, previousSelectedTrainId: detailTargetTrainId() });
@@ -5744,8 +6240,34 @@
         map.on("zoomend", persistView);
         map.on("moveend", syncVisibleMoveLayers);
         map.on("zoomend", syncVisibleZoomLayers);
+        map.on("click", (event) => {
+          this.handleMapClick(event);
+        });
         this.map = map;
         return this.map;
+      },
+
+      handleMapClick(event) {
+        if (!mapReportsEnabled() || !event || !event.latlng) {
+          return false;
+        }
+        if (Date.now() - this.lastMarkerInteractionAt < 250) {
+          return false;
+        }
+        const latitude = Number(event.latlng.lat);
+        const longitude = Number(event.latlng.lng);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return false;
+        }
+        const html = buildLocationReportDraftHTML({ latitude, longitude });
+        if (!window.L || typeof window.L.popup !== "function" || !this.map) {
+          return false;
+        }
+        window.L.popup()
+          .setLatLng(event.latlng)
+          .setContent(html)
+          .openOn(this.map);
+        return true;
       },
 
       detach() {
@@ -6256,6 +6778,14 @@
           marker.setIcon(this.buildMarkerIcon(item));
           applyTrainMarkerStateTransition(marker, previousItem, item);
         }
+        if (item.kind === "circle") {
+          if (typeof marker.setRadius === "function") {
+            marker.setRadius(item.options && typeof item.options.radius === "number" ? item.options.radius : 100);
+          }
+          if (typeof marker.setStyle === "function") {
+            marker.setStyle(item.options || {});
+          }
+        }
         if (typeof marker.setZIndexOffset === "function") {
           marker.setZIndexOffset(item.zIndexOffset || 0);
         }
@@ -6493,6 +7023,9 @@
             icon: this.buildMarkerIcon(item),
           });
         }
+        if (item.kind === "circle" && typeof window.L.circle === "function") {
+          return window.L.circle(item.latLng, item.options || {});
+        }
         return window.L.circleMarker(item.latLng, item.options);
       },
 
@@ -6546,18 +7079,125 @@
     return usesPublicNetworkMap() ? "network:public-network-map" : "network:mini-app";
   }
 
+  function coordinateLatLng(item) {
+    const latitude = typeof item === "object" && item ? Number(item.latitude) : NaN;
+    const longitude = typeof item === "object" && item ? Number(item.longitude) : NaN;
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return null;
+    }
+    return [latitude, longitude];
+  }
+
+  function pointListLatLng(points) {
+    return (Array.isArray(points) ? points : []).map(pointToLatLng).filter(Boolean);
+  }
+
+  function locatedTrainStops(mapData) {
+    return (Array.isArray(mapData && mapData.stops) ? mapData.stops : [])
+      .map((stop, index) => ({ stop, index, latLng: coordinateLatLng(stop) }))
+      .filter((entry) => entry.latLng);
+  }
+
+  function locatedNetworkStations(mapData) {
+    if (mapData && mapData.liveOnly) {
+      return [];
+    }
+    return (Array.isArray(mapData && mapData.stations) ? mapData.stations : [])
+      .map((station) => ({ station, latLng: coordinateLatLng(station) }))
+      .filter((entry) => entry.latLng);
+  }
+
+  function trainStopMarkerKey(trainId, stop, index) {
+    const stationId = String(stop && (stop.stationId || stop.stationName) || "stop").trim() || "stop";
+    return `train-stop:${trainId || "unknown"}:${stationId}:${index}`;
+  }
+
+  function networkStationMarkerKey(station) {
+    const stationId = String(station && (station.id || station.name) || "station").trim() || "station";
+    return `network-station:${stationId}`;
+  }
+
+  function trainRoutePolyline(mapData, liveItem) {
+    const externalPolyline = pointListLatLng(liveItem && liveItem.external && liveItem.external.polyline);
+    if (externalPolyline.length > 1) {
+      return externalPolyline;
+    }
+    return locatedTrainStops(mapData).map((entry) => entry.latLng);
+  }
+
+  function mapConfigBounds(baseMarkers, sightingMarkers, trainMarkers, polyline) {
+    return []
+      .concat((Array.isArray(baseMarkers) ? baseMarkers : []).map((item) => item.latLng))
+      .concat((Array.isArray(sightingMarkers) ? sightingMarkers : []).map((item) => item.latLng))
+      .concat((Array.isArray(trainMarkers) ? trainMarkers : []).map((item) => item.latLng))
+      .concat(Array.isArray(polyline) ? polyline : [])
+      .filter((latLng) => Array.isArray(latLng) && latLng.length === 2);
+  }
+
+  function buildTrainStopMarkerConfigs(mapData, liveItems, hasLiveTrainMarker, viewport) {
+    const trainId = normalizeTrainId(mapData && mapData.train && mapData.train.id);
+    const allLiveItems = Array.isArray(liveItems) ? liveItems : [];
+    return locatedTrainStops(mapData).map((entry) => {
+      const stop = entry.stop;
+      const markerKey = trainStopMarkerKey(trainId, stop, entry.index);
+      const stopLiveItems = allLiveItems.filter((item) => liveItemTouchesStation(item, stop.stationName || stop.stationId));
+      const popupHTML = buildTrainStopPopupHTML(stop, entry.index, mapData, stopLiveItems, hasLiveTrainMarker);
+      return buildStationMarkerConfig({
+        markerKey,
+        name: stop.stationName || stop.stationId || "",
+        latLng: entry.latLng,
+        sightings: stopSightings(stop, mapData),
+        liveItems: stopLiveItems,
+        popupHTML,
+        popupOptions: {},
+      }, viewport);
+    });
+  }
+
+  function buildNetworkStationMarkerConfigs(mapData, liveItems, viewport) {
+    const activity = buildStationActivityMap(mapData, liveItems);
+    return locatedNetworkStations(mapData).map((entry) => {
+      const station = entry.station;
+      const key = stationKeyValue(station.name || station.id);
+      const bucket = activity.get(key) || emptyStationActivity(station.name || station.id || "", station.id || "");
+      bucket.name = bucket.name || station.name || station.id || "";
+      bucket.stationId = bucket.stationId || station.id || "";
+      const incidents = activeStationIncidentsFor(station, bucket);
+      const popupHTML = buildStationPopupHTML(station, bucket, {
+        allowReports: mapReportsEnabled(),
+        incidents,
+      });
+      return buildStationMarkerConfig({
+        markerKey: networkStationMarkerKey(station),
+        name: station.name || station.id || "",
+        latLng: entry.latLng,
+        sightings: bucket.sightings,
+        liveItems: bucket.liveItems,
+        incidents,
+        popupHTML,
+        popupOptions: {},
+      }, viewport);
+    });
+  }
+
   function buildTrainMapConfig(mapData, viewport) {
     const liveItem = buildSelectedTrainLiveItem(mapData);
     const trainMarkers = liveItem && liveItem.external && liveItem.external.position
       ? [buildLiveTrainMarkerConfig(liveItem, viewport)]
       : [];
-    const bounds = trainMarkers.map((item) => item.latLng);
+    const liveItems = liveItem ? [liveItem] : [];
+    const baseMarkers = buildTrainStopMarkerConfigs(mapData, liveItems, trainMarkers.length > 0, viewport);
+    const polyline = trainRoutePolyline(mapData, liveItem);
+    const sightingMarkers = shouldShowSightingTags(viewport && viewport.zoom)
+      ? buildSightingMarkers(mapData && mapData.stationSightings, buildCoordinateLookup(Array.isArray(mapData && mapData.stops) ? mapData.stops : [], "stationId"))
+      : [];
+    const bounds = mapConfigBounds(baseMarkers, sightingMarkers, trainMarkers, polyline);
     const config = {
       viewKey: trainMapViewKey(mapData),
       bounds: bounds,
-      polyline: [],
-      baseMarkers: [],
-      sightingMarkers: [],
+      polyline: polyline,
+      baseMarkers: baseMarkers,
+      sightingMarkers: sightingMarkers,
       trainMarkers: trainMarkers,
     };
     return {
@@ -6572,17 +7212,21 @@
   }
 
   function buildNetworkMapConfig(mapData, viewport) {
-    const liveItems = buildMapVisibleLiveItems(serviceDayTrainItemsForMapMatching(), []);
+    const liveItems = buildMapVisibleLiveItems(serviceDayTrainItemsForMapMatching(), activeNetworkMapSightings(mapData));
     const trainMarkers = liveItems
       .filter((item) => item.external && item.external.position)
       .map((item) => buildLiveTrainMarkerConfig(item, viewport));
-    const bounds = trainMarkers.map((item) => item.latLng);
+    const baseMarkers = buildNetworkStationMarkerConfigs(mapData, liveItems, viewport);
+    const sightingMarkers = (shouldShowSightingTags(viewport && viewport.zoom)
+      ? buildSightingMarkers(activeNetworkMapSightings(mapData), buildCoordinateLookup(Array.isArray(mapData && mapData.stations) ? mapData.stations : [], "id"))
+      : []).concat(activeAreaIncidentMarkers());
+    const bounds = mapConfigBounds(baseMarkers, sightingMarkers, trainMarkers, []);
     const config = {
       viewKey: networkMapViewKey(),
       bounds: bounds,
       polyline: [],
-      baseMarkers: [],
-      sightingMarkers: [],
+      baseMarkers: baseMarkers,
+      sightingMarkers: sightingMarkers,
       trainMarkers: trainMarkers,
     };
     return {
@@ -6766,7 +7410,7 @@
       const localMatch = matchInfo && matchInfo.match ? matchInfo.match : null;
       const trainId = matchInfo && matchInfo.localTrainId ? matchInfo.localTrainId : localTrainId(localMatch);
       const markerKey = liveTrainMarkerKeyForExternal(mergedExternal);
-      return {
+      const item = {
         external: mergedExternal,
         localMatch: localMatch,
         matchInfo: matchInfo,
@@ -6776,6 +7420,8 @@
         timeline: localTrainTimeline(localMatch),
         sightings: localTrainSightings(localMatch, trainId, fallbackSightings, fallbackSightingIndex),
       };
+      item.incidents = activeTrainIncidentsForItem(item);
+      return item;
     }).filter((item) => item.external && item.external.position);
   }
 
@@ -6973,6 +7619,7 @@
   function buildStationMarkerConfig(options, viewport) {
     const sightings = Array.isArray(options.sightings) ? options.sightings : [];
     const liveItems = Array.isArray(options.liveItems) ? options.liveItems : [];
+    const incidents = Array.isArray(options.incidents) ? options.incidents : [];
     const profile = stationMarkerProfile(viewport);
     const markerKey = options.markerKey || "";
     const popupHTML = options.popupHTML || "";
@@ -6981,7 +7628,8 @@
       className: "map-html-marker",
       markerKey: markerKey,
       latLng: options.latLng,
-      html: buildStationMarkerHTML(options.name, sightings.length, liveItems, profile),
+      html: buildStationMarkerHTML(options.name, sightings.length, liveItems, profile, incidents.length),
+      incidentIds: incidents.map((item) => item.id).filter(Boolean),
       iconSize: profile.iconSize,
       iconAnchor: profile.iconAnchor,
       popupAnchor: profile.popupAnchor,
@@ -6999,7 +7647,8 @@
     const profile = liveTrainMarkerProfile(viewport);
     const popupHTML = buildTrainPopupHTML(item);
     const gpsClass = liveTrainGpsClass(item.external);
-    const crewActive = hasCrewActivity(item.status);
+    const incidents = Array.isArray(item && item.incidents) ? item.incidents : [];
+    const crewActive = hasCrewActivity(item.status) || incidents.length > 0;
     return {
       kind: "html",
       className: "map-html-marker",
@@ -7010,6 +7659,7 @@
       animateMovement: false,
       movementObservedAt: liveTrainDisplayUpdatedAt(item.external),
       html: buildLiveTrainMarkerHTML(item, profile, gpsClass, crewActive),
+      incidentIds: incidents.map((incident) => incident.id).filter(Boolean),
       iconSize: profile.iconSize,
       iconAnchor: profile.iconAnchor,
       popupAnchor: profile.popupAnchor,
@@ -7030,19 +7680,23 @@
     };
   }
 
-  function buildStationMarkerHTML(name, sightingCount, liveItems, profile) {
+  function buildStationMarkerHTML(name, sightingCount, liveItems, profile, incidentCount) {
     const markerProfile = profile || stationMarkerProfile({ zoom: MAP_DEFAULT_VIEW_ZOOM, visibleHeightMeters: Infinity });
+    const activeIncidentCount = Number(incidentCount) || 0;
     const crewCount = liveItems.filter((item) => hasCrewActivity(item.status)).length;
     const liveCount = liveItems.length;
     const stateClass = crewCount > 0
       ? "crew-active"
-      : liveCount > 0
-        ? "live-active"
-        : sightingCount > 0
-          ? "sighting-active"
-          : "idle";
+      : activeIncidentCount > 0
+        ? "crew-active"
+        : liveCount > 0
+          ? "live-active"
+          : sightingCount > 0
+            ? "sighting-active"
+            : "idle";
     const markerLabel = [
       name || "Station",
+      activeIncidentCount ? `${activeIncidentCount} ${t("app_section_incidents")}` : "",
       liveCount ? `${liveCount} ${t("app_map_popup_live_now")}` : "",
       sightingCount ? `${sightingCount} ${t("app_map_popup_recent_sightings")}` : "",
     ].filter(Boolean).join(" • ");
@@ -7053,7 +7707,7 @@
         title="${escapeAttr(markerLabel)}"
         aria-label="${escapeAttr(markerLabel)}"
       >
-        ${sightingCount ? `<span class="map-marker-count">!</span>` : ""}
+        ${(activeIncidentCount || sightingCount) ? `<span class="map-marker-count">!</span>` : ""}
       </div>
     `;
   }
@@ -7064,9 +7718,11 @@
     const gpsClass = gpsClassOverride || liveTrainGpsClass(item.external);
     const crewActive = typeof crewActiveOverride === "boolean" ? crewActiveOverride : hasCrewActivity(item.status);
     const reporterCount = item.status && typeof item.status.uniqueReporters === "number" ? item.status.uniqueReporters : 0;
+    const incidentCount = Array.isArray(item && item.incidents) ? item.incidents.length : 0;
     const markerLabel = [
       number,
       gpsClass.replace("gps-", ""),
+      incidentCount ? `${incidentCount} ${t("app_section_incidents")}` : "",
       reporterCount ? `${reporterCount} crew` : "",
     ].filter(Boolean).join(" • ");
     return `
@@ -7077,7 +7733,7 @@
         aria-label="${escapeAttr(markerLabel)}"
       >
         <span class="map-marker-label">${escapeHtml(number)}</span>
-        ${reporterCount ? `<span class="map-marker-count">!</span>` : ""}
+        ${(incidentCount || reporterCount) ? `<span class="map-marker-count">!</span>` : ""}
       </div>
     `;
   }
@@ -7391,6 +8047,7 @@
     const recentSightings = Array.isArray(item.sightings) && item.sightings.length
       ? item.sightings.slice(0, 3).map((entry) => `${entry.stationName || entry.stationId} • ${relativeAgo(entry.createdAt)}`)
       : [];
+    const incidents = Array.isArray(item.incidents) ? item.incidents : [];
     return buildPopupCard({
       title: item.external.trainNumber || trainNumberLabel(item.trainId),
       subtitle: routeName,
@@ -7403,10 +8060,11 @@
             : t("app_map_popup_schedule")
         ),
         popupInfoRow(t("app_map_popup_crew"), crewSummary),
+        incidentPopupSection(incidents),
         popupListSection(t("app_map_popup_recent_reports"), recentReports),
         popupListSection(t("app_map_popup_recent_sightings"), recentSightings),
       ],
-      actionsHTML: renderTrainPopupActions(item),
+      actionsHTML: renderTrainPopupActions(item) + incidentPopupActionsHTML(incidents),
     });
   }
 
@@ -7432,7 +8090,26 @@
     return null;
   }
 
-  function buildStationPopupHTML(station, bucket) {
+  function stationPopupReportAction(station, bucket, options) {
+    const hasExplicitAllow = options && Object.prototype.hasOwnProperty.call(options, "allowReports");
+    const allowReports = hasExplicitAllow ? Boolean(options.allowReports) : mapReportsEnabled();
+    const stationId = String((station && station.id) || (bucket && bucket.stationId) || "").trim();
+    if (!allowReports || !state.authenticated || !stationId) {
+      return null;
+    }
+    return {
+      className: "primary small",
+      action: "popup-report-station",
+      stationId: stationId,
+      label: t("app_station_report_action"),
+    };
+  }
+
+  function mapReportsEnabled() {
+    return Boolean(state.authenticated);
+  }
+
+  function buildStationPopupHTML(station, bucket, options) {
     const liveNow = bucket.liveItems.length
       ? bucket.liveItems.slice(0, 3).map((item) => {
         const crewSummary = item.status ? ` • ${statusSummary(item.status)}` : "";
@@ -7443,6 +8120,7 @@
     const recentSightings = bucket.sightings.length
       ? bucket.sightings.slice(0, 3).map((entry) => `${relativeAgo(entry.createdAt)}${entry.destinationStationName ? ` • ${entry.destinationStationName}` : ""}`)
       : [t("app_station_sighting_empty")];
+    const incidents = Array.isArray(options && options.incidents) ? options.incidents : [];
     const actions = [];
     const checkInAction = stationPopupQuickCheckInAction(bucket);
     if (checkInAction) {
@@ -7452,14 +8130,68 @@
     if (sightingAction) {
       actions.push(sightingAction);
     }
+    const reportAction = stationPopupReportAction(station, bucket, options);
+    if (reportAction) {
+      actions.push(reportAction);
+    }
     return buildPopupCard({
       title: (station && (station.name || station.id)) || bucket.name || "Station",
       sections: [
         popupListSection(t("app_map_popup_live_now"), liveNow),
+        incidentPopupSection(incidents),
         popupListSection(t("app_map_popup_recent_sightings"), recentSightings),
       ],
-      actionsHTML: renderPopupActionButtons(actions),
+      actionsHTML: renderPopupActionButtons(actions) + incidentPopupActionsHTML(incidents),
     });
+  }
+
+  function buildLocationReportDraftHTML(location) {
+    const latitude = roundMapCoord(location && (location.latitude != null ? location.latitude : location.lat));
+    const longitude = roundMapCoord(location && (location.longitude != null ? location.longitude : location.lng));
+    const radiusMeters = locationReportRadiusMeters(location && location.radiusMeters);
+    const radiusOptionsHTML = locationReportRadiusChoices().map((choice) => {
+      const selectedAttr = choice === radiusMeters ? " selected" : "";
+      return `<option value="${escapeAttr(choice)}"${selectedAttr}>${escapeHtml(`${choice} m`)}</option>`;
+    }).join("");
+    return buildPopupCard({
+      title: t("app_location_report_title"),
+      sections: [`
+        <div class="map-popup-row">
+          <label class="map-popup-label" for="location-report-description">${escapeHtml(t("app_location_report_description_label"))}</label>
+          <textarea
+            id="location-report-description"
+            data-role="location-report-description"
+            rows="3"
+            maxlength="160"
+            placeholder="${escapeAttr(t("app_location_report_description_placeholder"))}"
+          ></textarea>
+        </div>
+        <div class="map-popup-row">
+          <label class="map-popup-label" for="location-report-radius">${escapeHtml(t("app_location_report_radius_label"))}</label>
+          <select id="location-report-radius" data-role="location-report-radius">
+            ${radiusOptionsHTML}
+          </select>
+        </div>
+      `],
+      actionsHTML: `
+        <button
+          class="primary small"
+          data-action="popup-submit-location-report"
+          data-latitude="${escapeAttr(latitude)}"
+          data-longitude="${escapeAttr(longitude)}"
+          data-radius-meters="${escapeAttr(radiusMeters)}"
+        >${escapeHtml(t("app_location_report_submit"))}</button>
+      `,
+    });
+  }
+
+  function locationReportRadiusChoices() {
+    return [100, 250, 500, 1000];
+  }
+
+  function locationReportRadiusMeters(value) {
+    const radius = Math.round(Number(value) || 0);
+    return locationReportRadiusChoices().includes(radius) ? radius : 100;
   }
 
   function stopEligibleUntilAt(stop) {
@@ -7493,6 +8225,17 @@
     const recentSightings = sightings.length
       ? sightings.slice(0, 3).map((entry) => `${relativeAgo(entry.createdAt)}${entry.destinationStationName ? ` • ${entry.destinationStationName}` : ""}`)
       : [t("app_station_sighting_empty")];
+    const actions = [
+      stationPopupReportAction({
+        id: stop && stop.stationId,
+        name: stop && stop.stationName,
+      }, {
+        stationId: stop && stop.stationId,
+      }, {
+        allowReports: mapReportsEnabled(),
+      }),
+      resolveTrainStopPopupAction(stop, mapData, hasLiveTrainMarker),
+    ].filter(Boolean);
     return buildPopupCard({
       title: stop.stationName || stop.stationId || "",
       sections: [
@@ -7500,7 +8243,7 @@
         popupInfoRow(t("app_map_popup_live_train"), liveTrainSummary),
         popupListSection(t("app_map_popup_recent_sightings"), recentSightings),
       ],
-      actionsHTML: renderPopupActionButton(resolveTrainStopPopupAction(stop, mapData, hasLiveTrainMarker)),
+      actionsHTML: renderPopupActionButtons(actions),
     });
   }
 
@@ -7651,17 +8394,155 @@
       const stationKey = String(item.stationId || item.stationName || "unknown");
       const offsetIndex = stationCounts[stationKey] || 0;
       stationCounts[stationKey] = offsetIndex + 1;
+      const markerKey = `sighting:${stationKey}:${item.createdAt || offsetIndex}:${item.destinationStationName || ""}`;
+      const popupHTML = sightingPopupHTML(item);
       return {
         kind: "tag",
         latLng: baseLatLng,
-        markerKey: `sighting:${stationKey}:${item.createdAt || offsetIndex}:${item.destinationStationName || ""}`,
+        markerKey,
         pixelOffset: sightingPixelOffset(offsetIndex),
         zIndexOffset: 1000 - offsetIndex,
         tagText: sightingTagText(item.createdAt),
         bucketClass: `bucket-${sightingRecencyBucket(item.createdAt)}`,
-        popupHTML: sightingPopupHTML(item),
+        popupHTML,
+        interaction: {
+          entityKey: markerKey,
+          detailHTML: popupHTML,
+          selectionOptions: {},
+        },
       };
     }).filter(Boolean);
+  }
+
+  function activeMapIncidents(scope) {
+    return (Array.isArray(state.publicIncidents) ? state.publicIncidents : [])
+      .filter((item) => item && item.active !== false && (!scope || item.scope === scope));
+  }
+
+  function incidentActivityLabel(item) {
+    const title = String((item && item.subjectName) || (item && item.lastActivityName) || (item && item.lastReportName) || t("app_section_incidents")).trim();
+    const at = (item && (item.lastActivityAt || item.lastReportAt)) || "";
+    return at ? `${title} • ${relativeAgo(at)}` : title;
+  }
+
+  function incidentPopupActionsHTML(incidents) {
+    const items = (Array.isArray(incidents) ? incidents : []).filter((item) => item && item.id).slice(0, 3);
+    return items.map((item) => `
+      <button
+        class="ghost small"
+        data-action="popup-open-incident"
+        data-incident-id="${escapeAttr(item.id)}"
+      >${escapeHtml(t("app_section_incidents"))}</button>
+    `).join("");
+  }
+
+  function incidentPopupSection(incidents) {
+    const items = (Array.isArray(incidents) ? incidents : []).filter(Boolean);
+    return popupListSection(t("app_section_incidents"), items.slice(0, 3).map(incidentActivityLabel));
+  }
+
+  function activeStationIncidentsFor(station, bucket) {
+    const keys = [
+      station && station.id,
+      station && station.name,
+      bucket && bucket.stationId,
+      bucket && bucket.name,
+    ].map(stationKeyValue).filter(Boolean);
+    if (!keys.length) {
+      return [];
+    }
+    const seen = new Set();
+    return activeMapIncidents("station").filter((item) => {
+      const location = item && item.location ? item.location : null;
+      const incidentKeys = [
+        stationIdFromIncident(item),
+        item && item.subjectName,
+        location && location.name,
+        location && location.description,
+      ].map(stationKeyValue).filter(Boolean);
+      const matched = incidentKeys.some((key) => keys.includes(key));
+      if (!matched || seen.has(item.id)) {
+        return false;
+      }
+      seen.add(item.id);
+      return true;
+    });
+  }
+
+  function activeTrainIncidentsForItem(item) {
+    const keys = [
+      item && item.trainId,
+      item && localTrainId(item.localMatch),
+      item && externalTrainInstanceId(item.external),
+    ].map((value) => String(value || "").trim()).filter(Boolean);
+    if (!keys.length) {
+      return [];
+    }
+    const seen = new Set();
+    return activeMapIncidents().filter((incident) => {
+      const target = incidentMapTargetInfo(incident);
+      const trainId = target && target.type === "train"
+        ? target.trainInstanceId
+        : trainIdFromIncidentId(incident && incident.id);
+      if (!trainId || !keys.includes(trainId) || seen.has(incident.id)) {
+        return false;
+      }
+      seen.add(incident.id);
+      return true;
+    });
+  }
+
+  function activeAreaIncidentMarkers() {
+    const incidents = activeMapIncidents("area");
+    const markers = [];
+    incidents.forEach((item, index) => {
+      const location = item && item.location ? item.location : null;
+      const latitude = location && typeof location.latitude === "number" ? location.latitude : null;
+      const longitude = location && typeof location.longitude === "number" ? location.longitude : null;
+      if (!item || item.active === false || item.scope !== "area" || !location || location.kind !== "area" || latitude === null || longitude === null) {
+        return;
+      }
+      const markerKey = `area-incident:${item.id}`;
+      const circleKey = `area-circle:${item.id}`;
+      const radius = Math.max(0, Math.round(Number(location.radiusMeters) || 0));
+      const popupHTML = areaIncidentPopupHTML(item);
+      const interaction = {
+        entityKey: markerKey,
+        detailHTML: popupHTML,
+        selectionOptions: {
+          incidentId: item.id,
+        },
+      };
+      markers.push({
+        kind: "circle",
+        latLng: [latitude, longitude],
+        markerKey: circleKey,
+        incidentIds: [item.id],
+        options: {
+          radius: radius || 100,
+          color: "#b45309",
+          fillColor: "#f97316",
+          fillOpacity: 0.14,
+          opacity: 0.86,
+          weight: 2,
+        },
+        popupHTML,
+        interaction,
+      });
+      markers.push({
+        kind: "tag",
+        latLng: [latitude, longitude],
+        markerKey,
+        incidentIds: [item.id],
+        pixelOffset: sightingPixelOffset(index),
+        zIndexOffset: 900 - index,
+        tagText: radius > 0 ? `${radius}m` : "!",
+        bucketClass: "bucket-warm",
+        popupHTML,
+        interaction,
+      });
+    });
+    return markers;
   }
 
   function sightingPixelOffset(index) {
@@ -7710,6 +8591,21 @@
     details.push(`${escapeHtml(t("app_map_popup_status"))}: ${escapeHtml(item.matchedTrainInstanceId ? t("app_station_sighting_matched") : t("app_station_sighting_unmatched"))}`);
     details.push(`${escapeHtml(t("app_map_popup_age"))}: ${escapeHtml(relativeAgo(item.createdAt))}`);
     details.push(`${escapeHtml(t("app_map_popup_seen_at"))}: ${escapeHtml(formatDateTime(item.createdAt))}`);
+    return details.join("<br>");
+  }
+
+  function areaIncidentPopupHTML(item) {
+    const location = item && item.location ? item.location : {};
+    const radius = Math.max(0, Math.round(Number(location.radiusMeters) || 0));
+    const details = [
+      `<strong>${escapeHtml(item.subjectName || location.description || t("app_location_report_title"))}</strong>`,
+    ];
+    if (radius > 0) {
+      details.push(`${escapeHtml(t("app_map_popup_status"))}: ${escapeHtml(radius + " m")}`);
+    }
+    if (item.lastActivityAt) {
+      details.push(`${escapeHtml(t("app_map_popup_age"))}: ${escapeHtml(relativeAgo(item.lastActivityAt))}`);
+    }
     return details.join("<br>");
   }
 
@@ -8151,6 +9047,7 @@
         publicStatusLink(publicNetworkMapRoot(), t("app_section_map")),
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
         publicStatusLink(publicStationRoot(), t("app_open_station_search")),
+        classicControlLink(),
       ],
       trailingHTML: `<span class="status-pill">${escapeHtml(formatClock(new Date()))}</span>`,
     });
@@ -8164,6 +9061,7 @@
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
         publicStatusLink(publicDashboardRoot(), t("app_open_departures")),
         publicStatusLink(publicStationRoot(), t("app_open_station_search")),
+        classicControlLink(),
       ],
     });
   }
@@ -8256,7 +9154,12 @@
       };
     }
     const liveItem = buildSelectedTrainLiveItem(mapData);
-    const hasMap = Boolean(liveItem && liveItem.external && liveItem.external.position);
+    const stops = Array.isArray(mapData.stops) ? mapData.stops : [];
+    const locatedStops = locatedTrainStops(mapData);
+    const hasMap = Boolean((liveItem && liveItem.external && liveItem.external.position) || locatedStops.length);
+    const stopListHTML = stops.length
+      ? stops.map((stop, index) => renderStopRow(stop, index, mapData)).join("")
+      : `<div class="empty">${escapeHtml(t("app_map_empty"))}</div>`;
     return {
       hasTrain: true,
       hasMap: hasMap,
@@ -8267,16 +9170,17 @@
             <div class="train-map-detail-layer" hidden></div>
           </div>`
         : `<div class="empty">${escapeHtml(scheduleUnavailable() ? scheduleUnavailableMessage() : t("app_map_empty"))}</div>`,
-      missingCoordsText: "",
-      stopListHTML: "",
+      missingCoordsText: stops.length && locatedStops.length !== stops.length ? t("app_map_missing_coords") : "",
+      stopListHTML: stopListHTML,
     };
   }
 
   function networkMapShellState(containerId, mapData) {
     const liveItems = buildMapVisibleLiveItems(serviceDayTrainItemsForMapMatching(), []);
+    const stations = locatedNetworkStations(mapData);
     return {
-      hasMap: liveItems.length > 0,
-      html: liveItems.length
+      hasMap: liveItems.length > 0 || stations.length > 0,
+      html: liveItems.length || stations.length
         ? `
           <div id="${escapeAttr(containerId)}" class="train-map-shell" aria-label="${escapeAttr(t("app_network_map_title"))}">
             <div class="train-map-viewport"></div>
@@ -8335,6 +9239,7 @@
         publicStatusLink(publicNetworkMapRoot(), t("app_network_map_title")),
         publicStatusLink(pathFor(`/t/${encodeURIComponent(cfg.trainId || "")}`), t("btn_view_status")),
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
+        classicControlLink(),
       ],
     });
   }
@@ -8371,9 +9276,13 @@
     if (!summaryItem) {
       return `<div class="empty">${escapeHtml(scheduleUnavailable() ? scheduleUnavailableMessage() : t("app_map_empty"))}</div>`;
     }
+    const shellState = trainMapShellState("public-train-map", state.mapData, false);
     return `
       <div class="stack">
         <div id="public-map-summary">${renderRideSummary(summaryItem)}</div>
+        <section class="detail-card" id="public-map-sightings-card">${renderPublicMapSightingsCard()}</section>
+        ${shellState.missingCoordsText ? `<p class="panel-subtitle">${escapeHtml(shellState.missingCoordsText)}</p>` : ""}
+        <section class="detail-card" id="public-map-stop-list-card">${renderPublicMapStopListCard(shellState)}</section>
       </div>
     `;
   }
@@ -8408,6 +9317,7 @@
       patchPublicMapDetailsPanel();
     }
     syncActivePublicMap();
+    focusRequestedIncidentFromURL({ animate: false });
     return true;
   }
 
@@ -8416,17 +9326,7 @@
     if (!detailsPanel) {
       return false;
     }
-    const summaryEl = document.getElementById("public-map-summary");
-    if (!summaryEl) {
-      detailsPanel.innerHTML = renderPublicMapDetailsPanel();
-      return true;
-    }
-    const summaryItem = publicTrainMapSummaryItem();
-    if (!summaryItem) {
-      detailsPanel.innerHTML = renderPublicMapDetailsPanel();
-      return true;
-    }
-    summaryEl.innerHTML = renderRideSummary(summaryItem);
+    detailsPanel.innerHTML = renderPublicMapDetailsPanel();
     return true;
   }
 
@@ -8458,6 +9358,7 @@
         publicStatusLink(publicNetworkMapRoot(), t("app_section_map")),
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
         publicStatusLink(publicDashboardRoot(), t("app_open_departures")),
+        classicControlLink(),
         publicStatusButton("public-station-refresh", t("app_refresh"), "ghost small", "refresh-current-view"),
       ],
     });
@@ -8528,31 +9429,60 @@
       ],
       menuActions: [
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
+        classicControlLink(),
       ],
     });
   }
 
-  function renderPublicNetworkMapSightingsCard() {
+  function networkMapHasStationContext(mapData) {
+    if (!mapData || mapData.liveOnly) {
+      return false;
+    }
+    return Boolean(
+      (Array.isArray(mapData.stations) && mapData.stations.length) ||
+      (Array.isArray(mapData.recentSightings) && mapData.recentSightings.length) ||
+      (Array.isArray(mapData.sameDaySightings) && mapData.sameDaySightings.length)
+    );
+  }
+
+  function renderNetworkMapSightingsCard(mode) {
+    const normalizedMode = mode === "mini" ? "mini" : "public";
+    const showAll = normalizedMode === "public"
+      ? state.publicNetworkMapShowAllSightings
+      : state.miniNetworkMapShowAllSightings;
+    const toggleId = `${normalizedMode}-network-map-history-toggle`;
     const sightings = activeNetworkMapSightings(state.networkMapData);
     return `
       <div class="map-history-toggle-row">
-        <label class="map-history-toggle" for="public-network-map-history-toggle">
-          <input id="public-network-map-history-toggle" type="checkbox" data-action="toggle-network-map-history" data-mode="public" ${state.publicNetworkMapShowAllSightings ? "checked" : ""}>
+        <label class="map-history-toggle" for="${escapeAttr(toggleId)}">
+          <input id="${escapeAttr(toggleId)}" type="checkbox" data-action="toggle-network-map-history" data-mode="${escapeAttr(normalizedMode)}" ${showAll ? "checked" : ""}>
           <span>${escapeHtml(t("app_network_map_toggle_label"))}</span>
         </label>
-        <p class="panel-subtitle">${escapeHtml(state.publicNetworkMapShowAllSightings ? t("app_network_map_toggle_hint_all") : t("app_network_map_toggle_hint_default"))}</p>
+        <p class="panel-subtitle">${escapeHtml(showAll ? t("app_network_map_toggle_hint_all") : t("app_network_map_toggle_hint_default"))}</p>
       </div>
       <h3>${escapeHtml(t("app_recent_platform_sightings"))}</h3>
       ${renderStationSightings(sightings)}
     `;
   }
 
+  function renderPublicNetworkMapSightingsCard() {
+    return renderNetworkMapSightingsCard("public");
+  }
+
+  function renderMiniNetworkMapSightingsCard() {
+    return renderNetworkMapSightingsCard("mini");
+  }
+
   function renderPublicNetworkMapPanel() {
     const shellState = networkMapShellState("public-network-map", state.networkMapData);
+    const sightingsCard = networkMapHasStationContext(state.networkMapData)
+      ? `<section class="detail-card" id="public-network-map-sightings-card">${renderPublicNetworkMapSightingsCard()}</section>`
+      : "";
     return `
       <div class="stack">
         <div id="public-network-map-shell-slot">${shellState.html}</div>
         <p class="panel-subtitle map-live-status" id="public-network-map-live-status">${escapeHtml(externalFeedStatusText())}</p>
+        ${sightingsCard}
       </div>
     `;
   }
@@ -8564,14 +9494,24 @@
     }
     const slotEl = document.getElementById("public-network-map-shell-slot");
     const liveStatusEl = document.getElementById("public-network-map-live-status");
+    const sightingsCardEl = document.getElementById("public-network-map-sightings-card");
     const shellState = networkMapShellState("public-network-map", state.networkMapData);
+    const nextSightingsCardHTML = networkMapHasStationContext(state.networkMapData)
+      ? renderPublicNetworkMapSightingsCard()
+      : "";
     if (!slotEl || !liveStatusEl) {
       mapPanel.innerHTML = renderPublicNetworkMapPanel();
     } else {
       syncPublicMapShellSlot(slotEl, "public-network-map", shellState);
       liveStatusEl.textContent = externalFeedStatusText();
+      if (nextSightingsCardHTML && sightingsCardEl) {
+        sightingsCardEl.innerHTML = nextSightingsCardHTML;
+      } else if (Boolean(nextSightingsCardHTML) !== Boolean(sightingsCardEl)) {
+        mapPanel.innerHTML = renderPublicNetworkMapPanel();
+      }
     }
     syncActivePublicMap();
+    focusRequestedIncidentFromURL({ animate: false });
     bindPublicNetworkMapEvents(mapPanel);
     return true;
   }
@@ -8736,6 +9676,9 @@
             <span>${escapeHtml(t("app_public_incidents_last_reporter", activityActor))}</span>
             <span>${escapeHtml(activityAt ? relativeAgo(activityAt) : "")}</span>
           </div>
+          <div class="button-row incident-detail-actions">
+            <button class="ghost small" data-action="open-incident-map" data-incident-id="${escapeAttr(detail.summary.id)}">${escapeHtml(t("app_public_incidents_show_on_map"))}</button>
+          </div>
           ${state.authenticated ? `
             <div class="button-row">
               <button class="${voteValue === "ONGOING" ? "secondary small" : "ghost small"}" data-action="incident-vote" data-incident-id="${escapeAttr(detail.summary.id)}" data-value="ONGOING">${escapeHtml(t("app_public_incidents_vote_ongoing"))}</button>
@@ -8803,6 +9746,7 @@
         publicStatusLink(publicNetworkMapRoot(), t("app_section_map")),
         publicStatusLink(publicDashboardRoot(), t("app_open_departures")),
         publicStatusLink(publicStationRoot(), t("app_open_station_search")),
+        classicControlLink(),
         publicStatusButton("public-incidents-refresh", t("app_refresh"), "ghost small", "refresh-current-view"),
       ],
     });
@@ -9109,6 +10053,9 @@
   function renderMiniNetworkMapContent() {
     const shellState = networkMapShellState("mini-network-map", state.networkMapData);
     const loadingCard = renderMiniMapLoadCard("network");
+    const sightingsCard = networkMapHasStationContext(state.networkMapData)
+      ? `<section class="detail-card" id="mini-network-map-sightings-card">${renderMiniNetworkMapSightingsCard()}</section>`
+      : "";
     if (loadingCard && !hasNetworkMapPayload(state.networkMapData)) {
       return `
         <p class="panel-subtitle" id="mini-map-network-note">${escapeHtml(t("app_network_map_note"))}</p>
@@ -9119,6 +10066,7 @@
       <p class="panel-subtitle" id="mini-map-network-note">${escapeHtml(t("app_network_map_note"))}</p>
       <div id="mini-network-map-shell-slot">${shellState.html}</div>
       <p class="panel-subtitle map-live-status" id="mini-map-live-status">${escapeHtml(externalFeedStatusText())}</p>
+      ${sightingsCard}
     `;
   }
 
@@ -9171,6 +10119,10 @@
     const noteEl = mainPanel.querySelector("#mini-map-network-note");
     const slotEl = mainPanel.querySelector("#mini-network-map-shell-slot");
     const liveStatusEl = mainPanel.querySelector("#mini-map-live-status");
+    const sightingsCardEl = mainPanel.querySelector("#mini-network-map-sightings-card");
+    const nextSightingsCardHTML = networkMapHasStationContext(state.networkMapData)
+      ? renderMiniNetworkMapSightingsCard()
+      : "";
     if (!noteEl || !slotEl || !liveStatusEl) {
       mainPanel.innerHTML = renderMapTab();
       bindMiniAppEvents(mainPanel);
@@ -9180,6 +10132,15 @@
     noteEl.textContent = t("app_network_map_note");
     syncPublicMapShellSlot(slotEl, "mini-network-map", shellState);
     liveStatusEl.textContent = externalFeedStatusText();
+    if (nextSightingsCardHTML && sightingsCardEl) {
+      sightingsCardEl.innerHTML = nextSightingsCardHTML;
+      bindMiniAppEvents(sightingsCardEl);
+    } else if (Boolean(nextSightingsCardHTML) !== Boolean(sightingsCardEl)) {
+      mainPanel.innerHTML = renderMapTab();
+      bindMiniAppEvents(mainPanel);
+      syncActiveMiniMap();
+      return true;
+    }
     syncActiveMiniMap();
     return true;
   }
@@ -10382,6 +11343,11 @@
         }, null, { button: el });
       });
     });
+    scope.querySelectorAll("[data-action='open-incident-map']").forEach((el) => {
+      el.addEventListener("click", () => {
+        navigateToIncidentMap(el.getAttribute("data-incident-id"));
+      });
+    });
     scope.querySelectorAll("[data-action='incident-vote']").forEach((el) => {
       el.addEventListener("click", () => {
         if (!state.authenticated) {
@@ -10783,6 +11749,53 @@
       runAction(() => reportAction(signal, trainId), (result) => result, { button });
       return true;
     }
+	    if (action === "popup-report-station") {
+	      const stationId = String(button.getAttribute("data-station-id") || "").trim();
+	      if (!stationId) {
+	        return false;
+	      }
+      const runAction = typeof options.runUserAction === "function" ? options.runUserAction : runUserAction;
+      const reportAction = typeof options.submitStationReport === "function" ? options.submitStationReport : submitStationReport;
+	      runAction(() => reportAction(stationId), (result) => result, { button });
+	      return true;
+	    }
+    if (action === "popup-open-incident") {
+      const incidentId = String(button.getAttribute("data-incident-id") || "").trim();
+      if (!incidentId || !window.location) {
+        return false;
+      }
+      const href = urlWithIncidentParam(publicIncidentsRoot(), incidentId);
+      if (typeof window.location.assign === "function") {
+        window.location.assign(href);
+      } else {
+        window.location.href = href;
+      }
+      return true;
+    }
+	    if (action === "popup-submit-location-report") {
+      const latitude = Number(button.getAttribute("data-latitude") || button.getAttribute("data-lat") || "");
+      const longitude = Number(button.getAttribute("data-longitude") || button.getAttribute("data-lng") || "");
+      const popupRoot = typeof button.closest === "function"
+        ? (button.closest(".leaflet-popup") || button.closest(".train-map-detail-card"))
+        : null;
+      const input = popupRoot && typeof popupRoot.querySelector === "function"
+        ? popupRoot.querySelector("[data-role='location-report-description']")
+        : null;
+      const radiusInput = popupRoot && typeof popupRoot.querySelector === "function"
+        ? popupRoot.querySelector("[data-role='location-report-radius']")
+        : null;
+      const radiusMeters = locationReportRadiusMeters(radiusInput && "value" in radiusInput
+        ? radiusInput.value
+        : button.getAttribute("data-radius-meters"));
+      const description = input && "value" in input ? input.value : "";
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        return false;
+      }
+      const runAction = typeof options.runUserAction === "function" ? options.runUserAction : runUserAction;
+      const reportAction = typeof options.submitLocationReport === "function" ? options.submitLocationReport : submitLocationReport;
+      runAction(() => reportAction({ latitude, longitude, radiusMeters, description }), (result) => result, { button });
+      return true;
+    }
     if (action === "popup-report-train") {
       return false;
     }
@@ -10903,7 +11916,10 @@
         buildLiveTrainMarkerHTML,
         buildTrainPopupHTML,
         liveTrainGpsClass,
+        mapReportsEnabled,
         buildStationPopupHTML,
+        buildLocationReportDraftHTML,
+        reportMutationRenderTarget,
         buildTrainStopPopupHTML,
         buildTrainMapConfig,
         buildNetworkMapConfig,
@@ -10912,7 +11928,10 @@
         mapController,
         bindMapRelayoutListenersWithEnvironment,
         loadMiniAppInitialData,
+        bootPublicNetworkMapSurface,
+        bootMiniAppAnonymousFallback,
         authenticateMiniApp,
+        syncActivePublicMap,
         applyPublicMapFollow,
         applyMiniMapFollow,
         setMovingMapSelection,
@@ -10953,6 +11972,11 @@
             clearTimeout(externalFeedRenderTimer);
             externalFeedRenderTimer = null;
           }
+          if (publicMapLibraryRetryTimer) {
+            clearTimeout(publicMapLibraryRetryTimer);
+            publicMapLibraryRetryTimer = null;
+          }
+          publicMapLibraryRetryCount = 0;
           resetStateForTest(overrides);
           mapController.focusedEntityKey = "";
           mapController.openPopupKey = "";
@@ -11026,6 +12050,8 @@
         runUserAction,
         setActionButtonBusy,
         submitReport,
+        submitStationReport,
+        submitLocationReport,
         submitIncidentVote,
         submitIncidentComment,
         startRouteCheckIn,
@@ -11065,6 +12091,9 @@
           return renderIncidentDetailPanel();
         },
         selectedIncidentIdFromURL,
+        incidentMapURL,
+        navigateToIncidentMap,
+        focusRequestedIncidentFromURL,
         localizedIncidentActivityName,
         syncIncidentURL,
         syncIncidentLayoutState,

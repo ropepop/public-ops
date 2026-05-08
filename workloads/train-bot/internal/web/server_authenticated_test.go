@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,6 +138,169 @@ func TestServeHTTPStationSightingSubmissionAcceptsDirectSignedInReports(t *testi
 	}
 	if !payload.Accepted {
 		t.Fatalf("expected accepted station sighting payload, got %+v", payload)
+	}
+}
+
+func TestServeHTTPStationReportCreatesPublicLocationIncident(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	cookie := testSessionCookie(t, server, 77, "en", now)
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/stations/riga/reports", nil)
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected station report status: got %d body=%s", res.Code, res.Body.String())
+	}
+	var reportPayload struct {
+		Accepted   bool   `json:"accepted"`
+		IncidentID string `json:"incidentId"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &reportPayload); err != nil {
+		t.Fatalf("decode station report response: %v", err)
+	}
+	if !reportPayload.Accepted || reportPayload.IncidentID == "" {
+		t.Fatalf("expected accepted station report payload, got %+v", reportPayload)
+	}
+
+	incidentsReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/incidents?limit=0", nil)
+	incidentsRes := httptest.NewRecorder()
+	server.ServeHTTP(incidentsRes, incidentsReq)
+	if incidentsRes.Code != http.StatusOK {
+		t.Fatalf("unexpected public incidents status: got %d body=%s", incidentsRes.Code, incidentsRes.Body.String())
+	}
+	var incidentsPayload struct {
+		Incidents []struct {
+			ID          string `json:"id"`
+			Scope       string `json:"scope"`
+			SubjectID   string `json:"subjectId"`
+			SubjectName string `json:"subjectName"`
+			Location    *struct {
+				Kind        string   `json:"kind"`
+				Latitude    *float64 `json:"latitude"`
+				Longitude   *float64 `json:"longitude"`
+				Description string   `json:"description"`
+			} `json:"location"`
+		} `json:"incidents"`
+	}
+	if err := json.Unmarshal(incidentsRes.Body.Bytes(), &incidentsPayload); err != nil {
+		t.Fatalf("decode public incidents: %v", err)
+	}
+	var found bool
+	for _, incident := range incidentsPayload.Incidents {
+		if incident.ID != reportPayload.IncidentID {
+			continue
+		}
+		found = true
+		if incident.Scope != "station" || incident.SubjectID != "riga" || incident.SubjectName == "" {
+			t.Fatalf("unexpected station incident scope: %+v", incident)
+		}
+		if incident.Location == nil || incident.Location.Kind != "station" || incident.Location.Latitude == nil || incident.Location.Longitude == nil {
+			t.Fatalf("expected station coordinates in incident location, got %+v", incident.Location)
+		}
+	}
+	if !found {
+		t.Fatalf("expected station report incident %q in public incidents, got %+v", reportPayload.IncidentID, incidentsPayload.Incidents)
+	}
+}
+
+func TestServeHTTPLocationReportCreatesPublicAreaIncident(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	cookie := testSessionCookie(t, server, 77, "en", now)
+	body := []byte(`{"latitude":56.94672,"longitude":24.10589,"radiusMeters":100,"description":"near the station tunnel"}`)
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/location-reports", bytes.NewReader(body))
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected area report status: got %d body=%s", res.Code, res.Body.String())
+	}
+	var reportPayload struct {
+		Accepted   bool   `json:"accepted"`
+		IncidentID string `json:"incidentId"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &reportPayload); err != nil {
+		t.Fatalf("decode area report response: %v", err)
+	}
+	if !reportPayload.Accepted || reportPayload.IncidentID == "" {
+		t.Fatalf("expected accepted area report payload, got %+v", reportPayload)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/incidents/"+url.PathEscape(reportPayload.IncidentID), nil)
+	detailRes := httptest.NewRecorder()
+	server.ServeHTTP(detailRes, detailReq)
+	if detailRes.Code != http.StatusOK {
+		t.Fatalf("unexpected area incident detail status: got %d body=%s", detailRes.Code, detailRes.Body.String())
+	}
+	var detailPayload struct {
+		Summary struct {
+			Scope       string `json:"scope"`
+			SubjectName string `json:"subjectName"`
+			Location    *struct {
+				Kind         string   `json:"kind"`
+				Latitude     *float64 `json:"latitude"`
+				Longitude    *float64 `json:"longitude"`
+				RadiusMeters int      `json:"radiusMeters"`
+			} `json:"location"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(detailRes.Body.Bytes(), &detailPayload); err != nil {
+		t.Fatalf("decode area incident detail: %v", err)
+	}
+	if detailPayload.Summary.Scope != "area" || detailPayload.Summary.SubjectName != "near the station tunnel" {
+		t.Fatalf("unexpected area incident summary: %+v", detailPayload.Summary)
+	}
+	if detailPayload.Summary.Location == nil || detailPayload.Summary.Location.Kind != "area" || detailPayload.Summary.Location.RadiusMeters != 100 {
+		t.Fatalf("expected area radius in incident location, got %+v", detailPayload.Summary.Location)
+	}
+	if detailPayload.Summary.Location.Latitude == nil || detailPayload.Summary.Location.Longitude == nil {
+		t.Fatalf("expected area coordinates in incident location, got %+v", detailPayload.Summary.Location)
+	}
+}
+
+func TestServeHTTPLocationReportRejectsBlankDescriptions(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/location-reports", bytes.NewReader([]byte(`{"latitude":56.9,"longitude":24.1,"radiusMeters":100,"description":"   "}`)))
+	req.AddCookie(testSessionCookie(t, server, 77, "en", now))
+	res := httptest.NewRecorder()
+
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("expected blank location description to be rejected, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestServeHTTPLocationReportChecksNormalizedDescriptionLength(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	body, err := json.Marshal(map[string]any{
+		"latitude":     56.94672,
+		"longitude":    24.10589,
+		"radiusMeters": 100,
+		"description":  "near" + strings.Repeat(" ", 170) + "tunnel",
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/location-reports", bytes.NewReader(body))
+	req.AddCookie(testSessionCookie(t, server, 77, "en", now))
+	res := httptest.NewRecorder()
+
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected normalized location description to be accepted, got %d body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -402,5 +567,129 @@ func TestServeHTTPTrainReportAllowsDirectSignedInReportWithoutRide(t *testing.T)
 	}
 	if payload.Accepted || payload.Deduped || payload.CooldownRemaining <= 0 {
 		t.Fatalf("expected different signal inside cooldown to be rate limited, got %+v", payload)
+	}
+}
+
+func TestServeHTTPTrainReportAllowsLiveTrainMissingFromSchedule(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	const liveTrainID = "live-only-6321"
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/trains/"+liveTrainID+"/reports", bytes.NewReader([]byte(`{"signal":"INSPECTION_STARTED"}`)))
+	req.AddCookie(testSessionCookie(t, server, 77, "en", now))
+	res := httptest.NewRecorder()
+
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected live train report status: got %d body=%s", res.Code, res.Body.String())
+	}
+
+	var reportPayload struct {
+		Accepted   bool   `json:"accepted"`
+		IncidentID string `json:"incidentId"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &reportPayload); err != nil {
+		t.Fatalf("decode live train report response: %v", err)
+	}
+	if !reportPayload.Accepted || !strings.HasPrefix(reportPayload.IncidentID, "train:"+liveTrainID+":") {
+		t.Fatalf("expected accepted fallback train incident, got %+v", reportPayload)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/incidents/"+url.PathEscape(reportPayload.IncidentID), nil)
+	detailRes := httptest.NewRecorder()
+	server.ServeHTTP(detailRes, detailReq)
+	if detailRes.Code != http.StatusOK {
+		t.Fatalf("unexpected live train incident detail status: got %d body=%s", detailRes.Code, detailRes.Body.String())
+	}
+
+	var detailPayload domain.IncidentDetail
+	if err := json.Unmarshal(detailRes.Body.Bytes(), &detailPayload); err != nil {
+		t.Fatalf("decode live train incident detail: %v", err)
+	}
+	if detailPayload.Summary.Scope != "train" || !strings.Contains(detailPayload.Summary.SubjectName, liveTrainID) {
+		t.Fatalf("expected fallback train subject to mention raw train ID, got %+v", detailPayload.Summary)
+	}
+}
+
+func TestServeHTTPIncidentVoteAndCommentLifecycle(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	cookie := testSessionCookie(t, server, 77, "en", now)
+
+	reportReq := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/trains/train-next-0/reports", bytes.NewReader([]byte(`{"signal":"INSPECTION_STARTED"}`)))
+	reportReq.AddCookie(cookie)
+	reportRes := httptest.NewRecorder()
+	server.ServeHTTP(reportRes, reportReq)
+	if reportRes.Code != http.StatusOK {
+		t.Fatalf("unexpected train report status: got %d body=%s", reportRes.Code, reportRes.Body.String())
+	}
+
+	incidentsReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/incidents?limit=0", nil)
+	incidentsRes := httptest.NewRecorder()
+	server.ServeHTTP(incidentsRes, incidentsReq)
+	if incidentsRes.Code != http.StatusOK {
+		t.Fatalf("unexpected public incidents status: got %d body=%s", incidentsRes.Code, incidentsRes.Body.String())
+	}
+	var incidentsPayload struct {
+		Incidents []struct {
+			ID string `json:"id"`
+		} `json:"incidents"`
+	}
+	if err := json.Unmarshal(incidentsRes.Body.Bytes(), &incidentsPayload); err != nil {
+		t.Fatalf("decode public incidents: %v", err)
+	}
+	if len(incidentsPayload.Incidents) == 0 || incidentsPayload.Incidents[0].ID == "" {
+		t.Fatalf("expected incident created from report, got %+v", incidentsPayload.Incidents)
+	}
+	incidentID := incidentsPayload.Incidents[0].ID
+
+	voteReq := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/incidents/"+incidentID+"/votes", bytes.NewReader([]byte(`{"value":"ONGOING"}`)))
+	voteReq.AddCookie(cookie)
+	voteRes := httptest.NewRecorder()
+	server.ServeHTTP(voteRes, voteReq)
+	if voteRes.Code != http.StatusOK {
+		t.Fatalf("unexpected incident vote status: got %d body=%s", voteRes.Code, voteRes.Body.String())
+	}
+	var votePayload domain.IncidentVoteSummary
+	if err := json.Unmarshal(voteRes.Body.Bytes(), &votePayload); err != nil {
+		t.Fatalf("decode incident vote: %v", err)
+	}
+	if votePayload.Ongoing != 1 || votePayload.UserValue != domain.IncidentVoteOngoing {
+		t.Fatalf("unexpected incident vote payload: %+v", votePayload)
+	}
+
+	commentReq := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/incidents/"+incidentID+"/comments", bytes.NewReader([]byte(`{"body":"Still seeing checks"}`)))
+	commentReq.AddCookie(cookie)
+	commentRes := httptest.NewRecorder()
+	server.ServeHTTP(commentRes, commentReq)
+	if commentRes.Code != http.StatusOK {
+		t.Fatalf("unexpected incident comment status: got %d body=%s", commentRes.Code, commentRes.Body.String())
+	}
+	var commentPayload domain.IncidentComment
+	if err := json.Unmarshal(commentRes.Body.Bytes(), &commentPayload); err != nil {
+		t.Fatalf("decode incident comment: %v", err)
+	}
+	if commentPayload.Body != "Still seeing checks" {
+		t.Fatalf("unexpected incident comment payload: %+v", commentPayload)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/incidents/"+incidentID, nil)
+	detailReq.AddCookie(cookie)
+	detailRes := httptest.NewRecorder()
+	server.ServeHTTP(detailRes, detailReq)
+	if detailRes.Code != http.StatusOK {
+		t.Fatalf("unexpected incident detail status: got %d body=%s", detailRes.Code, detailRes.Body.String())
+	}
+	var detailPayload domain.IncidentDetail
+	if err := json.Unmarshal(detailRes.Body.Bytes(), &detailPayload); err != nil {
+		t.Fatalf("decode incident detail: %v", err)
+	}
+	if detailPayload.Summary.Votes.Ongoing != 1 || detailPayload.Summary.Votes.UserValue != domain.IncidentVoteOngoing {
+		t.Fatalf("expected signed-in vote state in incident detail, got %+v", detailPayload.Summary.Votes)
+	}
+	if len(detailPayload.Comments) != 1 || detailPayload.Comments[0].Body != "Still seeing checks" {
+		t.Fatalf("expected comment in incident detail, got %+v", detailPayload.Comments)
 	}
 }

@@ -2,7 +2,7 @@
 
 - Canonical operations: [ROOT_OPERATIONS](./ROOT_OPERATIONS.md)
 - Active runtime: Docker on Arbuzas
-- Public host: `https://train-bot.jolkins.id.lv`
+- Public host: `https://vilciens.kontrole.info`
 - Persistent state root: `/srv/arbuzas/train-bot`
 - Host env file: `/etc/arbuzas/env/train-bot.env`
 
@@ -85,5 +85,5 @@ Troubleshooting:
 ## Notes
 
 - The schedule directory now lives under `/srv/arbuzas/train-bot/data/schedules`.
-- `/etc/arbuzas/env/train-bot.env` should not define `TRAIN_WEB_BIND_ADDR` or `TRAIN_WEB_PORT`; Arbuzas Docker sets those at runtime.
+- `/etc/arbuzas/env/train-bot.env` should not define `TRAIN_WEB_BIND_ADDR`, `TRAIN_WEB_PORT`, or `TRAIN_WEB_PUBLIC_BASE_URL`; Arbuzas Docker sets those at runtime from the release hostname.
 - Rollback uses the repo-level deploy script, not workload-local Pixel helpers.

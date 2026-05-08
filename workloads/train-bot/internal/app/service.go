@@ -551,14 +551,11 @@ func (s *Service) MuteTrain(ctx context.Context, userID int64, trainID string, n
 }
 
 func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string, signal domain.SignalType, now time.Time) (reports.SubmitResult, error) {
-	train, err := s.schedules.GetTrain(ctx, trainID)
-	if err != nil {
-		return reports.SubmitResult{}, err
-	}
-	if train == nil {
+	cleanTrainID := strings.TrimSpace(trainID)
+	if cleanTrainID == "" {
 		return reports.SubmitResult{}, ErrNotFound
 	}
-	return s.reports.SubmitReport(ctx, userID, trainID, signal, now.In(s.loc))
+	return s.reports.SubmitReport(ctx, userID, cleanTrainID, signal, now.In(s.loc))
 }
 
 func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stationID string, destinationStationID *string, trainID *string, now time.Time) (reports.StationSightingSubmitResult, error) {
@@ -625,6 +622,22 @@ func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stati
 		result.Event.DestinationStationName = destinationName
 	}
 	return result, nil
+}
+
+func (s *Service) SubmitStationReport(ctx context.Context, userID int64, stationID string, now time.Time) (reports.LocationReportSubmitResult, error) {
+	localNow := now.In(s.loc)
+	station, err := s.schedules.GetStation(ctx, localNow, stationID)
+	if err != nil {
+		return reports.LocationReportSubmitResult{}, err
+	}
+	if station == nil {
+		return reports.LocationReportSubmitResult{}, ErrNotFound
+	}
+	return s.reports.SubmitStationReport(ctx, userID, *station, localNow)
+}
+
+func (s *Service) SubmitAreaReport(ctx context.Context, userID int64, latitude float64, longitude float64, radiusMeters int, description string, now time.Time) (reports.LocationReportSubmitResult, error) {
+	return s.reports.SubmitAreaReport(ctx, userID, latitude, longitude, radiusMeters, description, now.In(s.loc))
 }
 
 func (s *Service) TrainStatus(ctx context.Context, userID int64, trainID string, now time.Time) (*TrainStatusView, error) {

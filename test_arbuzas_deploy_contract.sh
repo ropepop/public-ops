@@ -23,6 +23,20 @@ if [[ ! -f "${COMPOSE_PATH}" ]]; then
   exit 1
 fi
 
+if ! grep -F 'ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"' "${SCRIPT_PATH}" >/dev/null; then
+  echo "FAIL: Arbuzas train tunnel default must use vilciens.kontrole.info" >&2
+  exit 1
+fi
+
+for train_public_base_snippet in \
+  "TRAIN_WEB_PUBLIC_BASE_URL: https://\${ARBUZAS_TRAIN_BOT_HOSTNAME}" \
+  "export TRAIN_WEB_PUBLIC_BASE_URL=\"https://\${ARBUZAS_TRAIN_BOT_HOSTNAME}\""; do
+  if ! grep -F "${train_public_base_snippet}" "${COMPOSE_PATH}" >/dev/null; then
+    echo "FAIL: train_bot public base URL must stay aligned with ARBUZAS_TRAIN_BOT_HOSTNAME: ${train_public_base_snippet}" >&2
+    exit 1
+  fi
+done
+
 for ticket_remote_runtime_snippet in \
   'export TICKET_REMOTE_AUTH_MODE="$${TICKET_REMOTE_AUTH_MODE:-spacetime}"' \
   'export TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN="$${TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}"' \
@@ -123,7 +137,10 @@ required_snippets = [
     "compact_remote_dns_db()",
     "run_automatic_remote_docker_gc()",
     "compose_target_service_args_without_dns()",
+    "compose_target_tunnel_service_args()",
     "compose_all_non_dns_service_args()",
+    "compose_all_tunnel_service_args()",
+    "render_remote_cloudflared_configs()",
     "collect_remote_dns_host_diagnostics()",
     "ensure_remote_dns_host_preflight()",
     "repair_remote_dns_admin()",
@@ -158,6 +175,11 @@ required_snippets = [
     "up -d --force-recreate --no-deps dns_controlplane",
     "up -d --remove-orphans${all_non_dns_service_args}",
     "up -d --no-deps${non_dns_service_args}",
+    "up -d --force-recreate --no-deps${tunnel_service_args}",
+    "--out '${remote_release_dir}/generated/cloudflared/train-bot.yml'",
+    "--out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'",
+    "--out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'",
+    "--out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'",
     "append_unique COMPOSE_TARGET_SERVICES train_tunnel",
     "append_unique COMPOSE_TARGET_SERVICES ticket_android_sim",
     "append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner",
@@ -165,9 +187,14 @@ required_snippets = [
     "prepare_remote_ticket_android_sim_active_backend()",
     "upload_remote_ticket_android_sim_phone_apk()",
     "setup_remote_ticket_android_sim()",
+    "cat > /tmp/ticket-android-sim-setup.sh",
+    "cat > /tmp/restore-aggressive-packages-inner.sh",
     "wait_for_remote_ticket_android_sim_tuning()",
     "ticket_phone_service package=lv.jolkins.pixelorchestrator",
     "install_or_update TicketPhoneService",
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+    "result=signature-mismatch-uninstall",
+    "result=reinstalled",
     "ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel",
     "ticket Android simulator ADB ready",
     "ticket Android simulator no swap",
@@ -180,11 +207,17 @@ required_snippets = [
     "ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}",
     "ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}",
     "TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID",
+    "TICKET_REMOTE_SESSION_SIGNING_KEY",
+    "ticket-remote runtime OIDC issuer",
+    "TICKET_REMOTE_SPACETIME_OIDC_ISSUER",
+    "https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc",
+    "jwks.json",
     "/api/v1/livez",
     "claim-dialog|showModal|confirmClaim",
     "options.tap.x",
     "control_code_button",
-    "inputQueueLimit = 20",
+    "inputQueueLimit = 30",
+    "inputDrainDelayMs = 35",
     "input_result",
     "gesturechange",
     "dblclick",
@@ -307,6 +340,9 @@ validate_netdata_block = block_between('  validate-netdata)\n', '  install-think
 install_thinkpad_fan_block = block_between('  install-thinkpad-fan)\n', '  validate-thinkpad-fan)\n')
 validate_thinkpad_fan_block = block_between('  validate-thinkpad-fan)\n', '  repair-portainer)\n')
 repair_block = block_between('  repair-portainer)\n', 'esac\n')
+render_cloudflared_block = block_between('render_remote_cloudflared_configs() {\n', 'resolve_remote_current_release_id() {\n')
+target_non_dns_block = block_between('compose_target_service_args_without_dns() {\n', 'compose_target_tunnel_service_args() {\n')
+all_non_dns_block = block_between('compose_all_non_dns_service_args() {\n', 'compose_all_tunnel_service_args() {\n')
 remote_compose_up_block = block_between('remote_compose_up() {\n', 'validate_remote_dns_querylog_flow() {\n')
 compact_function_block = block_between('compact_remote_dns_db() {\n', 'stage_netdata_config_to_remote() {\n')
 rollback_function_block = block_between('rollback_remote_release() {\n', 'while (( $# > 0 )); do\n')
@@ -332,6 +368,23 @@ if deploy_block.index("publish_remote_dns_admin_tailscale") > deploy_block.index
 
 if 'log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in validate_block:
     raise SystemExit("validate block does not announce targeted service validation")
+
+for tunnel_service in ("train_tunnel", "satiksme_tunnel", "subscription_tunnel", "ticket_remote_tunnel"):
+    if tunnel_service not in target_non_dns_block:
+        raise SystemExit(f"targeted non-DNS service args must explicitly skip tunnel service: {tunnel_service}")
+    if tunnel_service in all_non_dns_block:
+        raise SystemExit(f"all non-DNS service args should leave tunnel recreation to compose_all_tunnel_service_args: {tunnel_service}")
+
+if "targeted_service_selected" in render_cloudflared_block:
+    raise SystemExit("cloudflared configs must be rendered for every release, not only selected tunnels")
+for cloudflared_config in (
+    "train-bot.yml",
+    "satiksme-bot.yml",
+    "subscription-bot.yml",
+    "ticket-remote.yml",
+):
+    if render_cloudflared_block.count(cloudflared_config) != 1:
+        raise SystemExit(f"cloudflared config should be rendered exactly once: {cloudflared_config}")
 
 if rollback_block.index('validate_remote_release "${requested_release_id}"') > rollback_block.index("run_automatic_remote_docker_gc"):
     raise SystemExit("rollback cleanup runs before validation")

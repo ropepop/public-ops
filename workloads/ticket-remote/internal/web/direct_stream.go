@@ -137,13 +137,50 @@ func (h *directStreamHub) recordClientTelemetry(event, detail string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.lastBrowserEvent = telemetry
-	if strings.Contains(event, "media") || strings.Contains(event, "video") || strings.Contains(event, "h264") || strings.Contains(event, "decode") || strings.Contains(event, "decoder") {
+	if isBrowserMediaProblem(event) {
 		h.lastBrowserMediaError = detail
 	}
 	h.recentBrowserEvents = append(h.recentBrowserEvents, telemetry)
 	if len(h.recentBrowserEvents) > 12 {
 		h.recentBrowserEvents = append([]clientTelemetryEvent(nil), h.recentBrowserEvents[len(h.recentBrowserEvents)-12:]...)
 	}
+}
+
+func isBrowserMediaProblem(event string) bool {
+	switch event {
+	case "decoder_error":
+		return false
+	case "h264_decoder_mode",
+		"h264_decoder_recovery_avc_adapter",
+		"h264_decoder_recovery_reset",
+		"h264_server_recover_requested",
+		"server_stale_frames",
+		"stale_video_frames",
+		"video_stream_restart",
+		"websocket_error":
+		return false
+	}
+	if event == "direct_video_websocket_error" {
+		return true
+	}
+	for _, prefix := range []string{"decoder_", "h264_", "invalid_tsf2_"} {
+		if !strings.HasPrefix(event, prefix) {
+			continue
+		}
+		for _, marker := range []string{
+			"error",
+			"failed",
+			"unsupported",
+			"invalid",
+			"empty_frame",
+			"timeout",
+		} {
+			if strings.Contains(event, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[string]any {
@@ -208,6 +245,8 @@ func (h *directStreamHub) streamVerdictLocked(now time.Time, phoneHealth phone.H
 	keyFrameAge := ageSinceMillis(now, h.lastKeyFrameAt)
 	hasMediaError := strings.TrimSpace(h.lastBrowserMediaError) != ""
 	switch {
+	case h.activeVideoClients == 0 && frameAge >= 0 && frameAge <= 2500 && phoneHealth.Desired && phoneHealth.Connected && phoneHealth.StreamState == "streaming":
+		return "live"
 	case h.activeVideoClients == 0:
 		return "idle"
 	case hasMediaError:

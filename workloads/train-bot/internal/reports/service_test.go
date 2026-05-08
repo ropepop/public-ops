@@ -209,3 +209,54 @@ func TestSubmitStationSightingCooldownAndDedupe(t *testing.T) {
 		t.Fatalf("expected station sighting accepted after cooldown, got %+v", allowed)
 	}
 }
+
+func TestSubmitAreaReportValidationCooldownAndDedupe(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, 2, 25, 12, 0, 0, 0, time.UTC)
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+
+	if _, err := svc.SubmitAreaReport(ctx, 1, 56.9, 24.1, 100, "   ", now); err == nil {
+		t.Fatalf("expected blank area description to fail")
+	}
+	if _, err := svc.SubmitAreaReport(ctx, 1, 91, 24.1, 100, "near tunnel", now); err == nil {
+		t.Fatalf("expected invalid latitude to fail")
+	}
+
+	first, err := svc.SubmitAreaReport(ctx, 1, 56.946721, 24.105891, 250, "  near   the tunnel  ", now)
+	if err != nil {
+		t.Fatalf("first area report err: %v", err)
+	}
+	if !first.Accepted || first.Event == nil {
+		t.Fatalf("expected first area report accepted, got %+v", first)
+	}
+	if first.Event.Description != "near the tunnel" || first.Event.RadiusMeters != 250 {
+		t.Fatalf("expected normalized description and selected radius, got %+v", first.Event)
+	}
+
+	deduped, err := svc.SubmitAreaReport(ctx, 1, 56.946721, 24.105891, 250, "near the tunnel", now.Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("deduped area report err: %v", err)
+	}
+	if !deduped.Deduped {
+		t.Fatalf("expected area report dedupe, got %+v", deduped)
+	}
+
+	cooldown, err := svc.SubmitAreaReport(ctx, 1, 56.946721, 24.105891, 500, "near the tunnel", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("cooldown area report err: %v", err)
+	}
+	if cooldown.CooldownRemaining <= 0 {
+		t.Fatalf("expected area report cooldown remaining, got %+v", cooldown)
+	}
+
+	allowed, err := svc.SubmitAreaReport(ctx, 1, 56.946721, 24.105891, 500, "near the tunnel", now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("allowed area report err: %v", err)
+	}
+	if !allowed.Accepted || allowed.Event == nil || allowed.Event.RadiusMeters != 500 {
+		t.Fatalf("expected area report accepted after cooldown with selected radius, got %+v", allowed)
+	}
+}

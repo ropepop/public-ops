@@ -446,20 +446,24 @@ type TrainbotActivitySummary struct {
 }
 
 type TrainbotActivityEvent struct {
-	ID                     string `json:"id"`
-	Kind                   string `json:"kind"`
-	StableID               string `json:"stableId"`
-	Nickname               string `json:"nickname"`
-	Name                   string `json:"name"`
-	Detail                 string `json:"detail"`
-	CreatedAt              string `json:"createdAt"`
-	Signal                 string `json:"signal"`
-	TrainInstanceID        string `json:"trainInstanceId"`
-	StationID              string `json:"stationId"`
-	StationName            string `json:"stationName"`
-	DestinationStationID   string `json:"destinationStationId"`
-	DestinationStationName string `json:"destinationStationName"`
-	MatchedTrainInstanceID string `json:"matchedTrainInstanceId"`
+	ID                     string   `json:"id"`
+	Kind                   string   `json:"kind"`
+	StableID               string   `json:"stableId"`
+	Nickname               string   `json:"nickname"`
+	Name                   string   `json:"name"`
+	Detail                 string   `json:"detail"`
+	CreatedAt              string   `json:"createdAt"`
+	Signal                 string   `json:"signal"`
+	TrainInstanceID        string   `json:"trainInstanceId"`
+	StationID              string   `json:"stationId"`
+	StationName            string   `json:"stationName"`
+	DestinationStationID   string   `json:"destinationStationId"`
+	DestinationStationName string   `json:"destinationStationName"`
+	MatchedTrainInstanceID string   `json:"matchedTrainInstanceId"`
+	Latitude               *float64 `json:"latitude,omitempty"`
+	Longitude              *float64 `json:"longitude,omitempty"`
+	RadiusMeters           int      `json:"radiusMeters,omitempty"`
+	LocationDescription    string   `json:"locationDescription,omitempty"`
 }
 
 type TrainbotActivityComment struct {
@@ -1980,7 +1984,7 @@ func normalizeActivity(activity *TrainbotActivityRow) {
 
 	var latestReport *TrainbotActivityEvent
 	for i := range activity.Timeline {
-		if activity.Timeline[i].Kind == "report" || activity.Timeline[i].Kind == "station_sighting" {
+		if activity.Timeline[i].Kind == "report" || activity.Timeline[i].Kind == "station_sighting" || activity.Timeline[i].Kind == "location_report" {
 			latestReport = &activity.Timeline[i]
 			break
 		}

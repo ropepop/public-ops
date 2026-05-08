@@ -9,6 +9,7 @@
 
   var defaultCenter = { lat: 56.9496, lng: 24.1052, zoom: 13 };
   var config = (root.window && root.window.SATIKSME_APP_CONFIG) || root.SATIKSME_APP_CONFIG || {};
+  var trainSiteURL = "https://vilciens.kontrole.info";
   var incidentMobileBreakpointPx = 980;
   var incidentOverlayHistoryKey = "__satiksmeIncidentOverlay";
   function createInitialState() {
@@ -2876,6 +2877,7 @@
     } else {
       links.push('<a class="pill pill-muted" href="' + escapeAttr(pathFor("/incidents")) + '">Plūsma</a>');
     }
+    links.push('<a class="pill pill-muted train-site-link" href="' + escapeAttr(trainSiteURL) + '">Vilciens</a>');
     return '<div class="hero-meta">' + links.join("") + '<span id="status-pill" class="pill pill-muted">Ielādē…</span><span id="auth-controls" class="button-row hero-auth-controls"></span></div>';
   }
 

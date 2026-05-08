@@ -257,6 +257,144 @@ func TestQuickClaimTapClaimsThenForwardsSnappedTap(t *testing.T) {
 	if diag := server.quickClaimSnapshot(); !diag.Forwarded || diag.InputID != "quick-1" || diag.Action != "claimed" {
 		t.Fatalf("unexpected quick claim diagnostic: %#v", diag)
 	}
+	response := waitForBrowserMessage(t, conn, `"inputId":"quick-1"`)
+	if !strings.Contains(response, `"type":"input_result"`) || !strings.Contains(response, `"accepted":true`) || !strings.Contains(response, `"reason":"forwarded"`) {
+		t.Fatalf("expected accepted quick claim input_result, got %s", response)
+	}
+}
+
+func TestControlledTapReturnsAcceptedInputResult(t *testing.T) {
+	messages := make(chan string, 10)
+	phoneServer := newTicketPhoneTestServer(t, messages)
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	snapshot, err := store.ClaimControl(context.Background(), "vivi-default", "ticket-session", "ticket@jolkins.id.lv", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	server.rememberControlGate(snapshot, time.Now())
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	conn, _, err := websocket.Dial(context.Background(), wsURL(httpServer, "/api/v1/session"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"tap","inputId":"tap-1","x":101,"y":202}`)); err != nil {
+		t.Fatal(err)
+	}
+	forwarded := waitForPhoneMessageText(t, messages, `"inputId":"tap-1"`)
+	if !strings.Contains(forwarded, `"type":"tap"`) || !strings.Contains(forwarded, `"x":101`) || !strings.Contains(forwarded, `"y":202`) {
+		t.Fatalf("forwarded tap did not preserve coordinates: %s", forwarded)
+	}
+	response := waitForBrowserMessage(t, conn, `"inputId":"tap-1"`)
+	if !strings.Contains(response, `"type":"input_result"`) || !strings.Contains(response, `"accepted":true`) || !strings.Contains(response, `"reason":"forwarded"`) {
+		t.Fatalf("expected accepted tap input_result, got %s", response)
+	}
+}
+
+func TestControlledTapReturnsPhoneUnavailableWhenRelaySendFails(t *testing.T) {
+	store := newTicketMemoryStore(t, "http://127.0.0.1:1")
+	snapshot, err := store.ClaimControl(context.Background(), "vivi-default", "ticket-session", "ticket@jolkins.id.lv", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           "http://127.0.0.1:1",
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, "http://127.0.0.1:1")
+	server.rememberControlGate(snapshot, time.Now())
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	conn, _, err := websocket.Dial(context.Background(), wsURL(httpServer, "/api/v1/session"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"tap","inputId":"tap-fail","x":11,"y":22}`)); err != nil {
+		t.Fatal(err)
+	}
+	response := waitForBrowserMessage(t, conn, `"inputId":"tap-fail"`)
+	if !strings.Contains(response, `"type":"input_result"`) || !strings.Contains(response, `"accepted":false`) || !strings.Contains(response, `"reason":"phone_unavailable"`) {
+		t.Fatalf("expected phone_unavailable tap input_result, got %s", response)
+	}
+}
+
+func TestControlledTapsForwardInReceivedOrder(t *testing.T) {
+	messages := make(chan string, 20)
+	phoneServer := newTicketPhoneTestServer(t, messages)
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	snapshot, err := store.ClaimControl(context.Background(), "vivi-default", "ticket-session", "ticket@jolkins.id.lv", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	server.rememberControlGate(snapshot, time.Now())
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	conn, _, err := websocket.Dial(context.Background(), wsURL(httpServer, "/api/v1/session"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	for _, inputID := range []string{"tap-1", "tap-2", "tap-3"} {
+		body := []byte(`{"type":"tap","inputId":"` + inputID + `","x":15,"y":25}`)
+		if err := conn.Write(context.Background(), websocket.MessageText, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, inputID := range []string{"tap-1", "tap-2", "tap-3"} {
+		forwarded := waitForPhoneMessageText(t, messages, `"inputId":"`+inputID+`"`)
+		if !strings.Contains(forwarded, `"type":"tap"`) {
+			t.Fatalf("expected forwarded tap for %s, got %s", inputID, forwarded)
+		}
+		response := waitForBrowserMessage(t, conn, `"inputId":"`+inputID+`"`)
+		if !strings.Contains(response, `"accepted":true`) {
+			t.Fatalf("expected accepted response for %s, got %s", inputID, response)
+		}
+	}
 }
 
 func TestQuickClaimTapRejectsDifferentEmailWithoutForwarding(t *testing.T) {

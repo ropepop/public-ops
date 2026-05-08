@@ -9,7 +9,7 @@ import (
 
 func TestMainReplyKeyboardLocalizedEnglish(t *testing.T) {
 	catalog := i18n.NewCatalog()
-	kb := MainReplyKeyboardWithWebApp(domain.LanguageEN, catalog, "https://train-bot.jolkins.id.lv/app")
+	kb := MainReplyKeyboardWithWebApp(domain.LanguageEN, catalog, "https://vilciens.kontrole.info/app")
 
 	rows, ok := kb["keyboard"].([][]map[string]any)
 	if !ok {
@@ -23,7 +23,7 @@ func TestMainReplyKeyboardLocalizedEnglish(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected web_app payload in first row, got %T", rows[0][0]["web_app"])
 	}
-	if webApp["url"] != "https://train-bot.jolkins.id.lv/app" {
+	if webApp["url"] != "https://vilciens.kontrole.info/app" {
 		t.Fatalf("unexpected web app url: %q", webApp["url"])
 	}
 	if rows[1][0]["text"] != catalog.T(domain.LanguageEN, "btn_main_settings") {
@@ -75,8 +75,8 @@ func TestMainReplyKeyboardWithIncidentsAddsDedicatedShortcutRow(t *testing.T) {
 	kb := MainReplyKeyboardWithWebAppAndIncidents(
 		domain.LanguageEN,
 		catalog,
-		"https://train-bot.jolkins.id.lv/app",
-		"https://train-bot.jolkins.id.lv/incidents",
+		"https://vilciens.kontrole.info/app",
+		"https://vilciens.kontrole.info/incidents",
 	)
 
 	rows, ok := kb["keyboard"].([][]map[string]any)
@@ -93,7 +93,7 @@ func TestMainReplyKeyboardWithIncidentsAddsDedicatedShortcutRow(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected incidents web_app payload, got %T", rows[1][0]["web_app"])
 	}
-	if webApp["url"] != "https://train-bot.jolkins.id.lv/incidents" {
+	if webApp["url"] != "https://vilciens.kontrole.info/incidents" {
 		t.Fatalf("unexpected incidents web app url: %q", webApp["url"])
 	}
 }
@@ -103,8 +103,8 @@ func TestMainReplyKeyboardWithIncidentsUsesUpdatedLatvianLabel(t *testing.T) {
 	kb := MainReplyKeyboardWithWebAppAndIncidents(
 		domain.LanguageLV,
 		catalog,
-		"https://train-bot.jolkins.id.lv/app",
-		"https://train-bot.jolkins.id.lv/incidents",
+		"https://vilciens.kontrole.info/app",
+		"https://vilciens.kontrole.info/incidents",
 	)
 
 	rows, ok := kb["keyboard"].([][]map[string]any)

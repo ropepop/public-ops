@@ -401,6 +401,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		s.handleAuthLogout(w, r, now)
 	case route == "/auth/test":
 		s.handleAuthTest(w, r, now)
+	case route == "/session":
+		s.handleSession(w, r, now)
 	case route == "/me":
 		claims, ok := s.requireSession(w, r, now)
 		if !ok {
@@ -468,6 +470,21 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		stationID := strings.TrimSuffix(trimmed, "/sightings")
 		stationID = strings.Trim(stationID, "/")
 		s.handleStationSighting(w, r, claims, stationID, now)
+	case strings.HasPrefix(route, "/stations/") && strings.HasSuffix(route, "/reports"):
+		claims, ok := s.requireSession(w, r, now)
+		if !ok {
+			return
+		}
+		trimmed := strings.TrimPrefix(route, "/stations/")
+		stationID := strings.TrimSuffix(trimmed, "/reports")
+		stationID = strings.Trim(stationID, "/")
+		s.handleStationReport(w, r, claims, stationID, now)
+	case route == "/location-reports":
+		claims, ok := s.requireSession(w, r, now)
+		if !ok {
+			return
+		}
+		s.handleLocationReport(w, r, claims, now)
 	case route == "/routes/destinations":
 		s.writeRetired(w, retiredRideMessage)
 	case route == "/routes/trains":
@@ -681,7 +698,7 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 	if handled {
 		return
 	}
-	if payload, ok, err := s.bundlePublicNetworkMap(now); err != nil {
+	if payload, ok, err := s.bundlePublicNetworkMap(r.Context(), now); err != nil {
 		s.writeAppError(w, err)
 		return
 	} else if ok {
@@ -1205,6 +1222,10 @@ func (s *Server) handleSpacetimeJWKS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	language := trainapp.ParseLanguage(claims.Language)
 	settings, err := s.app.UserSettings(r.Context(), claims.UserID)
 	if err != nil {
@@ -1227,6 +1248,22 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, claims session
 		"baseUrl":       s.cfg.TrainWebPublicBaseURL,
 		"settings":      settings,
 		"routeCheckIn":  routeCheckIn,
+		"schedule":      s.appScheduleContext(now),
+	})
+}
+
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request, now time.Time) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if claims, ok := s.optionalSession(r, now); ok {
+		s.handleMe(w, r, claims, now)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"authenticated": false,
+		"baseUrl":       s.cfg.TrainWebPublicBaseURL,
 		"schedule":      s.appScheduleContext(now),
 	})
 }
@@ -1390,6 +1427,60 @@ func (s *Server) handleStationSighting(w http.ResponseWriter, r *http.Request, c
 			s.writeAppError(w, err)
 			return
 		}
+	}
+	s.writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleStationReport(w http.ResponseWriter, r *http.Request, claims sessionClaims, stationID string, now time.Time) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	result, err := s.app.SubmitStationReport(r.Context(), claims.UserID, stationID, now)
+	if err != nil {
+		s.writeAppError(w, err)
+		return
+	}
+	if s.publicEdgeCache != nil && result.Accepted {
+		s.publicEdgeCache.noteIncidentUpdated(result.IncidentID)
+	}
+	s.writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleLocationReport(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Latitude     float64 `json:"latitude"`
+		Longitude    float64 `json:"longitude"`
+		RadiusMeters int     `json:"radiusMeters"`
+		Description  string  `json:"description"`
+	}
+	if !s.decodeJSON(w, r, &body) {
+		return
+	}
+	description := strings.Join(strings.Fields(strings.TrimSpace(body.Description)), " ")
+	if description == "" {
+		s.writeError(w, http.StatusBadRequest, "description is required")
+		return
+	}
+	if len([]rune(description)) > reports.MaxLocationReportDescriptionLen {
+		s.writeError(w, http.StatusBadRequest, "description is too long")
+		return
+	}
+	if body.Latitude < -90 || body.Latitude > 90 || body.Longitude < -180 || body.Longitude > 180 {
+		s.writeError(w, http.StatusBadRequest, "invalid coordinates")
+		return
+	}
+	result, err := s.app.SubmitAreaReport(r.Context(), claims.UserID, body.Latitude, body.Longitude, body.RadiusMeters, description, now)
+	if err != nil {
+		s.writeAppError(w, err)
+		return
+	}
+	if s.publicEdgeCache != nil && result.Accepted {
+		s.publicEdgeCache.noteIncidentUpdated(result.IncidentID)
 	}
 	s.writeJSON(w, http.StatusOK, result)
 }
@@ -1954,12 +2045,35 @@ func (s *Server) bundlePublicServiceDayTrains(now time.Time) (map[string]any, bo
 	return data.publicServiceDayTrains(now), true, nil
 }
 
-func (s *Server) bundlePublicNetworkMap(now time.Time) (map[string]any, bool, error) {
+func (s *Server) bundlePublicNetworkMap(ctx context.Context, now time.Time) (map[string]any, bool, error) {
 	data, ok, err := s.bundleData()
 	if err != nil || !ok {
 		return nil, ok, err
 	}
-	return data.publicNetworkMap(now), true, nil
+	payload := data.publicNetworkMap(now)
+	live, err := s.app.NetworkMap(ctx, now)
+	if err != nil {
+		if payload["recentSightings"] == nil {
+			payload["recentSightings"] = []domain.StationSighting{}
+		}
+		if payload["sameDaySightings"] == nil {
+			payload["sameDaySightings"] = []domain.StationSighting{}
+		}
+		return payload, true, nil
+	}
+	if live != nil {
+		recentSightings := live.RecentSightings
+		if recentSightings == nil {
+			recentSightings = []domain.StationSighting{}
+		}
+		sameDaySightings := live.SameDaySightings
+		if sameDaySightings == nil {
+			sameDaySightings = []domain.StationSighting{}
+		}
+		payload["recentSightings"] = recentSightings
+		payload["sameDaySightings"] = sameDaySightings
+	}
+	return payload, true, nil
 }
 
 func (s *Server) bundlePublicStations(now time.Time, query string) (map[string]any, bool, error) {

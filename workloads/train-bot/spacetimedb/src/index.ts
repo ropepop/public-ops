@@ -394,7 +394,7 @@ const trainbot_public_sighting = table(
   }
 );
 
-const trainbot_public_incident = table(
+const trainbot_incident_summary = table(
   { name: named('incident_summary'), public: true },
   {
     id: t.string().primaryKey(),
@@ -412,10 +412,19 @@ const trainbot_public_incident = table(
     commentCount: t.u32(),
     ongoingVotes: t.u32(),
     clearedVotes: t.u32(),
+    locationKind: t.string().default('none'),
+    latitude: t.option(t.number()).default(-999),
+    longitude: t.option(t.number()).default(-999),
+    radiusMeters: t.u32().default(1),
+    locationDescription: t.string().default('none'),
+    mapTargetType: t.string().default('none'),
+    mapTargetTrainInstanceId: t.string().default('none'),
+    mapTargetStationId: t.string().default('none'),
+    mapTargetIncidentId: t.string().default('none'),
   }
 );
 
-const trainbot_public_incident_event = table(
+const trainbot_incident_event = table(
   { name: named('incident_event'), public: true },
   {
     id: t.string().primaryKey(),
@@ -430,7 +439,7 @@ const trainbot_public_incident_event = table(
   }
 );
 
-const trainbot_public_incident_comment = table(
+const trainbot_incident_comment = table(
   { name: named('incident_comment'), public: true },
   {
     id: t.string().primaryKey(),
@@ -663,9 +672,9 @@ const spacetimedb: any = schema(
     trainbot_trip_live,
     trainbot_trip_timeline_bucket,
     trainbot_public_sighting,
-    trainbot_public_incident,
-    trainbot_public_incident_event,
-    trainbot_public_incident_comment,
+    trainbot_incident_summary,
+    trainbot_incident_event,
+    trainbot_incident_comment,
     trainbot_import_chunk,
     trainbot_feed_import,
     trainbot_feed_event,
@@ -1038,15 +1047,16 @@ function sanitizeTimelineEvent(item: any): any | null {
   if (!id || !createdAt) {
     return null;
   }
+  const kind = asString(item?.kind).trim();
   return {
     id,
-    kind: asString(item?.kind).trim(),
+    kind,
     stableId: asString(item?.stableId).trim(),
     nickname: asString(item?.nickname).trim(),
     name: asString(item?.name).trim(),
     detail: asString(item?.detail).trim(),
     createdAt,
-    signal: asString(item?.signal).trim().toUpperCase(),
+    signal: sanitizeTimelineSignal(kind, item),
     trainInstanceId: asString(item?.trainInstanceId).trim(),
     stationId: asString(item?.stationId).trim(),
     stationName: asString(item?.stationName).trim(),
@@ -1054,6 +1064,20 @@ function sanitizeTimelineEvent(item: any): any | null {
     destinationStationName: asString(item?.destinationStationName).trim(),
     matchedTrainInstanceId: asString(item?.matchedTrainInstanceId).trim(),
   };
+}
+
+function sanitizeTimelineSignal(kind: string, item: any): string {
+  const existing = asString(item?.signal).trim();
+  if (kind !== 'location_report') {
+    return existing.toUpperCase();
+  }
+  const latitude = Number(item?.latitude);
+  const longitude = Number(item?.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return existing;
+  }
+  const radiusMeters = Math.max(0, Math.floor(Number(item?.radiusMeters) || 0));
+  return `LOC:${latitude},${longitude},${radiusMeters}`;
 }
 
 function sanitizeCommentDoc(item: any): any | null {
@@ -1136,7 +1160,7 @@ function sanitizeRiderRow(tx: any, item: any): any {
 
 function latestReportEvent(activity: any): any | null {
   for (const item of activity.timeline || []) {
-    if (item.kind === 'report' || item.kind === 'station_sighting') {
+    if (item.kind === 'report' || item.kind === 'station_sighting' || item.kind === 'location_report') {
       return item;
     }
   }
@@ -1209,7 +1233,7 @@ function refreshActivityRow(tx: any, row: any): any {
 
   const now = nowDate(tx).getTime();
   const reportAtMs = parseISO(report?.createdAt || '')?.getTime() || 0;
-  const activeThreshold = row.scopeType === 'station' ? STATION_ACTIVITY_ACTIVE_MS : TRAIN_ACTIVITY_ACTIVE_MS;
+  const activeThreshold = row.scopeType === 'station' || row.scopeType === 'area' ? STATION_ACTIVITY_ACTIVE_MS : TRAIN_ACTIVITY_ACTIVE_MS;
   const active = Boolean(report && now-reportAtMs <= activeThreshold);
 
   return {
@@ -1982,6 +2006,58 @@ function activityVoteSummary(activity: any, viewerStableId: string) {
   return { ongoing, cleared, userValue };
 }
 
+function incidentLocationPayload(activity: any): any | undefined {
+	const event = (activity.timeline || []).find((item: any) => item.kind === 'location_report');
+	if (!event) {
+		return undefined;
+	}
+  const signal = parseLocationSignal(event.signal);
+  return {
+    kind: activity.scopeType === 'area' ? 'area' : 'station',
+    latitude: signal.latitude,
+    longitude: signal.longitude,
+    radiusMeters: signal.radiusMeters,
+    description: trimOptional(asString(event.detail)) || '',
+	};
+}
+
+function incidentMapTargetPayload(activity: any): any | undefined {
+  const scopeType = asString(activity?.scopeType).trim();
+  const subjectId = asString(activity?.subjectId).trim();
+  if (scopeType === 'train') {
+    return subjectId ? { type: 'train', trainInstanceId: subjectId } : undefined;
+  }
+  const latest = latestReportEvent(activity);
+  if (scopeType === 'station') {
+    const matchedTrainId = asString(latest?.matchedTrainInstanceId).trim();
+    if (latest?.kind === 'station_sighting' && matchedTrainId) {
+      return { type: 'train', trainInstanceId: matchedTrainId };
+    }
+    return subjectId ? { type: 'station', stationId: subjectId } : undefined;
+  }
+  if (scopeType === 'area') {
+    const incidentId = asString(activity?.id).trim();
+    return incidentId ? { type: 'area', incidentId } : undefined;
+  }
+  return undefined;
+}
+
+function parseLocationSignal(rawSignal: unknown): { latitude?: number; longitude?: number; radiusMeters: number } {
+	const signal = asString(rawSignal).trim();
+	if (!signal.toUpperCase().startsWith('LOC:')) {
+    return { radiusMeters: 0 };
+  }
+  const parts = signal.slice(4).split(',');
+  const latitude = Number(parts[0]);
+  const longitude = Number(parts[1]);
+  const radiusMeters = Math.max(0, Math.floor(Number(parts[2]) || 0));
+  return {
+    latitude: Number.isFinite(latitude) ? latitude : undefined,
+    longitude: Number.isFinite(longitude) ? longitude : undefined,
+    radiusMeters,
+  };
+}
+
 function trainSignalIncidentLabel(signal: string): string {
   switch (signal.trim().toUpperCase()) {
     case 'INSPECTION_STARTED':
@@ -2530,6 +2606,8 @@ function incidentSummaryPayload(tx: any, activity: any, viewerStableId: string) 
     lastReporter: activity.summary.lastReporter,
     commentCount: Array.isArray(activity.comments) ? activity.comments.length : 0,
     votes: activityVoteSummary(activity, viewerStableId),
+    location: incidentLocationPayload(activity),
+    mapTarget: incidentMapTargetPayload(activity),
     active: activity.active === true,
   };
 }
@@ -2552,7 +2630,7 @@ function incidentDetailPayload(tx: any, incidentId: string) {
   const viewerStableId = optionalViewerStableId(tx);
   const timelineEvents = (activity.timeline || []).map((item: any) => ({
     id: item.id,
-    kind: item.kind === 'station_sighting' ? 'report' : item.kind,
+    kind: item.kind === 'station_sighting' || item.kind === 'location_report' ? 'report' : item.kind,
     name: item.name,
     detail: item.detail,
     nickname: item.nickname,
@@ -3267,11 +3345,11 @@ function clearScheduleProjectionRows(tx: any, serviceDate: string): void {
 function deleteActivity(tx: any, incidentId: string): boolean {
   const existing = tx.db.trainbot_activity.id.find(incidentId);
   deleteJobsWithPrefix(tx, `activity:${incidentId}|`);
-  clearRowsByIncident(tx.db.trainbot_public_incident_event, incidentId);
-  clearRowsByIncident(tx.db.trainbot_public_incident_comment, incidentId);
+  clearRowsByIncident(tx.db.trainbot_incident_event, incidentId);
+  clearRowsByIncident(tx.db.trainbot_incident_comment, incidentId);
   clearRowsByIncident(tx.db.trainbot_public_sighting, incidentId);
   clearRowsByIncident(tx.db.trainbot_incident_vote, incidentId);
-  tx.db.trainbot_public_incident.id.delete(incidentId);
+  tx.db.trainbot_incident_summary.id.delete(incidentId);
   tx.db.trainbot_activity.id.delete(incidentId);
   if (existing && asString(existing.scopeType).trim() === 'train') {
     refreshTripProjection(tx, asString(existing.subjectId).trim());
@@ -3299,9 +3377,9 @@ function deleteServiceDayData(tx: any, serviceDate: string): any {
   clearRowsByServiceDate(tx.db.trainbot_trip_timeline_bucket, cleanDate);
   clearRowsByServiceDate(tx.db.trainbot_trip_public, cleanDate);
   clearRowsByServiceDate(tx.db.trainbot_public_sighting, cleanDate);
-  clearRowsByServiceDate(tx.db.trainbot_public_incident_event, cleanDate);
-  clearRowsByServiceDate(tx.db.trainbot_public_incident_comment, cleanDate);
-  clearRowsByServiceDate(tx.db.trainbot_public_incident, cleanDate);
+  clearRowsByServiceDate(tx.db.trainbot_incident_event, cleanDate);
+  clearRowsByServiceDate(tx.db.trainbot_incident_comment, cleanDate);
+  clearRowsByServiceDate(tx.db.trainbot_incident_summary, cleanDate);
   for (const activity of rowsFrom(tx.db.trainbot_activity.serviceDate.filter(cleanDate))) {
     deleteActivity(tx, asString(activity.id).trim());
   }
@@ -3339,9 +3417,9 @@ function staleServiceDates(tx: any, oldestKeptServiceDate: string): string[] {
   addServiceDates(rowsFrom(tx.db.trainbot_trip_timeline_bucket.iter()), dates);
   addServiceDates(rowsFrom(tx.db.trainbot_trip_public.iter()), dates);
   addServiceDates(rowsFrom(tx.db.trainbot_public_sighting.iter()), dates);
-  addServiceDates(rowsFrom(tx.db.trainbot_public_incident_event.iter()), dates);
-  addServiceDates(rowsFrom(tx.db.trainbot_public_incident_comment.iter()), dates);
-  addServiceDates(rowsFrom(tx.db.trainbot_public_incident.iter()), dates);
+  addServiceDates(rowsFrom(tx.db.trainbot_incident_event.iter()), dates);
+  addServiceDates(rowsFrom(tx.db.trainbot_incident_comment.iter()), dates);
+  addServiceDates(rowsFrom(tx.db.trainbot_incident_summary.iter()), dates);
   addServiceDates(rowsFrom(tx.db.trainbot_activity.iter()), dates);
   addServiceDates(rowsFrom(tx.db.trainbot_job.iter()), dates);
   addServiceDates(rowsFrom(tx.db.trainbot_import_chunk.iter()), dates);
@@ -3492,10 +3570,10 @@ function refreshTripProjection(tx: any, trainId: string): void {
 }
 
 function refreshActivityProjection(tx: any, incidentId: string): void {
-  clearRowsByIncident(tx.db.trainbot_public_incident_event, incidentId);
-  clearRowsByIncident(tx.db.trainbot_public_incident_comment, incidentId);
+  clearRowsByIncident(tx.db.trainbot_incident_event, incidentId);
+  clearRowsByIncident(tx.db.trainbot_incident_comment, incidentId);
   clearRowsByIncident(tx.db.trainbot_public_sighting, incidentId);
-  tx.db.trainbot_public_incident.id.delete(incidentId);
+  tx.db.trainbot_incident_summary.id.delete(incidentId);
 
   const activity = tx.db.trainbot_activity.id.find(incidentId);
   if (!activity) {
@@ -3504,7 +3582,9 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   syncIncidentVoteProjection(tx, activity);
 
   const summary = incidentSummaryPayload(tx, activity, '');
-  tx.db.trainbot_public_incident.insert({
+  const location = summary.location || {};
+  const mapTarget = summary.mapTarget || {};
+  tx.db.trainbot_incident_summary.insert({
     id: incidentId,
     scopeType: activity.scopeType,
     subjectId: activity.subjectId,
@@ -3520,14 +3600,23 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     commentCount: Number(summary.commentCount) || 0,
     ongoingVotes: Number(summary.votes?.ongoing) || 0,
     clearedVotes: Number(summary.votes?.cleared) || 0,
+    locationKind: asString(location.kind).trim(),
+    latitude: typeof location.latitude === 'number' ? location.latitude : undefined,
+    longitude: typeof location.longitude === 'number' ? location.longitude : undefined,
+    radiusMeters: Number(location.radiusMeters) || 0,
+    locationDescription: asString(location.description).trim(),
+    mapTargetType: asString(mapTarget.type).trim(),
+    mapTargetTrainInstanceId: asString(mapTarget.trainInstanceId).trim(),
+    mapTargetStationId: asString(mapTarget.stationId).trim(),
+    mapTargetIncidentId: asString(mapTarget.incidentId).trim(),
   });
 
   for (const event of activity.timeline || []) {
-    tx.db.trainbot_public_incident_event.insert({
+    tx.db.trainbot_incident_event.insert({
       id: event.id,
       incidentId,
       serviceDate: activity.serviceDate,
-      kind: event.kind === 'station_sighting' ? 'report' : event.kind,
+      kind: event.kind === 'station_sighting' || event.kind === 'location_report' ? 'report' : event.kind,
       name: event.name,
       detail: event.detail,
       nickname: event.nickname,
@@ -3552,7 +3641,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   }
 
   for (const comment of activity.comments || []) {
-    tx.db.trainbot_public_incident_comment.insert({
+    tx.db.trainbot_incident_comment.insert({
       id: comment.id,
       incidentId,
       serviceDate: activity.serviceDate,
@@ -3566,7 +3655,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     if (asString(vote.value).trim().toUpperCase() !== 'ONGOING') {
       continue;
     }
-    tx.db.trainbot_public_incident_event.insert({
+    tx.db.trainbot_incident_event.insert({
       id: `${incidentId}|vote|${vote.stableId}`,
       incidentId,
       serviceDate: activity.serviceDate,
@@ -3590,10 +3679,10 @@ function refreshAllPublicProjections(tx: any, serviceDate?: string): void {
   ensureRuntimeRefreshJob(tx);
   if (targetServiceDate) {
     refreshScheduleProjection(tx, targetServiceDate);
-    clearRowsByServiceDate(tx.db.trainbot_public_incident_event, targetServiceDate);
-    clearRowsByServiceDate(tx.db.trainbot_public_incident_comment, targetServiceDate);
+    clearRowsByServiceDate(tx.db.trainbot_incident_event, targetServiceDate);
+    clearRowsByServiceDate(tx.db.trainbot_incident_comment, targetServiceDate);
     clearRowsByServiceDate(tx.db.trainbot_public_sighting, targetServiceDate);
-    clearRowsByServiceDate(tx.db.trainbot_public_incident, targetServiceDate);
+    clearRowsByServiceDate(tx.db.trainbot_incident_summary, targetServiceDate);
     clearRowsByServiceDate(tx.db.trainbot_trip_live, targetServiceDate);
     clearRowsByServiceDate(tx.db.trainbot_trip_timeline_bucket, targetServiceDate);
     clearRowsByServiceDate(tx.db.trainbot_trip_public, targetServiceDate);
@@ -3889,12 +3978,12 @@ export const publicDashboardLive = spacetimedb.anonymousView(
 
 export const publicIncidentListLive = spacetimedb.anonymousView(
   { name: named('public_incident_list_live'), public: true },
-  t.array(trainbot_public_incident.rowType),
+  t.array(trainbot_incident_summary.rowType),
   (ctx) => {
     const serviceDate = projectedServiceDateForReadonlyDb(ctx.db);
     const projected = serviceDate
-      ? rowsFrom(ctx.db.trainbot_public_incident.serviceDate.filter(serviceDate))
-      : rowsFrom(ctx.db.trainbot_public_incident.iter());
+      ? rowsFrom(ctx.db.trainbot_incident_summary.serviceDate.filter(serviceDate))
+      : rowsFrom(ctx.db.trainbot_incident_summary.iter());
     if (projected.length || !serviceDate) {
       return projected;
     }
@@ -3903,10 +3992,12 @@ export const publicIncidentListLive = spacetimedb.anonymousView(
       .sort((left, right) => compareTimeDescending(left.lastActivityAt, right.lastActivityAt))
       .map((activity) => {
         const summary = incidentSummaryPayload(ctx, activity, '');
+        const location = summary.location || {};
+        const mapTarget = summary.mapTarget || {};
         return {
           id: asString(summary.id).trim(),
+          scopeType: asString(summary.scope).trim(),
           serviceDate,
-          scope: asString(summary.scope).trim(),
           subjectId: asString(summary.subjectId).trim(),
           subjectName: asString(summary.subjectName).trim(),
           lastReportName: asString(summary.lastReportName).trim(),
@@ -3919,6 +4010,15 @@ export const publicIncidentListLive = spacetimedb.anonymousView(
           ongoingVotes: Number(summary.votes?.ongoing) || 0,
           clearedVotes: Number(summary.votes?.cleared) || 0,
           active: summary.active === true,
+          locationKind: asString(location.kind).trim(),
+          latitude: typeof location.latitude === 'number' ? location.latitude : undefined,
+          longitude: typeof location.longitude === 'number' ? location.longitude : undefined,
+          radiusMeters: Number(location.radiusMeters) || 0,
+          locationDescription: asString(location.description).trim(),
+          mapTargetType: asString(mapTarget.type).trim(),
+          mapTargetTrainInstanceId: asString(mapTarget.trainInstanceId).trim(),
+          mapTargetStationId: asString(mapTarget.stationId).trim(),
+          mapTargetIncidentId: asString(mapTarget.incidentId).trim(),
         };
       });
   }

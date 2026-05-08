@@ -39,15 +39,18 @@ type Server struct {
 	static    fs.FS
 	indexTmpl *template.Template
 	adminTmpl *template.Template
+	authTmpl  *template.Template
 
-	mu      sync.Mutex
-	clients map[*client]struct{}
+	mu              sync.Mutex
+	clients         map[*client]struct{}
+	relayViewerRefs map[string]int
 
 	gateMu sync.RWMutex
 	gate   *controlGate
 
-	stateMu     sync.RWMutex
-	cachedState state.Snapshot
+	stateMu       sync.RWMutex
+	cachedState   state.Snapshot
+	cachedStateAt time.Time
 
 	quickClaimMu   sync.RWMutex
 	lastQuickClaim quickClaimDiagnostic
@@ -93,7 +96,11 @@ type apiResponse struct {
 	Phone   phone.Health   `json:"phone,omitempty"`
 }
 
-const serverVersion = "ticket-remote-2026-05-07-spacetimeauth-login-v1"
+const (
+	serverVersion      = "ticket-remote-2026-05-08-browser-tap-queue-v1"
+	stateLookupTimeout = 1200 * time.Millisecond
+	stateCacheMaxAge   = 30 * time.Second
+)
 
 func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Server, error) {
 	if cfg.SimulatorSetup.BackendID == "" {
@@ -113,15 +120,17 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		return nil, err
 	}
 	s := &Server{
-		cfg:       cfg,
-		store:     store,
-		relay:     relay,
-		auth:      auth.NewValidator(cfg.Access),
-		direct:    newDirectStreamHub(),
-		static:    staticSub,
-		indexTmpl: template.Must(template.New("index").Parse(indexHTML)),
-		adminTmpl: template.Must(template.New("admin").Parse(adminHTML)),
-		clients:   map[*client]struct{}{},
+		cfg:             cfg,
+		store:           store,
+		relay:           relay,
+		auth:            auth.NewValidator(cfg.Access),
+		direct:          newDirectStreamHub(),
+		static:          staticSub,
+		indexTmpl:       template.Must(template.New("index").Parse(indexHTML)),
+		adminTmpl:       template.Must(template.New("admin").Parse(adminHTML)),
+		authTmpl:        template.Must(template.New("auth").Parse(authRedirectHTML)),
+		clients:         map[*client]struct{}{},
+		relayViewerRefs: map[string]int{},
 	}
 	s.setupRunner = commandSimulatorSetupRunner{
 		adbPath: cfg.SimulatorSetup.ADBPath,
@@ -196,7 +205,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/admin/phone/setup/open":
 		s.withOwnerSimulatorSetup(w, r, s.handleAdminPhoneSetupOpen)
 	case path == "/admin":
-		s.withAdmin(w, r, s.handleAdminPage)
+		s.handleAdminShell(w, r)
 	case path == "/auth/callback":
 		s.handleIndexShell(w, r)
 	case path == "/":
@@ -216,42 +225,114 @@ func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
 			s.handleIndex(w, r, id, sessionID, snapshot)
 			return
 		}
-		writeNoStoreHeaders(w)
-		_ = s.indexTmpl.Execute(w, map[string]any{
-			"AssetVersion": assetVersion(),
-			"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false))),
-		})
+		s.handleUnauthIndex(w)
 		return
 	}
 	s.withMember(w, r, s.handleIndex)
 }
 
+func (s *Server) handleAdminShell(w http.ResponseWriter, r *http.Request) {
+	if s.usesSpacetimeAuth() {
+		id, sessionID, snapshot, ok := s.optionalMember(r)
+		if !ok {
+			s.handleUnauthIndex(w)
+			return
+		}
+		if !snapshot.IsAdmin(id.Email) {
+			writeErrorPage(w, http.StatusForbidden, "Admin access is required.")
+			return
+		}
+		if sessionID == "" {
+			sessionID = s.sessionID(w, r)
+		}
+		s.handleAdminPage(w, r, id, sessionID, snapshot)
+		return
+	}
+	s.withAdmin(w, r, s.handleAdminPage)
+}
+
+func (s *Server) handleUnauthIndex(w http.ResponseWriter) {
+	writeNoStoreHeaders(w)
+	_ = s.authTmpl.Execute(w, map[string]any{
+		"AssetVersion": assetVersion(),
+		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false))),
+	})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, time.Now())
+	now := time.Now()
 	phoneHealth := s.relay.Snapshot()
-	ok := err == nil
+	snapshot, err := s.snapshotForHealth(r.Context(), now, phoneHealth)
+	stateBackendFresh := err == nil
+	ok := err == nil || snapshot.Ticket.ID != ""
 	reasons := []string{}
+	stateBackendWarning := ""
 	if err != nil {
-		reasons = append(reasons, err.Error())
+		if snapshot.Ticket.ID == "" {
+			reasons = append(reasons, publicHealthError(err))
+		} else {
+			stateBackendWarning = publicHealthError(err)
+		}
 	}
 	if snapshot.StateBackend == "memory" {
 		reasons = append(reasons, "state backend is memory; configure SpacetimeDB for production")
 	}
-	if err == nil {
-		snapshot = s.withActivePhoneBackend(snapshot, phoneHealth)
-		s.cacheSnapshot(snapshot)
-	}
+	streamNow := time.Now()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                 ok,
-		"serverVersion":      serverVersion,
-		"reasons":            reasons,
-		"state":              snapshot,
-		"phone":              phoneHealth,
-		"activePhoneBackend": s.activePhoneBackend(),
-		"directStream":       s.direct.snapshot(time.Now(), phoneHealth),
-		"controlGate":        s.controlGateSnapshot(time.Now()),
-		"quickClaim":         s.quickClaimSnapshot(),
+		"ok":                  ok,
+		"serverVersion":       serverVersion,
+		"reasons":             reasons,
+		"stateBackendFresh":   stateBackendFresh,
+		"stateBackendWarning": stateBackendWarning,
+		"state":               snapshot,
+		"phone":               phoneHealth,
+		"activePhoneBackend":  s.activePhoneBackend(),
+		"directStream":        s.direct.snapshot(streamNow, phoneHealth),
+		"controlGate":         s.controlGateSnapshot(streamNow),
+		"quickClaim":          s.quickClaimSnapshot(),
 	})
+}
+
+func publicHealthError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	for _, marker := range []string{"\n\nStack backtrace:", "\nStack backtrace:", "Stack backtrace:"} {
+		if index := strings.Index(text, marker); index >= 0 {
+			text = text[:index]
+			break
+		}
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	const maxHealthErrorLength = 240
+	if len(text) > maxHealthErrorLength {
+		return strings.TrimSpace(text[:maxHealthErrorLength]) + "..."
+	}
+	return text
+}
+
+func (s *Server) snapshotForHealth(ctx context.Context, now time.Time, phoneHealth phone.Health) (state.Snapshot, error) {
+	return s.snapshotWithCache(ctx, now, phoneHealth, stateLookupTimeout)
+}
+
+func (s *Server) snapshotWithCache(ctx context.Context, now time.Time, phoneHealth phone.Health, timeout time.Duration) (state.Snapshot, error) {
+	stateCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		stateCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	snapshot, err := s.store.Snapshot(stateCtx, s.cfg.TicketID, now)
+	if err != nil {
+		if cached, ok := s.cachedSnapshot(now); ok {
+			return s.withActivePhoneBackend(cached, phoneHealth), err
+		}
+		return state.Snapshot{}, err
+	}
+	snapshot = s.withActivePhoneBackend(snapshot, phoneHealth)
+	s.cacheSnapshot(snapshot)
+	return snapshot, nil
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
@@ -259,6 +340,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Ide
 	_ = s.indexTmpl.Execute(w, map[string]any{
 		"AssetVersion": assetVersion(),
 		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(id, sessionID, snapshot, true))),
+		"IsAdmin":      snapshot.IsAdmin(id.Email),
 	})
 }
 
@@ -332,11 +414,7 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			"email":         id.Email,
 			"sessionId":     sessionID,
 			"state":         snapshot,
-			"spacetime": map[string]any{
-				"host":     s.cfg.State.SpacetimeHost,
-				"database": s.cfg.State.SpacetimeDatabase,
-				"token":    s.authTokenFromRequest(r),
-			},
+			"spacetime":     s.directSpacetimeSessionFromRequest(r),
 		})
 	case http.MethodPost:
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 32*1024))
@@ -365,10 +443,19 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 		s.cacheSnapshot(snapshot)
 		if _, ok := snapshot.Member(id.Email); !ok {
-			writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "not_member", Message: "This email is not linked to this ticket."})
+			writeJSON(w, http.StatusForbidden, apiResponse{
+				OK:      false,
+				Error:   "not_member",
+				Message: fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email),
+			})
 			return
 		}
-		s.setAuthCookie(w, token, int(s.cfg.CookieTTL.Seconds()))
+		sessionToken, sessionExpiresAt, err := s.auth.IssueServerSession(id, s.cfg.CookieTTL, time.Now())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: "session_failed", Message: "Ticket session could not be created."})
+			return
+		}
+		s.setAuthCookie(w, sessionToken, int(s.cfg.CookieTTL.Seconds()))
 		sessionID := s.sessionID(w, r)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":            true,
@@ -376,6 +463,9 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			"email":         id.Email,
 			"sessionId":     sessionID,
 			"state":         snapshot,
+			"session": map[string]any{
+				"expiresAt": sessionExpiresAt.UTC().Format(time.RFC3339),
+			},
 			"spacetime": map[string]any{
 				"host":     s.cfg.State.SpacetimeHost,
 				"database": s.cfg.State.SpacetimeDatabase,
@@ -615,7 +705,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 	}
 	c := &client{conn: conn, sessionID: sessionID, email: id.Email, page: "ticket", video: video}
 	s.addClient(c)
-	s.relay.AddViewer()
+	s.addRelayViewer(sessionID)
 	if video {
 		s.direct.addVideoClient()
 	}
@@ -660,7 +750,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 		if video {
 			s.direct.removeVideoClient()
 		}
-		s.relay.RemoveViewer()
+		s.removeRelayViewer(sessionID)
 		if snapshot, err := s.store.DisconnectPresence(context.Background(), s.cfg.TicketID, sessionID, time.Now()); err == nil {
 			snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 			s.cacheSnapshot(snapshot)
@@ -731,6 +821,7 @@ func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte
 	inputID, _ := msg["inputId"].(string)
 	switch msgType {
 	case "heartbeat":
+		relaySnapshot := s.relay.Snapshot()
 		snapshot, err := s.store.HeartbeatPresence(ctx, state.PresenceInput{
 			TicketID:    s.cfg.TicketID,
 			SessionID:   c.sessionID,
@@ -743,14 +834,16 @@ func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte
 		if err != nil {
 			log.Printf("ticket presence heartbeat failed for %s: %v", c.email, err)
 			if cached, ok := s.cachedSnapshot(now); ok {
-				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached, "phone": s.relay.Snapshot()})
+				cached = s.withActivePhoneBackend(cached, relaySnapshot)
+				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached, "phone": relaySnapshot})
 			}
 			return
 		}
+		snapshot = s.withActivePhoneBackend(snapshot, relaySnapshot)
 		s.cacheSnapshot(snapshot)
 		s.rememberControlGate(snapshot, now)
 		_ = s.relay.SendJSON(ctx, map[string]any{"type": "activity", "reason": "public_heartbeat"})
-		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot, "phone": s.relay.Snapshot()})
+		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot, "phone": relaySnapshot})
 	case "state_refresh":
 		snapshot, err := s.store.Snapshot(ctx, s.cfg.TicketID, now)
 		if err != nil {
@@ -769,11 +862,20 @@ func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte
 			go func() {
 				_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "input_ignored", map[string]any{"reason": "not_active_controller"}, time.Now())
 			}()
-			c.sendJSON(ctx, map[string]any{"type": "input", "inputId": inputID, "accepted": false, "reason": "not_active_controller"})
+			sendTapInputResult(ctx, c, inputID, false, "not_active_controller")
 			return
 		}
-		_ = s.relay.SendText(ctx, data)
-		c.sendJSON(ctx, map[string]any{"type": "input", "inputId": inputID, "accepted": true})
+		if err := s.relay.SendText(ctx, data); err != nil {
+			go func() {
+				_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "input_ignored", map[string]any{
+					"reason": "phone_unavailable",
+					"error":  err.Error(),
+				}, time.Now())
+			}()
+			sendTapInputResult(ctx, c, inputID, false, "phone_unavailable")
+			return
+		}
+		sendTapInputResult(ctx, c, inputID, true, "forwarded")
 	case "quick_claim_tap":
 		s.handleQuickClaimTap(ctx, c, msg, inputID, now)
 	case "activity":
@@ -877,6 +979,7 @@ func (s *Server) handleQuickClaimTap(ctx context.Context, c *client, msg map[str
 		Reason:    "forwarded",
 		Forwarded: true,
 	})
+	sendTapInputResult(ctx, c, inputID, true, "forwarded")
 }
 
 func (s *Server) rejectQuickClaim(ctx context.Context, c *client, inputID string, reason string, action string, now time.Time) {
@@ -892,11 +995,22 @@ func (s *Server) rejectQuickClaim(ctx context.Context, c *client, inputID string
 		Reason:    reason,
 		Forwarded: false,
 	})
+	sendTapInputResult(ctx, c, inputID, false, reason)
+}
+
+func sendTapInputResult(ctx context.Context, c *client, inputID string, accepted bool, reason string) {
+	if reason == "" {
+		if accepted {
+			reason = "forwarded"
+		} else {
+			reason = "rejected"
+		}
+	}
 	c.sendJSON(ctx, map[string]any{
 		"type":     "input_result",
 		"inputId":  inputID,
 		"kind":     "tap",
-		"accepted": false,
+		"accepted": accepted,
 		"reason":   reason,
 	})
 }
@@ -1006,22 +1120,17 @@ func (s *Server) identifyMember(w http.ResponseWriter, r *http.Request) (auth.Id
 	}
 	sessionID := s.sessionID(w, r)
 	now := time.Now()
-	snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, now)
+	snapshot, err := s.snapshotWithCache(r.Context(), now, s.relay.Snapshot(), stateLookupTimeout)
 	if err != nil {
-		log.Printf("ticket state lookup failed for %s: %v", id.Email, err)
-		cached, ok := s.cachedSnapshot(now)
-		if !ok {
+		log.Printf("ticket state lookup failed for %s: %s", id.Email, publicHealthError(err))
+		if snapshot.Ticket.ID == "" {
 			writeErrorPage(w, http.StatusServiceUnavailable, "Ticket state is unavailable.")
 			return auth.Identity{}, "", state.Snapshot{}, false
 		}
-		snapshot = cached
-	} else {
-		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-		s.cacheSnapshot(snapshot)
-		s.rememberControlGate(snapshot, now)
 	}
+	s.rememberControlGate(snapshot, now)
 	if _, ok := snapshot.Member(id.Email); !ok {
-		writeErrorPage(w, http.StatusForbidden, "This email is not linked to this ticket.")
+		writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email))
 		return auth.Identity{}, "", snapshot, false
 	}
 	return id, sessionID, snapshot, true
@@ -1033,18 +1142,13 @@ func (s *Server) optionalMember(r *http.Request) (auth.Identity, string, state.S
 		return auth.Identity{}, "", state.Snapshot{}, false
 	}
 	now := time.Now()
-	snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, now)
+	snapshot, err := s.snapshotWithCache(r.Context(), now, s.relay.Snapshot(), stateLookupTimeout)
 	if err != nil {
-		if cached, ok := s.cachedSnapshot(now); ok {
-			snapshot = cached
-		} else {
+		if snapshot.Ticket.ID == "" {
 			return auth.Identity{}, "", state.Snapshot{}, false
 		}
-	} else {
-		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-		s.cacheSnapshot(snapshot)
-		s.rememberControlGate(snapshot, now)
 	}
+	s.rememberControlGate(snapshot, now)
 	if _, ok := snapshot.Member(id.Email); !ok {
 		return auth.Identity{}, "", snapshot, false
 	}
@@ -1102,6 +1206,18 @@ func (s *Server) authTokenFromRequest(r *http.Request) string {
 	return ""
 }
 
+func (s *Server) directSpacetimeSessionFromRequest(r *http.Request) map[string]any {
+	out := map[string]any{
+		"host":     s.cfg.State.SpacetimeHost,
+		"database": s.cfg.State.SpacetimeDatabase,
+	}
+	token := s.authTokenFromRequest(r)
+	if token != "" && !auth.IsServerSessionToken(token) {
+		out["token"] = token
+	}
+	return out
+}
+
 func (s *Server) usesSpacetimeAuth() bool {
 	mode := strings.ToLower(strings.TrimSpace(s.cfg.Access.Mode))
 	return mode == "" || mode == "spacetime" || mode == "spacetimeauth" || mode == "oidc"
@@ -1129,6 +1245,43 @@ func (s *Server) removeClient(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.clients, c)
+}
+
+func (s *Server) addRelayViewer(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		s.relay.AddViewer()
+		return
+	}
+	s.mu.Lock()
+	previous := s.relayViewerRefs[sessionID]
+	s.relayViewerRefs[sessionID] = previous + 1
+	s.mu.Unlock()
+	if previous == 0 {
+		s.relay.AddViewer()
+	}
+}
+
+func (s *Server) removeRelayViewer(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		s.relay.RemoveViewer()
+		return
+	}
+	removeFromRelay := false
+	s.mu.Lock()
+	if count, ok := s.relayViewerRefs[sessionID]; !ok {
+		removeFromRelay = false
+	} else if count <= 1 {
+		delete(s.relayViewerRefs, sessionID)
+		removeFromRelay = true
+	} else {
+		s.relayViewerRefs[sessionID] = count - 1
+	}
+	s.mu.Unlock()
+	if removeFromRelay {
+		s.relay.RemoveViewer()
+	}
 }
 
 func (s *Server) clientSnapshot() []*client {
@@ -1200,14 +1353,19 @@ func (s *Server) cacheSnapshot(snapshot state.Snapshot) {
 	}
 	s.stateMu.Lock()
 	s.cachedState = snapshot
+	s.cachedStateAt = time.Now()
 	s.stateMu.Unlock()
 }
 
 func (s *Server) cachedSnapshot(now time.Time) (state.Snapshot, bool) {
 	s.stateMu.RLock()
 	snapshot := s.cachedState
+	cachedAt := s.cachedStateAt
 	s.stateMu.RUnlock()
 	if snapshot.Ticket.ID == "" {
+		return state.Snapshot{}, false
+	}
+	if !cachedAt.IsZero() && now.Sub(cachedAt) > stateCacheMaxAge {
 		return state.Snapshot{}, false
 	}
 	if snapshot.ActiveControl != nil {
@@ -1662,6 +1820,7 @@ const indexHTML = `<!doctype html>
       <div class="stage">
         <canvas id="screen" width="540" height="1080" aria-label="ViVi biļetes straume"></canvas>
         <img id="quickClaimSpinner" class="quick-claim-spinner" src="/static/quick-claim-spinner.svg?v={{.AssetVersion}}" alt="" aria-hidden="true" draggable="false" hidden>
+        <img id="streamResumeSpinner" class="stream-resume-spinner" src="/static/quick-claim-spinner.svg?v={{.AssetVersion}}" alt="" aria-hidden="true" draggable="false" hidden>
         <div id="emptyState" class="empty-state">
           <div class="empty-inner">
             <button id="startStream" class="primary" type="button" hidden>Sākt</button>
@@ -1673,19 +1832,61 @@ const indexHTML = `<!doctype html>
     <aside id="panel" class="panel" aria-label="Straumes vadīklas" aria-hidden="true">
       <div class="identity">
         <span id="connectionState">Savienojas</span>
+        {{if .IsAdmin}}
         <a href="/admin" class="admin-link">Admin</a>
+        {{end}}
+      </div>
+      <div class="panel-summary" aria-label="Biļetes stāvoklis">
+        <section class="panel-summary-item control-summary">
+          <span class="panel-label">Kontrole</span>
+          <strong id="controlOwner">Brīva</strong>
+          <span id="controlMode" class="panel-detail">Pieejama ikvienam lapā</span>
+        </section>
+        <section class="panel-summary-item">
+          <span class="panel-label">Laiks</span>
+          <strong id="timer" class="timer" hidden>45 s</strong>
+          <span id="controlTimeDetail" class="panel-detail">Nav aktīvas kontroles</span>
+        </section>
+        <section class="panel-summary-item">
+          <span class="panel-label">Lapā</span>
+          <strong id="viewerCount">0</strong>
+          <span id="viewerCountDetail" class="panel-detail">cilvēki lapā</span>
+        </section>
+        <section class="panel-summary-item stream-summary">
+          <span class="panel-label">Straume</span>
+          <strong id="streamStateLabel">Savienojas</strong>
+          <span id="streamStateDetail" class="panel-detail">Gatavo biļetes attēlu</span>
+        </section>
       </div>
       <div class="control-row">
         <button id="claimControl" class="primary" type="button">Kontroles kods</button>
         <button id="extendControl" type="button" hidden>Pagarināt</button>
         <button id="releaseControl" type="button" hidden>Beigt</button>
       </div>
-      <div id="timer" class="timer" hidden>45s</div>
       <div id="statusLine" class="status-line"></div>
       <div id="presence" class="presence"></div>
     </aside>
   </main>
 </body>
+</html>`
+
+const authRedirectHTML = `<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Biļete</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css?v={{.AssetVersion}}">
+  <script>
+    window.TICKET_REMOTE_CONFIG = {{.ConfigJSON}};
+  </script>
+  <script defer src="/static/app.js?v={{.AssetVersion}}"></script>
+</head>
+<body class="auth-redirect-page"></body>
 </html>`
 
 const adminHTML = `<!doctype html>

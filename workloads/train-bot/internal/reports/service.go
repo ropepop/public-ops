@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -19,22 +20,34 @@ type Service struct {
 	dedupe   time.Duration
 }
 
-const stationSightingVisibilityWindow = 30 * time.Minute
+const (
+	stationSightingVisibilityWindow = 30 * time.Minute
+	DefaultAreaReportRadiusMeters   = 100
+	MaxLocationReportDescriptionLen = 160
+)
 
 type SubmitResult struct {
-	Accepted          bool
-	Deduped           bool
-	CooldownRemaining time.Duration
-	IncidentID        string
-	Event             *domain.ReportEvent
+	Accepted          bool                `json:"accepted"`
+	Deduped           bool                `json:"deduped"`
+	CooldownRemaining time.Duration       `json:"cooldownRemaining"`
+	IncidentID        string              `json:"incidentId"`
+	Event             *domain.ReportEvent `json:"event,omitempty"`
 }
 
 type StationSightingSubmitResult struct {
-	Accepted          bool
-	Deduped           bool
-	CooldownRemaining time.Duration
-	IncidentID        string
-	Event             *domain.StationSighting
+	Accepted          bool                    `json:"accepted"`
+	Deduped           bool                    `json:"deduped"`
+	CooldownRemaining time.Duration           `json:"cooldownRemaining"`
+	IncidentID        string                  `json:"incidentId"`
+	Event             *domain.StationSighting `json:"event,omitempty"`
+}
+
+type LocationReportSubmitResult struct {
+	Accepted          bool                   `json:"accepted"`
+	Deduped           bool                   `json:"deduped"`
+	CooldownRemaining time.Duration          `json:"cooldownRemaining"`
+	IncidentID        string                 `json:"incidentId"`
+	Event             *domain.LocationReport `json:"event,omitempty"`
 }
 
 type TimelineEvent struct {
@@ -80,7 +93,7 @@ func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	contextKey, _ := resolveTrainIncidentContext(train, stops, event.CreatedAt)
+	contextKey, _ := resolveTrainIncidentContextForTrainID(trainID, train, stops, event.CreatedAt)
 	return SubmitResult{Accepted: true, IncidentID: TrainIncidentID(trainID, incidentDayKey(now), contextKey), Event: &event}, nil
 }
 
@@ -112,6 +125,88 @@ func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stati
 	}
 	contextKey, _ := stationIncidentContext(event)
 	return StationSightingSubmitResult{Accepted: true, IncidentID: StationIncidentID(stationID, incidentDayKey(now), contextKey), Event: &event}, nil
+}
+
+func (s *Service) SubmitStationReport(ctx context.Context, userID int64, station domain.Station, now time.Time) (LocationReportSubmitResult, error) {
+	stationID := strings.TrimSpace(station.ID)
+	if stationID == "" {
+		return LocationReportSubmitResult{}, fmt.Errorf("station id is required")
+	}
+	subjectName := strings.TrimSpace(station.Name)
+	if subjectName == "" {
+		subjectName = stationID
+	}
+	event := domain.LocationReport{
+		ID:           generateID(),
+		Scope:        "station",
+		SubjectID:    stationID,
+		SubjectName:  subjectName,
+		Latitude:     copyFloatPtr(station.Latitude),
+		Longitude:    copyFloatPtr(station.Longitude),
+		Description:  "Inspection here",
+		UserID:       userID,
+		CreatedAt:    now.UTC(),
+		RadiusMeters: 0,
+	}
+	return s.submitLocationReport(ctx, event, now)
+}
+
+func (s *Service) SubmitAreaReport(ctx context.Context, userID int64, latitude float64, longitude float64, radiusMeters int, description string, now time.Time) (LocationReportSubmitResult, error) {
+	if !validLatitude(latitude) || !validLongitude(longitude) {
+		return LocationReportSubmitResult{}, fmt.Errorf("invalid coordinates")
+	}
+	description = normalizeLocationReportDescription(description)
+	if description == "" {
+		return LocationReportSubmitResult{}, fmt.Errorf("description is required")
+	}
+	if len([]rune(description)) > MaxLocationReportDescriptionLen {
+		return LocationReportSubmitResult{}, fmt.Errorf("description is too long")
+	}
+	if radiusMeters <= 0 {
+		radiusMeters = DefaultAreaReportRadiusMeters
+	}
+	if radiusMeters < 25 {
+		radiusMeters = 25
+	}
+	if radiusMeters > 1000 {
+		radiusMeters = 1000
+	}
+	lat := roundCoordinate(latitude)
+	lng := roundCoordinate(longitude)
+	subjectID := areaLocationSubjectID(lat, lng, description)
+	event := domain.LocationReport{
+		ID:           generateID(),
+		Scope:        "area",
+		SubjectID:    subjectID,
+		SubjectName:  description,
+		Latitude:     &lat,
+		Longitude:    &lng,
+		RadiusMeters: radiusMeters,
+		Description:  description,
+		UserID:       userID,
+		CreatedAt:    now.UTC(),
+	}
+	return s.submitLocationReport(ctx, event, now)
+}
+
+func (s *Service) submitLocationReport(ctx context.Context, event domain.LocationReport, now time.Time) (LocationReportSubmitResult, error) {
+	last, err := s.store.GetLastLocationReportByUserScope(ctx, event.UserID, event.Scope, event.SubjectID)
+	if err != nil {
+		return LocationReportSubmitResult{}, err
+	}
+	if last != nil {
+		delta := now.Sub(last.CreatedAt)
+		if delta < s.dedupe {
+			return LocationReportSubmitResult{Accepted: false, Deduped: true}, nil
+		}
+		if delta < s.cooldown {
+			return LocationReportSubmitResult{Accepted: false, CooldownRemaining: s.cooldown - delta}, nil
+		}
+	}
+	if err := s.store.InsertLocationReport(ctx, event); err != nil {
+		return LocationReportSubmitResult{}, err
+	}
+	return LocationReportSubmitResult{Accepted: true, IncidentID: LocationIncidentID(event, incidentDayKey(now)), Event: &event}, nil
 }
 
 func (s *Service) BuildStatus(ctx context.Context, trainID string, now time.Time) (domain.TrainStatus, error) {
@@ -275,4 +370,34 @@ func trimStringPtr(value *string) *string {
 		return nil
 	}
 	return &trimmed
+}
+
+func copyFloatPtr(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+func validLatitude(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= -90 && value <= 90
+}
+
+func validLongitude(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= -180 && value <= 180
+}
+
+func roundCoordinate(value float64) float64 {
+	return math.Round(value*100000) / 100000
+}
+
+func normalizeLocationReportDescription(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func areaLocationSubjectID(latitude float64, longitude float64, description string) string {
+	latKey := int(math.Round(latitude * 100000))
+	lngKey := int(math.Round(longitude * 100000))
+	return fmt.Sprintf("%d,%d,%s", latKey, lngKey, sanitizeIncidentKey(description))
 }

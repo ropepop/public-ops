@@ -682,6 +682,7 @@ func (s *SQLiteStore) ResetTestUser(ctx context.Context, userID int64) error {
 		`DELETE FROM favorite_routes WHERE user_id = ?`,
 		`DELETE FROM report_events WHERE user_id = ?`,
 		`DELETE FROM station_sighting_events WHERE user_id = ?`,
+		`DELETE FROM location_report_events WHERE user_id = ?`,
 		`DELETE FROM incident_votes WHERE user_id = ?`,
 		`DELETE FROM incident_vote_events WHERE user_id = ?`,
 		`DELETE FROM incident_comments WHERE user_id = ?`,
@@ -1310,6 +1311,58 @@ func (s *SQLiteStore) ListRecentStationSightingsByTrain(ctx context.Context, tra
 	return scanStationSightingRows(rows)
 }
 
+func (s *SQLiteStore) InsertLocationReport(ctx context.Context, e domain.LocationReport) error {
+	var latitude any
+	var longitude any
+	if e.Latitude != nil {
+		latitude = *e.Latitude
+	}
+	if e.Longitude != nil {
+		longitude = *e.Longitude
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO location_report_events(id, scope, subject_id, subject_name, latitude, longitude, radius_meters, description, user_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.ID, strings.TrimSpace(e.Scope), strings.TrimSpace(e.SubjectID), strings.TrimSpace(e.SubjectName), latitude, longitude, e.RadiusMeters, strings.TrimSpace(e.Description), e.UserID, e.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, scope, subject_id, subject_name, latitude, longitude, radius_meters, description, user_id, created_at
+		FROM location_report_events
+		WHERE user_id = ? AND scope = ? AND subject_id = ?
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, userID, strings.TrimSpace(scope), strings.TrimSpace(subjectID))
+	item, err := scanLocationReportRow(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (s *SQLiteStore) ListRecentLocationReports(ctx context.Context, since time.Time, limit int) ([]domain.LocationReport, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, scope, subject_id, subject_name, latitude, longitude, radius_meters, description, user_id, created_at
+		FROM location_report_events
+		WHERE created_at >= ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, since.UTC().Format(time.RFC3339), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanLocationReportRows(rows)
+}
+
 func (s *SQLiteStore) UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error {
 	createdAt := vote.CreatedAt
 	if createdAt.IsZero() {
@@ -1489,6 +1542,10 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retenti
 	if err != nil {
 		return CleanupResult{}, err
 	}
+	resLocationReports, err := s.db.ExecContext(ctx, `DELETE FROM location_report_events WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339))
+	if err != nil {
+		return CleanupResult{}, err
+	}
 	resTrains, err := s.db.ExecContext(ctx, `DELETE FROM train_instances WHERE service_date < ?`, oldestKeptServiceDate)
 	if err != nil {
 		return CleanupResult{}, err
@@ -1508,6 +1565,7 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retenti
 	subDeleted, _ := resSubs.RowsAffected()
 	reportsDeleted, _ := resReports.RowsAffected()
 	stationSightingsDeleted, _ := resStationSightings.RowsAffected()
+	locationReportsDeleted, _ := resLocationReports.RowsAffected()
 	trainStopsDeleted, _ := resTrainStops.RowsAffected()
 	trainsDeleted, _ := resTrains.RowsAffected()
 
@@ -1515,7 +1573,7 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retenti
 		CheckinsDeleted:         checkinsDeleted,
 		RouteCheckinsDeleted:    routeCheckinsDeleted,
 		SubscriptionsDeleted:    subDeleted,
-		ReportsDeleted:          reportsDeleted,
+		ReportsDeleted:          reportsDeleted + locationReportsDeleted,
 		StationSightingsDeleted: stationSightingsDeleted,
 		TrainStopsDeleted:       trainStopsDeleted,
 		TrainsDeleted:           trainsDeleted,
@@ -1738,6 +1796,53 @@ func scanStationSightingRow(row trainRowScanner) (domain.StationSighting, error)
 	parsedCreatedAt, err := time.Parse(time.RFC3339, createdAt)
 	if err != nil {
 		return domain.StationSighting{}, err
+	}
+	item.CreatedAt = parsedCreatedAt
+	return item, nil
+}
+
+func scanLocationReportRows(rows *sql.Rows) ([]domain.LocationReport, error) {
+	out := make([]domain.LocationReport, 0)
+	for rows.Next() {
+		item, err := scanLocationReportRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func scanLocationReportRow(row trainRowScanner) (domain.LocationReport, error) {
+	var (
+		item      domain.LocationReport
+		latitude  sql.NullFloat64
+		longitude sql.NullFloat64
+		createdAt string
+	)
+	if err := row.Scan(
+		&item.ID,
+		&item.Scope,
+		&item.SubjectID,
+		&item.SubjectName,
+		&latitude,
+		&longitude,
+		&item.RadiusMeters,
+		&item.Description,
+		&item.UserID,
+		&createdAt,
+	); err != nil {
+		return domain.LocationReport{}, err
+	}
+	if latitude.Valid {
+		item.Latitude = &latitude.Float64
+	}
+	if longitude.Valid {
+		item.Longitude = &longitude.Float64
+	}
+	parsedCreatedAt, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return domain.LocationReport{}, err
 	}
 	item.CreatedAt = parsedCreatedAt
 	return item, nil

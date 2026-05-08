@@ -3,7 +3,7 @@ module_id: train_bot
 owner: arbuzas
 runtime:
   type: external
-  healthcheck: curl -fsS https://train-bot.jolkins.id.lv/api/v1/ready >/dev/null
+  healthcheck: curl -fsS https://vilciens.kontrole.info/api/v1/ready >/dev/null
   run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: train_bot

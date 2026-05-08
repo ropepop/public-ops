@@ -55,6 +55,68 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	}
 }
 
+func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.addVideoClient()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
+	hub.recordFrame(key)
+	hub.recordClientTelemetry("h264_decoder_mode", "avc_adapter_configured")
+
+	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+
+	if snapshot["browserMediaError"] != "" {
+		t.Fatalf("normal decoder telemetry should not become media error: %#v", snapshot)
+	}
+	if snapshot["streamVerdict"] != "live" {
+		t.Fatalf("normal decoder telemetry should keep stream live, got %q", snapshot["streamVerdict"])
+	}
+}
+
+func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.addVideoClient()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
+	hub.recordFrame(key)
+	for _, event := range []string{
+		"decoder_error",
+		"h264_decoder_recovery_reset",
+		"h264_server_recover_requested",
+		"server_stale_frames",
+		"stale_video_frames",
+		"video_stream_restart",
+		"websocket_error",
+	} {
+		hub.recordClientTelemetry(event, "recovery detail")
+	}
+
+	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+
+	if snapshot["browserMediaError"] != "" {
+		t.Fatalf("recovery telemetry should not become media error: %#v", snapshot)
+	}
+	if snapshot["streamVerdict"] != "live" {
+		t.Fatalf("recovery telemetry should keep stream live, got %q", snapshot["streamVerdict"])
+	}
+}
+
+func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
+	hub.recordFrame(key)
+
+	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+
+	if snapshot["activeVideoClients"] != 0 {
+		t.Fatalf("test setup expected no active video clients: %#v", snapshot)
+	}
+	if snapshot["streamVerdict"] != "live" {
+		t.Fatalf("fresh streaming frames should stay live during client count race, got %q", snapshot["streamVerdict"])
+	}
+}
+
 func TestHealthReportsHTTPSH264Stream(t *testing.T) {
 	server := newDirectTestServer(t)
 

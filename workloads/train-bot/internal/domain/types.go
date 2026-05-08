@@ -151,6 +151,19 @@ type StationSighting struct {
 	CreatedAt              time.Time `json:"createdAt"`
 }
 
+type LocationReport struct {
+	ID           string    `json:"id"`
+	Scope        string    `json:"scope"`
+	SubjectID    string    `json:"subjectId"`
+	SubjectName  string    `json:"subjectName"`
+	Latitude     *float64  `json:"latitude,omitempty"`
+	Longitude    *float64  `json:"longitude,omitempty"`
+	RadiusMeters int       `json:"radiusMeters,omitempty"`
+	Description  string    `json:"description,omitempty"`
+	UserID       int64     `json:"-"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
 type UserSettings struct {
 	UserID        int64      `json:"userId"`
 	AlertsEnabled bool       `json:"alertsEnabled"`

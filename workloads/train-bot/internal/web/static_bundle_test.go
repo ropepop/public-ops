@@ -99,6 +99,16 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 		t.Fatalf("expected bundled graph bootstrap, body=%s", shellBody)
 	}
 
+	mapReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/map", nil)
+	mapRes := httptest.NewRecorder()
+	server.ServeHTTP(mapRes, mapReq)
+	if mapRes.Code != http.StatusOK {
+		t.Fatalf("unexpected public map status: got %d body=%s", mapRes.Code, mapRes.Body.String())
+	}
+	if !strings.Contains(mapRes.Body.String(), `"recentSightings":[]`) || !strings.Contains(mapRes.Body.String(), `"sameDaySightings":[]`) {
+		t.Fatalf("expected empty sighting arrays in bundled public map, body=%s", mapRes.Body.String())
+	}
+
 	dashboardReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/dashboard?limit=1", nil)
 	dashboardRes := httptest.NewRecorder()
 	server.ServeHTTP(dashboardRes, dashboardReq)
@@ -213,6 +223,111 @@ func TestStaticBundleServerPreservesRiderCountWhenTrainStopsFallbackUsesBundle(t
 	}
 	if payload.TrainCard.Riders != 1 {
 		t.Fatalf("expected live rider count in public train stops payload, got %d", payload.TrainCard.Riders)
+	}
+}
+
+func TestStaticBundlePublicNetworkMapKeepsLiveStationSightings(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.February, 26, 8, 0, 0, 0, loc)
+	appSvc, st := newStaticBundleTestServiceWithStore(t, now, loc)
+	bundleDir := filepath.Join(t.TempDir(), "bundles")
+	publisher := NewStaticBundlePublisher(bundleDir, appSvc, loc, &captureBundleSync{})
+	if _, err := publisher.PublishManifest(ctx, now); err != nil {
+		t.Fatalf("publish static bundle: %v", err)
+	}
+	destinationID := "jelgava"
+	matchedTrainID := "t1"
+	if err := st.InsertStationSighting(ctx, storeStationSighting("bundle-station-sighting", "riga", &destinationID, &matchedTrainID, 77, now.Add(-2*time.Minute))); err != nil {
+		t.Fatalf("insert station sighting: %v", err)
+	}
+
+	server := newStaticBundleTestServer(t, appSvc, bundleDir)
+	server.now = func() time.Time { return now }
+
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/map", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected public map status: got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload struct {
+		Stations []struct {
+			ID string `json:"id"`
+		} `json:"stations"`
+		RecentSightings []struct {
+			StationID              string  `json:"stationId"`
+			MatchedTrainInstanceID *string `json:"matchedTrainInstanceId"`
+		} `json:"recentSightings"`
+		SameDaySightings []struct {
+			StationID string `json:"stationId"`
+		} `json:"sameDaySightings"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode public map: %v", err)
+	}
+	if len(payload.Stations) == 0 {
+		t.Fatalf("expected bundled stations in public map payload")
+	}
+	if len(payload.RecentSightings) != 1 || payload.RecentSightings[0].StationID != "riga" {
+		t.Fatalf("expected live recent sighting with bundled map, got %+v", payload.RecentSightings)
+	}
+	if payload.RecentSightings[0].MatchedTrainInstanceID == nil || *payload.RecentSightings[0].MatchedTrainInstanceID != "t1" {
+		t.Fatalf("expected matched train in live recent sighting, got %+v", payload.RecentSightings[0])
+	}
+	if len(payload.SameDaySightings) != 1 || payload.SameDaySightings[0].StationID != "riga" {
+		t.Fatalf("expected live same-day sighting with bundled map, got %+v", payload.SameDaySightings)
+	}
+}
+
+func TestStaticBundlePublicNetworkMapSurvivesLiveOverlayFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.February, 26, 8, 0, 0, 0, loc)
+	appSvc, st := newStaticBundleTestServiceWithStore(t, now, loc)
+	bundleDir := filepath.Join(t.TempDir(), "bundles")
+	publisher := NewStaticBundlePublisher(bundleDir, appSvc, loc, &captureBundleSync{})
+	if _, err := publisher.PublishManifest(ctx, now); err != nil {
+		t.Fatalf("publish static bundle: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close live store: %v", err)
+	}
+
+	server := newStaticBundleTestServer(t, appSvc, bundleDir)
+	server.now = func() time.Time { return now }
+
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/map", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected bundled public map despite live overlay failure, got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload struct {
+		Stations []struct {
+			ID string `json:"id"`
+		} `json:"stations"`
+		RecentSightings  []struct{} `json:"recentSightings"`
+		SameDaySightings []struct{} `json:"sameDaySightings"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode public map: %v", err)
+	}
+	if len(payload.Stations) == 0 {
+		t.Fatalf("expected bundled stations in public map payload")
+	}
+	if payload.RecentSightings == nil || payload.SameDaySightings == nil {
+		t.Fatalf("expected empty sighting arrays after live overlay failure, got recent=%v sameDay=%v", payload.RecentSightings, payload.SameDaySightings)
 	}
 }
 

@@ -2,6 +2,109 @@
   const cfg = window.TICKET_REMOTE_CONFIG || {};
   const pageVersion = cfg.pageVersion || 'ticket-remote-dev';
 
+  function safeString(value) {
+    if (value == null) return '';
+    if (value instanceof Error) return value.message || value.name || 'error';
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value);
+      } catch (_) {
+        return String(value);
+      }
+    }
+    return String(value);
+  }
+
+  function reportClientFault(event, detail) {
+    if (typeof fetch !== 'function') return;
+    try {
+      fetch('/api/v1/client-log', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event,
+          pageVersion,
+          detail: safeString(detail).slice(0, 500),
+          webCodecs: 'VideoDecoder' in window,
+          userAgent: navigator.userAgent
+        })
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
+  function escapeHTML(value) {
+    return String(value || '').replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }[ch]));
+  }
+
+  function browserStorage(kind, key) {
+    try {
+      return kind === 'session' ? window.sessionStorage : window.localStorage;
+    } catch (error) {
+      reportClientFault('browser_storage_unavailable', `${key || kind}:${error && error.message || 'storage unavailable'}`);
+      return null;
+    }
+  }
+
+  function storageGet(kind, key) {
+    try {
+      const storage = browserStorage(kind, key);
+      return storage ? storage.getItem(key) || '' : '';
+    } catch (error) {
+      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'read failed'}`);
+      return '';
+    }
+  }
+
+  function storageSet(kind, key, value) {
+    try {
+      const storage = browserStorage(kind, key);
+      if (storage) storage.setItem(key, value);
+      return true;
+    } catch (error) {
+      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'write failed'}`);
+      return false;
+    }
+  }
+
+  function storageRemove(kind, key) {
+    try {
+      const storage = browserStorage(kind, key);
+      if (storage) storage.removeItem(key);
+    } catch (error) {
+      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'remove failed'}`);
+    }
+  }
+
+  function showFatalPage(message) {
+    try {
+      document.body.className = 'auth-error-page';
+      document.body.innerHTML = [
+        '<main class="auth-shell">',
+        '<section class="auth-panel">',
+        `<p class="auth-status" role="alert">${escapeHTML(message || 'Biļetes lapa pašlaik nevar ielādēties.')}</p>`,
+        '<button id="retryAuth" class="primary" type="button">Mēģināt vēlreiz</button>',
+        '</section>',
+        '</main>'
+      ].join('');
+      const retry = document.getElementById('retryAuth');
+      if (retry) retry.addEventListener('click', () => location.reload());
+    } catch (_) {}
+  }
+
+  window.addEventListener('error', (event) => {
+    reportClientFault('runtime_error', event && (event.message || event.error));
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    reportClientFault('unhandled_rejection', event && event.reason);
+  });
+
   if ('scrollRestoration' in history) {
     history.scrollRestoration = 'manual';
   }
@@ -12,39 +115,69 @@
   const pkceStateKey = 'ticket_remote_pkce_state';
   const pkceVerifierSharedKey = 'ticket_remote_pkce_verifier_shared';
   const pkceStateSharedKey = 'ticket_remote_pkce_state_shared';
-
-  if (!cfg.authenticated) {
-    startAuthShell();
-    return;
-  }
+  const authReturnToKey = 'ticket_remote_auth_return_to';
 
   let spacetimeClient = null;
   let spacetimeClientStatus = 'idle';
+  let spacetimeDirectUnavailable = false;
+  let spacetimeDirectUnavailableLogged = false;
+
+  if (!cfg.authenticated) {
+    startAuthRedirect();
+    return;
+  }
 
   if (document.querySelector('[data-admin="true"]')) {
     startAdmin();
     return;
   }
 
-  const stage = document.querySelector('.stage');
-  const canvas = document.getElementById('screen');
+  function requireElement(selector, label) {
+    const element = selector.startsWith('#') ? document.getElementById(selector.slice(1)) : document.querySelector(selector);
+    if (!element) {
+      reportClientFault('missing_ticket_dom', label || selector);
+      showFatalPage('Biļetes lapa nav pilnībā ielādējusies. Mēģini pārlādēt lapu.');
+    }
+    return element;
+  }
+
+  const stage = requireElement('.stage', 'stage');
+  const canvas = requireElement('#screen', 'screen');
+  if (!stage || !canvas || typeof canvas.getContext !== 'function') return;
   const ctx = canvas.getContext('2d', { alpha: false });
-  const emptyState = document.getElementById('emptyState');
-  const startStreamButton = document.getElementById('startStream');
-  const emptyMessage = document.getElementById('emptyMessage');
+  if (!ctx) {
+    reportClientFault('canvas_context_unavailable', '2d');
+    showFatalPage('Šajā pārlūkā biļetes attēlu nevar atvērt. Mēģini pārlādēt lapu.');
+    return;
+  }
+  const emptyState = requireElement('#emptyState', 'emptyState');
+  const startStreamButton = requireElement('#startStream', 'startStream');
+  const emptyMessage = requireElement('#emptyMessage', 'emptyMessage');
+  if (!emptyState || !startStreamButton || !emptyMessage) return;
   const quickClaimSpinner = document.getElementById('quickClaimSpinner');
-  const connectionState = document.getElementById('connectionState');
-  const statusLine = document.getElementById('statusLine');
+  const streamResumeSpinner = document.getElementById('streamResumeSpinner');
+  const connectionState = requireElement('#connectionState', 'connectionState');
+  const statusLine = requireElement('#statusLine', 'statusLine');
+  if (!connectionState || !statusLine) return;
   const panel = document.getElementById('panel');
-  const presence = document.getElementById('presence');
-  const claimButton = document.getElementById('claimControl');
-  const extendButton = document.getElementById('extendControl');
-  const releaseButton = document.getElementById('releaseControl');
+  const presence = requireElement('#presence', 'presence');
+  const claimButton = requireElement('#claimControl', 'claimControl');
+  const extendButton = requireElement('#extendControl', 'extendControl');
+  const releaseButton = requireElement('#releaseControl', 'releaseControl');
+  if (!presence || !claimButton || !extendButton || !releaseButton) return;
   const timer = document.getElementById('timer');
+  const controlOwner = document.getElementById('controlOwner');
+  const controlMode = document.getElementById('controlMode');
+  const controlTimeDetail = document.getElementById('controlTimeDetail');
+  const viewerCount = document.getElementById('viewerCount');
+  const viewerCountDetail = document.getElementById('viewerCountDetail');
+  const streamStateLabel = document.getElementById('streamStateLabel');
+  const streamStateDetail = document.getElementById('streamStateDetail');
 
   let ws = null;
   let videoWs = null;
   let reconnectTimer = null;
+  let hiddenVideoCloseTimer = null;
   let configured = false;
   let streamUnsupported = false;
   let streamSize = { width: 540, height: 1080 };
@@ -79,6 +212,9 @@
   let lastAcceptedFrameTimestamp = 0;
   let firstFrameReceived = false;
   let hasRenderedFrame = false;
+  let fallbackFrameCanvas = null;
+  let fallbackFrameAvailable = false;
+  let lastFallbackFrameAt = 0;
   let latestStreamStatus = null;
   let lastStreamStatusAt = 0;
   let claimPromise = null;
@@ -91,8 +227,11 @@
   let localControlSendGraceUntil = 0;
   let inputSeq = 0;
   let inputInFlight = null;
+  let inputDrainTimer = null;
+  const intentionallyClosedVideoSockets = new WeakSet();
   const inputQueue = [];
-  const inputQueueLimit = 20;
+  const inputQueueLimit = 30;
+  const inputDrainDelayMs = 35;
   const inputAckTimeoutMs = 1800;
   const inputRetryLimit = 1;
   const quickClaimSpinnerTimeoutMs = 8000;
@@ -109,6 +248,7 @@
   const streamStaleVideoReconnectMs = 8000;
   const streamStaleServerRecoverMs = 12000;
   const streamDecoderStartupGraceMs = 3500;
+  const hiddenVideoCloseDelayMs = 3000;
   const recoveryKeyframeDebounceMs = 2000;
   const recoveryDecoderResetDebounceMs = 5000;
   const recoveryVideoReconnectDebounceMs = 8000;
@@ -190,6 +330,20 @@
 
   function setConnected(text) {
     connectionState.textContent = text;
+    renderStreamSummary();
+  }
+
+  function safeWebSocket(url, label) {
+    if (typeof WebSocket !== 'function') {
+      reportClientFault('websocket_unavailable', label || url);
+      return null;
+    }
+    try {
+      return new WebSocket(url);
+    } catch (error) {
+      reportClientFault('websocket_create_failed', `${label || url}:${error && error.message || 'create failed'}`);
+      return null;
+    }
   }
 
   const publicMessageTranslations = new Map([
@@ -249,6 +403,40 @@
     return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 
+  function decodeBase64UrlJSON(value) {
+    const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
+    return JSON.parse(atob(padded));
+  }
+
+  function jwtExpiresAtMillis(token) {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return 0;
+    try {
+      const payload = decodeBase64UrlJSON(parts[1]);
+      const exp = Number(payload && payload.exp);
+      return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function rememberSpacetimeToken(token) {
+    storageSet('local', spacetimeTokenKey, token);
+    spacetimeDirectUnavailable = false;
+    spacetimeDirectUnavailableLogged = false;
+    const expiresAt = jwtExpiresAtMillis(token);
+    if (expiresAt > 0) {
+      storageSet('local', spacetimeTokenExpiryKey, new Date(expiresAt).toISOString());
+    } else {
+      storageRemove('local', spacetimeTokenExpiryKey);
+    }
+  }
+
+  function spacetimeTokenExpired(token) {
+    const expiresAt = jwtExpiresAtMillis(token);
+    return expiresAt > 0 && Date.now() + 30000 >= expiresAt;
+  }
+
   async function pkceChallenge(verifier) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
     return base64Url(new Uint8Array(digest));
@@ -271,17 +459,40 @@
     return !['cloudflare', 'cloudflare-access', 'cf-access', 'dev', 'development', 'none'].includes(mode);
   }
 
-  async function beginSpacetimeLogin() {
+  function safeAuthReturnTo(value) {
+    const fallback = '/';
+    const raw = String(value || '').trim();
+    if (!raw) return fallback;
+    try {
+      const parsed = new URL(raw, location.origin);
+      if (parsed.origin !== location.origin || parsed.pathname === '/auth/callback') {
+        return fallback;
+      }
+      return `${parsed.pathname}${parsed.search}${parsed.hash}` || fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function authReturnTarget() {
+    if (location.pathname === '/auth/callback') {
+      return safeAuthReturnTo(storageGet('local', authReturnToKey));
+    }
+    return safeAuthReturnTo(`${location.pathname}${location.search}${location.hash}`);
+  }
+
+  async function beginSpacetimeLogin(returnTo) {
     const auth = authConfig();
     if (!auth.clientId) {
       throw new Error('SpacetimeAuth client is not configured.');
     }
+    storageSet('local', authReturnToKey, safeAuthReturnTo(returnTo || authReturnTarget()));
     const verifier = randomBase64Url(32);
     const state = randomBase64Url(16);
-    sessionStorage.setItem(pkceVerifierKey, verifier);
-    sessionStorage.setItem(pkceStateKey, state);
-    localStorage.setItem(pkceVerifierSharedKey, verifier);
-    localStorage.setItem(pkceStateSharedKey, state);
+    storageSet('session', pkceVerifierKey, verifier);
+    storageSet('session', pkceStateKey, state);
+    storageSet('local', pkceVerifierSharedKey, verifier);
+    storageSet('local', pkceStateSharedKey, state);
     const challenge = await pkceChallenge(verifier);
     const next = new URL(auth.authorizeUrl);
     next.searchParams.set('response_type', 'code');
@@ -294,12 +505,12 @@
     location.assign(next.toString());
   }
 
-  async function finishSpacetimeCallback(statusEl) {
+  async function finishSpacetimeCallback() {
     const params = new URLSearchParams(location.search);
     const code = params.get('code') || '';
     const receivedState = params.get('state') || '';
-    const expectedState = sessionStorage.getItem(pkceStateKey) || localStorage.getItem(pkceStateSharedKey) || '';
-    const verifier = sessionStorage.getItem(pkceVerifierKey) || localStorage.getItem(pkceVerifierSharedKey) || '';
+    const expectedState = storageGet('session', pkceStateKey) || storageGet('local', pkceStateSharedKey) || '';
+    const verifier = storageGet('session', pkceVerifierKey) || storageGet('local', pkceVerifierSharedKey) || '';
     if (!code || !verifier || !expectedState || receivedState !== expectedState) {
       throw new Error('Login callback did not match this browser. Open the newest email link in the same browser you started from, or start sign-in again.');
     }
@@ -310,7 +521,6 @@
     body.set('code', code);
     body.set('redirect_uri', auth.redirectUrl);
     body.set('code_verifier', verifier);
-    statusEl.textContent = 'Pabeidz pierakstīšanos...';
     const tokenResponse = await fetch(auth.tokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -328,52 +538,60 @@
     });
     const sessionPayload = await sessionResponse.json().catch(() => ({}));
     if (!sessionResponse.ok || !sessionPayload.ok) {
+      clearLocalAuthState({ keepReturnTo: true });
       throw new Error(sessionPayload.message || sessionPayload.error || 'Ticket session was rejected.');
     }
-    localStorage.setItem(spacetimeTokenKey, tokenPayload.id_token);
-    if (sessionPayload.spacetime && sessionPayload.spacetime.expiresAt) {
-      localStorage.setItem(spacetimeTokenExpiryKey, sessionPayload.spacetime.expiresAt);
-    }
-    sessionStorage.removeItem(pkceVerifierKey);
-    sessionStorage.removeItem(pkceStateKey);
-    localStorage.removeItem(pkceVerifierSharedKey);
-    localStorage.removeItem(pkceStateSharedKey);
-    location.replace('/');
+    rememberSpacetimeToken(tokenPayload.id_token);
+    storageRemove('session', pkceVerifierKey);
+    storageRemove('session', pkceStateKey);
+    storageRemove('local', pkceVerifierSharedKey);
+    storageRemove('local', pkceStateSharedKey);
+    const returnTo = safeAuthReturnTo(storageGet('local', authReturnToKey));
+    storageRemove('local', authReturnToKey);
+    location.replace(returnTo);
   }
 
-  function startAuthShell() {
-    document.body.className = 'auth-page';
+  function clearLocalAuthState(options) {
+    const keepReturnTo = Boolean(options && options.keepReturnTo);
+    storageRemove('session', pkceVerifierKey);
+    storageRemove('session', pkceStateKey);
+    storageRemove('local', spacetimeTokenKey);
+    storageRemove('local', spacetimeTokenExpiryKey);
+    storageRemove('local', pkceVerifierSharedKey);
+    storageRemove('local', pkceStateSharedKey);
+    if (!keepReturnTo) {
+      storageRemove('local', authReturnToKey);
+    }
+  }
+
+  function showAuthError(error) {
+    clearLocalAuthState({ keepReturnTo: true });
+    document.body.className = 'auth-error-page';
     document.body.innerHTML = [
       '<main class="auth-shell">',
       '<section class="auth-panel">',
-      '<h1>Biļete</h1>',
-      '<p class="auth-copy">Pieraksties ar e-pastu, lai redzētu tiešraides biļeti.</p>',
-      '<p class="auth-copy">Ja e-pasta saite atveras jaunā cilnē, pēc apstiprināšanas atgriezies šajā pārlūkā.</p>',
-      '<button id="spacetimeLogin" class="primary" type="button">Pierakstīties ar e-pastu</button>',
-      '<p id="authStatus" class="auth-status" role="status"></p>',
+      `<p id="authStatus" class="auth-status" role="alert">${escapeHTML(error && error.message ? error.message : 'Pierakstīšanās neizdevās.')}</p>`,
+      '<button id="retryAuth" class="primary" type="button">Mēģināt vēlreiz</button>',
       '</section>',
       '</main>'
     ].join('');
-    const button = document.getElementById('spacetimeLogin');
-    const statusEl = document.getElementById('authStatus');
-    const isCallback = location.pathname === '/auth/callback';
-    if (isCallback) {
-      button.disabled = true;
-      finishSpacetimeCallback(statusEl)
-        .catch((error) => {
-          button.disabled = false;
-          statusEl.textContent = error && error.message ? error.message : 'Pierakstīšanās neizdevās.';
-        });
+    const button = document.getElementById('retryAuth');
+    if (button) {
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        beginSpacetimeLogin(authReturnTarget()).catch(showAuthError);
+      });
+    }
+  }
+
+  function startAuthRedirect() {
+    document.body.className = 'auth-redirect-page';
+    document.body.innerHTML = '';
+    if (location.pathname === '/auth/callback') {
+      finishSpacetimeCallback().catch(showAuthError);
       return;
     }
-    button.addEventListener('click', () => {
-      button.disabled = true;
-      statusEl.textContent = 'Atver SpacetimeAuth. Atver jaunāko e-pasta saiti šajā pašā pārlūkā vai jaunā cilnē.';
-      beginSpacetimeLogin().catch((error) => {
-        button.disabled = false;
-        statusEl.textContent = error && error.message ? error.message : 'Pierakstīšanās neizdevās.';
-      });
-    });
+    beginSpacetimeLogin(authReturnTarget()).catch(showAuthError);
   }
 
   function setStatus(text) {
@@ -425,33 +643,73 @@
   }
 
   function clientLog(event, detail) {
-    let safeDetail = '';
-    if (detail != null && typeof detail === 'object') {
-      try {
-        safeDetail = JSON.stringify(detail);
-      } catch (_) {
-        safeDetail = String(detail);
-      }
-    } else {
-      safeDetail = String(detail || '');
+    reportClientFault(event, detail);
+  }
+
+  function streamResumeSpinnerVisible() {
+    return Boolean(streamResumeSpinner && !streamResumeSpinner.hidden);
+  }
+
+  function showStreamResumeSpinner() {
+    if (!streamResumeSpinner || streamResumeSpinnerVisible()) return;
+    streamResumeSpinner.hidden = false;
+    renderStreamSummary();
+    publishStreamDebug();
+  }
+
+  function hideStreamResumeSpinner() {
+    if (!streamResumeSpinner || !streamResumeSpinnerVisible()) return;
+    streamResumeSpinner.hidden = true;
+    renderStreamSummary();
+    publishStreamDebug();
+  }
+
+  function clearPreservedFrame() {
+    fallbackFrameAvailable = false;
+    lastFallbackFrameAt = 0;
+  }
+
+  function preserveCurrentFrame(reason) {
+    if (!hasRenderedFrame || lastFrameAt <= 0 || canvas.width <= 0 || canvas.height <= 0) {
+      return fallbackFrameAvailable;
     }
-    fetch('/api/v1/client-log', {
-      method: 'POST',
-      cache: 'no-store',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event,
-        pageVersion,
-        detail: safeDetail.slice(0, 500),
-        webCodecs: 'VideoDecoder' in window,
-        userAgent: navigator.userAgent
-      })
-    }).catch(() => {});
+    try {
+      if (!fallbackFrameCanvas) {
+        fallbackFrameCanvas = document.createElement('canvas');
+      }
+      if (fallbackFrameCanvas.width !== canvas.width || fallbackFrameCanvas.height !== canvas.height) {
+        fallbackFrameCanvas.width = canvas.width;
+        fallbackFrameCanvas.height = canvas.height;
+      }
+      const fallbackCtx = fallbackFrameCanvas.getContext('2d', { alpha: false });
+      fallbackCtx.imageSmoothingEnabled = false;
+      fallbackCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height);
+      fallbackFrameAvailable = true;
+      lastFallbackFrameAt = performance.now();
+      return true;
+    } catch (error) {
+      clientLog('stream_frame_preserve_failed', `${reason || 'unknown'}:${error && error.message || 'copy failed'}`);
+      return fallbackFrameAvailable;
+    }
+  }
+
+  function redrawPreservedFrame() {
+    if (!fallbackFrameAvailable || !fallbackFrameCanvas || canvas.width <= 0 || canvas.height <= 0) return false;
+    try {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(fallbackFrameCanvas, 0, 0, canvas.width, canvas.height);
+      hasRenderedFrame = true;
+      return true;
+    } catch (error) {
+      clientLog('stream_frame_restore_failed', error && error.message || 'restore failed');
+      return false;
+    }
   }
 
   function showEmpty(message, showStart) {
     hideQuickClaimSpinner('', 'stream_empty');
     setTicketInUseSpinner(false);
+    hideStreamResumeSpinner();
     emptyMessage.textContent = localizePublicMessage(message);
     startStreamButton.hidden = true;
     emptyState.hidden = false;
@@ -460,10 +718,13 @@
   }
 
   function showStreamWaiting(message) {
-    if (hasRenderedFrame) {
+    if (hasRenderedFrame || fallbackFrameAvailable) {
+      preserveCurrentFrame('stream_waiting');
+      redrawPreservedFrame();
       emptyState.hidden = true;
       document.body.dataset.streamReady = 'true';
       setStatus(message);
+      showStreamResumeSpinner();
       keepFirstScreenPinned();
       return;
     }
@@ -473,6 +734,9 @@
   function hideEmpty() {
     emptyState.hidden = true;
     document.body.dataset.streamReady = 'true';
+    if (!streamStatusStale(freshStreamStatus(performance.now()) || latestStreamStatus)) {
+      hideStreamResumeSpinner();
+    }
     keepFirstScreenPinned();
   }
 
@@ -503,7 +767,13 @@
     keepFirstScreenPinned();
     setConnected('Savienojas');
     connectedAt = performance.now();
-    ws = new WebSocket(socketURL());
+    ws = safeWebSocket(socketURL(), 'control');
+    if (!ws) {
+      setConnected('Savienojuma kļūme');
+      showStreamWaiting('Atjauno straumi...');
+      reconnectTimer = setTimeout(connect, 1500);
+      return;
+    }
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       setConnected('Savienots');
@@ -511,11 +781,15 @@
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
       connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
-      send({ type: 'activity', reason: 'public_connected' });
+      send({ type: 'heartbeat', reason: 'public_connected' });
       connectDirectVideo();
       processInputQueue();
     };
-    ws.onmessage = handleMessage;
+    ws.onmessage = (event) => {
+      handleMessage(event).catch((error) => {
+        clientLog('control_message_failed', error && error.message || 'message failed');
+      });
+    };
     ws.onclose = () => {
       setConnected('Savienojas no jauna');
       configured = false;
@@ -537,6 +811,9 @@
 
   function resetStreamState(options) {
     const preserveFrame = Boolean(options && options.preserveFrame);
+    if (preserveFrame) {
+      preserveCurrentFrame('reset_stream_state');
+    }
     configured = false;
     configuredAt = 0;
     videoConnectedAt = 0;
@@ -560,8 +837,12 @@
     avcPps = null;
     if (!preserveFrame) {
       hasRenderedFrame = false;
+      clearPreservedFrame();
     }
     closeDecoder();
+    if (preserveFrame) {
+      redrawPreservedFrame();
+    }
   }
 
   function restartStream(reason, options) {
@@ -570,46 +851,96 @@
     if (now - lastRestartAt < 5000) return;
     lastRestartAt = now;
     clientLog('video_stream_restart', reason);
+    const preserveFrame = Boolean(options && options.preserveFrame) || hasRenderedFrame || fallbackFrameAvailable;
+    preserveCurrentFrame(`restart_stream:${reason || 'unknown'}`);
     closeDirectVideo();
-    resetStreamState({ preserveFrame: Boolean(options && options.preserveFrame) });
+    resetStreamState({ preserveFrame });
     showStreamWaiting('Atjauno straumi...');
     setTimeout(connectDirectVideo, 250);
   }
 
   function closeDirectVideo() {
+    if (hiddenVideoCloseTimer) {
+      clearTimeout(hiddenVideoCloseTimer);
+      hiddenVideoCloseTimer = null;
+    }
+    preserveCurrentFrame('close_direct_video');
     closeDecoder();
     if (videoWs) {
-      try { videoWs.close(); } catch (_) {}
-      videoWs = null;
+      const socket = videoWs;
+      intentionallyClosedVideoSockets.add(socket);
+      try { socket.close(); } catch (_) {}
+      if (videoWs === socket) videoWs = null;
     }
   }
 
+  function pauseVideoWhileHidden(reason) {
+    if (document.visibilityState !== 'hidden') return;
+    if (hiddenVideoCloseTimer) return;
+    hiddenVideoCloseTimer = setTimeout(() => {
+      hiddenVideoCloseTimer = null;
+      if (document.visibilityState !== 'hidden') return;
+      if (!videoWs) return;
+      clientLog('video_stream_paused_hidden', reason);
+      preserveCurrentFrame(reason || 'hidden_video_pause');
+      closeDirectVideo();
+    }, hiddenVideoCloseDelayMs);
+  }
+
   function connectDirectVideo() {
+    if (document.visibilityState === 'hidden') {
+      pauseVideoWhileHidden('connect_direct_video_hidden');
+      return;
+    }
+    if (hiddenVideoCloseTimer) {
+      clearTimeout(hiddenVideoCloseTimer);
+      hiddenVideoCloseTimer = null;
+    }
     if (videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)) return;
     closeDirectVideo();
     document.body.dataset.videoPath = 'https-h264';
-    videoWs = new WebSocket(streamURL());
-    videoWs.binaryType = 'arraybuffer';
-    videoWs.onopen = () => {
+    const socket = safeWebSocket(streamURL(), 'video');
+    if (!socket) {
+      showStreamWaiting('Atjauno straumi...');
+      setTimeout(connectDirectVideo, 1500);
+      return;
+    }
+    videoWs = socket;
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
       videoConnectedAt = performance.now();
       showStreamWaiting('Saņem video konfigurāciju...');
       requestKeyframe('video_socket_open');
     };
-    videoWs.onmessage = handleVideoSocketMessage;
-    videoWs.onclose = () => {
+    socket.onmessage = (event) => {
+      handleVideoSocketMessage(event).catch((error) => {
+        sendVideoClientLog('video_message_failed', error && error.message || 'message failed');
+        requestKeyframe('video_message_failed');
+      });
+    };
+    socket.onclose = () => {
+      if (videoWs === socket) videoWs = null;
+      if (intentionallyClosedVideoSockets.has(socket)) return;
+      resetStreamState({ preserveFrame: true });
+      showStreamWaiting('Atjauno straumi...');
       if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
         setTimeout(connectDirectVideo, 1000);
       }
     };
-    videoWs.onerror = () => {
+    socket.onerror = () => {
+      if (intentionallyClosedVideoSockets.has(socket)) return;
       clientLog('direct_video_websocket_error', 'socket error');
     };
   }
 
   function sendVideoSignal(value) {
     if (videoWs && videoWs.readyState === WebSocket.OPEN) {
-      videoWs.send(JSON.stringify(value));
-      return true;
+      try {
+        videoWs.send(JSON.stringify(value));
+        return true;
+      } catch (error) {
+        reportClientFault('video_send_failed', error && error.message || 'send failed');
+      }
     }
     return false;
   }
@@ -667,6 +998,7 @@
     const now = performance.now();
     if (now - lastRecoveryDecoderResetAt < recoveryDecoderResetDebounceMs) return false;
     lastRecoveryDecoderResetAt = now;
+    preserveCurrentFrame(`decoder_recovery:${reason || 'unknown'}`);
     sendVideoClientLog('h264_decoder_recovery_reset', reason);
     configureDecoder(lastDecoderConfig, { preserveFrame: true, preserveSequence: true, requestReason: reason, preferAvc: decoderMode === 'avc' })
       .catch((error) => sendVideoClientLog('decoder_recovery_config_failed', error && error.message || 'decoder recovery failed'));
@@ -690,6 +1022,9 @@
       needsKeyFrame,
       firstFrameReceived,
       hasRenderedFrame,
+      hasFallbackFrame: fallbackFrameAvailable,
+      lastFallbackFrameAt,
+      streamResumeSpinnerVisible: streamResumeSpinnerVisible(),
       latestStreamStatus
     };
   }
@@ -889,7 +1224,35 @@
   function handleStreamStatus(msg) {
     latestStreamStatus = msg;
     lastStreamStatusAt = performance.now();
+    if (hasRenderedFrame && streamStatusStale(msg)) {
+      preserveCurrentFrame('stream_status_stale');
+      redrawPreservedFrame();
+      showStreamResumeSpinner();
+    } else if (hasRenderedFrame) {
+      hideStreamResumeSpinner();
+    }
+    renderStreamSummary();
     publishStreamDebug();
+  }
+
+  function renderDecodedFrame(frame, source) {
+    try {
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      lastFrameAt = performance.now();
+      lastDecodedFrameAt = lastFrameAt;
+      firstFrameReceived = true;
+      hasRenderedFrame = true;
+      hideEmpty();
+      publishStreamDebug();
+    } catch (error) {
+      sendVideoClientLog('decoded_frame_render_failed', `${source || 'decoder'}:${error && error.message || 'draw failed'}`);
+      needsKeyFrame = true;
+      preserveCurrentFrame('decoded_frame_render_failed');
+      showStreamWaiting('Atjauno straumi...');
+      requestKeyframe('decoded_frame_render_failed');
+    } finally {
+      try { frame.close(); } catch (_) {}
+    }
   }
 
   async function configureDecoder(config, options) {
@@ -928,6 +1291,10 @@
     }
     const previousSequence = lastAcceptedFrameSequence;
     const previousTimestamp = lastAcceptedFrameTimestamp;
+    const shouldPreserveFrame = Boolean(options.preserveFrame) || hasRenderedFrame || fallbackFrameAvailable;
+    if (shouldPreserveFrame) {
+      preserveCurrentFrame('configure_decoder');
+    }
     lastDecoderConfig = { ...config };
     closeDecoder();
     decoderMode = preferAvc ? 'avc' : 'annexb';
@@ -940,6 +1307,9 @@
     canvas.width = width;
     canvas.height = height;
     ctx.imageSmoothingEnabled = false;
+    if (shouldPreserveFrame) {
+      redrawPreservedFrame();
+    }
     streamSize = { width, height };
     currentStreamEpoch = Number(config.streamEpoch || 0);
     lastAcceptedFrameSequence = options.preserveSequence ? previousSequence : 0;
@@ -960,17 +1330,7 @@
     }
     decoder = new VideoDecoder({
       output: (frame) => {
-        try {
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          lastFrameAt = performance.now();
-          lastDecodedFrameAt = lastFrameAt;
-          firstFrameReceived = true;
-          hasRenderedFrame = true;
-          hideEmpty();
-          publishStreamDebug();
-        } finally {
-          frame.close();
-        }
+        renderDecodedFrame(frame, 'annexb');
       },
       error: (error) => {
         sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
@@ -990,21 +1350,12 @@
     const width = Number(config.width || canvas.width || 0);
     const height = Number(config.height || canvas.height || 0);
     const codec = String(config.codec || 'avc1.42C028');
+    preserveCurrentFrame('configure_avc_decoder');
     closeDecoder();
     decoderMode = 'avc';
     decoder = new VideoDecoder({
       output: (frame) => {
-        try {
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          lastFrameAt = performance.now();
-          lastDecodedFrameAt = lastFrameAt;
-          firstFrameReceived = true;
-          hasRenderedFrame = true;
-          hideEmpty();
-          publishStreamDebug();
-        } finally {
-          frame.close();
-        }
+        renderDecodedFrame(frame, 'avc');
       },
       error: (error) => {
         sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
@@ -1048,8 +1399,12 @@
 
   function send(value) {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(value));
-      return true;
+      try {
+        ws.send(JSON.stringify(value));
+        return true;
+      } catch (error) {
+        reportClientFault('control_send_failed', error && error.message || 'send failed');
+      }
     }
     return false;
   }
@@ -1063,22 +1418,33 @@
     if (!response.ok || !payload.ok || !payload.spacetime || !payload.spacetime.token) {
       throw new Error(payload.message || payload.error || 'SpacetimeAuth session is unavailable.');
     }
-    localStorage.setItem(spacetimeTokenKey, payload.spacetime.token);
-    if (payload.spacetime.expiresAt) {
-      localStorage.setItem(spacetimeTokenExpiryKey, payload.spacetime.expiresAt);
-    }
+    rememberSpacetimeToken(payload.spacetime.token);
     return payload.spacetime.token;
   }
 
   async function spacetimeToken() {
-    const existing = localStorage.getItem(spacetimeTokenKey) || '';
-    if (existing) return existing;
+    const existing = storageGet('local', spacetimeTokenKey);
+    if (existing && !spacetimeTokenExpired(existing)) return existing;
+    if (existing) {
+      storageRemove('local', spacetimeTokenKey);
+      storageRemove('local', spacetimeTokenExpiryKey);
+    }
     return fetchAuthSessionToken();
   }
 
   async function connectSpacetimeState() {
-    if (!usesDirectSpacetimeAuth() || spacetimeClient || !window.TicketSpacetime) return;
-    const token = await spacetimeToken();
+    if (!usesDirectSpacetimeAuth() || spacetimeClient || !window.TicketSpacetime || spacetimeDirectUnavailable) return;
+    let token = '';
+    try {
+      token = await spacetimeToken();
+    } catch (error) {
+      spacetimeDirectUnavailable = true;
+      if (!spacetimeDirectUnavailableLogged) {
+        spacetimeDirectUnavailableLogged = true;
+        clientLog('spacetime_direct_unavailable', error && error.message);
+      }
+      return;
+    }
     const st = cfg.spacetime || {};
     spacetimeClient = window.TicketSpacetime.create({
       host: st.host || 'https://maincloud.spacetimedb.com',
@@ -1102,7 +1468,9 @@
   }
 
   async function syncServerState(reason) {
-    send({ type: 'state_refresh', reason: reason || 'spacetime_mutation' });
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      send({ type: 'state_refresh', reason: reason || 'spacetime_mutation' });
+    }
     const response = await fetch('/api/v1/state', { cache: 'no-store' });
     const payload = await response.json().catch(() => ({}));
     if (response.ok && payload.ok && payload.state) {
@@ -1128,12 +1496,40 @@
     return `${cfg.sessionId || 'ticket'}-${Date.now().toString(36)}-${inputSeq}`;
   }
 
-  function inputQueueSize() {
-    return inputQueue.length + (inputInFlight ? 1 : 0);
+  function clearInputDrainTimer() {
+    if (inputDrainTimer) {
+      clearTimeout(inputDrainTimer);
+      inputDrainTimer = null;
+    }
   }
 
-  function queueInput(value) {
-    if (inputQueueSize() >= inputQueueLimit) {
+  function scheduleInputQueueDrain(delayMs) {
+    if (inputDrainTimer) return;
+    inputDrainTimer = setTimeout(() => {
+      inputDrainTimer = null;
+      processInputQueue();
+    }, Math.max(0, delayMs || 0));
+  }
+
+  function inputIsQuickClaim(input) {
+    return input && input.type === 'quick_claim_tap';
+  }
+
+  function quickClaimQueuedOrInFlight() {
+    if (quickClaimSpinnerPending) return true;
+    if (inputIsQuickClaim(inputInFlight)) return true;
+    return inputQueue.some(inputIsQuickClaim);
+  }
+
+  function queueInput(value, options) {
+    const keepLatest = Boolean(options && options.keepLatest);
+    if (keepLatest) {
+      const queuedLimit = inputInFlight ? Math.max(1, inputQueueLimit - 1) : inputQueueLimit;
+      while (inputQueue.length >= queuedLimit) {
+        const dropped = inputQueue.shift();
+        clientLog('input_queue_dropped_oldest', dropped && dropped.inputId ? dropped.inputId : 'tap');
+      }
+    } else if (inputQueue.length >= inputQueueLimit) {
       setStatus('Pieskārienu rinda ir pilna. Uzgaidi mirkli un mēģini vēlreiz.');
       return '';
     }
@@ -1143,6 +1539,9 @@
       inputId,
       retryCount: value.retryCount || 0
     });
+    if (inputQueue.length > 1) {
+      setStatus(`Nosūta pieskārienus: ${inputQueue.length} gaida.`);
+    }
     processInputQueue();
     return inputId;
   }
@@ -1156,10 +1555,14 @@
     if (options && options.snapTarget) {
       value.snapTarget = options.snapTarget;
     }
-    return queueInput(value);
+    return queueInput(value, { keepLatest: true });
   }
 
   function queueQuickClaimTap(screenPoint, options) {
+    if (quickClaimQueuedOrInFlight()) {
+      setStatus('Atver kontroles kodu...');
+      return '';
+    }
     return queueInput({
       type: 'quick_claim_tap',
       x: screenPoint.x,
@@ -1169,7 +1572,7 @@
   }
 
   function inputCanStartWithoutControl(input) {
-    return input && input.type === 'quick_claim_tap';
+    return inputIsQuickClaim(input);
   }
 
   function currentUserCanSendInput() {
@@ -1180,6 +1583,7 @@
     if (inputInFlight && inputInFlight.timeout) {
       clearTimeout(inputInFlight.timeout);
     }
+    clearInputDrainTimer();
     const hadPending = Boolean(inputInFlight) || inputQueue.length > 0 || quickClaimSpinnerPending;
     inputInFlight = null;
     inputQueue.length = 0;
@@ -1239,16 +1643,24 @@
     if (inputInFlight.timeout) {
       clearTimeout(inputInFlight.timeout);
     }
+    const finishedInput = inputInFlight;
     hideQuickClaimSpinner(inputId, accepted ? 'input_result' : 'input_rejected');
     inputInFlight = null;
+    if (accepted && inputIsQuickClaim(finishedInput)) {
+      localControlSendGraceUntil = performance.now() + 4000;
+    }
     if (!accepted) {
       setStatus(reason === 'not_active_controller'
         ? 'Ievade netiek pieņemta, kamēr nav pārņemts kontroles koda režīms.'
-        : 'Pieskāriens netika pieņemts.');
+        : reason === 'phone_unavailable'
+          ? 'Tālrunis pašlaik nepieņem pieskārienu.'
+          : 'Pieskāriens netika pieņemts.');
     } else if (inputQueue.length > 0) {
       setStatus(`Nosūta pieskārienus: ${inputQueue.length} gaida.`);
     }
-    processInputQueue();
+    if (inputQueue.length > 0) {
+      scheduleInputQueueDrain(inputDrainDelayMs);
+    }
   }
 
   function handleInputMessage(msg) {
@@ -1295,8 +1707,10 @@
 
   function configureStreamInfo(config) {
     if (config.width && config.height && !configured) {
+      preserveCurrentFrame('configure_stream_info');
       canvas.width = config.width;
       canvas.height = config.height;
+      redrawPreservedFrame();
       streamSize = { width: config.width, height: config.height };
       resizeCanvasBox();
     }
@@ -1326,19 +1740,16 @@
     extendButton.hidden = !selfControl || control.extended;
     releaseButton.hidden = !selfControl;
 
+    const viewers = activeViewers(state.viewers || []);
+    renderPanelSummary(state, control, selfControl, viewers);
+
     if (control) {
-      const remaining = Math.max(0, Math.ceil((control.remainingMs || 0) / 1000));
-      timer.hidden = false;
-      timer.textContent = `${remaining}s`;
-      timer.classList.toggle('urgent', remaining <= 10);
-      setStatus(selfControl ? 'Tev ir privāta tālruņa kontrole.' : `${control.email} ir privāta tālruņa kontrole.`);
+      setStatus(selfControl ? 'Tu vari vadīt biļeti.' : 'Kontrole pašlaik ir aizņemta.');
     } else {
-      timer.hidden = true;
-      timer.classList.remove('urgent');
-      setStatus('Vispārīga skatīšanās');
+      setStatus('Kontrole ir brīva.');
     }
 
-    renderPresence(state.viewers || []);
+    renderPresence(viewers, control);
   }
 
   function rememberServerClock(state) {
@@ -1362,21 +1773,108 @@
     return { ...control, remainingMs };
   }
 
-  function renderPresence(viewers) {
+  function activeViewers(viewers) {
+    return (viewers || []).filter((viewer) => viewer && viewer.connected !== false);
+  }
+
+  function renderPanelSummary(state, control, selfControl, viewers) {
+    renderControlSummary(control, selfControl);
+    renderViewerSummary(viewers);
+    renderStreamSummary();
+  }
+
+  function renderControlSummary(control, selfControl) {
+    if (!control) {
+      if (controlOwner) controlOwner.textContent = 'Brīva';
+      if (controlMode) controlMode.textContent = 'Pieejama ikvienam lapā';
+      if (timer) {
+        timer.hidden = true;
+        timer.classList.remove('urgent');
+        timer.textContent = 'Nav';
+      }
+      if (controlTimeDetail) controlTimeDetail.textContent = 'Nav aktīvas kontroles';
+      return;
+    }
+    const remaining = Math.max(0, Math.ceil((control.remainingMs || 0) / 1000));
+    if (controlOwner) controlOwner.textContent = selfControl ? 'Tu kontrolē' : (control.email || 'Aizņemta');
+    if (controlMode) controlMode.textContent = selfControl ? 'Privātais režīms ir tavs' : 'Privātais režīms ir aizņemts';
+    if (timer) {
+      timer.hidden = false;
+      timer.textContent = `${remaining} s`;
+      timer.classList.toggle('urgent', remaining <= 10);
+    }
+    if (controlTimeDetail) controlTimeDetail.textContent = control.extended ? 'Pagarināts laiks' : 'Atlikušais laiks';
+  }
+
+  function renderViewerSummary(viewers) {
+    const count = activeViewers(viewers).length;
+    if (viewerCount) viewerCount.textContent = String(count);
+    if (viewerCountDetail) viewerCountDetail.textContent = count === 1 ? 'cilvēks lapā' : 'cilvēki lapā';
+  }
+
+  function renderStreamSummary() {
+    if (!streamStateLabel || !streamStateDetail) return;
+    const status = freshStreamStatus(performance.now()) || latestStreamStatus;
+    if (streamUnsupported) {
+      streamStateLabel.textContent = 'Nav pieejama';
+      streamStateDetail.textContent = 'Šajā pārlūkā straumi nevar parādīt';
+      return;
+    }
+    if (streamResumeSpinnerVisible() || (hasRenderedFrame && streamStatusStale(status))) {
+      streamStateLabel.textContent = 'Atjaunojas';
+      streamStateDetail.textContent = 'Attēls paliek redzams, kamēr straume atgriežas';
+      return;
+    }
+    if (document.body.dataset.streamReady === 'true' && hasRenderedFrame) {
+      streamStateLabel.textContent = 'Tiešraide';
+      streamStateDetail.textContent = 'Biļetes attēls ir aktīvs';
+      return;
+    }
+    if (status && status.phoneStreamState === 'streaming') {
+      streamStateLabel.textContent = 'Ielādējas';
+      streamStateDetail.textContent = 'Gaida pirmo biļetes kadru';
+      return;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      streamStateLabel.textContent = 'Gatava';
+      streamStateDetail.textContent = 'Savienojums ir atvērts';
+      return;
+    }
+    streamStateLabel.textContent = 'Savienojas';
+    streamStateDetail.textContent = 'Gatavo biļetes attēlu';
+  }
+
+  function renderPresence(viewers, control) {
+    const active = activeViewers(viewers);
     presence.textContent = '';
     const title = document.createElement('div');
-    title.textContent = `${viewers.length} lapā`;
+    title.className = 'presence-header';
+    const label = document.createElement('span');
+    label.textContent = 'Skatītāji';
+    const count = document.createElement('strong');
+    count.textContent = `${active.length} lapā`;
+    title.append(label, count);
     presence.appendChild(title);
-    viewers.forEach((viewer) => {
+    const list = document.createElement('div');
+    list.className = 'presence-list';
+    active.forEach((viewer) => {
       const row = document.createElement('div');
       row.className = 'presence-item';
       const email = document.createElement('span');
+      email.className = 'presence-email';
       email.textContent = viewer.email;
       const mark = document.createElement('span');
-      mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu' : 'skatās';
+      mark.className = 'presence-mark';
+      if (control && viewer.sessionId === control.sessionId) {
+        mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu kontrolē' : 'kontrolē';
+        mark.classList.add('control');
+      } else {
+        mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu' : 'skatās';
+      }
       row.append(email, mark);
-      presence.appendChild(row);
+      list.appendChild(row);
     });
+    presence.appendChild(list);
   }
 
   async function postJSON(path, body) {
@@ -1451,6 +1949,13 @@
     };
   }
 
+  function releaseCanvasPointer(pointerId) {
+    if (typeof canvas.releasePointerCapture !== 'function') return;
+    try {
+      canvas.releasePointerCapture(pointerId);
+    } catch (_) {}
+  }
+
   function firstClaimCandidateZone(screenPoint) {
     const width = canvas.width || streamSize.width || 1;
     const height = canvas.height || streamSize.height || 1;
@@ -1475,7 +1980,7 @@
     if (event.button != null && event.button !== 0) return;
     const control = currentControl(currentState);
     const start = point(event);
-    const selfControl = currentUserOwnsControl(control);
+    const selfControl = currentUserOwnsControl(control) || (!control && currentUserCanSendInput());
     pointerStart = {
       ...start,
       clientX: event.clientX,
@@ -1487,9 +1992,13 @@
       claimZone: !control ? firstClaimCandidateZone(start) : '',
       at: performance.now()
     };
-    if (event.pointerType === 'mouse') {
+    if (event.pointerType !== 'touch' && event.cancelable) {
       event.preventDefault();
-      canvas.setPointerCapture(event.pointerId);
+    }
+    if (typeof canvas.setPointerCapture === 'function') {
+      try {
+        canvas.setPointerCapture(event.pointerId);
+      } catch (_) {}
     }
   });
 
@@ -1499,6 +2008,7 @@
     const dx = event.clientX - pointerStart.clientX;
     const dy = event.clientY - pointerStart.clientY;
     if (Math.abs(dy) >= streamVerticalPanThresholdPx && Math.abs(dy) > Math.abs(dx) * streamVerticalPanDominance) {
+      releaseCanvasPointer(event.pointerId);
       pointerStart = null;
       clientLog('stream_vertical_scroll', 'allowed');
     }
@@ -1517,6 +2027,12 @@
       } else if (pointerStart.otherControl) {
         setStatus('Biļete pašlaik tiek izmantota.');
       } else if (pointerStart.claimZone) {
+        if (quickClaimQueuedOrInFlight()) {
+          setStatus('Atver kontroles kodu...');
+          releaseCanvasPointer(event.pointerId);
+          pointerStart = null;
+          return;
+        }
         showQuickClaimSpinner('');
         const inputId = quickClaimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' });
         if (inputId) {
@@ -1529,14 +2045,19 @@
       }
     } else {
       if (event.cancelable) event.preventDefault();
-      setStatus('Atbalstīti ir tikai pieskārieni.');
       clientLog('blocked_gesture', distance < maxTapTravelPx ? 'long_press' : 'swipe');
     }
+    releaseCanvasPointer(event.pointerId);
     pointerStart = null;
   });
 
-  canvas.addEventListener('pointercancel', () => {
-    pointerStart = null;
+  canvas.addEventListener('pointercancel', (event) => {
+    if (pointerStart && pointerStart.pointerId === event.pointerId) {
+      releaseCanvasPointer(event.pointerId);
+    }
+    if (!pointerStart || pointerStart.pointerId === event.pointerId) {
+      pointerStart = null;
+    }
   });
   canvas.addEventListener('dblclick', (event) => event.preventDefault());
   function blockStreamGesture(event) {
@@ -1583,6 +2104,10 @@
     return Number.isFinite(value) ? value : -1;
   }
 
+  function streamStatusStale(status) {
+    return Boolean(status && status.activeVideoClients > 0 && serverFrameAge(status) > streamStaleKeyframeMs);
+  }
+
   function reconnectVideoForRecovery(reason) {
     const now = performance.now();
     if (now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs) return false;
@@ -1597,13 +2122,34 @@
     return decoderMode === 'avc' || avcAdapterTried || lastPacketAt > 0;
   }
 
+  function streamRecoveryDetail(values) {
+    const detail = {};
+    for (const [key, value] of Object.entries(values || {})) {
+      if (typeof value === 'number') {
+        detail[key] = Math.round(value);
+      } else {
+        detail[key] = value;
+      }
+    }
+    return detail;
+  }
+
   function chaseLiveStream() {
     if (streamUnsupported) return;
+    if (document.visibilityState === 'hidden') {
+      pauseVideoWhileHidden('chase_live_stream_hidden');
+      return;
+    }
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       connect();
       return;
     }
     if (ws.readyState !== WebSocket.OPEN) return;
+    if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
+      connectDirectVideo();
+      return;
+    }
+    if (videoWs.readyState !== WebSocket.OPEN) return;
     const now = performance.now();
     const status = freshStreamStatus(now);
     const serverAge = serverFrameAge(status);
@@ -1647,21 +2193,43 @@
     const decodedAge = lastDecodedFrameAt > 0 ? now - lastDecodedFrameAt : 0;
     const sequenceStalledAge = lastPacketSequenceAdvancedAt > 0 ? now - lastPacketSequenceAdvancedAt : 0;
     const sequenceStalled = lastPacketAt > 0 && sequenceStalledAge > streamStaleKeyframeMs && decodedAge > streamStaleKeyframeMs;
-    const visibleStaleAge = Math.max(decodedAge, serverStale ? serverAge : 0, sequenceStalled ? sequenceStalledAge : 0);
-    if (visibleStaleAge <= streamStaleKeyframeMs && !backendInactive) return;
+    const localStaleAge = Math.max(decodedAge, sequenceStalled ? sequenceStalledAge : 0);
+    const serverStaleAge = serverStale ? serverAge : 0;
+    const detail = streamRecoveryDetail({
+      decodedAge,
+      serverAge,
+      sequenceStalledAge,
+      localStaleAge,
+      activeVideoClients: status ? status.activeVideoClients : 0,
+      backendInactive
+    });
+    if (localStaleAge <= streamStaleKeyframeMs) {
+      if (serverStaleAge > streamStaleKeyframeMs) {
+        if (requestKeyframeDebounced('server_stale_frames', recoveryKeyframeDebounceMs)) {
+          sendVideoClientLog('server_stale_frames', detail);
+        }
+        if (serverStaleAge > streamStaleServerRecoverMs) {
+          requestServerRecoveryDebounced('server_stale_frames');
+        }
+      }
+      if (backendInactive) {
+        requestServerRecoveryDebounced('backend_inactive');
+      }
+      return;
+    }
 
-    if (visibleStaleAge > streamStaleKeyframeMs) {
+    if (localStaleAge > streamStaleKeyframeMs) {
       if (requestKeyframeDebounced('stale_video_frames', recoveryKeyframeDebounceMs)) {
-        clientLog('stale_video_frames', 'fresh_frame_requested');
+        sendVideoClientLog('stale_video_frames', detail);
       }
     }
-    if (visibleStaleAge > streamStaleDecoderResetMs || (lastPacketAt > lastDecodedFrameAt && decodedAge > streamStaleDecoderResetMs)) {
+    if (localStaleAge > streamStaleDecoderResetMs || (lastPacketAt > lastDecodedFrameAt && decodedAge > streamStaleDecoderResetMs)) {
       resetDecoderForRecovery('stale_decoder_recovery');
     }
-    if (visibleStaleAge > streamStaleVideoReconnectMs) {
+    if (localStaleAge > streamStaleVideoReconnectMs) {
       reconnectVideoForRecovery('stale_video_frames');
     }
-    if (visibleStaleAge > streamStaleServerRecoverMs || backendInactive) {
+    if (Math.max(localStaleAge, serverStaleAge) > streamStaleServerRecoverMs || backendInactive) {
       requestServerRecoveryDebounced('stale_frames_server_recover');
     }
   }
@@ -1674,14 +2242,26 @@
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
+      if (hiddenVideoCloseTimer) {
+        clearTimeout(hiddenVideoCloseTimer);
+        hiddenVideoCloseTimer = null;
+      }
+      if (fallbackFrameAvailable) {
+        redrawPreservedFrame();
+        showStreamWaiting('Atjauno straumi...');
+      }
       scheduleFirstScreenPin(false);
       refreshHealth();
       connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
       connect();
+      connectDirectVideo();
+    } else if (document.visibilityState === 'hidden') {
+      pauseVideoWhileHidden('visibility_hidden');
     }
   });
   window.addEventListener('pageshow', () => scheduleFirstScreenPin(true));
   window.addEventListener('pagehide', () => {
+    closeDirectVideo();
     if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {
       spacetimeClient.disconnectPresence();
     }
@@ -1691,7 +2271,7 @@
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
       spacetimeClient.heartbeat(true);
     }
-    send({ type: 'activity', reason: 'public_heartbeat' });
+    send({ type: 'heartbeat', reason: 'public_heartbeat' });
   }, 15000);
   setInterval(refreshHealth, 15000);
   setInterval(() => {
@@ -1735,23 +2315,70 @@
     const simSetupTextForm = document.getElementById('simSetupTextForm');
     const simSetupText = document.getElementById('simSetupText');
     const simSetupLastInput = document.getElementById('simSetupLastInput');
+    const requiredAdminElements = [
+      memberForm,
+      memberEmail,
+      memberRole,
+      membersEl,
+      stateEl,
+      revokeButton,
+      notice,
+      memberSummary,
+      sessionSummary,
+      phoneState,
+      phoneDetail,
+      streamState,
+      streamDetail,
+      controlState,
+      controlDetail,
+      safetyState,
+      safetyDetail,
+      backendSummary,
+      backendList
+    ];
+    if (requiredAdminElements.some((element) => !element)) {
+      reportClientFault('missing_admin_dom', 'admin shell incomplete');
+      showFatalPage('Admin lapa nav pilnībā ielādējusies. Mēģini pārlādēt lapu.');
+      return;
+    }
     let simSetupDisplay = { width: 720, height: 1280 };
     let simSetupPointer = null;
     let simSetupLongPressTimer = null;
     const simSetupTapMaxDistance = 12;
     const simSetupLongPressDelayMs = 650;
+    const adminRefreshMs = 5000;
+    let adminLoadInFlight = null;
+    let adminActionDepth = 0;
 
-    async function load() {
-      const [stateResponse, backendResponse] = await Promise.all([
-        fetch('/api/v1/admin/state', { cache: 'no-store' }),
-        fetch('/api/v1/admin/phone/backends', { cache: 'no-store' })
-      ]);
-      const payload = await stateResponse.json();
-      const backendsPayload = await backendResponse.json();
-      if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
-      if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
-      renderAdmin(payload.state, payload.phone, backendsPayload);
-      if (simSetup) loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
+    async function load(options) {
+      const quiet = Boolean(options && options.quiet);
+      if (adminLoadInFlight) {
+        try {
+          await adminLoadInFlight;
+        } catch (error) {
+          if (!quiet) throw error;
+        }
+        return;
+      }
+      adminLoadInFlight = (async () => {
+        const [stateResponse, backendResponse] = await Promise.all([
+          fetch('/api/v1/admin/state', { cache: 'no-store' }),
+          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' })
+        ]);
+        const payload = await stateResponse.json();
+        const backendsPayload = await backendResponse.json();
+        if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
+        if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
+        renderAdmin(payload.state, payload.phone, backendsPayload);
+        if (simSetup) loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
+      })();
+      try {
+        await adminLoadInFlight;
+      } catch (error) {
+        if (!quiet) throw error;
+      } finally {
+        adminLoadInFlight = null;
+      }
     }
 
     function renderAdmin(state, phone, backendsPayload) {
@@ -1759,7 +2386,7 @@
       renderStatus(state, phone, phoneHealth);
       renderBackends(backendsPayload);
       membersEl.textContent = '';
-      (state.members || []).forEach((member) => {
+      activeMembers(state).forEach((member) => {
         const row = document.createElement('div');
         row.className = 'admin-member';
         const main = document.createElement('div');
@@ -1769,7 +2396,7 @@
         email.textContent = member.email;
         const updated = document.createElement('span');
         updated.className = 'admin-muted';
-        updated.textContent = member.active === false ? 'Inactive' : relativeTime(member.updatedAt);
+        updated.textContent = relativeTime(member.updatedAt);
         main.append(email, updated);
         const role = document.createElement('span');
         role.className = `admin-pill ${member.role || 'member'}`;
@@ -1780,11 +2407,7 @@
         remove.disabled = member.role === 'owner';
         remove.addEventListener('click', async () => {
           await runAdminAction(remove, 'Removing member...', async () => {
-            if (usesDirectSpacetimeAuth()) {
-              await runSpacetimeMutation((client) => client.removeMember(member.email), 'admin_member_remove');
-            } else {
-              await apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`, { method: 'DELETE', cache: 'no-store' });
-            }
+            await apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`, { method: 'DELETE', cache: 'no-store' });
             showNotice('Member removed');
             await load();
           });
@@ -1798,16 +2421,12 @@
     memberForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       await runAdminAction(memberForm.querySelector('button[type="submit"]'), 'Adding member...', async () => {
-        if (usesDirectSpacetimeAuth()) {
-          await runSpacetimeMutation((client) => client.upsertMember(memberEmail.value, memberRole.value), 'admin_member_upsert');
-        } else {
-          await apiFetch('/api/v1/admin/members', {
-            method: 'POST',
-            cache: 'no-store',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: memberEmail.value, role: memberRole.value })
-          });
-        }
+        await apiFetch('/api/v1/admin/members', {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: memberEmail.value, role: memberRole.value })
+        });
         memberEmail.value = '';
         showNotice('Member saved');
         await load();
@@ -1823,7 +2442,7 @@
     });
 
     function renderStatus(state, phone, phoneHealth) {
-      const members = state.members || [];
+      const members = activeMembers(state);
       const viewers = state.viewers || [];
       const activeViewers = viewers.filter((viewer) => viewer.connected !== false);
       const activeControl = state.activeControl || null;
@@ -1832,6 +2451,7 @@
       const pipeline = phoneHealth.streamPipeline || {};
       const inputGate = phoneHealth.inputGate || {};
       const lockdown = phoneHealth.notificationLockdown || {};
+      const streamLive = rootCapture.active || phoneHealth.streamVerdict === 'live' || pipeline.streamVerdict === 'live';
 
       memberSummary.textContent = `${members.length} member${members.length === 1 ? '' : 's'} configured`;
       sessionSummary.textContent = activeControl
@@ -1841,8 +2461,8 @@
       phoneState.textContent = phone && phone.connected ? 'Connected' : phoneRecord.desiredState || 'Idle';
       phoneDetail.textContent = `${phoneRecord.attachName || phoneRecord.id || 'Pixel'} · seen ${relativeTime(phoneRecord.lastSeenAt || (phone && phone.lastSeenAt))}`;
 
-      streamState.textContent = rootCapture.active ? 'Live' : (phoneHealth.streamActive ? 'Starting' : 'Idle');
-      streamDetail.textContent = rootCapture.message || pipeline.secureWindowCaptureBypassMessage || 'Waiting for viewers';
+      streamState.textContent = streamLive ? 'Live' : (phoneHealth.streamActive ? 'Starting' : 'Idle');
+      streamDetail.textContent = rootCapture.message || (streamLive ? 'Ticket stream is live' : pipeline.secureWindowCaptureBypassMessage) || 'Waiting for viewers';
 
       controlState.textContent = activeControl ? 'Claimed' : 'Open';
       controlDetail.textContent = activeControl
@@ -1856,6 +2476,10 @@
 
       revokeButton.disabled = !activeControl;
       revokeButton.classList.toggle('is-danger', Boolean(activeControl));
+    }
+
+    function activeMembers(state) {
+      return (state.members || []).filter((member) => member.active !== false);
     }
 
     function renderBackends(payload) {
@@ -2189,6 +2813,7 @@
     async function runAdminAction(button, pending, action) {
       const original = button ? button.textContent : '';
       const wasDisabled = button ? button.disabled : false;
+      adminActionDepth += 1;
       try {
         if (button) {
           button.disabled = true;
@@ -2202,6 +2827,7 @@
           button.textContent = original;
           button.disabled = wasDisabled || (button.id === 'adminRevoke' && !button.classList.contains('is-danger'));
         }
+        adminActionDepth = Math.max(0, adminActionDepth - 1);
       }
     }
 
@@ -2209,5 +2835,10 @@
       showNotice(error.message || 'Load failed', true);
       stateEl.textContent = error.stack || error.message;
     });
+    setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
+      if (adminActionDepth > 0) return;
+      load({ quiet: true });
+    }, adminRefreshMs);
   }
 })();

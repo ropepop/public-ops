@@ -98,6 +98,54 @@ func TestValidatorRejectsAudienceMismatch(t *testing.T) {
 	}
 }
 
+func TestValidatorAcceptsServerSessionToken(t *testing.T) {
+	validator := NewValidator(AccessConfig{
+		Mode:              "spacetime",
+		AuthCookieName:    "ticket_remote_auth",
+		SessionSigningKey: "test-signing-key",
+	})
+	now := time.Now()
+	token, expiresAt, err := validator.IssueServerSession(Identity{
+		Email:         "Member@Example.com",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsServerSessionToken(token) {
+		t.Fatalf("server session token was not recognized: %q", token)
+	}
+	if !expiresAt.After(now) {
+		t.Fatalf("expiresAt = %s, want after %s", expiresAt, now)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	identity, err := validator.IdentityFromRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Email != "member@example.com" || identity.Subject != "user_123" || !identity.EmailVerified {
+		t.Fatalf("identity = %#v", identity)
+	}
+}
+
+func TestValidatorRejectsExpiredServerSessionToken(t *testing.T) {
+	validator := NewValidator(AccessConfig{
+		Mode:              "spacetime",
+		SessionSigningKey: "test-signing-key",
+	})
+	now := time.Now()
+	token, _, err := validator.IssueServerSession(Identity{Email: "member@example.com"}, time.Minute, now.Add(-2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validator.ValidateServerSession(token, now); err == nil {
+		t.Fatal("expected expired server session to be rejected")
+	}
+}
+
 func TestValidatorAcceptsCloudflareAccessJWT(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

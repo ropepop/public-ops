@@ -85,6 +85,9 @@ type Store interface {
 	ListRecentStationSightings(ctx context.Context, since time.Time, limit int) ([]domain.StationSighting, error)
 	ListRecentStationSightingsByStation(ctx context.Context, stationID string, since time.Time, limit int) ([]domain.StationSighting, error)
 	ListRecentStationSightingsByTrain(ctx context.Context, trainID string, since time.Time, limit int) ([]domain.StationSighting, error)
+	InsertLocationReport(ctx context.Context, e domain.LocationReport) error
+	GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error)
+	ListRecentLocationReports(ctx context.Context, since time.Time, limit int) ([]domain.LocationReport, error)
 	UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error
 	InsertIncidentVoteEvent(ctx context.Context, vote domain.IncidentVoteEvent) error
 	ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error)

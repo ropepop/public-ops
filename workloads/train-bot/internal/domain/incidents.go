@@ -52,6 +52,8 @@ type IncidentSummary struct {
 	Scope             string              `json:"scope"`
 	SubjectID         string              `json:"subjectId,omitempty"`
 	SubjectName       string              `json:"subjectName"`
+	Location          *IncidentLocation   `json:"location,omitempty"`
+	MapTarget         *IncidentMapTarget  `json:"mapTarget,omitempty"`
 	LastReportName    string              `json:"lastReportName"`
 	LastReportAt      time.Time           `json:"lastReportAt"`
 	LastActivityName  string              `json:"lastActivityName,omitempty"`
@@ -61,6 +63,21 @@ type IncidentSummary struct {
 	CommentCount      int                 `json:"commentCount"`
 	Votes             IncidentVoteSummary `json:"votes"`
 	Active            bool                `json:"active"`
+}
+
+type IncidentLocation struct {
+	Kind         string   `json:"kind"`
+	Latitude     *float64 `json:"latitude,omitempty"`
+	Longitude    *float64 `json:"longitude,omitempty"`
+	RadiusMeters int      `json:"radiusMeters,omitempty"`
+	Description  string   `json:"description,omitempty"`
+}
+
+type IncidentMapTarget struct {
+	Type            string `json:"type"`
+	TrainInstanceID string `json:"trainInstanceId,omitempty"`
+	StationID       string `json:"stationId,omitempty"`
+	IncidentID      string `json:"incidentId,omitempty"`
 }
 
 type IncidentEvent struct {

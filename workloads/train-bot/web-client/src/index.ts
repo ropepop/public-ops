@@ -991,15 +991,36 @@ class TrainAppLiveClient {
   }
 
   private publicIncidentTable(source: any): any {
-    return pickAccessor(source, ["publicIncident", "public_incident", "trainbot_public_incident"]);
+    return pickAccessor(source, [
+      "incidentSummary",
+      "incident_summary",
+      "trainbot_incident_summary",
+      "publicIncident",
+      "public_incident",
+      "trainbot_public_incident",
+    ]);
   }
 
   private publicIncidentEventTable(source: any): any {
-    return pickAccessor(source, ["publicIncidentEvent", "public_incident_event", "trainbot_public_incident_event"]);
+    return pickAccessor(source, [
+      "incidentEvent",
+      "incident_event",
+      "trainbot_incident_event",
+      "publicIncidentEvent",
+      "public_incident_event",
+      "trainbot_public_incident_event",
+    ]);
   }
 
   private publicIncidentCommentTable(source: any): any {
-    return pickAccessor(source, ["publicIncidentComment", "public_incident_comment", "trainbot_public_incident_comment"]);
+    return pickAccessor(source, [
+      "incidentComment",
+      "incident_comment",
+      "trainbot_incident_comment",
+      "publicIncidentComment",
+      "public_incident_comment",
+      "trainbot_public_incident_comment",
+    ]);
   }
 
   private publicDashboardLiveTable(source: any): any | null {
@@ -1655,12 +1676,49 @@ class TrainAppLiveClient {
     };
   }
 
+  private incidentMapTargetPayload(row: any): any {
+    const cleanTargetValue = (value: any): string => {
+      const clean = asString(value).trim();
+      return clean && clean.toLowerCase() !== "none" ? clean : "";
+    };
+    const explicitType = asString(row.mapTargetType).trim().toLowerCase();
+    const scope = asString(row.scopeType).trim().toLowerCase();
+    const subjectId = asString(row.subjectId).trim();
+    const fallbackType = scope === "train" || scope === "station" || scope === "area" ? scope : "";
+    const type = explicitType === "train" || explicitType === "station" || explicitType === "area"
+      ? explicitType
+      : fallbackType;
+    if (type === "train") {
+      const trainInstanceId = cleanTargetValue(row.mapTargetTrainInstanceId) || (scope === "train" ? subjectId : "");
+      return trainInstanceId ? { type, trainInstanceId } : undefined;
+    }
+    if (type === "station") {
+      const stationId = cleanTargetValue(row.mapTargetStationId) || (scope === "station" ? subjectId : "");
+      return stationId ? { type, stationId } : undefined;
+    }
+    if (type === "area") {
+      const incidentId = cleanTargetValue(row.mapTargetIncidentId) || asString(row.id).trim();
+      return incidentId ? { type, incidentId } : undefined;
+    }
+    return undefined;
+  }
+
   private incidentSummaryPayload(row: any): any {
+    const locationKind = asString(row.locationKind).trim().toLowerCase();
+    const hasLocation = locationKind === "area" || locationKind === "station";
+    const location = hasLocation ? {
+      kind: locationKind,
+      latitude: typeof row.latitude === "number" ? row.latitude : undefined,
+      longitude: typeof row.longitude === "number" ? row.longitude : undefined,
+      radiusMeters: Number(row.radiusMeters) || 0,
+      description: asString(row.locationDescription),
+    } : undefined;
     return {
       id: asString(row.id),
       scope: asString(row.scopeType),
       subjectId: asString(row.subjectId),
       subjectName: asString(row.subjectName),
+      location,
       lastReportName: asString(row.lastReportName),
       lastReportAt: asString(row.lastReportAt),
       lastActivityName: asString(row.lastActivityName),
@@ -1669,6 +1727,7 @@ class TrainAppLiveClient {
       lastReporter: asString(row.lastReporter),
       commentCount: Number(row.commentCount) || 0,
       votes: this.incidentVoteSummary(asString(row.id)),
+      mapTarget: this.incidentMapTargetPayload(row),
       active: row.active === true,
     };
   }

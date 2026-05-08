@@ -94,13 +94,14 @@ func Load() (Config, error) {
 				"TICKET_REMOTE_AUTH_HTTP_TIMEOUT",
 				10*time.Second,
 			),
-			AuthCookieName: getenv("TICKET_REMOTE_AUTH_COOKIE_NAME", "ticket_remote_auth"),
-			TeamDomain:     strings.TrimRight(getenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", ""), "/"),
-			Audience:       getenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", ""),
-			OIDCIssuer:     strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
-			OIDCClientID:   getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
-			OIDCScope:      getenv("TICKET_REMOTE_SPACETIME_AUTH_SCOPE", "openid profile email"),
-			OIDCRedirect:   strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL", ""), "/"),
+			AuthCookieName:    getenv("TICKET_REMOTE_AUTH_COOKIE_NAME", "ticket_remote_auth"),
+			SessionSigningKey: getenv("TICKET_REMOTE_SESSION_SIGNING_KEY", ""),
+			TeamDomain:        strings.TrimRight(getenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", ""), "/"),
+			Audience:          getenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", ""),
+			OIDCIssuer:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
+			OIDCClientID:      getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
+			OIDCScope:         getenv("TICKET_REMOTE_SPACETIME_AUTH_SCOPE", "openid profile email"),
+			OIDCRedirect:      strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL", ""), "/"),
 		},
 		State: state.StoreConfig{
 			Backend:              getenv("TICKET_REMOTE_STATE_BACKEND", "auto"),
@@ -156,6 +157,9 @@ func Load() (Config, error) {
 		}
 		if cfg.Access.OIDCIssuer == "" {
 			return Config{}, fmt.Errorf("TICKET_REMOTE_SPACETIME_AUTH_ISSUER is required when SpacetimeAuth is enabled")
+		}
+		if strings.TrimSpace(cfg.Access.SessionSigningKey) == "" {
+			return Config{}, fmt.Errorf("TICKET_REMOTE_SESSION_SIGNING_KEY is required when SpacetimeAuth is enabled")
 		}
 	case "cloudflare", "cloudflare-access", "cf-access":
 		if cfg.Access.TeamDomain == "" {

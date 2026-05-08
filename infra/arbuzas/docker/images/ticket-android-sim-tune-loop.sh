@@ -218,6 +218,16 @@ install_or_update() {
       return 0
     fi
     cat /tmp/android-sim-install.log >&2 || true
+    if grep -F 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' /tmp/android-sim-install.log >/dev/null 2>&1; then
+      log "store_client label=${label} package=${package} result=signature-mismatch-uninstall"
+      adb_target uninstall "${package}" >/dev/null 2>&1 || true
+      if adb_target install -r "${apk}" >/tmp/android-sim-install.log 2>&1; then
+        log "store_client label=${label} package=${package} result=reinstalled"
+        return 0
+      fi
+      cat /tmp/android-sim-install.log >&2 || true
+      return 1
+    fi
     if [ "${attempt}" = "12" ]; then
       log "store_client label=${label} package=${package} result=update-failed"
       return 1

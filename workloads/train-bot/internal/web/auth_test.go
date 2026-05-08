@@ -359,6 +359,66 @@ func TestAuthTestRejectsReusedTicketAfterRestart(t *testing.T) {
 	}
 }
 
+func TestSessionEndpointReturnsAnonymousWithoutCookie(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/session", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("session status: got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode session payload: %v", err)
+	}
+	if payload["authenticated"] != false {
+		t.Fatalf("authenticated = %#v, want false", payload["authenticated"])
+	}
+	if _, ok := payload["schedule"].(map[string]any); !ok {
+		t.Fatalf("missing schedule payload: %#v", payload["schedule"])
+	}
+}
+
+func TestSessionEndpointReturnsAuthenticatedSession(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{
+		AuthDate: now,
+		User: telegramUser{
+			ID:        7001,
+			FirstName: "Session",
+			Username:  "session_user",
+		},
+	}, now)
+	if err != nil {
+		t.Fatalf("issue session cookie: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/session", nil)
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("session status: got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode session payload: %v", err)
+	}
+	if payload["authenticated"] != true {
+		t.Fatalf("authenticated = %#v, want true", payload["authenticated"])
+	}
+	if payload["userId"] != float64(7001) {
+		t.Fatalf("userId = %#v, want 7001", payload["userId"])
+	}
+}
+
 func TestAuthTelegramSetsScopedSessionCookie(t *testing.T) {
 	t.Parallel()
 
@@ -404,7 +464,7 @@ func TestAuthTelegramSetsRootScopedSessionCookieForHostRootDeployment(t *testing
 	t.Parallel()
 
 	now := time.Date(2026, time.March, 6, 10, 30, 0, 0, time.UTC)
-	server := newTestServerWithBaseURL(t, "https://train-bot.jolkins.id.lv")
+	server := newTestServerWithBaseURL(t, "https://vilciens.kontrole.info")
 	auth := telegramAuth{
 		QueryID:  "AAEAAAE",
 		AuthDate: now.Add(-30 * time.Second),
@@ -905,7 +965,7 @@ func TestServeHTTPRejectsAnonymousUserRoute(t *testing.T) {
 func TestServeHTTPServesRootHostDeploymentRoutes(t *testing.T) {
 	t.Parallel()
 
-	server := newTestServerWithBaseURL(t, "https://train-bot.jolkins.id.lv")
+	server := newTestServerWithBaseURL(t, "https://vilciens.kontrole.info")
 	paths := map[string]string{
 		"/":                 "public-network-map",
 		"/app":              "mini-app",

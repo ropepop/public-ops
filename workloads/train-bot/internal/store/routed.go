@@ -284,6 +284,18 @@ func (s *RoutedStore) ListRecentStationSightingsByTrain(ctx context.Context, tra
 	return s.state.ListRecentStationSightingsByTrain(ctx, trainID, since, limit)
 }
 
+func (s *RoutedStore) InsertLocationReport(ctx context.Context, e domain.LocationReport) error {
+	return s.state.InsertLocationReport(ctx, e)
+}
+
+func (s *RoutedStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
+	return s.state.GetLastLocationReportByUserScope(ctx, userID, scope, subjectID)
+}
+
+func (s *RoutedStore) ListRecentLocationReports(ctx context.Context, since time.Time, limit int) ([]domain.LocationReport, error) {
+	return s.state.ListRecentLocationReports(ctx, since, limit)
+}
+
 func (s *RoutedStore) UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error {
 	return s.state.UpsertIncidentVote(ctx, vote)
 }

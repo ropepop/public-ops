@@ -25,6 +25,9 @@ services:
       TRAIN_WEB_ENABLED: "true"
       TRAIN_WEB_BIND_ADDR: 0.0.0.0
       TRAIN_WEB_PORT: ${ARBUZAS_TRAIN_BOT_PORT}
+      TRAIN_WEB_PUBLIC_BASE_URL: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}
+      TRAIN_WEB_SPACETIME_OIDC_ISSUER: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc
+      TRAIN_RUNTIME_SPACETIME_OIDC_ISSUER: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc
       SCHEDULE_DIR: /srv/train-bot/data/schedules
       SCRAPER_OUTPUT_DIR: /srv/train-bot/data/schedules
       TRAIN_WEB_BUNDLE_DIR: /srv/train-bot/data/public-bundles
@@ -41,6 +44,9 @@ services:
         export TRAIN_WEB_ENABLED="true"
         export TRAIN_WEB_BIND_ADDR="0.0.0.0"
         export TRAIN_WEB_PORT="${ARBUZAS_TRAIN_BOT_PORT}"
+        export TRAIN_WEB_PUBLIC_BASE_URL="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}"
+        export TRAIN_WEB_SPACETIME_OIDC_ISSUER="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc"
+        export TRAIN_RUNTIME_SPACETIME_OIDC_ISSUER="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc"
         export SCHEDULE_DIR="/srv/train-bot/data/schedules"
         export SCRAPER_OUTPUT_DIR="/srv/train-bot/data/schedules"
         export TRAIN_WEB_BUNDLE_DIR="/srv/train-bot/data/public-bundles"

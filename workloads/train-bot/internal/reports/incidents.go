@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"telegramtrainapp/internal/domain"
@@ -31,15 +32,15 @@ func (s *Service) ListActiveIncidents(ctx context.Context, now time.Time, viewer
 	if err != nil {
 		return nil, err
 	}
-	bundles := append(trainBundles, stationBundles...)
+	locationBundles, err := s.collectLocationIncidentBundles(ctx, now, false)
+	if err != nil {
+		return nil, err
+	}
+	bundles := append(append(trainBundles, stationBundles...), locationBundles...)
 	dayStart := incidentDayStart(now)
-	summaries := make([]domain.IncidentSummary, 0, len(bundles))
-	for _, bundle := range bundles {
-		summary, err := s.enrichIncidentSummary(ctx, bundle.summary, viewerID, dayStart)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, summary)
+	summaries, err := s.enrichIncidentSummaries(ctx, bundles, viewerID, dayStart)
+	if err != nil {
+		return nil, err
 	}
 	sort.SliceStable(summaries, func(i, j int) bool {
 		return summaries[i].LastActivityAt.After(summaries[j].LastActivityAt)
@@ -48,6 +49,72 @@ func (s *Service) ListActiveIncidents(ctx context.Context, now time.Time, viewer
 		summaries = summaries[:limit]
 	}
 	return summaries, nil
+}
+
+func (s *Service) enrichIncidentSummaries(ctx context.Context, bundles []incidentBundle, viewerID int64, since time.Time) ([]domain.IncidentSummary, error) {
+	if len(bundles) == 0 {
+		return []domain.IncidentSummary{}, nil
+	}
+	workerCount := len(bundles)
+	if workerCount > 8 {
+		workerCount = 8
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	summaries := make([]domain.IncidentSummary, len(bundles))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	recordErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				summary, err := s.enrichIncidentSummary(ctx, bundles[idx].summary, viewerID, since)
+				if err != nil {
+					recordErr(err)
+					continue
+				}
+				summaries[idx] = summary
+			}
+		}()
+	}
+
+sendJobs:
+	for idx := range bundles {
+		select {
+		case jobs <- idx:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	out := make([]domain.IncidentSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		if strings.TrimSpace(summary.ID) != "" {
+			out = append(out, summary)
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) IncidentDetail(ctx context.Context, incidentID string, now time.Time, viewerID int64) (*domain.IncidentDetail, error) {
@@ -175,6 +242,17 @@ func StationIncidentID(stationID string, dayKey string, contextKey string) strin
 	return fmt.Sprintf("station:%s:%s", strings.TrimSpace(stationID), sanitizeIncidentKey(dayKey+"-"+contextKey))
 }
 
+func AreaIncidentID(subjectID string, dayKey string) string {
+	return fmt.Sprintf("area:%s:%s", strings.TrimSpace(subjectID), sanitizeIncidentKey(dayKey))
+}
+
+func LocationIncidentID(item domain.LocationReport, dayKey string) string {
+	if strings.TrimSpace(item.Scope) == "area" {
+		return AreaIncidentID(item.SubjectID, dayKey)
+	}
+	return StationIncidentID(item.SubjectID, dayKey, "report")
+}
+
 func (s *Service) collectTrainIncidentBundles(ctx context.Context, now time.Time, activeOnly bool) ([]incidentBundle, error) {
 	dayStart := incidentDayStart(now)
 	reportEvents, err := s.store.ListRecentReportEvents(ctx, dayStart, 600)
@@ -196,7 +274,7 @@ func (s *Service) collectTrainIncidentBundles(ctx context.Context, now time.Time
 		if err != nil {
 			return nil, err
 		}
-		contextKey, subjectName := resolveTrainIncidentContext(train, stops, reportEvent.CreatedAt)
+		contextKey, subjectName := resolveTrainIncidentContextForTrainID(reportEvent.TrainInstanceID, train, stops, reportEvent.CreatedAt)
 		incidentID := TrainIncidentID(reportEvent.TrainInstanceID, incidentDayKey(reportEvent.CreatedAt.In(now.Location())), contextKey)
 		event := domain.IncidentEvent{
 			ID:        reportEvent.ID,
@@ -213,6 +291,7 @@ func (s *Service) collectTrainIncidentBundles(ctx context.Context, now time.Time
 					Scope:             "train",
 					SubjectID:         contextKey,
 					SubjectName:       subjectName,
+					MapTarget:         trainIncidentMapTarget(reportEvent.TrainInstanceID),
 					LastReportName:    event.Name,
 					LastReportAt:      reportEvent.CreatedAt,
 					LastActivityName:  event.Name,
@@ -268,6 +347,7 @@ func (s *Service) collectStationIncidentBundles(ctx context.Context, now time.Ti
 					Scope:             "station",
 					SubjectID:         stationSighting.StationID,
 					SubjectName:       stationSighting.StationName,
+					MapTarget:         stationSightingMapTarget(stationSighting),
 					LastReportName:    event.Name,
 					LastReportAt:      stationSighting.CreatedAt,
 					LastActivityName:  event.Name,
@@ -287,6 +367,65 @@ func (s *Service) collectStationIncidentBundles(ctx context.Context, now time.Ti
 		}
 		if stationSighting.CreatedAt.After(existing.summary.LastActivityAt) {
 			existing.summary.LastActivityAt = stationSighting.CreatedAt
+			existing.summary.LastActivityName = event.Name
+			existing.summary.LastActivityActor = event.Nickname
+		}
+		existing.events = append(existing.events, event)
+	}
+	return incidentBundleList(bundlesByID, activeOnly), nil
+}
+
+func (s *Service) collectLocationIncidentBundles(ctx context.Context, now time.Time, activeOnly bool) ([]incidentBundle, error) {
+	dayStart := incidentDayStart(now)
+	locationReports, err := s.store.ListRecentLocationReports(ctx, dayStart, 600)
+	if err != nil {
+		return nil, err
+	}
+	if len(locationReports) == 0 {
+		return nil, nil
+	}
+	bundlesByID := map[string]*incidentBundle{}
+	for _, report := range locationReports {
+		incidentID := LocationIncidentID(report, incidentDayKey(report.CreatedAt.In(now.Location())))
+		event := domain.IncidentEvent{
+			ID:        report.ID,
+			Kind:      "report",
+			Name:      locationReportIncidentLabel(report),
+			Detail:    locationReportIncidentDetail(report),
+			Nickname:  domain.GenericNickname(report.UserID),
+			CreatedAt: report.CreatedAt,
+		}
+		existing, ok := bundlesByID[incidentID]
+		if !ok {
+			existing = &incidentBundle{
+				summary: domain.IncidentSummary{
+					ID:                incidentID,
+					Scope:             locationIncidentScope(report),
+					SubjectID:         report.SubjectID,
+					SubjectName:       locationIncidentSubjectName(report),
+					Location:          incidentLocation(report),
+					MapTarget:         locationIncidentMapTarget(report, incidentID),
+					LastReportName:    event.Name,
+					LastReportAt:      report.CreatedAt,
+					LastActivityName:  event.Name,
+					LastActivityAt:    report.CreatedAt,
+					LastActivityActor: event.Nickname,
+					LastReporter:      event.Nickname,
+					Active:            report.CreatedAt.After(now.Add(-stationIncidentActiveWindow)),
+				},
+			}
+			bundlesByID[incidentID] = existing
+		}
+		if report.CreatedAt.After(existing.summary.LastReportAt) {
+			existing.summary.LastReportAt = report.CreatedAt
+			existing.summary.LastReportName = event.Name
+			existing.summary.LastReporter = event.Nickname
+			existing.summary.Active = report.CreatedAt.After(now.Add(-stationIncidentActiveWindow))
+			existing.summary.Location = incidentLocation(report)
+			existing.summary.MapTarget = locationIncidentMapTarget(report, incidentID)
+		}
+		if report.CreatedAt.After(existing.summary.LastActivityAt) {
+			existing.summary.LastActivityAt = report.CreatedAt
 			existing.summary.LastActivityName = event.Name
 			existing.summary.LastActivityActor = event.Nickname
 		}
@@ -327,6 +466,25 @@ func (s *Service) findIncidentBundle(ctx context.Context, incidentID string, now
 		}
 	case "station":
 		bundles, err := s.collectStationIncidentBundles(ctx, now, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, bundle := range bundles {
+			if bundle.summary.ID == incidentID {
+				return &bundle, nil
+			}
+		}
+		locationBundles, err := s.collectLocationIncidentBundles(ctx, now, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, bundle := range locationBundles {
+			if bundle.summary.ID == incidentID {
+				return &bundle, nil
+			}
+		}
+	case "area":
+		bundles, err := s.collectLocationIncidentBundles(ctx, now, false)
 		if err != nil {
 			return nil, err
 		}
@@ -466,6 +624,18 @@ func resolveTrainIncidentContext(train *domain.TrainInstance, stops []domain.Tra
 	return "route:unknown", "Route"
 }
 
+func resolveTrainIncidentContextForTrainID(trainID string, train *domain.TrainInstance, stops []domain.TrainStop, at time.Time) (string, string) {
+	contextKey, subjectName := resolveTrainIncidentContext(train, stops, at)
+	if train != nil || contextKey != "route:unknown" {
+		return contextKey, subjectName
+	}
+	cleanTrainID := strings.TrimSpace(trainID)
+	if cleanTrainID == "" {
+		return contextKey, subjectName
+	}
+	return "train:" + sanitizeIncidentKey(cleanTrainID), "Train " + cleanTrainID
+}
+
 func trainStopPassAt(stop domain.TrainStop) *time.Time {
 	if stop.DepartureAt != nil {
 		return stop.DepartureAt
@@ -487,6 +657,98 @@ func stationIncidentContext(item domain.StationSighting) (string, string) {
 		return "destination:" + strings.TrimSpace(*item.DestinationStationID), "Platform sighting"
 	}
 	return "station", "Platform sighting"
+}
+
+func locationIncidentScope(item domain.LocationReport) string {
+	if strings.TrimSpace(item.Scope) == "area" {
+		return "area"
+	}
+	return "station"
+}
+
+func locationIncidentSubjectName(item domain.LocationReport) string {
+	if trimmed := strings.TrimSpace(item.SubjectName); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(item.Description); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(item.SubjectID)
+}
+
+func incidentLocation(item domain.LocationReport) *domain.IncidentLocation {
+	return &domain.IncidentLocation{
+		Kind:         locationIncidentScope(item),
+		Latitude:     copyFloatPtr(item.Latitude),
+		Longitude:    copyFloatPtr(item.Longitude),
+		RadiusMeters: item.RadiusMeters,
+		Description:  strings.TrimSpace(item.Description),
+	}
+}
+
+func trainIncidentMapTarget(trainID string) *domain.IncidentMapTarget {
+	cleanTrainID := strings.TrimSpace(trainID)
+	if cleanTrainID == "" {
+		return nil
+	}
+	return &domain.IncidentMapTarget{
+		Type:            "train",
+		TrainInstanceID: cleanTrainID,
+	}
+}
+
+func stationSightingMapTarget(item domain.StationSighting) *domain.IncidentMapTarget {
+	if item.MatchedTrainInstanceID != nil {
+		if matchedTrainID := strings.TrimSpace(*item.MatchedTrainInstanceID); matchedTrainID != "" {
+			return &domain.IncidentMapTarget{
+				Type:            "train",
+				TrainInstanceID: matchedTrainID,
+			}
+		}
+	}
+	stationID := strings.TrimSpace(item.StationID)
+	if stationID == "" {
+		return nil
+	}
+	return &domain.IncidentMapTarget{
+		Type:      "station",
+		StationID: stationID,
+	}
+}
+
+func locationIncidentMapTarget(item domain.LocationReport, incidentID string) *domain.IncidentMapTarget {
+	if locationIncidentScope(item) == "area" {
+		cleanIncidentID := strings.TrimSpace(incidentID)
+		if cleanIncidentID == "" {
+			return nil
+		}
+		return &domain.IncidentMapTarget{
+			Type:       "area",
+			IncidentID: cleanIncidentID,
+		}
+	}
+	stationID := strings.TrimSpace(item.SubjectID)
+	if stationID == "" {
+		return nil
+	}
+	return &domain.IncidentMapTarget{
+		Type:      "station",
+		StationID: stationID,
+	}
+}
+
+func locationReportIncidentLabel(item domain.LocationReport) string {
+	if strings.TrimSpace(item.Scope) == "area" {
+		return "Inspection near this location"
+	}
+	return "Inspection at station"
+}
+
+func locationReportIncidentDetail(item domain.LocationReport) string {
+	if strings.TrimSpace(item.Scope) != "area" {
+		return ""
+	}
+	return strings.TrimSpace(item.Description)
 }
 
 func trainSignalIncidentLabel(signal domain.SignalType) string {
@@ -511,7 +773,7 @@ func incidentVoteEventLabel(value domain.IncidentVoteValue) string {
 	case domain.IncidentVoteOngoing:
 		return "Still there"
 	case domain.IncidentVoteCleared:
-		return "Cleared"
+		return "Not present"
 	default:
 		return "Vote"
 	}
