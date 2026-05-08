@@ -228,6 +228,12 @@
   let inputSeq = 0;
   let inputInFlight = null;
   let inputDrainTimer = null;
+  let screenEngaged = false;
+  let screenWakeLock = null;
+  let screenWakeLockRequesting = false;
+  let screenWakeLockUnavailableLogged = false;
+  let ticketFullscreenAttempted = false;
+  let toolbarAnchorLogged = false;
   const intentionallyClosedVideoSockets = new WeakSet();
   const inputQueue = [];
   const inputQueueLimit = 30;
@@ -264,16 +270,44 @@
   const controlCodeButtonMinY = 0.10;
   const controlCodeButtonMaxY = 0.18;
 
+  function ticketViewportRect() {
+    const fallbackWidth = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || 1));
+    const fallbackHeight = Math.max(1, Math.round(window.innerHeight || document.documentElement.clientHeight || 1));
+    if (window.visualViewport) {
+      return {
+        width: Math.max(1, Math.round(window.visualViewport.width || fallbackWidth)),
+        height: Math.max(1, Math.round(window.visualViewport.height || fallbackHeight)),
+        offsetLeft: Math.round(window.visualViewport.offsetLeft || 0),
+        offsetTop: Math.round(window.visualViewport.offsetTop || 0)
+      };
+    }
+    return { width: fallbackWidth, height: fallbackHeight, offsetLeft: 0, offsetTop: 0 };
+  }
+
   function viewportHeight() {
-    return Math.max(1, Math.round((window.visualViewport && window.visualViewport.height) || window.innerHeight || document.documentElement.clientHeight || 1));
+    return ticketViewportRect().height;
+  }
+
+  function toolbarCollapseAnchorPx() {
+    return Math.round(Math.min(96, Math.max(24, viewportHeight() * 0.12)));
   }
 
   function updateViewportVars() {
-    document.documentElement.style.setProperty('--ticket-stage-height', `${viewportHeight()}px`);
+    const viewport = ticketViewportRect();
+    document.documentElement.style.setProperty('--ticket-stage-height', `${viewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-width', `${viewport.width}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-height', `${viewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-left', `${viewport.offsetLeft}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-top', `${viewport.offsetTop}px`);
+    document.documentElement.style.setProperty('--ticket-toolbar-anchor', `${screenEngaged ? toolbarCollapseAnchorPx() : 0}px`);
+  }
+
+  function firstScreenAnchorTop() {
+    return screenEngaged ? toolbarCollapseAnchorPx() : 0;
   }
 
   function updateDetailsReveal() {
-    const revealed = window.scrollY >= Math.max(1, viewportHeight() * 0.82);
+    const revealed = window.scrollY >= Math.max(1, firstScreenAnchorTop() + viewportHeight() * 0.82);
     document.body.classList.toggle('details-visible', revealed);
     if (panel) panel.setAttribute('aria-hidden', revealed ? 'false' : 'true');
   }
@@ -284,7 +318,10 @@
       if (panel) panel.setAttribute('aria-hidden', 'true');
     }
     if (force || !document.body.classList.contains('details-visible')) {
-      window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+      const targetTop = firstScreenAnchorTop();
+      if (Math.abs(window.scrollY - targetTop) > 1 || window.scrollX !== 0) {
+        window.scrollTo({ top: targetTop, left: 0, behavior: 'auto' });
+      }
       updateDetailsReveal();
     }
   }
@@ -294,6 +331,104 @@
     requestAnimationFrame(() => keepFirstScreenPinned(force));
     setTimeout(() => keepFirstScreenPinned(force), 60);
     setTimeout(() => keepFirstScreenPinned(force), 300);
+  }
+
+  function anchorToolbarCollapse(reason) {
+    updateViewportVars();
+    if (!toolbarAnchorLogged) {
+      toolbarAnchorLogged = true;
+      clientLog('toolbar_collapse_anchor', `${reason || 'gesture'}:${toolbarCollapseAnchorPx()}`);
+    }
+    scheduleFirstScreenPin(true);
+  }
+
+  async function requestScreenWakeLock(reason) {
+    if (!screenEngaged || document.visibilityState === 'hidden' || screenWakeLock || screenWakeLockRequesting) return;
+    if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') {
+      if (!screenWakeLockUnavailableLogged) {
+        screenWakeLockUnavailableLogged = true;
+        clientLog('wake_lock_unavailable', reason || 'unsupported');
+      }
+      return;
+    }
+    screenWakeLockRequesting = true;
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      screenWakeLock = lock;
+      clientLog('wake_lock_acquired', reason || 'gesture');
+      if (lock && typeof lock.addEventListener === 'function') {
+        lock.addEventListener('release', () => {
+          if (screenWakeLock === lock) {
+            screenWakeLock = null;
+          }
+          clientLog('wake_lock_released', 'browser');
+        });
+      }
+    } catch (error) {
+      clientLog('wake_lock_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`);
+    } finally {
+      screenWakeLockRequesting = false;
+    }
+  }
+
+  function releaseScreenWakeLock(reason) {
+    if (!screenWakeLock) return;
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    if (!lock || typeof lock.release !== 'function') return;
+    try {
+      Promise.resolve(lock.release()).then(
+        () => clientLog('wake_lock_released', reason || 'release'),
+        (error) => clientLog('wake_lock_release_failed', `${reason || 'release'}:${error && error.message || 'release failed'}`)
+      );
+    } catch (error) {
+      clientLog('wake_lock_release_failed', `${reason || 'release'}:${error && error.message || 'release failed'}`);
+    }
+  }
+
+  function requestTicketFullscreen(reason) {
+    if (ticketFullscreenAttempted || document.fullscreenElement) return;
+    ticketFullscreenAttempted = true;
+    const target = stage || document.documentElement;
+    const requestFullscreen = target.requestFullscreen
+      ? target.requestFullscreen.bind(target)
+      : (target.webkitRequestFullscreen ? target.webkitRequestFullscreen.bind(target) : null);
+    if (!requestFullscreen) {
+      clientLog('fullscreen_unavailable', reason || 'unsupported');
+      return;
+    }
+    try {
+      const result = target.requestFullscreen ? requestFullscreen({ navigationUI: 'hide' }) : requestFullscreen();
+      Promise.resolve(result).then(
+        () => clientLog('fullscreen_requested', reason || 'gesture'),
+        (error) => clientLog('fullscreen_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`)
+      );
+    } catch (error) {
+      clientLog('fullscreen_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`);
+    }
+  }
+
+  function engageTicketScreen(reason) {
+    const firstEngagement = !screenEngaged;
+    if (firstEngagement) {
+      screenEngaged = true;
+      document.body.classList.add('screen-engaged');
+      updateViewportVars();
+      clientLog('screen_engaged', reason || 'gesture');
+      anchorToolbarCollapse(reason || 'gesture');
+    }
+    requestTicketFullscreen(reason || 'gesture');
+    requestScreenWakeLock(reason || 'gesture');
+  }
+
+  function handleScreenEngagementEvent(event) {
+    if (event && event.type === 'keydown' && (event.metaKey || event.ctrlKey || event.altKey)) return;
+    if (event && event.isTrusted === false) return;
+    engageTicketScreen(event && event.type || 'gesture');
+  }
+
+  for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown']) {
+    document.addEventListener(eventName, handleScreenEngagementEvent, { capture: true, passive: true });
   }
 
   function checkServerVersion(payload) {
@@ -732,12 +867,13 @@
   }
 
   function hideEmpty() {
+    const wasEmptyVisible = !emptyState.hidden;
     emptyState.hidden = true;
     document.body.dataset.streamReady = 'true';
     if (!streamStatusStale(freshStreamStatus(performance.now()) || latestStreamStatus)) {
       hideStreamResumeSpinner();
     }
-    keepFirstScreenPinned();
+    if (wasEmptyVisible) keepFirstScreenPinned();
   }
 
   function showUnsupported(message) {
@@ -2250,16 +2386,25 @@
         redrawPreservedFrame();
         showStreamWaiting('Atjauno straumi...');
       }
+      if (screenEngaged) {
+        requestScreenWakeLock('visibility_visible');
+      }
       scheduleFirstScreenPin(false);
       refreshHealth();
       connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
       connect();
       connectDirectVideo();
     } else if (document.visibilityState === 'hidden') {
+      releaseScreenWakeLock('visibility_hidden');
       pauseVideoWhileHidden('visibility_hidden');
     }
   });
-  window.addEventListener('pageshow', () => scheduleFirstScreenPin(true));
+  window.addEventListener('pageshow', () => {
+    if (screenEngaged) {
+      requestScreenWakeLock('pageshow');
+    }
+    scheduleFirstScreenPin(true);
+  });
   window.addEventListener('pagehide', () => {
     closeDirectVideo();
     if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {

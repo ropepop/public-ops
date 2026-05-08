@@ -362,6 +362,26 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"msg.type === 'input_result'",
 		"scheduleInputQueueDrain(inputDrainDelayMs)",
 		"retryOrDropInput(inputInFlight.inputId)",
+		"let screenEngaged = false",
+		"let screenWakeLock = null",
+		"function engageTicketScreen(reason)",
+		"function requestScreenWakeLock(reason)",
+		"navigator.wakeLock.request('screen')",
+		"function releaseScreenWakeLock(reason)",
+		"function requestTicketFullscreen(reason)",
+		"requestFullscreen({ navigationUI: 'hide' })",
+		"function ticketViewportRect()",
+		"window.visualViewport.offsetLeft",
+		"window.visualViewport.offsetTop",
+		"--ticket-viewport-width",
+		"--ticket-viewport-height",
+		"--ticket-viewport-left",
+		"--ticket-viewport-top",
+		"function toolbarCollapseAnchorPx()",
+		"Math.min(96, Math.max(24, viewportHeight() * 0.12))",
+		"clientLog('toolbar_collapse_anchor'",
+		"document.body.classList.add('screen-engaged')",
+		"for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown'])",
 		"function cancelPendingInputs(reason)",
 		"let localControlSendGraceUntil = 0",
 		"localControlSendGraceUntil = performance.now() + 4000",
@@ -392,6 +412,8 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		"quickClaimSpinner.hidden = !(quickClaimSpinnerPending || ticketInUseSpinnerActive)",
 		"function preserveCurrentFrame(reason)",
 		"function redrawPreservedFrame()",
+		"const wasEmptyVisible = !emptyState.hidden",
+		"if (wasEmptyVisible) keepFirstScreenPinned()",
 		"function showStreamResumeSpinner()",
 		"function streamStatusStale(status)",
 		"preserveCurrentFrame('stream_status_stale')",
@@ -465,6 +487,13 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 	for _, snippet := range []string{
 		"touch-action: pan-y",
 		"scroll-snap-type: y proximity",
+		"body.screen-engaged",
+		"scroll-snap-type: none",
+		"--ticket-viewport-width",
+		"--ticket-viewport-height",
+		"--ticket-viewport-left",
+		"--ticket-viewport-top",
+		"--ticket-toolbar-anchor",
 		"overscroll-behavior: none",
 		"-webkit-touch-callout: none",
 		"-webkit-tap-highlight-color: transparent",
@@ -507,6 +536,7 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 		`id="viewerCountDetail"`,
 		`id="streamStateLabel"`,
 		`id="streamStateDetail"`,
+		`name="theme-color" content="#020304"`,
 		`aria-hidden="true"`,
 		`draggable="false" hidden`,
 	} {
@@ -526,6 +556,9 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 	}
 	if !strings.Contains(indexHTML, "maximum-scale=1, user-scalable=no") {
 		t.Fatalf("ticket viewer viewport should disable Safari double-tap zoom")
+	}
+	if !strings.Contains(authRedirectHTML, `name="theme-color" content="#020304"`) {
+		t.Fatalf("ticket auth redirect shell should keep the same dark browser theme color")
 	}
 	if strings.Contains(js, "['touchstart', 'touchmove']") {
 		t.Fatalf("ticket viewer should not block all touch movement; vertical scroll must remain available")
@@ -584,11 +617,18 @@ func TestTicketViewerKeepsSafariOnDirectControlPath(t *testing.T) {
 			"sessionStorage.getItem",
 			"sessionStorage.setItem",
 			"sessionStorage.removeItem",
+			"mozBrightness",
+			"AmbientLightSensor",
+			"screen.brightness",
+			"setBrightness",
 		} {
 			if strings.Contains(forbidden.body, snippet) {
 				t.Fatalf("%s should not contain stale control dialog snippet %q", forbidden.label, snippet)
 			}
 		}
+	}
+	if !strings.Contains(serverVersion, "screen-claim") {
+		t.Fatalf("ticket page version should be bumped for mobile screen claim rollout, got %q", serverVersion)
 	}
 	if strings.Contains(indexHTML, `id="webrtcVideo"`) || !strings.Contains(indexHTML, `id="screen"`) {
 		t.Fatalf("ticket viewer must render HTTPS H.264 on the canvas, not WebRTC video")

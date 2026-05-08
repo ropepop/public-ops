@@ -4,6 +4,11 @@
   background: #070b10;
   color: #eef3f8;
   --ticket-stage-height: 100vh;
+  --ticket-viewport-width: 100vw;
+  --ticket-viewport-height: var(--ticket-stage-height);
+  --ticket-viewport-left: 0px;
+  --ticket-viewport-top: 0px;
+  --ticket-toolbar-anchor: 0px;
   --ticket-controls-offset: 16px;
 }
 
@@ -31,6 +36,10 @@ body {
   scroll-snap-type: y proximity;
   -webkit-overflow-scrolling: touch;
   touch-action: manipulation;
+}
+
+body.screen-engaged {
+  scroll-snap-type: none;
 }
 
 .auth-error-page {
@@ -103,29 +112,32 @@ button:disabled {
 
 .shell {
   width: 100vw;
-  min-height: calc(var(--ticket-stage-height) + var(--ticket-controls-offset) + var(--ticket-stage-height));
+  min-height: calc(var(--ticket-stage-height) + var(--ticket-toolbar-anchor) + var(--ticket-controls-offset) + var(--ticket-stage-height));
   background: #070b10;
 }
 
 .stage-page {
   width: 100vw;
-  height: calc(var(--ticket-stage-height) + var(--ticket-controls-offset));
-  min-height: calc(var(--ticket-stage-height) + var(--ticket-controls-offset));
-  background: #020304;
+  height: calc(var(--ticket-stage-height) + var(--ticket-toolbar-anchor) + var(--ticket-controls-offset));
+  min-height: calc(var(--ticket-stage-height) + var(--ticket-toolbar-anchor) + var(--ticket-controls-offset));
+  background: #000;
   scroll-snap-align: start;
 }
 
 .stage {
   position: fixed;
-  inset: 0;
+  left: var(--ticket-viewport-left, 0px);
+  top: var(--ticket-viewport-top, 0px);
+  right: auto;
+  bottom: auto;
   z-index: 2;
-  width: 100vw;
-  height: var(--ticket-stage-height);
-  min-height: var(--ticket-stage-height);
+  width: var(--ticket-viewport-width, 100vw);
+  height: var(--ticket-viewport-height, var(--ticket-stage-height));
+  min-height: var(--ticket-viewport-height, var(--ticket-stage-height));
   display: grid;
   place-items: center;
   overflow: hidden;
-  background: #020304;
+  background: #000;
   isolation: isolate;
   contain: layout paint;
   overscroll-behavior: none;
@@ -145,7 +157,7 @@ body.details-visible .stage {
   grid-area: 1 / 1;
   display: block;
   width: var(--stream-width, 100vw);
-  height: var(--stream-height, var(--ticket-stage-height));
+  height: var(--stream-height, var(--ticket-viewport-height, var(--ticket-stage-height)));
   max-width: none;
   max-height: none;
   background: #000;
@@ -166,6 +178,8 @@ body.details-visible .stage {
   position: absolute;
   left: calc(var(--stream-left, 0px) + 20px);
   top: calc(var(--stream-top, 0px) + 20px);
+  margin-left: env(safe-area-inset-left);
+  margin-top: env(safe-area-inset-top);
   width: 34px;
   height: 34px;
   pointer-events: none;

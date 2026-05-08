@@ -97,7 +97,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion      = "ticket-remote-2026-05-08-browser-tap-queue-v1"
+	serverVersion      = "ticket-remote-2026-05-08-screen-claim-v1"
 	stateLookupTimeout = 1200 * time.Millisecond
 	stateCacheMaxAge   = 30 * time.Second
 )
@@ -1802,6 +1802,7 @@ const indexHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#020304">
   <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
@@ -1875,6 +1876,7 @@ const authRedirectHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#020304">
   <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
