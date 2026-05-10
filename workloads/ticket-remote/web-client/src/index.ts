@@ -32,10 +32,6 @@ function maybeAccessor<T = any>(source: any, candidates: string[]): T | null {
   return null;
 }
 
-function nowISO(): string {
-  return new Date().toISOString();
-}
-
 function asRowState(row: any): any | null {
   if (!row) return null;
   const raw = row.stateJson || row.state_json || row.stateJSON || "";
@@ -135,11 +131,9 @@ class TicketSpacetimeClient {
     const reducer = this.reducer("memberHeartbeatPresence");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
-      sessionId: this.cfg.sessionId,
       displayName: this.cfg.email,
       page: "ticket",
       connected,
-      now: nowISO(),
     })).catch((error) => this.handlers.onStatus?.("heartbeat_failed", error && String(error)));
   }
 
@@ -147,42 +141,7 @@ class TicketSpacetimeClient {
     if (!this.isReady()) return;
     Promise.resolve(this.reducer("memberDisconnectPresence")({
       ticketId: this.cfg.ticketId,
-      sessionId: this.cfg.sessionId,
-      now: nowISO(),
     })).catch(() => {});
-  }
-
-  claimControl(): Promise<void> {
-    return this.callReducer("memberClaimControl", {
-      ticketId: this.cfg.ticketId,
-      sessionId: this.cfg.sessionId,
-      now: nowISO(),
-    });
-  }
-
-  extendControl(): Promise<void> {
-    return this.callReducer("memberExtendControl", {
-      ticketId: this.cfg.ticketId,
-      sessionId: this.cfg.sessionId,
-      now: nowISO(),
-    });
-  }
-
-  releaseControl(reason = "user_released"): Promise<void> {
-    return this.callReducer("memberReleaseControl", {
-      ticketId: this.cfg.ticketId,
-      sessionId: this.cfg.sessionId,
-      reason,
-      now: nowISO(),
-    });
-  }
-
-  revokeControl(reason = "admin_revoked"): Promise<void> {
-    return this.callReducer("memberRevokeControl", {
-      ticketId: this.cfg.ticketId,
-      reason,
-      now: nowISO(),
-    });
   }
 
   upsertMember(email: string, role: string): Promise<void> {
@@ -190,7 +149,6 @@ class TicketSpacetimeClient {
       ticketId: this.cfg.ticketId,
       email,
       role,
-      now: nowISO(),
     });
   }
 
@@ -198,7 +156,6 @@ class TicketSpacetimeClient {
     return this.callReducer("memberRemoveMember", {
       ticketId: this.cfg.ticketId,
       email,
-      now: nowISO(),
     });
   }
 

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -9,18 +10,28 @@ import (
 	"ticketremote/internal/phone"
 )
 
+const (
+	warmStartFrameFreshness = 2500 * time.Millisecond
+	warmStartKeyFreshness   = 1500 * time.Millisecond
+	tsf2HeaderBytes         = 29
+	tsf2Magic               = uint32(0x54534632)
+	tsf2FlagKeyframe        = 1
+)
+
 type directStreamHub struct {
 	mu sync.Mutex
 
 	activeVideoClients int
 	videoConnections   uint64
 	phoneReconnects    uint64
+	phoneStartTimeouts uint64
 
 	codec       string
 	transport   string
 	width       int
 	height      int
 	rootCapture bool
+	streamEpoch uint64
 
 	lastConfig []byte
 
@@ -30,12 +41,23 @@ type directStreamHub struct {
 	lastFrameAt        time.Time
 	lastKeyFrameAt     time.Time
 	lastVideoClientAt  time.Time
+	lastFrameEpoch     uint64
+	lastKeyFrameEpoch  uint64
 	lastFrame          []byte
 	lastKeyFrame       []byte
 
 	lastBrowserMediaError string
 	lastBrowserEvent      clientTelemetryEvent
 	recentBrowserEvents   []clientTelemetryEvent
+	lastPhoneStartError   string
+	lastPhoneStartErrorAt time.Time
+}
+
+type tsf2Metadata struct {
+	ok       bool
+	keyFrame bool
+	epoch    uint64
+	sequence uint64
 }
 
 type clientTelemetryEvent struct {
@@ -70,6 +92,17 @@ func (h *directStreamHub) recordPhoneReconnect() {
 	h.mu.Unlock()
 }
 
+func (h *directStreamHub) recordPhoneStartFailure(err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.phoneStartTimeouts++
+	h.lastPhoneStartError = trimLogField(err.Error(), 500)
+	h.lastPhoneStartErrorAt = time.Now()
+}
+
 func (h *directStreamHub) setConfig(raw []byte) {
 	var payload struct {
 		Type        string `json:"type"`
@@ -78,6 +111,7 @@ func (h *directStreamHub) setConfig(raw []byte) {
 		Width       int    `json:"width"`
 		Height      int    `json:"height"`
 		RootCapture bool   `json:"rootCapture"`
+		StreamEpoch uint64 `json:"streamEpoch"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil || payload.Type != "config" {
 		return
@@ -89,6 +123,7 @@ func (h *directStreamHub) setConfig(raw []byte) {
 	h.width = payload.Width
 	h.height = payload.Height
 	h.rootCapture = payload.RootCapture
+	h.streamEpoch = payload.StreamEpoch
 	h.lastConfig = append(h.lastConfig[:0], raw...)
 	h.lastConfigAt = time.Now()
 }
@@ -100,13 +135,20 @@ func (h *directStreamHub) recordFrame(frame []byte) {
 	now := time.Now()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	meta := parseTSF2(frame)
 	h.framesForwarded++
 	h.lastFrameAt = now
+	if meta.ok {
+		h.lastFrameEpoch = meta.epoch
+	}
 	h.lastFrame = append(h.lastFrame[:0], frame...)
 	h.lastBrowserMediaError = ""
 	if frameIsKeyframe(frame) {
 		h.keyframesForwarded++
 		h.lastKeyFrameAt = now
+		if meta.ok {
+			h.lastKeyFrameEpoch = meta.epoch
+		}
 		h.lastKeyFrame = append(h.lastKeyFrame[:0], frame...)
 	}
 }
@@ -114,13 +156,27 @@ func (h *directStreamHub) recordFrame(frame []byte) {
 func (h *directStreamHub) warmStart() (config []byte, keyFrame []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	now := time.Now()
+	if !h.warmStartAllowedLocked(now) {
+		return nil, nil
+	}
 	if len(h.lastConfig) > 0 {
 		config = append([]byte(nil), h.lastConfig...)
 	}
-	if len(h.lastKeyFrame) > 0 {
+	if len(h.lastKeyFrame) > 0 && h.lastKeyFrameEpoch == h.streamEpoch && now.Sub(h.lastKeyFrameAt) <= warmStartKeyFreshness {
 		keyFrame = append([]byte(nil), h.lastKeyFrame...)
 	}
 	return config, keyFrame
+}
+
+func (h *directStreamHub) warmStartAllowedLocked(now time.Time) bool {
+	if h.streamEpoch == 0 || len(h.lastConfig) == 0 || h.lastFrameAt.IsZero() {
+		return false
+	}
+	if h.lastFrameEpoch != 0 && h.lastFrameEpoch != h.streamEpoch {
+		return false
+	}
+	return now.Sub(h.lastFrameAt) <= warmStartFrameFreshness
 }
 
 func (h *directStreamHub) recordClientTelemetry(event, detail string) {
@@ -195,9 +251,11 @@ func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[
 		"width":                    h.width,
 		"height":                   h.height,
 		"rootCapture":              h.rootCapture,
+		"streamEpoch":              h.streamEpoch,
 		"activeVideoClients":       h.activeVideoClients,
 		"videoConnections":         h.videoConnections,
 		"phoneReconnects":          h.phoneReconnects,
+		"phoneStartTimeouts":       h.phoneStartTimeouts,
 		"framesForwarded":          h.framesForwarded,
 		"keyframesForwarded":       h.keyframesForwarded,
 		"lastConfigAt":             timeString(h.lastConfigAt),
@@ -213,6 +271,9 @@ func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[
 		"phoneViewers":             phoneHealth.Viewers,
 		"phoneStreamState":         phoneHealth.StreamState,
 		"phoneLastError":           phoneHealth.LastError,
+		"phoneStartError":          h.lastPhoneStartError,
+		"phoneStartErrorAt":        timeString(h.lastPhoneStartErrorAt),
+		"phoneStartErrorAgoMillis": ageSinceMillis(now, h.lastPhoneStartErrorAt),
 		"browserMediaError":        h.lastBrowserMediaError,
 		"lastBrowserEvent":         h.lastBrowserEvent,
 		"recentBrowserEvents":      append([]clientTelemetryEvent(nil), h.recentBrowserEvents...),
@@ -232,11 +293,14 @@ func (h *directStreamHub) streamStatus(now time.Time, phoneHealth phone.Health) 
 		"lastFrameAgoMillis":    ageSinceMillis(now, h.lastFrameAt),
 		"lastKeyFrameAgoMillis": ageSinceMillis(now, h.lastKeyFrameAt),
 		"activeVideoClients":    h.activeVideoClients,
+		"streamEpoch":           h.streamEpoch,
 		"phoneConnected":        phoneHealth.Connected,
 		"phoneDesired":          phoneHealth.Desired,
 		"phoneStreamState":      phoneHealth.StreamState,
 		"phoneViewers":          phoneHealth.Viewers,
 		"phoneLastError":        phoneHealth.LastError,
+		"phoneStartTimeouts":    h.phoneStartTimeouts,
+		"phoneStartError":       h.lastPhoneStartError,
 	}
 }
 
@@ -265,10 +329,22 @@ func (h *directStreamHub) streamVerdictLocked(now time.Time, phoneHealth phone.H
 }
 
 func frameIsKeyframe(frame []byte) bool {
-	if len(frame) >= 5 && frame[0] == 'T' && frame[1] == 'S' && frame[2] == 'F' && frame[3] == '2' {
-		return frame[4]&1 == 1
+	if meta := parseTSF2(frame); meta.ok {
+		return meta.keyFrame
 	}
 	return len(frame) > 0 && frame[0] == 1
+}
+
+func parseTSF2(frame []byte) tsf2Metadata {
+	if len(frame) < tsf2HeaderBytes || binary.BigEndian.Uint32(frame[0:4]) != tsf2Magic {
+		return tsf2Metadata{}
+	}
+	return tsf2Metadata{
+		ok:       true,
+		keyFrame: frame[4]&tsf2FlagKeyframe == tsf2FlagKeyframe,
+		epoch:    binary.BigEndian.Uint64(frame[5:13]),
+		sequence: binary.BigEndian.Uint64(frame[13:21]),
+	}
 }
 
 func ageSinceMillis(now time.Time, at time.Time) int64 {

@@ -1,0 +1,65 @@
+- generic [ref=e3] [box=0,0,1200,1183]:
+  - banner [ref=e4] [box=28,18,1144,134]:
+    - generic [ref=e5] [box=28,18,1144,82]:
+      - heading "Kontrole" [level=1] [ref=e6] [box=28,18,1144,46]
+      - paragraph [ref=e7] [box=28,74,672,27]: Satiksmes karte, aktīvais transports un kontroles ziņojumi vienuviet.
+    - generic [ref=e8] [box=28,116,1144,36]:
+      - link "Plūsma" [ref=e9] [cursor=pointer] [box=28,116,84,36]:
+        - /url: /incidents
+      - link "Vilciens" [ref=e10] [cursor=pointer] [box=122,116,88,36]:
+        - /url: https://vilciens.kontrole.info
+      - generic [ref=e11] [box=220,116,129,36]: Mape gatava
+      - button "Pieslēgties ar Telegram" [ref=e41] [cursor=pointer] [box=359,118,192,32]
+  - generic [ref=e14] [box=28,166,1144,989]:
+    - generic [ref=e18] [box=29,167,1142,576]:
+      - generic [box=29,167,0,0]:
+        - generic [box=29,167,0,0]:
+          - img [box=-85,109,1370,691]
+        - generic [box=29,167,0,0]:
+          - button [ref=e50] [cursor=pointer] [box=673,472,5,5]
+          - button [ref=e53] [cursor=pointer] [box=744,491,5,5]
+          - button [ref=e56] [cursor=pointer] [box=674,473,5,5]
+          - button [ref=e59] [cursor=pointer] [box=679,470,5,5]
+          - button [ref=e62] [cursor=pointer] [box=744,-278,5,5]
+          - button [ref=e65] [cursor=pointer] [box=677,472,5,5]
+          - button [ref=e68] [cursor=pointer] [box=435,-49,5,5]
+          - button [ref=e71] [cursor=pointer] [box=682,468,5,5]
+          - button [ref=e74] [cursor=pointer] [box=673,473,5,5]
+          - button [ref=e77] [cursor=pointer] [box=654,467,5,5]
+          - button [ref=e80] [cursor=pointer] [box=893,598,5,5]
+          - button [ref=e83] [cursor=pointer] [box=888,539,5,5]
+          - button [ref=e86] [cursor=pointer] [box=778,381,5,5]
+          - button [ref=e89] [cursor=pointer] [box=727,40,5,5]
+          - button [ref=e92] [cursor=pointer] [box=912,222,5,5]
+          - button [ref=e95] [cursor=pointer] [box=585,647,5,5]
+          - button [ref=e98] [cursor=pointer] [box=739,340,5,5]
+          - button [ref=e101] [cursor=pointer] [box=564,643,5,5]
+          - button [ref=e104] [cursor=pointer] [box=570,439,7,22]
+      - generic [box=29,167,1142,0]:
+        - generic [box=29,167,44,118]:
+          - generic [ref=e19] [box=39,177,34,64]:
+            - button "Zoom in" [ref=e20] [cursor=pointer] [box=41,179,30,30]: +
+            - button "Zoom out" [ref=e21] [cursor=pointer] [box=41,209,30,30]: −
+          - button "Parādīt manu atrašanās vietu" [ref=e23] [cursor=pointer] [box=41,253,30,30]
+        - generic [ref=e25] [box=934,726,237,17]:
+          - link "Leaflet" [ref=e26] [cursor=pointer] [box=939,727,51,14]:
+            - /url: https://leafletjs.com
+            - img [ref=e27] [box=939,731,12,8]
+            - text: Leaflet
+          - text: "| © OpenStreetMap contributors"
+    - complementary [ref=e31] [box=28,760,1144,395]:
+      - generic [ref=e32] [box=28,760,1144,290]:
+        - heading "Izvēlētā pietura" [level=2] [ref=e33] [box=47,779,1106,19]
+        - generic [ref=e107] [box=47,810,1106,221]:
+          - generic [ref=e108] [box=47,810,1106,139]:
+            - heading "Poļu gāte" [level=3] [ref=e109] [box=47,829,1106,26]
+            - paragraph [ref=e110] [box=47,873,1106,22]: Pietura 2131
+            - paragraph [ref=e111] [box=47,911,1106,22]: Nav maršrutu
+          - generic [ref=e112] [box=47,963,1106,20]:
+            - generic [ref=e113] [box=47,963,141,20]: Nav nesenu ziņojumu
+            - generic [ref=e114] [box=200,963,90,20]: Nav ziņojumu
+          - paragraph [ref=e115] [box=47,1009,1106,22]: Pieslēdzies ar Telegram, lai ziņotu par kontroli.
+      - generic [ref=e35] [box=28,1064,1144,91]:
+        - heading "Jaunākie ziņojumi" [level=2] [ref=e36] [box=47,1083,1106,19]
+        - list [ref=e116] [box=47,1114,1106,22]:
+          - listitem [ref=e117] [box=47,1114,1106,22]: Nav nesenu ziņojumu.

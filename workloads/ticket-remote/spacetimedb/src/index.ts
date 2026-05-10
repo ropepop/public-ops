@@ -8,8 +8,7 @@ import {
 } from 'spacetimedb/server';
 
 const PREFIX = 'ticketremote_';
-const CONTROL_MS = 45 * 1000;
-const CONTROL_EXTENDED_MS = 90 * 1000;
+const CONTROL_MS = 90 * 1000;
 const PRESENCE_TTL_MS = 45 * 1000;
 
 function named(suffix: string): string {
@@ -167,6 +166,22 @@ function parseTime(value: string): number {
 function nowOr(value: string): string {
   const clean = String(value || '').trim();
   return clean || new Date().toISOString();
+}
+
+function serverNow(ctx: any): string {
+  const stamp = ctx.timestamp;
+  const text = stamp && typeof stamp.toISOString === 'function' ? stamp.toISOString() : String(stamp || '').trim();
+  if (!text) throw new SenderError('server time required');
+  return text;
+}
+
+function connectionSessionId(ctx: any): string {
+  const connectionId = ctx.connectionId;
+  const text = connectionId && typeof connectionId.toHexString === 'function'
+    ? connectionId.toHexString()
+    : String(connectionId || '').trim();
+  if (!text) throw new SenderError('connection required');
+  return text;
 }
 
 function memberId(ticketId: string, email: string): string {
@@ -356,16 +371,44 @@ function snapshot(tx: any, ticketId: string, now: string): string {
   });
 }
 
+function publicSnapshot(tx: any, ticketId: string, now: string): any {
+  const full = JSON.parse(snapshot(tx, ticketId, now)).state;
+  const activeViewers = Array.isArray(full.viewers)
+    ? full.viewers.filter((viewer: any) => viewer && viewer.connected !== false)
+    : [];
+  const viewerCount = activeViewers.length;
+  return {
+    ticket: full.ticket,
+    viewerCount: viewerCount,
+    viewerPresence: activeViewers.map((_viewer: any, index: number) => ({
+      label: `Skatītājs ${index + 1}`,
+    })),
+    activeControl: full.activeControl ? {
+      ownerEmail: full.activeControl.email,
+      claimedAt: full.activeControl.claimedAt,
+      expiresAt: full.activeControl.expiresAt,
+      remainingMs: full.activeControl.remainingMs,
+    } : null,
+    phone: full.phone ? {
+      id: full.phone.id,
+      attachName: full.phone.attachName,
+      desiredState: full.phone.desiredState,
+      lastSeenAt: full.phone.lastSeenAt,
+    } : null,
+    serverTime: full.serverTime,
+    stateBackend: full.stateBackend,
+  };
+}
+
 function writeLiveState(tx: any, ticketId: string, now: string): void {
   const ticket = ensureTicket(tx, ticketId, '', now);
   const id = ticket.id;
   const existing = tx.db.ticketremote_live_state.id.find(id);
   if (existing) tx.db.ticketremote_live_state.id.delete(id);
-  const statePayload = JSON.parse(snapshot(tx, id, now)).state;
   tx.db.ticketremote_live_state.insert({
     id,
     ticketId: id,
-    stateJson: serialize(statePayload),
+    stateJson: serialize(publicSnapshot(tx, id, now)),
     updatedAt: now,
   });
 }
@@ -387,15 +430,16 @@ export const clientConnected = spacetimedb.clientConnected((ctx) => {
 
 export const memberHeartbeatPresence = spacetimedb.reducer(
   { name: named('member_heartbeat_presence') },
-  { ticketId: t.string(), sessionId: t.string(), displayName: t.string(), page: t.string(), connected: t.bool(), now: t.string() },
+  { ticketId: t.string(), displayName: t.string(), page: t.string(), connected: t.bool() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
+    const sessionId = connectionSessionId(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     const email = clientEmailFromAuth(ctx, ticket.id);
-    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(args.sessionId);
-    if (existing) ctx.db.ticketremote_viewer_presence.sessionId.delete(args.sessionId);
+    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(sessionId);
+    if (existing) ctx.db.ticketremote_viewer_presence.sessionId.delete(sessionId);
     ctx.db.ticketremote_viewer_presence.insert({
-      sessionId: args.sessionId,
+      sessionId,
       ticketId: ticket.id,
       email,
       displayName: String(args.displayName || '').trim() || email,
@@ -410,14 +454,15 @@ export const memberHeartbeatPresence = spacetimedb.reducer(
 
 export const memberDisconnectPresence = spacetimedb.reducer(
   { name: named('member_disconnect_presence') },
-  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  { ticketId: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
+    const sessionId = connectionSessionId(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     clientEmailFromAuth(ctx, ticket.id);
-    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(args.sessionId);
+    const existing = ctx.db.ticketremote_viewer_presence.sessionId.find(sessionId);
     if (existing) {
-      ctx.db.ticketremote_viewer_presence.sessionId.delete(args.sessionId);
+      ctx.db.ticketremote_viewer_presence.sessionId.delete(sessionId);
       ctx.db.ticketremote_viewer_presence.insert({ ...existing, connected: false, lastSeenAt: now });
     }
     writeLiveState(ctx, ticket.id, now);
@@ -426,61 +471,42 @@ export const memberDisconnectPresence = spacetimedb.reducer(
 
 export const memberClaimControl = spacetimedb.reducer(
   { name: named('member_claim_control') },
-  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  { ticketId: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
-    const email = clientEmailFromAuth(ctx, ticket.id);
-    if (activeControl(ctx, ticket.id, now)) throw new SenderError('control_claimed');
-    const nowMs = parseTime(now);
-    ctx.db.ticketremote_control_session.insert({
-      id: `${args.sessionId}-${nowMs}`,
-      ticketId: ticket.id,
-      sessionId: args.sessionId,
-      email,
-      state: 'active',
-      claimedAt: now,
-      expiresAt: new Date(nowMs + CONTROL_MS).toISOString(),
-      extended: false,
-      endedAt: '',
-      endReason: '',
-    });
-    audit(ctx, ticket.id, email, 'control_claimed', serialize({ sessionId: args.sessionId, source: 'spacetime_client' }), now);
-    writeLiveState(ctx, ticket.id, now);
+    clientEmailFromAuth(ctx, ticket.id);
+    throw new SenderError('control_mode_removed');
   }
 );
 
 export const memberExtendControl = spacetimedb.reducer(
   { name: named('member_extend_control') },
-  { ticketId: t.string(), sessionId: t.string(), now: t.string() },
+  { ticketId: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
-    const email = clientEmailFromAuth(ctx, ticket.id);
-    const active = rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
-    if (!active) throw new SenderError('no_control');
-    if (active.email !== email) throw new SenderError('not_controller');
-    if (active.extended === true) throw new SenderError('already_extended');
-    ctx.db.ticketremote_control_session.id.delete(active.id);
-    ctx.db.ticketremote_control_session.insert({ ...active, extended: true, expiresAt: new Date(parseTime(active.claimedAt) + CONTROL_EXTENDED_MS).toISOString() });
-    audit(ctx, ticket.id, email, 'control_extended', serialize({ sessionId: args.sessionId, source: 'spacetime_client' }), now);
-    writeLiveState(ctx, ticket.id, now);
+    clientEmailFromAuth(ctx, ticket.id);
+    throw new SenderError('extension_disabled');
   }
 );
 
 export const memberReleaseControl = spacetimedb.reducer(
   { name: named('member_release_control') },
-  { ticketId: t.string(), sessionId: t.string(), reason: t.string(), now: t.string() },
+  { ticketId: t.string(), reason: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
+    const sessionId = connectionSessionId(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     const email = clientEmailFromAuth(ctx, ticket.id);
+    cleanup(ctx, ticket.id, now);
     const active = rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
     if (!active) {
       writeLiveState(ctx, ticket.id, now);
       return;
     }
     if (active.email !== email) throw new SenderError('not_controller');
+    if (active.sessionId !== sessionId) throw new SenderError('not_controller');
     ctx.db.ticketremote_control_session.id.delete(active.id);
     ctx.db.ticketremote_control_session.insert({ ...active, state: 'released', endedAt: now, endReason: String(args.reason || 'released') });
     audit(ctx, ticket.id, email, 'control_released', serialize({ reason: args.reason, source: 'spacetime_client' }), now);
@@ -490,12 +516,13 @@ export const memberReleaseControl = spacetimedb.reducer(
 
 export const memberRevokeControl = spacetimedb.reducer(
   { name: named('member_revoke_control') },
-  { ticketId: t.string(), reason: t.string(), now: t.string() },
+  { ticketId: t.string(), reason: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     const email = clientEmailFromAuth(ctx, ticket.id);
     if (!isAdmin(ctx, ticket.id, email)) throw new SenderError('forbidden');
+    cleanup(ctx, ticket.id, now);
     for (const active of rowsFrom(ctx.db.ticketremote_control_session.ticketId.filter(ticket.id)).filter((row) => row.state === 'active')) {
       ctx.db.ticketremote_control_session.id.delete(active.id);
       ctx.db.ticketremote_control_session.insert({ ...active, state: 'revoked', endedAt: now, endReason: String(args.reason || 'admin_revoked') });
@@ -507,9 +534,9 @@ export const memberRevokeControl = spacetimedb.reducer(
 
 export const memberUpsertMember = spacetimedb.reducer(
   { name: named('member_upsert_member') },
-  { ticketId: t.string(), email: t.string(), role: t.string(), now: t.string() },
+  { ticketId: t.string(), email: t.string(), role: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     const actor = clientEmailFromAuth(ctx, ticket.id);
     if (!isAdmin(ctx, ticket.id, actor)) throw new SenderError('forbidden');
@@ -526,9 +553,9 @@ export const memberUpsertMember = spacetimedb.reducer(
 
 export const memberRemoveMember = spacetimedb.reducer(
   { name: named('member_remove_member') },
-  { ticketId: t.string(), email: t.string(), now: t.string() },
+  { ticketId: t.string(), email: t.string() },
   (ctx, args) => {
-    const now = nowOr(args.now);
+    const now = serverNow(ctx);
     const ticket = ensureTicket(ctx, args.ticketId, '', now);
     const actor = clientEmailFromAuth(ctx, ticket.id);
     if (!isAdmin(ctx, ticket.id, actor)) throw new SenderError('forbidden');
@@ -687,24 +714,7 @@ export const claimControl = spacetimedb.procedure(
     const now = nowOr(args.now);
     const ticket = ensureTicket(tx, args.ticketId, '', now);
     if (!isMember(tx, ticket.id, args.email)) return stateError(tx, ticket.id, 'not_member', now);
-    if (activeControl(tx, ticket.id, now)) return stateError(tx, ticket.id, 'control_claimed', now);
-    const nowMs = parseTime(now);
-    const id = `${args.sessionId}-${nowMs}`;
-    tx.db.ticketremote_control_session.insert({
-      id,
-      ticketId: ticket.id,
-      sessionId: args.sessionId,
-      email: cleanEmail(args.email),
-      state: 'active',
-      claimedAt: now,
-      expiresAt: new Date(nowMs + CONTROL_MS).toISOString(),
-      extended: false,
-      endedAt: '',
-      endReason: '',
-    });
-    audit(tx, ticket.id, args.email, 'control_claimed', serialize({ sessionId: args.sessionId }), now);
-    writeLiveState(tx, ticket.id, now);
-    return snapshot(tx, ticket.id, now);
+    return stateError(tx, ticket.id, 'control_mode_removed', now);
   })
 );
 
@@ -716,15 +726,7 @@ export const extendControl = spacetimedb.procedure(
     requireService(tx);
     const now = nowOr(args.now);
     const ticket = ensureTicket(tx, args.ticketId, '', now);
-    const active = rowsFrom(tx.db.ticketremote_control_session.ticketId.filter(ticket.id)).find((row) => row.state === 'active');
-    if (!active) return stateError(tx, ticket.id, 'no_control', now);
-    if (active.email !== cleanEmail(args.email)) return stateError(tx, ticket.id, 'not_controller', now);
-    if (active.extended === true) return stateError(tx, ticket.id, 'already_extended', now);
-    tx.db.ticketremote_control_session.id.delete(active.id);
-    tx.db.ticketremote_control_session.insert({ ...active, extended: true, expiresAt: new Date(parseTime(active.claimedAt) + CONTROL_EXTENDED_MS).toISOString() });
-    audit(tx, ticket.id, args.email, 'control_extended', serialize({ sessionId: args.sessionId }), now);
-    writeLiveState(tx, ticket.id, now);
-    return snapshot(tx, ticket.id, now);
+    return stateError(tx, ticket.id, 'extension_disabled', now);
   })
 );
 

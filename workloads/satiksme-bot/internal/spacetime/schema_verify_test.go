@@ -124,6 +124,77 @@ func TestExpectedSchemaVersionMatchesSpacetimeModule(t *testing.T) {
 	}
 }
 
+func TestServiceAndImportActionsRequireServiceRole(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(spacetimeModuleIndexPath(t))
+	if err != nil {
+		t.Fatalf("read Spacetime module: %v", err)
+	}
+	source := string(body)
+	for _, name := range []string{
+		"beginBundleImport",
+		"appendBundleChunk",
+		"commitBundleImport",
+		"abortBundleImport",
+		"serviceSyncBundle",
+		"serviceImportStateSnapshot",
+		"serviceUpsertLiveSnapshotState",
+		"serviceCountLiveViewers",
+		"serviceCleanupLiveViewers",
+		"servicePutStopSighting",
+		"serviceRecordStopSightingWithVote",
+		"serviceGetLastStopSighting",
+		"serviceListStopSightingsSince",
+		"servicePutVehicleSighting",
+		"serviceRecordVehicleSightingWithVote",
+		"serviceGetLastVehicleSighting",
+		"serviceListVehicleSightingsSince",
+		"servicePutAreaReport",
+		"serviceRecordAreaReportWithVote",
+		"serviceGetLastAreaReport",
+		"serviceListAreaReportsSince",
+		"serviceUpsertIncidentVote",
+		"serviceRecordIncidentVote",
+		"serviceListIncidentVotes",
+		"serviceListIncidentVoteEvents",
+		"serviceCountMapReportsByUserSince",
+		"serviceCountIncidentVoteEventsByUserSince",
+		"servicePutIncidentComment",
+		"serviceListIncidentComments",
+		"serviceEnqueueReportDump",
+		"serviceNextReportDump",
+		"servicePeekReportDump",
+		"serviceDeleteReportDump",
+		"serviceUpdateReportDumpFailure",
+		"servicePendingReportDumpCount",
+		"serviceGetChatAnalyzerCheckpoint",
+		"serviceSetChatAnalyzerCheckpoint",
+		"serviceEnqueueChatAnalyzerMessage",
+		"serviceListPendingChatAnalyzerMessages",
+		"serviceMarkChatAnalyzerMessageProcessed",
+		"serviceSaveChatAnalyzerBatch",
+		"serviceCountChatAnalyzerMessagesBySenderSince",
+		"serviceCountChatAnalyzerAppliedByTargetSince",
+		"serviceCleanupExpiredState",
+	} {
+		anchor := "export const " + name + " ="
+		start := strings.Index(source, anchor)
+		if start < 0 {
+			t.Fatalf("missing %s", anchor)
+		}
+		rest := source[start+len(anchor):]
+		end := strings.Index(rest, "\n\nexport const ")
+		if end < 0 {
+			end = len(rest)
+		}
+		block := rest[:end]
+		if !strings.Contains(block, "requireServiceRole(tx)") {
+			t.Fatalf("%s must call requireServiceRole(tx)", name)
+		}
+	}
+}
+
 func spacetimeModuleIndexPath(t *testing.T) string {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)

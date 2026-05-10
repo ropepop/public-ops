@@ -173,6 +173,7 @@ type CleanupExpiredStateResult struct {
 	FeedEventsDeleted       int64 `json:"feedEventsDeleted"`
 	FeedImportsDeleted      int64 `json:"feedImportsDeleted"`
 	ImportChunksDeleted     int64 `json:"importChunksDeleted"`
+	AnonymousViewersDeleted int64 `json:"anonymousViewersDeleted"`
 }
 
 type UserSnapshot struct {
@@ -2085,6 +2086,7 @@ func decodeCleanupExpiredStateResult(payload any) CleanupExpiredStateResult {
 		FeedEventsDeleted:       decodeInt64(raw["feedEventsDeleted"]),
 		FeedImportsDeleted:      decodeInt64(raw["feedImportsDeleted"]),
 		ImportChunksDeleted:     decodeInt64(raw["importChunksDeleted"]),
+		AnonymousViewersDeleted: decodeInt64(raw["anonymousViewersDeleted"]),
 	}
 }
 

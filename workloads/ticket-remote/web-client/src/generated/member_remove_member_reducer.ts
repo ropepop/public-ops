@@ -13,5 +13,4 @@ import {
 export default {
   ticketId: __t.string(),
   email: __t.string(),
-  now: __t.string(),
 };

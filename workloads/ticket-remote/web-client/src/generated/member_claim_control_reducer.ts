@@ -12,6 +12,4 @@ import {
 
 export default {
   ticketId: __t.string(),
-  sessionId: __t.string(),
-  now: __t.string(),
 };

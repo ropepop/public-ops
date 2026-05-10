@@ -69,6 +69,8 @@ type Server struct {
 type pageData struct {
 	AppCSSURL       string
 	AppJSURL        string
+	LeafletCSSURL   string
+	LeafletJSURL    string
 	LiveClientJSURL string
 	ConfigJS        template.JS
 }
@@ -118,13 +120,11 @@ func NewServer(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrole</title>
   <link rel="stylesheet" href="{{.AppCSSURL}}">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script async src="https://oauth.telegram.org/js/telegram-login.js?3"></script>
-  <script>window.SATIKSME_APP_CONFIG = {{.ConfigJS}};</script>
-  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-  {{if .LiveClientJSURL}}<script defer src="{{.LiveClientJSURL}}"></script>{{end}}
-  <script defer src="{{.AppJSURL}}"></script>
+  {{if .LeafletCSSURL}}<link rel="stylesheet" href="{{.LeafletCSSURL}}">{{end}}
+  <script data-cfasync="false">window.SATIKSME_APP_CONFIG = {{.ConfigJS}};</script>
+  {{if .LeafletJSURL}}<script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>{{end}}
+  {{if .LiveClientJSURL}}<script data-cfasync="false" defer src="{{.LiveClientJSURL}}"></script>{{end}}
+  <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
 </head>
 <body>
   <div id="app"></div>
@@ -221,22 +221,32 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.setReleaseHeaders(w)
+	s.setSecurityHeaders(w)
+	if unsafePublicPath(r) {
+		writeError(w, http.StatusBadRequest, "bad path")
+		return
+	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	basePath := strings.TrimRight(s.pathPrefix, "/")
 	switch {
 	case path == strings.TrimRight(basePath+"/oidc/.well-known/openid-configuration", "/"):
+		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
 		s.handleSpacetimeOpenIDConfiguration(w, r)
 	case path == strings.TrimRight(basePath+"/oidc/jwks.json", "/"):
+		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
 		s.handleSpacetimeJWKS(w, r)
 	case path == basePath || path == "":
-		s.serveShell(w, "public")
+		s.serveShellPage(w, r, "public")
 	case path == basePath+"/incidents":
-		s.serveShell(w, "public-incidents")
+		s.serveShellPage(w, r, "public-incidents")
 	case path == basePath+"/-incidents":
-		s.serveShell(w, "public-incidents")
+		s.serveShellPage(w, r, "public-incidents")
 	case path == basePath+"/app":
-		s.serveShell(w, "public")
+		s.serveShellPage(w, r, "public")
 	case path == basePath+"/bundles/active.json":
 		s.serveBundleActive(w, r)
 	case strings.HasPrefix(path, basePath+"/bundles/"):
@@ -287,13 +297,28 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 	if browserSpacetimeEnabled && s.release.LiveClientHash != "" {
 		liveClientURL = s.release.AssetURL(basePath, "live-client.js")
 	}
+	leafletCSSURL := ""
+	leafletJSURL := ""
+	if mode != "public-incidents" {
+		leafletCSSURL = s.release.AssetURL(basePath, "leaflet/leaflet.css")
+		leafletJSURL = s.release.AssetURL(basePath, "leaflet/leaflet.js")
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.pageTemplate.Execute(w, pageData{
 		AppCSSURL:       s.release.AssetURL(basePath, "app.css"),
 		AppJSURL:        s.release.AssetURL(basePath, "app.js"),
+		LeafletCSSURL:   leafletCSSURL,
+		LeafletJSURL:    leafletJSURL,
 		LiveClientJSURL: liveClientURL,
 		ConfigJS:        template.JS(raw),
 	})
+}
+
+func (s *Server) serveShellPage(w http.ResponseWriter, r *http.Request, mode string) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	s.serveShell(w, mode)
 }
 
 func (s *Server) browserSpacetimeConfigured() bool {
@@ -311,7 +336,16 @@ func (s *Server) browserLiveSnapshotLookupEnabled() bool {
 }
 
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath string) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	assetPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/assets/")
+	if excludedGenericPublicAsset(assetPath) || !s.allowAssetQuery(r, assetPath) {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	s.setNoIndexHeaders(w)
 	version := strings.TrimSpace(r.URL.Query().Get("v"))
 	if version != "" && version == s.release.AssetHash(assetPath) {
 		s.setImmutableHeaders(w)
@@ -326,6 +360,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	switch {
 	case route == "/health":
 		s.handleHealth(w, r)
+	case route == "/livez":
+		s.handleLivez(w, r)
+	case route == "/internal/health":
+		s.handleInternalHealth(w, r)
 	case route == "/public/incidents":
 		s.handlePublicIncidents(w, r, now)
 	case route == "/public/catalog":
@@ -398,15 +436,64 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	}
 }
 
+type healthSnapshot struct {
+	ok      bool
+	reasons []string
+	payload map[string]any
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	now := time.Now().UTC()
+	snapshot := s.healthSnapshot(r.Context(), now)
+	status := http.StatusOK
+	if !snapshot.ok {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]any{
+		"ok":       snapshot.ok,
+		"degraded": len(snapshot.reasons) > 0,
+	})
+}
+
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	s.setNoStoreHeaders(w)
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
+	s.setNoStoreHeaders(w)
+	if !isLocalRequest(r) {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	snapshot := s.healthSnapshot(r.Context(), time.Now().UTC())
+	status := http.StatusOK
+	if !snapshot.ok {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, snapshot.payload)
+}
+
+func (s *Server) healthSnapshot(ctx context.Context, now time.Time) healthSnapshot {
 	catalogStatus := runtime.CatalogStatus{}
 	if s.catalog != nil {
 		catalogStatus = s.catalog.Status()
 	}
 	stale := s.catalogStale(catalogStatus, now)
-	dbWritable, dbError := s.dbStatus(r.Context())
+	dbWritable, dbError := s.dbStatus(ctx)
 	var telegramStatus runtime.TelegramStatus
 	var dumpStatus runtime.DumpStatus
 	startedAt := time.Time{}
@@ -476,7 +563,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"ok":       ok,
 		"degraded": len(reasons) > 0,
 		"reasons":  reasons,
@@ -541,11 +628,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"bundle":       bundlePayload,
 		"liveSnapshot": liveSnapshotPayload,
 		"catalogStops": catalogStatus.StopCount,
-	})
+	}
+	return healthSnapshot{ok: ok, reasons: reasons, payload: payload}
 }
 
 func (s *Server) handlePublicCatalog(w http.ResponseWriter, r *http.Request) {
 	s.setRevalidateHeaders(w)
+	s.setNoIndexHeaders(w)
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
@@ -587,7 +676,7 @@ func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, n
 	}
 	items, err := s.reports.ListActiveIncidents(r.Context(), catalog, now, viewerID, limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load incidents")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -614,10 +703,10 @@ func (s *Server) handlePublicIncidentDetail(w http.ResponseWriter, r *http.Reque
 	item, err := s.reports.IncidentDetail(r.Context(), catalog, incidentID, now, viewerID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "not found") {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeError(w, http.StatusNotFound, "incident not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load incident")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -634,7 +723,7 @@ func (s *Server) handlePublicSightings(w http.ResponseWriter, r *http.Request, n
 	limit := parseSightingsLimit(r, 100)
 	visible, err := s.reports.VisibleSightings(r.Context(), catalog, stopID, now, limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load sightings")
 		return
 	}
 	writeJSON(w, http.StatusOK, visible)
@@ -649,7 +738,7 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 	}
 	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
 	}
 	viewerID := int64(0)
@@ -658,7 +747,7 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 	}
 	stopIncidents, areaIncidents, liveVehicles, err := s.publicMapState(r.Context(), catalog, visible, now, viewerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
 	}
 	writeJSON(w, http.StatusOK, model.PublicMapPayload{
@@ -680,7 +769,7 @@ func (s *Server) handlePublicMapLive(w http.ResponseWriter, r *http.Request, now
 	}
 	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
 	}
 	viewerID := int64(0)
@@ -689,7 +778,7 @@ func (s *Server) handlePublicMapLive(w http.ResponseWriter, r *http.Request, now
 	}
 	stopIncidents, areaIncidents, liveVehicles, err := s.publicMapState(r.Context(), catalog, visible, now, viewerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
 	}
 	writeJSON(w, http.StatusOK, model.PublicLiveMapPayload{
@@ -710,7 +799,7 @@ func (s *Server) handlePublicLiveVehicles(w http.ResponseWriter, r *http.Request
 	}
 	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load live vehicles")
 		return
 	}
 	viewerID := int64(0)
@@ -719,7 +808,7 @@ func (s *Server) handlePublicLiveVehicles(w http.ResponseWriter, r *http.Request
 	}
 	incidents, err := s.reports.ListMapVisibleIncidents(r.Context(), catalog, now, viewerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "unable to load live vehicles")
 		return
 	}
 	vehicleIncidents := make([]model.IncidentSummary, 0, len(incidents))
@@ -730,7 +819,7 @@ func (s *Server) handlePublicLiveVehicles(w http.ResponseWriter, r *http.Request
 	}
 	liveVehicles, err := s.publicLiveVehicles(r.Context(), catalog, visible, now, vehicleIncidents)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, http.StatusServiceUnavailable, "live vehicles unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1134,52 +1223,87 @@ func (s *Server) authRedirectURL(returnTo string, status string) string {
 }
 
 func (s *Server) serveBundleActive(w http.ResponseWriter, r *http.Request) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	if s.bundleStore == nil {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.bundleStore.invalidate()
 	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebBundleDir, "active.json"))
 }
 
 func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, basePath string) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	if s.bundleStore == nil {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	relative := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/bundles/")
 	clean := filepath.Clean(relative)
-	if clean == "." || strings.HasPrefix(clean, "..") {
+	if clean == "." || strings.HasPrefix(clean, "..") || excludedGenericPublicAsset(clean) {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.setImmutableHeaders(w)
+	s.setNoIndexHeaders(w)
 	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebBundleDir, "bundles", clean))
 }
 
 func (s *Server) serveLiveSnapshotActive(w http.ResponseWriter, r *http.Request) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	if strings.TrimSpace(s.cfg.SatiksmeWebLiveSnapshotDir) == "" {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
+	if hasQueryString(r) {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
 	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebLiveSnapshotDir, "active.json"))
 }
 
 func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, basePath string) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	if strings.TrimSpace(s.cfg.SatiksmeWebLiveSnapshotDir) == "" {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	relative := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/transport/live/")
 	clean := filepath.Clean(relative)
-	if clean == "." || strings.HasPrefix(clean, "..") || strings.Contains(clean, string(filepath.Separator)+".") {
+	if clean == "." || strings.HasPrefix(clean, "..") || strings.Contains(clean, string(filepath.Separator)+".") || excludedGenericPublicAsset(clean) {
 		s.setNoStoreHeaders(w)
 		http.NotFound(w, r)
 		return
@@ -1195,7 +1319,8 @@ func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, 
 		http.NotFound(w, r)
 		return
 	}
-	s.setImmutableHeaders(w)
+	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	http.ServeFile(w, r, fullPath)
 }
@@ -1474,13 +1599,76 @@ func (s *Server) catalogStale(status runtime.CatalogStatus, now time.Time) bool 
 	return now.After(status.GeneratedAt.Add(refreshAfter * 2))
 }
 
-func (s *Server) setReleaseHeaders(w http.ResponseWriter) {
-	w.Header().Set("X-Satiksme-Bot-Commit", s.release.Commit)
-	w.Header().Set("X-Satiksme-Bot-Build-Time", s.release.BuildTime)
-	w.Header().Set("X-Satiksme-Bot-Instance", s.release.Instance)
-	w.Header().Set("X-Satiksme-Bot-App-Js", s.release.AppJSHash)
-	w.Header().Set("X-Satiksme-Bot-App-Css", s.release.AppCSSHash)
-	w.Header().Set("X-Satiksme-Bot-Live-Client", s.release.LiveClientHash)
+func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Strict-Transport-Security", "max-age=300")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	h.Set("Permissions-Policy", "geolocation=(self), camera=(), microphone=(), payment=(), usb=(), fullscreen=(self)")
+	h.Set("Content-Security-Policy", s.contentSecurityPolicy())
+}
+
+func (s *Server) contentSecurityPolicy() string {
+	connectSources := []string{"'self'"}
+	addCSPConnectSources(&connectSources, s.cfg.SatiksmeWebSpacetimeHost)
+	return strings.Join([]string{
+		"default-src 'self'",
+		"base-uri 'self'",
+		"object-src 'none'",
+		"frame-ancestors 'none'",
+		"form-action 'self' https://oauth.telegram.org",
+		"script-src 'self' 'unsafe-inline' https://oauth.telegram.org",
+		"style-src 'self' 'unsafe-inline'",
+		"img-src 'self' data: blob: https://*.tile.openstreetmap.org",
+		"font-src 'self' data:",
+		"connect-src " + strings.Join(connectSources, " "),
+		"frame-src https://oauth.telegram.org https://telegram.org",
+		"worker-src 'self' blob:",
+	}, "; ")
+}
+
+func addCSPConnectSources(sources *[]string, raw string) {
+	origin := cspOrigin(raw)
+	if origin == "" {
+		return
+	}
+	appendUniqueString(sources, origin)
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed == nil || parsed.Host == "" {
+		return
+	}
+	switch parsed.Scheme {
+	case "https":
+		appendUniqueString(sources, "wss://"+parsed.Host)
+	case "http":
+		appendUniqueString(sources, "ws://"+parsed.Host)
+	}
+}
+
+func cspOrigin(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func appendUniqueString(values *[]string, next string) {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return
+	}
+	for _, existing := range *values {
+		if existing == next {
+			return
+		}
+	}
+	*values = append(*values, next)
 }
 
 func (s *Server) setNoStoreHeaders(w http.ResponseWriter) {
@@ -1499,6 +1687,74 @@ func (s *Server) setImmutableHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("CDN-Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "public, max-age=31536000, immutable")
+}
+
+func (s *Server) setNoIndexHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Robots-Tag", "noindex, noarchive")
+}
+
+func (s *Server) allowAssetQuery(r *http.Request, assetPath string) bool {
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	query := r.URL.Query()
+	values, ok := query["v"]
+	if !ok || len(query) != 1 || len(values) != 1 {
+		return false
+	}
+	return strings.TrimSpace(values[0]) != "" && strings.TrimSpace(values[0]) == s.release.AssetHash(assetPath)
+}
+
+func excludedGenericPublicAsset(assetPath string) bool {
+	cleanPath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+assetPath)), "/")
+	name := strings.ToLower(filepath.Base(cleanPath))
+	return strings.HasSuffix(name, ".test.js") || strings.HasSuffix(name, ".test.css") || strings.HasSuffix(name, ".map")
+}
+
+func allowMethods(w http.ResponseWriter, r *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if r.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return false
+}
+
+func unsafePublicPath(r *http.Request) bool {
+	escaped := r.URL.EscapedPath()
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil {
+		return true
+	}
+	for _, candidate := range []string{r.URL.Path, escaped, decoded} {
+		if strings.Contains(candidate, "//") {
+			return true
+		}
+		for _, segment := range strings.Split(candidate, "/") {
+			if segment == "." || segment == ".." {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasQueryString(r *http.Request) bool {
+	return r.URL.RawQuery != ""
+}
+
+func isLocalRequest(r *http.Request) bool {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func optionalTimeValue(at time.Time) any {
@@ -1528,6 +1784,8 @@ func emptyToNil(value string) any {
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Robots-Tag", "noindex, noarchive")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }

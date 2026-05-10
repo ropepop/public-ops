@@ -16,6 +16,7 @@ import (
 type Config struct {
 	BindAddr            string
 	Port                int
+	Production          bool
 	PublicBaseURL       string
 	TicketID            string
 	TicketDisplayName   string
@@ -81,6 +82,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		BindAddr:            getenv("TICKET_REMOTE_BIND_ADDR", "0.0.0.0"),
 		Port:                getenvInt("TICKET_REMOTE_PORT", 9338),
+		Production:          getenvBool("TICKET_REMOTE_PRODUCTION", false),
 		PublicBaseURL:       strings.TrimRight(getenv("TICKET_REMOTE_PUBLIC_BASE_URL", "https://ticket.jolkins.id.lv"), "/"),
 		TicketID:            getenv("TICKET_REMOTE_TICKET_ID", "vivi-default"),
 		TicketDisplayName:   getenv("TICKET_REMOTE_TICKET_DISPLAY_NAME", "ViVi timed ticket"),
@@ -175,6 +177,11 @@ func Load() (Config, error) {
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")
 	}
+	if cfg.Production {
+		if err := validateProductionConfig(cfg); err != nil {
+			return Config{}, err
+		}
+	}
 	if len(cfg.Phone.Backends) == 0 {
 		return Config{}, fmt.Errorf("at least one ticket phone backend is required")
 	}
@@ -188,6 +195,28 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_SIMULATOR_SETUP_ADB_PATH is required")
 	}
 	return cfg, nil
+}
+
+func validateProductionConfig(cfg Config) error {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Access.Mode))
+	switch mode {
+	case "", "spacetime", "spacetimeauth", "oidc", "cloudflare", "cloudflare-access", "cf-access":
+	case "dev", "development", "none":
+		return fmt.Errorf("production auth mode %q is not allowed", cfg.Access.Mode)
+	default:
+		return fmt.Errorf("unsupported production auth mode %q", cfg.Access.Mode)
+	}
+	backend := strings.ToLower(strings.TrimSpace(cfg.State.Backend))
+	if backend != "spacetime" && backend != "spacetimedb" {
+		return fmt.Errorf("production state backend must be spacetime, got %q", cfg.State.Backend)
+	}
+	if strings.TrimSpace(cfg.State.SpacetimeDatabase) == "" {
+		return fmt.Errorf("TICKET_REMOTE_SPACETIME_DATABASE is required in production")
+	}
+	if strings.TrimSpace(cfg.State.SpacetimeBearerToken) == "" && strings.TrimSpace(cfg.State.SpacetimeKeyFile) == "" {
+		return fmt.Errorf("TICKET_REMOTE_SPACETIME_BEARER_TOKEN or TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE is required in production")
+	}
+	return nil
 }
 
 func FindPhoneBackend(backends []PhoneBackend, id string) (PhoneBackend, bool) {

@@ -183,7 +183,7 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
 			server.telegramLogin = verifier
 		}
 	}
-	if cfg.TrainWebTestLoginEnabled {
+	if cfg.TrainWebTestLoginEnabled && !productionTrainPublicBaseURL(cfg.TrainWebPublicBaseURL) {
 		broker, err := newTestLoginBroker(cfg)
 		if err != nil {
 			return nil, err
@@ -212,6 +212,43 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
 		server.bundleStore = newStaticBundleStore(cfg.TrainWebBundleDir)
 	}
 	return server, nil
+}
+
+func productionTrainPublicBaseURL(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return true
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return false
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return false
+	case "vilciens.kontrole.info":
+		return true
+	}
+	return !strings.HasSuffix(host, ".test")
+}
+
+func unsafePublicPath(r *http.Request) bool {
+	escaped := r.URL.EscapedPath()
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil {
+		return true
+	}
+	for _, candidate := range []string{r.URL.Path, escaped, decoded} {
+		if strings.Contains(candidate, "//") {
+			return true
+		}
+		for _, segment := range strings.Split(candidate, "/") {
+			if segment == "." || segment == ".." {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func mustStaticSubFS() fs.FS {
@@ -277,9 +314,13 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.setSecurityHeaders(w)
+	if unsafePublicPath(r) {
+		s.writeError(w, http.StatusBadRequest, "bad path")
+		return
+	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	basePath := strings.TrimRight(s.pathPrefix, "/")
-	s.setReleaseHeaders(w)
 	if s.serveHTTPForBasePath(w, r, path, basePath) {
 		return
 	}
@@ -292,34 +333,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, path string, basePath string) bool {
 	switch {
 	case path == strings.TrimRight(basePath+"/oidc/.well-known/openid-configuration", "/"):
+		if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return true
+		}
 		s.handleSpacetimeOpenIDConfiguration(w, r)
 		return true
 	case path == strings.TrimRight(basePath+"/oidc/jwks.json", "/"):
+		if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return true
+		}
 		s.handleSpacetimeJWKS(w, r)
 		return true
 	case path == basePath || path == "":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-network-map", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-network-map", ""))
 		return true
 	case path == basePath+"/app":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "mini-app", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "mini-app", ""))
 		return true
 	case path == basePath+"/stations":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-stations", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-stations", ""))
 		return true
 	case path == basePath+"/incidents":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-incidents", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-incidents", ""))
 		return true
 	case path == basePath+"/events":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-incidents", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-incidents", ""))
 		return true
 	case path == basePath+"/map":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-network-map", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-network-map", ""))
 		return true
 	case path == basePath+"/feed":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-dashboard", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-dashboard", ""))
 		return true
 	case path == basePath+"/departures":
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-dashboard", ""))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-dashboard", ""))
 		return true
 	case strings.HasPrefix(path, basePath+"/t/") && strings.HasSuffix(path, "/map"):
 		trainID := strings.TrimSuffix(strings.TrimPrefix(path, basePath+"/t/"), "/map")
@@ -328,7 +375,7 @@ func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, pa
 			http.NotFound(w, r)
 			return true
 		}
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-map", trainID))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-map", trainID))
 		return true
 	case strings.HasPrefix(path, basePath+"/t/"):
 		trainID := strings.TrimPrefix(path, basePath+"/t/")
@@ -336,7 +383,7 @@ func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, pa
 			http.NotFound(w, r)
 			return true
 		}
-		s.serveShell(w, http.StatusOK, s.newPageData(basePath, "public-train", trainID))
+		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-train", trainID))
 		return true
 	case strings.HasPrefix(path, basePath+"/assets/"):
 		s.serveAsset(w, r, basePath)
@@ -541,24 +588,27 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	s.writeJSON(w, http.StatusOK, s.healthPayload(now, true))
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	payload := s.healthPayload(now, false)
+	_, scheduleErr := s.appScheduleAvailability()
+	scheduleCtx := s.appScheduleContext(now)
+	ready, _ := scheduleReadiness(scheduleCtx, s.appLoadedServiceDate(), scheduleErr)
 	status := http.StatusOK
-	if payload["ready"] != true {
+	if !ready {
 		status = http.StatusServiceUnavailable
 	}
-	s.writeJSON(w, status, payload)
+	s.writeJSON(w, status, map[string]any{
+		"ok":    ready,
+		"ready": ready,
+	})
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -1851,6 +1901,24 @@ func (s *Server) serveShell(w http.ResponseWriter, status int, data pageData) {
 	_ = s.pageTemplate.Execute(w, data)
 }
 
+func (s *Server) serveShellPage(w http.ResponseWriter, r *http.Request, status int, data pageData) {
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	s.serveShell(w, status, data)
+}
+
+func (s *Server) allowMethods(w http.ResponseWriter, r *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if r.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return false
+}
+
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	defer r.Body.Close()
 	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
@@ -1957,7 +2025,15 @@ func (s *Server) newPageData(basePath string, mode string, trainID string) pageD
 }
 
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath string) {
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	assetPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/assets/")
+	if excludedTrainPublicAsset(assetPath) {
+		s.setNoStoreHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
 	if s.bundleStore != nil && strings.HasPrefix(assetPath, "bundles/") {
 		s.serveBundleAsset(w, r, strings.TrimPrefix(assetPath, "bundles/"))
 		return
@@ -1972,8 +2048,11 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath str
 }
 
 func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, relativePath string) {
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
 	cleanRelativePath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+relativePath)), "/")
-	if cleanRelativePath == "" || cleanRelativePath == "." || strings.HasPrefix(cleanRelativePath, "..") {
+	if cleanRelativePath == "" || cleanRelativePath == "." || strings.HasPrefix(cleanRelativePath, "..") || excludedGenericPublicAsset(cleanRelativePath) {
 		http.NotFound(w, r)
 		return
 	}
@@ -1991,11 +2070,28 @@ func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, relati
 	http.ServeFile(w, r, assetPath)
 }
 
+func excludedTrainPublicAsset(assetPath string) bool {
+	cleanPath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+assetPath)), "/")
+	return cleanPath == "live-client.js" || excludedGenericPublicAsset(cleanPath)
+}
+
+func excludedGenericPublicAsset(assetPath string) bool {
+	cleanPath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+assetPath)), "/")
+	name := strings.ToLower(filepath.Base(cleanPath))
+	return strings.HasSuffix(name, ".test.js") || strings.HasSuffix(name, ".test.css") || strings.HasSuffix(name, ".map")
+}
+
 func (s *Server) setReleaseHeaders(w http.ResponseWriter) {
-	w.Header().Set("X-Train-Bot-Commit", s.release.Commit)
-	w.Header().Set("X-Train-Bot-Build-Time", s.release.BuildTime)
-	w.Header().Set("X-Train-Bot-Instance", s.release.Instance)
-	w.Header().Set("X-Train-Bot-App-Js", s.release.AppJSHash)
+	s.setSecurityHeaders(w)
+}
+
+func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' https://telegram.org https://oauth.telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: wss:; frame-src https://telegram.org https://oauth.telegram.org")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), payment=(), usb=(), geolocation=(self)")
 }
 
 func (s *Server) setNoStoreHeaders(w http.ResponseWriter) {

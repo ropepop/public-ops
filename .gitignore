@@ -41,8 +41,16 @@ orchestrator/android-orchestrator/.kotlin/
 orchestrator/android-orchestrator/runtime-tests/debug-helper.*.sh
 "$TMP"
 
-# Stable local browser session exports
+# Stable local browser session exports and sensitive browser captures
 state/browser-use/
+state/
+evidence/
+security-audit-evidence/
+security-audits/
+**/cookies*.json
+**/cookies*.txt
+**/cookie-jar*.json
+**/cookie-jar*.txt
 
 # Local reports and ad hoc screenshots
 /ops/reports/*.db

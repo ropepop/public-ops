@@ -119,6 +119,57 @@ func (r *Relay) AddViewer() {
 	r.mu.Unlock()
 }
 
+func (r *Relay) EnsureActive(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "ensure active"
+	}
+	var conn *websocket.Conn
+	var videoConn *websocket.Conn
+	var oldCancel context.CancelFunc
+	var ctx context.Context
+	r.mu.Lock()
+	if r.viewers <= 0 {
+		r.mu.Unlock()
+		return false
+	}
+	if r.idleStop != nil {
+		r.idleStop.Stop()
+		r.idleStop = nil
+	}
+	if r.desired && r.connected && r.conn != nil && r.videoConn != nil {
+		r.mu.Unlock()
+		return true
+	}
+	if r.cancelLoop != nil {
+		oldCancel = r.cancelLoop
+		r.cancelLoop = nil
+	}
+	conn = r.conn
+	videoConn = r.videoConn
+	r.conn = nil
+	r.videoConn = nil
+	r.connected = false
+	r.desired = true
+	r.lastError = reason
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(context.Background())
+	r.cancelLoop = cancel
+	r.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close(websocket.StatusInternalError, reason)
+	}
+	if videoConn != nil {
+		_ = videoConn.Close(websocket.StatusInternalError, reason)
+	}
+	if oldCancel != nil {
+		oldCancel()
+	}
+	go r.connectLoop(ctx)
+	return true
+}
+
 func (r *Relay) RemoveViewer() {
 	r.mu.Lock()
 	if r.viewers > 0 {
@@ -493,6 +544,45 @@ func (r *Relay) recordError(err error) {
 	}
 }
 
+func (r *Relay) Reconnect(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "recovery reconnect"
+	}
+	r.mu.Lock()
+	conn := r.conn
+	videoConn := r.videoConn
+	var oldCancel context.CancelFunc
+	var ctx context.Context
+	shouldRestart := r.desired && r.viewers > 0
+	if shouldRestart {
+		if r.cancelLoop != nil {
+			oldCancel = r.cancelLoop
+			r.cancelLoop = nil
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		r.cancelLoop = cancel
+	}
+	r.conn = nil
+	r.videoConn = nil
+	r.connected = false
+	r.lastError = reason
+	r.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close(websocket.StatusInternalError, reason)
+	}
+	if videoConn != nil {
+		_ = videoConn.Close(websocket.StatusInternalError, reason)
+	}
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if shouldRestart {
+		go r.connectLoop(ctx)
+	}
+}
+
 func (r *Relay) sendVideoJSON(ctx context.Context, value any) error {
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -540,32 +630,39 @@ func (r *Relay) stopPhoneSession() {
 	r.stopPhoneSessionAt(base)
 }
 
-func (r *Relay) startPhoneSession(ctx context.Context) error {
+func (r *Relay) StartPhoneSession(ctx context.Context) error {
 	r.mu.Lock()
 	base := r.cfg.BaseURL
+	timeout := r.cfg.RequestTimeout
 	r.mu.Unlock()
-	return r.startPhoneSessionAt(ctx, base)
+	return r.startPhoneSessionAt(ctx, base, timeout)
 }
 
 func (r *Relay) startPhoneSessionFallback() {
 	r.mu.Lock()
 	base := r.cfg.BaseURL
+	timeout := r.cfg.RequestTimeout
+	if timeout < 20*time.Second {
+		timeout = 20 * time.Second
+	}
 	r.mu.Unlock()
 	go func() {
-		if err := r.startPhoneSessionAt(context.Background(), base); err != nil {
+		if err := r.startPhoneSessionAt(context.Background(), base, timeout); err != nil {
 			log.Printf("ticket phone relay: HTTP session start fallback failed: %v", err)
 		}
 	}()
 }
 
-func (r *Relay) startPhoneSessionAt(ctx context.Context, baseURL string) error {
+func (r *Relay) startPhoneSessionAt(ctx context.Context, baseURL string, timeout time.Duration) error {
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" {
 		return fmt.Errorf("phone base URL is empty")
 	}
-	timeout := r.cfg.RequestTimeout
-	if timeout < 20*time.Second {
-		timeout = 20 * time.Second
+	if timeout <= 0 {
+		timeout = r.cfg.RequestTimeout
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
 	}
 	startCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

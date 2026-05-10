@@ -30,9 +30,11 @@ fi
 
 for train_public_base_snippet in \
   "TRAIN_WEB_PUBLIC_BASE_URL: https://\${ARBUZAS_TRAIN_BOT_HOSTNAME}" \
-  "export TRAIN_WEB_PUBLIC_BASE_URL=\"https://\${ARBUZAS_TRAIN_BOT_HOSTNAME}\""; do
+  "export TRAIN_WEB_PUBLIC_BASE_URL=\"https://\${ARBUZAS_TRAIN_BOT_HOSTNAME}\"" \
+  "TRAIN_WEB_TEST_LOGIN_ENABLED: \"false\"" \
+  "export TRAIN_WEB_TEST_LOGIN_ENABLED=\"false\""; do
   if ! grep -F "${train_public_base_snippet}" "${COMPOSE_PATH}" >/dev/null; then
-    echo "FAIL: train_bot public base URL must stay aligned with ARBUZAS_TRAIN_BOT_HOSTNAME: ${train_public_base_snippet}" >&2
+    echo "FAIL: train_bot production web setting is missing or misaligned: ${train_public_base_snippet}" >&2
     exit 1
   fi
 done
@@ -216,9 +218,19 @@ required_snippets = [
     "claim-dialog|showModal|confirmClaim",
     "options.tap.x",
     "control_code_button",
+    "quick_claim_tap",
+    "runControlMutation",
+    "claimControl()",
+    "releaseControl(",
+    "revokeControl(",
     "inputQueueLimit = 30",
     "inputDrainDelayMs = 35",
-    "input_result",
+    "/api/v1/control-code/request",
+    "/api/v1/control-code/close",
+    "control_code_request",
+    "generate_control_code",
+    "requestControlCode",
+    "sanitizeControlDigits",
     "navigator.wakeLock.request",
     "requestFullscreen",
     "toolbarCollapseAnchorPx",
@@ -238,6 +250,25 @@ required_snippets = [
     "validate_remote_satiksme_dependency_dns",
     "getent hosts saraksti.rigassatiksme.lv",
     "Validation failed: satiksme dependency DNS",
+    "validate_remote_train_public_hardening",
+    "validate_remote_train_anonymous_data_denial",
+    "validate_remote_satiksme_public_hardening",
+    "validate_remote_public_tls_dns_hardening",
+    "train public web hardening",
+    "train anonymous direct data access is denied",
+    "satiksme public web hardening",
+    "public TLS and DNS hardening",
+    "/assets/app.test.js",
+    "/assets/app.js.map",
+    "/assets/live-client.js",
+    "/api/v1/auth/test",
+    "test_ticket",
+    "stripTestTicketFromLocation",
+    "trainbot_service_get_schedule",
+    "trainbot_service_list_activities",
+    "TLS 1.0 unexpectedly accepted",
+    "TLS 1.1 unexpectedly accepted",
+    "dig +short CAA kontrole.info",
     'DNS_ADMIN_NGINX_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/nginx"',
     'DNS_ADMIN_NGINX_TEMPLATE_FILE="${DNS_ADMIN_NGINX_TEMPLATE_FILE:-${DNS_ADMIN_NGINX_CONFIG_ROOT}/arbuzas-dns-admin.conf.template}"',
     'DNS_ADMIN_NGINX_REMOTE_SITE_FILE="/etc/nginx/sites-available/arbuzas-dns-admin"',

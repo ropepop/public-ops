@@ -559,29 +559,6 @@
     return true;
   }
 
-  function readTestTicketFromLocation() {
-    const currentURL = currentLocationURL();
-    if (!currentURL) {
-      return "";
-    }
-    return currentURL.searchParams.get("test_ticket") || "";
-  }
-
-  function stripTestTicketFromLocation() {
-    if (!window.history || typeof window.history.replaceState !== "function") {
-      return;
-    }
-    const currentURL = currentLocationURL();
-    if (!currentURL || !currentURL.searchParams.has("test_ticket")) {
-      return;
-    }
-    currentURL.searchParams.delete("test_ticket");
-    const nextPath = `${currentURL.pathname}${currentURL.search}${currentURL.hash}`;
-    try {
-      window.history.replaceState({}, "", nextPath);
-    } catch (_) {}
-  }
-
   async function fetchBundleJSON(url) {
     const response = await fetch(url, { method: "GET", credentials: "include" });
     if (!response.ok) {
@@ -2479,24 +2456,11 @@
     };
   }
 
-  async function finalizeMiniAppAuthentication(payload, options) {
-    if (options && options.stripTestTicket) {
-      stripTestTicketFromLocation();
-    }
+  async function finalizeMiniAppAuthentication(payload) {
     await applyAuthenticatedSession(payload, { focusActiveRide: true });
   }
 
   async function authenticateMiniApp() {
-    const testTicket = readTestTicketFromLocation();
-    if (testTicket) {
-      const payload = await api("/auth/test", {
-        method: "POST",
-        body: JSON.stringify({ ticket: testTicket }),
-      }, true);
-      await finalizeMiniAppAuthentication(payload, { stripTestTicket: true });
-      return;
-    }
-
     const tg = telegramWebApp();
     const initData = telegramInitData();
     if (!initData) {
@@ -11939,8 +11903,6 @@
         pauseMovingMapFollow,
         setPublicMapPopupSelection,
         clearPublicMapPopupSelection,
-        readTestTicketFromLocation,
-        stripTestTicketFromLocation,
         telegramLoginConfigURL,
         telegramLoginLibraryURL,
         telegramLoginScopes,

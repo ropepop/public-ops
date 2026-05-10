@@ -1,0 +1,148 @@
+- generic [ref=e3] [box=0,0,390,2125]:
+  - banner [ref=e4] [box=16,18,358,259]:
+    - generic [ref=e5] [box=16,18,358,119]:
+      - paragraph [ref=e6] [box=16,18,358,17]: Pēdējās 24 stundas
+      - heading "Kontroles plūsma" [level=1] [ref=e7] [box=16,51,358,30]
+      - paragraph [ref=e8] [box=16,91,358,46]: Aktīvie kontroles ziņojumi, anonīmi balsojumi un komentāri vienuviet.
+    - generic [ref=e9] [box=16,153,358,124]:
+      - link "Mape" [ref=e10] [cursor=pointer] [box=16,153,72,36]:
+        - /url: /
+      - link "Vilciens" [ref=e11] [cursor=pointer] [box=98,153,88,36]:
+        - /url: https://vilciens.kontrole.info
+      - generic [ref=e12] [box=16,199,229,36]: Incidentu plūsma ielādēta
+      - button "Pieslēgties ar Telegram" [ref=e29] [cursor=pointer] [box=16,245,192,32]
+  - generic [ref=e16] [box=16,291,358,1806]:
+    - heading "Pēdējās 24 stundas" [level=2] [ref=e17] [box=35,310,320,19]
+    - generic [ref=e18] [box=35,341,320,1737]:
+      - article [ref=e30] [box=35,341,320,155]:
+        - 'button "Inženieru iela в сторону центра контролеры pirms 1 h Kontrole Pēdējais: Cloud Scout 863 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e31] [cursor=pointer] [box=50,356,290,125]':
+          - generic [ref=e32] [box=50,356,290,76]:
+            - heading "Inženieru iela в сторону центра контролеры" [level=3] [ref=e33] [box=50,356,290,36]
+            - generic [ref=e35] [box=50,402,84,30]: pirms 1 h
+          - generic [ref=e36] [box=50,440,290,17]:
+            - generic [ref=e37] [box=50,440,54,17]: Kontrole
+            - generic [ref=e38] [box=116,440,170,17]: "Pēdējais: Cloud Scout 863"
+          - generic [ref=e39] [box=50,465,290,17]:
+            - generic [ref=e40] [box=50,465,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e41] [box=241,465,75,17]: 0 komentāri
+      - article [ref=e42] [box=35,496,320,137]:
+        - 'button "Dauderi pirms 2 h Kontrole Pēdējais: Mellow Harbor 589 Kontrole: 4 · Nav kontrole: 0 0 komentāri" [ref=e43] [cursor=pointer] [box=50,511,290,107]':
+          - generic [ref=e44] [box=50,511,290,58]:
+            - heading "Dauderi" [level=3] [ref=e45] [box=50,511,58,18]
+            - generic [ref=e47] [box=50,539,84,30]: pirms 2 h
+          - generic [ref=e48] [box=50,577,290,17]:
+            - generic [ref=e49] [box=50,577,54,17]: Kontrole
+            - generic [ref=e50] [box=116,577,184,17]: "Pēdējais: Mellow Harbor 589"
+          - generic [ref=e51] [box=50,602,290,17]:
+            - generic [ref=e52] [box=50,602,179,17]: "Kontrole: 4 · Nav kontrole: 0"
+            - generic [ref=e53] [box=241,602,75,17]: 0 komentāri
+      - article [ref=e54] [box=35,633,320,173]:
+        - 'button "Сидят две на Стадионе \"Даугава\" в сторону центра, ждут какой-то транспорт pirms 3 h Kontrole Pēdējais: Granite Signal 228 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e55] [cursor=pointer] [box=50,648,290,143]':
+          - generic [ref=e56] [box=50,648,290,94]:
+            - heading "Сидят две на Стадионе \"Даугава\" в сторону центра, ждут какой-то транспорт" [level=3] [ref=e57] [box=50,648,290,54]
+            - generic [ref=e59] [box=50,712,84,30]: pirms 3 h
+          - generic [ref=e60] [box=50,750,290,17]:
+            - generic [ref=e61] [box=50,750,54,17]: Kontrole
+            - generic [ref=e62] [box=116,750,183,17]: "Pēdējais: Granite Signal 228"
+          - generic [ref=e63] [box=50,775,290,17]:
+            - generic [ref=e64] [box=50,775,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e65] [box=241,775,75,17]: 0 komentāri
+      - article [ref=e66] [box=35,806,320,137]:
+        - 'button "Вышли на Ilūkstes iela pirms 5 h Kontrole Pēdējais: Amber Watcher 144 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e67] [cursor=pointer] [box=50,821,290,107]':
+          - generic [ref=e68] [box=50,821,290,58]:
+            - heading "Вышли на Ilūkstes iela" [level=3] [ref=e69] [box=50,821,172,18]
+            - generic [ref=e71] [box=50,849,84,30]: pirms 5 h
+          - generic [ref=e72] [box=50,887,290,17]:
+            - generic [ref=e73] [box=50,887,54,17]: Kontrole
+            - generic [ref=e74] [box=116,887,190,17]: "Pēdējais: Amber Watcher 144"
+          - generic [ref=e75] [box=50,912,290,17]:
+            - generic [ref=e76] [box=50,912,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e77] [box=241,912,75,17]: 0 komentāri
+      - article [ref=e78] [box=35,943,320,155]:
+        - 'button "Зашли на 3А на Itas Kozakeviča iela в сторону плявников pirms 5 h Kontrole Pēdējais: Amber Watcher 144 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e79] [cursor=pointer] [box=50,958,290,125]':
+          - generic [ref=e80] [box=50,958,290,76]:
+            - heading "Зашли на 3А на Itas Kozakeviča iela в сторону плявников" [level=3] [ref=e81] [box=50,958,290,36]
+            - generic [ref=e83] [box=50,1004,84,30]: pirms 5 h
+          - generic [ref=e84] [box=50,1042,290,17]:
+            - generic [ref=e85] [box=50,1042,54,17]: Kontrole
+            - generic [ref=e86] [box=116,1042,190,17]: "Pēdējais: Amber Watcher 144"
+          - generic [ref=e87] [box=50,1067,290,17]:
+            - generic [ref=e88] [box=50,1067,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e89] [box=241,1067,75,17]: 0 komentāri
+      - article [ref=e90] [box=35,1098,320,137]:
+        - 'button "Зашли на 51А на Dārzciema iela pirms 5 h Kontrole Pēdējais: Amber Watcher 144 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e91] [cursor=pointer] [box=50,1113,290,107]':
+          - generic [ref=e92] [box=50,1113,290,58]:
+            - heading "Зашли на 51А на Dārzciema iela" [level=3] [ref=e93] [box=50,1113,242,18]
+            - generic [ref=e95] [box=50,1141,84,30]: pirms 5 h
+          - generic [ref=e96] [box=50,1179,290,17]:
+            - generic [ref=e97] [box=50,1179,54,17]: Kontrole
+            - generic [ref=e98] [box=116,1179,190,17]: "Pēdējais: Amber Watcher 144"
+          - generic [ref=e99] [box=50,1204,290,17]:
+            - generic [ref=e100] [box=50,1204,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e101] [box=241,1204,75,17]: 0 komentāri
+      - article [ref=e102] [box=35,1235,320,137]:
+        - 'button "Вышли на Dārzciema iela pirms 5 h Kontrole Pēdējais: Amber Watcher 144 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e103] [cursor=pointer] [box=50,1250,290,107]':
+          - generic [ref=e104] [box=50,1250,290,58]:
+            - heading "Вышли на Dārzciema iela" [level=3] [ref=e105] [box=50,1250,192,18]
+            - generic [ref=e107] [box=50,1278,84,30]: pirms 5 h
+          - generic [ref=e108] [box=50,1316,290,17]:
+            - generic [ref=e109] [box=50,1316,54,17]: Kontrole
+            - generic [ref=e110] [box=116,1316,190,17]: "Pēdējais: Amber Watcher 144"
+          - generic [ref=e111] [box=50,1341,290,17]:
+            - generic [ref=e112] [box=50,1341,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e113] [box=241,1341,75,17]: 0 komentāri
+      - article [ref=e114] [box=35,1372,320,137]:
+        - 'button "bus 3 pirms 7 h Kontrole Pēdējais: River Signal 106 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e115] [cursor=pointer] [box=50,1387,290,107]':
+          - generic [ref=e116] [box=50,1387,290,58]:
+            - heading "bus 3" [level=3] [ref=e117] [box=50,1387,41,18]
+            - generic [ref=e119] [box=50,1415,84,30]: pirms 7 h
+          - generic [ref=e120] [box=50,1453,290,17]:
+            - generic [ref=e121] [box=50,1453,54,17]: Kontrole
+            - generic [ref=e122] [box=116,1453,169,17]: "Pēdējais: River Signal 106"
+          - generic [ref=e123] [box=50,1478,290,17]:
+            - generic [ref=e124] [box=50,1478,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e125] [box=241,1478,75,17]: 0 komentāri
+      - article [ref=e126] [box=35,1509,320,137]:
+        - 'button "bus 3 pirms 9 h Kontrole Pēdējais: Cloud Falcon 195 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e127] [cursor=pointer] [box=50,1524,290,107]':
+          - generic [ref=e128] [box=50,1524,290,58]:
+            - heading "bus 3" [level=3] [ref=e129] [box=50,1524,41,18]
+            - generic [ref=e131] [box=50,1552,84,30]: pirms 9 h
+          - generic [ref=e132] [box=50,1590,290,17]:
+            - generic [ref=e133] [box=50,1590,54,17]: Kontrole
+            - generic [ref=e134] [box=116,1590,176,17]: "Pēdējais: Cloud Falcon 195"
+          - generic [ref=e135] [box=50,1615,290,17]:
+            - generic [ref=e136] [box=50,1615,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e137] [box=241,1615,75,17]: 0 komentāri
+      - article [ref=e138] [box=35,1646,320,155]:
+        - 'button "Стоит один на Centrālā Stacija где останавливается 17,30,13 pirms 14 h Kontrole Pēdējais: Amber Watcher 144 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e139] [cursor=pointer] [box=50,1661,290,125]':
+          - generic [ref=e140] [box=50,1661,290,76]:
+            - heading "Стоит один на Centrālā Stacija где останавливается 17,30,13" [level=3] [ref=e141] [box=50,1661,290,36]
+            - generic [ref=e143] [box=50,1707,91,30]: pirms 14 h
+          - generic [ref=e144] [box=50,1745,290,17]:
+            - generic [ref=e145] [box=50,1745,54,17]: Kontrole
+            - generic [ref=e146] [box=116,1745,190,17]: "Pēdējais: Amber Watcher 144"
+          - generic [ref=e147] [box=50,1770,290,17]:
+            - generic [ref=e148] [box=50,1770,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e149] [box=241,1770,75,17]: 0 komentāri
+      - article [ref=e150] [box=35,1801,320,140]:
+        - 'button "E.Smiļǧa iela из центра рейд ❗️❗️❗️ pirms 15 h Kontrole Pēdējais: Silver Scout 566 Kontrole: 2 · Nav kontrole: 0 0 komentāri" [ref=e151] [cursor=pointer] [box=50,1816,290,110]':
+          - generic [ref=e152] [box=50,1816,290,61]:
+            - heading "E.Smiļǧa iela из центра рейд ❗️❗️❗️" [level=3] [ref=e153] [box=50,1816,269,21]
+            - generic [ref=e155] [box=50,1847,91,30]: pirms 15 h
+          - generic [ref=e156] [box=50,1885,290,17]:
+            - generic [ref=e157] [box=50,1885,54,17]: Kontrole
+            - generic [ref=e158] [box=116,1885,168,17]: "Pēdējais: Silver Scout 566"
+          - generic [ref=e159] [box=50,1909,290,17]:
+            - generic [ref=e160] [box=50,1909,179,17]: "Kontrole: 2 · Nav kontrole: 0"
+            - generic [ref=e161] [box=241,1909,75,17]: 0 komentāri
+      - article [ref=e162] [box=35,1941,320,137]:
+        - 'button "bus 22 pirms 17 h Kontrole Pēdējais: Bright Lantern 226 Kontrole: 1 · Nav kontrole: 0 0 komentāri" [ref=e163] [cursor=pointer] [box=50,1956,290,107]':
+          - generic [ref=e164] [box=50,1956,290,58]:
+            - heading "bus 22" [level=3] [ref=e165] [box=50,1956,49,18]
+            - generic [ref=e167] [box=50,1984,91,30]: pirms 17 h
+          - generic [ref=e168] [box=50,2022,290,17]:
+            - generic [ref=e169] [box=50,2022,54,17]: Kontrole
+            - generic [ref=e170] [box=116,2022,182,17]: "Pēdējais: Bright Lantern 226"
+          - generic [ref=e171] [box=50,2046,290,17]:
+            - generic [ref=e172] [box=50,2046,179,17]: "Kontrole: 1 · Nav kontrole: 0"
+            - generic [ref=e173] [box=241,2046,75,17]: 0 komentāri

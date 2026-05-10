@@ -34,6 +34,14 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 	if err != nil {
 		return releaseInfo{}, err
 	}
+	leafletCSSHash, err := hashStaticAsset(static, "leaflet/leaflet.css")
+	if err != nil {
+		return releaseInfo{}, err
+	}
+	leafletJSHash, err := hashStaticAsset(static, "leaflet/leaflet.js")
+	if err != nil {
+		return releaseInfo{}, err
+	}
 	liveClientHash, err := hashOptionalStaticAsset(static, "live-client.js")
 	if err != nil {
 		return releaseInfo{}, err
@@ -51,8 +59,10 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 		AppCSSHash:     appCSSHash,
 		LiveClientHash: liveClientHash,
 		assetHash: map[string]string{
-			"app.js":  appJSHash,
-			"app.css": appCSSHash,
+			"app.js":              appJSHash,
+			"app.css":             appCSSHash,
+			"leaflet/leaflet.css": leafletCSSHash,
+			"leaflet/leaflet.js":  leafletJSHash,
 		},
 	}
 	if liveClientHash != "" {

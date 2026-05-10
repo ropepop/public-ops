@@ -359,6 +359,58 @@ func TestAuthTestRejectsReusedTicketAfterRestart(t *testing.T) {
 	}
 }
 
+func TestAuthTestRouteStaysDisabledOnProductionHost(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionSecretPath := filepath.Join(dir, "session.secret")
+	if err := os.WriteFile(sessionSecretPath, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
+		t.Fatalf("write session secret: %v", err)
+	}
+	testSecretPath := filepath.Join(dir, "test-ticket.secret")
+	if err := os.WriteFile(testSecretPath, []byte("abcdef0123456789abcdef0123456789"), 0o600); err != nil {
+		t.Fatalf("write test ticket secret: %v", err)
+	}
+	privateKeyPath := filepath.Join(dir, "spacetime-test.key")
+	if err := os.WriteFile(privateKeyPath, pemEncodePKCS1PrivateKey(t), 0o600); err != nil {
+		t.Fatalf("write spacetime private key: %v", err)
+	}
+
+	server, err := NewServer(config.Config{
+		BotToken:                           "bot-token",
+		TrainWebEnabled:                    true,
+		TrainWebBindAddr:                   "127.0.0.1",
+		TrainWebPort:                       9317,
+		TrainWebPublicBaseURL:              "https://vilciens.kontrole.info",
+		TrainWebSessionSecretFile:          sessionSecretPath,
+		TrainWebTelegramAuthMaxAgeSec:      300,
+		TrainWebTestLoginEnabled:           true,
+		TrainWebTestUserID:                 7001,
+		TrainWebTestTicketSecretFile:       testSecretPath,
+		TrainWebTestTicketTTLSec:           60,
+		TrainWebSpacetimeHost:              "https://stdb.example.test",
+		TrainWebSpacetimeDatabase:          "train-bot",
+		TrainWebSpacetimeOIDCAudience:      "train-bot-web",
+		TrainWebSpacetimeJWTPrivateKeyFile: privateKeyPath,
+		TrainWebSpacetimeTokenTTLSec:       24 * 60 * 60,
+	}, trainapp.NewService(nil, nil, nil, nil, time.UTC, false), i18n.NewCatalog(), time.UTC)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPost} {
+		req := httptest.NewRequest(method, "/api/v1/auth/test", strings.NewReader(`{}`))
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != http.StatusNotFound {
+			t.Fatalf("%s /auth/test status = %d, want 404 body=%s", method, res.Code, res.Body.String())
+		}
+		if got := res.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("%s /auth/test unexpectedly set cookies: %v", method, got)
+		}
+	}
+}
+
 func TestSessionEndpointReturnsAnonymousWithoutCookie(t *testing.T) {
 	t.Parallel()
 
@@ -1012,7 +1064,7 @@ func TestServeHTTPLegacyPathDeploymentRoutesStillWork(t *testing.T) {
 	}
 }
 
-func TestServeHTTPShellAddsReleaseHeadersAndFingerprintedAssets(t *testing.T) {
+func TestServeHTTPShellAddsSecurityHeadersAndFingerprintedAssets(t *testing.T) {
 	t.Parallel()
 
 	server := newTestServerWithBaseURL(t, "https://example.test/pixel-stack/train")
@@ -1027,17 +1079,22 @@ func TestServeHTTPShellAddsReleaseHeadersAndFingerprintedAssets(t *testing.T) {
 	if got := res.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
 		t.Fatalf("unexpected cache-control: %q", got)
 	}
-	if got := res.Header().Get("X-Train-Bot-Commit"); got != server.release.Commit {
-		t.Fatalf("unexpected commit header: got %q want %q", got, server.release.Commit)
+	for _, header := range []string{
+		"Strict-Transport-Security",
+		"Content-Security-Policy",
+		"X-Frame-Options",
+		"X-Content-Type-Options",
+		"Referrer-Policy",
+		"Permissions-Policy",
+	} {
+		if got := res.Header().Get(header); got == "" {
+			t.Fatalf("missing security header %s", header)
+		}
 	}
-	if got := res.Header().Get("X-Train-Bot-Build-Time"); got != server.release.BuildTime {
-		t.Fatalf("unexpected build time header: got %q want %q", got, server.release.BuildTime)
-	}
-	if got := res.Header().Get("X-Train-Bot-Instance"); got != server.release.Instance {
-		t.Fatalf("unexpected instance header: got %q want %q", got, server.release.Instance)
-	}
-	if got := res.Header().Get("X-Train-Bot-App-Js"); got != server.release.AppJSHash {
-		t.Fatalf("unexpected app.js header: got %q want %q", got, server.release.AppJSHash)
+	for _, header := range []string{"X-Train-Bot-Commit", "X-Train-Bot-Build-Time", "X-Train-Bot-Instance", "X-Train-Bot-App-Js"} {
+		if got := res.Header().Get(header); got != "" {
+			t.Fatalf("unexpected public debug header %s=%q", header, got)
+		}
 	}
 	body := res.Body.String()
 	if !strings.Contains(body, "/pixel-stack/train/assets/app.css?v="+server.release.AppCSSHash) {
@@ -1111,8 +1168,8 @@ func TestServeHTTPAssetCacheHeadersDependOnFingerprint(t *testing.T) {
 	if got := versionedRes.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
 		t.Fatalf("unexpected immutable cache-control: %q", got)
 	}
-	if got := versionedRes.Header().Get("X-Train-Bot-App-Js"); got != server.release.AppJSHash {
-		t.Fatalf("unexpected app.js hash header: got %q want %q", got, server.release.AppJSHash)
+	if got := versionedRes.Header().Get("X-Train-Bot-App-Js"); got != "" {
+		t.Fatalf("unexpected app.js hash header: %q", got)
 	}
 
 	unversionedReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/assets/vendor/leaflet.js", nil)

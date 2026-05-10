@@ -12,9 +12,7 @@ import {
 
 export default {
   ticketId: __t.string(),
-  sessionId: __t.string(),
   displayName: __t.string(),
   page: __t.string(),
   connected: __t.bool(),
-  now: __t.string(),
 };

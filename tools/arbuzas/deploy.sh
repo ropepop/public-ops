@@ -2631,6 +2631,231 @@ validate_remote_portainer_health() {
     portainer
 }
 
+validate_remote_train_public_hardening() {
+  local remote_release_dir="$1"
+
+  validate_remote_probe "${remote_release_dir}" "train public web hardening" \
+    "tmp=\$(mktemp)
+trap 'rm -f \"\${tmp}\"' EXIT
+cat > \"\${tmp}\" <<'PY'
+import json
+import urllib.error
+import urllib.request
+
+root = 'https://${ARBUZAS_TRAIN_BOT_HOSTNAME}'
+
+def request(path, method='GET', body=None):
+    data = None if body is None else body.encode('utf-8')
+    req = urllib.request.Request(root + path, method=method, data=data, headers={'User-Agent': 'curl/8.0'})
+    if body is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
+
+status, headers, body = request('/')
+if status != 200:
+    raise SystemExit(f'root status {status}')
+for header in [
+    'strict-transport-security',
+    'content-security-policy',
+    'x-frame-options',
+    'x-content-type-options',
+    'referrer-policy',
+    'permissions-policy',
+]:
+    if not headers.get(header):
+        raise SystemExit(f'missing security header {header}')
+for header in headers:
+    if header.startswith('x-train-bot-'):
+        raise SystemExit(f'public debug header leaked: {header}')
+
+status, _, health_body = request('/api/v1/health')
+if status != 200:
+    raise SystemExit(f'health status {status}')
+health = json.loads(health_body)
+if set(health) != {'ok'} or health.get('ok') is not True:
+    raise SystemExit(f'health payload is not minimal: {health}')
+
+for path in ['/assets/app.test.js', '/assets/app.js.map', '/assets/live-client.test.js', '/assets/live-client.js']:
+    status, _, _ = request(path)
+    if status == 200:
+        raise SystemExit(f'test-only or unused asset is public: {path}')
+
+status, _, app_js = request('/assets/app.js')
+if status != 200:
+    raise SystemExit(f'app.js status {status}')
+for needle in ['test_ticket', '/auth/test', 'stripTestTicketFromLocation']:
+    if needle in app_js:
+        raise SystemExit(f'production bundle exposes test login string: {needle}')
+
+for path in ['/assets/%2e%2e/app.js', '/assets//app.js']:
+    status, _, _ = request(path)
+    if status != 400:
+        raise SystemExit(f'unsafe path {path} returned {status}, want 400')
+
+for path in ['/', '/assets/app.js']:
+    status, _, _ = request(path, method='POST', body='')
+    if status != 405:
+        raise SystemExit(f'POST {path} returned {status}, want 405')
+
+for method in ['GET', 'HEAD', 'OPTIONS', 'POST']:
+    status, headers, _ = request('/api/v1/auth/test', method=method, body='' if method == 'POST' else None)
+    if status != 404:
+        raise SystemExit(f'{method} /api/v1/auth/test returned {status}, want 404')
+    if headers.get('set-cookie'):
+        raise SystemExit(f'{method} /api/v1/auth/test set a cookie')
+PY
+wait_until_ok python3 \"\${tmp}\"" \
+    train_bot train_tunnel
+}
+
+validate_remote_train_anonymous_data_denial() {
+  local remote_release_dir="$1"
+
+  validate_remote_probe "${remote_release_dir}" "train anonymous direct data access is denied" \
+    "html_tmp=\$(mktemp)
+tmp=\$(mktemp)
+trap 'rm -f \"\${html_tmp}\" \"\${tmp}\"' EXIT
+wait_until_ok compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/' > \"\${html_tmp}\"
+cat > \"\${tmp}\" <<'PY'
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+
+with open(os.environ['TRAIN_PAGE_HTML_FILE'], 'r', encoding='utf-8') as handle:
+    html = handle.read()
+
+host_match = re.search(r'spacetimeHost:\\s*\"([^\"]+)\"', html)
+db_match = re.search(r'spacetimeDatabase:\\s*\"([^\"]+)\"', html)
+if not host_match or not db_match:
+    raise SystemExit('public page did not expose spacetime host/database config')
+spacetime_host = host_match.group(1).rstrip('/')
+database = urllib.parse.quote(db_match.group(1), safe='')
+
+def call(name, args):
+    procedure = urllib.parse.quote(name, safe='')
+    url = f'{spacetime_host}/v1/database/{database}/call/{procedure}'
+    data = json.dumps(args).encode('utf-8')
+    request = urllib.request.Request(url, data=data, method='POST', headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read().decode('utf-8', 'replace')
+            return response.status, body
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode('utf-8', 'replace')
+
+for name, args in [
+    ('trainbot_bootstrap_me', []),
+    ('trainbot_get_current_ride', []),
+    ('trainbot_service_get_schedule', ['1970-01-01']),
+    ('trainbot_service_list_activities', ['', '', '', '']),
+]:
+    status, body = call(name, args)
+    if 200 <= status < 300:
+        raise SystemExit(f'anonymous call unexpectedly succeeded: {name} {status} {body[:200]}')
+PY
+wait_until_ok env TRAIN_PAGE_HTML_FILE=\"\${html_tmp}\" python3 \"\${tmp}\"" \
+    train_bot train_tunnel
+}
+
+validate_remote_satiksme_public_hardening() {
+  local remote_release_dir="$1"
+
+  validate_remote_probe "${remote_release_dir}" "satiksme public web hardening" \
+    "tmp=\$(mktemp)
+trap 'rm -f \"\${tmp}\"' EXIT
+cat > \"\${tmp}\" <<'PY'
+import json
+import urllib.error
+import urllib.request
+
+root = 'https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}'
+
+def request(path, method='GET', body=None):
+    data = None if body is None else body.encode('utf-8')
+    req = urllib.request.Request(root + path, method=method, data=data, headers={'User-Agent': 'curl/8.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
+
+status, headers, _ = request('/')
+if status != 200:
+    raise SystemExit(f'root status {status}')
+for header in [
+    'strict-transport-security',
+    'content-security-policy',
+    'x-frame-options',
+    'x-content-type-options',
+    'referrer-policy',
+    'permissions-policy',
+]:
+    if not headers.get(header):
+        raise SystemExit(f'missing security header {header}')
+for header in headers:
+    if header.startswith('x-satiksme-bot-'):
+        raise SystemExit(f'public debug header leaked: {header}')
+
+status, _, health_body = request('/api/v1/health')
+if status != 200:
+    raise SystemExit(f'health status {status}')
+health = json.loads(health_body)
+for forbidden in ['runtime', 'assets', 'catalog', 'telegram', 'reportDump', 'db', 'web', 'bundle', 'liveSnapshot', 'version']:
+    if forbidden in health:
+        raise SystemExit(f'health payload leaks diagnostics: {forbidden}')
+if 'ok' not in health:
+    raise SystemExit(f'health payload missing ok: {health}')
+
+for path in ['/assets/app.test.js', '/assets/app.js.map']:
+    status, _, _ = request(path)
+    if status == 200:
+        raise SystemExit(f'test-only asset is public: {path}')
+
+for path in ['/assets/%2e%2e/app.js', '/assets//app.js']:
+    status, _, _ = request(path)
+    if status != 400:
+        raise SystemExit(f'unsafe path {path} returned {status}, want 400')
+
+for path in ['/', '/assets/app.js']:
+    status, _, _ = request(path, method='POST', body='')
+    if status != 405:
+        raise SystemExit(f'POST {path} returned {status}, want 405')
+PY
+wait_until_ok python3 \"\${tmp}\"" \
+    satiksme_bot satiksme_tunnel
+}
+
+validate_remote_public_tls_dns_hardening() {
+  local remote_release_dir="$1"
+
+  validate_remote_probe "${remote_release_dir}" "public TLS and DNS hardening" \
+    "wait_until_ok sh -lc '
+      set -e
+      for host in \"${ARBUZAS_TRAIN_BOT_HOSTNAME}\" \"${ARBUZAS_SATIKSME_BOT_HOSTNAME}\"; do
+        if printf \"\" | timeout 10 openssl s_client -tls1 -servername \"\${host}\" -connect \"\${host}:443\" >/dev/null 2>&1; then
+          echo \"TLS 1.0 unexpectedly accepted for \${host}\" >&2
+          exit 1
+        fi
+        if printf \"\" | timeout 10 openssl s_client -tls1_1 -servername \"\${host}\" -connect \"\${host}:443\" >/dev/null 2>&1; then
+          echo \"TLS 1.1 unexpectedly accepted for \${host}\" >&2
+          exit 1
+        fi
+        printf \"\" | timeout 10 openssl s_client -tls1_2 -servername \"\${host}\" -connect \"\${host}:443\" >/dev/null 2>&1
+        printf \"\" | timeout 10 openssl s_client -tls1_3 -servername \"\${host}\" -connect \"\${host}:443\" >/dev/null 2>&1
+        curl -fsS -D - -o /dev/null \"https://\${host}/api/v1/health\" | tr -d \"\\r\" | grep -Fi \"strict-transport-security:\" >/dev/null
+      done
+      dig +short CAA kontrole.info | grep -E \".+\" >/dev/null
+    '" \
+    train_bot train_tunnel satiksme_bot satiksme_tunnel
+}
+
 validate_remote_train_workload_health() {
   local remote_release_dir="$1"
 
@@ -2648,6 +2873,9 @@ validate_remote_train_workload_health() {
   validate_remote_probe "${remote_release_dir}" "train public dashboard feed" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/public/dashboard?limit=3 >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
+  validate_remote_train_public_hardening "${remote_release_dir}"
+  validate_remote_train_anonymous_data_denial "${remote_release_dir}"
+  validate_remote_public_tls_dns_hardening "${remote_release_dir}"
 }
 
 validate_remote_train_dependency_dns() {
@@ -2705,6 +2933,20 @@ validate_remote_satiksme_workload_health() {
   validate_remote_probe "${remote_release_dir}" "satiksme public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
     satiksme_bot satiksme_tunnel
+  validate_remote_probe "${remote_release_dir}" "satiksme local internal health is detailed" \
+    "wait_until_ok compose exec -T satiksme_bot sh -lc 'body=\$(curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/internal/health) && printf %s \"\${body}\" | grep -F runtime >/dev/null && printf %s \"\${body}\" | grep -F assets >/dev/null && printf %s \"\${body}\" | grep -F catalog >/dev/null'" \
+    satiksme_bot satiksme_tunnel
+  validate_remote_probe "${remote_release_dir}" "satiksme public health is minimal" \
+    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; body=\$(curl -fsS \"\${root}/api/v1/health\") && printf %s \"\${body}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version catalogStops; do if printf %s \"\${body}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && livez=\$(curl -fsS \"\${root}/api/v1/livez\") && printf %s \"\${livez}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version; do if printf %s \"\${livez}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/api/v1/internal/health\") && test \"\${code}\" = 404'" \
+    satiksme_bot satiksme_tunnel
+  validate_remote_probe "${remote_release_dir}" "satiksme public security headers and shell assets" \
+    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/root.headers\" -o \"\${tmp}/root.html\" \"\${root}/\" && grep -Fi \"strict-transport-security: max-age=300\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-frame-options: DENY\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-content-type-options: nosniff\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"referrer-policy: strict-origin-when-cross-origin\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"content-security-policy:\" \"\${tmp}/root.headers\" >/dev/null && ! grep -Fi \"x-satiksme-bot-\" \"\${tmp}/root.headers\" >/dev/null && grep -F \"/assets/leaflet/leaflet.js\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"unpkg.com/leaflet\" \"\${tmp}/root.html\" >/dev/null && incidents=\$(curl -fsS \"\${root}/incidents\") && printf %s \"\${incidents}\" | grep -F \"\\\"mode\\\":\\\"public-incidents\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"unpkg.com/leaflet\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-login\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-web-app\" >/dev/null'" \
+    satiksme_bot satiksme_tunnel
+  validate_remote_probe "${remote_release_dir}" "satiksme live snapshots are uncacheable and query-safe" \
+    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/active.headers\" -o \"\${tmp}/active.json\" \"\${root}/transport/live/active.json\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/active.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/active.headers\" >/dev/null && path=\$(sed -n \"s/.*\\\"path\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p\" \"\${tmp}/active.json\" | head -1) && test -n \"\${path}\" && case \"\${path}\" in transport/live/*) ;; *) exit 1 ;; esac && curl -fsS -D \"\${tmp}/snapshot.headers\" -o /dev/null \"\${root}/\${path}\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/snapshot.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/snapshot.headers\" >/dev/null && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/\${path}?cache=split\") && test \"\${code}\" = 404'" \
+    satiksme_bot satiksme_tunnel
+  validate_remote_satiksme_public_hardening "${remote_release_dir}"
+  validate_remote_public_tls_dns_hardening "${remote_release_dir}"
 }
 
 validate_remote_satiksme_dependency_dns() {
@@ -2774,6 +3016,16 @@ validate_remote_ticket_remote_workload_health() {
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote production state backend" \
+    "ticket_state_backend_ok() {
+      file_backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
+      case \"\${file_backend}\" in ''|spacetime|spacetimedb) ;; *) return 1 ;; esac
+      compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PRODUCTION}\" = true && case \"\${TICKET_REMOTE_STATE_BACKEND}\" in spacetime|spacetimedb) exit 0 ;; *) exit 1 ;; esac'
+    }; wait_until_ok ticket_state_backend_ok" \
+    ticket_remote
+  validate_remote_probe "${remote_release_dir}" "ticket-remote public container secrets scoped" \
+    "wait_until_ok compose exec -T ticket_remote sh -lc 'test ! -e /root/.android/adbkey && test ! -e /root/.android/adbkey.pub && test ! -e /root/.android/adb_known_hosts.pb && test ! -d /etc/arbuzas/secrets && test -d /run/secrets/ticket-remote'" \
+    ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket Android simulator ADB ready" \
     "wait_until_ok compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; adb -s ticket_android_sim:5555 get-state >/dev/null 2>/dev/null'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge
@@ -2812,8 +3064,14 @@ validate_remote_ticket_remote_workload_health() {
   validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
     ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote public HTTP redirects to HTTPS" \
+    "wait_until_ok sh -lc 'result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" http://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${result}\" in \"301 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*|\"308 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*) exit 0 ;; *) printf \"%s\\n\" \"\${result}\" >&2; exit 1 ;; esac'" \
+    ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote public safety headers" \
+    "wait_until_ok sh -lc 'headers=\$(curl -fsSI https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null | tr -d \"\\r\"); printf \"%s\\n\" \"\${headers}\" | grep -Fi \"strict-transport-security:\" >/dev/null && printf \"%s\\n\" \"\${headers}\" | grep -Fi \"content-security-policy:\" >/dev/null && printf \"%s\\n\" \"\${headers}\" | grep -Fi \"x-frame-options:\" >/dev/null && printf \"%s\\n\" \"\${headers}\" | grep -Fi \"x-content-type-options:\" >/dev/null'" \
+    ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote auth configured" \
-    "auth_configured_ok() { mode=\$(sed -n 's/^TICKET_REMOTE_AUTH_MODE=//p' /etc/arbuzas/env/ticket-remote.env | tail -1); case \"\${mode}\" in cloudflare|cloudflare-access|cf-access) grep -Eq '^TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_CF_ACCESS_AUDIENCE=.+' /etc/arbuzas/env/ticket-remote.env ;; spacetime|spacetimeauth|oidc) grep -Eq '^TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_SESSION_SIGNING_KEY=.+' /etc/arbuzas/env/ticket-remote.env ;; dev|development|none) ;; *) return 1 ;; esac; }; wait_until_ok auth_configured_ok" \
+    "auth_configured_ok() { mode=\$(sed -n 's/^TICKET_REMOTE_AUTH_MODE=//p' /etc/arbuzas/env/ticket-remote.env | tail -1); case \"\${mode}\" in ''|spacetime|spacetimeauth|oidc) grep -Eq '^TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_SESSION_SIGNING_KEY=.+' /etc/arbuzas/env/ticket-remote.env ;; cloudflare|cloudflare-access|cf-access) grep -Eq '^TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=.+' /etc/arbuzas/env/ticket-remote.env && grep -Eq '^TICKET_REMOTE_CF_ACCESS_AUDIENCE=.+' /etc/arbuzas/env/ticket-remote.env ;; dev|development|none) return 1 ;; *) return 1 ;; esac; }; wait_until_ok auth_configured_ok" \
     ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote runtime OIDC issuer" \
     "runtime_oidc_ok() {
@@ -2833,7 +3091,48 @@ validate_remote_ticket_remote_workload_health() {
     }; wait_until_ok runtime_oidc_ok" \
     ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
-    "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e; binary=/usr/local/bin/ticket-remote; grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1; grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1; grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null; grep -aF \"inputQueueLimit = 30\" \"\${binary}\" >/dev/null; grep -aF \"inputDrainDelayMs = 35\" \"\${binary}\" >/dev/null; grep -aF \"input_result\" \"\${binary}\" >/dev/null; grep -aF \"navigator.wakeLock.request('\\''screen'\\'')\" \"\${binary}\" >/dev/null; grep -aF \"requestFullscreen({ navigationUI: '\\''hide'\\'' })\" \"\${binary}\" >/dev/null; grep -aF \"toolbarCollapseAnchorPx\" \"\${binary}\" >/dev/null; grep -aF -- \"--ticket-viewport-height\" \"\${binary}\" >/dev/null; grep -aF \"gesturechange\" \"\${binary}\" >/dev/null; grep -aF \"dblclick\" \"\${binary}\" >/dev/null; grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null; grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null; grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null; grep -aF \"ctx.drawImage\" \"\${binary}\" >/dev/null; grep -aF \"invalid_tsf2_frame\" \"\${binary}\" >/dev/null'" \
+    "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e
+      binary=/usr/local/bin/ticket-remote
+      grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
+      grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1
+      grep -aE \"localStorage|sessionStorage|ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"type: '\\''quick_claim_tap'\\''\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"runControlMutation\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"claimControl()\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"releaseControl(\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"revokeControl(\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"inputQueueLimit = 30\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"inputDrainDelayMs = 35\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"/api/v1/control-code/request\" \"\${binary}\" >/dev/null
+      grep -aF \"/api/v1/control-code/close\" \"\${binary}\" >/dev/null
+      grep -aF \"control_code_request\" \"\${binary}\" >/dev/null
+      grep -aF \"generate_control_code\" \"\${binary}\" >/dev/null
+      grep -aF \"requestControlCode\" \"\${binary}\" >/dev/null
+      grep -aF \"sanitizeControlDigits\" \"\${binary}\" >/dev/null
+      grep -aF \"navigator.wakeLock.request\" \"\${binary}\" >/dev/null
+      grep -aF \"requestFullscreen\" \"\${binary}\" >/dev/null
+      grep -aF \"toolbarCollapseAnchorPx\" \"\${binary}\" >/dev/null
+      grep -aF -- \"--ticket-viewport-height\" \"\${binary}\" >/dev/null
+      grep -aF \"gesturechange\" \"\${binary}\" >/dev/null
+      grep -aF \"dblclick\" \"\${binary}\" >/dev/null
+      grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null
+      grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null
+      grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null
+      grep -aF \"ctx.drawImage\" \"\${binary}\" >/dev/null
+      grep -aF \"invalid_tsf2_frame\" \"\${binary}\" >/dev/null
+    '" \
     ticket_remote
 }
 

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -90,6 +91,146 @@ func TestServeHTTPPublicShellRoutes(t *testing.T) {
 		}
 		if body := res.Body.String(); !strings.Contains(body, `mode: "`+tc.mode+`"`) {
 			t.Fatalf("%s shell missing %s mode: %s", tc.path, tc.mode, body)
+		}
+	}
+}
+
+func TestServeHTTPAppliesSecurityHeadersWithoutDebugHeaders(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	for _, path := range []string{
+		"/pixel-stack/train",
+		"/pixel-stack/train/api/v1/health",
+		"/pixel-stack/train/assets/app.js",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("%s unexpected status: got %d body=%s", path, res.Code, res.Body.String())
+		}
+		for _, header := range []string{
+			"Strict-Transport-Security",
+			"Content-Security-Policy",
+			"X-Frame-Options",
+			"X-Content-Type-Options",
+			"Referrer-Policy",
+			"Permissions-Policy",
+		} {
+			if res.Header().Get(header) == "" {
+				t.Fatalf("%s missing security header %s", path, header)
+			}
+		}
+		for name := range res.Header() {
+			if strings.HasPrefix(strings.ToLower(name), "x-train-bot-") {
+				t.Fatalf("%s exposed debug header %s=%q", path, name, res.Header().Get(name))
+			}
+		}
+	}
+}
+
+func TestServeHTTPPublicHealthAndReadyAreMinimal(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	for _, path := range []string{
+		"/pixel-stack/train/api/v1/health",
+		"/pixel-stack/train/api/v1/ready",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("%s unexpected status: got %d body=%s", path, res.Code, res.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s decode payload: %v", path, err)
+		}
+		if payload["ok"] != true {
+			t.Fatalf("%s ok = %#v, want true", path, payload["ok"])
+		}
+		for _, forbidden := range []string{
+			"assets",
+			"bundle",
+			"loadedServiceDate",
+			"now",
+			"readinessReason",
+			"runtime",
+			"schedule",
+			"scheduleAvailable",
+			"scheduleError",
+			"scheduleFallbackActive",
+			"scheduleSameDayFresh",
+			"staleLoadedServiceDate",
+			"version",
+		} {
+			if _, ok := payload[forbidden]; ok {
+				t.Fatalf("%s public health exposed %q in payload %#v", path, forbidden, payload)
+			}
+		}
+	}
+}
+
+func TestServeHTTPDoesNotServeProductionOnlyExcludedAssets(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	for _, path := range []string{
+		"/pixel-stack/train/assets/app.test.js",
+		"/pixel-stack/train/assets/external-feed.test.js",
+		"/pixel-stack/train/assets/live-client.test.js",
+		"/pixel-stack/train/assets/live-client.js",
+		"/pixel-stack/train/assets/app.js.map",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code == http.StatusOK {
+			t.Fatalf("%s should not be publicly served, got 200", path)
+		}
+	}
+}
+
+func TestServeHTTPRejectsUnsafeStaticPathsAndUnsupportedMethods(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test/pixel-stack/train")
+	cases := []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{method: http.MethodGet, path: "/pixel-stack/train/assets/%2e%2e/app.js", want: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/pixel-stack/train/assets//app.js", want: http.StatusBadRequest},
+		{method: http.MethodPost, path: "/pixel-stack/train", want: http.StatusMethodNotAllowed},
+		{method: http.MethodPost, path: "/pixel-stack/train/assets/app.js", want: http.StatusMethodNotAllowed},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		if res.Code != tc.want {
+			t.Fatalf("%s %s status = %d, want %d body=%s", tc.method, tc.path, res.Code, tc.want, res.Body.String())
+		}
+	}
+}
+
+func TestProductionAppBundleDoesNotExposeTestLoginStrings(t *testing.T) {
+	t.Parallel()
+
+	body, err := fs.ReadFile(mustStaticSubFS(), "app.js")
+	if err != nil {
+		t.Fatalf("read app bundle: %v", err)
+	}
+	for _, forbidden := range []string{
+		"test_ticket",
+		"/auth/test",
+		"stripTestTicketFromLocation",
+	} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("production app bundle exposes test-login string %q", forbidden)
 		}
 	}
 }
@@ -767,7 +908,7 @@ func TestServeHTTPPublicTrainIncludesRiderCount(t *testing.T) {
 	}
 }
 
-func TestServeHTTPHealthIncludesReleaseMetadata(t *testing.T) {
+func TestServeHTTPHealthIsMinimal(t *testing.T) {
 	t.Parallel()
 
 	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
@@ -782,57 +923,17 @@ func TestServeHTTPHealthIncludesReleaseMetadata(t *testing.T) {
 	if got := res.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
 		t.Fatalf("unexpected cache-control: %q", got)
 	}
-	if got := res.Header().Get("X-Train-Bot-Commit"); got != server.release.Commit {
-		t.Fatalf("unexpected commit header: got %q want %q", got, server.release.Commit)
+	for _, header := range []string{"X-Train-Bot-Commit", "X-Train-Bot-Build-Time", "X-Train-Bot-Instance", "X-Train-Bot-App-Js"} {
+		if got := res.Header().Get(header); got != "" {
+			t.Fatalf("public health exposed debug header %s=%q", header, got)
+		}
 	}
-
-	var payload struct {
-		Ready           bool   `json:"ready"`
-		ReadinessReason string `json:"readinessReason"`
-		Schedule        struct {
-			Available      bool `json:"available"`
-			FallbackActive bool `json:"fallbackActive"`
-			SameDayFresh   bool `json:"sameDayFresh"`
-		} `json:"schedule"`
-		Version struct {
-			Commit    string `json:"commit"`
-			BuildTime string `json:"buildTime"`
-			Dirty     string `json:"dirty"`
-		} `json:"version"`
-		Runtime struct {
-			InstanceID string `json:"instanceId"`
-		} `json:"runtime"`
-		Assets struct {
-			AppJSSha256  string `json:"appJsSha256"`
-			AppCSSSha256 string `json:"appCssSha256"`
-		} `json:"assets"`
-	}
+	var payload map[string]any
 	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode health payload: %v", err)
 	}
-	if payload.Version.Commit != server.release.Commit {
-		t.Fatalf("unexpected version.commit: got %q want %q", payload.Version.Commit, server.release.Commit)
-	}
-	if payload.Version.BuildTime != server.release.BuildTime {
-		t.Fatalf("unexpected version.buildTime: got %q want %q", payload.Version.BuildTime, server.release.BuildTime)
-	}
-	if payload.Version.Dirty != server.release.Dirty {
-		t.Fatalf("unexpected version.dirty: got %q want %q", payload.Version.Dirty, server.release.Dirty)
-	}
-	if payload.Runtime.InstanceID != server.release.Instance {
-		t.Fatalf("unexpected runtime.instanceId: got %q want %q", payload.Runtime.InstanceID, server.release.Instance)
-	}
-	if payload.Assets.AppJSSha256 != server.release.AppJSHash {
-		t.Fatalf("unexpected assets.appJsSha256: got %q want %q", payload.Assets.AppJSSha256, server.release.AppJSHash)
-	}
-	if payload.Assets.AppCSSSha256 != server.release.AppCSSHash {
-		t.Fatalf("unexpected assets.appCssSha256: got %q want %q", payload.Assets.AppCSSSha256, server.release.AppCSSHash)
-	}
-	if !payload.Ready || payload.ReadinessReason != "same-day schedule loaded" {
-		t.Fatalf("expected ready same-day health payload, got %+v", payload)
-	}
-	if !payload.Schedule.Available || !payload.Schedule.SameDayFresh || payload.Schedule.FallbackActive {
-		t.Fatalf("unexpected healthy schedule payload: %+v", payload.Schedule)
+	if len(payload) != 1 || payload["ok"] != true {
+		t.Fatalf("expected minimal public health payload, got %+v", payload)
 	}
 }
 
@@ -858,37 +959,18 @@ func TestServeHTTPReadyReturnsOKDuringAllowedFallback(t *testing.T) {
 		t.Fatalf("expected fallback readiness to succeed, got %d body=%s", res.Code, res.Body.String())
 	}
 	var payload struct {
-		Ready                  bool   `json:"ready"`
-		ReadinessReason        string `json:"readinessReason"`
-		ScheduleAvailable      bool   `json:"scheduleAvailable"`
-		ScheduleFallbackActive bool   `json:"scheduleFallbackActive"`
-		ScheduleSameDayFresh   bool   `json:"scheduleSameDayFresh"`
-		Schedule               struct {
-			RequestedServiceDate string `json:"requestedServiceDate"`
-			EffectiveServiceDate string `json:"effectiveServiceDate"`
-			LoadedServiceDate    string `json:"loadedServiceDate"`
-			FallbackActive       bool   `json:"fallbackActive"`
-			CutoffHour           int    `json:"cutoffHour"`
-		} `json:"schedule"`
+		OK    bool `json:"ok"`
+		Ready bool `json:"ready"`
 	}
 	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode ready payload: %v", err)
 	}
-	if !payload.Ready || payload.ReadinessReason != "previous-day fallback active before cutoff" {
+	if !payload.OK || !payload.Ready {
 		t.Fatalf("unexpected fallback readiness payload: %+v", payload)
-	}
-	if !payload.ScheduleAvailable || !payload.ScheduleFallbackActive || payload.ScheduleSameDayFresh {
-		t.Fatalf("unexpected fallback flags: %+v", payload)
-	}
-	if payload.Schedule.RequestedServiceDate != "2026-02-28" || payload.Schedule.EffectiveServiceDate != serviceDate || payload.Schedule.LoadedServiceDate != serviceDate {
-		t.Fatalf("unexpected fallback schedule dates: %+v", payload.Schedule)
-	}
-	if !payload.Schedule.FallbackActive || payload.Schedule.CutoffHour != 3 {
-		t.Fatalf("unexpected fallback schedule context: %+v", payload.Schedule)
 	}
 }
 
-func TestServeHTTPHealthAndReadyExposeStaleScheduleAfterCutoff(t *testing.T) {
+func TestServeHTTPHealthAndReadyStayMinimalForStaleScheduleAfterCutoff(t *testing.T) {
 	t.Parallel()
 
 	loc, err := time.LoadLocation("Europe/Riga")
@@ -897,9 +979,8 @@ func TestServeHTTPHealthAndReadyExposeStaleScheduleAfterCutoff(t *testing.T) {
 	}
 	loadAt := time.Date(2026, 2, 27, 23, 30, 0, 0, loc)
 	now := time.Date(2026, 2, 28, 4, 0, 0, 0, loc)
-	serviceDate := loadAt.Format("2006-01-02")
 	server, _ := newPublicDataServerWithLoadedSnapshot(t, "https://example.test/pixel-stack/train", now, loadAt, []publicSnapshotTrain{
-		buildPublicSnapshotTrain("train-stale", serviceDate, "Riga", "Jelgava", time.Date(2026, 2, 28, 1, 30, 0, 0, loc)),
+		buildPublicSnapshotTrain("train-stale", loadAt.Format("2006-01-02"), "Riga", "Jelgava", time.Date(2026, 2, 28, 1, 30, 0, 0, loc)),
 	})
 
 	healthReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/health", nil)
@@ -909,29 +990,12 @@ func TestServeHTTPHealthAndReadyExposeStaleScheduleAfterCutoff(t *testing.T) {
 		t.Fatalf("expected liveness endpoint to stay up, got %d body=%s", healthRes.Code, healthRes.Body.String())
 	}
 
-	var healthPayload struct {
-		Ready                  bool   `json:"ready"`
-		ReadinessReason        string `json:"readinessReason"`
-		ScheduleAvailable      bool   `json:"scheduleAvailable"`
-		ScheduleFallbackActive bool   `json:"scheduleFallbackActive"`
-		ScheduleSameDayFresh   bool   `json:"scheduleSameDayFresh"`
-		LoadedServiceDate      string `json:"loadedServiceDate"`
-		StaleLoadedServiceDate string `json:"staleLoadedServiceDate"`
-	}
+	var healthPayload map[string]any
 	if err := json.Unmarshal(healthRes.Body.Bytes(), &healthPayload); err != nil {
 		t.Fatalf("decode health payload: %v", err)
 	}
-	if healthPayload.Ready {
-		t.Fatalf("expected stale after-cutoff health to be not ready, got %+v", healthPayload)
-	}
-	if !strings.Contains(healthPayload.ReadinessReason, "outside the active service window") {
-		t.Fatalf("expected stale readiness reason, got %+v", healthPayload)
-	}
-	if healthPayload.ScheduleAvailable || healthPayload.ScheduleFallbackActive || healthPayload.ScheduleSameDayFresh {
-		t.Fatalf("expected stale schedule flags to be false, got %+v", healthPayload)
-	}
-	if healthPayload.LoadedServiceDate != serviceDate || healthPayload.StaleLoadedServiceDate != serviceDate {
-		t.Fatalf("expected stale loaded service date to be surfaced, got %+v", healthPayload)
+	if len(healthPayload) != 1 || healthPayload["ok"] != true {
+		t.Fatalf("expected minimal health payload, got %+v", healthPayload)
 	}
 
 	readyReq := httptest.NewRequest("GET", "/pixel-stack/train/api/v1/ready", nil)
@@ -939,6 +1003,16 @@ func TestServeHTTPHealthAndReadyExposeStaleScheduleAfterCutoff(t *testing.T) {
 	server.ServeHTTP(readyRes, readyReq)
 	if readyRes.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected stale after-cutoff readiness to fail, got %d body=%s", readyRes.Code, readyRes.Body.String())
+	}
+	var readyPayload struct {
+		OK    bool `json:"ok"`
+		Ready bool `json:"ready"`
+	}
+	if err := json.Unmarshal(readyRes.Body.Bytes(), &readyPayload); err != nil {
+		t.Fatalf("decode ready payload: %v", err)
+	}
+	if readyPayload.OK || readyPayload.Ready {
+		t.Fatalf("expected minimal failed readiness payload, got %+v", readyPayload)
 	}
 }
 

@@ -8,6 +8,10 @@
   --ticket-viewport-height: var(--ticket-stage-height);
   --ticket-viewport-left: 0px;
   --ticket-viewport-top: 0px;
+  --ticket-dialog-width: 100vw;
+  --ticket-dialog-height: var(--ticket-stage-height);
+  --ticket-dialog-left: 0px;
+  --ticket-dialog-top: 0px;
   --ticket-toolbar-anchor: 0px;
   --ticket-controls-offset: 16px;
 }
@@ -153,6 +157,12 @@ body.details-visible .stage {
   pointer-events: none;
 }
 
+body.control-code-result-visible .stage {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
 #screen {
   grid-area: 1 / 1;
   display: block;
@@ -173,7 +183,6 @@ body.details-visible .stage {
   -webkit-tap-highlight-color: transparent;
 }
 
-.quick-claim-spinner,
 .stream-resume-spinner {
   position: absolute;
   left: calc(var(--stream-left, 0px) + 20px);
@@ -185,30 +194,66 @@ body.details-visible .stage {
   pointer-events: none;
   user-select: none;
   -webkit-user-select: none;
-  animation: quickClaimSpinnerRotate 760ms linear infinite;
-}
-
-.quick-claim-spinner {
-  z-index: 3;
+  animation: streamResumeSpinnerRotate 760ms linear infinite;
 }
 
 .stream-resume-spinner {
   z-index: 4;
 }
 
-.quick-claim-spinner[hidden],
 .stream-resume-spinner[hidden] {
   display: none;
 }
 
-@keyframes quickClaimSpinnerRotate {
+.control-code-hotspot,
+.control-code-close-hotspot {
+  position: fixed;
+  top: 0;
+  width: 25vw;
+  height: 25vh;
+  min-height: 120px;
+  z-index: 8;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  opacity: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.control-code-hotspot {
+  left: 0;
+  width: 50vw;
+  height: 25vh;
+}
+
+.control-code-close-hotspot {
+  right: 0;
+  display: none;
+}
+
+body.control-code-result-visible .control-code-close-hotspot {
+  display: block;
+}
+
+.control-code-hotspot:focus,
+.control-code-close-hotspot:focus {
+  outline: none;
+}
+
+body.code-dialog-open .control-code-hotspot,
+body.code-dialog-open .control-code-close-hotspot {
+  pointer-events: none;
+}
+
+@keyframes streamResumeSpinnerRotate {
   to {
     transform: rotate(360deg);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .quick-claim-spinner,
   .stream-resume-spinner {
     animation: none;
   }
@@ -322,8 +367,7 @@ body:not(.details-visible) .panel > * {
   background: #0b1119;
 }
 
-.control-summary,
-.stream-summary {
+.code-summary {
   grid-column: 1 / -1;
 }
 
@@ -373,6 +417,171 @@ body:not(.details-visible) .panel > * {
   color: #d6deea;
   font-size: 13px;
   line-height: 1.4;
+}
+
+.control-code-result {
+  position: fixed;
+  left: var(--ticket-viewport-left, 0px);
+  top: var(--ticket-viewport-top, 0px);
+  z-index: 7;
+  width: var(--ticket-viewport-width, 100vw);
+  height: var(--ticket-viewport-height, var(--ticket-stage-height));
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: #000;
+  color: #eef3f8;
+  text-align: center;
+  overflow: hidden;
+  touch-action: manipulation;
+}
+
+.control-code-result[hidden] {
+  display: none;
+}
+
+.control-code-result-status {
+  width: min(420px, calc(100vw - 36px));
+  border: 1px solid #29405b;
+  border-radius: 8px;
+  padding: 12px 42px 12px 14px;
+  background: rgba(11, 17, 25, .94);
+  color: #d6deea;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.control-code-result[data-status="succeeded"] .control-code-result-status,
+.control-code-result[data-status="succeeded"] .control-code-value,
+.control-code-result[data-status="succeeded"] .panel-detail {
+  display: none;
+}
+
+.control-code-result[data-status="failed"] {
+  place-content: center;
+  background: rgba(0, 0, 0, .82);
+  padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(18px, env(safe-area-inset-left));
+}
+
+.control-code-result[data-status="failed"] .control-code-result-status {
+  color: #ffd8d8;
+}
+
+.control-code-image {
+  grid-area: 1 / 1;
+  width: var(--stream-width, 100vw);
+  height: var(--stream-height, var(--ticket-viewport-height, var(--ticket-stage-height)));
+  max-width: none;
+  max-height: none;
+  object-fit: fill;
+  border-radius: 0;
+  background: #000;
+}
+
+.control-code-value {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  border: 1px solid #2a3a50;
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(16, 23, 32, .94);
+  color: #f4f8fc;
+  font-size: 26px;
+  line-height: 1.15;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.control-code-close,
+.code-dialog-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid #304158;
+  border-radius: 999px;
+  background: #111927;
+  color: #d8e1ed;
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.control-code-close {
+  position: fixed;
+  top: max(10px, env(safe-area-inset-top));
+  right: max(10px, env(safe-area-inset-right));
+  z-index: 9;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+}
+
+.code-dialog {
+  position: fixed;
+  left: var(--ticket-dialog-left, 0px);
+  top: var(--ticket-dialog-top, 0px);
+  z-index: 20;
+  width: var(--ticket-dialog-width, 100vw);
+  height: var(--ticket-dialog-height, 100vh);
+  display: grid;
+  place-items: center;
+  padding: 18px max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(18px, env(safe-area-inset-left));
+  background: rgba(0, 0, 0, .62);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.code-dialog[hidden] {
+  display: none;
+}
+
+.code-dialog-panel {
+  position: relative;
+  width: min(380px, calc(100vw - 36px));
+  display: grid;
+  gap: 14px;
+  border: 1px solid #26364b;
+  border-radius: 8px;
+  padding: 18px;
+  background: #0d121a;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, .42);
+}
+
+.code-dialog-field {
+  display: grid;
+  gap: 8px;
+  color: #d6deea;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.code-dialog-field input {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 12px;
+  font-size: 24px;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.code-dialog-error {
+  min-height: 18px;
+  margin: 0;
+  color: #fca5a5;
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .presence {

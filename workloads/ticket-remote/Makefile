@@ -3,7 +3,7 @@
 SPACETIME ?= $(HOME)/.local/bin/spacetime
 
 run:
-	TICKET_REMOTE_AUTH_MODE=dev go run ./cmd/ticket-remote
+	TICKET_REMOTE_AUTH_MODE=dev TICKET_REMOTE_STATE_BACKEND=memory go run ./cmd/ticket-remote
 
 test:
 	go test ./...

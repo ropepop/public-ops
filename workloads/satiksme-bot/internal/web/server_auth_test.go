@@ -524,8 +524,11 @@ func TestAppRouteUsesPublicWebsiteShell(t *testing.T) {
 		if !strings.Contains(body, "<title>Kontrole</title>") {
 			t.Fatalf("%s body missing updated title: %s", path, body)
 		}
-		if !strings.Contains(body, "https://telegram.org/js/telegram-web-app.js") {
-			t.Fatalf("%s body missing Telegram Web App script: %s", path, body)
+		if !strings.Contains(body, "/assets/leaflet/leaflet.js") || strings.Contains(body, "unpkg.com/leaflet") {
+			t.Fatalf("%s body should load self-hosted Leaflet only: %s", path, body)
+		}
+		if strings.Contains(body, "telegram.org/js/telegram-login") || strings.Contains(body, "telegram-web-app.js") {
+			t.Fatalf("%s body should lazy-load Telegram scripts only after login starts: %s", path, body)
 		}
 		if !strings.Contains(body, `"mode":"public"`) {
 			t.Fatalf("%s body missing public mode: %s", path, body)

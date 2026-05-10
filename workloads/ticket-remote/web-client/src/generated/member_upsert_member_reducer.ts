@@ -14,5 +14,4 @@ export default {
   ticketId: __t.string(),
   email: __t.string(),
   role: __t.string(),
-  now: __t.string(),
 };

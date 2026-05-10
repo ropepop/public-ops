@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	SnapshotPublicPrefix = "transport/live"
-	snapshotActiveName   = "active.json"
-	snapshotFileSuffix   = ".json.js"
+	SnapshotPublicPrefix  = "transport/live"
+	snapshotActiveName    = "active.json"
+	snapshotFileSuffix    = ".json.js"
+	snapshotFormatVersion = "satiksme-live-snapshot-v2"
 )
 
 type SnapshotActiveState struct {
@@ -108,8 +109,11 @@ func (p *SnapshotPublisher) Publish(now time.Time, vehicles []model.LiveVehicle)
 	if err != nil {
 		return nil, fmt.Errorf("marshal live snapshot hash payload: %w", err)
 	}
-	hashSum := sha256.Sum256(canonicalBody)
-	hash := hex.EncodeToString(hashSum[:])
+	hasher := sha256.New()
+	hasher.Write([]byte(snapshotFormatVersion))
+	hasher.Write([]byte{0})
+	hasher.Write(canonicalBody)
+	hash := hex.EncodeToString(hasher.Sum(nil))
 
 	active, err := p.ActiveState()
 	if err != nil {

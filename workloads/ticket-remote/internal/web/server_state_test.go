@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,6 +44,57 @@ func TestAdjustSnapshotTimeUpdatesRemainingControlTime(t *testing.T) {
 	}
 	if snapshot.ActiveControl.RemainingMS != 12000 {
 		t.Fatalf("remaining ms = %d", snapshot.ActiveControl.RemainingMS)
+	}
+}
+
+func TestMemberStateRedactionHidesAdminOnlyDetails(t *testing.T) {
+	snapshot := state.Snapshot{
+		Ticket: state.Ticket{ID: "vivi-default", DisplayName: "ViVi timed ticket", UpdatedAt: "2026-05-08T10:00:00Z"},
+		Members: []state.Member{
+			{Email: "owner@example.test", Role: state.RoleOwner, Active: true},
+			{Email: "viewer@example.test", Role: state.RoleMember, Active: true},
+		},
+		Viewers: []state.Viewer{
+			{SessionID: "secret-session", Email: "viewer@example.test", Connected: true},
+			{SessionID: "secret-session-2", Email: "other@example.test", Connected: true},
+			{SessionID: "secret-session-3", Email: "gone@example.test", Connected: false},
+		},
+		ActiveControl: &state.ControlSession{
+			ID:          "secret-control",
+			SessionID:   "secret-session",
+			Email:       "controller@example.test",
+			ClaimedAt:   "2026-05-08T10:00:00Z",
+			ExpiresAt:   "2026-05-08T10:01:30Z",
+			RemainingMS: 90000,
+		},
+		Phone: &state.PhoneBackend{
+			ID:           "pixel",
+			AttachName:   "Pixel",
+			BaseURL:      "http://ticket_phone_bridge:9388",
+			DesiredState: "streaming",
+			HealthJSON:   `{"secret":true}`,
+			LastError:    "internal",
+			LastSeenAt:   "2026-05-08T10:00:00Z",
+		},
+		ServerTime:   "2026-05-08T10:00:00Z",
+		StateBackend: "spacetime",
+	}
+
+	public := snapshot.PublicForMember("viewer@example.test")
+	body, err := json.Marshal(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, forbidden := range []string{"secret-session", "secret-session-2", "secret-session-3", "secret-control", "owner@example.test", "viewer@example.test", "other@example.test", "gone@example.test", "ticket_phone_bridge", "healthJson", "lastError", `"members"`, `"viewers"`} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("public member state leaked %q in %s", forbidden, text)
+		}
+	}
+	for _, required := range []string{`"viewerCount":2`, `"viewerPresence":[{"label":"Skatītājs 1"},{"label":"Skatītājs 2"}]`, `"activeControl"`, `"ownerEmail":"controller@example.test"`, `"stateBackend":"spacetime"`} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("public member state missing %q in %s", required, text)
+		}
 	}
 }
 

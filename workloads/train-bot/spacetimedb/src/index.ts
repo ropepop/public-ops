@@ -882,15 +882,25 @@ function genericNickname(stableId: string): string {
   return `${adjective} ${noun} ${suffix}`;
 }
 
-function requireUserSession(tx: any) {
+function publicOpaqueId(prefix: string, ...parts: unknown[]): string {
+  const input = parts.map((part) => asString(part).trim()).join('\u001f');
+  let hash = 2166136261 >>> 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return `${prefix}:${hash.toString(16).padStart(8, '0')}`;
+}
+
+function requireAuthenticatedSession(tx: any) {
   const auth = tx.senderAuth;
   if (!auth || !auth.hasJWT || !auth.jwt) {
-    throw new SenderError('telegram auth required');
+    throw new SenderError('auth required');
   }
   const jwt = auth.jwt;
   const stableId = asString(jwt.subject).trim();
   if (!stableId) {
-    throw new SenderError('telegram auth required');
+    throw new SenderError('auth required');
   }
   const payload = (jwt.fullPayload || {}) as ParsedObject;
   const roles = Array.isArray(payload.roles)
@@ -903,19 +913,27 @@ function requireUserSession(tx: any) {
   };
 }
 
+function requireUserSession(tx: any) {
+  const session = requireAuthenticatedSession(tx);
+  if (!session.roles.includes('train_user') || !session.stableId.startsWith('telegram:')) {
+    throw new SenderError('telegram auth required');
+  }
+  return session;
+}
+
 function requireServiceRole(tx: any): void {
-  const session = requireUserSession(tx);
+  const session = requireAuthenticatedSession(tx);
   if (!session.roles.includes('train_service')) {
     throw new SenderError('service role required');
   }
 }
 
 function optionalViewerStableId(tx: any): string {
-  const auth = tx.senderAuth;
-  if (!auth || !auth.hasJWT || !auth.jwt) {
+  try {
+    return requireUserSession(tx).stableId;
+  } catch (_) {
     return '';
   }
-  return asString(auth.jwt.subject).trim();
 }
 
 function telegramUserIdForStableId(stableId: string): string {
@@ -1282,6 +1300,26 @@ function clearRowsByStableId(tableView: any, stableId: string): void {
   for (const row of rowsFrom(tableView.stableId.filter(stableId))) {
     tableView.delete(row);
   }
+}
+
+function deleteProjectedRiderState(tx: any, stableId: string): void {
+  const cleanStableId = asString(stableId).trim();
+  if (!cleanStableId) {
+    return;
+  }
+  tx.db.trainbot_rider_identity.stableId.delete(cleanStableId);
+  tx.db.trainbot_rider_settings.stableId.delete(cleanStableId);
+  tx.db.trainbot_active_checkin.stableId.delete(cleanStableId);
+  tx.db.trainbot_route_checkin.stableId.delete(cleanStableId);
+  tx.db.trainbot_undo_checkout.stableId.delete(cleanStableId);
+  tx.db.trainbot_recent_action_state.stableId.delete(cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_favorite_route, cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_train_mute, cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_train_subscription, cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_incident_vote, cleanStableId);
+  deleteJobsWithPrefix(tx, `rider:${cleanStableId}|`);
+  deleteJobsWithPrefix(tx, routeCheckInJobPrefix(cleanStableId));
+  tx.db.trainbot_rider.stableId.delete(cleanStableId);
 }
 
 function syncRiderProjection(tx: any, rider: any): void {
@@ -2628,16 +2666,22 @@ function incidentDetailPayload(tx: any, incidentId: string) {
     throw new SenderError('not found');
   }
   const viewerStableId = optionalViewerStableId(tx);
-  const timelineEvents = (activity.timeline || []).map((item: any) => ({
-    id: item.id,
+  const timelineEvents = (activity.timeline || []).map((item: any, index: number) => ({
+    id: publicOpaqueId('event', activity.id, item.createdAt, item.kind, index),
     kind: item.kind === 'station_sighting' || item.kind === 'location_report' ? 'report' : item.kind,
     name: item.name,
     detail: item.detail,
     nickname: item.nickname,
     createdAt: item.createdAt,
   }));
-  const commentEvents = (activity.comments || []).map((item: any) => ({
-    id: item.id,
+  const sanitizedComments = (activity.comments || []).map((item: any, index: number) => ({
+    id: publicOpaqueId('comment', activity.id, item.createdAt, index),
+    nickname: item.nickname,
+    body: item.body,
+    createdAt: item.createdAt,
+  }));
+  const commentEvents = sanitizedComments.map((item: any) => ({
+    id: publicOpaqueId('comment-event', activity.id, item.createdAt, item.id),
     kind: 'comment',
     name: incidentCommentActivityLabel(),
     detail: item.body,
@@ -2646,8 +2690,8 @@ function incidentDetailPayload(tx: any, incidentId: string) {
   }));
   const voteEvents = (activity.votes || [])
     .filter((item: any) => asString(item.value).trim().toUpperCase() === 'ONGOING')
-    .map((item: any) => ({
-      id: `${activity.id}|vote|${item.stableId}`,
+    .map((item: any, index: number) => ({
+      id: publicOpaqueId('vote-event', activity.id, item.updatedAt, index),
       kind: 'vote',
       name: incidentVoteEventLabel(item.value),
       nickname: item.nickname,
@@ -2658,7 +2702,7 @@ function incidentDetailPayload(tx: any, incidentId: string) {
   return {
     summary: incidentSummaryPayload(tx, activity, viewerStableId),
     events,
-    comments: (activity.comments || []).slice(),
+    comments: sanitizedComments,
   };
 }
 
@@ -3611,9 +3655,9 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     mapTargetIncidentId: asString(mapTarget.incidentId).trim(),
   });
 
-  for (const event of activity.timeline || []) {
+  for (const [index, event] of (activity.timeline || []).entries()) {
     tx.db.trainbot_incident_event.insert({
-      id: event.id,
+      id: publicOpaqueId('event', incidentId, event.createdAt, event.kind, index),
       incidentId,
       serviceDate: activity.serviceDate,
       kind: event.kind === 'station_sighting' || event.kind === 'location_report' ? 'report' : event.kind,
@@ -3626,7 +3670,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     if (event.kind === 'station_sighting') {
       const createdMs = parseISO(event.createdAt)?.getTime() || 0;
       tx.db.trainbot_public_sighting.insert({
-        id: event.id,
+        id: publicOpaqueId('sighting', incidentId, event.createdAt, index),
         incidentId,
         serviceDate: activity.serviceDate,
         stationId: event.stationId,
@@ -3640,9 +3684,9 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     }
   }
 
-  for (const comment of activity.comments || []) {
+  for (const [index, comment] of (activity.comments || []).entries()) {
     tx.db.trainbot_incident_comment.insert({
-      id: comment.id,
+      id: publicOpaqueId('comment', incidentId, comment.createdAt, index),
       incidentId,
       serviceDate: activity.serviceDate,
       nickname: comment.nickname,
@@ -3651,12 +3695,12 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     });
   }
 
-  for (const vote of activity.votes || []) {
+  for (const [index, vote] of (activity.votes || []).entries()) {
     if (asString(vote.value).trim().toUpperCase() !== 'ONGOING') {
       continue;
     }
     tx.db.trainbot_incident_event.insert({
-      id: `${incidentId}|vote|${vote.stableId}`,
+      id: publicOpaqueId('vote-event', incidentId, vote.updatedAt, index),
       incidentId,
       serviceDate: activity.serviceDate,
       kind: 'vote',
@@ -4749,7 +4793,10 @@ export const serviceGetSchedule = spacetimedb.procedure(
   { name: named('service_get_schedule') },
   { serviceDate: t.string() },
   t.string(),
-  (ctx, { serviceDate }) => ctx.withTx((tx) => serialize(serviceGetSchedulePayload(tx, asString(serviceDate).trim())))
+  (ctx, { serviceDate }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize(serviceGetSchedulePayload(tx, asString(serviceDate).trim()));
+  })
 );
 
 export const serviceListActivities = spacetimedb.procedure(
@@ -4761,15 +4808,18 @@ export const serviceListActivities = spacetimedb.procedure(
     serviceDate: t.string(),
   },
   t.string(),
-  (ctx, { sinceIso, scopeType, subjectId, serviceDate }) => ctx.withTx((tx) => serialize({
-    activities: listActivitiesFiltered(
-      tx,
-      asString(sinceIso).trim(),
-      asString(scopeType).trim(),
-      asString(subjectId).trim(),
-      asString(serviceDate).trim(),
-    ),
-  }))
+  (ctx, { sinceIso, scopeType, subjectId, serviceDate }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize({
+      activities: listActivitiesFiltered(
+        tx,
+        asString(sinceIso).trim(),
+        asString(scopeType).trim(),
+        asString(subjectId).trim(),
+        asString(serviceDate).trim(),
+      ),
+    });
+  })
 );
 
 export const serviceListActiveCheckinUsers = spacetimedb.procedure(
@@ -5443,6 +5493,70 @@ function cleanupExpiredTestLoginTickets(tx: any, nowAt: Date): void {
   }
 }
 
+function isAnonymousViewerStableId(stableId: string): boolean {
+  const cleanStableId = asString(stableId).trim();
+  return cleanStableId !== '' && !cleanStableId.startsWith('telegram:') && !cleanStableId.startsWith('service:');
+}
+
+function activityReferencesStableId(activity: any, stableId: string): boolean {
+  for (const item of [...(activity.timeline || []), ...(activity.comments || []), ...(activity.votes || [])]) {
+    if (asString(item?.stableId).trim() === stableId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function riderHasMeaningfulViewerState(tx: any, rider: any): boolean {
+  const stableId = asString(rider?.stableId).trim();
+  if (!stableId) {
+    return false;
+  }
+  if (rider.currentRide || rider.undoRide || rider.recentActionState) {
+    return true;
+  }
+  if ((rider.favorites || []).length || (rider.mutes || []).length || (rider.subscriptions || []).length) {
+    return true;
+  }
+  if (tx.db.trainbot_active_checkin.stableId.find(stableId) || tx.db.trainbot_route_checkin.stableId.find(stableId)) {
+    return true;
+  }
+  if (tx.db.trainbot_undo_checkout.stableId.find(stableId) || tx.db.trainbot_recent_action_state.stableId.find(stableId)) {
+    return true;
+  }
+  if (rowsFrom(tx.db.trainbot_favorite_route.stableId.filter(stableId)).length > 0) {
+    return true;
+  }
+  if (rowsFrom(tx.db.trainbot_train_mute.stableId.filter(stableId)).length > 0) {
+    return true;
+  }
+  if (rowsFrom(tx.db.trainbot_train_subscription.stableId.filter(stableId)).length > 0) {
+    return true;
+  }
+  if (rowsFrom(tx.db.trainbot_incident_vote.stableId.filter(stableId)).length > 0) {
+    return true;
+  }
+  for (const activity of rowsFrom(tx.db.trainbot_activity.iter())) {
+    if (activityReferencesStableId(activity, stableId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cleanupEmptyAnonymousViewerState(tx: any): number {
+  let deleted = 0;
+  for (const rider of rowsFrom(tx.db.trainbot_rider.iter())) {
+    const stableId = asString(rider?.stableId).trim();
+    if (!isAnonymousViewerStableId(stableId) || riderHasMeaningfulViewerState(tx, rider)) {
+      continue;
+    }
+    deleteProjectedRiderState(tx, stableId);
+    deleted += 1;
+  }
+  return deleted;
+}
+
 export const cleanupExpiredState = spacetimedb.reducer(
   { name: named('cleanup_expired_state') },
   {
@@ -5462,6 +5576,7 @@ export const cleanupExpiredState = spacetimedb.reducer(
 
     const policy = cleanupRetentionPolicy(ctx);
     const riderCleanup = cleanupExpiredProjectedRiderState(ctx, nowAt);
+    const anonymousViewersDeleted = cleanupEmptyAnonymousViewerState(ctx);
     let reportsDeleted = 0;
     let stationSightingsDeleted = 0;
     const rawCleanup = applyStoredCleanupRetentionIfDue(ctx, policy, nowAt);
@@ -5490,6 +5605,7 @@ export const cleanupExpiredState = spacetimedb.reducer(
       feedEventsDeleted: rawCleanup.feedEventsDeleted,
       feedImportsDeleted: rawCleanup.feedImportsDeleted,
       importChunksDeleted: rawCleanup.importChunksDeleted,
+      anonymousViewersDeleted,
     };
     writeCleanupSummary(ctx, summary);
     writeRuntimeState(ctx);

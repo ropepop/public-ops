@@ -3388,7 +3388,6 @@
       .then(function () {
         startLiveMapPolling();
       })
-      .then(requestLocation)
       .catch(function (error) {
         setStatus(error.message || "Failed to load");
       });

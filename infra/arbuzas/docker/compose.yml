@@ -28,6 +28,7 @@ services:
       TRAIN_WEB_PUBLIC_BASE_URL: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}
       TRAIN_WEB_SPACETIME_OIDC_ISSUER: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc
       TRAIN_RUNTIME_SPACETIME_OIDC_ISSUER: https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc
+      TRAIN_WEB_TEST_LOGIN_ENABLED: "false"
       SCHEDULE_DIR: /srv/train-bot/data/schedules
       SCRAPER_OUTPUT_DIR: /srv/train-bot/data/schedules
       TRAIN_WEB_BUNDLE_DIR: /srv/train-bot/data/public-bundles
@@ -47,6 +48,7 @@ services:
         export TRAIN_WEB_PUBLIC_BASE_URL="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}"
         export TRAIN_WEB_SPACETIME_OIDC_ISSUER="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc"
         export TRAIN_RUNTIME_SPACETIME_OIDC_ISSUER="https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc"
+        export TRAIN_WEB_TEST_LOGIN_ENABLED="false"
         export SCHEDULE_DIR="/srv/train-bot/data/schedules"
         export SCRAPER_OUTPUT_DIR="/srv/train-bot/data/schedules"
         export TRAIN_WEB_BUNDLE_DIR="/srv/train-bot/data/public-bundles"
@@ -316,8 +318,10 @@ services:
       TZ: ${ARBUZAS_TZ}
       TICKET_REMOTE_BIND_ADDR: 0.0.0.0
       TICKET_REMOTE_PORT: ${ARBUZAS_TICKET_REMOTE_PORT}
+      TICKET_REMOTE_PRODUCTION: "true"
       TICKET_REMOTE_PUBLIC_BASE_URL: https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}
       TICKET_REMOTE_AUTH_MODE: ${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}
+      TICKET_REMOTE_STATE_BACKEND: spacetime
       TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN: ${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}
       TICKET_REMOTE_CF_ACCESS_AUDIENCE: ${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}
       TICKET_REMOTE_SPACETIME_AUTH_ISSUER: ${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
@@ -342,8 +346,10 @@ services:
         set +a
         export TICKET_REMOTE_BIND_ADDR="0.0.0.0"
         export TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT}"
+        export TICKET_REMOTE_PRODUCTION="$${TICKET_REMOTE_PRODUCTION:-true}"
         export TICKET_REMOTE_PUBLIC_BASE_URL="https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}"
         export TICKET_REMOTE_AUTH_MODE="$${TICKET_REMOTE_AUTH_MODE:-spacetime}"
+        export TICKET_REMOTE_STATE_BACKEND="$${TICKET_REMOTE_STATE_BACKEND:-spacetime}"
         export TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN="$${TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}"
         export TICKET_REMOTE_CF_ACCESS_AUDIENCE="$${TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}"
         export TICKET_REMOTE_SPACETIME_AUTH_ISSUER="$${TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}"
@@ -383,10 +389,7 @@ services:
     volumes:
       - /srv/arbuzas/ticket-remote:/srv/ticket-remote
       - /etc/arbuzas/env/ticket-remote.env:/srv/ticket-remote/.env:ro
-      - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
-      - /etc/arbuzas/secrets/android-adb/adbkey:/root/.android/adbkey:ro
-      - /etc/arbuzas/secrets/android-adb/adbkey.pub:/root/.android/adbkey.pub:ro
-      - /etc/arbuzas/secrets/android-adb/adb_known_hosts.pb:/root/.android/adb_known_hosts.pb:ro
+      - /etc/arbuzas/secrets/ticket-remote:/run/secrets/ticket-remote:ro
 
   train_tunnel:
     image: ${ARBUZAS_CLOUDFLARED_IMAGE}

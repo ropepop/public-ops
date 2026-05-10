@@ -19,7 +19,7 @@ import (
 func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1}`))
 	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
 	delta := append([]byte{'T', 'S', 'F', '2', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2}, []byte{0x41, 0x9a}...)
 	hub.recordFrame(key)
@@ -58,7 +58,7 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1}`))
 	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
 	hub.recordFrame(key)
 	hub.recordClientTelemetry("h264_decoder_mode", "avc_adapter_configured")
@@ -76,7 +76,7 @@ func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1}`))
 	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
 	hub.recordFrame(key)
 	for _, event := range []string{
@@ -103,7 +103,7 @@ func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
 
 func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true}`))
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1}`))
 	key := append([]byte{'T', 'S', 'F', '2', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, []byte{0x65, 0x88}...)
 	hub.recordFrame(key)
 
@@ -114,6 +114,27 @@ func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
 	}
 	if snapshot["streamVerdict"] != "live" {
 		t.Fatalf("fresh streaming frames should stay live during client count race, got %q", snapshot["streamVerdict"])
+	}
+}
+
+func TestDirectStreamWarmStartRejectsStoppedOrStaleFrames(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":0}`))
+	hub.recordFrame(testTSF2KeyFrameWithEpoch(0, 1, true))
+
+	if config, keyFrame := hub.warmStart(); len(config) > 0 || len(keyFrame) > 0 {
+		t.Fatalf("stopped stream should not warm-start stale media: config=%q key=%x", string(config), keyFrame)
+	}
+
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
+	hub.recordFrame(testTSF2KeyFrameWithEpoch(7, 1, true))
+	hub.mu.Lock()
+	hub.lastFrameAt = time.Now().Add(-10 * time.Second)
+	hub.lastKeyFrameAt = time.Now().Add(-10 * time.Second)
+	hub.mu.Unlock()
+
+	if config, keyFrame := hub.warmStart(); len(config) > 0 || len(keyFrame) > 0 {
+		t.Fatalf("old stream should not warm-start stale media: config=%q key=%x", string(config), keyFrame)
 	}
 }
 
@@ -151,6 +172,28 @@ func TestHealthReportsHTTPSH264Stream(t *testing.T) {
 	}
 	if _, ok := direct["streamVerdict"]; !ok {
 		t.Fatalf("directStream missing streamVerdict: %#v", direct)
+	}
+}
+
+func testTSF2KeyFrameWithEpoch(epoch uint64, sequence uint64, keyFrame bool) []byte {
+	frame := make([]byte, 29)
+	frame[0] = 'T'
+	frame[1] = 'S'
+	frame[2] = 'F'
+	frame[3] = '2'
+	if keyFrame {
+		frame[4] = 1
+	}
+	putUint64(frame[5:13], epoch)
+	putUint64(frame[13:21], sequence)
+	putUint64(frame[21:29], sequence)
+	return append(frame, 0x65, 0x88)
+}
+
+func putUint64(dst []byte, value uint64) {
+	for i := 7; i >= 0; i-- {
+		dst[i] = byte(value)
+		value >>= 8
 	}
 }
 

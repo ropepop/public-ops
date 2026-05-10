@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -110,5 +111,29 @@ func TestCloudflareAccessAuthModeLoads(t *testing.T) {
 	}
 	if cfg.Access.TeamDomain != "team.example.cloudflareaccess.com" || cfg.Access.Audience != "audience-tag" {
 		t.Fatalf("access config = %#v", cfg.Access)
+	}
+}
+
+func TestProductionModeRejectsDevAuth(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_PRODUCTION", "true")
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_STATE_BACKEND", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_DATABASE", "ticket_remote")
+	t.Setenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", "test-token")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "production auth mode") {
+		t.Fatalf("expected production auth rejection, got %v", err)
+	}
+}
+
+func TestProductionModeRequiresSpacetimeState(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_PRODUCTION", "true")
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", "client_test")
+	t.Setenv("TICKET_REMOTE_SESSION_SIGNING_KEY", "test-signing-key")
+	t.Setenv("TICKET_REMOTE_STATE_BACKEND", "memory")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "production state backend") {
+		t.Fatalf("expected production state rejection, got %v", err)
 	}
 }

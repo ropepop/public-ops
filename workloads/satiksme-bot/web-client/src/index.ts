@@ -1,4 +1,4 @@
-import { DbConnection, tables } from "./generated/index";
+import { DbConnection, tables } from "./public-bindings";
 
 type SessionLike = {
   token?: string;

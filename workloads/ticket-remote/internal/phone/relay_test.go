@@ -304,6 +304,90 @@ func TestRelayWebsocketStartDoesNotWaitForHTTPStartFallback(t *testing.T) {
 	}
 }
 
+func TestRelayRecoveryStartUsesCallerTimeoutAndReconnects(t *testing.T) {
+	startRequests := make(chan struct{}, 2)
+	releaseStart := make(chan struct{})
+	controlClosed := make(chan struct{}, 1)
+	videoClosed := make(chan struct{}, 1)
+	defer close(releaseStart)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			startRequests <- struct{}{}
+			select {
+			case <-releaseStart:
+				w.WriteHeader(http.StatusOK)
+			case <-r.Context().Done():
+			}
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			_, _, _ = conn.Read(ctx)
+			<-ctx.Done()
+			controlClosed <- struct{}{}
+		case "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept video websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			_, _, _ = conn.Read(ctx)
+			<-ctx.Done()
+			videoClosed <- struct{}{}
+		case "/api/v1/session/stop":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL:           server.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+	})
+	relay.AddViewer()
+	defer relay.Close()
+
+	select {
+	case <-startRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial HTTP start fallback was not issued")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := relay.StartPhoneSession(ctx); err == nil {
+		t.Fatal("expected bounded recovery start to time out")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("recovery start ignored caller timeout: %v", elapsed)
+	}
+	relay.Reconnect("test_recovery_timeout")
+
+	select {
+	case <-controlClosed:
+	case <-time.After(time.Second):
+		t.Fatal("control websocket was not closed during recovery reconnect")
+	}
+	select {
+	case <-videoClosed:
+	case <-time.After(time.Second):
+		t.Fatal("video websocket was not closed during recovery reconnect")
+	}
+}
+
 func TestRelaySwitchBackendUpdatesSnapshot(t *testing.T) {
 	oldBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/session/stop" {

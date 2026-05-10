@@ -43,45 +43,6 @@
     }[ch]));
   }
 
-  function browserStorage(kind, key) {
-    try {
-      return kind === 'session' ? window.sessionStorage : window.localStorage;
-    } catch (error) {
-      reportClientFault('browser_storage_unavailable', `${key || kind}:${error && error.message || 'storage unavailable'}`);
-      return null;
-    }
-  }
-
-  function storageGet(kind, key) {
-    try {
-      const storage = browserStorage(kind, key);
-      return storage ? storage.getItem(key) || '' : '';
-    } catch (error) {
-      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'read failed'}`);
-      return '';
-    }
-  }
-
-  function storageSet(kind, key, value) {
-    try {
-      const storage = browserStorage(kind, key);
-      if (storage) storage.setItem(key, value);
-      return true;
-    } catch (error) {
-      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'write failed'}`);
-      return false;
-    }
-  }
-
-  function storageRemove(kind, key) {
-    try {
-      const storage = browserStorage(kind, key);
-      if (storage) storage.removeItem(key);
-    } catch (error) {
-      reportClientFault('browser_storage_unavailable', `${key}:${error && error.message || 'remove failed'}`);
-    }
-  }
-
   function showFatalPage(message) {
     try {
       document.body.className = 'auth-error-page';
@@ -109,18 +70,12 @@
     history.scrollRestoration = 'manual';
   }
 
-  const spacetimeTokenKey = 'ticket_remote_spacetime_token';
-  const spacetimeTokenExpiryKey = 'ticket_remote_spacetime_token_expires_at';
-  const pkceVerifierKey = 'ticket_remote_pkce_verifier';
-  const pkceStateKey = 'ticket_remote_pkce_state';
-  const pkceVerifierSharedKey = 'ticket_remote_pkce_verifier_shared';
-  const pkceStateSharedKey = 'ticket_remote_pkce_state_shared';
-  const authReturnToKey = 'ticket_remote_auth_return_to';
-
   let spacetimeClient = null;
   let spacetimeClientStatus = 'idle';
   let spacetimeDirectUnavailable = false;
   let spacetimeDirectUnavailableLogged = false;
+  let directSpacetimeToken = '';
+  let directSpacetimeTokenExpiresAt = 0;
 
   if (!cfg.authenticated) {
     startAuthRedirect();
@@ -154,25 +109,32 @@
   const startStreamButton = requireElement('#startStream', 'startStream');
   const emptyMessage = requireElement('#emptyMessage', 'emptyMessage');
   if (!emptyState || !startStreamButton || !emptyMessage) return;
-  const quickClaimSpinner = document.getElementById('quickClaimSpinner');
   const streamResumeSpinner = document.getElementById('streamResumeSpinner');
   const connectionState = requireElement('#connectionState', 'connectionState');
   const statusLine = requireElement('#statusLine', 'statusLine');
   if (!connectionState || !statusLine) return;
   const panel = document.getElementById('panel');
   const presence = requireElement('#presence', 'presence');
-  const claimButton = requireElement('#claimControl', 'claimControl');
-  const extendButton = requireElement('#extendControl', 'extendControl');
-  const releaseButton = requireElement('#releaseControl', 'releaseControl');
-  if (!presence || !claimButton || !extendButton || !releaseButton) return;
-  const timer = document.getElementById('timer');
-  const controlOwner = document.getElementById('controlOwner');
-  const controlMode = document.getElementById('controlMode');
-  const controlTimeDetail = document.getElementById('controlTimeDetail');
+  const requestCodeButton = requireElement('#requestControlCode', 'requestControlCode');
+  const codeRequestState = requireElement('#codeRequestState', 'codeRequestState');
+  const codeRequestDetail = requireElement('#codeRequestDetail', 'codeRequestDetail');
+  const codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog');
+  const codeForm = requireElement('#controlCodeForm', 'controlCodeForm');
+  const codeDigits = requireElement('#controlCodeDigits', 'controlCodeDigits');
+  const codeSubmit = requireElement('#controlCodeSubmit', 'controlCodeSubmit');
+  const codeDialogClose = requireElement('#controlCodeDialogClose', 'controlCodeDialogClose');
+  const codeError = requireElement('#controlCodeError', 'controlCodeError');
+  const codeResultArea = requireElement('#controlCodeResultArea', 'controlCodeResultArea');
+  const codeResultStatus = requireElement('#controlCodeResultStatus', 'controlCodeResultStatus');
+  const codeResultImage = requireElement('#controlCodeResultImage', 'controlCodeResultImage');
+  const codeResultValue = requireElement('#controlCodeResultValue', 'controlCodeResultValue');
+  const codeResultTimer = requireElement('#controlCodeResultTimer', 'controlCodeResultTimer');
+  const codeResultClose = requireElement('#closeControlCodeResult', 'closeControlCodeResult');
+  const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');
+  const controlCodeCloseHotspot = requireElement('#controlCodeCloseHotspot', 'controlCodeCloseHotspot');
+  if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultStatus || !codeResultImage || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot || !controlCodeCloseHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
-  const streamStateLabel = document.getElementById('streamStateLabel');
-  const streamStateDetail = document.getElementById('streamStateDetail');
 
   let ws = null;
   let videoWs = null;
@@ -217,17 +179,10 @@
   let lastFallbackFrameAt = 0;
   let latestStreamStatus = null;
   let lastStreamStatusAt = 0;
-  let claimPromise = null;
-  let quickClaimSpinnerInputId = '';
-  let quickClaimSpinnerTimeout = null;
-  let quickClaimSpinnerPending = false;
-  let ticketInUseSpinnerActive = false;
-  let lastSelfControl = false;
-  let lastActiveControlEmail = '';
-  let localControlSendGraceUntil = 0;
-  let inputSeq = 0;
-  let inputInFlight = null;
-  let inputDrainTimer = null;
+  let codeRequest = null;
+  let codeDialogOpen = false;
+  let codeResultTickTimer = null;
+  let stableViewport = null;
   let screenEngaged = false;
   let screenWakeLock = null;
   let screenWakeLockRequesting = false;
@@ -235,12 +190,6 @@
   let ticketFullscreenAttempted = false;
   let toolbarAnchorLogged = false;
   const intentionallyClosedVideoSockets = new WeakSet();
-  const inputQueue = [];
-  const inputQueueLimit = 30;
-  const inputDrainDelayMs = 35;
-  const inputAckTimeoutMs = 1800;
-  const inputRetryLimit = 1;
-  const quickClaimSpinnerTimeoutMs = 8000;
   let lastTouchEndAt = 0;
   let lastTouchEndX = 0;
   let lastTouchEndY = 0;
@@ -263,29 +212,66 @@
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
   const doubleTapSuppressMs = 420;
   const doubleTapSuppressPx = 28;
-  const quickClaimMaxX = 0.25;
-  const quickClaimMaxY = 0.25;
-  const controlCodeButtonMinX = 0.04;
-  const controlCodeButtonMaxX = 0.45;
-  const controlCodeButtonMinY = 0.10;
-  const controlCodeButtonMaxY = 0.18;
 
-  function ticketViewportRect() {
+  function layoutViewportRect() {
     const fallbackWidth = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || 1));
     const fallbackHeight = Math.max(1, Math.round(window.innerHeight || document.documentElement.clientHeight || 1));
+    return { width: fallbackWidth, height: fallbackHeight, offsetLeft: 0, offsetTop: 0 };
+  }
+
+  function visualViewportRect() {
+    const fallback = layoutViewportRect();
     if (window.visualViewport) {
       return {
-        width: Math.max(1, Math.round(window.visualViewport.width || fallbackWidth)),
-        height: Math.max(1, Math.round(window.visualViewport.height || fallbackHeight)),
+        width: Math.max(1, Math.round(window.visualViewport.width || fallback.width)),
+        height: Math.max(1, Math.round(window.visualViewport.height || fallback.height)),
         offsetLeft: Math.round(window.visualViewport.offsetLeft || 0),
         offsetTop: Math.round(window.visualViewport.offsetTop || 0)
       };
     }
-    return { width: fallbackWidth, height: fallbackHeight, offsetLeft: 0, offsetTop: 0 };
+    return fallback;
+  }
+
+  function ticketViewportRect() {
+    return visualViewportRect();
+  }
+
+  function keyboardLikelyOpen(layout, visual) {
+    const active = document.activeElement;
+    const inputFocused = active && (active === codeDigits || codeDialog.contains(active));
+    return Boolean(
+      codeDialogOpen &&
+      inputFocused &&
+      visual.height > 0 &&
+      layout.height - visual.height >= Math.max(120, layout.height * 0.18)
+    );
+  }
+
+  function stableStageViewportRect() {
+    const layout = layoutViewportRect();
+    const visual = visualViewportRect();
+    const keyboardOpen = keyboardLikelyOpen(layout, visual);
+    if (!stableViewport || !keyboardOpen) {
+      stableViewport = {
+        width: Math.max(layout.width, visual.width),
+        height: Math.max(layout.height, visual.height),
+        offsetLeft: keyboardOpen ? 0 : visual.offsetLeft,
+        offsetTop: keyboardOpen ? 0 : visual.offsetTop
+      };
+    } else {
+      stableViewport = {
+        width: Math.max(stableViewport.width, layout.width),
+        height: Math.max(stableViewport.height, layout.height),
+        offsetLeft: 0,
+        offsetTop: 0
+      };
+    }
+    document.body.classList.toggle('keyboard-active', keyboardOpen);
+    return keyboardOpen ? stableViewport : visual;
   }
 
   function viewportHeight() {
-    return ticketViewportRect().height;
+    return stableStageViewportRect().height;
   }
 
   function toolbarCollapseAnchorPx() {
@@ -293,12 +279,17 @@
   }
 
   function updateViewportVars() {
-    const viewport = ticketViewportRect();
-    document.documentElement.style.setProperty('--ticket-stage-height', `${viewport.height}px`);
-    document.documentElement.style.setProperty('--ticket-viewport-width', `${viewport.width}px`);
-    document.documentElement.style.setProperty('--ticket-viewport-height', `${viewport.height}px`);
-    document.documentElement.style.setProperty('--ticket-viewport-left', `${viewport.offsetLeft}px`);
-    document.documentElement.style.setProperty('--ticket-viewport-top', `${viewport.offsetTop}px`);
+    const stageViewport = stableStageViewportRect();
+    const dialogViewport = visualViewportRect();
+    document.documentElement.style.setProperty('--ticket-stage-height', `${stageViewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-width', `${stageViewport.width}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-height', `${stageViewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-left', `${stageViewport.offsetLeft}px`);
+    document.documentElement.style.setProperty('--ticket-viewport-top', `${stageViewport.offsetTop}px`);
+    document.documentElement.style.setProperty('--ticket-dialog-width', `${dialogViewport.width}px`);
+    document.documentElement.style.setProperty('--ticket-dialog-height', `${dialogViewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-dialog-left', `${dialogViewport.offsetLeft}px`);
+    document.documentElement.style.setProperty('--ticket-dialog-top', `${dialogViewport.offsetTop}px`);
     document.documentElement.style.setProperty('--ticket-toolbar-anchor', `${screenEngaged ? toolbarCollapseAnchorPx() : 0}px`);
   }
 
@@ -313,6 +304,10 @@
   }
 
   function keepFirstScreenPinned(force) {
+    if (codeDialogOpen && document.activeElement === codeDigits) {
+      updateDetailsReveal();
+      return;
+    }
     if (force) {
       document.body.classList.remove('details-visible');
       if (panel) panel.setAttribute('aria-hidden', 'true');
@@ -421,9 +416,21 @@
     requestScreenWakeLock(reason || 'gesture');
   }
 
+  function isControlCodeUiEventTarget(target) {
+    if (!target || target === document || target === window) return false;
+    return Boolean(
+      controlCodeHotspot.contains(target) ||
+      controlCodeCloseHotspot.contains(target) ||
+      requestCodeButton.contains(target) ||
+      codeDialog.contains(target) ||
+      codeResultArea.contains(target)
+    );
+  }
+
   function handleScreenEngagementEvent(event) {
     if (event && event.type === 'keydown' && (event.metaKey || event.ctrlKey || event.altKey)) return;
     if (event && event.isTrusted === false) return;
+    if (event && isControlCodeUiEventTarget(event.target)) return;
     engageTicketScreen(event && event.type || 'gesture');
   }
 
@@ -465,7 +472,6 @@
 
   function setConnected(text) {
     connectionState.textContent = text;
-    renderStreamSummary();
   }
 
   function safeWebSocket(url, label) {
@@ -498,10 +504,21 @@
     ['Unavailable', 'Nav pieejams'],
     ['Connection failed', 'Savienojums neizdevās'],
     ['Video connection failed', 'Video savienojums neizdevās'],
-    ['control_claimed', 'Kontrole jau ir pārņemta'],
-    ['no_control', 'Nav aktīvas kontroles sesijas'],
-    ['not_controller', 'Šo kontroles sesiju pārvalda cits lietotājs'],
-    ['already_extended', 'Sesija jau ir pagarināta']
+    ['control_mode_removed', 'Kontroles režīms ir aizstāts ar koda pieprasījumiem'],
+    ['invalid_code', 'Ievadi 2-9 ciparus'],
+    ['rate_limited', 'Minūtē var pieprasīt divus kodus'],
+    ['phone_timeout', 'Tālrunis nepaspēja izveidot kodu'],
+    ['phone_unavailable', 'Tālrunis pašlaik nav pieejams'],
+    ['control_code_result_timeout', 'Tālrunis nepaspēja izveidot kodu'],
+    ['control_code_not_generated', 'Tālrunis neatgrieza ģenerētu kodu'],
+    ['control_code_submit_returned_no_result', 'ViVi neatgrieza ģenerētu kodu'],
+    ['control_code_submit_timeout', 'ViVi neapstiprināja kodu laikā'],
+    ['control_code_request_hierarchy_unavailable', 'Tālrunis atjauno biļetes skatu. Mēģini vēlreiz.'],
+    ['control_code_request_preflight_cleanup_failed', 'Tālrunis vēl atgriežas pie biļetes. Mēģini vēlreiz.'],
+    ['control_code_request_previous_result_cleanup_failed', 'Iepriekšējais kods vēl aizveras. Mēģini vēlreiz.'],
+    ['control_code_cleanup_attention_needed', 'Tālrunim vajag mirkli, lai atgrieztos pie biļetes'],
+    ['control_code_image_capture_failed', 'Neizdevās nofotografēt ģenerēto kodu'],
+    ['extension_disabled', 'Pagarināšana ir izslēgta']
   ]);
 
   function localizePublicMessage(value) {
@@ -524,18 +541,9 @@
     return text;
   }
 
-  function randomBase64Url(bytes) {
-    const data = new Uint8Array(bytes);
-    crypto.getRandomValues(data);
-    return base64Url(data);
-  }
-
-  function base64Url(data) {
-    let text = '';
-    for (let i = 0; i < data.length; i += 1) {
-      text += String.fromCharCode(data[i]);
-    }
-    return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  function isTechnicalPublicStatusMessage(value) {
+    const text = String(value || '').trim();
+    return /\b(ffmpeg|h\.?264|h265|h\.?265|root capture|root screenrecord|root shell|screenrecord|codec)\b/i.test(text);
   }
 
   function decodeBase64UrlJSON(value) {
@@ -556,37 +564,15 @@
   }
 
   function rememberSpacetimeToken(token) {
-    storageSet('local', spacetimeTokenKey, token);
+    directSpacetimeToken = String(token || '');
     spacetimeDirectUnavailable = false;
     spacetimeDirectUnavailableLogged = false;
-    const expiresAt = jwtExpiresAtMillis(token);
-    if (expiresAt > 0) {
-      storageSet('local', spacetimeTokenExpiryKey, new Date(expiresAt).toISOString());
-    } else {
-      storageRemove('local', spacetimeTokenExpiryKey);
-    }
+    directSpacetimeTokenExpiresAt = jwtExpiresAtMillis(token);
   }
 
   function spacetimeTokenExpired(token) {
-    const expiresAt = jwtExpiresAtMillis(token);
+    const expiresAt = directSpacetimeTokenExpiresAt || jwtExpiresAtMillis(token);
     return expiresAt > 0 && Date.now() + 30000 >= expiresAt;
-  }
-
-  async function pkceChallenge(verifier) {
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
-    return base64Url(new Uint8Array(digest));
-  }
-
-  function authConfig() {
-    const auth = cfg.auth || {};
-    return {
-      mode: auth.mode || 'spacetime',
-      authorizeUrl: auth.authorizeUrl || `${String(auth.issuer || 'https://auth.spacetimedb.com/oidc').replace(/\/$/, '')}/auth`,
-      tokenUrl: auth.tokenUrl || `${String(auth.issuer || 'https://auth.spacetimedb.com/oidc').replace(/\/$/, '')}/token`,
-      clientId: auth.clientId || '',
-      scope: auth.scope || 'openid profile email',
-      redirectUrl: auth.redirectUrl || `${location.origin}/auth/callback`
-    };
   }
 
   function usesDirectSpacetimeAuth() {
@@ -611,96 +597,28 @@
 
   function authReturnTarget() {
     if (location.pathname === '/auth/callback') {
-      return safeAuthReturnTo(storageGet('local', authReturnToKey));
+      return '/';
     }
     return safeAuthReturnTo(`${location.pathname}${location.search}${location.hash}`);
   }
 
   async function beginSpacetimeLogin(returnTo) {
-    const auth = authConfig();
-    if (!auth.clientId) {
-      throw new Error('SpacetimeAuth client is not configured.');
-    }
-    storageSet('local', authReturnToKey, safeAuthReturnTo(returnTo || authReturnTarget()));
-    const verifier = randomBase64Url(32);
-    const state = randomBase64Url(16);
-    storageSet('session', pkceVerifierKey, verifier);
-    storageSet('session', pkceStateKey, state);
-    storageSet('local', pkceVerifierSharedKey, verifier);
-    storageSet('local', pkceStateSharedKey, state);
-    const challenge = await pkceChallenge(verifier);
-    const next = new URL(auth.authorizeUrl);
-    next.searchParams.set('response_type', 'code');
-    next.searchParams.set('client_id', auth.clientId);
-    next.searchParams.set('redirect_uri', auth.redirectUrl);
-    next.searchParams.set('scope', auth.scope);
-    next.searchParams.set('state', state);
-    next.searchParams.set('code_challenge', challenge);
-    next.searchParams.set('code_challenge_method', 'S256');
+    const next = new URL('/api/v1/auth/start', location.origin);
+    next.searchParams.set('returnTo', safeAuthReturnTo(returnTo || authReturnTarget()));
     location.assign(next.toString());
   }
 
   async function finishSpacetimeCallback() {
-    const params = new URLSearchParams(location.search);
-    const code = params.get('code') || '';
-    const receivedState = params.get('state') || '';
-    const expectedState = storageGet('session', pkceStateKey) || storageGet('local', pkceStateSharedKey) || '';
-    const verifier = storageGet('session', pkceVerifierKey) || storageGet('local', pkceVerifierSharedKey) || '';
-    if (!code || !verifier || !expectedState || receivedState !== expectedState) {
-      throw new Error('Login callback did not match this browser. Open the newest email link in the same browser you started from, or start sign-in again.');
-    }
-    const auth = authConfig();
-    const body = new URLSearchParams();
-    body.set('grant_type', 'authorization_code');
-    body.set('client_id', auth.clientId);
-    body.set('code', code);
-    body.set('redirect_uri', auth.redirectUrl);
-    body.set('code_verifier', verifier);
-    const tokenResponse = await fetch(auth.tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
-    const tokenPayload = await tokenResponse.json().catch(() => ({}));
-    if (!tokenResponse.ok || !tokenPayload.id_token) {
-      throw new Error(tokenPayload.error_description || tokenPayload.error || 'SpacetimeAuth token exchange failed.');
-    }
-    const sessionResponse = await fetch('/api/v1/auth/session', {
-      method: 'POST',
-      cache: 'no-store',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idToken: tokenPayload.id_token })
-    });
-    const sessionPayload = await sessionResponse.json().catch(() => ({}));
-    if (!sessionResponse.ok || !sessionPayload.ok) {
-      clearLocalAuthState({ keepReturnTo: true });
-      throw new Error(sessionPayload.message || sessionPayload.error || 'Ticket session was rejected.');
-    }
-    rememberSpacetimeToken(tokenPayload.id_token);
-    storageRemove('session', pkceVerifierKey);
-    storageRemove('session', pkceStateKey);
-    storageRemove('local', pkceVerifierSharedKey);
-    storageRemove('local', pkceStateSharedKey);
-    const returnTo = safeAuthReturnTo(storageGet('local', authReturnToKey));
-    storageRemove('local', authReturnToKey);
-    location.replace(returnTo);
+    location.replace('/');
   }
 
-  function clearLocalAuthState(options) {
-    const keepReturnTo = Boolean(options && options.keepReturnTo);
-    storageRemove('session', pkceVerifierKey);
-    storageRemove('session', pkceStateKey);
-    storageRemove('local', spacetimeTokenKey);
-    storageRemove('local', spacetimeTokenExpiryKey);
-    storageRemove('local', pkceVerifierSharedKey);
-    storageRemove('local', pkceStateSharedKey);
-    if (!keepReturnTo) {
-      storageRemove('local', authReturnToKey);
-    }
+  function clearLocalAuthState() {
+    directSpacetimeToken = '';
+    directSpacetimeTokenExpiresAt = 0;
   }
 
   function showAuthError(error) {
-    clearLocalAuthState({ keepReturnTo: true });
+    clearLocalAuthState();
     document.body.className = 'auth-error-page';
     document.body.innerHTML = [
       '<main class="auth-shell">',
@@ -730,6 +648,7 @@
   }
 
   function setStatus(text) {
+    if (isTechnicalPublicStatusMessage(text)) return;
     statusLine.textContent = localizePublicMessage(text);
   }
 
@@ -737,44 +656,6 @@
     const cleanLeft = String(left || '').trim().toLowerCase();
     const cleanRight = String(right || '').trim().toLowerCase();
     return Boolean(cleanLeft && cleanRight && cleanLeft === cleanRight);
-  }
-
-  function currentUserOwnsControl(control) {
-    return Boolean(control && sameEmail(control.email, cfg.email));
-  }
-
-  function refreshQuickClaimSpinner() {
-    if (quickClaimSpinner) {
-      quickClaimSpinner.hidden = !(quickClaimSpinnerPending || ticketInUseSpinnerActive);
-    }
-  }
-
-  function setTicketInUseSpinner(active) {
-    ticketInUseSpinnerActive = Boolean(active);
-    refreshQuickClaimSpinner();
-  }
-
-  function showQuickClaimSpinner(inputId) {
-    quickClaimSpinnerPending = true;
-    if (typeof inputId === 'string') {
-      quickClaimSpinnerInputId = inputId;
-    }
-    refreshQuickClaimSpinner();
-    if (quickClaimSpinnerTimeout) {
-      clearTimeout(quickClaimSpinnerTimeout);
-    }
-    quickClaimSpinnerTimeout = setTimeout(() => hideQuickClaimSpinner('', 'timeout'), quickClaimSpinnerTimeoutMs);
-  }
-
-  function hideQuickClaimSpinner(inputId, reason) {
-    if (inputId && quickClaimSpinnerInputId && inputId !== quickClaimSpinnerInputId) return;
-    quickClaimSpinnerPending = false;
-    quickClaimSpinnerInputId = '';
-    if (quickClaimSpinnerTimeout) {
-      clearTimeout(quickClaimSpinnerTimeout);
-      quickClaimSpinnerTimeout = null;
-    }
-    refreshQuickClaimSpinner();
   }
 
   function clientLog(event, detail) {
@@ -788,14 +669,12 @@
   function showStreamResumeSpinner() {
     if (!streamResumeSpinner || streamResumeSpinnerVisible()) return;
     streamResumeSpinner.hidden = false;
-    renderStreamSummary();
     publishStreamDebug();
   }
 
   function hideStreamResumeSpinner() {
     if (!streamResumeSpinner || !streamResumeSpinnerVisible()) return;
     streamResumeSpinner.hidden = true;
-    renderStreamSummary();
     publishStreamDebug();
   }
 
@@ -842,8 +721,6 @@
   }
 
   function showEmpty(message, showStart) {
-    hideQuickClaimSpinner('', 'stream_empty');
-    setTicketInUseSpinner(false);
     hideStreamResumeSpinner();
     emptyMessage.textContent = localizePublicMessage(message);
     startStreamButton.hidden = true;
@@ -919,7 +796,6 @@
       connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
       send({ type: 'heartbeat', reason: 'public_connected' });
       connectDirectVideo();
-      processInputQueue();
     };
     ws.onmessage = (event) => {
       handleMessage(event).catch((error) => {
@@ -1116,7 +992,7 @@
     lastRecoveryServerRecoverAt = now;
     sendVideoClientLog('h264_server_recover_requested', reason);
     if (!sendVideoSignal({ type: 'recover_stream', reason })) {
-      send({ type: 'keyframe', reason });
+      send({ type: 'recover_stream', reason });
     }
     return true;
   }
@@ -1367,7 +1243,6 @@
     } else if (hasRenderedFrame) {
       hideStreamResumeSpinner();
     }
-    renderStreamSummary();
     publishStreamDebug();
   }
 
@@ -1559,11 +1434,9 @@
   }
 
   async function spacetimeToken() {
-    const existing = storageGet('local', spacetimeTokenKey);
-    if (existing && !spacetimeTokenExpired(existing)) return existing;
-    if (existing) {
-      storageRemove('local', spacetimeTokenKey);
-      storageRemove('local', spacetimeTokenExpiryKey);
+    if (directSpacetimeToken && !spacetimeTokenExpired(directSpacetimeToken)) return directSpacetimeToken;
+    if (directSpacetimeToken) {
+      clearLocalAuthState();
     }
     return fetchAuthSessionToken();
   }
@@ -1623,195 +1496,253 @@
     await syncServerState(reason);
   }
 
-  async function runControlMutation(reason, fallbackPath, fallbackBody) {
-    return postJSON(fallbackPath, fallbackBody || {});
+  function sanitizeControlDigits(value) {
+    return String(value || '').replace(/\D/g, '').slice(0, 9);
   }
 
-  function nextInputId() {
-    inputSeq += 1;
-    return `${cfg.sessionId || 'ticket'}-${Date.now().toString(36)}-${inputSeq}`;
-  }
-
-  function clearInputDrainTimer() {
-    if (inputDrainTimer) {
-      clearTimeout(inputDrainTimer);
-      inputDrainTimer = null;
+  function controlCodeStatusText(status, reason) {
+    switch (status) {
+    case 'queued':
+      return 'Gaida rindā';
+    case 'running':
+      return 'Tālrunis veido kodu';
+    case 'succeeded':
+      return 'Kods gatavs';
+    case 'failed':
+      return localizePublicMessage(reason || 'Kodu neizdevās izveidot');
+    case 'expired':
+      return 'Kods paslēpts';
+    case 'closed':
+      return 'Kods aizvērts';
+    default:
+      return 'Gatavs';
     }
   }
 
-  function scheduleInputQueueDrain(delayMs) {
-    if (inputDrainTimer) return;
-    inputDrainTimer = setTimeout(() => {
-      inputDrainTimer = null;
-      processInputQueue();
-    }, Math.max(0, delayMs || 0));
+  function controlCodeStatusRank(status) {
+    if (status === 'queued') return 1;
+    if (status === 'running') return 2;
+    if (status === 'succeeded' || status === 'failed' || status === 'expired' || status === 'closed') return 3;
+    return 0;
   }
 
-  function inputIsQuickClaim(input) {
-    return input && input.type === 'quick_claim_tap';
+  function controlCodeDetailText(request) {
+    if (!request) return 'Ievadi 2-9 ciparus, tālrunis kodu izveidos automātiski.';
+    if (request.status === 'queued') {
+      const position = Number(request.queuePosition || 0);
+      return position > 1 ? `Rindā: ${position}. vieta` : 'Pieprasījums rindā';
+    }
+    if (request.status === 'running') return 'Tālrunis īsi atver koda logu un atgriezīsies pie biļetes.';
+    if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
+    if (request.status === 'failed') return localizePublicMessage(request.reason || request.message || 'Kodu neizdevās izveidot');
+    if (request.status === 'expired' || request.status === 'closed') return 'Vari pieprasīt jaunu kodu.';
+    return 'Ievadi 2-9 ciparus, tālrunis kodu izveidos automātiski.';
   }
 
-  function quickClaimQueuedOrInFlight() {
-    if (quickClaimSpinnerPending) return true;
-    if (inputIsQuickClaim(inputInFlight)) return true;
-    return inputQueue.some(inputIsQuickClaim);
-  }
-
-  function queueInput(value, options) {
-    const keepLatest = Boolean(options && options.keepLatest);
-    if (keepLatest) {
-      const queuedLimit = inputInFlight ? Math.max(1, inputQueueLimit - 1) : inputQueueLimit;
-      while (inputQueue.length >= queuedLimit) {
-        const dropped = inputQueue.shift();
-        clientLog('input_queue_dropped_oldest', dropped && dropped.inputId ? dropped.inputId : 'tap');
+  function scheduleControlCodeTicker(request) {
+    if (codeResultTickTimer) {
+      clearInterval(codeResultTickTimer);
+      codeResultTickTimer = null;
+    }
+    codeResultTimer.textContent = '';
+    if (!request || request.status !== 'succeeded') return;
+    const expiresAt = Date.parse(request.resultExpiresAt || '');
+    if (!Number.isFinite(expiresAt)) return;
+    const requestID = request.requestId;
+    const refresh = () => {
+      if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
+        if (codeResultTickTimer) {
+          clearInterval(codeResultTickTimer);
+          codeResultTickTimer = null;
+        }
+        return;
       }
-    } else if (inputQueue.length >= inputQueueLimit) {
-      setStatus('Pieskārienu rinda ir pilna. Uzgaidi mirkli un mēģini vēlreiz.');
-      return '';
-    }
-    const inputId = value.inputId || nextInputId();
-    inputQueue.push({
-      ...value,
-      inputId,
-      retryCount: value.retryCount || 0
-    });
-    if (inputQueue.length > 1) {
-      setStatus(`Nosūta pieskārienus: ${inputQueue.length} gaida.`);
-    }
-    processInputQueue();
-    return inputId;
-  }
-
-  function queueTap(screenPoint, options) {
-    const value = {
-      type: 'tap',
-      x: screenPoint.x,
-      y: screenPoint.y
+      const remainingMs = expiresAt - (Date.now() + serverClockSkewMs);
+      if (remainingMs <= 0) {
+        if (codeResultTickTimer) {
+          clearInterval(codeResultTickTimer);
+          codeResultTickTimer = null;
+        }
+        codeResultTimer.textContent = '';
+        closeCurrentControlCode(false);
+        return;
+      }
+      codeResultTimer.textContent = `${Math.ceil(remainingMs / 1000)}s`;
     };
-    if (options && options.snapTarget) {
-      value.snapTarget = options.snapTarget;
+    refresh();
+    codeResultTickTimer = setInterval(refresh, 1000);
+  }
+
+  function setControlCodeResultVisible(visible) {
+    codeResultArea.hidden = !visible;
+    document.body.classList.toggle('control-code-result-visible', Boolean(visible));
+  }
+
+  function renderControlCodeRequest(request) {
+    if (request && codeRequest && request.requestId === codeRequest.requestId) {
+      const incomingRank = controlCodeStatusRank(request.status);
+      const currentRank = controlCodeStatusRank(codeRequest.status);
+      if (incomingRank < currentRank) {
+        request = codeRequest;
+      }
     }
-    return queueInput(value, { keepLatest: true });
-  }
-
-  function queueQuickClaimTap(screenPoint, options) {
-    if (quickClaimQueuedOrInFlight()) {
-      setStatus('Atver kontroles kodu...');
-      return '';
-    }
-    return queueInput({
-      type: 'quick_claim_tap',
-      x: screenPoint.x,
-      y: screenPoint.y,
-      snapTarget: options && options.snapTarget ? options.snapTarget : 'control_code_button'
-    });
-  }
-
-  function inputCanStartWithoutControl(input) {
-    return inputIsQuickClaim(input);
-  }
-
-  function currentUserCanSendInput() {
-    return currentUserOwnsControl(currentControl(currentState)) || performance.now() < localControlSendGraceUntil;
-  }
-
-  function cancelPendingInputs(reason) {
-    if (inputInFlight && inputInFlight.timeout) {
-      clearTimeout(inputInFlight.timeout);
-    }
-    clearInputDrainTimer();
-    const hadPending = Boolean(inputInFlight) || inputQueue.length > 0 || quickClaimSpinnerPending;
-    inputInFlight = null;
-    inputQueue.length = 0;
-    localControlSendGraceUntil = 0;
-    hideQuickClaimSpinner('', reason || 'input_cancelled');
-    if (hadPending) {
-      clientLog('input_queue_cancelled', reason || 'control_lost');
-    }
-  }
-
-  function processInputQueue() {
-    if (inputInFlight || inputQueue.length === 0) return;
-    const nextInput = inputQueue[0];
-    if (!currentUserCanSendInput() && !inputCanStartWithoutControl(nextInput)) {
-      cancelPendingInputs('control_lost_before_send');
-      setStatus('Ievade atcelta, jo kontroles režīms vairs nav aktīvs.');
+    codeRequest = request || codeRequest;
+    const current = codeRequest;
+    const busy = current && (current.status === 'queued' || current.status === 'running');
+    codeRequestState.textContent = controlCodeStatusText(current && current.status, current && current.reason);
+    codeRequestDetail.textContent = controlCodeDetailText(current);
+    requestCodeButton.disabled = Boolean(busy);
+    codeSubmit.disabled = Boolean(busy);
+    if (!current || current.status === 'closed' || current.status === 'expired') {
+      setControlCodeResultVisible(false);
+      delete codeResultArea.dataset.status;
+      codeResultStatus.hidden = false;
+      codeResultStatus.textContent = '';
+      codeResultImage.hidden = true;
+      codeResultImage.removeAttribute('src');
+      codeResultValue.hidden = true;
+      codeResultValue.textContent = '';
+      codeResultTimer.hidden = false;
+      codeResultTimer.textContent = '';
+      scheduleControlCodeTicker(null);
       return;
     }
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setStatus('Gaida savienojumu, lai nosūtītu pieskārienu.');
+    if (current.status === 'succeeded') {
+      setControlCodeResultVisible(true);
+      codeResultArea.dataset.status = 'succeeded';
+      codeResultStatus.textContent = '';
+      codeResultStatus.hidden = true;
+      const imageBase64 = String(current.imageBase64 || '');
+      if (imageBase64) {
+        const mime = current.imageMime || 'image/png';
+        codeResultImage.src = `data:${mime};base64,${imageBase64}`;
+        codeResultImage.hidden = false;
+      } else {
+        codeResultImage.hidden = true;
+        codeResultImage.removeAttribute('src');
+      }
+      const value = String(current.value || '').trim();
+      codeResultValue.textContent = value;
+      codeResultValue.hidden = true;
+      codeResultTimer.hidden = true;
+      codeResultTimer.textContent = '';
+      scheduleControlCodeTicker(current);
       return;
     }
-    inputInFlight = inputQueue.shift();
-    if (!send(inputInFlight)) {
-      inputQueue.unshift(inputInFlight);
-      inputInFlight = null;
-      setStatus('Gaida savienojumu, lai nosūtītu pieskārienu.');
+    if (current.status === 'failed') {
+      setControlCodeResultVisible(true);
+      codeResultArea.dataset.status = 'failed';
+      codeResultStatus.textContent = controlCodeStatusText('failed', current.reason || current.message);
+      codeResultStatus.hidden = false;
+      codeResultImage.hidden = true;
+      codeResultImage.removeAttribute('src');
+      codeResultValue.hidden = true;
+      codeResultValue.textContent = '';
+      codeResultTimer.hidden = false;
+      codeResultTimer.textContent = '';
+      scheduleControlCodeTicker(null);
       return;
     }
-    inputInFlight.timeout = setTimeout(() => retryOrDropInput(inputInFlight.inputId), inputAckTimeoutMs);
+    setControlCodeResultVisible(false);
+    scheduleControlCodeTicker(null);
   }
 
-  function retryOrDropInput(inputId) {
-    if (!inputInFlight || inputInFlight.inputId !== inputId) return;
-    if (!currentUserCanSendInput() && !inputCanStartWithoutControl(inputInFlight)) {
-      cancelPendingInputs('control_lost_retry');
-      setStatus('Ievade atcelta, jo kontroles režīms vairs nav aktīvs.');
-      return;
+  function openControlCodeDialog() {
+    if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      try {
+        document.exitFullscreen().catch(() => {});
+      } catch (_) {}
     }
-    const timedOut = inputInFlight;
-    inputInFlight = null;
-    if (timedOut.retryCount < inputRetryLimit) {
-      timedOut.retryCount += 1;
-      delete timedOut.timeout;
-      inputQueue.unshift(timedOut);
-      setStatus('Pieskāriens netika apstiprināts, mēģina vēlreiz.');
-      processInputQueue();
-      return;
-    }
-    hideQuickClaimSpinner(inputId, 'input_timeout');
-    setStatus('Pieskāriens netika apstiprināts.');
-    processInputQueue();
+    codeDialogOpen = true;
+    document.body.classList.add('code-dialog-open');
+    updateViewportVars();
+    codeDialog.hidden = false;
+    codeError.textContent = '';
+    codeDigits.value = '';
+    setTimeout(() => {
+      updateViewportVars();
+      codeDigits.focus();
+    }, 30);
   }
 
-  function finishInput(inputId, accepted, reason) {
-    if (!inputInFlight || inputInFlight.inputId !== inputId) return;
-    if (inputInFlight.timeout) {
-      clearTimeout(inputInFlight.timeout);
+  function closeControlCodeDialog() {
+    codeDialogOpen = false;
+    document.body.classList.remove('code-dialog-open', 'keyboard-active');
+    codeDialog.hidden = true;
+    codeError.textContent = '';
+    updateViewportVars();
+    resizeCanvasBox();
+  }
+
+  async function submitControlCodeRequest() {
+    const digits = sanitizeControlDigits(codeDigits.value);
+    codeDigits.value = digits;
+    if (digits.length < 2 || digits.length > 9) {
+      codeError.textContent = 'Ievadi 2-9 ciparus.';
+      return;
     }
-    const finishedInput = inputInFlight;
-    hideQuickClaimSpinner(inputId, accepted ? 'input_result' : 'input_rejected');
-    inputInFlight = null;
-    if (accepted && inputIsQuickClaim(finishedInput)) {
-      localControlSendGraceUntil = performance.now() + 4000;
+    codeError.textContent = '';
+    codeSubmit.disabled = true;
+    try {
+      const payload = await postJSON('/api/v1/control-code/request', { digits });
+      if (payload.request) {
+        renderControlCodeRequest(payload.request);
+      }
+      closeControlCodeDialog();
+      setStatus('Pieprasījums nosūtīts.');
+    } catch (error) {
+      codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
+    } finally {
+      codeSubmit.disabled = false;
     }
-    if (!accepted) {
-      setStatus(reason === 'not_active_controller'
-        ? 'Ievade netiek pieņemta, kamēr nav pārņemts kontroles koda režīms.'
-        : reason === 'phone_unavailable'
-          ? 'Tālrunis pašlaik nepieņem pieskārienu.'
-          : 'Pieskāriens netika pieņemts.');
-    } else if (inputQueue.length > 0) {
-      setStatus(`Nosūta pieskārienus: ${inputQueue.length} gaida.`);
+  }
+
+  async function closeCurrentControlCode(openNext) {
+    const requestID = codeRequest && codeRequest.requestId;
+    if (requestID) {
+      try {
+        const payload = await postJSON('/api/v1/control-code/close', { requestId: requestID });
+        if (payload.request) renderControlCodeRequest(payload.request);
+      } catch (error) {
+        clientLog('control_code_close_failed', error && error.message || 'close failed');
+      }
+    } else {
+      setControlCodeResultVisible(false);
     }
-    if (inputQueue.length > 0) {
-      scheduleInputQueueDrain(inputDrainDelayMs);
+    if (openNext) openControlCodeDialog();
+  }
+
+  function requestControlCodeFromHotspot(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
     }
+    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
+    if (busy || codeDialogOpen) return;
+    if (!codeResultArea.hidden && codeRequest) {
+      closeCurrentControlCode(false);
+      return;
+    }
+    openControlCodeDialog();
+  }
+
+  function closeControlCodeFromHotspot(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    if (codeDialogOpen || codeResultArea.hidden) return;
+    closeCurrentControlCode(false);
+  }
+
+  function handleControlCodeMessage(msg) {
+    if (msg.type !== 'control_code_request') return false;
+    renderControlCodeRequest(msg.request || null);
+    return true;
   }
 
   function handleInputMessage(msg) {
-    if (msg.type === 'input_result') {
-      finishInput(String(msg.inputId || ''), msg.accepted !== false, msg.reason || '');
-      return true;
-    }
-    if (msg.type === 'input' && msg.accepted === false) {
-      finishInput(String(msg.inputId || ''), false, msg.reason || '');
-      if (!msg.inputId) {
-        setStatus('Ievade netiek pieņemta, kamēr nav pārņemts kontroles koda režīms.');
-      }
-      return true;
-    }
-    return msg.type === 'input';
+    return msg.type === 'input' || msg.type === 'input_result';
   }
 
   async function handleMessage(event) {
@@ -1828,11 +1759,16 @@
         if (msg.data && msg.data.message) {
           setStatus(msg.data.message);
           if (msg.data.streamActive === false && !streamUnsupported) {
-            showStreamWaiting(`${localizePublicMessage(msg.data.message)} Restartē...`);
+            const waitingMessage = isTechnicalPublicStatusMessage(msg.data.message)
+              ? 'Straume atjaunojas...'
+              : `${localizePublicMessage(msg.data.message)} Restartē...`;
+            showStreamWaiting(waitingMessage);
           }
         }
       } else if (msg.type === 'phone') {
         setStatus(msg.message || '');
+      } else if (handleControlCodeMessage(msg)) {
+        return;
       } else if (handleInputMessage(msg)) {
         return;
       }
@@ -1859,33 +1795,12 @@
     const state = currentState;
     if (!state) return;
     rememberServerClock(state);
-    const control = currentControl(state);
-    const selfControl = currentUserOwnsControl(control);
-    const otherControl = control && !selfControl;
-    const activeControlEmail = control && control.email ? String(control.email).trim().toLowerCase() : '';
-
-    if ((lastSelfControl && !selfControl) || (lastActiveControlEmail && lastActiveControlEmail !== activeControlEmail && !selfControl)) {
-      cancelPendingInputs('control_lost_state_update');
-    }
-    lastSelfControl = Boolean(selfControl);
-    lastActiveControlEmail = activeControlEmail;
-
-    setTicketInUseSpinner(Boolean(otherControl));
-
-    claimButton.hidden = Boolean(control);
-    extendButton.hidden = !selfControl || control.extended;
-    releaseButton.hidden = !selfControl;
-
-    const viewers = activeViewers(state.viewers || []);
-    renderPanelSummary(state, control, selfControl, viewers);
-
-    if (control) {
-      setStatus(selfControl ? 'Tu vari vadīt biļeti.' : 'Kontrole pašlaik ir aizņemta.');
-    } else {
-      setStatus('Kontrole ir brīva.');
-    }
-
-    renderPresence(viewers, control);
+    const viewers = activeViewerPresence(state);
+    const visibleViewerCount = Number.isFinite(Number(state.viewerCount)) ? Number(state.viewerCount) : viewers.length;
+    renderPanelSummary(viewers, visibleViewerCount);
+    renderControlCodeRequest(codeRequest);
+    setStatus('Tiešraide rāda biļeti.');
+    renderPresence(viewers, visibleViewerCount);
   }
 
   function rememberServerClock(state) {
@@ -1895,119 +1810,57 @@
     }
   }
 
-  function serverNow() {
-    return Date.now() + serverClockSkewMs;
-  }
-
-  function currentControl(state) {
-    const control = state && state.activeControl;
-    if (!control) return null;
-    const expiresAt = Date.parse(control.expiresAt);
-    if (!Number.isFinite(expiresAt)) return control;
-    const remainingMs = Math.max(0, expiresAt - serverNow());
-    if (remainingMs <= 0) return null;
-    return { ...control, remainingMs };
-  }
-
   function activeViewers(viewers) {
     return (viewers || []).filter((viewer) => viewer && viewer.connected !== false);
   }
 
-  function renderPanelSummary(state, control, selfControl, viewers) {
-    renderControlSummary(control, selfControl);
-    renderViewerSummary(viewers);
-    renderStreamSummary();
+  function activeViewerPresence(state) {
+    const publicPresence = Array.isArray(state && state.viewerPresence) ? state.viewerPresence : [];
+    if (publicPresence.length) {
+      return publicPresence.map((viewer, index) => ({
+        label: String(viewer && viewer.label || `Skatītājs ${index + 1}`)
+      }));
+    }
+    return activeViewers(state && state.viewers || []).map((_viewer, index) => ({
+      label: `Skatītājs ${index + 1}`
+    }));
   }
 
-  function renderControlSummary(control, selfControl) {
-    if (!control) {
-      if (controlOwner) controlOwner.textContent = 'Brīva';
-      if (controlMode) controlMode.textContent = 'Pieejama ikvienam lapā';
-      if (timer) {
-        timer.hidden = true;
-        timer.classList.remove('urgent');
-        timer.textContent = 'Nav';
-      }
-      if (controlTimeDetail) controlTimeDetail.textContent = 'Nav aktīvas kontroles';
-      return;
-    }
-    const remaining = Math.max(0, Math.ceil((control.remainingMs || 0) / 1000));
-    if (controlOwner) controlOwner.textContent = selfControl ? 'Tu kontrolē' : (control.email || 'Aizņemta');
-    if (controlMode) controlMode.textContent = selfControl ? 'Privātais režīms ir tavs' : 'Privātais režīms ir aizņemts';
-    if (timer) {
-      timer.hidden = false;
-      timer.textContent = `${remaining} s`;
-      timer.classList.toggle('urgent', remaining <= 10);
-    }
-    if (controlTimeDetail) controlTimeDetail.textContent = control.extended ? 'Pagarināts laiks' : 'Atlikušais laiks';
+  function renderPanelSummary(viewers, visibleViewerCount) {
+    renderViewerSummary(viewers, visibleViewerCount);
   }
 
-  function renderViewerSummary(viewers) {
-    const count = activeViewers(viewers).length;
+  function renderViewerSummary(viewers, visibleViewerCount) {
+    const count = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : activeViewers(viewers).length;
     if (viewerCount) viewerCount.textContent = String(count);
     if (viewerCountDetail) viewerCountDetail.textContent = count === 1 ? 'cilvēks lapā' : 'cilvēki lapā';
   }
 
-  function renderStreamSummary() {
-    if (!streamStateLabel || !streamStateDetail) return;
-    const status = freshStreamStatus(performance.now()) || latestStreamStatus;
-    if (streamUnsupported) {
-      streamStateLabel.textContent = 'Nav pieejama';
-      streamStateDetail.textContent = 'Šajā pārlūkā straumi nevar parādīt';
-      return;
-    }
-    if (streamResumeSpinnerVisible() || (hasRenderedFrame && streamStatusStale(status))) {
-      streamStateLabel.textContent = 'Atjaunojas';
-      streamStateDetail.textContent = 'Attēls paliek redzams, kamēr straume atgriežas';
-      return;
-    }
-    if (document.body.dataset.streamReady === 'true' && hasRenderedFrame) {
-      streamStateLabel.textContent = 'Tiešraide';
-      streamStateDetail.textContent = 'Biļetes attēls ir aktīvs';
-      return;
-    }
-    if (status && status.phoneStreamState === 'streaming') {
-      streamStateLabel.textContent = 'Ielādējas';
-      streamStateDetail.textContent = 'Gaida pirmo biļetes kadru';
-      return;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      streamStateLabel.textContent = 'Gatava';
-      streamStateDetail.textContent = 'Savienojums ir atvērts';
-      return;
-    }
-    streamStateLabel.textContent = 'Savienojas';
-    streamStateDetail.textContent = 'Gatavo biļetes attēlu';
-  }
-
-  function renderPresence(viewers, control) {
+  function renderPresence(viewers, visibleViewerCount) {
     const active = activeViewers(viewers);
+    const countValue = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : active.length;
     presence.textContent = '';
     const title = document.createElement('div');
     title.className = 'presence-header';
     const label = document.createElement('span');
     label.textContent = 'Skatītāji';
     const count = document.createElement('strong');
-    count.textContent = `${active.length} lapā`;
+    count.textContent = `${countValue} lapā`;
     title.append(label, count);
     presence.appendChild(title);
+    if (!active.length) return;
     const list = document.createElement('div');
     list.className = 'presence-list';
-    active.forEach((viewer) => {
+    active.forEach((viewer, index) => {
       const row = document.createElement('div');
       row.className = 'presence-item';
-      const email = document.createElement('span');
-      email.className = 'presence-email';
-      email.textContent = viewer.email;
+      const label = document.createElement('span');
+      label.className = 'presence-email';
+      label.textContent = viewer.label || `Skatītājs ${index + 1}`;
       const mark = document.createElement('span');
       mark.className = 'presence-mark';
-      if (control && viewer.sessionId === control.sessionId) {
-        mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu kontrolē' : 'kontrolē';
-        mark.classList.add('control');
-      } else {
-        mark.textContent = viewer.sessionId === cfg.sessionId ? 'tu' : 'skatās';
-      }
-      row.append(email, mark);
+      mark.textContent = 'skatās';
+      row.append(label, mark);
       list.appendChild(row);
     });
     presence.appendChild(list);
@@ -2030,48 +1883,57 @@
     if (!response.ok || !payload.ok) {
       throw new Error(payload.message || payload.error || 'Pieprasījums neizdevās');
     }
-    currentState = payload.state;
-    rememberServerClock(currentState);
-    renderState();
+    if (payload.state) {
+      currentState = payload.state;
+      rememberServerClock(currentState);
+      renderState();
+    }
     return payload;
   }
 
-  async function ensureControl() {
-    const control = currentControl(currentState);
-    const selfControl = currentUserOwnsControl(control);
-    if (selfControl) return;
-    if (!claimPromise) {
-      claimPromise = runControlMutation('control_claim', '/api/v1/control/claim').finally(() => {
-        claimPromise = null;
-      });
-    }
-    await claimPromise;
-    localControlSendGraceUntil = performance.now() + 4000;
-  }
-
-  function quickClaimControl(options) {
-    if (options && options.tap) {
-      setStatus('Atver kontroles kodu...');
-      return queueQuickClaimTap(options.tap, { snapTarget: options.snapTarget });
-    }
-    return '';
-  }
-
-  async function claimControl(options) {
-    await ensureControl();
-    if (options && options.tap) {
-      return queueTap(options.tap, { snapTarget: options.snapTarget });
-    }
-    return '';
-  }
-
-  claimButton.addEventListener('click', () => claimControl().catch((error) => setStatus(error.message)));
-  extendButton.addEventListener('click', () => runControlMutation('control_extend', '/api/v1/control/extend').catch((error) => setStatus(error.message)));
-  releaseButton.addEventListener('click', () => {
-    cancelPendingInputs('control_release_requested');
-    runControlMutation('control_release', '/api/v1/control/release')
-      .then(() => cancelPendingInputs('control_release_confirmed'))
-      .catch((error) => setStatus(error.message));
+  codeDigits.addEventListener('input', () => {
+    const cleaned = sanitizeControlDigits(codeDigits.value);
+    if (codeDigits.value !== cleaned) codeDigits.value = cleaned;
+    codeError.textContent = '';
+    updateViewportVars();
+  });
+  codeDigits.addEventListener('focus', updateViewportVars);
+  codeDigits.addEventListener('blur', () => {
+    setTimeout(() => {
+      updateViewportVars();
+      resizeCanvasBox();
+    }, 80);
+  });
+  requestCodeButton.addEventListener('click', () => openControlCodeDialog());
+  controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
+  controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot);
+  controlCodeHotspot.addEventListener('touchend', requestControlCodeFromHotspot);
+  controlCodeCloseHotspot.addEventListener('touchend', closeControlCodeFromHotspot);
+  codeDialogClose.addEventListener('click', closeControlCodeDialog);
+  codeDialog.addEventListener('click', (event) => {
+    if (event.target === codeDialog) closeControlCodeDialog();
+  });
+  codeForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submitControlCodeRequest();
+  });
+  codeResultArea.addEventListener('click', (event) => {
+    if (event.target === codeResultClose) return;
+    event.preventDefault();
+  });
+  codeResultClose.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCurrentControlCode(false);
+  });
+  codeResultClose.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeCurrentControlCode(false);
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && codeDialogOpen) closeControlCodeDialog();
   });
   startStreamButton.addEventListener('click', () => restartStream('manual_start'));
 
@@ -2092,40 +1954,16 @@
     } catch (_) {}
   }
 
-  function firstClaimCandidateZone(screenPoint) {
-    const width = canvas.width || streamSize.width || 1;
-    const height = canvas.height || streamSize.height || 1;
-    const relativeX = screenPoint.x / width;
-    const relativeY = screenPoint.y / height;
-    if (relativeX >= 0 && relativeX <= quickClaimMaxX && relativeY >= 0 && relativeY <= quickClaimMaxY) {
-      return 'top_left_quarter';
-    }
-    if (
-      relativeX >= controlCodeButtonMinX &&
-      relativeX <= controlCodeButtonMaxX &&
-      relativeY >= controlCodeButtonMinY &&
-      relativeY <= controlCodeButtonMaxY
-    ) {
-      return 'control_code_button_geometry';
-    }
-    return '';
-  }
-
   canvas.addEventListener('pointerdown', (event) => {
     if (!configured) return;
     if (event.button != null && event.button !== 0) return;
-    const control = currentControl(currentState);
     const start = point(event);
-    const selfControl = currentUserOwnsControl(control) || (!control && currentUserCanSendInput());
     pointerStart = {
       ...start,
       clientX: event.clientX,
       clientY: event.clientY,
       pointerId: event.pointerId,
       pointerType: event.pointerType || 'mouse',
-      selfControl: Boolean(selfControl),
-      otherControl: Boolean(control && !selfControl),
-      claimZone: !control ? firstClaimCandidateZone(start) : '',
       at: performance.now()
     };
     if (event.pointerType !== 'touch' && event.cancelable) {
@@ -2158,27 +1996,7 @@
     const heldMs = performance.now() - pointerStart.at;
     if (distance < maxTapTravelPx && heldMs <= maxTapDurationMs) {
       event.preventDefault();
-      if (pointerStart.selfControl) {
-        queueTap(end);
-      } else if (pointerStart.otherControl) {
-        setStatus('Biļete pašlaik tiek izmantota.');
-      } else if (pointerStart.claimZone) {
-        if (quickClaimQueuedOrInFlight()) {
-          setStatus('Atver kontroles kodu...');
-          releaseCanvasPointer(event.pointerId);
-          pointerStart = null;
-          return;
-        }
-        showQuickClaimSpinner('');
-        const inputId = quickClaimControl({ tap: { x: pointerStart.x, y: pointerStart.y }, snapTarget: 'control_code_button' });
-        if (inputId) {
-          showQuickClaimSpinner(inputId);
-        } else {
-          hideQuickClaimSpinner('', 'claim_not_queued');
-        }
-      } else {
-        setStatus('Pirms pieskaries tālrunim, pārņem kontroles koda režīmu.');
-      }
+      setStatus('Kontroles kodu pieprasi ar pogu zem biļetes.');
     } else {
       if (event.cancelable) event.preventDefault();
       clientLog('blocked_gesture', distance < maxTapTravelPx ? 'long_press' : 'swipe');
@@ -2234,6 +2052,10 @@
     return streamState !== '' && streamState !== 'streaming';
   }
 
+  function viewerIsForeground() {
+    return document.visibilityState === 'visible' && (typeof document.hasFocus !== 'function' || document.hasFocus());
+  }
+
   function serverFrameAge(status) {
     if (!status) return -1;
     const value = Number(status.lastFrameAgoMillis);
@@ -2272,10 +2094,13 @@
 
   function chaseLiveStream() {
     if (streamUnsupported) return;
-    if (document.visibilityState === 'hidden') {
-      pauseVideoWhileHidden('chase_live_stream_hidden');
+    if (!viewerIsForeground()) {
+      if (document.visibilityState === 'hidden') {
+        pauseVideoWhileHidden('chase_live_stream_hidden');
+      }
       return;
     }
+    const hadStream = configured || lastDecodedFrameAt > 0 || lastPacketAt > 0 || latestStreamStatus;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       connect();
       return;
@@ -2283,6 +2108,9 @@
     if (ws.readyState !== WebSocket.OPEN) return;
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       connectDirectVideo();
+      if (hadStream) {
+        requestServerRecoveryDebounced('foreground_video_socket_closed');
+      }
       return;
     }
     if (videoWs.readyState !== WebSocket.OPEN) return;
@@ -2404,6 +2232,11 @@
       requestScreenWakeLock('pageshow');
     }
     scheduleFirstScreenPin(true);
+    chaseLiveStream();
+  });
+  window.addEventListener('focus', () => {
+    refreshHealth();
+    chaseLiveStream();
   });
   window.addEventListener('pagehide', () => {
     closeDirectVideo();
@@ -2419,9 +2252,6 @@
     send({ type: 'heartbeat', reason: 'public_heartbeat' });
   }, 15000);
   setInterval(refreshHealth, 15000);
-  setInterval(() => {
-    if (currentState && currentState.activeControl) renderState();
-  }, 1000);
   setInterval(chaseLiveStream, 1000);
   updateViewportVars();
   scheduleFirstScreenPin(true);
@@ -2438,7 +2268,6 @@
     const memberRole = document.getElementById('memberRole');
     const membersEl = document.getElementById('adminMembers');
     const stateEl = document.getElementById('adminState');
-    const revokeButton = document.getElementById('adminRevoke');
     const notice = document.getElementById('adminNotice');
     const memberSummary = document.getElementById('adminMemberSummary');
     const sessionSummary = document.getElementById('adminSessionSummary');
@@ -2466,7 +2295,6 @@
       memberRole,
       membersEl,
       stateEl,
-      revokeButton,
       notice,
       memberSummary,
       sessionSummary,
@@ -2494,6 +2322,7 @@
     const adminRefreshMs = 5000;
     let adminLoadInFlight = null;
     let adminActionDepth = 0;
+    let activeBackendId = '';
 
     async function load(options) {
       const quiet = Boolean(options && options.quiet);
@@ -2515,7 +2344,9 @@
         if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
         if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
         renderAdmin(payload.state, payload.phone, backendsPayload);
-        if (simSetup) loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
+        if (simSetup && simulatorSetupActive()) {
+          loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
+        }
       })();
       try {
         await adminLoadInFlight;
@@ -2578,30 +2409,20 @@
       });
     });
 
-    revokeButton.addEventListener('click', async () => {
-      await runAdminAction(revokeButton, 'Revoking control...', async () => {
-        await apiFetch('/api/v1/admin/control/revoke', { method: 'POST', cache: 'no-store' });
-        showNotice('Control revoked');
-        await load();
-      });
-    });
-
     function renderStatus(state, phone, phoneHealth) {
       const members = activeMembers(state);
       const viewers = state.viewers || [];
       const activeViewers = viewers.filter((viewer) => viewer.connected !== false);
-      const activeControl = state.activeControl || null;
       const phoneRecord = state.phone || {};
       const rootCapture = phoneHealth.rootCapture || {};
       const pipeline = phoneHealth.streamPipeline || {};
       const inputGate = phoneHealth.inputGate || {};
       const lockdown = phoneHealth.notificationLockdown || {};
+      const controlCode = phoneHealth.controlCodeRequest || {};
       const streamLive = rootCapture.active || phoneHealth.streamVerdict === 'live' || pipeline.streamVerdict === 'live';
 
       memberSummary.textContent = `${members.length} member${members.length === 1 ? '' : 's'} configured`;
-      sessionSummary.textContent = activeControl
-        ? `${activeControl.email} has control for ${Math.max(0, Math.ceil((activeControl.remainingMs || 0) / 1000))}s`
-        : 'No active control claim';
+      sessionSummary.textContent = `${activeViewers.length} viewer${activeViewers.length === 1 ? '' : 's'} on page`;
 
       phoneState.textContent = phone && phone.connected ? 'Connected' : phoneRecord.desiredState || 'Idle';
       phoneDetail.textContent = `${phoneRecord.attachName || phoneRecord.id || 'Pixel'} · seen ${relativeTime(phoneRecord.lastSeenAt || (phone && phone.lastSeenAt))}`;
@@ -2609,18 +2430,14 @@
       streamState.textContent = streamLive ? 'Live' : (phoneHealth.streamActive ? 'Starting' : 'Idle');
       streamDetail.textContent = rootCapture.message || (streamLive ? 'Ticket stream is live' : pipeline.secureWindowCaptureBypassMessage) || 'Waiting for viewers';
 
-      controlState.textContent = activeControl ? 'Claimed' : 'Open';
-      controlDetail.textContent = activeControl
-        ? `${activeControl.email}${activeControl.extended ? ' · extended' : ''}`
-        : `${activeViewers.length} viewer${activeViewers.length === 1 ? '' : 's'} on page`;
+      controlState.textContent = controlCode.status || 'Ready';
+      controlDetail.textContent = controlCode.reason || 'Requests are handled by the phone one at a time';
 
       safetyState.textContent = lockdown.active ? 'Locked down' : 'Ready';
       safetyDetail.textContent = inputGate.reason
         ? `Input gate: ${inputGate.reason}`
         : (lockdown.reason || 'Tap-only controls');
 
-      revokeButton.disabled = !activeControl;
-      revokeButton.classList.toggle('is-danger', Boolean(activeControl));
     }
 
     function activeMembers(state) {
@@ -2629,6 +2446,7 @@
 
     function renderBackends(payload) {
       const activeId = payload.activeBackendId || '';
+      activeBackendId = activeId;
       const backends = payload.backends || [];
       const active = backends.find((backend) => backend.id === activeId);
       backendSummary.textContent = active
@@ -2674,10 +2492,31 @@
         row.append(main, badge, button);
         backendList.appendChild(row);
       });
+      renderSimulatorAvailability(active);
+    }
+
+    function simulatorSetupActive() {
+      return Boolean(simSetup && activeBackendId && activeBackendId === (cfg.simulatorSetupBackendId || 'android-sim'));
+    }
+
+    function renderSimulatorAvailability(activeBackend) {
+      if (!simSetup) return;
+      const enabled = simulatorSetupActive();
+      simSetup.classList.toggle('is-disabled', !enabled);
+      simSetup.querySelectorAll('button, input').forEach((control) => {
+        control.disabled = !enabled;
+      });
+      if (!enabled) {
+        const label = activeBackend ? (activeBackend.attachName || activeBackend.id) : 'selected backend';
+        renderSimulatorSetupError(`Simulator control is available only when the Android simulator backend is active. Current backend: ${label}.`);
+        if (simSetupPackages) simSetupPackages.textContent = '';
+        if (simSetupScreenshot) simSetupScreenshot.removeAttribute('src');
+        setSimulatorLastInput('Simulator backend is not active');
+      }
     }
 
     async function loadSimulatorSetup() {
-      if (!simSetup) return;
+      if (!simSetup || !simulatorSetupActive()) return;
       const response = await fetch('/api/v1/admin/phone/setup/status', { cache: 'no-store' });
       const payload = await response.json();
       if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || 'Simulator control unavailable');
@@ -2970,7 +2809,7 @@
       } finally {
         if (button) {
           button.textContent = original;
-          button.disabled = wasDisabled || (button.id === 'adminRevoke' && !button.classList.contains('is-danger'));
+          button.disabled = wasDisabled;
         }
         adminActionDepth = Math.max(0, adminActionDepth - 1);
       }

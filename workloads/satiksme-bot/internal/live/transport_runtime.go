@@ -75,6 +75,7 @@ func RunTransportSnapshotLoop(ctx context.Context, settings TransportRuntimeSett
 		currentVehicleCount int
 		consecutiveFailures int
 		nextPollDelay       = settings.PollInterval
+		startupRefresh      = true
 		lastStoredState     model.LiveTransportState
 		storedStateLoaded   bool
 		hadActiveViewers    bool
@@ -139,7 +140,7 @@ func RunTransportSnapshotLoop(ctx context.Context, settings TransportRuntimeSett
 			graceUntil = now.Add(settings.ViewerGracePeriod)
 		}
 		hadActiveViewers = activeViewers > 0
-		shouldPoll := activeViewers > 0 || (!graceUntil.IsZero() && now.Before(graceUntil))
+		shouldPoll := startupRefresh || activeViewers > 0 || (!graceUntil.IsZero() && now.Before(graceUntil))
 		if !shouldPoll {
 			resetTimer(settings.IdleCheckInterval)
 			continue
@@ -198,6 +199,7 @@ func RunTransportSnapshotLoop(ctx context.Context, settings TransportRuntimeSett
 
 		recovered := consecutiveFailures > 0
 		consecutiveFailures = 0
+		startupRefresh = false
 		lastSuccessAt = now
 		if result != nil {
 			currentVersion = result.Version
