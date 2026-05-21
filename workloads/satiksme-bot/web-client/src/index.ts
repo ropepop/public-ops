@@ -72,13 +72,6 @@ function normalizeSnapshotState(row: any) {
     feed: asString(row.feed).trim(),
     version: asString(row.version).trim(),
     path: asString(row.path).trim(),
-    hash: asString(row.hash).trim(),
-    publishedAt: asString(row.publishedAt).trim(),
-    lastSuccessAt: asString(row.lastSuccessAt).trim(),
-    lastAttemptAt: asString(row.lastAttemptAt).trim(),
-    status: asString(row.status).trim(),
-    consecutiveFailures: Number(row.consecutiveFailures) || 0,
-    vehicleCount: Number(row.vehicleCount) || 0,
   };
 }
 
@@ -87,7 +80,6 @@ function normalizeVehicleContext(row: any) {
     return null;
   }
   return {
-    scopeKey: asString(row.scopeKey).trim(),
     stopId: asString(row.stopId).trim(),
     stopName: asString(row.stopName).trim(),
     mode: asString(row.mode).trim(),
@@ -95,7 +87,6 @@ function normalizeVehicleContext(row: any) {
     direction: asString(row.direction).trim(),
     destination: asString(row.destination).trim(),
     departureSeconds: asNumber(row.departureSeconds),
-    liveRowId: asString(row.liveRowId).trim(),
   };
 }
 
@@ -110,7 +101,6 @@ function normalizeAreaContext(row: any) {
     return null;
   }
   return {
-    scopeKey: asString(row.scopeKey).trim(),
     latitude,
     longitude,
     radiusMeters,
@@ -204,7 +194,6 @@ function normalizeVehicleSighting(row: any) {
     direction: asString(row.direction).trim(),
     destination: asString(row.destination).trim(),
     departureSeconds: asNumber(row.departureSeconds),
-    liveRowId: asString(row.liveRowId).trim(),
     createdAt: asString(row.createdAt).trim(),
   };
 }

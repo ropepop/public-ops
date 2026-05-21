@@ -41,7 +41,7 @@
 - Modify `workloads/ticket-remote/README.md`: update production requirements and validation checklist.
 - Modify `workloads/ticket-remote/module.yaml`: make health checks strict enough for production readiness.
 - Modify `infra/arbuzas/docker/compose.yml`: remove broad secrets/ADB mounts from `ticket_remote`; set explicit production state/auth defaults.
-- Modify `infra/arbuzas/docker/images/ticket-remote.Dockerfile`: remove ADB if simulator setup is moved out of the public web container; otherwise keep ADB but no private key mounts.
+- Modify `infra/arbuzas/docker/images/ticket-remote.Dockerfile`: keep the public web image free of ADB and private device-control mounts.
 - Modify `tools/arbuzas/deploy.sh`: production validation for state backend, auth mode, HTTP redirect, headers, static asset strings, and public served version.
 
 ---
@@ -814,9 +814,9 @@ Replace them with only the exact ticket remote JWT key mount when key-file mode 
 
 Set `TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE=/run/secrets/ticket-remote/spacetime-jwt-private-key.pem` in `/etc/arbuzas/env/ticket-remote.env` on Arbuzas.
 
-- [ ] **Step 2: Decide whether ADB remains in the web image**
+- [ ] **Step 2: Keep ADB out of the web image**
 
-If simulator setup still requires ADB from `ticket_remote`, keep `android-tools-adb` installed but rely only on private Docker-network simulator access with no Pixel ADB keys. If simulator setup is split into `ticket_android_sim_bridge`, remove `android-tools-adb` from `ticket-remote.Dockerfile`.
+Remove `android-tools-adb` from `ticket-remote.Dockerfile` and keep device-control responsibilities outside the public web container.
 
 - [ ] **Step 3: Add deploy validation for removed mounts**
 

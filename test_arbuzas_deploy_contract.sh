@@ -4,6 +4,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${REPO_ROOT}/tools/arbuzas/deploy.sh"
 COMPOSE_PATH="${REPO_ROOT}/infra/arbuzas/docker/compose.yml"
+TRAIN_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/train-bot.Dockerfile"
+SATIKSME_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/satiksme-bot.Dockerfile"
+TRAIN_LDFLAGS_PATH="${REPO_ROOT}/workloads/train-bot/scripts/ldflags.sh"
+SATIKSME_LDFLAGS_PATH="${REPO_ROOT}/workloads/satiksme-bot/scripts/ldflags.sh"
 NETDATA_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/netdata.conf"
 NETDATA_DOCKER_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/docker.conf"
 NETDATA_DOCKER_SD_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/sd/docker.conf"
@@ -23,6 +27,17 @@ if [[ ! -f "${COMPOSE_PATH}" ]]; then
   exit 1
 fi
 
+for release_identity_file in \
+  "${TRAIN_DOCKERFILE_PATH}" \
+  "${SATIKSME_DOCKERFILE_PATH}" \
+  "${TRAIN_LDFLAGS_PATH}" \
+  "${SATIKSME_LDFLAGS_PATH}"; do
+  if [[ ! -f "${release_identity_file}" ]]; then
+    echo "FAIL: missing release identity build file at ${release_identity_file}" >&2
+    exit 1
+  fi
+done
+
 if ! grep -F 'ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"' "${SCRIPT_PATH}" >/dev/null; then
   echo "FAIL: Arbuzas train tunnel default must use vilciens.kontrole.info" >&2
   exit 1
@@ -37,6 +52,70 @@ for train_public_base_snippet in \
     echo "FAIL: train_bot production web setting is missing or misaligned: ${train_public_base_snippet}" >&2
     exit 1
   fi
+done
+
+for satiksme_public_base_snippet in \
+  "SATIKSME_WEB_PUBLIC_BASE_URL: https://\${ARBUZAS_SATIKSME_BOT_HOSTNAME}" \
+  "export SATIKSME_WEB_PUBLIC_BASE_URL=\"https://\${ARBUZAS_SATIKSME_BOT_HOSTNAME}\""; do
+  if ! grep -F "${satiksme_public_base_snippet}" "${COMPOSE_PATH}" >/dev/null; then
+    echo "FAIL: satiksme_bot production web setting is missing or misaligned: ${satiksme_public_base_snippet}" >&2
+    exit 1
+  fi
+done
+
+for satiksme_live_viewer_snippet in \
+  "SATIKSME_WEB_LIVE_VIEWER_HEARTBEAT_ENABLED: \"true\"" \
+  "export SATIKSME_WEB_LIVE_VIEWER_HEARTBEAT_ENABLED=\"true\""; do
+  if ! grep -F "${satiksme_live_viewer_snippet}" "${COMPOSE_PATH}" >/dev/null; then
+    echo "FAIL: satiksme_bot live map heartbeat setting is missing or misaligned: ${satiksme_live_viewer_snippet}" >&2
+    exit 1
+  fi
+done
+if ! grep -F "shell missing public live viewer heartbeat writes" "${SCRIPT_PATH}" >/dev/null; then
+  echo "FAIL: satiksme deploy validation must require live viewer heartbeat writes" >&2
+  exit 1
+fi
+if grep -F "shell enables public live viewer heartbeat writes" "${SCRIPT_PATH}" >/dev/null; then
+  echo "FAIL: satiksme deploy validation must not reject live viewer heartbeat writes" >&2
+  exit 1
+fi
+
+for release_build_arg in \
+  "ARBUZAS_RELEASE_ID" \
+  "ARBUZAS_RELEASE_SOURCE_COMMIT" \
+  "ARBUZAS_RELEASE_SOURCE_DIRTY" \
+  "ARBUZAS_RELEASE_SOURCE_SHA256"; do
+  compose_count="$(grep -F "${release_build_arg}: \${${release_build_arg}}" "${COMPOSE_PATH}" || true)"
+  compose_count="$(printf '%s\n' "${compose_count}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "${compose_count}" -lt 2 ]]; then
+    echo "FAIL: train_bot and satiksme_bot builds must receive ${release_build_arg}" >&2
+    exit 1
+  fi
+  for dockerfile_path in "${TRAIN_DOCKERFILE_PATH}" "${SATIKSME_DOCKERFILE_PATH}"; do
+    if ! grep -F "ARG ${release_build_arg}" "${dockerfile_path}" >/dev/null; then
+      echo "FAIL: $(basename "${dockerfile_path}") must declare ${release_build_arg}" >&2
+      exit 1
+    fi
+    if ! grep -F "export ${release_build_arg}" "${dockerfile_path}" >/dev/null; then
+      echo "FAIL: $(basename "${dockerfile_path}") must export ${release_build_arg} for ldflags" >&2
+      exit 1
+    fi
+  done
+done
+
+for ldflags_path in "${TRAIN_LDFLAGS_PATH}" "${SATIKSME_LDFLAGS_PATH}"; do
+  for ldflags_snippet in \
+    "ARBUZAS_RELEASE_ID" \
+    "ARBUZAS_RELEASE_SOURCE_COMMIT" \
+    "ARBUZAS_RELEASE_SOURCE_DIRTY" \
+    "ARBUZAS_RELEASE_SOURCE_SHA256" \
+    "version.ReleaseID" \
+    "version.SourceSHA256"; do
+    if ! grep -F "${ldflags_snippet}" "${ldflags_path}" >/dev/null; then
+      echo "FAIL: $(basename "${ldflags_path}") must stamp ${ldflags_snippet}" >&2
+      exit 1
+    fi
+  done
 done
 
 for ticket_remote_runtime_snippet in \
@@ -131,7 +210,7 @@ required_snippets = [
     "--release-id is not supported for install-thinkpad-fan",
     "--release-id is not supported for validate-thinkpad-fan",
     "--services NAME[,NAME...]",
-    "--services is only supported for deploy and validate",
+    "--services is only supported for deploy, validate, and rollback",
     "--services requires at least one service name",
     "remote_run_docker_gc()",
     "remote_run_host_cache_cleanup()",
@@ -143,6 +222,21 @@ required_snippets = [
     "compose_all_non_dns_service_args()",
     "compose_all_tunnel_service_args()",
     "render_remote_cloudflared_configs()",
+    "cleanup_remote_public_bundle_versions()",
+    "compute_release_source_sha256()",
+    "validate_remote_release_identity()",
+    "ARBUZAS_RELEASE_SOURCE_COMMIT",
+    "ARBUZAS_RELEASE_SOURCE_DIRTY",
+    "ARBUZAS_RELEASE_SOURCE_SHA256",
+    "releaseId",
+    "sourceSha256",
+    "public bundle cleanup target=train_bot",
+    "public bundle cleanup target=satiksme_bot",
+    "version_dirs(versions_root)",
+    "reason=missing-active-no-versions",
+    "missing active while version dirs exist",
+    "empty active while version dirs exist",
+    "active version directory is missing",
     "collect_remote_dns_host_diagnostics()",
     "ensure_remote_dns_host_preflight()",
     "repair_remote_dns_admin()",
@@ -154,6 +248,22 @@ required_snippets = [
     "install_remote_thinkpad_fan()",
     "validate_remote_thinkpad_fan()",
     'copy_tree_into_release "tools/arbuzas-rs"',
+    '--exclude="${path}/.env"',
+    '--exclude="${path}/.env.*"',
+    '--exclude="${path}/.DS_Store"',
+    '--exclude="${path}/state"',
+    '--exclude="${path}/*.env"',
+    '--exclude="${path}/*.secret"',
+    '--exclude="${path}/*.db"',
+    '--exclude="${path}/*.db.lock"',
+    '--exclude="${path}/*.instance.lock"',
+    '--exclude="${path}/data/*.db"',
+    '--exclude="${path}/data/*.db.lock"',
+    '--exclude="${path}/data/catalog"',
+    '--exclude="${path}/data/public-bundles"',
+    '--exclude="${path}/data/schedules/*.json"',
+    '--exclude="${path}/spacetimedb/dist"',
+    '--exclude="${path}/web-client/src/generated"',
     'cp "${REPO_ROOT}/tools/arbuzas/render_cloudflared_config.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/render_cloudflared_config.py"',
     'cp "${REPO_ROOT}/tools/arbuzas/docker_gc.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/docker_gc.py"',
     'gc_script="$(resolve_local_docker_gc_script)"',
@@ -175,35 +285,25 @@ required_snippets = [
     "run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null",
     "up -d --build --force-recreate --no-deps dns_controlplane >/dev/null",
     "up -d --force-recreate --no-deps dns_controlplane",
-    "up -d --remove-orphans${all_non_dns_service_args}",
-    "up -d --no-deps${non_dns_service_args}",
+    "up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}",
+    "up -d --build --force-recreate --no-deps${non_dns_service_args}",
     "up -d --force-recreate --no-deps${tunnel_service_args}",
+    "release_static = pathlib.Path('${remote_release_dir}') / 'workloads/train-bot/internal/web/static'",
+    "release_static = pathlib.Path('${remote_release_dir}') / 'workloads/satiksme-bot/internal/web/static'",
+    "def expected_asset_body(path):",
+    "def strip_named_js_function(source, name):",
+    "root shell does not reference release asset hash",
+    "public asset {asset} hash {actual} does not match release hash {expected}",
+    "public asset {path} exposes private hostname",
     "--out '${remote_release_dir}/generated/cloudflared/train-bot.yml'",
     "--out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'",
     "--out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'",
     "--out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'",
     "append_unique COMPOSE_TARGET_SERVICES train_tunnel",
-    "append_unique COMPOSE_TARGET_SERVICES ticket_android_sim",
-    "append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner",
-    "append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_bridge",
-    "prepare_remote_ticket_android_sim_active_backend()",
-    "upload_remote_ticket_android_sim_phone_apk()",
-    "setup_remote_ticket_android_sim()",
-    "cat > /tmp/ticket-android-sim-setup.sh",
-    "cat > /tmp/restore-aggressive-packages-inner.sh",
-    "wait_for_remote_ticket_android_sim_tuning()",
-    "ticket_phone_service package=lv.jolkins.pixelorchestrator",
-    "install_or_update TicketPhoneService",
-    "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
-    "result=signature-mismatch-uninstall",
-    "result=reinstalled",
-    "ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel",
-    "ticket Android simulator ADB ready",
-    "ticket Android simulator no swap",
-    "ticket Android simulator current boot tuned",
-    "ticket Android simulator resources",
-    "Memory=6442450944",
-    "MemorySwap=6442450944",
+    "ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel",
+    "rigassatiksme_qr_bot",
+    "ARBUZAS_PHONE_BROKER_PORT",
+    "TICKET_REMOTE_PHONE_BROKER_URL",
     "ticket-remote stale viewer code absent",
     "ARBUZAS_TICKET_REMOTE_AUTH_MODE=${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}",
     "ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}",
@@ -240,13 +340,11 @@ required_snippets = [
     "dblclick",
     "touch-action: pan-y",
     "ctx.drawImage",
-    "tuning-status.env",
-    "ticket_android_sim_active_backend result=preserved",
     "ticket-remote active configured backend",
-    "/srv/arbuzas/android-sim/google-apis/avd",
-    "/srv/arbuzas/android-sim/apks",
     "validate_remote_selected_workload_health",
     "validate_remote_current_release_link",
+    "mark_remote_validation_failed()",
+    "return_remote_validation_status()",
     "validate_remote_satiksme_dependency_dns",
     "getent hosts saraksti.rigassatiksme.lv",
     "Validation failed: satiksme dependency DNS",
@@ -262,10 +360,77 @@ required_snippets = [
     "/assets/app.js.map",
     "/assets/live-client.js",
     "/api/v1/auth/test",
+    "/pixel-stack/train/api/v1/health",
+    "/service-worker.js",
+    "/spacetimedb/dist/bundle.js",
+    "app.js?v={app_hash}&debug=1",
+    "assert_no_train_bot_headers",
+    "assert_no_satiksme_headers",
+    "assert_vary_accept_encoding",
+    "assert_unversioned_asset_range_not_partial",
+    "assert_immutable_public_asset_cache",
+    "assert_public_json_cache_not_long_immutable",
+    "non_current_asset_hash",
+    "missing immutable public asset cache",
+    "public JSON cache is immutable",
+    "'Range': 'bytes=0-63'",
+    "range request returned Content-Range",
+    "HEAD /robots.txt returned",
+    "/api/v1/public/service-day-trains?debug=1",
+    "/api/v1/messages?lang=lv&lang=en",
+    "/__outside-audit-404",
+    "/.well-known/security.txt",
+    "/favicon.ico",
+    "/site.webmanifest",
+    "/apple-touch-icon.png",
+    "HEAD {path} returned {status}, want 200",
+    "exposes repeated per-train sourceVersion",
+    "shell exposes public sourceVersion",
+    "train active bundle pointer exposes sourceVersion",
+    "train active bundle manifest /assets/{manifest_path} exposes sourceVersion",
+    "public dashboard HEAD cache redirect returned",
+    "sourceMappingURL=",
+    "'\\\"__\\\" + \\\"test__\\\"'",
+    "resetStateForTest",
+    "malformed Telegram login leaks validation detail",
+    "legacy malformed Telegram login leaks validation detail",
+    "unauthenticated {path} returned {status}, want 401",
+    "public live viewer heartbeat route is enabled for {method}",
+    "oidc discovery exposes internal smoke claim",
+    "/api/v1/public/dashboard?limit=2001",
+    "unknown public train shell {path} returned {status}, want 404",
+    "/bundles/no-such-version/manifest.json",
+    "live snapshot active path is not under transport/live",
+    "invalid public incident limit",
+    "invalid public sightings limit",
+    "unexpected public query",
+    "public incident detail event id is not opaque",
+    "/api/v1/public/live-vehicles",
     "test_ticket",
     "stripTestTicketFromLocation",
     "trainbot_service_get_schedule",
     "trainbot_service_list_activities",
+    "trainbot_submit_report",
+    "trainbot_vote_incident",
+    "trainbot_comment_incident",
+    "trainbot_begin_service_day_import",
+    "trainbot_run_trainbot_job",
+    "trainbot_my_profile",
+    "satiksmebot_bootstrap_me",
+    "satiksmebot_list_recent_reports",
+    "satiksmebot_submit_stop_report",
+    "satiksmebot_submit_vehicle_report",
+    "satiksmebot_submit_area_report",
+    "satiksmebot_vote_incident",
+    "satiksmebot_comment_incident",
+    "satiksmebot_heartbeat_live_viewer",
+    "satiksmebot_set_live_viewer_state",
+    "satiksmebot_service_pending_report_dump_count",
+    "satiksmebot_stop_sighting",
+    "satiksmebot_incident_comment",
+    "stale query-versioned asset remained public",
+    "/robots.txt",
+    "public shell exposes preview metadata",
     "TLS 1.0 unexpectedly accepted",
     "TLS 1.1 unexpectedly accepted",
     "dig +short CAA kontrole.info",
@@ -354,10 +519,19 @@ for snippet in required_snippets:
 
 for retired_snippet in [
     "require_cmd nc",
+    "ticket_android_" + "sim",
+    "android-" + "sim",
+    "Android " + "sim" + "ulator",
+    "android_" + "sim",
+    "/srv/arbuzas/android-" + "sim",
+    "ticket-android-" + "sim",
+    "emu" + "lator",
+    "sim" + "ulator",
+    "av" + "d",
+    "qe" + "mu",
 ]:
     if retired_snippet in script:
         raise SystemExit(f"retired deploy contract snippet still present: {retired_snippet}")
-
 
 def block_between(start: str, end: str) -> str:
     start_index = script.index(start)
@@ -382,9 +556,18 @@ all_non_dns_block = block_between('compose_all_non_dns_service_args() {\n', 'com
 remote_compose_up_block = block_between('remote_compose_up() {\n', 'validate_remote_dns_querylog_flow() {\n')
 compact_function_block = block_between('compact_remote_dns_db() {\n', 'stage_netdata_config_to_remote() {\n')
 rollback_function_block = block_between('rollback_remote_release() {\n', 'while (( $# > 0 )); do\n')
+validate_probe_block = block_between('validate_remote_probe() {\n', 'validate_remote_host_probe() {\n')
+validate_host_probe_block = block_between('validate_remote_host_probe() {\n', 'wait_until_local_ok() {\n')
+validate_release_block = block_between('validate_remote_release() {\n', 'repair_remote_portainer() {\n')
 
 if deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"') > deploy_block.index("run_automatic_remote_docker_gc"):
     raise SystemExit("deploy cleanup runs before validation")
+if deploy_block.index("cleanup_remote_public_bundle_versions") < deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"'):
+    raise SystemExit("deploy cleans public bundles before validation")
+if deploy_block.index("cleanup_remote_public_bundle_versions") > deploy_block.index("run_automatic_remote_docker_gc"):
+    raise SystemExit("deploy cleans public bundles after docker cleanup")
+if "if requires_dns_release_prepare; then\n      publish_remote_dns_admin_tailscale\n" not in deploy_block:
+    raise SystemExit("deploy block must only publish the private DNS admin surface when DNS is in scope")
 if deploy_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"') > deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"'):
     raise SystemExit("deploy validates the release before confirming the current symlink")
 if 'log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in deploy_block:
@@ -393,17 +576,20 @@ if 'if dns_validation_requested || requires_dns_release_prepare; then' not in de
     raise SystemExit("deploy block does not gate DNS-only private admin requirements")
 if 'require_dns_private_admin_env' not in deploy_block:
     raise SystemExit("deploy block does not require the DNS private admin environment when needed")
-if deploy_block.index("prepare_remote_ticket_android_sim_active_backend") > deploy_block.index("remote_compose_up"):
-    raise SystemExit("deploy starts ticket services before preparing the simulator backend state")
-if deploy_block.index("upload_remote_ticket_android_sim_phone_apk") > deploy_block.index("remote_compose_up"):
-    raise SystemExit("deploy starts ticket services before staging the simulator phone service APK")
-if deploy_block.index("setup_remote_ticket_android_sim") < deploy_block.index("remote_compose_up"):
-    raise SystemExit("deploy prepares the simulator device before compose has started it")
 if deploy_block.index("publish_remote_dns_admin_tailscale") > deploy_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"'):
     raise SystemExit("deploy block publishes the private DNS admin path after validation starts")
 
 if 'log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in validate_block:
     raise SystemExit("validate block does not announce targeted service validation")
+
+if "mark_remote_validation_failed" not in validate_probe_block:
+    raise SystemExit("remote compose validation failures must be recorded explicitly")
+if "mark_remote_validation_failed" not in validate_host_probe_block:
+    raise SystemExit("remote host validation failures must be recorded explicitly")
+if "local REMOTE_VALIDATION_FAILED=0" not in validate_release_block:
+    raise SystemExit("validate_remote_release must reset the explicit failure flag")
+if validate_release_block.count("return_remote_validation_status") < 2:
+    raise SystemExit("validate_remote_release must return the explicit failure flag in both full and targeted modes")
 
 for tunnel_service in ("train_tunnel", "satiksme_tunnel", "subscription_tunnel", "ticket_remote_tunnel"):
     if tunnel_service not in target_non_dns_block:
@@ -426,6 +612,17 @@ if rollback_block.index('validate_remote_release "${requested_release_id}"') > r
     raise SystemExit("rollback cleanup runs before validation")
 if rollback_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"') > rollback_block.index('validate_remote_release "${requested_release_id}"'):
     raise SystemExit("rollback validates the release before confirming the current symlink")
+for rollback_snippet in (
+    'rollback_non_dns_service_args="$(compose_target_service_args_without_dns)"',
+    'rollback_tunnel_service_args="$(compose_target_tunnel_service_args)"',
+    'ROLLBACK_DNS_IN_SCOPE',
+    'up -d --build --force-recreate --no-deps${rollback_non_dns_service_args}',
+    'up -d --force-recreate --no-deps${rollback_tunnel_service_args}',
+):
+    if rollback_snippet not in rollback_function_block:
+        raise SystemExit(f"rollback function does not preserve targeted deploy scope: {rollback_snippet}")
+if "if requires_dns_release_prepare; then\n      publish_remote_dns_admin_tailscale\n" not in rollback_block:
+    raise SystemExit("rollback block must only publish the private DNS admin surface when DNS is in scope")
 if rollback_block.index("publish_remote_dns_admin_tailscale") > rollback_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"'):
     raise SystemExit("rollback block publishes the private DNS admin path after validation starts")
 

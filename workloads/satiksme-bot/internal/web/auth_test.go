@@ -1,6 +1,7 @@
 package web
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,9 @@ func TestIssueSessionCookieLivesForThirtyDays(t *testing.T) {
 	}
 	if got, want := cookie.MaxAge, int((30 * 24 * time.Hour).Seconds()); got != want {
 		t.Fatalf("cookie.MaxAge = %d, want %d", got, want)
+	}
+	if cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("cookie.SameSite = %v, want Lax", cookie.SameSite)
 	}
 	claims, err := parseSession(secret, cookie.Value, now.Add(29*24*time.Hour))
 	if err != nil {

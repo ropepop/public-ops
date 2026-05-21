@@ -104,7 +104,9 @@ func TestRelayAcceptsLargePhoneFrames(t *testing.T) {
 }
 
 func TestRelayDelaysPhoneStopAcrossBriefViewerGap(t *testing.T) {
-	stopRequests := make(chan struct{}, 1)
+	startCommands := make(chan struct{}, 1)
+	stopCommands := make(chan struct{}, 1)
+	httpStopRequests := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -117,9 +119,14 @@ func TestRelayDelaysPhoneStopAcrossBriefViewerGap(t *testing.T) {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+			ctx, cancel := context.WithTimeout(r.Context(), 700*time.Millisecond)
 			defer cancel()
 			_, _, _ = conn.Read(ctx)
+			startCommands <- struct{}{}
+			_, data, err := conn.Read(ctx)
+			if err == nil && bytes.Contains(data, []byte(`"type":"stop"`)) {
+				stopCommands <- struct{}{}
+			}
 			<-ctx.Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
@@ -127,13 +134,12 @@ func TestRelayDelaysPhoneStopAcrossBriefViewerGap(t *testing.T) {
 				t.Errorf("accept video websocket: %v", err)
 				return
 			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			ctx, cancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
 			defer cancel()
 			_, _, _ = conn.Read(ctx)
 			<-ctx.Done()
 		case "/api/v1/session/stop":
-			stopRequests <- struct{}{}
+			httpStopRequests <- struct{}{}
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -148,28 +154,98 @@ func TestRelayDelaysPhoneStopAcrossBriefViewerGap(t *testing.T) {
 		NoViewerStopDelay: 80 * time.Millisecond,
 	})
 	relay.AddViewer()
+	select {
+	case <-startCommands:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("relay did not start phone session")
+	}
 	relay.RemoveViewer()
 	time.Sleep(20 * time.Millisecond)
 	relay.AddViewer()
 	defer relay.Close()
 
 	select {
-	case <-stopRequests:
+	case <-stopCommands:
 		t.Fatal("phone session stopped during brief viewer gap")
 	case <-time.After(120 * time.Millisecond):
+	}
+	select {
+	case <-httpStopRequests:
+		t.Fatal("idle stop should use the existing websocket, not HTTP")
+	default:
 	}
 
 	relay.RemoveViewer()
 
 	select {
-	case <-stopRequests:
+	case <-stopCommands:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("phone session was not stopped after idle grace")
+	}
+	select {
+	case <-httpStopRequests:
+		t.Fatal("idle stop should use the existing websocket, not HTTP")
+	default:
+	}
+}
+
+func TestRelayAddViewerWaitsForIdleStopCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session", "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			<-r.Context().Done()
+		case "/api/v1/session/stop":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL:           server.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	done := make(chan struct{})
+	relay.mu.Lock()
+	relay.idleStopping = true
+	relay.idleStopDone = done
+	relay.mu.Unlock()
+
+	addDone := make(chan struct{})
+	go func() {
+		relay.AddViewer()
+		close(addDone)
+	}()
+	select {
+	case <-addDone:
+		t.Fatal("viewer add returned while idle stop was still in flight")
+	case <-time.After(80 * time.Millisecond):
+	}
+	relay.finishIdleStop(done)
+	select {
+	case <-addDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("viewer add did not resume after idle stop completed")
+	}
+	if snapshot := relay.Snapshot(); snapshot.Viewers != 1 || !snapshot.Desired {
+		t.Fatalf("viewer was not added after idle stop completed: %#v", snapshot)
 	}
 }
 
 func TestRelayStopsPhoneImmediatelyWhenNoViewerDelayIsZero(t *testing.T) {
-	stopRequests := make(chan struct{}, 1)
+	startCommands := make(chan struct{}, 1)
+	stopCommands := make(chan struct{}, 1)
+	httpStopRequests := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -185,6 +261,11 @@ func TestRelayStopsPhoneImmediatelyWhenNoViewerDelayIsZero(t *testing.T) {
 			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 			defer cancel()
 			_, _, _ = conn.Read(ctx)
+			startCommands <- struct{}{}
+			_, data, err := conn.Read(ctx)
+			if err == nil && bytes.Contains(data, []byte(`"type":"stop"`)) {
+				stopCommands <- struct{}{}
+			}
 			<-ctx.Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
@@ -198,7 +279,7 @@ func TestRelayStopsPhoneImmediatelyWhenNoViewerDelayIsZero(t *testing.T) {
 			_, _, _ = conn.Read(ctx)
 			<-ctx.Done()
 		case "/api/v1/session/stop":
-			stopRequests <- struct{}{}
+			httpStopRequests <- struct{}{}
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -213,31 +294,35 @@ func TestRelayStopsPhoneImmediatelyWhenNoViewerDelayIsZero(t *testing.T) {
 		NoViewerStopDelay: 0,
 	})
 	relay.AddViewer()
+	select {
+	case <-startCommands:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("relay did not start phone session")
+	}
 	relay.RemoveViewer()
 	defer relay.Close()
 
 	select {
-	case <-stopRequests:
+	case <-stopCommands:
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("phone session was not stopped immediately after the last viewer left")
 	}
+	select {
+	case <-httpStopRequests:
+		t.Fatal("idle stop should use the existing websocket, not HTTP")
+	default:
+	}
 }
 
-func TestRelayWebsocketStartDoesNotWaitForHTTPStartFallback(t *testing.T) {
+func TestRelayWebsocketStartDoesNotWaitForHTTPStart(t *testing.T) {
 	httpStartRequests := make(chan struct{}, 1)
-	releaseHTTPStart := make(chan struct{})
 	websocketStartRequests := make(chan struct{}, 1)
 	keyframeRequests := make(chan struct{}, 1)
-	defer close(releaseHTTPStart)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/session/start":
 			httpStartRequests <- struct{}{}
-			select {
-			case <-releaseHTTPStart:
-			case <-r.Context().Done():
-			}
 			w.WriteHeader(http.StatusOK)
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
@@ -290,36 +375,26 @@ func TestRelayWebsocketStartDoesNotWaitForHTTPStartFallback(t *testing.T) {
 	select {
 	case <-websocketStartRequests:
 	case <-time.After(2 * time.Second):
-		t.Fatal("relay did not send websocket start without waiting for HTTP start")
+		t.Fatal("relay did not send websocket start")
 	}
 	select {
 	case <-keyframeRequests:
 	case <-time.After(2 * time.Second):
-		t.Fatal("relay did not request video keyframe without waiting for HTTP start")
+		t.Fatal("relay did not request video keyframe")
 	}
 	select {
 	case <-httpStartRequests:
-	case <-time.After(2 * time.Second):
-		t.Fatal("relay did not issue HTTP start fallback")
+		t.Fatal("relay should not use HTTP session start in the viewer path")
+	case <-time.After(120 * time.Millisecond):
 	}
 }
 
-func TestRelayRecoveryStartUsesCallerTimeoutAndReconnects(t *testing.T) {
-	startRequests := make(chan struct{}, 2)
-	releaseStart := make(chan struct{})
-	controlClosed := make(chan struct{}, 1)
-	videoClosed := make(chan struct{}, 1)
-	defer close(releaseStart)
+func TestRelayAddViewerRestartsDesiredButDisconnectedLoop(t *testing.T) {
+	websocketStartRequests := make(chan struct{}, 1)
+	keyframeRequests := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			startRequests <- struct{}{}
-			select {
-			case <-releaseStart:
-				w.WriteHeader(http.StatusOK)
-			case <-r.Context().Done():
-			}
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -330,8 +405,8 @@ func TestRelayRecoveryStartUsesCallerTimeoutAndReconnects(t *testing.T) {
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
 			_, _, _ = conn.Read(ctx)
+			websocketStartRequests <- struct{}{}
 			<-ctx.Done()
-			controlClosed <- struct{}{}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -342,8 +417,76 @@ func TestRelayRecoveryStartUsesCallerTimeoutAndReconnects(t *testing.T) {
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
 			_, _, _ = conn.Read(ctx)
+			keyframeRequests <- struct{}{}
 			<-ctx.Done()
-			videoClosed <- struct{}{}
+		case "/api/v1/session/stop":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL:           server.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+	})
+	defer relay.Close()
+	relay.mu.Lock()
+	relay.desired = true
+	relay.connected = false
+	relay.cancelLoop = nil
+	relay.mu.Unlock()
+
+	relay.AddViewer()
+
+	select {
+	case <-websocketStartRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not reconnect desired disconnected phone after viewer join")
+	}
+	select {
+	case <-keyframeRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not request keyframe after reconnecting desired disconnected phone")
+	}
+}
+
+func TestRelayReconnectUsesWebsocketStartOnly(t *testing.T) {
+	httpStartRequests := make(chan struct{}, 1)
+	websocketStartRequests := make(chan struct{}, 2)
+	keyframeRequests := make(chan struct{}, 2)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			httpStartRequests <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			_, _, _ = conn.Read(ctx)
+			websocketStartRequests <- struct{}{}
+			<-ctx.Done()
+		case "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept video websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			_, _, _ = conn.Read(ctx)
+			keyframeRequests <- struct{}{}
+			<-ctx.Done()
 		case "/api/v1/session/stop":
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -361,30 +504,31 @@ func TestRelayRecoveryStartUsesCallerTimeoutAndReconnects(t *testing.T) {
 	defer relay.Close()
 
 	select {
-	case <-startRequests:
+	case <-websocketStartRequests:
 	case <-time.After(2 * time.Second):
-		t.Fatal("initial HTTP start fallback was not issued")
+		t.Fatal("initial control websocket did not start")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-	defer cancel()
-	started := time.Now()
-	if err := relay.StartPhoneSession(ctx); err == nil {
-		t.Fatal("expected bounded recovery start to time out")
-	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("recovery start ignored caller timeout: %v", elapsed)
+	select {
+	case <-keyframeRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial video websocket did not request keyframe")
 	}
 	relay.Reconnect("test_recovery_timeout")
 
 	select {
-	case <-controlClosed:
-	case <-time.After(time.Second):
-		t.Fatal("control websocket was not closed during recovery reconnect")
+	case <-websocketStartRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control websocket did not reconnect after recovery")
 	}
 	select {
-	case <-videoClosed:
-	case <-time.After(time.Second):
-		t.Fatal("video websocket was not closed during recovery reconnect")
+	case <-keyframeRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("video websocket did not request keyframe after recovery")
+	}
+	select {
+	case <-httpStartRequests:
+		t.Fatal("relay should not use HTTP session start during reconnect")
+	case <-time.After(120 * time.Millisecond):
 	}
 }
 
@@ -404,19 +548,19 @@ func TestRelaySwitchBackendUpdatesSnapshot(t *testing.T) {
 		BaseURL:    oldBackend.URL + "/",
 	})
 	relay.SwitchBackend(Backend{
-		ID:         "android-sim",
-		AttachName: "Android simulator",
-		BaseURL:    "http://sim.test/",
+		ID:         "lab-pixel",
+		AttachName: "Lab Pixel",
+		BaseURL:    "http://lab.test/",
 	})
 
 	snapshot := relay.Snapshot()
-	if snapshot.BackendID != "android-sim" {
+	if snapshot.BackendID != "lab-pixel" {
 		t.Fatalf("backend id = %q", snapshot.BackendID)
 	}
-	if snapshot.AttachName != "Android simulator" {
+	if snapshot.AttachName != "Lab Pixel" {
 		t.Fatalf("attach name = %q", snapshot.AttachName)
 	}
-	if snapshot.BaseURL != "http://sim.test" {
+	if snapshot.BaseURL != "http://lab.test" {
 		t.Fatalf("base URL = %q", snapshot.BaseURL)
 	}
 	if snapshot.Connected || snapshot.StreamState != "idle" {

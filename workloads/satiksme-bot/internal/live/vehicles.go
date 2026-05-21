@@ -3,7 +3,9 @@ package live
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -143,6 +145,87 @@ func ParseVehicles(raw string, catalog *model.Catalog, now time.Time) []model.Li
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+func PublicLiveVehicles(vehicles []model.LiveVehicle) []model.LiveVehicle {
+	out := make([]model.LiveVehicle, 0, len(vehicles))
+	for index, vehicle := range vehicles {
+		out = append(out, PublicLiveVehicle(vehicle, index))
+	}
+	return out
+}
+
+func PublicLiveVehicle(vehicle model.LiveVehicle, index int) model.LiveVehicle {
+	next := vehicle
+	next.ID = publicVehicleID(next, index)
+	next.VehicleCode = ""
+	next.LiveRowID = ""
+	next.Latitude = publicLiveCoordinate(next.Latitude)
+	next.Longitude = publicLiveCoordinate(next.Longitude)
+	if !next.UpdatedAt.IsZero() {
+		next.UpdatedAt = next.UpdatedAt.UTC().Truncate(time.Second)
+	}
+	next.Incidents = publicLiveVehicleIncidents(next.Incidents)
+	return next
+}
+
+func publicLiveVehicleIncidents(items []model.IncidentSummary) []model.IncidentSummary {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]model.IncidentSummary, 0, len(items))
+	for _, item := range items {
+		next := item
+		if next.Scope == "vehicle" {
+			next.SubjectID = ""
+		}
+		if next.Vehicle != nil {
+			vehicle := *next.Vehicle
+			vehicle.ScopeKey = ""
+			vehicle.LiveRowID = ""
+			next.Vehicle = &vehicle
+		}
+		out = append(out, next)
+	}
+	return out
+}
+
+func publicVehicleID(vehicle model.LiveVehicle, index int) string {
+	seed := publicVehicleStableSeed(vehicle)
+	if seed == "" {
+		seed = fmt.Sprintf(
+			"fallback\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d",
+			strings.ToLower(strings.TrimSpace(vehicle.Mode)),
+			strings.TrimSpace(vehicle.RouteLabel),
+			normalizeDirection(vehicle.Direction),
+			strings.ToLower(strings.TrimSpace(vehicle.Destination)),
+			strings.TrimSpace(vehicle.StopID),
+			vehicle.ArrivalSeconds,
+			index,
+		)
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(seed))
+	return fmt.Sprintf("vehicle:pub-%08x", hash.Sum32())
+}
+
+func publicVehicleStableSeed(vehicle model.LiveVehicle) string {
+	mode := strings.ToLower(strings.TrimSpace(vehicle.Mode))
+	routeLabel := strings.TrimSpace(vehicle.RouteLabel)
+	if id := strings.TrimSpace(vehicle.ID); id != "" {
+		return fmt.Sprintf("id\x00%s\x00%s\x00%s", mode, routeLabel, strings.ToLower(id))
+	}
+	if liveRowID := strings.TrimSpace(vehicle.LiveRowID); liveRowID != "" {
+		return fmt.Sprintf("live-row\x00%s\x00%s\x00%s", mode, routeLabel, liveRowID)
+	}
+	if code := strings.TrimSpace(vehicle.VehicleCode); code != "" {
+		return fmt.Sprintf("vehicle-code\x00%s\x00%s\x00%s", mode, routeLabel, code)
+	}
+	return ""
+}
+
+func publicLiveCoordinate(value float64) float64 {
+	return math.Round(value*100000) / 100000
 }
 
 func ApplyVehicleSightingCounts(vehicles []model.LiveVehicle, sightings []model.PublicVehicleSighting) {

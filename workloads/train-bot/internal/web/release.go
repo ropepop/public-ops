@@ -14,14 +14,16 @@ import (
 )
 
 type releaseInfo struct {
-	Commit     string
-	BuildTime  string
-	Dirty      string
-	Instance   string
-	AppJSHash  string
-	AppCSSHash string
-	FeedJSHash string
-	assetHash  map[string]string
+	Commit       string
+	BuildTime    string
+	Dirty        string
+	ReleaseID    string
+	SourceSHA256 string
+	Instance     string
+	AppJSHash    string
+	AppCSSHash   string
+	FeedJSHash   string
+	assetHash    map[string]string
 }
 
 func newReleaseInfo(static fs.FS) (releaseInfo, error) {
@@ -34,14 +36,16 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 		return releaseInfo{}, err
 	}
 	return releaseInfo{
-		Commit:     strings.TrimSpace(appversion.Commit),
-		BuildTime:  strings.TrimSpace(appversion.BuildTime),
-		Dirty:      strings.TrimSpace(appversion.Dirty),
-		Instance:   instanceID,
-		AppJSHash:  assetHashes["app.js"],
-		AppCSSHash: assetHashes["app.css"],
-		FeedJSHash: assetHashes["external-feed.js"],
-		assetHash:  assetHashes,
+		Commit:       strings.TrimSpace(appversion.Commit),
+		BuildTime:    strings.TrimSpace(appversion.BuildTime),
+		Dirty:        strings.TrimSpace(appversion.Dirty),
+		ReleaseID:    strings.TrimSpace(appversion.ReleaseID),
+		SourceSHA256: strings.TrimSpace(appversion.SourceSHA256),
+		Instance:     instanceID,
+		AppJSHash:    assetHashes["app.js"],
+		AppCSSHash:   assetHashes["app.css"],
+		FeedJSHash:   assetHashes["external-feed.js"],
+		assetHash:    assetHashes,
 	}, nil
 }
 

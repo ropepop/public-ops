@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ops.local/schemas/rs-vivi-incident-trace.v1.schema.json",
+  "title": "RS/ViVi User Incident Trace v1",
+  "description": "Cross-component incident trace for Telegram RS QR jobs and ticket.jolkins/ViVi recovery. This schema is intentionally user-impact centric and secret-free.",
+  "type": "object",
+  "required": ["schema", "traceId", "servicePath", "actor", "phases", "outcome", "safety"],
+  "properties": {
+    "schema": { "const": "rs-vivi-incident-trace.v1" },
+    "traceId": { "type": "string", "minLength": 1 },
+    "servicePath": { "type": "string", "enum": ["rs_telegram_monthly_qr", "ticket_jolkins_vivi_stream", "shared_phone_recovery"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "closedAt": { "type": "string", "format": "date-time" },
+    "actor": {
+      "type": "object",
+      "properties": {
+        "label": { "type": "string", "pattern": "^@?[A-Za-z0-9_:. -]{1,64}$" },
+        "actorHash": { "type": "string", "pattern": "^user:[a-f0-9]{8,64}$" },
+        "source": { "type": "string", "enum": ["telegram_access_state", "broker_hash", "synthetic", "unknown"] }
+      },
+      "additionalProperties": false
+    },
+    "brokerJob": {
+      "type": "object",
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "status": { "type": "string", "enum": ["waiting", "running", "succeeded", "failed", "canceled"] },
+        "reason": { "type": "string" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "createdAt": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "completedAt": { "type": "string" },
+        "queueSec": { "type": "number", "minimum": 0 },
+        "finalAttemptSec": { "type": "number", "minimum": 0 },
+        "totalSec": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/phase" }
+    },
+    "outcome": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["open", "mitigated", "fixed", "recovered", "failed", "monitoring"] },
+        "rootCause": { "type": "string" },
+        "userDeliveredRealRsPng": { "type": "boolean" },
+        "viviRestoredToTicketDetail": { "type": "boolean" },
+        "publicTicketVerified": { "type": "boolean" },
+        "deploy": { "type": "string" },
+        "tests": { "type": "array", "items": { "type": "string" } },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "safety": {
+      "type": "object",
+      "required": ["containsSecrets", "containsRawUserIds", "containsRsCodes"],
+      "properties": {
+        "containsSecrets": { "const": false },
+        "containsRawUserIds": { "const": false },
+        "containsRsCodes": { "const": false }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "required": ["name", "component", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "telegram_request_received",
+            "broker_job_created",
+            "broker_attempt_started",
+            "phone_control_connected",
+            "rs_app_navigation",
+            "rs_code_submitted",
+            "rs_control_screen_verified",
+            "rs_png_captured",
+            "broker_image_available",
+            "telegram_photo_sent",
+            "vivi_cleanup_started",
+            "vivi_ticket_detail_restored",
+            "public_ticket_verified",
+            "incident_closed"
+          ]
+        },
+        "component": { "type": "string", "enum": ["telegram_bot", "phone_broker", "android_ticket_screen", "ticket_phone_bridge", "ticket_remote", "watchdog", "steward"] },
+        "status": { "type": "string", "enum": ["ok", "degraded", "error", "skipped", "unknown"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "durationSec": { "type": "number", "minimum": 0 },
+        "reason": { "type": "string" },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "integer", "boolean", "null"] }
+        },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

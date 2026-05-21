@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestSnapshotPublisherReusesVersionWhenPayloadIsUnchanged(t *testing.T) {
 
 	dir := t.TempDir()
 	publisher := NewSnapshotPublisher(dir, 1000)
-	now := time.Date(2026, 3, 30, 1, 45, 5, 0, time.UTC)
+	now := time.Date(2026, 3, 30, 1, 45, 5, 987654321, time.UTC)
 	vehicles := []model.LiveVehicle{{
 		ID:             "bus:22:17693",
 		VehicleCode:    "17693",
@@ -117,7 +118,7 @@ func TestSnapshotPublisherWritesSnapshotPayload(t *testing.T) {
 
 	dir := t.TempDir()
 	publisher := NewSnapshotPublisher(dir, 1000)
-	now := time.Date(2026, 3, 30, 1, 45, 5, 0, time.UTC)
+	now := time.Date(2026, 3, 30, 1, 45, 5, 987654321, time.UTC)
 	result, err := publisher.Publish(now, []model.LiveVehicle{{
 		ID:             "bus:22:17693",
 		VehicleCode:    "17693",
@@ -156,8 +157,23 @@ func TestSnapshotPublisherWritesSnapshotPayload(t *testing.T) {
 	if len(payload.Vehicles) != 1 {
 		t.Fatalf("len(payload.Vehicles) = %d, want 1", len(payload.Vehicles))
 	}
-	if !payload.Vehicles[0].UpdatedAt.Equal(now) {
-		t.Fatalf("payload vehicle updatedAt = %s, want %s", payload.Vehicles[0].UpdatedAt, now)
+	if !payload.GeneratedAt.Equal(now.Truncate(time.Second)) {
+		t.Fatalf("payload generatedAt = %s, want %s", payload.GeneratedAt, now.Truncate(time.Second))
+	}
+	if !payload.Vehicles[0].UpdatedAt.Equal(now.Truncate(time.Second)) {
+		t.Fatalf("payload vehicle updatedAt = %s, want %s", payload.Vehicles[0].UpdatedAt, now.Truncate(time.Second))
+	}
+	if got := payload.Vehicles[0].LiveRowID; got != "" {
+		t.Fatalf("payload vehicle liveRowId = %q, want empty", got)
+	}
+	if got := payload.Vehicles[0].VehicleCode; got != "" {
+		t.Fatalf("payload vehicle vehicleCode = %q, want empty", got)
+	}
+	if strings.Contains(payload.Vehicles[0].ID, "17693") {
+		t.Fatalf("payload vehicle id exposes raw live row id: %q", payload.Vehicles[0].ID)
+	}
+	if payload.Vehicles[0].Latitude != 56.94773 || payload.Vehicles[0].Longitude != 24.11845 {
+		t.Fatalf("payload vehicle coordinates = %.8f, %.8f; want rounded", payload.Vehicles[0].Latitude, payload.Vehicles[0].Longitude)
 	}
 
 	active, err := ReadSnapshotActiveState(dir)
@@ -169,5 +185,43 @@ func TestSnapshotPublisherWritesSnapshotPayload(t *testing.T) {
 	}
 	if active.Path != result.Path {
 		t.Fatalf("active path = %q, want %q", active.Path, result.Path)
+	}
+}
+
+func TestSnapshotPublisherRetainsPreviousSnapshotWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	publisher := NewSnapshotPublisher(dir, 2)
+	first, err := publisher.Publish(time.Date(2026, 5, 10, 21, 56, 56, 0, time.UTC), []model.LiveVehicle{{
+		ID:          "bus:22:17693",
+		VehicleCode: "17693",
+		Mode:        "bus",
+		RouteLabel:  "22",
+		Latitude:    56.947733,
+		Longitude:   24.118448,
+	}})
+	if err != nil {
+		t.Fatalf("Publish(first) error = %v", err)
+	}
+	second, err := publisher.Publish(time.Date(2026, 5, 10, 21, 57, 7, 0, time.UTC), []model.LiveVehicle{{
+		ID:          "bus:22:17694",
+		VehicleCode: "17694",
+		Mode:        "bus",
+		RouteLabel:  "22",
+		Latitude:    56.9479,
+		Longitude:   24.1189,
+	}})
+	if err != nil {
+		t.Fatalf("Publish(second) error = %v", err)
+	}
+	if first == nil || second == nil || !second.Changed {
+		t.Fatalf("expected two published snapshot versions, got first=%+v second=%+v", first, second)
+	}
+	if _, err := os.Stat(filepath.Join(dir, filepath.Base(first.Path))); err != nil {
+		t.Fatalf("first snapshot should remain fetchable while public state catches up: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, filepath.Base(second.Path))); err != nil {
+		t.Fatalf("second snapshot should exist: %v", err)
 	}
 }

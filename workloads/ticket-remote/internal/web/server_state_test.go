@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -91,9 +92,18 @@ func TestMemberStateRedactionHidesAdminOnlyDetails(t *testing.T) {
 			t.Fatalf("public member state leaked %q in %s", forbidden, text)
 		}
 	}
-	for _, required := range []string{`"viewerCount":2`, `"viewerPresence":[{"label":"Skatītājs 1"},{"label":"Skatītājs 2"}]`, `"activeControl"`, `"ownerEmail":"controller@example.test"`, `"stateBackend":"spacetime"`} {
+	for _, required := range []string{`"viewerCount":2`, `"viewerPresence"`, `"activeControl"`, `"ownerEmail":"controller@example.test"`, `"stateBackend":"spacetime"`} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("public member state missing %q in %s", required, text)
+		}
+	}
+	publicIDPattern := regexp.MustCompile(`^[0-9A-Z]{4}$`)
+	for _, viewer := range public.ViewerPresence {
+		if !publicIDPattern.MatchString(viewer.Label) || viewer.PublicID != viewer.Label {
+			t.Fatalf("public viewer label/public ID = %#v, want matching 4-character account ID", viewer)
+		}
+		if strings.HasPrefix(viewer.Label, "Skatītājs") {
+			t.Fatalf("public viewer label must not use ordinal fallback: %#v", viewer)
 		}
 	}
 }
@@ -148,7 +158,6 @@ func TestAdminPageRendersDashboardShell(t *testing.T) {
 		`id="adminPhoneState"`,
 		`id="adminSafetyState"`,
 		`id="adminBackendList"`,
-		`data-simulator-setup="true"`,
 		`id="adminNotice"`,
 		`<details class="admin-section admin-raw">`,
 	} {

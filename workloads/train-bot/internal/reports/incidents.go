@@ -3,6 +3,8 @@ package reports
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -16,7 +18,34 @@ const (
 	stationIncidentActiveWindow = 30 * time.Minute
 	maxIncidentComments         = 100
 	maxIncidentVoteEvents       = 100
+	sameVoteWindow              = 30 * time.Minute
+	commentActionWindow         = time.Hour
+	commentActionLimit          = 10
+	incidentCommentActionLimit  = 50
 )
+
+type RateLimitError struct {
+	Reason    string
+	Remaining time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	switch e.Reason {
+	case "same_vote":
+		return "same vote submitted too recently"
+	case "comment_action_limit":
+		return "too many comments"
+	case "incident_comment_limit":
+		return "too many comments on this incident"
+	default:
+		return "wait before trying again"
+	}
+}
+
+type incidentCommentRateLimitStore interface {
+	CountIncidentCommentsByUserSince(context.Context, int64, time.Time) (int, error)
+	CountIncidentCommentsByIncidentSince(context.Context, string, time.Time) (int, error)
+}
 
 type incidentBundle struct {
 	summary domain.IncidentSummary
@@ -185,6 +214,9 @@ func (s *Service) VoteIncident(ctx context.Context, incidentID string, userID in
 	if _, err := s.IncidentDetail(ctx, incidentID, now, userID); err != nil {
 		return domain.IncidentVoteSummary{}, err
 	}
+	if err := s.enforceSameVoteWindow(ctx, incidentID, userID, value, now); err != nil {
+		return domain.IncidentVoteSummary{}, err
+	}
 	vote := domain.IncidentVote{
 		IncidentID: incidentID,
 		UserID:     userID,
@@ -220,6 +252,9 @@ func (s *Service) AddIncidentComment(ctx context.Context, incidentID string, use
 	if len([]rune(body)) > 280 {
 		return nil, fmt.Errorf("comment is too long")
 	}
+	if err := s.enforceCommentActionLimit(ctx, incidentID, userID, now); err != nil {
+		return nil, err
+	}
 	comment := domain.IncidentComment{
 		ID:         generateID(),
 		IncidentID: incidentID,
@@ -234,6 +269,57 @@ func (s *Service) AddIncidentComment(ctx context.Context, incidentID string, use
 	return &comment, nil
 }
 
+func (s *Service) enforceSameVoteWindow(ctx context.Context, incidentID string, userID int64, value domain.IncidentVoteValue, now time.Time) error {
+	current, err := s.currentIncidentVote(ctx, incidentID, userID)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.Value != value {
+		return nil
+	}
+	delta := now.Sub(current.UpdatedAt)
+	if delta < sameVoteWindow {
+		return &RateLimitError{Reason: "same_vote", Remaining: sameVoteWindow - delta}
+	}
+	return nil
+}
+
+func (s *Service) enforceCommentActionLimit(ctx context.Context, incidentID string, userID int64, now time.Time) error {
+	rateStore, ok := s.store.(incidentCommentRateLimitStore)
+	if !ok {
+		return nil
+	}
+	since := now.Add(-commentActionWindow)
+	userCount, err := rateStore.CountIncidentCommentsByUserSince(ctx, userID, since)
+	if err != nil {
+		return err
+	}
+	if userCount >= commentActionLimit {
+		return &RateLimitError{Reason: "comment_action_limit", Remaining: commentActionWindow}
+	}
+	incidentCount, err := rateStore.CountIncidentCommentsByIncidentSince(ctx, incidentID, since)
+	if err != nil {
+		return err
+	}
+	if incidentCount >= incidentCommentActionLimit {
+		return &RateLimitError{Reason: "incident_comment_limit", Remaining: commentActionWindow}
+	}
+	return nil
+}
+
+func (s *Service) currentIncidentVote(ctx context.Context, incidentID string, userID int64) (*domain.IncidentVote, error) {
+	items, err := s.store.ListIncidentVotes(ctx, incidentID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.UserID == userID {
+			return &item, nil
+		}
+	}
+	return nil, nil
+}
+
 func TrainIncidentID(trainID string, dayKey string, contextKey string) string {
 	return fmt.Sprintf("train:%s:%s", strings.TrimSpace(trainID), sanitizeIncidentKey(dayKey+"-"+contextKey))
 }
@@ -243,7 +329,7 @@ func StationIncidentID(stationID string, dayKey string, contextKey string) strin
 }
 
 func AreaIncidentID(subjectID string, dayKey string) string {
-	return fmt.Sprintf("area:%s:%s", strings.TrimSpace(subjectID), sanitizeIncidentKey(dayKey))
+	return publicStableID("area:pub", strings.TrimSpace(subjectID)+"|"+strings.TrimSpace(dayKey))
 }
 
 func LocationIncidentID(item domain.LocationReport, dayKey string) string {
@@ -401,7 +487,7 @@ func (s *Service) collectLocationIncidentBundles(ctx context.Context, now time.T
 				summary: domain.IncidentSummary{
 					ID:                incidentID,
 					Scope:             locationIncidentScope(report),
-					SubjectID:         report.SubjectID,
+					SubjectID:         locationIncidentSubjectID(report),
 					SubjectName:       locationIncidentSubjectName(report),
 					Location:          incidentLocation(report),
 					MapTarget:         locationIncidentMapTarget(report, incidentID),
@@ -450,11 +536,14 @@ func incidentBundleList(items map[string]*incidentBundle, activeOnly bool) []inc
 
 func (s *Service) findIncidentBundle(ctx context.Context, incidentID string, now time.Time) (*incidentBundle, error) {
 	parts := strings.SplitN(strings.TrimSpace(incidentID), ":", 3)
-	if len(parts) != 3 {
+	if len(parts) < 2 {
 		return nil, nil
 	}
 	switch parts[0] {
 	case "train":
+		if len(parts) != 3 {
+			return nil, nil
+		}
 		bundles, err := s.collectTrainIncidentBundles(ctx, now, false)
 		if err != nil {
 			return nil, err
@@ -465,6 +554,9 @@ func (s *Service) findIncidentBundle(ctx context.Context, incidentID string, now
 			}
 		}
 	case "station":
+		if len(parts) != 3 {
+			return nil, nil
+		}
 		bundles, err := s.collectStationIncidentBundles(ctx, now, false)
 		if err != nil {
 			return nil, err
@@ -667,6 +759,9 @@ func locationIncidentScope(item domain.LocationReport) string {
 }
 
 func locationIncidentSubjectName(item domain.LocationReport) string {
+	if strings.TrimSpace(item.Scope) == "area" {
+		return "Inspection near this location"
+	}
 	if trimmed := strings.TrimSpace(item.SubjectName); trimmed != "" {
 		return trimmed
 	}
@@ -676,7 +771,28 @@ func locationIncidentSubjectName(item domain.LocationReport) string {
 	return strings.TrimSpace(item.SubjectID)
 }
 
+func locationIncidentSubjectID(item domain.LocationReport) string {
+	if strings.TrimSpace(item.Scope) == "area" {
+		return ""
+	}
+	return strings.TrimSpace(item.SubjectID)
+}
+
 func incidentLocation(item domain.LocationReport) *domain.IncidentLocation {
+	if strings.TrimSpace(item.Scope) == "area" {
+		latitude := publicAreaCoordinate(item.Latitude)
+		longitude := publicAreaCoordinate(item.Longitude)
+		radiusMeters := item.RadiusMeters
+		if radiusMeters < 250 {
+			radiusMeters = 250
+		}
+		return &domain.IncidentLocation{
+			Kind:         "area",
+			Latitude:     latitude,
+			Longitude:    longitude,
+			RadiusMeters: radiusMeters,
+		}
+	}
 	return &domain.IncidentLocation{
 		Kind:         locationIncidentScope(item),
 		Latitude:     copyFloatPtr(item.Latitude),
@@ -748,7 +864,25 @@ func locationReportIncidentDetail(item domain.LocationReport) string {
 	if strings.TrimSpace(item.Scope) != "area" {
 		return ""
 	}
-	return strings.TrimSpace(item.Description)
+	return ""
+}
+
+func publicStableID(prefix string, value string) string {
+	clean := strings.TrimSpace(value)
+	if clean == "" {
+		clean = "unknown"
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(clean))
+	return fmt.Sprintf("%s-%08x", strings.TrimSpace(prefix), hash.Sum32())
+}
+
+func publicAreaCoordinate(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	rounded := math.Round(*value*1000) / 1000
+	return &rounded
 }
 
 func trainSignalIncidentLabel(signal domain.SignalType) string {

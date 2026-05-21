@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,11 +53,43 @@ func (s staticCatalog) FindStop(stopID string) (model.Stop, bool) {
 func (s staticCatalog) CatalogJSON() []byte { return s.catalogJSON }
 func (s staticCatalog) CatalogETag() string { return s.etag }
 
+type liveViewerHeartbeatStore struct {
+	store.Store
+	calls []liveViewerHeartbeatCall
+}
+
+type failingHealthStore struct {
+	store.Store
+	err   error
+	calls int
+}
+
+func (s *failingHealthStore) HealthCheck(context.Context) error {
+	s.calls++
+	return s.err
+}
+
+type liveViewerHeartbeatCall struct {
+	SessionID string
+	Page      string
+	Visible   bool
+}
+
+func (s *liveViewerHeartbeatStore) SetLiveViewerState(_ context.Context, sessionID string, page string, visible bool) error {
+	s.calls = append(s.calls, liveViewerHeartbeatCall{
+		SessionID: sessionID,
+		Page:      page,
+		Visible:   visible,
+	})
+	return nil
+}
+
 func TestPublicResponsesApplySecurityHeadersWithoutDebugHeaders(t *testing.T) {
 	server := newHardeningTestServer(t)
 	for _, path := range []string{
 		"/",
 		"/api/v1/health",
+		"/api/v1/auth/telegram/config",
 		"/assets/app.js",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -63,6 +97,14 @@ func TestPublicResponsesApplySecurityHeadersWithoutDebugHeaders(t *testing.T) {
 		server.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s status = %d, want 200 body=%s", path, rec.Code, rec.Body.String())
+		}
+		if path == "/" {
+			if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+				t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+			}
+			if !strings.Contains(rec.Body.String(), `<meta name="robots" content="noindex, noarchive">`) {
+				t.Fatalf("%s body missing robots meta tag: %s", path, rec.Body.String())
+			}
 		}
 		for _, header := range []string{
 			"Strict-Transport-Security",
@@ -80,6 +122,148 @@ func TestPublicResponsesApplySecurityHeadersWithoutDebugHeaders(t *testing.T) {
 			if strings.HasPrefix(strings.ToLower(name), "x-satiksme-bot-") {
 				t.Fatalf("%s exposed debug header %s=%q", path, name, rec.Header().Get(name))
 			}
+		}
+	}
+}
+
+func TestPublicLiveViewerHeartbeatDisabledByDefault(t *testing.T) {
+	server := newHardeningTestServer(t)
+	liveStore := &liveViewerHeartbeatStore{Store: server.store}
+	server.store = liveStore
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodOptions} {
+		reqBody := strings.NewReader(`{"sessionId":"viewer-1","page":"public","visible":true}`)
+		req := httptest.NewRequest(method, "/api/v1/public/live-viewer", reqBody)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s live viewer status = %d, want 404 body=%s", method, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s live viewer Cache-Control = %q", method, got)
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s live viewer X-Robots-Tag = %q", method, got)
+		}
+	}
+	if len(liveStore.calls) != 0 {
+		t.Fatalf("live viewer calls = %d, want 0", len(liveStore.calls))
+	}
+}
+
+func TestPublicLiveViewerHeartbeatRequiresExplicitEnablement(t *testing.T) {
+	server := newHardeningTestServer(t)
+	server.cfg.SatiksmeWebLiveViewerHeartbeatEnabled = true
+	liveStore := &liveViewerHeartbeatStore{Store: server.store}
+	server.store = liveStore
+
+	reqBody := strings.NewReader(`{"sessionId":"viewer-1","page":"public","visible":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/public/live-viewer", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("live viewer status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if len(liveStore.calls) != 1 {
+		t.Fatalf("live viewer calls = %d, want 1", len(liveStore.calls))
+	}
+	if got := liveStore.calls[0]; got.SessionID != "viewer-1" || got.Page != "public" || !got.Visible {
+		t.Fatalf("live viewer call mismatch: %#v", got)
+	}
+}
+
+func TestPublicLiveViewerHeartbeatRequiresJSONContentType(t *testing.T) {
+	server := newHardeningTestServer(t)
+	server.cfg.SatiksmeWebLiveViewerHeartbeatEnabled = true
+	liveStore := &liveViewerHeartbeatStore{Store: server.store}
+	server.store = liveStore
+
+	reqBody := strings.NewReader(`{"sessionId":"viewer-1","page":"public","visible":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/public/live-viewer", reqBody)
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("live viewer status = %d, want 415 body=%s", rec.Code, rec.Body.String())
+	}
+	if len(liveStore.calls) != 0 {
+		t.Fatalf("live viewer calls = %d, want 0", len(liveStore.calls))
+	}
+}
+
+func TestShellConfigDoesNotEnablePublicLiveViewerHeartbeatByDefault(t *testing.T) {
+	server := newHardeningTestServer(t)
+	server.cfg.SatiksmeWebSpacetimeEnabled = true
+	server.cfg.SatiksmeWebSpacetimeHost = "https://maincloud.spacetimedb.com"
+	server.cfg.SatiksmeWebSpacetimeDatabase = "satiksme"
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "liveTransportViewerHeartbeatEnabled") {
+		t.Fatalf("shell enabled live viewer heartbeat without server store: %s", rec.Body.String())
+	}
+
+	server.store = &liveViewerHeartbeatStore{Store: server.store}
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "liveTransportViewerHeartbeatEnabled") {
+		t.Fatalf("shell enabled live viewer heartbeat without explicit config: %s", rec.Body.String())
+	}
+}
+
+func TestShellConfigEnablesPublicLiveViewerHeartbeatOnlyWhenConfigured(t *testing.T) {
+	server := newHardeningTestServer(t)
+	server.cfg.SatiksmeWebLiveViewerHeartbeatEnabled = true
+	server.cfg.SatiksmeWebSpacetimeEnabled = true
+	server.cfg.SatiksmeWebSpacetimeHost = "https://maincloud.spacetimedb.com"
+	server.cfg.SatiksmeWebSpacetimeDatabase = "satiksme"
+	server.store = &liveViewerHeartbeatStore{Store: server.store}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"liveTransportViewerHeartbeatEnabled":true`) {
+		t.Fatalf("shell did not enable live viewer heartbeat with server store: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"liveTransportViewerHeartbeatURL":"/api/v1/public/live-viewer"`) {
+		t.Fatalf("shell missing live viewer heartbeat endpoint with server store: %s", rec.Body.String())
+	}
+}
+
+func TestProductionAppBundleDoesNotExposeTestHarnessMarker(t *testing.T) {
+	t.Parallel()
+
+	body, err := fs.ReadFile(mustStaticSubFS(), "app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	for _, forbidden := range []string{
+		"__test__",
+		`"__" + "test__"`,
+		"resetStateForTest",
+	} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("production app.js exposes the test harness marker %q", forbidden)
+		}
+	}
+}
+
+func TestProductionStaticJSDoesNotReferenceSourceMaps(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"static/app.js", "static/live-client.js", "static/leaflet/leaflet.js"} {
+		body, err := staticFS.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(body), "sourceMappingURL=") {
+			t.Fatalf("%s references a source map that is not publicly served", path)
 		}
 	}
 }
@@ -130,6 +314,10 @@ func TestStaticRoutesRejectTestAssetsUnsafePathsAndUnsupportedMethods(t *testing
 		{method: http.MethodGet, path: "/assets/app.js.map", want: http.StatusNotFound},
 		{method: http.MethodGet, path: "/assets/%2e%2e/app.js", want: http.StatusBadRequest},
 		{method: http.MethodGet, path: "/assets//app.js", want: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/assets%5capp.js", want: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/assets/app.js/", want: http.StatusNotFound},
+		{method: http.MethodGet, path: "/api%2fv1%2fpublic%2fcatalog", want: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/api%5cv1%5cpublic%5ccatalog", want: http.StatusBadRequest},
 		{method: http.MethodPost, path: "/", want: http.StatusMethodNotAllowed},
 		{method: http.MethodPost, path: "/assets/app.js", want: http.StatusMethodNotAllowed},
 	}
@@ -139,6 +327,140 @@ func TestStaticRoutesRejectTestAssetsUnsafePathsAndUnsupportedMethods(t *testing
 		server.ServeHTTP(rec, req)
 		if rec.Code != tc.want {
 			t.Fatalf("%s %s status = %d, want %d body=%s", tc.method, tc.path, rec.Code, tc.want, rec.Body.String())
+		}
+		if tc.want >= http.StatusBadRequest {
+			if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+				t.Fatalf("%s %s Cache-Control = %q", tc.method, tc.path, got)
+			}
+			if got := rec.Header().Get("CDN-Cache-Control"); got != "no-store" {
+				t.Fatalf("%s %s CDN-Cache-Control = %q", tc.method, tc.path, got)
+			}
+		}
+	}
+}
+
+func TestPublicReadAPIRoutesRejectUnsupportedMethods(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, path := range []string{
+		"/api/v1/public/catalog",
+		"/api/v1/public/sightings",
+		"/api/v1/public/incidents",
+		"/api/v1/public/incidents/stop:3012",
+		"/api/v1/public/map",
+		"/api/v1/public/map-live",
+		"/api/v1/public/live-vehicles",
+	} {
+		headReq := httptest.NewRequest(http.MethodHead, path, nil)
+		headRec := httptest.NewRecorder()
+		server.ServeHTTP(headRec, headReq)
+		if headRec.Code != http.StatusOK && headRec.Code != http.StatusNotFound {
+			t.Fatalf("HEAD %s status = %d, want 200 or 404 body=%s", path, headRec.Code, headRec.Body.String())
+		}
+		for _, method := range []string{http.MethodPost, http.MethodOptions} {
+			req := httptest.NewRequest(method, path, nil)
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("%s %s status = %d, want 405 body=%s", method, path, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
+				t.Fatalf("%s %s Allow = %q, want GET, HEAD", method, path, got)
+			}
+			if strings.Contains(rec.Body.String(), "liveVehicles") || strings.Contains(rec.Body.String(), "incidents") || strings.Contains(rec.Body.String(), "sightings") {
+				t.Fatalf("%s %s returned public JSON body on unsupported method: %s", method, path, rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestPublicIncidentLimitRejectsInvalidValues(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, query := range []string{
+		"limit=abc",
+		"limit=-1",
+		"limit=2001",
+		"limit=",
+		"limit=1&limit=999",
+		"limit=&limit=1",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/public/incidents?"+query, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400 body=%s", query, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s Cache-Control = %q", query, got)
+		}
+	}
+
+	for _, value := range []string{"0", "1", "2000"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/public/incidents?limit="+value, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("limit=%s status = %d, want 200 body=%s", value, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestPublicSightingsLimitRejectsInvalidValues(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, path := range []string{
+		"/api/v1/public/sightings",
+		"/api/v1/public/map",
+		"/api/v1/public/map-live",
+		"/api/v1/public/live-vehicles",
+	} {
+		for _, query := range []string{
+			"limit=abc",
+			"limit=-1",
+			"limit=0",
+			"limit=501",
+			"limit=1&limit=2",
+		} {
+			req := httptest.NewRequest(http.MethodGet, path+"?"+query, nil)
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s?%s status = %d, want 400 body=%s", path, query, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+				t.Fatalf("%s?%s Cache-Control = %q", path, query, got)
+			}
+		}
+
+		for _, value := range []string{"1", "500"} {
+			req := httptest.NewRequest(http.MethodGet, path+"?limit="+value, nil)
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s?limit=%s status = %d, want 200 body=%s", path, value, rec.Code, rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestPublicReadEndpointsRejectUnexpectedQueryKeys(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, path := range []string{
+		"/api/v1/public/catalog?cv=bogus",
+		"/api/v1/public/incidents?limit=1&cv=bogus",
+		"/api/v1/public/incidents/stop:3012?debug=1",
+		"/api/v1/public/sightings?stopId=3012&stopId=3013",
+		"/api/v1/public/sightings?stopId=3012&cacheVersion=bogus",
+		"/api/v1/public/map?limit=1&date=2026-05-10",
+		"/api/v1/public/map-live?limit=1&date=2026-05-10&cv=bogus",
+		"/api/v1/public/live-vehicles?limit=1&cacheVersion=bogus",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400 body=%s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s Cache-Control = %q", path, got)
 		}
 	}
 }
@@ -340,7 +662,7 @@ func TestPublicCannotSubmitAndAuthenticatedSessionCan(t *testing.T) {
 	}
 }
 
-func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
+func TestPublicReportEndpointsIgnoreSmokeHeader(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
 	if err != nil {
@@ -415,7 +737,7 @@ func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
 		t.Fatalf("NewRequest(stop) error = %v", err)
 	}
 	stopReq.Header.Set("Content-Type", "application/json")
-	stopReq.Header.Set(smokeRequestHeader, "1")
+	stopReq.Header.Set("X-Satiksme-Smoke", "1")
 	stopReq.AddCookie(sessionCookie)
 	stopResp, err := httpClient.Do(stopReq)
 	if err != nil {
@@ -431,7 +753,7 @@ func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
 		t.Fatalf("NewRequest(vehicle) error = %v", err)
 	}
 	vehicleReq.Header.Set("Content-Type", "application/json")
-	vehicleReq.Header.Set(smokeRequestHeader, "1")
+	vehicleReq.Header.Set("X-Satiksme-Smoke", "1")
 	vehicleReq.AddCookie(sessionCookie)
 	vehicleResp, err := httpClient.Do(vehicleReq)
 	if err != nil {
@@ -451,8 +773,8 @@ func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
 	if err := json.NewDecoder(publicSightingsResp.Body).Decode(&publicSightings); err != nil {
 		t.Fatalf("Decode(public sightings) error = %v", err)
 	}
-	if len(publicSightings.StopSightings) != 0 || len(publicSightings.VehicleSightings) != 0 {
-		t.Fatalf("public sightings leaked smoke reports: %#v", publicSightings)
+	if len(publicSightings.StopSightings) != 1 {
+		t.Fatalf("len(publicSightings.StopSightings) = %d, want 1", len(publicSightings.StopSightings))
 	}
 
 	publicIncidentsResp, err := http.Get(ts.URL + "/api/v1/public/incidents?limit=20")
@@ -466,8 +788,8 @@ func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
 	if err := json.NewDecoder(publicIncidentsResp.Body).Decode(&publicIncidents); err != nil {
 		t.Fatalf("Decode(public incidents) error = %v", err)
 	}
-	if len(publicIncidents.Incidents) != 0 {
-		t.Fatalf("public incidents leaked smoke reports: %#v", publicIncidents.Incidents)
+	if len(publicIncidents.Incidents) == 0 {
+		t.Fatalf("public incidents = empty, want smoke header ignored")
 	}
 
 	recentReq, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/reports/recent?stopId=3012&limit=20", nil)
@@ -516,8 +838,8 @@ func TestSmokeReportsStayOutOfPublicViewsAndDumpQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PendingReportDumpCount() error = %v", err)
 	}
-	if pending != 0 {
-		t.Fatalf("pending dump count = %d, want 0", pending)
+	if pending != 2 {
+		t.Fatalf("pending dump count = %d, want 2", pending)
 	}
 }
 
@@ -540,8 +862,8 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	now := time.Date(2026, 3, 10, 18, 55, 0, 0, time.UTC)
 	testCatalog := &model.Catalog{
 		GeneratedAt: now.Add(-45 * time.Minute),
-		Stops:       []model.Stop{{ID: "3012", Name: "Centrāltirgus", Latitude: 56.94, Longitude: 24.12}},
-		Routes:      []model.Route{{Label: "22", Mode: "bus", Name: "Lidosta"}},
+		Stops:       []model.Stop{{ID: "3012", LiveID: "4126", Name: "Centrāltirgus", Latitude: 56.94, Longitude: 24.12, NearbyStopIDs: []string{"3013"}}},
+		Routes:      []model.Route{{Label: "22", Mode: "bus", Name: "Lidosta", StopIDs: []string{"3012"}}},
 	}
 	catalogJSON, err := json.Marshal(testCatalog)
 	if err != nil {
@@ -584,6 +906,10 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
+	server.release.Commit = "abcdef123456"
+	server.release.Dirty = "clean"
+	server.release.ReleaseID = "release-20260511T120000Z"
+	server.release.SourceSHA256 = "4e07408562bedb8b60ce05c1decfe3ad16b72230950de01f640b7e4729b49fce"
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
 	healthRec := httptest.NewRecorder()
@@ -619,6 +945,24 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 			t.Fatalf("public health unexpectedly exposes %q: %#v", key, health[key])
 		}
 	}
+	for _, path := range []string{"/api/v1/health", "/api/v1/livez"} {
+		headReq := httptest.NewRequest(http.MethodHead, path, nil)
+		headRec := httptest.NewRecorder()
+		server.ServeHTTP(headRec, headReq)
+		if headRec.Code != http.StatusOK {
+			t.Fatalf("HEAD %s status = %d, want 200", path, headRec.Code)
+		}
+
+		optionsReq := httptest.NewRequest(http.MethodOptions, path, nil)
+		optionsRec := httptest.NewRecorder()
+		server.ServeHTTP(optionsRec, optionsReq)
+		if optionsRec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("OPTIONS %s status = %d, want 405", path, optionsRec.Code)
+		}
+		if optionsRec.Header().Get("Allow") != "GET, HEAD" {
+			t.Fatalf("OPTIONS %s Allow = %q, want GET, HEAD", path, optionsRec.Header().Get("Allow"))
+		}
+	}
 
 	internalReq := httptest.NewRequest(http.MethodGet, "/api/v1/internal/health", nil)
 	internalReq.RemoteAddr = "127.0.0.1:48123"
@@ -633,6 +977,19 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	}
 	if _, ok := internalHealth["runtime"].(map[string]any); !ok {
 		t.Fatalf("internal health missing runtime payload: %#v", internalHealth)
+	}
+	versionPayload := internalHealth["version"].(map[string]any)
+	if versionPayload["commit"] != "abcdef123456" {
+		t.Fatalf("version.commit = %#v, want abcdef123456", versionPayload["commit"])
+	}
+	if versionPayload["dirty"] != "clean" {
+		t.Fatalf("version.dirty = %#v, want clean", versionPayload["dirty"])
+	}
+	if versionPayload["releaseId"] != "release-20260511T120000Z" {
+		t.Fatalf("version.releaseId = %#v, want release-20260511T120000Z", versionPayload["releaseId"])
+	}
+	if versionPayload["sourceSha256"] != "4e07408562bedb8b60ce05c1decfe3ad16b72230950de01f640b7e4729b49fce" {
+		t.Fatalf("version.sourceSha256 = %#v, want release source hash", versionPayload["sourceSha256"])
 	}
 	assetsPayload := internalHealth["assets"].(map[string]any)
 	if assetsPayload["liveClientSha256"] == "" {
@@ -693,8 +1050,25 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	if catalogRec.Header().Get("Cache-Control") != "public, max-age=0, must-revalidate" {
 		t.Fatalf("catalog Cache-Control = %q", catalogRec.Header().Get("Cache-Control"))
 	}
-	if !bytes.Equal(catalogRec.Body.Bytes(), catalogJSON) {
-		t.Fatalf("catalog body mismatch")
+	if catalogRec.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("catalog Vary = %q, want Accept-Encoding", catalogRec.Header().Get("Vary"))
+	}
+	var publicCatalogPayload map[string]any
+	if err := json.Unmarshal(catalogRec.Body.Bytes(), &publicCatalogPayload); err != nil {
+		t.Fatalf("Unmarshal(public catalog) error = %v", err)
+	}
+	stops, _ := publicCatalogPayload["stops"].([]any)
+	if len(stops) != 1 {
+		t.Fatalf("public catalog stops = %#v", publicCatalogPayload["stops"])
+	}
+	stop, _ := stops[0].(map[string]any)
+	for _, forbidden := range []string{"liveId", "nearbyStopIds"} {
+		if _, ok := stop[forbidden]; ok {
+			t.Fatalf("public catalog stop exposes %q: %#v", forbidden, stop)
+		}
+	}
+	if stop["id"] != "3012" || stop["name"] != "Centrāltirgus" {
+		t.Fatalf("public catalog stop = %#v", stop)
 	}
 
 	notModifiedReq := httptest.NewRequest(http.MethodGet, "/api/v1/public/catalog", nil)
@@ -704,12 +1078,79 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	if notModifiedRec.Code != http.StatusNotModified {
 		t.Fatalf("conditional catalog status = %d, want 304", notModifiedRec.Code)
 	}
+	if notModifiedRec.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("conditional catalog Vary = %q, want Accept-Encoding", notModifiedRec.Header().Get("Vary"))
+	}
+	if notModifiedRec.Header().Get("X-Robots-Tag") != "noindex, noarchive" {
+		t.Fatalf("conditional catalog X-Robots-Tag = %q, want noindex, noarchive", notModifiedRec.Header().Get("X-Robots-Tag"))
+	}
+	if notModifiedRec.Header().Get("Cache-Control") != "public, max-age=0, must-revalidate" {
+		t.Fatalf("conditional catalog Cache-Control = %q", notModifiedRec.Header().Get("Cache-Control"))
+	}
 
 	liveDeparturesReq := httptest.NewRequest(http.MethodGet, "/api/v1/live/departures?stopId=3012", nil)
 	liveDeparturesRec := httptest.NewRecorder()
 	server.ServeHTTP(liveDeparturesRec, liveDeparturesReq)
 	if liveDeparturesRec.Code != http.StatusNotFound {
 		t.Fatalf("live departures status = %d, want 404", liveDeparturesRec.Code)
+	}
+}
+
+func TestPublicHealthDoesNotDependOnWritableStore(t *testing.T) {
+	server := newHardeningTestServer(t)
+	failingStore := &failingHealthStore{
+		Store: server.store,
+		err:   errors.New("live snapshot state timeout"),
+	}
+	server.store = failingStore
+
+	publicReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	publicRec := httptest.NewRecorder()
+	server.ServeHTTP(publicRec, publicReq)
+	if publicRec.Code != http.StatusOK {
+		t.Fatalf("public health status = %d, want 200 body=%s", publicRec.Code, publicRec.Body.String())
+	}
+	if failingStore.calls != 0 {
+		t.Fatalf("public health called store HealthCheck %d times, want 0", failingStore.calls)
+	}
+	var publicHealth map[string]any
+	if err := json.Unmarshal(publicRec.Body.Bytes(), &publicHealth); err != nil {
+		t.Fatalf("Unmarshal(public health) error = %v", err)
+	}
+	if publicHealth["ok"] != true {
+		t.Fatalf("public health ok = %#v, want true", publicHealth["ok"])
+	}
+
+	internalReq := httptest.NewRequest(http.MethodGet, "/api/v1/internal/health", nil)
+	internalReq.RemoteAddr = "127.0.0.1:48123"
+	internalRec := httptest.NewRecorder()
+	server.ServeHTTP(internalRec, internalReq)
+	if internalRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("internal health status = %d, want 503 body=%s", internalRec.Code, internalRec.Body.String())
+	}
+	if failingStore.calls != 1 {
+		t.Fatalf("internal health called store HealthCheck %d times, want 1", failingStore.calls)
+	}
+	var internalHealth map[string]any
+	if err := json.Unmarshal(internalRec.Body.Bytes(), &internalHealth); err != nil {
+		t.Fatalf("Unmarshal(internal health) error = %v", err)
+	}
+	if internalHealth["ok"] != false {
+		t.Fatalf("internal health ok = %#v, want false", internalHealth["ok"])
+	}
+	reasons, ok := internalHealth["reasons"].([]any)
+	if !ok {
+		t.Fatalf("internal health reasons = %#v, want array", internalHealth["reasons"])
+	}
+	found := false
+	for _, reason := range reasons {
+		if reason == "db_unwritable" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("internal health reasons = %#v, want db_unwritable", reasons)
 	}
 }
 
@@ -737,7 +1178,7 @@ func TestPublicResponsesIncludeSafetyHeaders(t *testing.T) {
 	server.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	wantHeaders := map[string]string{
-		"Strict-Transport-Security": "max-age=300",
+		"Strict-Transport-Security": "max-age=31536000",
 		"X-Frame-Options":           "DENY",
 		"X-Content-Type-Options":    "nosniff",
 		"Referrer-Policy":           "strict-origin-when-cross-origin",
@@ -754,10 +1195,139 @@ func TestPublicResponsesIncludeSafetyHeaders(t *testing.T) {
 			t.Fatalf("Content-Security-Policy missing %q: %q", fragment, csp)
 		}
 	}
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+		t.Fatalf("Content-Security-Policy still allows inline scripts: %q", csp)
+	}
+	if strings.Contains(csp, "style-src 'self' 'unsafe-inline'") {
+		t.Fatalf("Content-Security-Policy still allows inline styles: %q", csp)
+	}
+	if !strings.Contains(csp, "script-src 'self' 'nonce-") {
+		t.Fatalf("Content-Security-Policy missing script nonce: %q", csp)
+	}
+	if !strings.Contains(rec.Body.String(), `nonce="`) {
+		t.Fatalf("shell missing script nonce: %s", rec.Body.String())
+	}
 	for _, header := range []string{"X-Satiksme-Bot-Instance", "X-Satiksme-Bot-App-Js", "X-Satiksme-Bot-App-Css", "X-Satiksme-Bot-Live-Client"} {
 		if got := rec.Header().Get(header); got != "" {
 			t.Fatalf("%s = %q, want empty", header, got)
 		}
+	}
+}
+
+func TestMissingPublicPathsAreNoStoreAndNoIndex(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, path := range []string{
+		"/.well-known/security.txt",
+		"/sitemap.xml",
+		"/service-worker.js",
+		"/manifest.json",
+		"/favicon.ico",
+		"/site.webmanifest",
+		"/apple-touch-icon.png",
+		"/apple-touch-icon-precomposed.png",
+		"/deploy-validation-missing-path",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404 body=%s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Fatalf("%s Cache-Control = %q, want no-store", path, got)
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+		}
+	}
+}
+
+func TestRobotsTxtDeniesIndexing(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/robots.txt", nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s /robots.txt status = %d, want 200 body=%s", method, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Fatalf("%s /robots.txt Cache-Control = %q, want no-store", method, got)
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s /robots.txt X-Robots-Tag = %q, want noindex, noarchive", method, got)
+		}
+		if method == http.MethodGet {
+			body := strings.ToLower(rec.Body.String())
+			if !strings.Contains(body, "user-agent: *") || !strings.Contains(body, "disallow: /") {
+				t.Fatalf("robots.txt does not deny indexing: %q", rec.Body.String())
+			}
+		}
+	}
+}
+
+func TestStaticAssetsUseSecurityAndNoIndexHeaders(t *testing.T) {
+	server := newHardeningTestServer(t)
+	for _, path := range []string{"/assets/app.js", "/assets/app.css"} {
+		req := httptest.NewRequest(http.MethodHead, path, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200 body=%s", path, rec.Code, rec.Body.String())
+		}
+		for _, header := range []string{
+			"Strict-Transport-Security",
+			"Content-Security-Policy",
+			"X-Frame-Options",
+			"X-Content-Type-Options",
+			"Referrer-Policy",
+			"Permissions-Policy",
+		} {
+			if got := rec.Header().Get(header); got == "" {
+				t.Fatalf("%s missing %s", path, header)
+			}
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+		}
+		if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+			t.Fatalf("%s Vary = %q, want Accept-Encoding", path, got)
+		}
+	}
+}
+
+func TestStaticAssetCacheHeadersPreserveNoStoreForRangesAndVaryForCompression(t *testing.T) {
+	server := newHardeningTestServer(t)
+
+	versionedReq := httptest.NewRequest(http.MethodGet, "/assets/app.js?v="+server.release.AssetHash("app.js"), nil)
+	versionedReq.Header.Set("Accept-Encoding", "gzip")
+	versionedRec := httptest.NewRecorder()
+	server.ServeHTTP(versionedRec, versionedReq)
+	if versionedRec.Code != http.StatusOK {
+		t.Fatalf("versioned asset status = %d, want 200 body=%s", versionedRec.Code, versionedRec.Body.String())
+	}
+	if got := versionedRec.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("versioned asset Cache-Control = %q", got)
+	}
+	if got := versionedRec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("versioned asset Vary = %q", got)
+	}
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	rangeReq.Header.Set("Range", "bytes=0-63")
+	rangeRec := httptest.NewRecorder()
+	server.ServeHTTP(rangeRec, rangeReq)
+	if rangeRec.Code != http.StatusOK {
+		t.Fatalf("unversioned range asset status = %d, want 200 body=%s", rangeRec.Code, rangeRec.Body.String())
+	}
+	if got := rangeRec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("unversioned range asset Cache-Control = %q", got)
+	}
+	if got := rangeRec.Header().Get("Content-Range"); got != "" {
+		t.Fatalf("unversioned range asset Content-Range = %q", got)
+	}
+	if got := rangeRec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("unversioned range asset Vary = %q", got)
 	}
 }
 
@@ -816,7 +1386,13 @@ func TestIncidentShellRoutesRenderPublicIncidentsMode(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s status = %d, want 200", path, rec.Code)
 		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+		}
 		body := rec.Body.String()
+		if !strings.Contains(body, `<meta name="robots" content="noindex, noarchive">`) {
+			t.Fatalf("%s body missing robots meta tag: %s", path, body)
+		}
 		if !strings.Contains(body, "<title>Kontrole</title>") {
 			t.Fatalf("%s body missing updated title: %s", path, body)
 		}
@@ -863,6 +1439,7 @@ func TestShellConfigEnablesBrowserLiveSnapshotLookup(t *testing.T) {
 		SatiksmeWebSpacetimeJWTPrivateKeyFile: keyPath,
 		SatiksmeWebSpacetimeTokenTTLSec:       86400,
 		SatiksmeWebSpacetimeDirectOnly:        false,
+		SatiksmeWebLiveSnapshotDir:            t.TempDir(),
 	}, staticCatalog{}, nil, nil, nil, nil, time.UTC)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
@@ -877,13 +1454,10 @@ func TestShellConfigEnablesBrowserLiveSnapshotLookup(t *testing.T) {
 	if !strings.Contains(body, `"liveTransportSnapshotLookupEnabled":true`) {
 		t.Fatalf("shell config missing live snapshot lookup: %s", body)
 	}
-	if !strings.Contains(body, `"spacetimeHost":"https://maincloud.spacetimedb.com"`) ||
-		!strings.Contains(body, `"spacetimeDatabase":"db123"`) {
-		t.Fatalf("shell config missing Spacetime target: %s", body)
-	}
-	if !strings.Contains(body, `"spacetimeEnabled":false`) ||
-		!strings.Contains(body, `"liveTransportRealtimeEnabled":false`) {
-		t.Fatalf("shell should keep full direct data disabled when direct-only is false: %s", body)
+	for _, forbidden := range []string{`"spacetimeHost"`, `"spacetimeDatabase"`, `"spacetimeEnabled"`, `"liveTransportRealtimeEnabled"`, "/assets/live-client.js"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("snapshot shell unexpectedly exposes direct Spacetime config %s: %s", forbidden, body)
+		}
 	}
 	if !strings.Contains(body, `/assets/leaflet/leaflet.css`) ||
 		!strings.Contains(body, `/assets/leaflet/leaflet.js`) {
@@ -895,10 +1469,20 @@ func TestShellConfigEnablesBrowserLiveSnapshotLookup(t *testing.T) {
 	if strings.Contains(body, "telegram.org/js/telegram-login") || strings.Contains(body, "telegram-web-app.js") {
 		t.Fatalf("shell should not load Telegram scripts before login: %s", body)
 	}
-	liveClientIndex := strings.Index(body, "/assets/live-client.js")
-	appIndex := strings.Index(body, "/assets/app.js")
-	if liveClientIndex < 0 || appIndex < 0 || liveClientIndex > appIndex {
-		t.Fatalf("shell should load live-client.js before app.js: %s", body)
+	if !strings.Contains(body, "/assets/app.js") {
+		t.Fatalf("shell should load app.js: %s", body)
+	}
+
+	assetRec := httptest.NewRecorder()
+	server.ServeHTTP(assetRec, httptest.NewRequest(http.MethodGet, "/assets/live-client.js", nil))
+	if assetRec.Code != http.StatusNotFound {
+		t.Fatalf("snapshot-only live client asset status = %d, want 404", assetRec.Code)
+	}
+	if got := assetRec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("snapshot-only live client asset Cache-Control = %q", got)
+	}
+	if got := assetRec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("snapshot-only live client asset X-Robots-Tag = %q", got)
 	}
 }
 
@@ -1008,12 +1592,101 @@ func TestLegacyDirectOnlyFlagNoLongerBlocksWebsiteRoutes(t *testing.T) {
 	if !strings.Contains(bundleRec.Body.String(), "\"version\":\"bundle-123\"") {
 		t.Fatalf("bundle body missing active version: %s", bundleRec.Body.String())
 	}
+	if bundleRec.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("active bundle Vary = %q, want Accept-Encoding", bundleRec.Header().Get("Vary"))
+	}
+
+	manifestReq := httptest.NewRequest(http.MethodGet, "/bundles/bundle-123/manifest.json", nil)
+	manifestRec := httptest.NewRecorder()
+	server.ServeHTTP(manifestRec, manifestReq)
+	if manifestRec.Code != http.StatusOK {
+		t.Fatalf("bundle manifest status = %d, want 200", manifestRec.Code)
+	}
+	if manifestRec.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("bundle manifest Vary = %q, want Accept-Encoding", manifestRec.Header().Get("Vary"))
+	}
+	trailingManifestReq := httptest.NewRequest(http.MethodGet, "/bundles/bundle-123/manifest.json/", nil)
+	trailingManifestRec := httptest.NewRecorder()
+	server.ServeHTTP(trailingManifestRec, trailingManifestReq)
+	if trailingManifestRec.Code != http.StatusNotFound {
+		t.Fatalf("trailing slash bundle manifest status = %d, want 404", trailingManifestRec.Code)
+	}
 
 	vehiclesReq := httptest.NewRequest(http.MethodGet, "/api/v1/public/live-vehicles", nil)
 	vehiclesRec := httptest.NewRecorder()
 	server.ServeHTTP(vehiclesRec, vehiclesReq)
 	if vehiclesRec.Code != http.StatusOK {
 		t.Fatalf("live vehicles status = %d, want 200", vehiclesRec.Code)
+	}
+}
+
+func TestMissingPublicBundleAssetUsesNoStoreHeaders(t *testing.T) {
+	server := newHardeningTestServer(t)
+	bundleDir := filepath.Join(t.TempDir(), "public-bundles")
+	versionDir := filepath.Join(bundleDir, "bundles", "bundle-123")
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "active.json"), []byte("{\"version\":\"bundle-123\"}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(active.json) error = %v", err)
+	}
+	server.cfg.SatiksmeWebBundleDir = bundleDir
+	server.bundleStore = newStaticBundleStore(bundleDir)
+
+	for _, path := range []string{"/bundles/bundle-123/missing.json", "/bundles/bundle-123/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404 body=%s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s Cache-Control = %q", path, got)
+		}
+		if got := rec.Header().Get("CDN-Cache-Control"); got != "no-store" {
+			t.Fatalf("%s CDN-Cache-Control = %q", path, got)
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+		}
+	}
+}
+
+func TestBundleActiveErrorsUseNoStoreAndNoIndexHeaders(t *testing.T) {
+	server := newHardeningTestServer(t)
+
+	for _, path := range []string{"/bundles/active.json"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404 body=%s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s Cache-Control = %q", path, got)
+		}
+		if got := rec.Header().Get("CDN-Cache-Control"); got != "no-store" {
+			t.Fatalf("%s CDN-Cache-Control = %q", path, got)
+		}
+		if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s X-Robots-Tag = %q, want noindex, noarchive", path, got)
+		}
+	}
+
+	bundleDir := t.TempDir()
+	server.cfg.SatiksmeWebBundleDir = bundleDir
+	server.bundleStore = newStaticBundleStore(bundleDir)
+	req := httptest.NewRequest(http.MethodGet, "/bundles/active.json?debug=1", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("active bundle query status = %d, want 404 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("active bundle query Cache-Control = %q", got)
+	}
+	if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("active bundle query X-Robots-Tag = %q, want noindex, noarchive", got)
 	}
 }
 
@@ -1132,7 +1805,7 @@ func TestPublicMapIncludesStopIncidentsAndVehicleIncidentAttachments(t *testing.
 	catalogReader := staticCatalog{
 		catalog: &model.Catalog{
 			GeneratedAt: now,
-			Stops:       []model.Stop{{ID: "3012", Name: "Centrāltirgus", Latitude: 56.94, Longitude: 24.12}},
+			Stops:       []model.Stop{{ID: "3012", LiveID: "4126", Name: "Centrāltirgus", Latitude: 56.94, Longitude: 24.12, NearbyStopIDs: []string{"3013"}}},
 		},
 		status: runtime.CatalogStatus{Loaded: true},
 	}
@@ -1153,7 +1826,8 @@ func TestPublicMapIncludesStopIncidentsAndVehicleIncidentAttachments(t *testing.
 		Direction:        "a-b",
 		Destination:      "Lidosta",
 		DepartureSeconds: 68420,
-		ScopeKey:         reports.VehicleScopeKey(model.VehicleReportInput{StopID: "3012", Mode: "bus", RouteLabel: "22", Direction: "a-b", Destination: "Lidosta", DepartureSeconds: 68420}),
+		LiveRowID:        "67133",
+		ScopeKey:         reports.VehicleScopeKey(model.VehicleReportInput{StopID: "3012", Mode: "bus", RouteLabel: "22", Direction: "a-b", Destination: "Lidosta", DepartureSeconds: 68420, LiveRowID: "67133"}),
 		CreatedAt:        now.Add(-70 * time.Minute),
 	}); err != nil {
 		t.Fatalf("InsertVehicleSighting() error = %v", err)
@@ -1205,6 +1879,11 @@ func TestPublicMapIncludesStopIncidentsAndVehicleIncidentAttachments(t *testing.
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
+	for _, forbidden := range []string{`"liveId"`, `"nearbyStopIds"`, `"liveRowId"`, `"scopeKey"`} {
+		if bytes.Contains(rec.Body.Bytes(), []byte(forbidden)) {
+			t.Fatalf("public map payload exposes %s: %s", forbidden, rec.Body.Bytes())
+		}
+	}
 	var payload model.PublicMapPayload
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
@@ -1243,6 +1922,26 @@ func TestPublicMapIncludesStopIncidentsAndVehicleIncidentAttachments(t *testing.
 	if len(livePayload.LiveVehicles) != 1 || len(livePayload.LiveVehicles[0].Incidents) != 1 {
 		t.Fatalf("livePayload = %#v", livePayload)
 	}
+	if got := livePayload.LiveVehicles[0].LiveRowID; got != "" {
+		t.Fatalf("public live vehicle liveRowId = %q, want empty", got)
+	}
+	if got := livePayload.LiveVehicles[0].VehicleCode; got != "" {
+		t.Fatalf("public live vehicle vehicleCode = %q, want empty", got)
+	}
+	if strings.Contains(livePayload.LiveVehicles[0].ID, "67133") {
+		t.Fatalf("public live vehicle id exposes raw live row id: %q", livePayload.LiveVehicles[0].ID)
+	}
+	if livePayload.LiveVehicles[0].UpdatedAt.Nanosecond() != 0 {
+		t.Fatalf("public live vehicle updatedAt keeps subsecond precision: %s", livePayload.LiveVehicles[0].UpdatedAt)
+	}
+	if livePayload.LiveVehicles[0].Latitude != 56.94811 || livePayload.LiveVehicles[0].Longitude != 24.12115 {
+		t.Fatalf("public live vehicle coordinates = %.8f, %.8f; want rounded", livePayload.LiveVehicles[0].Latitude, livePayload.LiveVehicles[0].Longitude)
+	}
+	if len(livePayload.LiveVehicles[0].Incidents) == 1 &&
+		livePayload.LiveVehicles[0].Incidents[0].Vehicle != nil &&
+		livePayload.LiveVehicles[0].Incidents[0].Vehicle.LiveRowID != "" {
+		t.Fatalf("public live vehicle incident exposes liveRowId: %+v", livePayload.LiveVehicles[0].Incidents[0].Vehicle)
+	}
 
 	mapLiveReq := httptest.NewRequest(http.MethodGet, "/api/v1/public/map-live", nil)
 	mapLiveRec := httptest.NewRecorder()
@@ -1277,7 +1976,7 @@ func TestLiveSnapshotRoutesExposeExpectedCacheHeaders(t *testing.T) {
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(snapshotDir) error = %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, "active.json"), []byte("{\"version\":\"snapshot-123\"}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(snapshotDir, "active.json"), []byte(`{"version":"snapshot-123","path":"transport/live/snapshot-123.json.js","hash":"internal-hash","publishedAt":"2026-03-30T01:45:05Z","vehicleCount":12}`+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(active.json) error = %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(snapshotDir, "snapshot-123.json.js"), []byte("{\"vehicles\":[]}\n"), 0o644); err != nil {
@@ -1312,6 +2011,18 @@ func TestLiveSnapshotRoutesExposeExpectedCacheHeaders(t *testing.T) {
 	if activeRec.Header().Get("X-Robots-Tag") != "noindex, noarchive" {
 		t.Fatalf("active snapshot X-Robots-Tag = %q", activeRec.Header().Get("X-Robots-Tag"))
 	}
+	var activePayload map[string]any
+	if err := json.Unmarshal(activeRec.Body.Bytes(), &activePayload); err != nil {
+		t.Fatalf("Unmarshal(active snapshot) error = %v", err)
+	}
+	if activePayload["version"] != "snapshot-123" || activePayload["path"] != "transport/live/snapshot-123.json.js" {
+		t.Fatalf("active snapshot payload = %#v", activePayload)
+	}
+	for _, forbidden := range []string{"hash", "publishedAt", "vehicleCount", "lastSuccessAt", "lastAttemptAt", "status", "consecutiveFailures"} {
+		if _, ok := activePayload[forbidden]; ok {
+			t.Fatalf("active snapshot exposes %q in payload %#v", forbidden, activePayload)
+		}
+	}
 
 	assetReq := httptest.NewRequest(http.MethodGet, "/transport/live/snapshot-123.json.js", nil)
 	assetRec := httptest.NewRecorder()
@@ -1332,6 +2043,23 @@ func TestLiveSnapshotRoutesExposeExpectedCacheHeaders(t *testing.T) {
 		t.Fatalf("snapshot asset X-Robots-Tag = %q", assetRec.Header().Get("X-Robots-Tag"))
 	}
 
+	rangeReq := httptest.NewRequest(http.MethodGet, "/transport/live/snapshot-123.json.js", nil)
+	rangeReq.Header.Set("Range", "bytes=0-4")
+	rangeRec := httptest.NewRecorder()
+	server.ServeHTTP(rangeRec, rangeReq)
+	if rangeRec.Code != http.StatusOK {
+		t.Fatalf("range snapshot status = %d, want 200", rangeRec.Code)
+	}
+	if rangeRec.Header().Get("Cache-Control") != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("range snapshot Cache-Control = %q", rangeRec.Header().Get("Cache-Control"))
+	}
+	if rangeRec.Header().Get("Content-Range") != "" {
+		t.Fatalf("range snapshot Content-Range = %q", rangeRec.Header().Get("Content-Range"))
+	}
+	if !bytes.Equal(rangeRec.Body.Bytes(), []byte("{\"vehicles\":[]}\n")) {
+		t.Fatalf("range snapshot body mismatch: %q", rangeRec.Body.Bytes())
+	}
+
 	queryReq := httptest.NewRequest(http.MethodGet, "/transport/live/snapshot-123.json.js?cache=split", nil)
 	queryRec := httptest.NewRecorder()
 	server.ServeHTTP(queryRec, queryReq)
@@ -1340,6 +2068,15 @@ func TestLiveSnapshotRoutesExposeExpectedCacheHeaders(t *testing.T) {
 	}
 	if queryRec.Header().Get("Cache-Control") != "no-store, no-cache, must-revalidate, max-age=0" {
 		t.Fatalf("query snapshot Cache-Control = %q", queryRec.Header().Get("Cache-Control"))
+	}
+	if queryRec.Header().Get("X-Robots-Tag") != "noindex, noarchive" {
+		t.Fatalf("query snapshot X-Robots-Tag = %q", queryRec.Header().Get("X-Robots-Tag"))
+	}
+	trailingActiveReq := httptest.NewRequest(http.MethodGet, "/transport/live/active.json/", nil)
+	trailingActiveRec := httptest.NewRecorder()
+	server.ServeHTTP(trailingActiveRec, trailingActiveReq)
+	if trailingActiveRec.Code != http.StatusNotFound {
+		t.Fatalf("trailing active snapshot status = %d, want 404", trailingActiveRec.Code)
 	}
 
 	missingReq := httptest.NewRequest(http.MethodGet, "/transport/live/missing.json", nil)
@@ -1350,6 +2087,9 @@ func TestLiveSnapshotRoutesExposeExpectedCacheHeaders(t *testing.T) {
 	}
 	if missingRec.Header().Get("Cache-Control") != "no-store, no-cache, must-revalidate, max-age=0" {
 		t.Fatalf("missing snapshot Cache-Control = %q", missingRec.Header().Get("Cache-Control"))
+	}
+	if missingRec.Header().Get("X-Robots-Tag") != "noindex, noarchive" {
+		t.Fatalf("missing snapshot X-Robots-Tag = %q", missingRec.Header().Get("X-Robots-Tag"))
 	}
 }
 

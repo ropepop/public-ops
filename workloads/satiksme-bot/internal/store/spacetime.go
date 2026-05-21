@@ -87,6 +87,15 @@ func (s *SpacetimeStore) ListPublicSightings(ctx context.Context, stopID string,
 	return raw, nil
 }
 
+func (s *SpacetimeStore) SetLiveViewerState(ctx context.Context, sessionID string, page string, visible bool) error {
+	_, err := s.client.CallProcedure(ctx, "satiksmebot_set_live_viewer_state", []any{
+		strings.TrimSpace(sessionID),
+		strings.TrimSpace(page),
+		visible,
+	})
+	return err
+}
+
 func (s *SpacetimeStore) InsertVehicleSighting(ctx context.Context, sighting model.VehicleSighting) error {
 	_, err := s.client.CallProcedure(ctx, "satiksmebot_service_put_vehicle_sighting", []any{mustJSONValue(spacetimeVehicleSightingPayload(sighting))})
 	return err
@@ -272,6 +281,63 @@ func (s *SpacetimeStore) CountIncidentVoteEventsByUserSince(ctx context.Context,
 		return 0, err
 	}
 	return raw.Count, nil
+}
+
+func (s *SpacetimeStore) CountIncidentCommentsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	payload, err := s.client.CallProcedure(ctx, "satiksmebot_service_count_incident_comments_by_user_since", []any{strconv.FormatInt(userID, 10), since.UTC().Format(time.RFC3339)})
+	if err != nil {
+		if missingSpacetimeProcedure(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var raw struct {
+		Count int `json:"count"`
+	}
+	if err := decodePayload(payload, &raw); err != nil {
+		return 0, err
+	}
+	return raw.Count, nil
+}
+
+func (s *SpacetimeStore) CountIncidentCommentsByIncidentSince(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	payload, err := s.client.CallProcedure(ctx, "satiksmebot_service_count_incident_comments_by_incident_since", []any{strings.TrimSpace(incidentID), since.UTC().Format(time.RFC3339)})
+	if err != nil {
+		if missingSpacetimeProcedure(err) {
+			return s.countIncidentCommentsByIncidentSinceFallback(ctx, incidentID, since)
+		}
+		return 0, err
+	}
+	var raw struct {
+		Count int `json:"count"`
+	}
+	if err := decodePayload(payload, &raw); err != nil {
+		return 0, err
+	}
+	return raw.Count, nil
+}
+
+func (s *SpacetimeStore) countIncidentCommentsByIncidentSinceFallback(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	comments, err := s.ListIncidentComments(ctx, incidentID, 100)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, comment := range comments {
+		if !comment.CreatedAt.Before(since.UTC()) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func missingSpacetimeProcedure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "nonexistent procedure") ||
+		strings.Contains(message, "unknown procedure")
 }
 
 func (s *SpacetimeStore) InsertIncidentComment(ctx context.Context, comment model.IncidentComment) error {

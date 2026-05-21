@@ -1402,6 +1402,48 @@ func (s *SpacetimeStore) ListIncidentComments(ctx context.Context, incidentID st
 	return trimComments(out, limit), nil
 }
 
+func (s *SpacetimeStore) CountIncidentCommentsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	stableID := spacetime.StableIDForTelegramUser(userID)
+	activities, err := s.client.ServiceListActivities(ctx, spacetime.ListActivitiesFilter{Since: &since})
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, activity := range activities {
+		for _, comment := range activity.Comments {
+			if comment.StableID != stableID {
+				continue
+			}
+			createdAt, err := time.Parse(time.RFC3339, comment.CreatedAt)
+			if err != nil {
+				return 0, err
+			}
+			if !createdAt.Before(since.UTC()) {
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
+func (s *SpacetimeStore) CountIncidentCommentsByIncidentSince(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	activity, err := s.findIncidentActivity(ctx, incidentID, nil)
+	if err != nil || activity == nil {
+		return 0, err
+	}
+	total := 0
+	for _, comment := range activity.Comments {
+		createdAt, err := time.Parse(time.RFC3339, comment.CreatedAt)
+		if err != nil {
+			return 0, err
+		}
+		if !createdAt.Before(since.UTC()) {
+			total++
+		}
+	}
+	return total, nil
+}
+
 func (s *SpacetimeStore) CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (CleanupResult, error) {
 	if loc == nil {
 		loc = time.UTC

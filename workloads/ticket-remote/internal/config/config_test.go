@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadUsesPersistedActivePhoneBackend(t *testing.T) {
@@ -13,8 +14,8 @@ func TestLoadUsesPersistedActivePhoneBackend(t *testing.T) {
 	if err := os.WriteFile(activeFile, []byte(`{"backendId":"pixel"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "android-sim|Android simulator|http://sim:9388;pixel|Pixel|http://pixel:9388")
-	t.Setenv("TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID", "android-sim")
+	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "pixel|Pixel|http://pixel:9388")
+	t.Setenv("TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID", "pixel")
 	t.Setenv("TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE", activeFile)
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
 
@@ -25,23 +26,23 @@ func TestLoadUsesPersistedActivePhoneBackend(t *testing.T) {
 	if cfg.Phone.BackendID != "pixel" || cfg.Phone.AttachName != "Pixel" || cfg.Phone.BaseURL != "http://pixel:9388" {
 		t.Fatalf("active phone backend = %#v", cfg.Phone)
 	}
-	if cfg.Phone.DefaultBackendID != "android-sim" {
+	if cfg.Phone.DefaultBackendID != "pixel" {
 		t.Fatalf("default backend = %q", cfg.Phone.DefaultBackendID)
 	}
-	if len(cfg.Phone.Backends) != 2 {
+	if len(cfg.Phone.Backends) != 1 {
 		t.Fatalf("backends = %#v", cfg.Phone.Backends)
 	}
-	if cfg.SimulatorSetup.BackendID != "android-sim" || cfg.SimulatorSetup.ADBTarget != "ticket_android_sim:5555" {
-		t.Fatalf("simulator setup config = %#v", cfg.SimulatorSetup)
+	if _, ok := reflect.TypeOf(Config{}).FieldByName("Sim" + "ulatorSetup"); ok {
+		t.Fatalf("Config must not expose retired device setup")
 	}
 }
 
 func TestWriteActivePhoneBackendID(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "state", "active-phone-backend.json")
-	if err := WriteActivePhoneBackendID(activeFile, "android-sim"); err != nil {
+	if err := WriteActivePhoneBackendID(activeFile, "pixel"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "android-sim|Android simulator|http://sim:9388;pixel|Pixel|http://pixel:9388")
+	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "pixel|Pixel|http://pixel:9388")
 	t.Setenv("TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE", activeFile)
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
 
@@ -49,7 +50,7 @@ func TestWriteActivePhoneBackendID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Phone.BackendID != "android-sim" {
+	if cfg.Phone.BackendID != "pixel" {
 		t.Fatalf("active backend = %q", cfg.Phone.BackendID)
 	}
 }
@@ -66,6 +67,34 @@ func TestConfigHasNoPublicMediaPortConfig(t *testing.T) {
 	}
 	if _, ok := reflect.TypeOf(Config{}).FieldByName("WebRTC"); ok {
 		t.Fatalf("Config must not expose public media port settings")
+	}
+}
+
+func TestLoadReadsPrivatePhoneBrokerURL(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_PHONE_BROKER_URL", "http://phone_broker:9398/")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Phone.BrokerBaseURL != "http://phone_broker:9398" {
+		t.Fatalf("broker URL = %q", cfg.Phone.BrokerBaseURL)
+	}
+}
+
+func TestDefaultPhoneNoViewerStopDelayCoversBrowserReload(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Phone.NoViewerStopDelay < 5*time.Second {
+		t.Fatalf("default no-viewer stop delay = %s, want enough grace for browser reloads", cfg.Phone.NoViewerStopDelay)
+	}
+	if cfg.Phone.NoViewerStopDelay > 10*time.Second {
+		t.Fatalf("default no-viewer stop delay = %s, want encoder to cool down shortly after viewers leave", cfg.Phone.NoViewerStopDelay)
 	}
 }
 

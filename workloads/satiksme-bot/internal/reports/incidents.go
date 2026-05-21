@@ -11,14 +11,18 @@ import (
 )
 
 const (
-	maxIncidentComments       = 100
-	incidentLookbackWindow    = 24 * time.Hour
-	incidentResolvedVoteCount = 2
-	sameVoteWindow            = 30 * time.Minute
-	mapReportWindow           = 30 * time.Minute
-	mapReportLimit            = 5
-	voteActionWindow          = time.Hour
-	voteActionLimit           = 20
+	maxIncidentComments        = 100
+	incidentLookbackWindow     = 24 * time.Hour
+	incidentResolvedVoteCount  = 2
+	sameVoteWindow             = 30 * time.Minute
+	mapReportWindow            = 30 * time.Minute
+	mapReportLimit             = 5
+	voteActionWindow           = time.Hour
+	voteActionLimit            = 20
+	commentActionWindow        = time.Hour
+	commentActionLimit         = 10
+	incidentCommentActionLimit = 50
+	publicIncidentActorLabel   = "anonīmi"
 )
 
 type RateLimitError struct {
@@ -34,6 +38,10 @@ func (e *RateLimitError) Error() string {
 		return "Pārāk daudz kartes ziņojumu. Jānogaida."
 	case "vote_action_limit":
 		return "Pārāk daudz balsojumu. Jānogaida."
+	case "comment_action_limit":
+		return "Pārāk daudz komentāru. Jānogaida."
+	case "incident_comment_limit":
+		return "Pārāk daudz komentāru šajā ziņojumā. Jānogaida."
 	default:
 		return "Jānogaida pirms nākamās darbības."
 	}
@@ -49,6 +57,11 @@ type publicIncidentsStore interface {
 	GetPublicIncidentDetail(context.Context, string, int64) (*model.IncidentDetail, error)
 }
 
+type incidentCommentRateLimitStore interface {
+	CountIncidentCommentsByUserSince(context.Context, int64, time.Time) (int, error)
+	CountIncidentCommentsByIncidentSince(context.Context, string, time.Time) (int, error)
+}
+
 func StopIncidentID(stopID string) string {
 	return fmt.Sprintf("stop:%s", sanitizeIncidentKey(stopID))
 }
@@ -61,7 +74,11 @@ const IncidentScopeArea = "area"
 
 func (s *Service) ListActiveIncidents(ctx context.Context, catalog *model.Catalog, now time.Time, viewerID int64, limit int) ([]model.IncidentSummary, error) {
 	if publicStore, ok := s.store.(publicIncidentsStore); ok {
-		return publicStore.ListPublicIncidents(ctx, viewerID, limit)
+		summaries, err := publicStore.ListPublicIncidents(ctx, viewerID, limit)
+		if err != nil {
+			return nil, err
+		}
+		return redactPublicIncidentSummaries(summaries), nil
 	}
 	summaries, err := s.listRecentIncidents(ctx, catalog, now, viewerID)
 	if err != nil {
@@ -70,7 +87,7 @@ func (s *Service) ListActiveIncidents(ctx context.Context, catalog *model.Catalo
 	if limit > 0 && len(summaries) > limit {
 		summaries = summaries[:limit]
 	}
-	return summaries, nil
+	return redactPublicIncidentSummaries(summaries), nil
 }
 
 func (s *Service) ListMapVisibleIncidents(ctx context.Context, catalog *model.Catalog, now time.Time, viewerID int64) ([]model.IncidentSummary, error) {
@@ -84,7 +101,7 @@ func (s *Service) ListMapVisibleIncidents(ctx context.Context, catalog *model.Ca
 			if summary.Resolved {
 				continue
 			}
-			out = append(out, summary)
+			out = append(out, redactPublicIncidentSummary(summary))
 		}
 		return out, nil
 	}
@@ -97,7 +114,7 @@ func (s *Service) ListMapVisibleIncidents(ctx context.Context, catalog *model.Ca
 		if summary.Resolved {
 			continue
 		}
-		out = append(out, summary)
+		out = append(out, redactPublicIncidentSummary(summary))
 	}
 	return out, nil
 }
@@ -108,7 +125,11 @@ func (s *Service) IncidentDetail(ctx context.Context, catalog *model.Catalog, in
 		return nil, fmt.Errorf("incident id is required")
 	}
 	if publicStore, ok := s.store.(publicIncidentsStore); ok {
-		return publicStore.GetPublicIncidentDetail(ctx, incidentID, viewerID)
+		detail, err := publicStore.GetPublicIncidentDetail(ctx, incidentID, viewerID)
+		if err != nil {
+			return nil, err
+		}
+		return redactPublicIncidentDetail(detail), nil
 	}
 	bundle, err := s.findIncidentBundle(ctx, catalog, incidentID, now)
 	if err != nil {
@@ -134,11 +155,11 @@ func (s *Service) IncidentDetail(ctx context.Context, catalog *model.Catalog, in
 	sort.SliceStable(comments, func(left, right int) bool {
 		return comments[left].CreatedAt.Before(comments[right].CreatedAt)
 	})
-	return &model.IncidentDetail{
+	return redactPublicIncidentDetail(&model.IncidentDetail{
 		Summary:  summary,
 		Events:   events,
 		Comments: comments,
-	}, nil
+	}), nil
 }
 
 func (s *Service) VoteIncident(ctx context.Context, catalog *model.Catalog, incidentID string, userID int64, value model.IncidentVoteValue, now time.Time) (model.IncidentVoteSummary, error) {
@@ -189,6 +210,9 @@ func (s *Service) AddIncidentComment(ctx context.Context, catalog *model.Catalog
 	if len([]rune(body)) > 280 {
 		return nil, fmt.Errorf("comment is too long")
 	}
+	if err := s.enforceCommentActionLimit(ctx, incidentID, userID, now); err != nil {
+		return nil, err
+	}
 	comment := model.IncidentComment{
 		ID:         generateID(),
 		IncidentID: incidentID,
@@ -200,7 +224,73 @@ func (s *Service) AddIncidentComment(ctx context.Context, catalog *model.Catalog
 	if err := s.store.InsertIncidentComment(ctx, comment); err != nil {
 		return nil, err
 	}
+	comment = redactPublicIncidentComment(comment)
 	return &comment, nil
+}
+
+func redactPublicIncidentSummaries(summaries []model.IncidentSummary) []model.IncidentSummary {
+	out := make([]model.IncidentSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		out = append(out, redactPublicIncidentSummary(summary))
+	}
+	return out
+}
+
+func redactPublicIncidentSummary(summary model.IncidentSummary) model.IncidentSummary {
+	summary.LastReporter = publicIncidentActorLabel
+	summary.LastReportAt = publicIncidentTime(summary.LastReportAt)
+	if summary.Scope == IncidentScopeArea {
+		summary.SubjectID = ""
+		summary.Area = publicAreaContext(summary.Area)
+	}
+	if summary.Scope == "vehicle" {
+		summary.SubjectID = ""
+		if summary.Vehicle != nil {
+			vehicle := *summary.Vehicle
+			vehicle.ScopeKey = ""
+			vehicle.LiveRowID = ""
+			summary.Vehicle = &vehicle
+		}
+	}
+	return summary
+}
+
+func redactPublicIncidentDetail(detail *model.IncidentDetail) *model.IncidentDetail {
+	if detail == nil {
+		return nil
+	}
+	out := *detail
+	out.Summary = redactPublicIncidentSummary(detail.Summary)
+	out.Events = make([]model.IncidentEvent, 0, len(detail.Events))
+	for _, event := range detail.Events {
+		out.Events = append(out.Events, redactPublicIncidentEvent(event))
+	}
+	out.Comments = make([]model.IncidentComment, 0, len(detail.Comments))
+	for _, comment := range detail.Comments {
+		out.Comments = append(out.Comments, redactPublicIncidentComment(comment))
+	}
+	return &out
+}
+
+func redactPublicIncidentEvent(event model.IncidentEvent) model.IncidentEvent {
+	event.ID = ""
+	event.Kind = ""
+	event.Nickname = publicIncidentActorLabel
+	event.CreatedAt = publicIncidentTime(event.CreatedAt)
+	return event
+}
+
+func redactPublicIncidentComment(comment model.IncidentComment) model.IncidentComment {
+	comment.Nickname = publicIncidentActorLabel
+	comment.CreatedAt = publicIncidentTime(comment.CreatedAt)
+	return comment
+}
+
+func publicIncidentTime(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC().Truncate(time.Second)
 }
 
 func (s *Service) listRecentIncidents(ctx context.Context, catalog *model.Catalog, now time.Time, viewerID int64) ([]model.IncidentSummary, error) {
@@ -503,6 +593,29 @@ func (s *Service) enforceVoteActionLimit(ctx context.Context, userID int64, now 
 	}
 	if total >= voteActionLimit {
 		return &RateLimitError{Reason: "vote_action_limit", Remaining: voteActionWindow}
+	}
+	return nil
+}
+
+func (s *Service) enforceCommentActionLimit(ctx context.Context, incidentID string, userID int64, now time.Time) error {
+	rateStore, ok := s.store.(incidentCommentRateLimitStore)
+	if !ok {
+		return nil
+	}
+	since := now.Add(-commentActionWindow)
+	userCount, err := rateStore.CountIncidentCommentsByUserSince(ctx, userID, since)
+	if err != nil {
+		return err
+	}
+	if userCount >= commentActionLimit {
+		return &RateLimitError{Reason: "comment_action_limit", Remaining: commentActionWindow}
+	}
+	incidentCount, err := rateStore.CountIncidentCommentsByIncidentSince(ctx, incidentID, since)
+	if err != nil {
+		return err
+	}
+	if incidentCount >= incidentCommentActionLimit {
+		return &RateLimitError{Reason: "incident_comment_limit", Remaining: commentActionWindow}
 	}
 	return nil
 }

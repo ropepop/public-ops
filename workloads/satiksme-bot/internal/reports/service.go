@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"strings"
 	"time"
@@ -283,6 +284,7 @@ func VehicleScopeKey(input model.VehicleReportInput) string {
 const (
 	defaultAreaRadiusMeters = 100
 	maxAreaRadiusMeters     = 500
+	publicAreaRadiusMeters  = 250
 )
 
 func NormalizeAreaReportInput(input model.AreaReportInput) (model.AreaReportInput, error) {
@@ -330,7 +332,29 @@ func AreaScopeKey(input model.AreaReportInput) string {
 }
 
 func AreaIncidentID(scopeKey string) string {
-	return fmt.Sprintf("area:%s", sanitizeIncidentKey(scopeKey))
+	return publicStableID("area:pub", scopeKey)
+}
+
+func publicAreaReportID(reportID string) string {
+	return publicStableID("area-report:pub", reportID)
+}
+
+func publicStopSightingID(reportID string) string {
+	return publicStableID("stop-report:pub", reportID)
+}
+
+func publicVehicleSightingID(reportID string) string {
+	return publicStableID("vehicle-report:pub", reportID)
+}
+
+func publicStableID(prefix string, value string) string {
+	clean := strings.TrimSpace(value)
+	if clean == "" {
+		clean = "unknown"
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(clean))
+	return fmt.Sprintf("%s-%08x", strings.TrimSpace(prefix), hash.Sum32())
 }
 
 func validCoordinate(value, minValue, maxValue float64) bool {
@@ -339,6 +363,47 @@ func validCoordinate(value, minValue, maxValue float64) bool {
 
 func roundCoordinate(value float64) float64 {
 	return math.Round(value*100000) / 100000
+}
+
+func publicAreaCoordinate(value float64) float64 {
+	return math.Round(value*1000) / 1000
+}
+
+func publicAreaRadius(radius int) int {
+	if radius <= 0 {
+		radius = defaultAreaRadiusMeters
+	}
+	if radius > maxAreaRadiusMeters {
+		radius = maxAreaRadiusMeters
+	}
+	if radius < publicAreaRadiusMeters {
+		return publicAreaRadiusMeters
+	}
+	return radius
+}
+
+func publicAreaContext(area *model.IncidentAreaContext) *model.IncidentAreaContext {
+	if area == nil {
+		return nil
+	}
+	out := *area
+	out.ScopeKey = ""
+	out.Latitude = publicAreaCoordinate(area.Latitude)
+	out.Longitude = publicAreaCoordinate(area.Longitude)
+	out.RadiusMeters = publicAreaRadius(area.RadiusMeters)
+	return &out
+}
+
+func publicAreaReport(item model.AreaReport) model.PublicAreaReport {
+	return model.PublicAreaReport{
+		ID:           publicAreaReportID(item.ID),
+		IncidentID:   AreaIncidentID(item.ScopeKey),
+		Latitude:     publicAreaCoordinate(item.Latitude),
+		Longitude:    publicAreaCoordinate(item.Longitude),
+		RadiusMeters: publicAreaRadius(item.RadiusMeters),
+		Description:  item.Description,
+		CreatedAt:    item.CreatedAt,
+	}
 }
 
 func trimIncidentKey(value string, maxRunes int) string {
@@ -424,7 +489,7 @@ func buildVisibleSightings(
 			continue
 		}
 		out.StopSightings = append(out.StopSightings, model.PublicStopSighting{
-			ID:        item.ID,
+			ID:        publicStopSightingID(item.ID),
 			StopID:    item.StopID,
 			StopName:  stopNames[item.StopID],
 			CreatedAt: item.CreatedAt,
@@ -435,7 +500,7 @@ func buildVisibleSightings(
 			continue
 		}
 		out.VehicleSightings = append(out.VehicleSightings, model.PublicVehicleSighting{
-			ID:               item.ID,
+			ID:               publicVehicleSightingID(item.ID),
 			StopID:           item.StopID,
 			StopName:         stopNames[item.StopID],
 			Mode:             item.Mode,
@@ -443,7 +508,6 @@ func buildVisibleSightings(
 			Direction:        item.Direction,
 			Destination:      item.Destination,
 			DepartureSeconds: item.DepartureSeconds,
-			LiveRowID:        item.LiveRowID,
 			CreatedAt:        item.CreatedAt,
 		})
 	}
@@ -451,15 +515,7 @@ func buildVisibleSightings(
 		if includeArea != nil && !includeArea(item) {
 			continue
 		}
-		out.AreaReports = append(out.AreaReports, model.PublicAreaReport{
-			ID:           item.ID,
-			IncidentID:   AreaIncidentID(item.ScopeKey),
-			Latitude:     item.Latitude,
-			Longitude:    item.Longitude,
-			RadiusMeters: item.RadiusMeters,
-			Description:  item.Description,
-			CreatedAt:    item.CreatedAt,
-		})
+		out.AreaReports = append(out.AreaReports, publicAreaReport(item))
 	}
 	return out
 }

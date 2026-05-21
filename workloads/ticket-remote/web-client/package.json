@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node ./build.mjs"
+    "build": "node ./build.mjs",
+    "build:ticket-app": "node ./build-ticket-app.mjs"
   },
   "dependencies": {
     "spacetimedb": "^2.1.0"

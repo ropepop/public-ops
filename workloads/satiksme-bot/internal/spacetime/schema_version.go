@@ -2,7 +2,7 @@ package spacetime
 
 const (
 	ExpectedSchemaModule  = "satiksme-bot"
-	ExpectedSchemaVersion = "2026-04-30-area-reports-v1"
+	ExpectedSchemaVersion = "2026-05-11-public-direct-privacy-v2"
 
 	schemaInfoProcedureName = satiksmebotDBPrefix + "schema_info"
 )

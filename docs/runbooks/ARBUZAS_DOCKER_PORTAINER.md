@@ -157,7 +157,6 @@ What the cleanup does not touch:
 - volumes
 - networks
 - DNS state
-- Android simulator state
 - Portainer data or backups
 - application state under `/srv/arbuzas/*`
 

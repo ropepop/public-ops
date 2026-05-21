@@ -48,6 +48,15 @@ func TestTelegramAuthLifecycle(t *testing.T) {
 	if anonymousMeResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous /me status = %d, want 401", anonymousMeResp.StatusCode)
 	}
+	if got := anonymousMeResp.Header.Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("anonymous /me Cache-Control = %q, want no-store", got)
+	}
+	if got := anonymousMeResp.Header.Get("CDN-Cache-Control"); got != "no-store" {
+		t.Fatalf("anonymous /me CDN-Cache-Control = %q, want no-store", got)
+	}
+	if got := anonymousMeResp.Header.Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("anonymous /me X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
 
 	configReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/auth/telegram/config", nil)
 	if err != nil {
@@ -198,48 +207,295 @@ func TestTelegramAuthLifecycle(t *testing.T) {
 	}
 }
 
+func TestTelegramConfigRateLimitsNonceMinting(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	for index := 0; index < 30; index++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/telegram/config", nil)
+		req.RemoteAddr = "203.0.113.7:48123"
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("config request %d status = %d, want 200 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+		if cookie := cookieByName(rec.Result().Cookies(), loginNonceCookieName); cookie == nil {
+			t.Fatalf("config request %d did not mint nonce cookie", index+1)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/telegram/config", nil)
+	req.RemoteAddr = "203.0.113.7:48123"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited config status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+	if cookie := cookieByName(rec.Result().Cookies(), loginNonceCookieName); cookie != nil {
+		t.Fatalf("limited config minted nonce cookie: %#v", cookie)
+	}
+}
+
+func TestTelegramCompleteRateLimitsInvalidAttempts(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.8:48123"
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.8:48123"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRateLimitIgnoresSpoofedForwardedHeaders(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.9:48123"
+		req.Header.Set("CF-Connecting-IP", "198.51.100."+strconv.Itoa(index+1))
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.9:48123"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.200")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRateLimitIgnoresSpoofedForwardedHeadersFromPrivatePeer(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "10.0.0.5:48123"
+		req.Header.Set("X-Real-IP", "198.51.100."+strconv.Itoa(index+1))
+		req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(index+101))
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "10.0.0.5:48123"
+	req.Header.Set("X-Real-IP", "198.51.100.200")
+	req.Header.Set("X-Forwarded-For", "198.51.100.201")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUnsafeAPIRejectsCrossSiteBrowserRequests(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{
+			name: "foreign origin",
+			headers: map[string]string{
+				"Origin": "https://evil.example",
+			},
+		},
+		{
+			name: "cross-site fetch metadata",
+			headers: map[string]string{
+				"Sec-Fetch-Site": "cross-site",
+			},
+		},
+		{
+			name: "sibling origin",
+			headers: map[string]string{
+				"Origin": "https://vilciens.kontrole.info",
+			},
+		},
+		{
+			name: "same-site fetch metadata",
+			headers: map[string]string{
+				"Sec-Fetch-Site": "same-site",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+			for key, value := range tc.headers {
+				req.Header.Set(key, value)
+			}
+			rec := httptest.NewRecorder()
+
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	req.Header.Set("Origin", "https://kontrole.info")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same-origin status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuthUnsupportedMethodsReturnAllowHeader(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	for _, tc := range []struct {
+		method string
+		path   string
+		allow  string
+	}{
+		{method: http.MethodOptions, path: "/api/v1/auth/telegram/config", allow: "GET"},
+		{method: http.MethodGet, path: "/api/v1/auth/telegram/complete", allow: "POST"},
+		{method: http.MethodOptions, path: "/api/v1/auth/telegram/complete", allow: "POST"},
+			{method: http.MethodGet, path: "/api/v1/auth/logout", allow: "POST"},
+			{method: http.MethodOptions, path: "/api/v1/auth/logout", allow: "POST"},
+			{method: http.MethodOptions, path: "/api/v1/me", allow: "GET"},
+		} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s status = %d, want 405 body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Allow"); got != tc.allow {
+			t.Fatalf("%s %s Allow = %q, want %q", tc.method, tc.path, got, tc.allow)
+		}
+	}
+}
+
+func TestTelegramCompleteRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	body := `{"idToken":"` + strings.Repeat("a", 70*1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRejectsNonJSONContentType(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newTelegramAuthTestServer(t, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
+}
+
 func TestTelegramCompleteRejectsInvalidIDTokenClaims(t *testing.T) {
 	serverNow := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
 	authNow := time.Now().UTC()
 	testCases := []struct {
-		name          string
-		mutateClaims  func(map[string]any)
-		wantSubstring string
+		name         string
+		mutateClaims func(map[string]any)
 	}{
 		{
 			name: "bad issuer",
 			mutateClaims: func(claims map[string]any) {
 				claims["iss"] = "https://example.com"
 			},
-			wantSubstring: "issuer",
 		},
 		{
 			name: "bad audience",
 			mutateClaims: func(claims map[string]any) {
 				claims["aud"] = "987654321"
 			},
-			wantSubstring: "audience",
 		},
 		{
 			name: "expired",
 			mutateClaims: func(claims map[string]any) {
 				claims["exp"] = authNow.Add(-time.Minute).Unix()
 			},
-			wantSubstring: "expired",
 		},
 		{
 			name: "missing id",
 			mutateClaims: func(claims map[string]any) {
 				delete(claims, "id")
 			},
-			wantSubstring: "id",
 		},
 		{
 			name: "nonce mismatch",
 			mutateClaims: func(claims map[string]any) {
 				claims["nonce"] = "different-nonce"
 			},
-			wantSubstring: "nonce",
 		},
 	}
 
@@ -296,8 +552,13 @@ func TestTelegramCompleteRejectsInvalidIDTokenClaims(t *testing.T) {
 				t.Fatalf("complete status = %d, want 401", resp.StatusCode)
 			}
 			body := mustReadBody(t, resp)
-			if !strings.Contains(body, tc.wantSubstring) {
-				t.Fatalf("complete error = %q, want substring %q", body, tc.wantSubstring)
+			if !strings.Contains(body, "invalid Telegram login") {
+				t.Fatalf("complete error = %q, want generic login error", body)
+			}
+			for _, leaked := range []string{"issuer", "audience", "expired", "nonce", "id_token", "decode", "signature"} {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("complete error leaked validation detail %q: %s", leaked, body)
+				}
 			}
 		})
 	}
@@ -465,7 +726,7 @@ func TestTelegramCompleteRejectsInvalidMiniAppInitData(t *testing.T) {
 				values.Set("hash", strings.Repeat("0", 64))
 				return values.Encode()
 			},
-			want: "signature",
+			want: "invalid Telegram login",
 		},
 		{
 			name: "expired",
@@ -473,7 +734,7 @@ func TestTelegramCompleteRejectsInvalidMiniAppInitData(t *testing.T) {
 				"auth_date": {strconv.FormatInt(authNow.Add(-10*time.Minute).Unix(), 10)},
 				"user":      {`{"id":777001,"first_name":"Kontrole Tester"}`},
 			},
-			want: "expired",
+			want: "invalid Telegram login",
 		},
 	}
 
@@ -533,8 +794,37 @@ func TestAppRouteUsesPublicWebsiteShell(t *testing.T) {
 		if !strings.Contains(body, `"mode":"public"`) {
 			t.Fatalf("%s body missing public mode: %s", path, body)
 		}
-		if strings.Contains(body, `"spacetimeEnabled"`) || strings.Contains(body, `"spacetimeDirectOnly"`) {
-			t.Fatalf("%s body unexpectedly exposes browser-direct Spacetime config", path)
+		for _, forbidden := range []string{`"spacetimeEnabled"`, `"spacetimeDirectOnly"`, `"liveTransportViewerHeartbeatEnabled"`} {
+			if strings.Contains(body, forbidden) {
+				t.Fatalf("%s body unexpectedly exposes public write/direct config %s", path, forbidden)
+			}
+		}
+	}
+}
+
+func TestSnapshotOnlyShellDoesNotExposeSpacetimeConnectionConfig(t *testing.T) {
+	now := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
+	snapshotDir := t.TempDir()
+	server, _ := newTelegramAuthTestServer(t, now, func(cfg *config.Config) {
+		cfg.SatiksmeWebSpacetimeEnabled = true
+		cfg.SatiksmeWebSpacetimeDirectOnly = false
+		cfg.SatiksmeWebLiveSnapshotDir = snapshotDir
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"liveTransportSnapshotLookupEnabled":true`) {
+		t.Fatalf("snapshot-only shell missing snapshot lookup flag: %s", body)
+	}
+	for _, forbidden := range []string{`"spacetimeHost"`, `"spacetimeDatabase"`, "maincloud.spacetimedb.com", "db123", "/assets/live-client.js"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("snapshot-only shell exposes %s: %s", forbidden, body)
 		}
 	}
 }
@@ -560,6 +850,20 @@ func TestSpacetimeOIDCRoutesServeMetadata(t *testing.T) {
 	if openIDConfiguration["jwks_uri"] != "https://kontrole.info/oidc/jwks.json" {
 		t.Fatalf("jwks_uri = %#v, want https://kontrole.info/oidc/jwks.json", openIDConfiguration["jwks_uri"])
 	}
+	claimsSupported, ok := openIDConfiguration["claims_supported"].([]any)
+	if !ok {
+		t.Fatalf("claims_supported = %#v, want array", openIDConfiguration["claims_supported"])
+	}
+	for _, claim := range claimsSupported {
+		if claim == "smoke" {
+			t.Fatalf("claims_supported exposes internal smoke claim: %#v", claimsSupported)
+		}
+	}
+	configHeadRec := httptest.NewRecorder()
+	server.ServeHTTP(configHeadRec, httptest.NewRequest(http.MethodHead, "/oidc/.well-known/openid-configuration", nil))
+	if configHeadRec.Code != http.StatusOK {
+		t.Fatalf("openid configuration HEAD status = %d, want 200", configHeadRec.Code)
+	}
 
 	jwksRec := httptest.NewRecorder()
 	server.ServeHTTP(jwksRec, httptest.NewRequest(http.MethodGet, "/oidc/jwks.json", nil))
@@ -573,6 +877,11 @@ func TestSpacetimeOIDCRoutesServeMetadata(t *testing.T) {
 	keys, ok := jwks["keys"].([]any)
 	if !ok || len(keys) == 0 {
 		t.Fatalf("jwks keys = %#v, want non-empty array", jwks["keys"])
+	}
+	jwksHeadRec := httptest.NewRecorder()
+	server.ServeHTTP(jwksHeadRec, httptest.NewRequest(http.MethodHead, "/oidc/jwks.json", nil))
+	if jwksHeadRec.Code != http.StatusOK {
+		t.Fatalf("jwks HEAD status = %d, want 200", jwksHeadRec.Code)
 	}
 }
 

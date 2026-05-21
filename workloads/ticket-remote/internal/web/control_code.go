@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -29,9 +30,11 @@ const (
 	controlCodePhoneResultWait  = 75 * time.Second
 	controlCodePhoneCleanupWait = 20 * time.Second
 	controlCodeRequestPruneAge  = 5 * time.Minute
+	controlCodePrepareRelayHold = 8 * time.Second
+	controlCodeRelayConnectWait = 1500 * time.Millisecond
 )
 
-var controlCodeDigitsPattern = regexp.MustCompile(`^[0-9]{2,9}$`)
+var controlCodeDigitsPattern = regexp.MustCompile(`^[0-9]{2,8}$`)
 
 type controlCodeRequest struct {
 	ID                  string
@@ -42,34 +45,53 @@ type controlCodeRequest struct {
 	Reason              string
 	Message             string
 	Value               string
-	ImageMime           string
-	ImageBase64         string
+	StreamEpoch         int64
+	FrameSequence       int64
+	MinFrameSequence    int64
 	RequestedAt         time.Time
 	StartedAt           time.Time
 	CompletedAt         time.Time
+	MarkerReceivedAt    time.Time
 	TotalDurationMillis int64
+	Phases              map[string]int64
 	CleanupPending      bool
 	CleanupCompletedAt  time.Time
 	CleanupReason       string
 	CleanupOK           bool
 }
 
+func (req *controlCodeRequest) latestActivityTime() time.Time {
+	if !req.CompletedAt.IsZero() {
+		return req.CompletedAt
+	}
+	if !req.StartedAt.IsZero() {
+		return req.StartedAt
+	}
+	return req.RequestedAt
+}
+
 type controlCodeRequestView struct {
-	ID                  string `json:"requestId"`
-	Status              string `json:"status"`
-	Reason              string `json:"reason,omitempty"`
-	Message             string `json:"message,omitempty"`
-	Value               string `json:"value,omitempty"`
-	ImageMime           string `json:"imageMime,omitempty"`
-	ImageBase64         string `json:"imageBase64,omitempty"`
-	RequestedAt         string `json:"requestedAt,omitempty"`
-	StartedAt           string `json:"startedAt,omitempty"`
-	CompletedAt         string `json:"completedAt,omitempty"`
-	ResultExpiresAt     string `json:"resultExpiresAt,omitempty"`
-	ResultRemainingMS   int64  `json:"resultRemainingMs,omitempty"`
-	QueuePosition       int    `json:"queuePosition,omitempty"`
-	TotalDurationMillis int64  `json:"totalDurationMillis,omitempty"`
-	CleanupPending      bool   `json:"cleanupPending,omitempty"`
+	ID                  string           `json:"requestId"`
+	SessionID           string           `json:"sessionId,omitempty"`
+	Status              string           `json:"status"`
+	Reason              string           `json:"reason,omitempty"`
+	Message             string           `json:"message,omitempty"`
+	Value               string           `json:"value,omitempty"`
+	StreamEpoch         int64            `json:"streamEpoch,omitempty"`
+	FrameSequence       int64            `json:"frameSequence,omitempty"`
+	MinFrameSequence    int64            `json:"minFrameSequence,omitempty"`
+	RequestedAt         string           `json:"requestedAt,omitempty"`
+	StartedAt           string           `json:"startedAt,omitempty"`
+	CompletedAt         string           `json:"completedAt,omitempty"`
+	MarkerReceivedAt    string           `json:"markerReceivedAt,omitempty"`
+	ResultExpiresAt     string           `json:"resultExpiresAt,omitempty"`
+	ResultRemainingMS   int64            `json:"resultRemainingMs,omitempty"`
+	QueuePosition       int              `json:"queuePosition,omitempty"`
+	TotalDurationMillis int64            `json:"totalDurationMillis,omitempty"`
+	Phases              map[string]int64 `json:"phases,omitempty"`
+	CleanupPending      bool             `json:"cleanupPending,omitempty"`
+	CleanupReason       string           `json:"cleanupReason,omitempty"`
+	CleanupOK           *bool            `json:"cleanupOk,omitempty"`
 }
 
 func cleanControlCodeDigits(value string) string {
@@ -80,10 +102,58 @@ func validControlCodeDigits(value string) bool {
 	return controlCodeDigitsPattern.MatchString(value)
 }
 
+func controlCodeRelayLeaseID(requestID string) string {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ""
+	}
+	return "control-code:" + requestID
+}
+
+func controlCodePrepareRelayLeaseID(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = randomID()
+	}
+	return sessionID
+}
+
+func (s *Server) retainControlCodeRelay(requestID string) {
+	leaseID := controlCodeRelayLeaseID(requestID)
+	if leaseID == "" {
+		return
+	}
+	hold := controlCodePhoneResultWait + controlCodePhoneCleanupWait + 5*time.Second
+	s.retainRelayViewerForPrewarm(leaseID, hold)
+}
+
+func (s *Server) releaseControlCodeRelay(requestID string) {
+	if leaseID := controlCodeRelayLeaseID(requestID); leaseID != "" {
+		s.releaseRetainedRelayViewer(leaseID)
+	}
+}
+
+func (s *Server) waitForPhoneRelayConnected(reason string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = controlCodeRelayConnectWait
+	}
+	s.relay.EnsureActive(reason)
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.relay.Snapshot().Connected {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func (s *Server) createControlCodeRequest(email string, sessionID string, digits string, now time.Time) (controlCodeRequestView, string, error) {
 	digits = cleanControlCodeDigits(digits)
 	if !validControlCodeDigits(digits) {
-		return controlCodeRequestView{}, "invalid_code", fmt.Errorf("control code must contain 2-9 digits")
+		return controlCodeRequestView{}, "invalid_code", fmt.Errorf("control code must contain 2-8 digits")
 	}
 	email = strings.ToLower(strings.TrimSpace(email))
 	req := &controlCodeRequest{
@@ -160,27 +230,30 @@ func (s *Server) startNextControlCodeRequest() {
 func (s *Server) dispatchControlCodeRequest(requestID string) {
 	s.codeMu.Lock()
 	req := s.codeRequests[requestID]
-	if req == nil || req.Status != controlCodeRunning {
+	if req == nil || (req.Status != controlCodeRunning && req.Status != controlCodeSucceeded) {
 		s.codeMu.Unlock()
 		return
 	}
 	digits := req.Digits
 	s.codeMu.Unlock()
 
-	if !s.relay.Snapshot().Connected {
-		s.completeControlCodeRequest(requestID, false, "phone_unavailable", "", "", "", 0, false)
+	s.retainControlCodeRelay(requestID)
+	if !s.waitForPhoneRelayConnected("control_code_request", controlCodeRelayConnectWait) {
+		s.completeControlCodeRequest(requestID, false, "phone_unavailable", "", 0, nil, false)
 		return
 	}
 
+	serverSentAt := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneSendTTL)
 	err := s.relay.SendJSON(ctx, map[string]any{
-		"type":      "generate_control_code",
-		"requestId": requestID,
-		"digits":    digits,
+		"type":         "generate_control_code",
+		"requestId":    requestID,
+		"digits":       digits,
+		"serverSentAt": serverSentAt.Format(time.RFC3339Nano),
 	})
 	cancel()
 	if err != nil {
-		s.completeControlCodeRequest(requestID, false, "phone_unavailable", "", "", "", 0, false)
+		s.completeControlCodeRequest(requestID, false, "phone_unavailable", "", 0, nil, false)
 		return
 	}
 	go s.timeoutControlCodeRequest(requestID, time.Now().Add(controlCodePhoneResultWait))
@@ -197,7 +270,7 @@ func (s *Server) timeoutControlCodeRequest(requestID string, deadline time.Time)
 		return
 	}
 	s.codeMu.Unlock()
-	s.completeControlCodeRequest(requestID, false, "phone_timeout", "", "", "", 0, false)
+	s.completeControlCodeRequest(requestID, false, "phone_timeout", "", 0, nil, false)
 }
 
 func (s *Server) handleControlCodePhoneResult(msg map[string]any) bool {
@@ -210,6 +283,17 @@ func (s *Server) handleControlCodePhoneResult(msg map[string]any) bool {
 		}
 		reason, _ := msg["reason"].(string)
 		s.completeControlCodeCleanup(requestID, ok, reason)
+		return true
+	}
+	if msgType == "control_code_frame_ready" {
+		requestID, _ := msg["requestId"].(string)
+		value, _ := msg["value"].(string)
+		phases := controlCodePhasesFromMessage(msg["phases"])
+		totalDurationMillis := controlCodeInt64FromMessage(msg["totalDurationMillis"])
+		streamEpoch := controlCodeInt64FromMessage(msg["streamEpoch"])
+		frameSequence := controlCodeInt64FromMessage(msg["frameSequence"])
+		minFrameSequence := controlCodeInt64FromMessage(msg["minFrameSequence"])
+		s.markControlCodeFrameReady(requestID, value, streamEpoch, frameSequence, minFrameSequence, totalDurationMillis, phases)
 		return true
 	}
 	if msgType != "control_code_result" {
@@ -226,23 +310,179 @@ func (s *Server) handleControlCodePhoneResult(msg map[string]any) bool {
 	}
 	reason, _ := msg["reason"].(string)
 	value, _ := msg["value"].(string)
-	imageMime, _ := msg["imageMime"].(string)
-	imageBase64, _ := msg["imageBase64"].(string)
 	cleanupPending, _ := msg["cleanupPending"].(bool)
-	totalDurationMillis := int64(0)
-	switch raw := msg["totalDurationMillis"].(type) {
-	case float64:
-		totalDurationMillis = int64(raw)
-	case int64:
-		totalDurationMillis = raw
-	case json.Number:
-		totalDurationMillis, _ = raw.Int64()
-	}
-	s.completeControlCodeRequest(requestID, ok, reason, value, imageMime, imageBase64, totalDurationMillis, cleanupPending)
+	phases := controlCodePhasesFromMessage(msg["phases"])
+	totalDurationMillis := controlCodeInt64FromMessage(msg["totalDurationMillis"])
+	s.completeControlCodeRequest(requestID, ok, reason, value, totalDurationMillis, phases, cleanupPending)
 	return true
 }
 
-func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason string, value string, imageMime string, imageBase64 string, totalDurationMillis int64, cleanupPending bool) {
+func controlCodeInt64FromMessage(raw any) int64 {
+	switch typed := raw.(type) {
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func controlCodePhasesFromMessage(raw any) map[string]int64 {
+	values, ok := raw.(map[string]any)
+	if !ok || len(values) == 0 {
+		return nil
+	}
+	phases := make(map[string]int64, len(values))
+	for name, value := range values {
+		cleanName := strings.TrimSpace(name)
+		if cleanName == "" {
+			continue
+		}
+		switch typed := value.(type) {
+		case float64:
+			phases[cleanName] = int64(typed)
+		case int64:
+			phases[cleanName] = typed
+		case json.Number:
+			if parsed, err := typed.Int64(); err == nil {
+				phases[cleanName] = parsed
+			}
+		}
+	}
+	if len(phases) == 0 {
+		return nil
+	}
+	return phases
+}
+
+func (s *Server) markControlCodeFrameReady(requestID string, value string, streamEpoch int64, frameSequence int64, minFrameSequence int64, totalDurationMillis int64, phases map[string]int64) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	now := time.Now()
+	var email, sessionID string
+	var view controlCodeRequestView
+	var resultExpiresAt time.Time
+	s.codeMu.Lock()
+	req := s.codeRequests[requestID]
+	if req == nil || req.Status != controlCodeRunning {
+		s.codeMu.Unlock()
+		return
+	}
+	s.completeControlCodeFromMarkerLocked(req, value, "generated", streamEpoch, frameSequence, minFrameSequence, totalDurationMillis, phases, now)
+	email = req.Email
+	sessionID = req.SessionID
+	view = s.controlCodeViewLocked(req, now)
+	if !req.CompletedAt.IsZero() {
+		resultExpiresAt = req.CompletedAt.Add(controlCodeResultTTL)
+	}
+	s.codeMu.Unlock()
+
+	s.notifyControlCodeRequest(email, sessionID, view)
+	if !resultExpiresAt.IsZero() {
+		go s.expireControlCodeRequestAt(requestID, resultExpiresAt)
+	}
+	go s.timeoutControlCodeCleanup(requestID, now.Add(controlCodePhoneCleanupWait))
+}
+
+func (s *Server) completeControlCodeFromMarker(requestID string, value string, reason string, streamEpoch int64, frameSequence int64, minFrameSequence int64, totalDurationMillis int64, phases map[string]int64) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	now := time.Now()
+	var email, sessionID string
+	var view controlCodeRequestView
+	var resultExpiresAt time.Time
+	var notify bool
+	var startCleanupTimer bool
+	s.codeMu.Lock()
+	req := s.codeRequests[requestID]
+	if req == nil {
+		s.codeMu.Unlock()
+		return
+	}
+	if req.Status != controlCodeRunning && req.Status != controlCodeSucceeded {
+		s.codeMu.Unlock()
+		return
+	}
+	if req.Status == controlCodeSucceeded && !req.CompletedAt.IsZero() {
+		s.codeMu.Unlock()
+		return
+	}
+	wasCompleted := !req.CompletedAt.IsZero()
+	s.completeControlCodeFromMarkerLocked(req, value, reason, streamEpoch, frameSequence, minFrameSequence, totalDurationMillis, phases, now)
+	email = req.Email
+	sessionID = req.SessionID
+	view = s.controlCodeViewLocked(req, now)
+	notify = true
+	if !req.CompletedAt.IsZero() {
+		resultExpiresAt = req.CompletedAt.Add(controlCodeResultTTL)
+	}
+	startCleanupTimer = !wasCompleted && req.CleanupPending
+	s.codeMu.Unlock()
+
+	if notify {
+		s.notifyControlCodeRequest(email, sessionID, view)
+	}
+	if !resultExpiresAt.IsZero() {
+		go s.expireControlCodeRequestAt(requestID, resultExpiresAt)
+	}
+	if startCleanupTimer {
+		go s.timeoutControlCodeCleanup(requestID, now.Add(controlCodePhoneCleanupWait))
+	}
+}
+
+func (s *Server) completeControlCodeFromMarkerLocked(req *controlCodeRequest, value string, reason string, streamEpoch int64, frameSequence int64, minFrameSequence int64, totalDurationMillis int64, phases map[string]int64, now time.Time) {
+	if req == nil {
+		return
+	}
+	req.Status = controlCodeSucceeded
+	req.Reason = strings.TrimSpace(reason)
+	if req.Reason == "" || req.Reason == "control_code_frame_ready" {
+		req.Reason = "generated"
+	}
+	if cleanValue := strings.TrimSpace(value); cleanValue != "" || req.Value == "" {
+		req.Value = cleanValue
+	}
+	if frameSequence == 0 {
+		frameSequence = minFrameSequence
+	}
+	if minFrameSequence == 0 {
+		minFrameSequence = frameSequence
+	}
+	if streamEpoch > 0 {
+		req.StreamEpoch = streamEpoch
+	}
+	if frameSequence > 0 {
+		req.FrameSequence = frameSequence
+	}
+	if minFrameSequence > 0 {
+		req.MinFrameSequence = minFrameSequence
+	}
+	if req.CompletedAt.IsZero() {
+		req.CompletedAt = now.UTC()
+	}
+	if req.MarkerReceivedAt.IsZero() {
+		req.MarkerReceivedAt = now.UTC()
+	}
+	if totalDurationMillis > 0 || req.TotalDurationMillis == 0 {
+		req.TotalDurationMillis = totalDurationMillis
+	}
+	if len(phases) > 0 {
+		req.Phases = phases
+	}
+	req.CleanupPending = true
+}
+
+func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason string, value string, totalDurationMillis int64, phases map[string]int64, cleanupPending bool) {
 	now := time.Now()
 	var req *controlCodeRequest
 	var view controlCodeRequestView
@@ -250,13 +490,12 @@ func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason st
 	var email, sessionID string
 	shouldStartNext := false
 	shouldWaitForCleanup := false
-	imageBase64 = strings.TrimSpace(imageBase64)
-	if ok && imageBase64 == "" {
+	if ok {
 		ok = false
-		if strings.TrimSpace(reason) == "" || strings.TrimSpace(reason) == "generated" {
-			reason = "control_code_image_capture_failed"
+		if strings.TrimSpace(reason) == "" || strings.TrimSpace(reason) == "generated" || strings.TrimSpace(reason) == "control_code_screenshot_capture_failed" {
+			reason = "control_code_stream_marker_required"
 		}
-		cleanupPending = false
+		cleanupPending = true
 	}
 	s.codeMu.Lock()
 	req = s.codeRequests[requestID]
@@ -274,11 +513,6 @@ func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason st
 	if ok {
 		req.Status = controlCodeSucceeded
 		req.Value = strings.TrimSpace(value)
-		req.ImageMime = strings.TrimSpace(imageMime)
-		req.ImageBase64 = imageBase64
-		if req.ImageMime == "" && req.ImageBase64 != "" {
-			req.ImageMime = "image/png"
-		}
 	} else {
 		req.Status = controlCodeFailed
 	}
@@ -292,6 +526,7 @@ func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason st
 	}
 	req.CompletedAt = now.UTC()
 	req.TotalDurationMillis = totalDurationMillis
+	req.Phases = phases
 	req.CleanupPending = cleanupPending
 	if s.codeRunning == requestID && !req.CleanupPending {
 		s.codeRunning = ""
@@ -316,6 +551,9 @@ func (s *Server) completeControlCodeRequest(requestID string, ok bool, reason st
 	}
 	if shouldStartNext {
 		s.startNextControlCodeRequest()
+	}
+	if !shouldWaitForCleanup {
+		s.releaseControlCodeRelay(requestID)
 	}
 }
 
@@ -344,9 +582,6 @@ func (s *Server) completeControlCodeCleanup(requestID string, ok bool, reason st
 		req.CleanupOK = ok
 		req.CleanupReason = strings.TrimSpace(reason)
 		req.CleanupCompletedAt = now.UTC()
-		if req.Status == controlCodeSucceeded && !ok && req.Reason == "generated" {
-			req.Reason = "control_code_cleanup_attention_needed"
-		}
 		email = req.Email
 		sessionID = req.SessionID
 		view = s.controlCodeViewLocked(req, now)
@@ -359,6 +594,9 @@ func (s *Server) completeControlCodeCleanup(requestID string, ok bool, reason st
 	if req.Status == controlCodeRunning {
 		req.Status = controlCodeFailed
 		req.Reason = strings.TrimSpace(reason)
+		if req.Reason == "return_to_raw_complete" {
+			req.Reason = "control_code_not_generated"
+		}
 		if req.Reason == "" {
 			req.Reason = "control_code_cleanup_finished_without_result"
 		}
@@ -375,26 +613,26 @@ func (s *Server) completeControlCodeCleanup(requestID string, ok bool, reason st
 	if shouldStartNext {
 		s.startNextControlCodeRequest()
 	}
+	s.releaseControlCodeRelay(requestID)
 }
 
-func (s *Server) closeControlCodeRequest(email string, requestID string, now time.Time) (controlCodeRequestView, bool) {
+func (s *Server) closeControlCodeRequest(email string, sessionID string, requestID string, now time.Time) (controlCodeRequestView, bool) {
 	email = strings.ToLower(strings.TrimSpace(email))
+	sessionID = strings.TrimSpace(sessionID)
 	requestID = strings.TrimSpace(requestID)
 	shouldStartNext := false
 	s.codeMu.Lock()
 	req := s.codeRequests[requestID]
-	if req == nil || req.Email != email {
+	if req == nil || req.Email != email || strings.TrimSpace(req.SessionID) != sessionID {
 		s.codeMu.Unlock()
 		return controlCodeRequestView{}, false
 	}
-	if req.Status == controlCodeRunning && !req.CleanupPending {
+	if req.Status == controlCodeRunning {
 		view := s.controlCodeViewLocked(req, now)
 		s.codeMu.Unlock()
 		return view, true
 	}
 	req.Status = controlCodeClosed
-	req.ImageBase64 = ""
-	req.ImageMime = ""
 	if s.codeRunning == requestID && !req.CleanupPending {
 		s.codeRunning = ""
 		shouldStartNext = true
@@ -412,11 +650,16 @@ func (s *Server) controlCodeViewLocked(req *controlCodeRequest, now time.Time) c
 	s.expireControlCodeRequestLocked(req, now)
 	view := controlCodeRequestView{
 		ID:                  req.ID,
+		SessionID:           strings.TrimSpace(req.SessionID),
 		Status:              req.Status,
 		Reason:              req.Reason,
 		Message:             req.Message,
 		Value:               req.Value,
+		StreamEpoch:         req.StreamEpoch,
+		FrameSequence:       req.FrameSequence,
+		MinFrameSequence:    req.MinFrameSequence,
 		TotalDurationMillis: req.TotalDurationMillis,
+		Phases:              req.Phases,
 	}
 	if !req.RequestedAt.IsZero() {
 		view.RequestedAt = req.RequestedAt.UTC().Format(time.RFC3339)
@@ -427,7 +670,15 @@ func (s *Server) controlCodeViewLocked(req *controlCodeRequest, now time.Time) c
 	if !req.CompletedAt.IsZero() {
 		view.CompletedAt = req.CompletedAt.UTC().Format(time.RFC3339)
 	}
+	if !req.MarkerReceivedAt.IsZero() {
+		view.MarkerReceivedAt = req.MarkerReceivedAt.UTC().Format(time.RFC3339)
+	}
 	view.CleanupPending = req.CleanupPending
+	if !req.CleanupCompletedAt.IsZero() {
+		view.CleanupReason = req.CleanupReason
+		cleanupOK := req.CleanupOK
+		view.CleanupOK = &cleanupOK
+	}
 	if req.Status == controlCodeQueued {
 		for index, id := range s.codeQueue {
 			if id == req.ID {
@@ -437,8 +688,6 @@ func (s *Server) controlCodeViewLocked(req *controlCodeRequest, now time.Time) c
 		}
 	}
 	if req.Status == controlCodeSucceeded {
-		view.ImageMime = req.ImageMime
-		view.ImageBase64 = req.ImageBase64
 		if !req.CompletedAt.IsZero() {
 			expiresAt := req.CompletedAt.Add(controlCodeResultTTL).UTC()
 			view.ResultExpiresAt = expiresAt.Format(time.RFC3339)
@@ -457,11 +706,17 @@ func (s *Server) controlCodeViewLocked(req *controlCodeRequest, now time.Time) c
 func (s *Server) notifyControlCodeRequest(email string, sessionID string, view controlCodeRequestView) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
 	for _, c := range s.clientSnapshot() {
 		if c.video {
 			continue
 		}
 		if strings.ToLower(strings.TrimSpace(c.email)) != email {
+			continue
+		}
+		if strings.TrimSpace(c.sessionID) != sessionID {
 			continue
 		}
 		c.sendJSON(context.Background(), map[string]any{"type": "control_code_request", "request": view})
@@ -480,17 +735,14 @@ func (s *Server) sendLatestControlCodeRequest(ctx context.Context, c *client) {
 		if req == nil || req.Email != email {
 			continue
 		}
+		if strings.TrimSpace(req.SessionID) != strings.TrimSpace(c.sessionID) {
+			continue
+		}
 		s.expireControlCodeRequestLocked(req, now)
 		if req.Status == controlCodeClosed || req.Status == controlCodeExpired {
 			continue
 		}
-		candidateTime := req.CompletedAt
-		if candidateTime.IsZero() {
-			candidateTime = req.StartedAt
-		}
-		if candidateTime.IsZero() {
-			candidateTime = req.RequestedAt
-		}
+		candidateTime := req.latestActivityTime()
 		if !found || candidateTime.After(latest) {
 			found = true
 			latest = candidateTime
@@ -530,6 +782,42 @@ func (s *Server) handleControlCodeRequestHTTP(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "request": view})
 }
 
+func (s *Server) handleControlCodePrepareHTTP(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 1024))
+	prepareLeaseID := controlCodePrepareRelayLeaseID(sessionID)
+	s.retainRelayViewerForPrewarm(prepareLeaseID, controlCodePrepareRelayHold)
+	if !s.waitForPhoneRelayConnected("control_code_prepare", controlCodeRelayConnectWait) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":      true,
+			"ready":   false,
+			"message": "Phone wake requested.",
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), controlCodePhoneSendTTL)
+	err := s.relay.SendJSON(ctx, map[string]any{
+		"type":      "prepare_control_code",
+		"reason":    "dialog_open",
+		"sessionId": sessionID,
+		"email":     id.Email,
+		"sentAt":    time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	cancel()
+	if err != nil {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":      true,
+			"ready":   false,
+			"message": "Phone wake requested.",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ready": true})
+}
+
 func (s *Server) expireControlCodeRequestAt(requestID string, deadline time.Time) {
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
@@ -562,8 +850,6 @@ func (s *Server) expireControlCodeRequestLocked(req *controlCodeRequest, now tim
 		return false
 	}
 	req.Status = controlCodeExpired
-	req.ImageBase64 = ""
-	req.ImageMime = ""
 	req.Value = ""
 	req.Reason = "expired"
 	return true
@@ -617,7 +903,7 @@ func (s *Server) handleControlCodeCloseHTTP(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad_request", "message": "Could not read request."})
 		return
 	}
-	view, ok := s.closeControlCodeRequest(id.Email, req.RequestID, time.Now())
+	view, ok := s.closeControlCodeRequest(id.Email, sessionID, req.RequestID, time.Now())
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "not_found", "message": "Control code request was not found."})
 		return

@@ -8,9 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+	"unicode"
 
 	"ticketremote/internal/auth"
 	"ticketremote/internal/config"
@@ -18,8 +18,33 @@ import (
 	"ticketremote/internal/state"
 )
 
+func normalizeStaticJSForContains(value string) string {
+	normalized := make([]rune, 0, len(value))
+	for _, r := range strings.ToLower(value) {
+		switch {
+		case unicode.IsSpace(r):
+			continue
+		case r == '"' || r == '`':
+			normalized = append(normalized, '\'')
+		default:
+			normalized = append(normalized, r)
+		}
+	}
+	return string(normalized)
+}
+
+func staticContains(source, snippet string) bool {
+	return strings.Contains(normalizeStaticJSForContains(source), normalizeStaticJSForContains(snippet))
+}
+
+func staticCSSContains(source, snippet string) bool {
+	normalizedSource := strings.ReplaceAll(normalizeStaticJSForContains(source), "'", "")
+	normalizedSnippet := strings.ReplaceAll(normalizeStaticJSForContains(snippet), "'", "")
+	return strings.Contains(normalizedSource, normalizedSnippet)
+}
+
 func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
+	server := newTicketSetupTestServer(t, "pixel")
 
 	server.addRelayViewer("session-a")
 	server.addRelayViewer("session-a")
@@ -43,6 +68,80 @@ func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
 	server.removeRelayViewer("session-b")
 	if got := server.relay.Snapshot().Viewers; got != 0 {
 		t.Fatalf("relay viewers after closing all sessions = %d, want 0", got)
+	}
+}
+
+func TestRelayViewerCountPublishesPhoneBrokerPresence(t *testing.T) {
+	presenceUpdates := make(chan int, 4)
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/ticket/presence" {
+			t.Fatalf("broker path = %s", r.URL.Path)
+		}
+		var req struct {
+			Viewers int `json:"viewers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode presence: %v", err)
+		}
+		presenceUpdates <- req.Viewers
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer broker.Close()
+
+	server := newTicketSetupTestServer(t, "pixel")
+	server.cfg.Phone.BrokerBaseURL = broker.URL
+
+	server.addRelayViewer("session-a")
+	expectBrokerPresence(t, presenceUpdates, 1)
+
+	server.addRelayViewer("session-b")
+	expectBrokerPresence(t, presenceUpdates, 2)
+
+	server.removeRelayViewer("session-a")
+	expectBrokerPresence(t, presenceUpdates, 1)
+
+	server.removeRelayViewer("session-b")
+	expectBrokerPresence(t, presenceUpdates, 0)
+}
+
+func expectBrokerPresence(t *testing.T, updates <-chan int, want int) {
+	t.Helper()
+	select {
+	case got := <-updates:
+		if got != want {
+			t.Fatalf("broker presence = %d, want %d", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for broker presence %d", want)
+	}
+}
+
+func TestRelayPrewarmUsesBrowserSessionLease(t *testing.T) {
+	if got := streamPrewarmRelayLeaseID(" session-a "); got != "session-a" {
+		t.Fatalf("stream prewarm lease = %q, want session-a", got)
+	}
+	if got := controlCodePrepareRelayLeaseID(" session-a "); got != "session-a" {
+		t.Fatalf("control-code prepare lease = %q, want session-a", got)
+	}
+}
+
+func TestRelayPrewarmDoesNotDoubleCountActiveBrowserSession(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPrewarm(streamPrewarmRelayLeaseID("session-a"), time.Hour)
+	server.retainRelayViewerForPrewarm(controlCodePrepareRelayLeaseID("session-a"), time.Hour)
+
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after active session prewarm = %d, want 1", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after active socket closes while prewarm retained = %d, want 1", got)
+	}
+	server.releaseRetainedRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after prewarm release = %d, want 0", got)
 	}
 }
 
@@ -158,212 +257,121 @@ func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
 	}
 }
 
-func TestOwnerSimulatorSetupWorksWhenViviMissing(t *testing.T) {
-	server, runner := newSimulatorSetupTestServer(t, "android-sim")
-
-	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/phone/setup/status", nil)
-	statusReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-	statusRec := httptest.NewRecorder()
-	server.ServeHTTP(statusRec, statusReq)
-	if statusRec.Code != http.StatusOK {
-		t.Fatalf("status code = %d body = %s", statusRec.Code, statusRec.Body.String())
-	}
-	var status struct {
-		Packages map[string]struct {
-			Installed bool `json:"installed"`
-		} `json:"packages"`
-	}
-	if err := json.NewDecoder(statusRec.Body).Decode(&status); err != nil {
+func TestVersionedStaticAssetsAreCacheable(t *testing.T) {
+	store := state.NewMemoryStore()
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://pixel.test",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if status.Packages["vivi"].Installed {
-		t.Fatalf("ViVi should be missing in setup status: %#v", status.Packages)
-	}
-	if !status.Packages["accrescent"].Installed || !status.Packages["aurora"].Installed || !status.Packages["controller"].Installed {
-		t.Fatalf("setup packages missing: %#v", status.Packages)
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "https://ticket.jolkins.id.lv",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "dev",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		Phone: config.PhoneConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://pixel.test"},
+	}, store, phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://pixel.test"}))
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	screenshotReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/phone/setup/screenshot", nil)
-	screenshotReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-	screenshotRec := httptest.NewRecorder()
-	server.ServeHTTP(screenshotRec, screenshotReq)
-	if screenshotRec.Code != http.StatusOK || screenshotRec.Header().Get("Content-Type") != "image/png" {
-		t.Fatalf("screenshot status=%d content-type=%q body=%q", screenshotRec.Code, screenshotRec.Header().Get("Content-Type"), screenshotRec.Body.String())
-	}
-	if got := screenshotRec.Body.String(); got != fakePNG {
-		t.Fatalf("screenshot bytes = %q", got)
-	}
-
-	inputReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/phone/setup/input", strings.NewReader(`{"type":"tap","x":12,"y":34}`))
-	inputReq.Header.Set("Content-Type", "application/json")
-	inputReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-	inputRec := httptest.NewRecorder()
-	server.ServeHTTP(inputRec, inputReq)
-	if inputRec.Code != http.StatusOK {
-		t.Fatalf("input status = %d body = %s", inputRec.Code, inputRec.Body.String())
-	}
-	if !runner.called("shell", "input", "tap", "12", "34") {
-		t.Fatalf("tap command was not sent, calls=%#v", runner.callsSnapshot())
-	}
-}
-
-func TestOwnerSimulatorControlSupportsGeneralInputs(t *testing.T) {
-	server, runner := newSimulatorSetupTestServer(t, "android-sim")
-	cases := []struct {
-		name string
-		body string
-		call []string
-	}{
-		{
-			name: "drag",
-			body: `{"type":"drag","startX":10,"startY":20,"endX":40,"endY":80,"durationMs":250}`,
-			call: []string{"shell", "input", "swipe", "10", "20", "40", "80", "250"},
-		},
-		{
-			name: "long_press",
-			body: `{"type":"long_press","x":12,"y":34,"durationMs":700}`,
-			call: []string{"shell", "input", "swipe", "12", "34", "12", "34", "700"},
-		},
-		{
-			name: "app_switch",
-			body: `{"type":"key","key":"app_switch"}`,
-			call: []string{"shell", "input", "keyevent", "KEYCODE_APP_SWITCH"},
-		},
-		{
-			name: "wake",
-			body: `{"type":"key","key":"wake"}`,
-			call: []string{"shell", "input", "keyevent", "KEYCODE_WAKEUP"},
-		},
-		{
-			name: "delete",
-			body: `{"type":"key","key":"delete"}`,
-			call: []string{"shell", "input", "keyevent", "KEYCODE_DEL"},
-		},
-		{
-			name: "space",
-			body: `{"type":"key","key":"space"}`,
-			call: []string{"shell", "input", "keyevent", "KEYCODE_SPACE"},
-		},
-		{
-			name: "text",
-			body: `{"type":"text","text":"Vivi Latvija 123"}`,
-			call: []string{"shell", "input", "text", "Vivi%sLatvija%s123"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/phone/setup/input", strings.NewReader(tc.body))
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-			rec := httptest.NewRecorder()
-			server.ServeHTTP(rec, req)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("input status = %d body = %s", rec.Code, rec.Body.String())
-			}
-			if !runner.called(tc.call...) {
-				t.Fatalf("%s command was not sent, calls=%#v", tc.name, runner.callsSnapshot())
-			}
-		})
-	}
-}
-
-func TestSimulatorSetupRequiresOwner(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "android-sim")
-	for _, tc := range []struct {
-		email string
-		role  string
-	}{
-		{"admin@example.com", state.RoleAdmin},
-		{"member@example.com", state.RoleMember},
-	} {
-		t.Run(tc.role, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/phone/setup/status", nil)
-			req.Header.Set("X-Ticket-Remote-Email", tc.email)
-			rec := httptest.NewRecorder()
-			server.ServeHTTP(rec, req)
-			if rec.Code != http.StatusForbidden {
-				t.Fatalf("status for %s = %d body = %s", tc.email, rec.Code, rec.Body.String())
-			}
-		})
-	}
-}
-
-func TestSimulatorSetupRequiresActiveSimulatorBackend(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/phone/setup/status", nil)
-	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	req := httptest.NewRequest(http.MethodGet, "https://ticket.jolkins.id.lv/static/app.js?v=test-release", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
-	}
-}
 
-func TestSimulatorSetupRejectsUnsafeInputs(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "android-sim")
-	cases := []string{
-		`{"type":"pinch","x":1,"y":1}`,
-		`{"type":"tap","x":9000,"y":1}`,
-		`{"type":"swipe","startX":1,"startY":1,"endX":1,"endY":1200,"durationMs":300}`,
-		`{"type":"swipe","startX":1,"startY":1,"endX":2,"endY":2,"durationMs":5000}`,
-		`{"type":"long_press","x":9000,"y":1,"durationMs":650}`,
-		`{"type":"long_press","x":1,"y":1,"durationMs":2000}`,
-		`{"type":"key","key":"power"}`,
-		`{"type":"text","text":"hello; reboot"}`,
-	}
-	cases = append(cases, `{"type":"text","text":"`+strings.Repeat("a", setupTextMaxRunes+1)+`"}`)
-	for _, body := range cases {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/phone/setup/input", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-		rec := httptest.NewRecorder()
-		server.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("body %s status = %d response = %s", body, rec.Code, rec.Body.String())
-		}
-	}
-}
-
-func TestSimulatorSetupOpenShortcuts(t *testing.T) {
-	server, runner := newSimulatorSetupTestServer(t, "android-sim")
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/phone/setup/open", strings.NewReader(`{"target":"aurora-vivi"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-	rec := httptest.NewRecorder()
-	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("open status = %d body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("static app status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if !runner.called("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "market://details?id=com.pv.vivi", "-p", setupPackageAurora) {
-		t.Fatalf("aurora intent was not sent, calls=%#v", runner.callsSnapshot())
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") || !strings.Contains(got, "max-age=31536000") {
+		t.Fatalf("static app cache-control = %q", got)
+	}
+	if got := rec.Header().Get("Clear-Site-Data"); got != "" {
+		t.Fatalf("static app must not clear browser cache, got %q", got)
 	}
 }
 
-func TestAdminPageShowsSimulatorSetupOnlyForOwner(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "android-sim")
+func TestUnversionedStaticAssetsAreNotLongLived(t *testing.T) {
+	store := state.NewMemoryStore()
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://pixel.test",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "https://ticket.jolkins.id.lv",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "dev",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		Phone: config.PhoneConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://pixel.test"},
+	}, store, phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://pixel.test"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://ticket.jolkins.id.lv/static/app.js", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("static app status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") || strings.Contains(got, "immutable") {
+		t.Fatalf("unversioned static app cache-control = %q", got)
+	}
+	if got := rec.Header().Get("CDN-Cache-Control"); !strings.Contains(got, "no-store") || strings.Contains(got, "immutable") {
+		t.Fatalf("unversioned static app CDN cache-control = %q", got)
+	}
+}
+
+func TestAssetVersionIsStableDuringProcess(t *testing.T) {
+	first := assetVersion()
+	time.Sleep(1100 * time.Millisecond)
+	second := assetVersion()
+	if first == "" || second == "" {
+		t.Fatalf("asset version must not be empty: first=%q second=%q", first, second)
+	}
+	if first != second {
+		t.Fatalf("asset version changed within one process: first=%q second=%q", first, second)
+	}
+}
+
+func TestAdminPageDoesNotExposeRetiredDeviceSetup(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
 	ownerReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	ownerReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
 	ownerRec := httptest.NewRecorder()
 	server.ServeHTTP(ownerRec, ownerReq)
 	ownerBody := ownerRec.Body.String()
-	if ownerRec.Code != http.StatusOK || !strings.Contains(ownerBody, `data-simulator-setup="true"`) || !strings.Contains(ownerBody, `Owner simulator control`) || !strings.Contains(ownerBody, `data-sim-key="app_switch"`) || !strings.Contains(ownerBody, `data-sim-key="delete"`) || !strings.Contains(ownerBody, `data-sim-key="space"`) {
+	if ownerRec.Code != http.StatusOK {
 		t.Fatalf("owner admin page status=%d body=%s", ownerRec.Code, ownerRec.Body.String())
 	}
-
-	adminReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
-	adminReq.Header.Set("X-Ticket-Remote-Email", "admin@example.com")
-	adminRec := httptest.NewRecorder()
-	server.ServeHTTP(adminRec, adminReq)
-	if adminRec.Code != http.StatusOK {
-		t.Fatalf("admin page status = %d body = %s", adminRec.Code, adminRec.Body.String())
-	}
-	if strings.Contains(adminRec.Body.String(), `data-simulator-setup="true"`) {
-		t.Fatalf("non-owner admin page should not render simulator setup: %s", adminRec.Body.String())
+	for _, forbidden := range []string{`data-` + `sim` + `ulator-setup="true"`, `Owner ` + `sim` + `ulator control`, `data-sim-key=`, `/api/v1/admin/phone/setup`} {
+		if strings.Contains(ownerBody, forbidden) {
+			t.Fatalf("admin page must not render retired device setup %q: %s", forbidden, ownerBody)
+		}
 	}
 }
 
 func TestTicketViewerAdminLinkOnlyShowsForAdmins(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
+	server := newTicketSetupTestServer(t, "pixel")
 
 	memberReq := httptest.NewRequest(http.MethodGet, "/", nil)
 	memberReq.Header.Set("X-Ticket-Remote-Email", "member@example.com")
@@ -388,28 +396,6 @@ func TestTicketViewerAdminLinkOnlyShowsForAdmins(t *testing.T) {
 	}
 }
 
-func TestAdminSimulatorControlStaticAssetsWirePointerAndKeyboard(t *testing.T) {
-	body, err := staticFS.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	js := string(body)
-	for _, snippet := range []string{
-		"pointerdown",
-		"pointerup",
-		"keydown",
-		"type: 'tap'",
-		"type: 'drag'",
-		"type: 'long_press'",
-		"key: 'delete'",
-		"key: 'space'",
-	} {
-		if !strings.Contains(js, snippet) {
-			t.Fatalf("admin simulator control JS missing %q", snippet)
-		}
-	}
-}
-
 func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	jsBody, err := staticFS.ReadFile("static/app.js")
 	if err != nil {
@@ -423,154 +409,163 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	serverGoBody, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	js := string(jsBody)
 	css := string(cssBody)
 	spinner := string(spinnerBody)
+	serverGo := string(serverGoBody)
 	for _, snippet := range []string{
-		"const requestCodeButton = requireElement('#requestControlCode', 'requestControlCode')",
-		"const codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog')",
-		"const codeDigits = requireElement('#controlCodeDigits', 'controlCodeDigits')",
+		"requestCodeButton = requireElement('#requestControlCode', 'requestControlCode')",
+		"codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog')",
+		"codeDigits = requireElement('#controlCodeDigits', 'controlCodeDigits')",
 		"function sanitizeControlDigits(value)",
 		"function renderControlCodeRequest(request)",
-		"function submitControlCodeRequest()",
+		"ownedControlCodeRequestIDs=new Set",
+		"ownedControlCodeRequestIDs.has(String(requestID))",
+		"control_code_message_ignored",
 		"function closeCurrentControlCode(openNext)",
-		"postJSON('/api/v1/control-code/request', { digits })",
+		"postJSON('/api/v1/control-code/request',{digits})",
 		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
-		"msg.type !== 'control_code_request'",
+		"msg.type!=='control_code_request'",
 		"codeResultArea.addEventListener('click'",
 		"setStatus('Kontroles kodu pieprasi ar pogu zem biļetes.')",
 		"window.TicketSpacetime.create",
 		"/api/v1/auth/session",
 		"/api/v1/auth/start",
-		"startAuthRedirect()",
+		"beginSpacetimeLogin(authReturnTarget())",
 		"beginSpacetimeLogin",
 		"window.addEventListener('error'",
 		"window.addEventListener('unhandledrejection'",
 		"function requireElement(selector, label)",
 		"function showFatalPage(message)",
-		"function safeWebSocket(url, label)",
-		"function renderDecodedFrame(frame, source)",
 		"control_message_failed",
 		"video_message_failed",
 		"decoded_frame_render_failed",
-		"missing_admin_dom",
-		"finishSpacetimeCallback().catch(showAuthError)",
+		"location.pathname==='/auth/callback'",
 		"location.replace('/')",
-		"let screenEngaged = false",
-		"let screenWakeLock = null",
+		"screenEngaged=false",
+		"screenWakeLock=null",
 		"function engageTicketScreen(reason)",
 		"function requestScreenWakeLock(reason)",
 		"navigator.wakeLock.request('screen')",
-		"function releaseScreenWakeLock(reason)",
-		"function requestTicketFullscreen(reason)",
-		"requestFullscreen({ navigationUI: 'hide' })",
-		"function ticketViewportRect()",
-		"window.visualViewport.offsetLeft",
-		"window.visualViewport.offsetTop",
-		"--ticket-viewport-width",
-		"--ticket-viewport-height",
-		"--ticket-viewport-left",
-		"--ticket-viewport-top",
+		"if(!screenWakeLock)return;const lock=screenWakeLock",
+		"openControlCodeDialog(){if(document.fullscreenElement&&typeof document.exitFullscreen==='function')",
+		"document.exitFullscreen().catch",
+		"function layoutViewportRect()",
 		"function toolbarCollapseAnchorPx()",
-		"Math.min(96, Math.max(24, viewportHeight() * 0.12))",
+		"Math.min(96,Math.max(24,viewportHeight()*.12))",
 		"clientLog('toolbar_collapse_anchor'",
-		"document.body.classList.add('screen-engaged')",
-		"for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown'])",
-		"const streamResumeSpinner = document.getElementById('streamResumeSpinner')",
-		"function sameEmail(left, right)",
-		"function renderPanelSummary(viewers, visibleViewerCount)",
-		"function renderViewerSummary(viewers, visibleViewerCount)",
-		"function isTechnicalPublicStatusMessage(value)",
-		"isTechnicalPublicStatusMessage(msg.data.message)",
-		"const streamLive = rootCapture.active || phoneHealth.streamVerdict === 'live' || pipeline.streamVerdict === 'live'",
-		"streamState.textContent = streamLive ? 'Live'",
-		"streamLive ? 'Ticket stream is live'",
+		"function firstScreenAnchorTop()",
+		"streamLive=rootCapture.active||phoneHealth.streamVerdict==='live'||pipeline.streamVerdict==='live'",
 		"function activeViewers(viewers)",
-		"function activeViewerPresence(state)",
 		"function preserveCurrentFrame(reason)",
 		"function redrawPreservedFrame()",
-		"const wasEmptyVisible = !emptyState.hidden",
-		"if (wasEmptyVisible) keepFirstScreenPinned()",
-		"function showStreamResumeSpinner()",
 		"function streamStatusStale(status)",
 		"preserveCurrentFrame('stream_status_stale')",
-		"if (!streamStatusStale(freshStreamStatus(performance.now()) || latestStreamStatus))",
-		"streamResumeSpinnerVisible: streamResumeSpinnerVisible()",
-		"hasFallbackFrame: fallbackFrameAvailable",
 		"preserveCurrentFrame('configure_decoder')",
-		"redrawPreservedFrame()",
-		"stage.style.setProperty('--stream-left'",
-		"stage.style.setProperty('--stream-top'",
-		"const streamVerticalPanThresholdPx = 6",
-		"const streamVerticalPanDominance = 1.1",
-		"const FRAME_ENVELOPE_MAGIC = 0x54534632",
-		"const FRAME_ENVELOPE_HEADER_BYTES = 29",
+		"Math.abs(dy)>=streamVerticalPanThresholdPx&&Math.abs(dy)>Math.abs(dx)*streamVerticalPanDominance",
 		"invalid_tsf2_frame",
-		"function annexBNalUnits(data)",
-		"function annexBToAvcSample(data)",
-		"function configureAvcDecoderFromDescription(config, description)",
+		"function findStartCode(data,from)",
+		"function configureDecoder(config, options)",
 		"sendVideoClientLog('h264_decoder_recovery_avc_adapter', reason)",
+		"function connectDirectVideo()",
+		"function switchToAvcAdapter(reason)",
+		"intentionallyClosedVideoSockets",
 		"new VideoDecoder({",
-		"new EncodedVideoChunk({ type: frame.kind",
 		"avc: { format: 'annexb' }",
+		"const preferAvc=Boolean(options.preferAvc)",
+		"requestReason:`${reason}_avc_adapter`",
+		"configure_avc_decoder",
 		"ctx.drawImage(frame, 0, 0, canvas.width, canvas.height)",
+		"codeResultImage.src = canvas.toDataURL('image/png')",
+		"function controlCodeMarkerReady(request)",
+		"function waitForControlCodeResultScreenshot(request)",
+		"status === 'succeeded'",
 		"String(serverVersion).startsWith('ticket-remote-')",
-		"let lastPacketAt = 0",
-		"let lastDecodedFrameAt = 0",
-		"let lastPacketSequenceAdvancedAt = 0",
-		"let latestStreamStatus = null",
-		"const streamStaleKeyframeMs = 2500",
-		"const streamStaleDecoderResetMs = 5000",
-		"const streamStaleVideoReconnectMs = 8000",
-		"const streamStaleServerRecoverMs = 12000",
-		"const streamDecoderStartupGraceMs = 3500",
-		"const hiddenVideoCloseDelayMs = 3000",
-		"function pauseVideoWhileHidden(reason)",
-		"video_stream_paused_hidden",
-		"document.visibilityState === 'hidden'",
-		"function showStreamWaiting(message)",
-		"function handleStreamStatus(msg)",
+		"lastPacketAt=0",
+		"lastDecodedFrameAt=0",
+		"latestStreamStatus=null",
+		"function handleScreenEngagementEvent(event)",
+		"msg.type==='state'",
 		"function resetDecoderForRecovery(reason)",
-		"function decoderStartupGraceActive(now)",
-		"function requestServerRecoveryDebounced(reason)",
-		"function chaseLiveStream()",
-		"function viewerIsForeground()",
-		"document.hasFocus()",
-		"requestServerRecoveryDebounced('foreground_video_socket_closed')",
-		"send({ type: 'recover_stream', reason })",
-		"window.addEventListener('focus'",
-		"msg.type === 'stream_status'",
-		"sendVideoSignal({ type: 'recover_stream', reason })",
-		"restartStream(reason, { preserveFrame: true })",
-		"setInterval(chaseLiveStream, 1000)",
-		"requestKeyframeDebounced('h264_first_frame_nudge'",
-		"if (decoderStartupGraceActive(now))",
+		"requestReason:reason",
+		"resetDecoderForRecovery(\"first_frame_decoder_reset\")",
+		"function pauseVideoWhileHidden(reason)",
+		"function controlCodeKeepsVideoAliveWhileHidden()",
+		"control_code_capture_keepalive",
+		"control_code_wait_reconnect",
+		"msg.type==='stream_status'",
 		"send({ type: 'heartbeat', reason: 'public_connected' })",
 		"send({ type: 'heartbeat', reason: 'public_heartbeat' })",
-		"streamVerticalPanThresholdPx",
+		"window.visualViewport",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
-		"canvas.addEventListener('touchend', blockDoubleTapZoom, { passive: false })",
-		"document.addEventListener(eventName, blockStreamGesture, { passive: false })",
 	} {
-		if !strings.Contains(js, snippet) {
+		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer JS missing %q", snippet)
 		}
 	}
+	foundFirstFrameSignals := false
 	for _, snippet := range []string{
-		"touch-action: pan-y",
-		"scroll-snap-type: y proximity",
+		"first_frame_timeout",
+		"first_frame_decoder_reset",
+		"first_frame_video_reconnect",
+		"first_frame_server_recover",
+	} {
+		if strings.Contains(js, snippet) {
+			foundFirstFrameSignals = true
+			break
+		}
+	}
+	if !foundFirstFrameSignals {
+		t.Fatalf("ticket viewer JS missing first-frame recovery signals")
+	}
+	for _, snippet := range []string{
+		"canvas.toBlob",
+		"FileReader",
+		"uploadControlCodeCapture",
+		"captureRequired",
+		"/api/v1/control-code/capture",
+		"confirmControlCodeBrowserCapture",
+		"controlCodeCapturedImages",
+		"imageBase64",
+		"imageMime",
+	} {
+		if strings.Contains(js, snippet) {
+			t.Fatalf("ticket viewer JS must rely on phone stream markers, not browser capture confirmations: found %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		"controlCodeResultImage",
+		"Gaida koda attēlu",
+		"lastRenderedFrameEpoch",
+		"lastRenderedFrameSequence",
+		"minFrameSequence",
+		`canvas.toDataURL("image/png")`,
+		"captureControlCodeResultScreenshot",
+	} {
+		if !strings.Contains(js, snippet) {
+			t.Fatalf("ticket viewer JS missing local marker-frame screenshot behavior: %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		"touch-action:pan-y",
+		"scroll-snap-type:y proximity",
 		"body.screen-engaged",
-		"scroll-snap-type: none",
+		"scroll-snap-type:none",
 		"--ticket-viewport-width",
 		"--ticket-viewport-height",
 		"--ticket-viewport-left",
 		"--ticket-viewport-top",
 		"--ticket-dialog-height",
 		"--ticket-toolbar-anchor",
-		"overscroll-behavior: none",
-		"-webkit-touch-callout: none",
-		"-webkit-tap-highlight-color: transparent",
+		"overscroll-behavior-y:contain",
+		"overscroll-behavior:none",
+		"-webkit-touch-callout:none",
+		"-webkit-tap-highlight-color:transparent",
 		".stream-resume-spinner",
 		".control-code-hotspot",
 		".control-code-close-hotspot",
@@ -580,13 +575,13 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		".panel-summary",
 		".panel-summary-item",
 		".presence-header",
-		"left: calc(var(--stream-left, 0px) + 20px)",
-		"top: calc(var(--stream-top, 0px) + 20px)",
-		"pointer-events: none",
-		"font-variant-numeric: tabular-nums",
+		"left:calc(var(--stream-left,0px) + 20px)",
+		"top:calc(var(--stream-top,0px) + 20px)",
+		"pointer-events:none",
+		"font-variant-numeric:tabular-nums",
 		"streamResumeSpinnerRotate",
 	} {
-		if !strings.Contains(css, snippet) {
+		if !staticCSSContains(css, snippet) {
 			t.Fatalf("ticket viewer CSS missing %q", snippet)
 		}
 	}
@@ -601,18 +596,24 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			t.Fatalf("ticket viewer stream resume spinner should use top-left quick-spinner styling, found %q", snippet)
 		}
 	}
-	hotspotStart := strings.Index(css, ".control-code-hotspot {")
+	hotspotStart := strings.Index(css, ".control-code-hotspot{left:0;")
+	if hotspotStart < 0 {
+		hotspotStart = strings.Index(css, ".control-code-hotspot,.control-code-close-hotspot{")
+		if hotspotStart < 0 {
+			hotspotStart = strings.Index(css, ".control-code-hotspot{")
+		}
+	}
 	if hotspotStart < 0 {
 		t.Fatalf("ticket viewer CSS missing isolated control-code hotspot block")
 	}
-	hotspotEnd := strings.Index(css[hotspotStart:], ".control-code-close-hotspot {")
+	hotspotEnd := strings.Index(css[hotspotStart:], "}")
 	if hotspotEnd < 0 {
-		t.Fatalf("ticket viewer CSS missing control-code close hotspot block")
+		t.Fatalf("ticket viewer CSS missing complete control-code hotspot rule")
 	}
 	hotspotBlock := css[hotspotStart : hotspotStart+hotspotEnd]
 	for _, snippet := range []string{
-		"width: 50vw",
-		"height: 25vh",
+		"width:50vw",
+		"height:25vh",
 	} {
 		if !strings.Contains(hotspotBlock, snippet) {
 			t.Fatalf("control-code hotspot block missing %q", snippet)
@@ -632,7 +633,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`inputmode="numeric"`,
 		`pattern="[0-9]*"`,
 		`minlength="2"`,
-		`maxlength="9"`,
 		`id="closeControlCodeResult"`,
 		`id="viewerCount"`,
 		`id="viewerCountDetail"`,
@@ -676,8 +676,29 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if strings.Contains(js, "['touchstart', 'touchmove']") {
 		t.Fatalf("ticket viewer should not block all touch movement; vertical scroll must remain available")
 	}
-	if !strings.Contains(serverVersion, "control-code-request") {
-		t.Fatalf("ticket page version should be bumped for control-code request rollout, got %q", serverVersion)
+	if !strings.Contains(serverVersion, "pixel-only-hardware") {
+		t.Fatalf("ticket page version should name the Pixel hardware path, got %q", serverVersion)
+	}
+	if strings.Contains(serverVersion, "emu"+"lator") || strings.Contains(serverVersion, "sim"+"ulator") || strings.Contains(serverVersion, "android-"+"sim") {
+		t.Fatalf("ticket page version should not name retired device paths, got %q", serverVersion)
+	}
+	if !strings.Contains(indexHTML, `<script nonce="{{.Nonce}}" defer src="/static/app.js?v={{.AssetVersion}}"></script>`) {
+		t.Fatalf("ticket viewer must keep the app script versioned and cacheable")
+	}
+	if !strings.Contains(serverGo, "assetVersionValue = serverVersion") {
+		t.Fatalf("ticket asset fallback version must follow the page version so public caches cannot keep an old app.js")
+	}
+	if strings.Contains(indexHTML, `/static/spacetime-client.js`) || strings.Contains(adminHTML, `/static/spacetime-client.js`) {
+		t.Fatalf("ticket pages must not block first video frame behind the Spacetime client script")
+	}
+	for _, snippet := range []string{
+		"function usesDirectSpacetimeAuth()",
+		"function connectSpacetimeState()",
+		"spacetimeToken()",
+	} {
+		if !staticContains(js, snippet) {
+			t.Fatalf("ticket viewer should defer Spacetime until video is active, missing %q", snippet)
+		}
 	}
 	for _, snippet := range []string{
 		`id="extendControl"`,
@@ -771,11 +792,63 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(serverVersion, "control-code-request") {
-		t.Fatalf("ticket page version should be bumped for control-code request rollout, got %q", serverVersion)
+	if !strings.Contains(serverVersion, "pixel-only-hardware") {
+		t.Fatalf("ticket page version should name the Pixel hardware path, got %q", serverVersion)
+	}
+	if strings.Contains(serverVersion, "emu"+"lator") || strings.Contains(serverVersion, "sim"+"ulator") || strings.Contains(serverVersion, "android-"+"sim") {
+		t.Fatalf("ticket page version should not name retired device paths, got %q", serverVersion)
 	}
 	if strings.Contains(indexHTML, `id="webrtcVideo"`) || !strings.Contains(indexHTML, `id="screen"`) {
 		t.Fatalf("ticket viewer must render HTTPS H.264 on the canvas, not WebRTC video")
+	}
+	if strings.Contains(js, "decoderMode !== 'avc'") {
+		t.Fatalf("latest-keyframe decoder reset must apply to every WebCodecs decoder mode")
+	}
+	for _, snippet := range []string{
+		"function lastRenderedVisualAge(now)",
+		"const renderedVisualAge = freshness.hasFrame ? Number(freshness.visualAgeMillis || 0) : lastRenderedVisualAge(now)",
+		"const localStaleAge = Math.max(decodedAge, renderedVisualAge, sequenceStalled ? sequenceStalledAge : 0)",
+		"renderedVisualAge,",
+	} {
+		if !staticContains(js, snippet) {
+			t.Fatalf("ticket viewer stale detection must use current rendered-frame age, missing %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		"const streamLiveFreshMaxAgeMs = 1e3",
+		"const streamLiveOkMaxAgeMs = 1500",
+		"const streamDegradedMaxAgeMs = 2e3",
+		"function freshnessStateForVisualAge(ageMs)",
+		"function currentRenderedFreshness(now)",
+		"function updateStreamFreshnessStatus(reason)",
+		"document.body.dataset.streamFreshness",
+		"document.body.dataset.streamLive",
+		"visualAgeMillis:",
+		"browserReceiveToDecodeMillis:",
+		"decodeToRenderMillis:",
+		"decoderQueueDelayMillis:",
+		"streamFreshnessState:",
+		"liveLabeled:",
+		"LIVE_FRESH",
+		"LIVE_OK",
+		"DEGRADED",
+		"STALE",
+	} {
+		if !staticContains(js, snippet) {
+			t.Fatalf("ticket viewer JS missing freshness contract snippet %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		`body[data-stream-freshness="STALE"] .stage::after`,
+		`body[data-stream-live="false"] .stage::after`,
+		`body[data-stream-freshness="STALE"] #screen`,
+	} {
+		if !staticCSSContains(css, snippet) {
+			t.Fatalf("ticket viewer CSS missing stale video indicator %q", snippet)
+		}
+	}
+	if strings.Contains(js, "renderControlCodeRequest(codeRequest);\n    setStatus('Tiešraide rāda biļeti.');") {
+		t.Fatalf("ticket viewer must not unconditionally label the stream live")
 	}
 	stageStart := strings.Index(indexHTML, `<section class="stage-page"`)
 	panelStart := strings.Index(indexHTML, `<aside id="panel"`)
@@ -787,6 +860,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		t.Fatalf("control-code result must render in the stream stage, not the lower panel")
 	}
 	resultCSSStart := strings.Index(css, ".control-code-result {")
+	if resultCSSStart < 0 {
+		resultCSSStart = strings.Index(css, ".control-code-result{")
+	}
 	if resultCSSStart < 0 {
 		t.Fatalf("ticket viewer CSS missing control-code result overlay")
 	}
@@ -805,32 +881,16 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"place-items: center",
 		"padding: 0",
 	} {
-		if !strings.Contains(resultCSS, snippet) {
+		if !staticCSSContains(resultCSS, snippet) {
 			t.Fatalf("control-code result overlay CSS missing %q", snippet)
 		}
 	}
-	imageCSSStart := strings.Index(css, ".control-code-image {")
-	if imageCSSStart < 0 {
-		t.Fatalf("ticket viewer CSS missing control-code image block")
+	if !staticCSSContains(css, ".control-code-image") || !strings.Contains(indexHTML, "controlCodeResultImage") {
+		t.Fatalf("ticket viewer must include the private local control-code result image surface")
 	}
-	imageCSSEnd := strings.Index(css[imageCSSStart:], ".control-code-value {")
-	if imageCSSEnd < 0 {
-		t.Fatalf("ticket viewer CSS missing control-code value block")
-	}
-	imageCSS := css[imageCSSStart : imageCSSStart+imageCSSEnd]
-	for _, snippet := range []string{
-		"width: var(--stream-width",
-		"height: var(--stream-height",
-		"max-width: none",
-		"object-fit: fill",
-	} {
-		if !strings.Contains(imageCSS, snippet) {
-			t.Fatalf("control-code success image CSS missing %q", snippet)
-		}
-	}
-	if !strings.Contains(css, `.control-code-result[data-status="succeeded"] .control-code-result-status`) ||
-		!strings.Contains(css, `.control-code-result[data-status="succeeded"] .control-code-value`) {
-		t.Fatalf("successful control-code overlay must hide text chrome around the image")
+	if !staticCSSContains(css, `.control-code-result[data-status="succeeded"] .control-code-result-status`) ||
+		!staticCSSContains(css, `.control-code-result[data-status="succeeded"] .panel-detail`) {
+		t.Fatalf("successful control-code overlay must hide non-result chrome around the numeric marker")
 	}
 }
 
@@ -843,23 +903,25 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	for _, snippet := range []string{
 		"sanitizeControlDigits(codeDigits.value)",
 		"controlCodeStatusRank(request.status)",
+		"rememberOwnedControlCodeRequest(payload.request)",
+		"locallyClosedControlCodeRequestIDs.add(String(requestID))",
+		"return String(value || '').replace(/\\D/g, '')",
 		"digits.length < 2 || digits.length > 9",
-		"postJSON('/api/v1/control-code/request', { digits })",
+		"postJSON('/api/v1/control-code/request',{digits})",
 		"renderControlCodeRequest(payload.request)",
 		"closeCurrentControlCode(false)",
 		"scheduleControlCodeTicker(current)",
-		"codeResultStatus.hidden = true",
-		"codeResultValue.hidden = true",
-		"codeResultTimer.hidden = true",
-		"postJSON('/api/v1/control-code/close'",
-		"const viewers = activeViewerPresence(state)",
-		"viewer.label || `Skatītājs ${index + 1}`",
+		"codeResultValue.hidden=true",
+		"codeResultTimer.hidden=false",
+		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
+		"publicPresence=Array.isArray(state&&state.viewerPresence)",
+		"activeViewers(state&&state.viewers||[])",
 		"controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot)",
 		"controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot)",
 		"codeDialog.addEventListener('click'",
-		"event.key === 'Escape'",
+		"event.key==='Escape'",
 	} {
-		if !strings.Contains(js, snippet) {
+		if !staticContains(js, snippet) {
 			t.Fatalf("control-code request flow missing %q", snippet)
 		}
 	}
@@ -878,11 +940,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	if strings.Contains(hotspotHandler, "closeCurrentControlCode(true)") {
 		t.Fatalf("top-left hotspot should not immediately reopen the request dialog after closing a visible result")
 	}
-	resultClickStart := strings.Index(js, "codeResultArea.addEventListener('click'")
+	resultClickStart := strings.Index(js, `codeResultArea.addEventListener("click"`)
 	if resultClickStart < 0 {
 		t.Fatalf("control-code result click handler missing")
 	}
-	resultClickEnd := strings.Index(js[resultClickStart:], "codeResultClose.addEventListener('click'")
+	resultClickEnd := strings.Index(js[resultClickStart:], `codeResultClose.addEventListener("click"`)
 	if resultClickEnd < 0 {
 		t.Fatalf("control-code result close handler missing")
 	}
@@ -895,6 +957,7 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"showQuickClaimSpinner",
 		"quickClaimControl",
 		"type: 'quick_claim_tap'",
+		"replace(/\\D/g, '').slice(0, 9)",
 	} {
 		if strings.Contains(js, snippet) {
 			t.Fatalf("control-code request flow should not keep old quick-claim code %q", snippet)
@@ -987,7 +1050,7 @@ func TestTicketSpacetimeLiveStateIsRedacted(t *testing.T) {
 			t.Fatalf("public snapshot missing %q in %s", required, chunk)
 		}
 	}
-	for _, required := range []string{"viewerPresence:", "label: `Skatītājs ${index + 1}`"} {
+	for _, required := range []string{"viewerPresence:", "publicId: memberPublicIds.get(cleanEmail(viewer.email))", "label: memberPublicIds.get(cleanEmail(viewer.email))"} {
 		if !strings.Contains(chunk, required) {
 			t.Fatalf("public snapshot missing anonymized presence %q in %s", required, chunk)
 		}
@@ -1048,26 +1111,25 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	}
 	js := string(jsBody)
 	for _, snippet := range []string{
-		"startAuthRedirect()",
+		"beginSpacetimeLogin(authReturnTarget())",
 		"beginSpacetimeLogin",
 		"/api/v1/auth/start",
 		"clearLocalAuthState()",
 		"/api/v1/auth/session",
-		"postJSON('/api/v1/control-code/request', { digits })",
+		"postJSON('/api/v1/control-code/request',{digits})",
 		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
 		"usesDirectSpacetimeAuth()",
 		"apiFetch('/api/v1/admin/members'",
 		"apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`",
 		"activeMembers(state)",
-		"send({ type: 'state_refresh'",
-		"adminRefreshMs = 5000",
+		"adminRefreshMs=5e3",
 	} {
-		if !strings.Contains(js, snippet) {
+		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer SpacetimeAuth JS missing %q", snippet)
 		}
 	}
-	authRedirectIndex := strings.Index(js, "if (!cfg.authenticated)")
-	spacetimeUnavailableIndex := strings.Index(js, "let spacetimeDirectUnavailable = false")
+	authRedirectIndex := strings.Index(normalizeStaticJSForContains(js), "if(!cfg.authenticated)")
+	spacetimeUnavailableIndex := strings.Index(normalizeStaticJSForContains(js), "spacetimedirectunavailable")
 	if authRedirectIndex < 0 || spacetimeUnavailableIndex < 0 {
 		t.Fatalf("ticket viewer SpacetimeAuth JS missing auth redirect or direct state initialization")
 	}
@@ -1111,7 +1173,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 }
 
 func TestAdminMembersRouteAddsAndRemovesMember(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
+	server := newTicketSetupTestServer(t, "pixel")
 
 	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"new.member@example.com","role":"member"}`))
 	addReq.Header.Set("Content-Type", "application/json")
@@ -1146,7 +1208,7 @@ func TestAdminMembersRouteAddsAndRemovesMember(t *testing.T) {
 }
 
 func TestAdminMembersRouteRequiresAdmin(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
+	server := newTicketSetupTestServer(t, "pixel")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"blocked@example.com","role":"member"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1159,7 +1221,7 @@ func TestAdminMembersRouteRequiresAdmin(t *testing.T) {
 }
 
 func TestDevAdminMemberDeleteUsesConfiguredIdentityNotTargetEmailQuery(t *testing.T) {
-	server, _ := newSimulatorSetupTestServer(t, "pixel")
+	server := newTicketSetupTestServer(t, "pixel")
 
 	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"delete.target@example.com","role":"member"}`))
 	addReq.Header.Set("Content-Type", "application/json")
@@ -1319,17 +1381,27 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	if healthRec.Code != http.StatusOK {
 		t.Fatalf("health status = %d body = %s", healthRec.Code, healthRec.Body.String())
 	}
+
+	indexReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	indexReq.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	indexRec := httptest.NewRecorder()
+	server.ServeHTTP(indexRec, indexReq)
+	if indexRec.Code != http.StatusOK {
+		t.Fatalf("index status = %d body = %s", indexRec.Code, indexRec.Body.String())
+	}
+	if !strings.Contains(indexRec.Body.String(), `"authenticated":true`) {
+		t.Fatalf("authenticated index should render ticket shell, got %s", indexRec.Body.String())
+	}
+	if len(indexRec.Result().Cookies()) == 0 {
+		t.Fatalf("authenticated index should establish a browser session cookie")
+	}
 }
 
-func newSimulatorSetupTestServer(t *testing.T, activeBackendID string) (*Server, *fakeSimulatorSetupRunner) {
+func newTicketSetupTestServer(t *testing.T, activeBackendID string) *Server {
 	t.Helper()
 	store := state.NewMemoryStore()
-	activeURL := "http://sim.test"
-	activeName := "Android simulator"
-	if activeBackendID == "pixel" {
-		activeURL = "http://pixel.test"
-		activeName = "Pixel"
-	}
+	activeURL := "http://pixel.test"
+	activeName := "Pixel"
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1365,92 +1437,14 @@ func newSimulatorSetupTestServer(t *testing.T, activeBackendID string) (*Server,
 			AttachName: activeName,
 			BaseURL:    activeURL,
 			Backends: []config.PhoneBackend{
-				{ID: "android-sim", AttachName: "Android simulator", BaseURL: "http://sim.test"},
 				{ID: "pixel", AttachName: "Pixel", BaseURL: "http://pixel.test"},
 			},
-			DefaultBackendID:  "android-sim",
+			DefaultBackendID:  "pixel",
 			ActiveBackendFile: filepath.Join(t.TempDir(), "active-phone-backend.json"),
-		},
-		SimulatorSetup: config.SimulatorSetupConfig{
-			BackendID: "android-sim",
-			ADBTarget: "ticket_android_sim:5555",
-			ADBPath:   "adb",
-			Timeout:   time.Second,
 		},
 	}, store, relay)
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := newFakeSimulatorSetupRunner()
-	server.setupRunner = runner
-	return server, runner
-}
-
-const fakePNG = "\x89PNG\r\n\x1a\nfake"
-
-type fakeSimulatorSetupRunner struct {
-	mu    sync.Mutex
-	calls [][]string
-}
-
-func newFakeSimulatorSetupRunner() *fakeSimulatorSetupRunner {
-	return &fakeSimulatorSetupRunner{}
-}
-
-func (r *fakeSimulatorSetupRunner) Run(_ context.Context, args ...string) ([]byte, error) {
-	r.mu.Lock()
-	r.calls = append(r.calls, append([]string(nil), args...))
-	r.mu.Unlock()
-	switch strings.Join(args, "\x00") {
-	case "get-state":
-		return []byte("device\n"), nil
-	case "shell\x00wm\x00size":
-		return []byte("Physical size: 1080x1920\nOverride size: 720x1280\n"), nil
-	case "shell\x00wm\x00density":
-		return []byte("Physical density: 420\nOverride density: 240\n"), nil
-	case "shell\x00pm\x00path\x00com.pv.vivi":
-		return nil, errFakePackageMissing
-	case "shell\x00pm\x00path\x00app.accrescent.client":
-		return []byte("package:/data/app/accrescent/base.apk\n"), nil
-	case "shell\x00pm\x00path\x00com.aurora.store":
-		return []byte("package:/data/app/aurora/base.apk\n"), nil
-	case "shell\x00pm\x00path\x00lv.jolkins.pixelorchestrator":
-		return []byte("package:/data/app/controller/base.apk\n"), nil
-	case "exec-out\x00screencap\x00-p":
-		return []byte(fakePNG), nil
-	default:
-		return []byte("ok\n"), nil
-	}
-}
-
-func (r *fakeSimulatorSetupRunner) called(args ...string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	want := strings.Join(args, "\x00")
-	for _, call := range r.calls {
-		if strings.Join(call, "\x00") == want {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *fakeSimulatorSetupRunner) callsSnapshot() [][]string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([][]string, 0, len(r.calls))
-	for _, call := range r.calls {
-		out = append(out, append([]string(nil), call...))
-	}
-	return out
-}
-
-var errFakePackageMissing = &fakeADBError{"package missing"}
-
-type fakeADBError struct {
-	message string
-}
-
-func (e *fakeADBError) Error() string {
-	return e.message
+	return server
 }

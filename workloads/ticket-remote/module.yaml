@@ -7,8 +7,8 @@ runtime:
   run_id_env: ARBUZAS_RELEASE_ID
 components:
   - id: ticket_remote
-    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d ticket_phone_bridge ticket_remote ticket_remote_tunnel
-    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop ticket_remote_tunnel ticket_remote ticket_phone_bridge
+    start: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+    stop: docker compose --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop ticket_remote_tunnel ticket_remote phone_broker ticket_phone_bridge
     health: curl -fsS http://127.0.0.1:9338/api/v1/livez >/dev/null
     redeploy:
       mode: compose_release

@@ -2,6 +2,8 @@
 
 Web-first Riga Satiksme control map and incident feed workload for the Arbuzas production stack.
 
+For agent-specific context, tests, deploy checks, and live-map pitfalls, start with [AGENTS.md](./AGENTS.md).
+
 ## Local Development
 
 ```bash

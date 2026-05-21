@@ -1510,6 +1510,30 @@ func (s *SQLiteStore) ListIncidentComments(ctx context.Context, incidentID strin
 	return out, rows.Err()
 }
 
+func (s *SQLiteStore) CountIncidentCommentsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_comments
+		WHERE user_id = ? AND created_at >= ?
+	`, userID, since.UTC().Format(time.RFC3339)).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *SQLiteStore) CountIncidentCommentsByIncidentSince(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_comments
+		WHERE incident_id = ? AND created_at >= ?
+	`, strings.TrimSpace(incidentID), since.UTC().Format(time.RFC3339)).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *SQLiteStore) CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (CleanupResult, error) {
 	if loc == nil {
 		loc = time.UTC

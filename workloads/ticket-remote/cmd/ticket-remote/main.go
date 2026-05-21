@@ -44,15 +44,7 @@ func main() {
 		log.Fatalf("bootstrap state: %v", err)
 	}
 
-	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         cfg.Phone.BackendID,
-		AttachName:        cfg.Phone.AttachName,
-		BaseURL:           cfg.Phone.BaseURL,
-		RequestTimeout:    cfg.Phone.RequestTimeout,
-		ReconnectMinDelay: cfg.Phone.ReconnectMinDelay,
-		ReconnectMaxDelay: cfg.Phone.ReconnectMaxDelay,
-		NoViewerStopDelay: cfg.Phone.NoViewerStopDelay,
-	})
+	relay := phone.NewRelay(cfg.Phone.RelayConfig())
 	defer relay.Close()
 
 	server, err := web.NewServer(cfg, store, relay)

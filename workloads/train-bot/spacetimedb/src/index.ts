@@ -158,7 +158,7 @@ const activityVoteDoc = t.object('TrainbotActivityVoteDoc', {
 
 const timelineBucketDoc = t.object('TrainbotTimelineBucketDoc', {
   at: t.string(),
-  signal: t.string(),
+  eventLabel: t.string(),
   count: t.u32(),
 });
 
@@ -186,7 +186,7 @@ const feedEventDoc = t.object('TrainbotFeedEventDoc', {
 });
 
 const trainbot_service_day = table(
-  { name: named('service_day'), public: true },
+  { name: named('service_day') },
   {
     serviceDate: t.string().primaryKey(),
     sourceVersion: t.string(),
@@ -196,7 +196,7 @@ const trainbot_service_day = table(
 );
 
 const trainbot_trip = table(
-  { name: named('trip'), public: true },
+  { name: named('trip') },
   {
     id: t.string().primaryKey(),
     serviceDate: t.string().index(),
@@ -373,7 +373,7 @@ const trainbot_trip_timeline_bucket = table(
     trainId: t.string().index(),
     serviceDate: t.string().index(),
     at: t.string(),
-    signal: t.string(),
+    eventLabel: t.string(),
     count: t.u32(),
   }
 );
@@ -435,7 +435,6 @@ const trainbot_incident_event = table(
     detail: t.string(),
     nickname: t.string(),
     createdAt: t.string(),
-    signal: t.string(),
   }
 );
 
@@ -527,7 +526,6 @@ const trainbot_trip_public = table(
     toStationName: t.string(),
     departureAt: t.string(),
     arrivalAt: t.string(),
-    sourceVersion: t.string(),
     state: t.string(),
     confidence: t.string(),
     uniqueReporters: t.u32(),
@@ -890,6 +888,22 @@ function publicOpaqueId(prefix: string, ...parts: unknown[]): string {
     hash = Math.imul(hash, 16777619) >>> 0;
   }
   return `${prefix}:${hash.toString(16).padStart(8, '0')}`;
+}
+
+function publicStationSightingID(event: any): string {
+  const current = asString(event?.id).trim();
+  if (current.startsWith('sighting:')) {
+    return current;
+  }
+  return publicOpaqueId(
+    'sighting',
+    current,
+    asString(event?.incidentId).trim(),
+    asString(event?.stationId).trim(),
+    asString(event?.destinationStationId).trim(),
+    asString(event?.matchedTrainInstanceId).trim(),
+    asString(event?.createdAt).trim()
+  );
 }
 
 function requireAuthenticatedSession(tx: any) {
@@ -2059,6 +2073,29 @@ function incidentLocationPayload(activity: any): any | undefined {
 	};
 }
 
+function publicIncidentLocationPayload(activity: any): any | undefined {
+  const location = incidentLocationPayload(activity);
+  if (!location || asString(activity?.scopeType).trim() !== 'area') {
+    return location;
+  }
+  const latitude = typeof location.latitude === 'number' ? Math.round(location.latitude * 1000) / 1000 : undefined;
+  const longitude = typeof location.longitude === 'number' ? Math.round(location.longitude * 1000) / 1000 : undefined;
+  return {
+    kind: 'area',
+    latitude,
+    longitude,
+    radiusMeters: Math.max(250, Number(location.radiusMeters) || 0),
+    description: '',
+  };
+}
+
+function publicIncidentEventDetail(activity: any, event: any): string {
+  if (asString(activity?.scopeType).trim() === 'area' && asString(event?.kind).trim() === 'location_report') {
+    return '';
+  }
+  return asString(event?.detail).trim();
+}
+
 function incidentMapTargetPayload(activity: any): any | undefined {
   const scopeType = asString(activity?.scopeType).trim();
   const subjectId = asString(activity?.subjectId).trim();
@@ -2195,19 +2232,100 @@ function activeRidersForTrain(tx: any, trainId: string): number {
   return lookupActiveCheckinUserIds(tx, trainId, nowDate(tx)).length;
 }
 
-function buildTrainCard(tx: any, stableId: string, train: any) {
+function publicSmallGroupBucket(raw: number): number {
+  const count = Number(raw) || 0;
+  if (count >= 10) {
+    return 10;
+  }
+  if (count >= 5) {
+    return 5;
+  }
+  if (count >= 2) {
+    return 2;
+  }
+  return 0;
+}
+
+function publicRiderCount(raw: number): number {
+  return publicSmallGroupBucket(raw);
+}
+
+function publicReporterCount(raw: number): number {
+  return publicSmallGroupBucket(raw);
+}
+
+function publicTrainStatus(status: any): any {
+  const item = status || {};
   return {
-    train: {
-      id: train.id,
-      serviceDate: train.serviceDate,
-      fromStation: train.fromStationName,
-      toStation: train.toStationName,
-      departureAt: train.departureAt,
-      arrivalAt: train.arrivalAt,
-      sourceVersion: train.sourceVersion,
-    },
-    status: buildTrainState(tx, train.id),
-    riders: activeRidersForTrain(tx, train.id),
+    ...item,
+    uniqueReporters: publicReporterCount(Number(item.uniqueReporters) || 0),
+  };
+}
+
+function publicTimelineEventLabel(bucket: any): string {
+  const explicit = asString(bucket?.eventLabel).trim();
+  if (explicit) {
+    return explicit;
+  }
+  return trainSignalIncidentLabel(asString(bucket?.signal).trim());
+}
+
+function publicTimelineBucket(bucket: any): any {
+  return {
+    at: asString(bucket?.at).trim(),
+    eventLabel: publicTimelineEventLabel(bucket),
+    count: Number(bucket?.count) || 0,
+  };
+}
+
+function publicTimelinePayload(bucket: any): any {
+  const projected = publicTimelineBucket(bucket);
+  return {
+    at: projected.at,
+    eventLabel: projected.eventLabel,
+    count: Number(projected.count) || 0,
+  };
+}
+
+function publicTripRow(row: any): any {
+  const item = row || {};
+  return {
+    id: asString(item.id).trim(),
+    serviceDate: asString(item.serviceDate).trim(),
+    fromStationId: asString(item.fromStationId).trim(),
+    fromStationName: asString(item.fromStationName).trim(),
+    toStationId: asString(item.toStationId).trim(),
+    toStationName: asString(item.toStationName).trim(),
+    departureAt: asString(item.departureAt).trim(),
+    arrivalAt: asString(item.arrivalAt).trim(),
+    state: asString(item.state).trim(),
+    confidence: asString(item.confidence).trim(),
+    uniqueReporters: publicReporterCount(Number(item.uniqueReporters) || 0),
+    riders: publicRiderCount(Number(item.riders) || 0),
+    lastReportAt: asString(item.lastReportAt).trim(),
+    updatedAt: asString(item.updatedAt).trim(),
+    recentTimeline: Array.isArray(item.recentTimeline) ? item.recentTimeline.map(publicTimelineBucket) : [],
+  };
+}
+
+function buildTrainCard(tx: any, stableId: string, train: any) {
+  const riders = activeRidersForTrain(tx, train.id);
+  const status = buildTrainState(tx, train.id);
+  const trainPayload: any = {
+    id: train.id,
+    serviceDate: train.serviceDate,
+    fromStation: train.fromStationName,
+    toStation: train.toStationName,
+    departureAt: train.departureAt,
+    arrivalAt: train.arrivalAt,
+  };
+  if (stableId) {
+    trainPayload.sourceVersion = train.sourceVersion;
+  }
+  return {
+    train: trainPayload,
+    status: stableId ? status : publicTrainStatus(status),
+    riders: stableId ? riders : publicRiderCount(riders),
   };
 }
 
@@ -2225,7 +2343,7 @@ function stationSightingsSince(tx: any, sinceMs: number, limit: number): any[] {
       const createdMs = parseISO(event.createdAt)?.getTime() || 0;
       if (createdMs >= sinceMs) {
         items.push({
-          id: event.id,
+          id: publicStationSightingID(event),
           stationId: event.stationId,
           stationName: event.stationName,
           destinationStationId: event.destinationStationId,
@@ -2290,11 +2408,10 @@ function buildPublicTrainView(tx: any, trainId: string) {
       toStation: train.toStationName,
       departureAt: train.departureAt,
       arrivalAt: train.arrivalAt,
-      sourceVersion: train.sourceVersion,
     },
-    status: buildTrainState(tx, trainId),
-    riders: activeRidersForTrain(tx, trainId),
-    timeline: recentTimeline(tx, trainId, 5),
+    status: publicTrainStatus(buildTrainState(tx, trainId)),
+    riders: publicRiderCount(activeRidersForTrain(tx, trainId)),
+    timeline: recentTimeline(tx, trainId, 5).map(publicTimelinePayload),
     stationSightings: recentStationSightingsByTrain(tx, trainId, 30, 5),
   };
 }
@@ -2477,17 +2594,20 @@ function trainStopPayload(tx: any, stableId: string, trainId: string) {
   if (!train) {
     throw new SenderError('not found');
   }
+  const trainPayload: any = {
+    id: train.id,
+    serviceDate: train.serviceDate,
+    fromStation: train.fromStationName,
+    toStation: train.toStationName,
+    departureAt: train.departureAt,
+    arrivalAt: train.arrivalAt,
+  };
+  if (stableId) {
+    trainPayload.sourceVersion = train.sourceVersion;
+  }
   return {
     trainCard: buildTrainCard(tx, stableId, train),
-    train: {
-      id: train.id,
-      serviceDate: train.serviceDate,
-      fromStation: train.fromStationName,
-      toStation: train.toStationName,
-      departureAt: train.departureAt,
-      arrivalAt: train.arrivalAt,
-      sourceVersion: train.sourceVersion,
-    },
+    train: trainPayload,
     stops: trainStopsSorted(tx, trainId),
     stationSightings: recentStationSightingsByTrain(tx, trainId, 30, 10),
   };
@@ -2513,18 +2633,13 @@ function publicDashboardPayload(tx: any, limit: number) {
         toStationName: train.toStationName,
         departureAt: train.departureAt,
         arrivalAt: train.arrivalAt,
-        sourceVersion: train.sourceVersion,
         state: asString(status.state).trim(),
         confidence: asString(status.confidence).trim(),
-        uniqueReporters: Number(status.uniqueReporters) || 0,
-        riders: activeRidersForTrain(tx, train.id),
+        uniqueReporters: publicReporterCount(Number(status.uniqueReporters) || 0),
+        riders: publicRiderCount(activeRidersForTrain(tx, train.id)),
         lastReportAt: trimOptional(asString(status.lastReportAt)) || '',
         updatedAt: nowISO(tx),
-        recentTimeline: buckets.map((bucket) => ({
-          at: asString(bucket.at).trim(),
-          signal: asString(bucket.signal).trim(),
-          count: Number(bucket.count) || 0,
-        })),
+        recentTimeline: buckets.map(publicTimelineBucket),
       };
     });
   const trains = source.filter((train) => {
@@ -2540,20 +2655,15 @@ function publicDashboardPayload(tx: any, limit: number) {
       toStation: train.toStationName,
       departureAt: train.departureAt,
       arrivalAt: train.arrivalAt,
-      sourceVersion: train.sourceVersion,
     },
     status: {
       state: asString(train.state).trim() || 'NO_REPORTS',
       confidence: asString(train.confidence).trim() || 'LOW',
-      uniqueReporters: Number(train.uniqueReporters) || 0,
+      uniqueReporters: publicReporterCount(Number(train.uniqueReporters) || 0),
       lastReportAt: asString(train.lastReportAt).trim(),
     },
-    riders: Number(train.riders) || 0,
-    timeline: (train.recentTimeline || []).slice(0, 5).map((bucket: any) => ({
-      at: asString(bucket.at).trim(),
-      signal: asString(bucket.signal).trim(),
-      count: Number(bucket.count) || 0,
-    })),
+    riders: publicRiderCount(Number(train.riders) || 0),
+    timeline: (train.recentTimeline || []).slice(0, 5).map(publicTimelinePayload),
     stationSightings: [],
   }));
 }
@@ -2567,11 +2677,10 @@ function publicServiceDayPayload(tx: any) {
       toStation: train.toStationName,
       departureAt: train.departureAt,
       arrivalAt: train.arrivalAt,
-      sourceVersion: train.sourceVersion,
     },
-    status: buildTrainState(tx, train.id),
-    riders: activeRidersForTrain(tx, train.id),
-    timeline: recentTimeline(tx, train.id, 5),
+    status: publicTrainStatus(buildTrainState(tx, train.id)),
+    riders: publicRiderCount(activeRidersForTrain(tx, train.id)),
+    timeline: recentTimeline(tx, train.id, 5).map(publicTimelinePayload),
     stationSightings: [],
   }));
 }
@@ -2634,8 +2743,8 @@ function incidentSummaryPayload(tx: any, activity: any, viewerStableId: string) 
   return {
     id: activity.id,
     scope: activity.scopeType,
-    subjectId: activity.subjectId,
-    subjectName: activity.subjectName,
+    subjectId: publicIncidentSubjectId(activity),
+    subjectName: publicIncidentSubjectName(activity),
     lastReportName: activity.summary.lastReportName,
     lastReportAt: activity.summary.lastReportAt,
     lastActivityName: activity.summary.lastActivityName,
@@ -2644,10 +2753,21 @@ function incidentSummaryPayload(tx: any, activity: any, viewerStableId: string) 
     lastReporter: activity.summary.lastReporter,
     commentCount: Array.isArray(activity.comments) ? activity.comments.length : 0,
     votes: activityVoteSummary(activity, viewerStableId),
-    location: incidentLocationPayload(activity),
+    location: publicIncidentLocationPayload(activity),
     mapTarget: incidentMapTargetPayload(activity),
     active: activity.active === true,
   };
+}
+
+function publicIncidentSubjectId(activity: any): string {
+  return asString(activity?.scopeType).trim() === 'area' ? '' : asString(activity?.subjectId).trim();
+}
+
+function publicIncidentSubjectName(activity: any): string {
+  if (asString(activity?.scopeType).trim() === 'area') {
+    return 'Inspection near this location';
+  }
+  return asString(activity?.subjectName).trim();
 }
 
 function listIncidentSummariesPayload(tx: any, limit: number) {
@@ -2670,7 +2790,7 @@ function incidentDetailPayload(tx: any, incidentId: string) {
     id: publicOpaqueId('event', activity.id, item.createdAt, item.kind, index),
     kind: item.kind === 'station_sighting' || item.kind === 'location_report' ? 'report' : item.kind,
     name: item.name,
-    detail: item.detail,
+    detail: publicIncidentEventDetail(activity, item),
     nickname: item.nickname,
     createdAt: item.createdAt,
   }));
@@ -3567,25 +3687,28 @@ function refreshTripProjection(tx: any, trainId: string): void {
     return;
   }
   const status = buildTrainState(tx, trainId);
+  const publicStatus = publicTrainStatus(status);
+  const publicRiders = publicRiderCount(activeRidersForTrain(tx, trainId));
   tx.db.trainbot_trip_live.insert({
     trainId,
     serviceDate: trip.serviceDate,
     state: asString(status.state).trim(),
     confidence: asString(status.confidence).trim(),
-    uniqueReporters: Number(status.uniqueReporters) || 0,
-    riders: activeRidersForTrain(tx, trainId),
+    uniqueReporters: Number(publicStatus.uniqueReporters) || 0,
+    riders: publicRiders,
     lastReportAt: trimOptional(asString(status.lastReportAt)) || '',
     updatedAt: nowISO(tx),
   });
 
   const buckets = recentTimeline(tx, trainId, 0);
   for (const bucket of buckets) {
+    const publicBucket = publicTimelineBucket(bucket);
     tx.db.trainbot_trip_timeline_bucket.insert({
-      id: `${trainId}|${bucket.at}|${bucket.signal}`,
+      id: publicOpaqueId('timeline', trainId, publicBucket.at, publicBucket.eventLabel),
       trainId,
       serviceDate: trip.serviceDate,
-      at: bucket.at,
-      signal: bucket.signal,
+      at: publicBucket.at,
+      eventLabel: publicBucket.eventLabel,
       count: Number(bucket.count) || 0,
     });
   }
@@ -3598,18 +3721,13 @@ function refreshTripProjection(tx: any, trainId: string): void {
     toStationName: trip.toStationName,
     departureAt: trip.departureAt,
     arrivalAt: trip.arrivalAt,
-    sourceVersion: trip.sourceVersion,
     state: asString(status.state).trim(),
     confidence: asString(status.confidence).trim(),
-    uniqueReporters: Number(status.uniqueReporters) || 0,
-    riders: activeRidersForTrain(tx, trainId),
+    uniqueReporters: Number(publicStatus.uniqueReporters) || 0,
+    riders: publicRiders,
     lastReportAt: trimOptional(asString(status.lastReportAt)) || '',
     updatedAt: nowISO(tx),
-    recentTimeline: buckets.map((bucket) => ({
-      at: asString(bucket.at).trim(),
-      signal: asString(bucket.signal).trim(),
-      count: Number(bucket.count) || 0,
-    })),
+    recentTimeline: buckets.map(publicTimelineBucket),
   });
 }
 
@@ -3631,8 +3749,8 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   tx.db.trainbot_incident_summary.insert({
     id: incidentId,
     scopeType: activity.scopeType,
-    subjectId: activity.subjectId,
-    subjectName: activity.subjectName,
+    subjectId: summary.subjectId,
+    subjectName: summary.subjectName,
     serviceDate: activity.serviceDate,
     active: activity.active === true,
     lastReportName: summary.lastReportName,
@@ -3662,15 +3780,14 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       serviceDate: activity.serviceDate,
       kind: event.kind === 'station_sighting' || event.kind === 'location_report' ? 'report' : event.kind,
       name: event.name,
-      detail: event.detail,
+      detail: publicIncidentEventDetail(activity, event),
       nickname: event.nickname,
       createdAt: event.createdAt,
-      signal: event.signal,
     });
     if (event.kind === 'station_sighting') {
       const createdMs = parseISO(event.createdAt)?.getTime() || 0;
       tx.db.trainbot_public_sighting.insert({
-        id: publicOpaqueId('sighting', incidentId, event.createdAt, index),
+        id: publicStationSightingID(event),
         incidentId,
         serviceDate: activity.serviceDate,
         stationId: event.stationId,
@@ -3708,7 +3825,6 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       detail: '',
       nickname: vote.nickname,
       createdAt: vote.updatedAt,
-      signal: '',
     });
   }
 
@@ -3989,7 +4105,7 @@ export const publicDashboardLive = spacetimedb.anonymousView(
       ? rowsFrom(ctx.db.trainbot_trip_public.serviceDate.filter(serviceDate))
       : rowsFrom(ctx.db.trainbot_trip_public.iter());
     if (projected.length || !serviceDate) {
-      return projected;
+      return projected.map(publicTripRow);
     }
     return listTripsForServiceDate(ctx, serviceDate).map((trip) => {
       const status = buildTrainState(ctx, trip.id);
@@ -4003,18 +4119,13 @@ export const publicDashboardLive = spacetimedb.anonymousView(
         toStationName: trip.toStationName,
         departureAt: trip.departureAt,
         arrivalAt: trip.arrivalAt,
-        sourceVersion: trip.sourceVersion,
         state: asString(status.state).trim(),
         confidence: asString(status.confidence).trim(),
-        uniqueReporters: Number(status.uniqueReporters) || 0,
-        riders: activeRidersForTrain(ctx, trip.id),
+        uniqueReporters: publicReporterCount(Number(status.uniqueReporters) || 0),
+        riders: publicRiderCount(activeRidersForTrain(ctx, trip.id)),
         lastReportAt: trimOptional(asString(status.lastReportAt)) || '',
         updatedAt: nowISO(ctx),
-        recentTimeline: buckets.map((bucket) => ({
-          at: asString(bucket.at).trim(),
-          signal: asString(bucket.signal).trim(),
-          count: Number(bucket.count) || 0,
-        })),
+        recentTimeline: buckets.map(publicTimelineBucket),
       };
     });
   }
@@ -4110,7 +4221,7 @@ export const publicNetworkMapLive = spacetimedb.anonymousView(
     const sightings = projectedSightings.length || !serviceDate
       ? projectedSightings
       : stationSightingsSince(ctx, utcDayStart(nowDate(ctx)).getTime(), 500).map((item) => ({
-        id: asString(item.id).trim(),
+        id: publicStationSightingID(item),
         incidentId: '',
         serviceDate,
         stationId: asString(item.stationId).trim(),

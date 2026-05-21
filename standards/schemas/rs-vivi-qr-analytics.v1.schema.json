@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ops.local/schemas/rs-vivi-qr-analytics.v1.schema.json",
+  "title": "RS/ViVi QR Analytics Snapshot v1",
+  "description": "Safe user-impact analytics for Rīgas Satiksme QR jobs sharing the Pixel/ViVi phone. Must not contain raw Telegram IDs, RS codes, job IDs, tokens, cookies, or session secrets.",
+  "type": "object",
+  "required": ["schema", "generatedAt", "rsQr"],
+  "properties": {
+    "schema": { "const": "rs-vivi-qr-analytics.v1" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "rsQr": {
+      "type": "object",
+      "required": ["totals"],
+      "properties": {
+        "totals": {
+          "type": "object",
+          "required": ["jobs"],
+          "properties": {
+            "jobs": { "type": "integer", "minimum": 0 },
+            "waiting": { "type": "integer", "minimum": 0 },
+            "running": { "type": "integer", "minimum": 0 },
+            "succeeded": { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "canceled": { "type": "integer", "minimum": 0 },
+            "retried": { "type": "integer", "minimum": 0 },
+            "slowSuccess": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "byReason": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "successLatencySec": { "$ref": "#/$defs/latencyStats" },
+        "userImpact": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/userImpact" }
+        },
+        "recentIncidents": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/incident" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "latencyStats": {
+      "type": "object",
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "min": { "type": "number", "minimum": 0 },
+        "p50": { "type": "number", "minimum": 0 },
+        "p90": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "userImpact": {
+      "type": "object",
+      "required": ["actorHash", "jobs"],
+      "properties": {
+        "actorHash": { "type": "string", "pattern": "^user:[a-f0-9]{8,64}$" },
+        "jobs": { "type": "integer", "minimum": 0 },
+        "waiting": { "type": "integer", "minimum": 0 },
+        "running": { "type": "integer", "minimum": 0 },
+        "succeeded": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "canceled": { "type": "integer", "minimum": 0 },
+        "retried": { "type": "integer", "minimum": 0 },
+        "slowSuccess": { "type": "integer", "minimum": 0 },
+        "lastStatus": { "type": "string", "enum": ["waiting", "running", "succeeded", "failed", "canceled"] },
+        "lastReason": { "type": "string" },
+        "lastAt": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "incident": {
+      "type": "object",
+      "required": ["traceId", "seq", "status"],
+      "properties": {
+        "traceId": { "type": "string", "pattern": "^rsqr:[0-9]{6}$" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "actorHash": { "type": "string", "pattern": "^user:[a-f0-9]{8,64}$" },
+        "status": { "type": "string", "enum": ["waiting", "running", "succeeded", "failed", "canceled"] },
+        "reason": { "type": "string" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "createdAt": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "completedAt": { "type": "string" },
+        "totalSec": { "type": "number", "minimum": 0 },
+        "queueSec": { "type": "number", "minimum": 0 },
+        "finalAttemptSec": { "type": "number", "minimum": 0 },
+        "retried": { "type": "boolean" },
+        "slowSuccess": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

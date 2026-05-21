@@ -785,7 +785,7 @@ func (s *Syncer) ServiceGetSchedule(ctx context.Context, serviceDate string) (*T
 		return nil, nil, err
 	}
 	tripResults, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt, sourceVersion FROM trainbot_trip_public WHERE serviceDate = %s",
+		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt FROM trainbot_trip_public WHERE serviceDate = %s",
 		sqlQuote(cleanDate),
 	))
 	if err != nil {
@@ -798,6 +798,9 @@ func (s *Syncer) ServiceGetSchedule(ctx context.Context, serviceDate string) (*T
 	}
 	if err := decodeSQLRowsInto(tripRowsRaw, &tripRows); err != nil {
 		return nil, nil, err
+	}
+	if len(serviceDayRows) > 0 {
+		applyTripSourceVersion(tripRows, serviceDayRows[0].SourceVersion)
 	}
 	sortTripRows(tripRows)
 	stopResults, err := s.SQL(ctx, fmt.Sprintf(
@@ -822,9 +825,8 @@ func (s *Syncer) ServiceGetSchedule(ctx context.Context, serviceDate string) (*T
 			return nil, nil, nil
 		}
 		return &TrainbotServiceDayRow{
-			ServiceDate:   cleanDate,
-			SourceVersion: firstTripSourceVersion(tripRows),
-			Stations:      stations,
+			ServiceDate: cleanDate,
+			Stations:    stations,
 		}, tripRows, nil
 	}
 	serviceDayRows[0].Stations = stations
@@ -937,18 +939,19 @@ func stationsFromTripRows(trips []TrainbotTripRow) []TrainbotStation {
 	return out
 }
 
-func firstTripSourceVersion(trips []TrainbotTripRow) string {
-	for _, trip := range trips {
-		if clean := strings.TrimSpace(trip.SourceVersion); clean != "" {
-			return clean
-		}
+func applyTripSourceVersion(trips []TrainbotTripRow, sourceVersion string) {
+	clean := strings.TrimSpace(sourceVersion)
+	if clean == "" {
+		return
 	}
-	return ""
+	for index := range trips {
+		trips[index].SourceVersion = clean
+	}
 }
 
 func (s *Syncer) ServiceGetTrip(ctx context.Context, trainID string) (*TrainbotTripRow, error) {
 	results, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt, sourceVersion FROM trainbot_trip_public WHERE id = %s LIMIT 1",
+		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt FROM trainbot_trip_public WHERE id = %s LIMIT 1",
 		sqlQuote(trainID),
 	))
 	if err != nil {
@@ -965,6 +968,11 @@ func (s *Syncer) ServiceGetTrip(ctx context.Context, trainID string) (*TrainbotT
 	if len(items) == 0 {
 		return nil, nil
 	}
+	sourceVersion, err := s.serviceDaySourceVersion(ctx, items[0].ServiceDate)
+	if err != nil {
+		return nil, err
+	}
+	items[0].SourceVersion = sourceVersion
 	stopResults, err := s.SQL(ctx, fmt.Sprintf(
 		"SELECT trainId, stationId, stationName, seq, arrivalAt, departureAt, latitude, longitude FROM trainbot_trip_stop WHERE trainId = %s",
 		sqlQuote(trainID),
@@ -982,6 +990,34 @@ func (s *Syncer) ServiceGetTrip(ctx context.Context, trainID string) (*TrainbotT
 	}
 	attachStopsToTrips(items, stopRows)
 	return &items[0], nil
+}
+
+func (s *Syncer) serviceDaySourceVersion(ctx context.Context, serviceDate string) (string, error) {
+	cleanDate := strings.TrimSpace(serviceDate)
+	if cleanDate == "" {
+		return "", nil
+	}
+	results, err := s.SQL(ctx, fmt.Sprintf(
+		"SELECT sourceVersion FROM trainbot_service_day WHERE serviceDate = %s LIMIT 1",
+		sqlQuote(cleanDate),
+	))
+	if err != nil {
+		return "", err
+	}
+	rows, err := sqlRows(results)
+	if err != nil {
+		return "", err
+	}
+	var items []struct {
+		SourceVersion string `json:"sourceVersion"`
+	}
+	if err := decodeSQLRowsInto(rows, &items); err != nil {
+		return "", err
+	}
+	if len(items) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(items[0].SourceVersion), nil
 }
 
 func (s *Syncer) ServiceGetRider(ctx context.Context, stableID string) (*TrainbotRiderRow, error) {

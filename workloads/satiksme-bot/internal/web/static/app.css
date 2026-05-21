@@ -1,3 +1,4 @@
+/* Public asset fingerprint bump: clears stale cached response headers (2026-05-18 live map). */
 :root {
   --bg: #f3efe5;
   --panel: rgba(255, 252, 247, 0.92);

@@ -110,6 +110,9 @@ func TestIssueSessionCookieRoundTrip(t *testing.T) {
 	if got, want := cookie.MaxAge, int((30 * 24 * time.Hour).Seconds()); got != want {
 		t.Fatalf("cookie MaxAge = %d, want %d", got, want)
 	}
+	if cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("cookie.SameSite = %v, want Lax", cookie.SameSite)
+	}
 
 	claims, err := parseSession([]byte("0123456789abcdef0123456789abcdef"), cookie.Value, now.Add(30*24*time.Hour-time.Second))
 	if err != nil {
@@ -471,6 +474,107 @@ func TestSessionEndpointReturnsAuthenticatedSession(t *testing.T) {
 	}
 }
 
+func TestAuthSpacetimeRefreshReturnsFreshTokenForSession(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{
+		AuthDate: now,
+		User: telegramUser{
+			ID:           7001,
+			FirstName:    "Session",
+			LanguageCode: "lv",
+		},
+	}, now)
+	if err != nil {
+		t.Fatalf("issue session cookie: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/spacetime", nil)
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("spacetime refresh status: got %d body=%s", res.Code, res.Body.String())
+	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := res.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
+	var payload struct {
+		OK        bool `json:"ok"`
+		Spacetime struct {
+			Enabled   bool   `json:"enabled"`
+			Host      string `json:"host"`
+			Database  string `json:"database"`
+			Token     string `json:"token"`
+			ExpiresAt string `json:"expiresAt"`
+			Issuer    string `json:"issuer"`
+			Audience  string `json:"audience"`
+		} `json:"spacetime"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode spacetime refresh payload: %v", err)
+	}
+	if !payload.OK || !payload.Spacetime.Enabled {
+		t.Fatalf("spacetime refresh payload not enabled: %+v", payload)
+	}
+	if payload.Spacetime.Host != "https://stdb.example.test" || payload.Spacetime.Database != "train-bot" {
+		t.Fatalf("unexpected spacetime target: %+v", payload.Spacetime)
+	}
+	claims := decodeJWTClaims(t, payload.Spacetime.Token)
+	if got := claims["sub"]; got != "telegram:7001" {
+		t.Fatalf("unexpected sub: %#v", got)
+	}
+	if got := claims["language"]; got != "lv" {
+		t.Fatalf("unexpected language: %#v", got)
+	}
+	if err := verifyJWTSignature(server.spacetime.publicKey, payload.Spacetime.Token); err != nil {
+		t.Fatalf("verify spacetime token signature: %v", err)
+	}
+}
+
+func TestAuthSpacetimeRefreshHidesTokenIssueDetails(t *testing.T) {
+	t.Parallel()
+
+	server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	server.spacetimeIssueToken = func(telegramAuth, time.Time) (spacetimeIssuedToken, error) {
+		return spacetimeIssuedToken{}, fmt.Errorf("sign OIDC token: crypto failure")
+	}
+	cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{
+		AuthDate: now,
+		User: telegramUser{
+			ID:           7001,
+			FirstName:    "Session",
+			LanguageCode: "lv",
+		},
+	}, now)
+	if err != nil {
+		t.Fatalf("issue session cookie: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/spacetime", nil)
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("spacetime refresh status: got %d body=%s", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	if !strings.Contains(body, "failed to issue token") {
+		t.Fatalf("body = %q, want generic token issue error", body)
+	}
+	for _, leaked := range []string{"sign OIDC token", "crypto failure"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("body leaked token issue detail %q: %s", leaked, body)
+		}
+	}
+}
+
 func TestAuthTelegramSetsScopedSessionCookie(t *testing.T) {
 	t.Parallel()
 
@@ -490,25 +594,26 @@ func TestAuthTelegramSetsScopedSessionCookie(t *testing.T) {
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
 	}
-	cookies := res.Result().Cookies()
-	if len(cookies) != 1 {
-		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	sessionCookie := cookieByName(res.Result().Cookies(), sessionCookieName)
+	if sessionCookie == nil {
+		t.Fatalf("missing %s cookie", sessionCookieName)
 	}
-	if cookies[0].Path != "/pixel-stack/train" {
-		t.Fatalf("unexpected cookie path: %q", cookies[0].Path)
+	if sessionCookie.Path != "/pixel-stack/train" {
+		t.Fatalf("unexpected cookie path: %q", sessionCookie.Path)
 	}
-	if !cookies[0].Secure {
+	if !sessionCookie.Secure {
 		t.Fatalf("expected secure cookie")
 	}
-	if cookies[0].SameSite != http.SameSiteNoneMode {
-		t.Fatalf("unexpected SameSite: %v", cookies[0].SameSite)
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected SameSite: %v", sessionCookie.SameSite)
 	}
 }
 
@@ -531,25 +636,56 @@ func TestAuthTelegramSetsRootScopedSessionCookieForHostRootDeployment(t *testing
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
 	}
-	cookies := res.Result().Cookies()
-	if len(cookies) != 1 {
-		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	sessionCookie := cookieByName(res.Result().Cookies(), sessionCookieName)
+	if sessionCookie == nil {
+		t.Fatalf("missing %s cookie", sessionCookieName)
 	}
-	if cookies[0].Path != "/" {
-		t.Fatalf("unexpected cookie path: %q", cookies[0].Path)
+	if sessionCookie.Path != "/" {
+		t.Fatalf("unexpected cookie path: %q", sessionCookie.Path)
 	}
-	if !cookies[0].Secure {
+	if !sessionCookie.Secure {
 		t.Fatalf("expected secure cookie")
 	}
-	if cookies[0].SameSite != http.SameSiteNoneMode {
-		t.Fatalf("unexpected SameSite: %v", cookies[0].SameSite)
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected SameSite: %v", sessionCookie.SameSite)
+	}
+}
+
+func TestLegacyAuthTelegramReturnsGone(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.March, 6, 10, 30, 0, 0, time.UTC)
+	server := newTestServerWithBaseURL(t, "https://vilciens.kontrole.info")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/telegram", strings.NewReader(`{"initData":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	server.handleAuthTelegram(res, req, now)
+
+	if res.Code != http.StatusGone {
+		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	if !strings.Contains(body, "/api/v1/auth/telegram/complete") {
+		t.Fatalf("body missing replacement route: %s", body)
+	}
+	for _, forbidden := range []string{"invalid Telegram login", "missing hash", "signature", "expired", "initData", "parse"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("body should not reach legacy validation detail %q: %s", forbidden, body)
+		}
+	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := res.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("X-Robots-Tag = %q, want noindex, noarchive", got)
 	}
 }
 
@@ -615,6 +751,7 @@ func TestTelegramBrowserAuthLifecycle(t *testing.T) {
 		t.Fatalf("marshal complete body: %v", err)
 	}
 	completeReq := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	completeReq.Header.Set("Content-Type", "application/json")
 	completeReq.AddCookie(nonceCookie)
 	completeRes := httptest.NewRecorder()
 	server.ServeHTTP(completeRes, completeReq)
@@ -669,6 +806,340 @@ func TestTelegramBrowserAuthLifecycle(t *testing.T) {
 	}
 }
 
+func TestTelegramConfigRateLimitsNonceMinting(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	server.cfg.BotToken = "123456:telegram-login-secret"
+	server.cfg.TrainWebTelegramClientID = ""
+	server.telegramLogin = newTelegramLoginFixture(t, "123456").verifier
+
+	for index := 0; index < 30; index++ {
+		req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/auth/telegram/config", nil)
+		req.RemoteAddr = "203.0.113.7:48123"
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("config request %d status = %d, want 200 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+		if cookie := cookieByName(rec.Result().Cookies(), loginNonceCookieName); cookie == nil {
+			t.Fatalf("config request %d did not mint nonce cookie", index+1)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/auth/telegram/config", nil)
+	req.RemoteAddr = "203.0.113.7:48123"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited config status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+	if cookie := cookieByName(rec.Result().Cookies(), loginNonceCookieName); cookie != nil {
+		t.Fatalf("limited config minted nonce cookie: %#v", cookie)
+	}
+}
+
+func TestTelegramCompleteRateLimitsInvalidAttempts(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	server.cfg.BotToken = "123456:telegram-login-secret"
+	server.cfg.TrainWebTelegramClientID = ""
+	server.telegramLogin = newTelegramLoginFixture(t, "123456").verifier
+
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.8:48123"
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.8:48123"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRateLimitIgnoresSpoofedForwardedHeaders(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	server.cfg.BotToken = "123456:telegram-login-secret"
+	server.cfg.TrainWebTelegramClientID = ""
+	server.telegramLogin = newTelegramLoginFixture(t, "123456").verifier
+
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.9:48123"
+		req.Header.Set("CF-Connecting-IP", "198.51.100."+strconv.Itoa(index+1))
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.9:48123"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.200")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRateLimitIgnoresSpoofedForwardedHeadersFromPrivatePeer(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	server.cfg.BotToken = "123456:telegram-login-secret"
+	server.cfg.TrainWebTelegramClientID = ""
+	server.telegramLogin = newTelegramLoginFixture(t, "123456").verifier
+
+	for index := 0; index < 15; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "10.0.0.5:48123"
+		req.Header.Set("X-Real-IP", "198.51.100."+strconv.Itoa(index+1))
+		req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(index+101))
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("complete request %d status = %d, want 401 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "10.0.0.5:48123"
+	req.Header.Set("X-Real-IP", "198.51.100.200")
+	req.Header.Set("X-Forwarded-For", "198.51.100.201")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited complete status = %d, want 429 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLegacyAuthTelegramDoesNotReachValidationOrRateLimit(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	for index := 0; index < 3; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", strings.NewReader(`{"initData":"invalid"}`))
+		req.RemoteAddr = "203.0.113.10:48123"
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusGone {
+			t.Fatalf("legacy auth request %d status = %d, want 410 body=%s", index+1, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "invalid Telegram login") {
+			t.Fatalf("legacy auth request %d reached auth validation: %s", index+1, rec.Body.String())
+		}
+	}
+}
+
+func TestUnsafeAPIRejectsCrossSiteBrowserRequests(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{
+			name: "foreign origin",
+			headers: map[string]string{
+				"Origin": "https://evil.example",
+			},
+		},
+		{
+			name: "cross-site fetch metadata",
+			headers: map[string]string{
+				"Sec-Fetch-Site": "cross-site",
+			},
+		},
+		{
+			name: "sibling origin",
+			headers: map[string]string{
+				"Origin": "https://kontrole.info",
+			},
+		},
+		{
+			name: "same-site fetch metadata",
+			headers: map[string]string{
+				"Sec-Fetch-Site": "same-site",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/logout", nil)
+			for key, value := range tc.headers {
+				req.Header.Set(key, value)
+			}
+			rec := httptest.NewRecorder()
+
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/logout", nil)
+	req.Header.Set("Origin", "https://example.test")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same-origin status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuthUnsupportedMethodsReturnAllowHeader(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	for _, tc := range []struct {
+		method string
+		path   string
+		allow  string
+	}{
+		{method: http.MethodOptions, path: "/pixel-stack/train/api/v1/auth/telegram/config", allow: "GET"},
+		{method: http.MethodGet, path: "/pixel-stack/train/api/v1/auth/telegram/complete", allow: "POST"},
+		{method: http.MethodOptions, path: "/pixel-stack/train/api/v1/auth/telegram/complete", allow: "POST"},
+		{method: http.MethodGet, path: "/pixel-stack/train/api/v1/auth/telegram", allow: "POST"},
+		{method: http.MethodOptions, path: "/pixel-stack/train/api/v1/auth/telegram", allow: "POST"},
+		{method: http.MethodGet, path: "/pixel-stack/train/api/v1/auth/spacetime", allow: "POST"},
+		{method: http.MethodOptions, path: "/pixel-stack/train/api/v1/auth/spacetime", allow: "POST"},
+		{method: http.MethodGet, path: "/pixel-stack/train/api/v1/auth/logout", allow: "POST"},
+		{method: http.MethodOptions, path: "/pixel-stack/train/api/v1/auth/logout", allow: "POST"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		rec := httptest.NewRecorder()
+
+		server.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s status = %d, want 405 body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Allow"); got != tc.allow {
+			t.Fatalf("%s %s Allow = %q, want %q", tc.method, tc.path, got, tc.allow)
+		}
+	}
+}
+
+func TestProtectedAPIUnsupportedMethodsReturnAllowBeforeAuth(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	req := httptest.NewRequest(http.MethodOptions, "/pixel-stack/train/api/v1/me", nil)
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Allow"); got != "GET" {
+		t.Fatalf("Allow = %q, want GET", got)
+	}
+	if strings.Contains(rec.Body.String(), "session") {
+		t.Fatalf("unsupported method reached session handling: %s", rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	body := `{"idToken":"` + strings.Repeat("a", 70*1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTelegramCompleteRejectsNonJSONContentType(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", strings.NewReader(`{"idToken":"invalid"}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
+}
+
+func TestProtectedAPIReturnsGenericInvalidSession(t *testing.T) {
+	t.Parallel()
+
+	server, _, _ := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/stations", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "header.%%%%.signature"})
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "invalid session") {
+		t.Fatalf("body = %q, want generic invalid session", body)
+	}
+	if strings.Contains(body, "base64") || strings.Contains(body, "decode") {
+		t.Fatalf("body leaked parser detail: %q", body)
+	}
+}
+
 func TestTelegramCompleteRejectsLegacyWidgetAuthResult(t *testing.T) {
 	t.Parallel()
 
@@ -699,6 +1170,7 @@ func TestTelegramCompleteRejectsLegacyWidgetAuthResult(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
 	if res.Code != http.StatusBadRequest {
@@ -732,6 +1204,7 @@ func TestTelegramCompleteAcceptsMiniAppInitData(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -760,9 +1233,10 @@ func TestAuthTelegramPersistsTelegramLanguageForFirstTimeUser(t *testing.T) {
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
@@ -806,9 +1280,10 @@ func TestAuthTelegramKeepsSavedLanguageForExistingUser(t *testing.T) {
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
@@ -852,9 +1327,10 @@ func TestAuthTelegramFallsBackToTelegramLanguageWhenStoreUnavailable(t *testing.
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
@@ -889,9 +1365,10 @@ func TestAuthTelegramIncludesSpacetimeTokenWhenConfigured(t *testing.T) {
 		t.Fatalf("marshal body: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/auth/telegram/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	server.handleAuthTelegram(res, req, now)
+	server.handleAuthTelegramComplete(res, req, now)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
@@ -979,6 +1456,12 @@ func TestServeHTTPExposesSpacetimeOIDCMetadata(t *testing.T) {
 	if got := discovery["jwks_uri"]; got != "https://example.test/pixel-stack/train/oidc/jwks.json" {
 		t.Fatalf("unexpected discovery jwks_uri: %#v", got)
 	}
+	discoveryHeadReq := httptest.NewRequest(http.MethodHead, "/pixel-stack/train/oidc/.well-known/openid-configuration", nil)
+	discoveryHeadRes := httptest.NewRecorder()
+	server.ServeHTTP(discoveryHeadRes, discoveryHeadReq)
+	if discoveryHeadRes.Code != http.StatusOK {
+		t.Fatalf("unexpected discovery HEAD status: got %d body=%s", discoveryHeadRes.Code, discoveryHeadRes.Body.String())
+	}
 
 	jwksReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/oidc/jwks.json", nil)
 	jwksRes := httptest.NewRecorder()
@@ -997,6 +1480,12 @@ func TestServeHTTPExposesSpacetimeOIDCMetadata(t *testing.T) {
 	}
 	if got := jwks.Keys[0]["kid"]; got != server.spacetime.keyID {
 		t.Fatalf("unexpected jwks kid: %#v", got)
+	}
+	jwksHeadReq := httptest.NewRequest(http.MethodHead, "/pixel-stack/train/oidc/jwks.json", nil)
+	jwksHeadRes := httptest.NewRecorder()
+	server.ServeHTTP(jwksHeadRes, jwksHeadReq)
+	if jwksHeadRes.Code != http.StatusOK {
+		t.Fatalf("unexpected jwks HEAD status: got %d body=%s", jwksHeadRes.Code, jwksHeadRes.Body.String())
 	}
 }
 
@@ -1091,6 +1580,19 @@ func TestServeHTTPShellAddsSecurityHeadersAndFingerprintedAssets(t *testing.T) {
 			t.Fatalf("missing security header %s", header)
 		}
 	}
+	csp := res.Header().Get("Content-Security-Policy")
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+		t.Fatalf("Content-Security-Policy still allows inline scripts: %q", csp)
+	}
+	if strings.Contains(csp, "'unsafe-inline'") {
+		t.Fatalf("Content-Security-Policy still allows inline code: %q", csp)
+	}
+	if !strings.Contains(csp, "style-src 'self'") {
+		t.Fatalf("Content-Security-Policy missing strict style-src: %q", csp)
+	}
+	if !strings.Contains(csp, "script-src 'self' 'nonce-") {
+		t.Fatalf("Content-Security-Policy missing script nonce: %q", csp)
+	}
 	for _, header := range []string{"X-Train-Bot-Commit", "X-Train-Bot-Build-Time", "X-Train-Bot-Instance", "X-Train-Bot-App-Js"} {
 		if got := res.Header().Get(header); got != "" {
 			t.Fatalf("unexpected public debug header %s=%q", header, got)
@@ -1099,6 +1601,9 @@ func TestServeHTTPShellAddsSecurityHeadersAndFingerprintedAssets(t *testing.T) {
 	body := res.Body.String()
 	if !strings.Contains(body, "/pixel-stack/train/assets/app.css?v="+server.release.AppCSSHash) {
 		t.Fatalf("expected fingerprinted app.css URL, body=%s", body)
+	}
+	if !strings.Contains(body, `nonce="`) {
+		t.Fatalf("shell missing script nonce: %s", body)
 	}
 	if !strings.Contains(body, "/pixel-stack/train/assets/app.js?v="+server.release.AppJSHash) {
 		t.Fatalf("expected fingerprinted app.js URL, body=%s", body)
@@ -1168,6 +1673,9 @@ func TestServeHTTPAssetCacheHeadersDependOnFingerprint(t *testing.T) {
 	if got := versionedRes.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
 		t.Fatalf("unexpected immutable cache-control: %q", got)
 	}
+	if got := versionedRes.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("unexpected immutable asset Vary: %q", got)
+	}
 	if got := versionedRes.Header().Get("X-Train-Bot-App-Js"); got != "" {
 		t.Fatalf("unexpected app.js hash header: %q", got)
 	}
@@ -1180,6 +1688,23 @@ func TestServeHTTPAssetCacheHeadersDependOnFingerprint(t *testing.T) {
 	}
 	if got := unversionedRes.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
 		t.Fatalf("unexpected unversioned cache-control: %q", got)
+	}
+	if got := unversionedRes.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("unexpected unversioned asset Vary: %q", got)
+	}
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/assets/vendor/leaflet.js", nil)
+	rangeReq.Header.Set("Range", "bytes=0-63")
+	rangeRes := httptest.NewRecorder()
+	server.ServeHTTP(rangeRes, rangeReq)
+	if rangeRes.Code != http.StatusOK {
+		t.Fatalf("unexpected unversioned range asset status: got %d body=%s", rangeRes.Code, rangeRes.Body.String())
+	}
+	if got := rangeRes.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+		t.Fatalf("unexpected unversioned range cache-control: %q", got)
+	}
+	if got := rangeRes.Header().Get("Content-Range"); got != "" {
+		t.Fatalf("unexpected unversioned range Content-Range: %q", got)
 	}
 }
 

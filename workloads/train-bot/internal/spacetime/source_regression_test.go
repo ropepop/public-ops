@@ -262,6 +262,233 @@ func TestPublicIncidentShapesUseOpaquePublicIDs(t *testing.T) {
 	}
 }
 
+func TestPublicAreaIncidentsAreCoarsenedInSpacetimeSource(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	for _, required := range []string{
+		"function publicIncidentSubjectId",
+		"function publicIncidentSubjectName",
+		"function publicIncidentLocationPayload",
+		"function publicIncidentEventDetail",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("Spacetime source missing %s", required)
+		}
+	}
+	summarySnippet := sourceSnippet(t, source, "function incidentSummaryPayload", 1600)
+	for _, required := range []string{
+		"subjectId: publicIncidentSubjectId(activity)",
+		"subjectName: publicIncidentSubjectName(activity)",
+		"location: publicIncidentLocationPayload(activity)",
+	} {
+		if !strings.Contains(summarySnippet, required) {
+			t.Fatalf("public incident summary missing %q in:\n%s", required, summarySnippet)
+		}
+	}
+	locationSnippet := sourceSnippet(t, source, "function publicIncidentLocationPayload", 1200)
+	for _, required := range []string{
+		"Math.round(location.latitude * 1000) / 1000",
+		"Math.max(250, Number(location.radiusMeters) || 0)",
+		"description: ''",
+	} {
+		if !strings.Contains(locationSnippet, required) {
+			t.Fatalf("public area location redaction missing %q in:\n%s", required, locationSnippet)
+		}
+	}
+	projectionSnippet := sourceSnippet(t, source, "function refreshActivityProjection", 2600)
+	for _, required := range []string{
+		"subjectId: summary.subjectId",
+		"subjectName: summary.subjectName",
+		"detail: publicIncidentEventDetail(activity, event)",
+	} {
+		if !strings.Contains(projectionSnippet, required) {
+			t.Fatalf("public projection missing %q in:\n%s", required, projectionSnippet)
+		}
+	}
+}
+
+func TestPublicStationSightingsUseOpaquePublicIDs(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	start := strings.Index(source, "function stationSightingsSince")
+	if start < 0 {
+		t.Fatalf("stationSightingsSince anchor not found")
+	}
+	end := strings.Index(source[start:], "\nfunction recentStationSightingsByStation")
+	if end < 0 {
+		t.Fatalf("recentStationSightingsByStation anchor not found")
+	}
+	snippet := source[start : start+end]
+	if strings.Contains(snippet, "id: event.id") {
+		t.Fatalf("stationSightingsSince must not expose the raw station sighting event ID:\n%s", snippet)
+	}
+	if !strings.Contains(snippet, "id: publicStationSightingID(event)") {
+		t.Fatalf("stationSightingsSince must use opaque station sighting IDs:\n%s", snippet)
+	}
+
+	start = strings.Index(source, "const sightings = projectedSightings.length || !serviceDate")
+	if start < 0 {
+		t.Fatalf("publicSearch fallback sightings anchor not found")
+	}
+	end = strings.Index(source[start:], "\n    for (const sighting of sightings)")
+	if end < 0 {
+		t.Fatalf("publicSearch fallback sightings end anchor not found")
+	}
+	snippet = source[start : start+end]
+	if strings.Contains(snippet, "id: asString(item.id).trim()") {
+		t.Fatalf("publicSearch fallback sightings must not expose raw station sighting event IDs:\n%s", snippet)
+	}
+	if !strings.Contains(snippet, "id: publicStationSightingID(item)") {
+		t.Fatalf("publicSearch fallback sightings must use opaque station sighting IDs:\n%s", snippet)
+	}
+}
+
+func TestPublicRiderCountsUseBuckets(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	if !strings.Contains(source, "function publicRiderCount(raw: number): number") {
+		t.Fatalf("Spacetime source missing public rider count helper")
+	}
+	for _, tc := range []struct {
+		name   string
+		anchor string
+		want   []string
+	}{
+		{
+			name:   "buildTrainCard",
+			anchor: "function buildTrainCard",
+			want: []string{
+				"const riders = activeRidersForTrain(tx, train.id);",
+				"riders: stableId ? riders : publicRiderCount(riders),",
+			},
+		},
+		{
+			name:   "buildPublicTrainView",
+			anchor: "function buildPublicTrainView",
+			want: []string{
+				"riders: publicRiderCount(activeRidersForTrain(tx, trainId)),",
+			},
+		},
+		{
+			name:   "publicDashboardPayload",
+			anchor: "function publicDashboardPayload",
+			want: []string{
+				"riders: publicRiderCount(activeRidersForTrain(tx, train.id)),",
+				"riders: publicRiderCount(Number(train.riders) || 0),",
+			},
+		},
+		{
+			name:   "publicServiceDayPayload",
+			anchor: "function publicServiceDayPayload",
+			want: []string{
+				"riders: publicRiderCount(activeRidersForTrain(tx, train.id)),",
+			},
+		},
+		{
+			name:   "refreshTripProjection",
+			anchor: "function refreshTripProjection",
+			want: []string{
+				"const publicRiders = publicRiderCount(activeRidersForTrain(tx, trainId));",
+				"riders: publicRiders,",
+			},
+		},
+		{
+			name:   "publicDashboardLive",
+			anchor: "export const publicDashboardLive",
+			want: []string{
+				"return projected.map(publicTripRow);",
+				"riders: publicRiderCount(activeRidersForTrain(ctx, trip.id)),",
+			},
+		},
+	} {
+		start := strings.Index(source, tc.anchor)
+		if start < 0 {
+			t.Fatalf("%s anchor not found", tc.name)
+		}
+		snippet := source[start:min(start+4000, len(source))]
+		for _, want := range tc.want {
+			if !strings.Contains(snippet, want) {
+				t.Fatalf("%s snippet missing %q in:\n%s", tc.name, want, snippet)
+			}
+		}
+	}
+}
+
+func TestPublicReporterCountsUseBuckets(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	if !strings.Contains(source, "function publicReporterCount(raw: number): number") {
+		t.Fatalf("Spacetime source missing public reporter count helper")
+	}
+	for _, tc := range []struct {
+		name   string
+		anchor string
+		want   []string
+	}{
+		{
+			name:   "buildTrainCard",
+			anchor: "function buildTrainCard",
+			want: []string{
+				"const status = buildTrainState(tx, train.id);",
+				"status: stableId ? status : publicTrainStatus(status),",
+			},
+		},
+		{
+			name:   "buildPublicTrainView",
+			anchor: "function buildPublicTrainView",
+			want: []string{
+				"status: publicTrainStatus(buildTrainState(tx, trainId)),",
+			},
+		},
+		{
+			name:   "publicDashboardPayload",
+			anchor: "function publicDashboardPayload",
+			want: []string{
+				"uniqueReporters: publicReporterCount(Number(status.uniqueReporters) || 0),",
+				"uniqueReporters: publicReporterCount(Number(train.uniqueReporters) || 0),",
+			},
+		},
+		{
+			name:   "publicServiceDayPayload",
+			anchor: "function publicServiceDayPayload",
+			want: []string{
+				"status: publicTrainStatus(buildTrainState(tx, train.id)),",
+			},
+		},
+		{
+			name:   "refreshTripProjection",
+			anchor: "function refreshTripProjection",
+			want: []string{
+				"const publicStatus = publicTrainStatus(status);",
+				"uniqueReporters: Number(publicStatus.uniqueReporters) || 0,",
+			},
+		},
+		{
+			name:   "publicDashboardLive",
+			anchor: "export const publicDashboardLive",
+			want: []string{
+				"return projected.map(publicTripRow);",
+				"uniqueReporters: publicReporterCount(Number(status.uniqueReporters) || 0),",
+			},
+		},
+	} {
+		start := strings.Index(source, tc.anchor)
+		if start < 0 {
+			t.Fatalf("%s anchor not found", tc.name)
+		}
+		snippet := source[start:min(start+4000, len(source))]
+		for _, want := range tc.want {
+			if !strings.Contains(snippet, want) {
+				t.Fatalf("%s snippet missing %q in:\n%s", tc.name, want, snippet)
+			}
+		}
+	}
+}
+
 func TestCleanupExpiredStateRemovesEmptyAnonymousViewerRows(t *testing.T) {
 	t.Parallel()
 
@@ -294,6 +521,15 @@ func readSpacetimeSource(t *testing.T) string {
 		t.Fatalf("read source: %v", err)
 	}
 	return string(body)
+}
+
+func sourceSnippet(t *testing.T, source string, anchor string, length int) string {
+	t.Helper()
+	start := strings.Index(source, anchor)
+	if start < 0 {
+		t.Fatalf("%s anchor not found", anchor)
+	}
+	return source[start:min(start+length, len(source))]
 }
 
 func min(left int, right int) int {

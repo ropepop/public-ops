@@ -18,6 +18,8 @@ type releaseInfo struct {
 	Commit         string
 	BuildTime      string
 	Dirty          string
+	ReleaseID      string
+	SourceSHA256   string
 	Instance       string
 	AppJSHash      string
 	AppCSSHash     string
@@ -54,6 +56,8 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 		Commit:         strings.TrimSpace(appversion.Commit),
 		BuildTime:      strings.TrimSpace(appversion.BuildTime),
 		Dirty:          strings.TrimSpace(appversion.Dirty),
+		ReleaseID:      strings.TrimSpace(appversion.ReleaseID),
+		SourceSHA256:   strings.TrimSpace(appversion.SourceSHA256),
 		Instance:       instanceID,
 		AppJSHash:      appJSHash,
 		AppCSSHash:     appCSSHash,

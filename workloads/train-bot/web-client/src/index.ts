@@ -975,7 +975,7 @@ class TrainAppLiveClient {
   }
 
   private tripPublicTable(source: any): any {
-    return pickAccessor(source, ["tripPublic", "trip_public", "trip", "trainbot_trip_public", "trainbot_trip"]);
+    return pickAccessor(source, ["tripPublic", "trip_public", "trainbot_trip_public"]);
   }
 
   private tripStopTable(source: any): any {
@@ -1247,7 +1247,7 @@ class TrainAppLiveClient {
     const projected = Array.isArray(trip?.recentTimeline)
       ? trip.recentTimeline.map((item: any) => ({
         at: asString(item.at),
-        signal: asString(item.signal),
+        eventLabel: asString(item.eventLabel || item.signal),
         count: Number(item.count) || 0,
       }))
       : [];
@@ -1255,7 +1255,7 @@ class TrainAppLiveClient {
     buckets.sort((left, right) => compareTimeDescending(asString(left.at), asString(right.at)));
     const mapped = buckets.map((item) => ({
       at: asString(item.at),
-      signal: asString(item.signal),
+      eventLabel: asString(item.eventLabel || item.signal),
       count: Number(item.count) || 0,
     }));
     return limit > 0 ? mapped.slice(0, limit) : mapped;
@@ -1277,7 +1277,6 @@ class TrainAppLiveClient {
         toStation: asString(train.toStationName),
         departureAt: asString(train.departureAt),
         arrivalAt: asString(train.arrivalAt),
-        sourceVersion: asString(train.sourceVersion),
       },
       status: this.trainState(asString(train.id)),
       riders: this.activeRidersForTrain(asString(train.id)),
@@ -1355,11 +1354,10 @@ class TrainAppLiveClient {
         id: asString(train.id),
         serviceDate: asString(train.serviceDate),
         fromStation: asString(train.fromStationName),
-        toStation: asString(train.toStationName),
-        departureAt: asString(train.departureAt),
-        arrivalAt: asString(train.arrivalAt),
-        sourceVersion: asString(train.sourceVersion),
-      },
+          toStation: asString(train.toStationName),
+          departureAt: asString(train.departureAt),
+          arrivalAt: asString(train.arrivalAt),
+        },
       status: this.trainState(trainId),
       riders: this.activeRidersForTrain(trainId),
       timeline: this.recentTimeline(trainId, 5),
@@ -1555,7 +1553,6 @@ class TrainAppLiveClient {
         toStation: asString(train.toStationName),
         departureAt: asString(train.departureAt),
         arrivalAt: asString(train.arrivalAt),
-        sourceVersion: asString(train.sourceVersion),
       },
       stops: this.tripStopsSorted(trainId),
       stationSightings: this.recentStationSightingsByTrain(trainId, 30, 10),
@@ -1573,7 +1570,6 @@ class TrainAppLiveClient {
         toStation: asString(train.toStationName),
         departureAt: asString(train.departureAt),
         arrivalAt: asString(train.arrivalAt),
-        sourceVersion: asString(train.sourceVersion),
       },
       status: this.trainState(asString(train.id)),
       riders: this.activeRidersForTrain(asString(train.id)),
@@ -1591,7 +1587,6 @@ class TrainAppLiveClient {
         toStation: asString(train.toStationName),
         departureAt: asString(train.departureAt),
         arrivalAt: asString(train.arrivalAt),
-        sourceVersion: asString(train.sourceVersion),
       },
       status: this.trainState(asString(train.id)),
       riders: this.activeRidersForTrain(asString(train.id)),

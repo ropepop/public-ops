@@ -92,3 +92,40 @@ func TestParseVehiclesResolvesStopNameThroughStopAlias(t *testing.T) {
 		t.Fatalf("vehicles[0].StopName = %q, want Slavu iela", vehicles[0].StopName)
 	}
 }
+
+func TestPublicLiveVehicleIDStaysStableAcrossMovement(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC)
+	first := model.LiveVehicle{
+		ID:             "bus:10:67133",
+		VehicleCode:    "67133",
+		Mode:           "bus",
+		RouteLabel:     "10",
+		Direction:      "a-b",
+		Latitude:       56.91413,
+		Longitude:      24.06852,
+		UpdatedAt:      now,
+		StopID:         "432",
+		ArrivalSeconds: 3600,
+		LiveRowID:      "67133",
+	}
+	moved := first
+	moved.Latitude = 56.91388
+	moved.Longitude = 24.06791
+	moved.UpdatedAt = now.Add(6 * time.Second)
+	moved.StopID = "433"
+	moved.ArrivalSeconds = 3612
+
+	publicFirst := PublicLiveVehicle(first, 0)
+	publicMoved := PublicLiveVehicle(moved, 7)
+	if publicFirst.ID == "" {
+		t.Fatalf("public live vehicle id is empty")
+	}
+	if publicFirst.ID != publicMoved.ID {
+		t.Fatalf("public live vehicle id changed across movement: %q -> %q", publicFirst.ID, publicMoved.ID)
+	}
+	if strings.Contains(publicFirst.ID, "67133") || publicFirst.VehicleCode != "" || publicFirst.LiveRowID != "" {
+		t.Fatalf("public live vehicle leaked raw vehicle identity: %+v", publicFirst)
+	}
+}

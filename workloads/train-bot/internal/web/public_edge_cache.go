@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-const (
-	cacheModeBypass   = "bypass"
-	cacheModeRedirect = "redirect"
-	cacheModeHit      = "versioned"
-)
-
 type publicEdgeCacheRouteKind string
 
 const (
@@ -34,6 +28,7 @@ const (
 	publicEdgeCacheTrainStopsKind        publicEdgeCacheRouteKind = "public_train_stops"
 	publicEdgeCacheIncidentsKind         publicEdgeCacheRouteKind = "public_incidents"
 	publicEdgeCacheIncidentDetailKind    publicEdgeCacheRouteKind = "public_incident_detail"
+	maxPublicEdgeCacheHTTPMaxAgeSec                               = 60
 )
 
 type publicEdgeCacheRoute struct {
@@ -144,6 +139,7 @@ type publicEdgeCache struct {
 type publicEdgeCacheState struct {
 	CatalogVersion       uint64            `json:"catalogVersion"`
 	LoadedServiceDate    string            `json:"loadedServiceDate,omitempty"`
+	LoadedScheduleID     string            `json:"loadedScheduleId,omitempty"`
 	ScheduleRoot         uint64            `json:"scheduleRoot"`
 	DashboardReportsRoot uint64            `json:"dashboardReportsRoot"`
 	NetworkSightingsRoot uint64            `json:"networkSightingsRoot"`
@@ -237,20 +233,37 @@ func (c *publicEdgeCache) ttl() int {
 	return c.ttlSec
 }
 
+func (c *publicEdgeCache) httpMaxAge() int {
+	ttl := c.ttl()
+	if ttl <= 0 || ttl > maxPublicEdgeCacheHTTPMaxAgeSec {
+		return maxPublicEdgeCacheHTTPMaxAgeSec
+	}
+	return ttl
+}
+
 func (c *publicEdgeCache) syncLoadedServiceDate(serviceDate string) {
+	c.syncLoadedSchedule(serviceDate, "")
+}
+
+func (c *publicEdgeCache) syncLoadedSchedule(serviceDate string, scheduleID string) {
 	trimmed := strings.TrimSpace(serviceDate)
 	if trimmed == "" {
 		return
+	}
+	trimmedScheduleID := strings.TrimSpace(scheduleID)
+	if trimmedScheduleID == "" {
+		trimmedScheduleID = trimmed
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.normalizeLocked()
-	if c.state.LoadedServiceDate == trimmed {
+	if c.state.LoadedServiceDate == trimmed && c.state.LoadedScheduleID == trimmedScheduleID {
 		return
 	}
 	c.state.LoadedServiceDate = trimmed
+	c.state.LoadedScheduleID = trimmedScheduleID
 	c.bumpCounterLocked(&c.state.ScheduleRoot)
 	c.bumpCounterLocked(&c.state.IncidentsListRoot)
 	clear(c.state.TrainVersion)
@@ -362,6 +375,7 @@ func (c *publicEdgeCache) versionFor(route publicEdgeCacheRoute) string {
 	case publicEdgeCacheIncidentDetailKind:
 		return publicEdgeCacheHashVersion(
 			string(route.kind),
+			strconv.FormatUint(c.state.ScheduleRoot, 10),
 			route.incidentID,
 			strconv.FormatUint(c.state.IncidentVersion[route.incidentID], 10),
 		)
@@ -400,21 +414,34 @@ func normalizePublicEdgeCacheQuery(query string) string {
 }
 
 func (s *Server) beginPublicEdgeCache(w http.ResponseWriter, r *http.Request, now time.Time, route publicEdgeCacheRoute) (*publicEdgeCacheDecision, bool) {
-	if s.publicEdgeCache == nil || r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return nil, false
 	}
-	s.publicEdgeCache.syncLoadedServiceDate(s.appLoadedServiceDate())
+	query := r.URL.Query()
+	if !publicEdgeCacheQueryAllowed(query, route) {
+		s.writeError(w, http.StatusBadRequest, "invalid query")
+		return nil, true
+	}
+	cvValues, hasCV := query["cv"]
+	if hasCV && len(cvValues) != 1 {
+		s.writeError(w, http.StatusBadRequest, "invalid cache version")
+		return nil, true
+	}
+	if s.publicEdgeCache == nil {
+		return nil, false
+	}
+	serviceDate, scheduleID := s.publicEdgeCacheScheduleState()
+	s.publicEdgeCache.syncLoadedSchedule(serviceDate, scheduleID)
 	if route.disallowSessionShare {
 		if _, ok := s.optionalSession(r, now); ok {
-			s.setPublicEdgeCacheDebugHeaders(w, route.sliceName(), "", cacheModeBypass)
 			return nil, false
 		}
 	}
 
 	version := s.publicEdgeCache.versionFor(route)
-	if strings.TrimSpace(r.URL.Query().Get("cv")) != version {
+	if !hasCV || strings.TrimSpace(cvValues[0]) != version {
 		s.setNoStoreHeaders(w)
-		s.setPublicEdgeCacheDebugHeaders(w, route.sliceName(), version, cacheModeRedirect)
+		s.setNoIndexHeaders(w)
 		redirectURL := cloneURLWithCacheVersion(r.URL, version)
 		w.Header().Set("Location", redirectURL)
 		w.WriteHeader(http.StatusTemporaryRedirect)
@@ -424,31 +451,58 @@ func (s *Server) beginPublicEdgeCache(w http.ResponseWriter, r *http.Request, no
 	return &publicEdgeCacheDecision{route: route, version: version}, false
 }
 
-func (s *Server) writePublicJSON(w http.ResponseWriter, status int, payload any, decision *publicEdgeCacheDecision) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if decision == nil || s.publicEdgeCache == nil {
-		s.setNoStoreHeaders(w)
-		if decision != nil {
-			s.setPublicEdgeCacheDebugHeaders(w, decision.route.sliceName(), decision.version, cacheModeBypass)
-		}
-	} else {
-		s.setImmutableHeadersWithTTL(w, s.publicEdgeCache.ttl())
-		s.setPublicEdgeCacheDebugHeaders(w, decision.route.sliceName(), decision.version, cacheModeHit)
+func publicEdgeCacheQueryAllowed(query url.Values, route publicEdgeCacheRoute) bool {
+	allowed := map[string]bool{"cv": true}
+	switch route.kind {
+	case publicEdgeCacheMessagesKind:
+		allowed["lang"] = true
+	case publicEdgeCacheDashboardKind, publicEdgeCacheIncidentsKind:
+		allowed["limit"] = true
+	case publicEdgeCacheStationSearchKind:
+		allowed["q"] = true
 	}
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	for key, values := range query {
+		if !allowed[key] || len(values) != 1 {
+			return false
+		}
+	}
+	return true
 }
 
-func (s *Server) setPublicEdgeCacheDebugHeaders(w http.ResponseWriter, slice string, version string, mode string) {
-	if strings.TrimSpace(slice) != "" {
-		w.Header().Set("X-Train-Bot-Cache-Slice", slice)
+func (s *Server) publicEdgeCacheScheduleState() (string, string) {
+	serviceDate := strings.TrimSpace(s.appLoadedServiceDate())
+	scheduleID := publicEdgeCacheHashVersion("app", serviceDate)
+	if s.bundleStore == nil {
+		return serviceDate, scheduleID
 	}
-	if strings.TrimSpace(version) != "" {
-		w.Header().Set("X-Train-Bot-Cache-Version", version)
+	metadata, err := s.bundleStore.bundleMetadata()
+	if err != nil || metadata == nil {
+		return serviceDate, scheduleID
 	}
-	if strings.TrimSpace(mode) != "" {
-		w.Header().Set("X-Train-Bot-Cache-Mode", mode)
+	bundleServiceDate := strings.TrimSpace(metadata.ServiceDate)
+	if bundleServiceDate != "" {
+		serviceDate = bundleServiceDate
 	}
+	return serviceDate, publicEdgeCacheHashVersion(
+		"bundle",
+		strings.TrimSpace(metadata.Version),
+		bundleServiceDate,
+		strings.TrimSpace(metadata.SourceVersion),
+		strings.TrimSpace(metadata.TransformVersion),
+	)
+}
+
+func (s *Server) writePublicJSON(w http.ResponseWriter, status int, payload any, decision *publicEdgeCacheDecision) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Vary", "Accept-Encoding")
+	s.setNoIndexHeaders(w)
+	if decision == nil || s.publicEdgeCache == nil {
+		s.setNoStoreHeaders(w)
+	} else {
+		s.setPublicCacheHeadersWithTTL(w, s.publicEdgeCache.httpMaxAge())
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(redactPublicJSONPayload(payload))
 }
 
 func cloneURLWithCacheVersion(rawURL *url.URL, version string) string {

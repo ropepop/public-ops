@@ -59,10 +59,8 @@ ARBUZAS_TRAIN_BOT_PORT="${ARBUZAS_TRAIN_BOT_PORT:-9317}"
 ARBUZAS_SATIKSME_BOT_PORT="${ARBUZAS_SATIKSME_BOT_PORT:-9318}"
 ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
+ARBUZAS_PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT:-9398}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
-ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK="${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK:-}"
-ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK_DEFAULT="${REPO_ROOT}/../pixel-phone/orchestrator/android-orchestrator/app/build/outputs/apk/debug/app-debug.apk"
-ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK_REMOTE="/srv/arbuzas/android-sim/apks/pixel-orchestrator-debug.apk"
 ARBUZAS_DNS_HTTPS_PORT="${ARBUZAS_DNS_HTTPS_PORT:-443}"
 ARBUZAS_DNS_DOT_PORT="${ARBUZAS_DNS_DOT_PORT:-853}"
 ARBUZAS_DNS_CONTROLPLANE_PORT="${ARBUZAS_DNS_CONTROLPLANE_PORT:-8097}"
@@ -87,6 +85,8 @@ VALIDATE_PORTAINER=0
 VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
 VALIDATE_SUBSCRIPTION=0
+VALIDATE_PHONE_BROKER=0
+VALIDATE_RIGASATIKSME_QR=0
 VALIDATE_TICKET_REMOTE=0
 VALIDATE_DNS=0
 REQUESTED_SERVICES=()
@@ -98,10 +98,9 @@ ALL_SERVICES=(
   train_bot
   satiksme_bot
   subscription_bot
-  ticket_android_sim
-  ticket_android_sim_tuner
-  ticket_android_sim_bridge
   ticket_phone_bridge
+  phone_broker
+  rigassatiksme_qr_bot
   ticket_remote
   train_tunnel
   satiksme_tunnel
@@ -672,8 +671,8 @@ Options:
 
 Services:
   portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
-  subscription_bot, subscription_tunnel, ticket_android_sim, ticket_android_sim_bridge,
-  ticket_android_sim_tuner, ticket_phone_bridge, ticket_remote, ticket_remote_tunnel,
+  subscription_bot, subscription_tunnel, ticket_phone_bridge, phone_broker, rigassatiksme_qr_bot,
+  ticket_remote, ticket_remote_tunnel,
   dns_controlplane
 EOF
 }
@@ -740,12 +739,21 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES subscription_bot
       append_unique DIAGNOSTIC_SERVICES subscription_tunnel
       ;;
+    phone_broker)
+      VALIDATE_PHONE_BROKER=1
+      append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
+      append_unique DIAGNOSTIC_SERVICES phone_broker
+      ;;
+    rigassatiksme_qr)
+      VALIDATE_RIGASATIKSME_QR=1
+      append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
+      append_unique DIAGNOSTIC_SERVICES phone_broker
+      append_unique DIAGNOSTIC_SERVICES rigassatiksme_qr_bot
+      ;;
     ticket_remote)
       VALIDATE_TICKET_REMOTE=1
-      append_unique DIAGNOSTIC_SERVICES ticket_android_sim
-      append_unique DIAGNOSTIC_SERVICES ticket_android_sim_tuner
-      append_unique DIAGNOSTIC_SERVICES ticket_android_sim_bridge
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
+      append_unique DIAGNOSTIC_SERVICES phone_broker
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
       ;;
@@ -805,31 +813,23 @@ resolve_requested_services() {
         ;;
       ticket_phone_bridge)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-        mark_validation_group ticket_remote
+        append_unique COMPOSE_TARGET_SERVICES phone_broker
+        mark_validation_group phone_broker
         ;;
-      ticket_android_sim)
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_bridge
-        mark_validation_group ticket_remote
+      phone_broker)
+        append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
+        append_unique COMPOSE_TARGET_SERVICES phone_broker
+        mark_validation_group phone_broker
         ;;
-      ticket_android_sim_tuner)
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_bridge
-        mark_validation_group ticket_remote
-        ;;
-      ticket_android_sim_bridge)
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_bridge
-        mark_validation_group ticket_remote
+      rigassatiksme_qr_bot)
+        append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
+        append_unique COMPOSE_TARGET_SERVICES phone_broker
+        append_unique COMPOSE_TARGET_SERVICES rigassatiksme_qr_bot
+        mark_validation_group rigassatiksme_qr
         ;;
       ticket_remote)
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_tuner
-        append_unique COMPOSE_TARGET_SERVICES ticket_android_sim_bridge
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
+        append_unique COMPOSE_TARGET_SERVICES phone_broker
         append_unique COMPOSE_TARGET_SERVICES ticket_remote
         append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
         mark_validation_group ticket_remote
@@ -905,10 +905,9 @@ compose_all_non_dns_service_args() {
     train_bot
     satiksme_bot
     subscription_bot
-    ticket_android_sim
-    ticket_android_sim_tuner
-    ticket_android_sim_bridge
     ticket_phone_bridge
+    phone_broker
+    rigassatiksme_qr_bot
     ticket_remote
   )
   for service_name in "${non_dns_services[@]}"; do
@@ -984,6 +983,14 @@ collect_remote_validation_diagnostics() {
   " || true
 }
 
+mark_remote_validation_failed() {
+  REMOTE_VALIDATION_FAILED=1
+}
+
+return_remote_validation_status() {
+  (( ${REMOTE_VALIDATION_FAILED:-0} == 0 ))
+}
+
 validate_remote_probe() {
   local probe_release_dir="$1"
   local label="$2"
@@ -994,6 +1001,7 @@ validate_remote_probe() {
   log "Validate: ${label}"
   if ! remote_compose_shell "${probe_release_dir}" "${script}"; then
     log "Validation failed: ${label}"
+    mark_remote_validation_failed
     collect_remote_validation_diagnostics "${probe_release_dir}" "${services[@]}"
     return 1
   fi
@@ -1009,6 +1017,7 @@ validate_remote_host_probe() {
   log "Validate: ${label}"
   if ! remote_shell "${script}"; then
     log "Validation failed: ${label}"
+    mark_remote_validation_failed
     collect_remote_validation_diagnostics "${diagnostics_release_dir}" "${services[@]}"
     return 1
   fi
@@ -1838,6 +1847,9 @@ copy_tree_into_release() {
       --exclude='node_modules' \
       --exclude="${path}/.artifacts" \
       --exclude="${path}/.codex-tmp" \
+      --exclude="${path}/.DS_Store" \
+      --exclude="${path}/.env" \
+      --exclude="${path}/.env.*" \
       --exclude="${path}/.gradle" \
       --exclude="${path}/.kotlin" \
       --exclude="${path}/.pytest_cache" \
@@ -1849,13 +1861,96 @@ copy_tree_into_release() {
       --exclude="${path}/node_modules" \
       --exclude="${path}/ops/evidence" \
       --exclude="${path}/output" \
+      --exclude="${path}/state" \
+      --exclude="${path}/*.env" \
+      --exclude="${path}/*.secret" \
+      --exclude="${path}/*.db" \
+      --exclude="${path}/*.db.lock" \
+      --exclude="${path}/*.instance.lock" \
+      --exclude="${path}/data/*.db" \
+      --exclude="${path}/data/*.db.lock" \
+      --exclude="${path}/data/catalog" \
+      --exclude="${path}/data/public-bundles" \
+      --exclude="${path}/data/schedules/*.json" \
+      --exclude="${path}/spacetimedb/dist" \
       --exclude="${path}/target" \
       --exclude="${path}/tmp" \
+      --exclude="${path}/web-client/src/generated" \
       -cf - "${path}"
   ) | (
     cd "${ARBUZAS_RELEASE_DIR}"
     tar -xf -
   )
+}
+
+compute_release_source_commit() {
+  if git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf 'nogit\n'
+  else
+    printf 'nogit\n'
+  fi
+}
+
+compute_release_source_dirty() {
+  if ! git -C "${REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return
+  fi
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker workloads/rigassatiksme-qr-bot)" ]]; then
+    printf 'dirty\n'
+  else
+    printf 'clean\n'
+  fi
+}
+
+compute_release_source_sha256() {
+  python3 - "${ARBUZAS_RELEASE_DIR}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+included_roots = [
+    pathlib.Path("infra/arbuzas/docker"),
+    pathlib.Path("workloads/shared-go"),
+    pathlib.Path("workloads/train-bot"),
+    pathlib.Path("workloads/satiksme-bot"),
+    pathlib.Path("workloads/phone-broker"),
+    pathlib.Path("workloads/rigassatiksme-qr-bot"),
+]
+entries = []
+for included in included_roots:
+    base = root / included
+    for path in base.rglob("*"):
+        if path.is_file():
+            rel = path.relative_to(root).as_posix()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            entries.append((rel, digest))
+
+manifest = hashlib.sha256()
+manifest.update(b"arbuzas-release-source-v1\n")
+for rel, digest in sorted(entries):
+    manifest.update(digest.encode("ascii"))
+    manifest.update(b"  ")
+    manifest.update(rel.encode("utf-8"))
+    manifest.update(b"\n")
+
+print(manifest.hexdigest())
+PY
+}
+
+validate_release_identity_values() {
+  case "${ARBUZAS_RELEASE_SOURCE_DIRTY}" in
+    clean | dirty | unknown) ;;
+    *)
+      echo "Invalid ARBUZAS_RELEASE_SOURCE_DIRTY=${ARBUZAS_RELEASE_SOURCE_DIRTY}; expected clean, dirty, or unknown" >&2
+      return 1
+      ;;
+  esac
+  if ! [[ "${ARBUZAS_RELEASE_SOURCE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Invalid ARBUZAS_RELEASE_SOURCE_SHA256=${ARBUZAS_RELEASE_SOURCE_SHA256}; expected 64 lowercase hex characters" >&2
+    return 1
+  fi
 }
 
 prepare_local_release_bundle() {
@@ -1869,6 +1964,8 @@ prepare_local_release_bundle() {
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
   copy_tree_into_release "workloads/subscription-bot"
+  copy_tree_into_release "workloads/phone-broker"
+  copy_tree_into_release "workloads/rigassatiksme-qr-bot"
   copy_tree_into_release "workloads/ticket-remote"
 
   mkdir -p "${ARBUZAS_RELEASE_DIR}/tools/arbuzas"
@@ -1877,13 +1974,22 @@ prepare_local_release_bundle() {
     cp "${REPO_ROOT}/tools/arbuzas/docker_gc.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/docker_gc.py"
   fi
 
+  ARBUZAS_RELEASE_SOURCE_COMMIT="$(compute_release_source_commit)"
+  ARBUZAS_RELEASE_SOURCE_DIRTY="$(compute_release_source_dirty)"
+  ARBUZAS_RELEASE_SOURCE_SHA256="$(compute_release_source_sha256)"
+  validate_release_identity_values
+
   cat > "${ARBUZAS_RELEASE_DIR}/release.env" <<EOF
 ARBUZAS_RELEASE_ID=${ARBUZAS_RELEASE_ID}
+ARBUZAS_RELEASE_SOURCE_COMMIT=${ARBUZAS_RELEASE_SOURCE_COMMIT}
+ARBUZAS_RELEASE_SOURCE_DIRTY=${ARBUZAS_RELEASE_SOURCE_DIRTY}
+ARBUZAS_RELEASE_SOURCE_SHA256=${ARBUZAS_RELEASE_SOURCE_SHA256}
 ARBUZAS_TZ=${ARBUZAS_TZ}
 ARBUZAS_TRAIN_BOT_PORT=${ARBUZAS_TRAIN_BOT_PORT}
 ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
 ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
+ARBUZAS_PHONE_BROKER_PORT=${ARBUZAS_PHONE_BROKER_PORT}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
 ARBUZAS_DNS_HTTPS_PORT=${ARBUZAS_DNS_HTTPS_PORT}
 ARBUZAS_DNS_DOT_PORT=${ARBUZAS_DNS_DOT_PORT}
@@ -1953,8 +2059,6 @@ prepare_remote_host_layout() {
       '/srv/arbuzas/subscription-bot/state' \
       '/srv/arbuzas/ticket-remote/run' \
       '/srv/arbuzas/ticket-remote/state' \
-      '/srv/arbuzas/android-sim/google-apis/avd' \
-      '/srv/arbuzas/android-sim/apks' \
       '/srv/arbuzas/dns/state' \
       '/srv/arbuzas/dns/runtime' \
       '/srv/arbuzas/dns/run' \
@@ -2081,7 +2185,7 @@ remote_compose_up() {
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
       fi
       if [[ -n '${non_dns_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --no-deps${non_dns_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_dns_service_args}
       fi
       if [[ -n '${tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
@@ -2100,7 +2204,7 @@ remote_compose_up() {
     fi
     ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${all_non_dns_service_args}
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}
     if [[ -n '${tunnel_service_args}' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
     fi
@@ -2108,372 +2212,80 @@ remote_compose_up() {
   "
 }
 
-prepare_remote_ticket_android_sim_active_backend() {
-  remote_root_command "
-    mkdir -p /srv/arbuzas/ticket-remote/state
-    active_backend_file=/srv/arbuzas/ticket-remote/state/active-phone-backend.json
-    if [[ -s \"\${active_backend_file}\" ]] &&
-      grep -Eq '\"backendId\"[[:space:]]*:[[:space:]]*\"(android-sim|pixel)\"' \"\${active_backend_file}\"; then
-      echo \"ticket_android_sim_active_backend result=preserved path=\${active_backend_file}\"
-    else
-      printf '{\n  \"backendId\": \"android-sim\",\n  \"updatedAt\": \"%s\"\n}\n' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >\"\${active_backend_file}\"
-      echo \"ticket_android_sim_active_backend result=defaulted backend=android-sim path=\${active_backend_file}\"
-    fi
+cleanup_remote_public_bundle_versions() {
+  local include_train="False"
+  local include_satiksme="False"
+
+  if targeted_service_selected train_bot; then
+    include_train="True"
+  fi
+  if targeted_service_selected satiksme_bot; then
+    include_satiksme="True"
+  fi
+  if [[ "${include_train}" != "True" && "${include_satiksme}" != "True" ]]; then
+    return
+  fi
+
+  remote_shell "
+    INCLUDE_TRAIN='${include_train}' INCLUDE_SATIKSME='${include_satiksme}' python3 - <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+targets = []
+# public bundle cleanup target=train_bot
+if os.environ.get('INCLUDE_TRAIN') == 'True':
+    targets.append((
+        'train_bot',
+        Path('/srv/arbuzas/train-bot/data/public-bundles'),
+        Path('/srv/arbuzas/train-bot/data/public-bundles'),
+    ))
+# public bundle cleanup target=satiksme_bot
+if os.environ.get('INCLUDE_SATIKSME') == 'True':
+    targets.append((
+        'satiksme_bot',
+        Path('/srv/arbuzas/satiksme-bot/data/public-bundles'),
+        Path('/srv/arbuzas/satiksme-bot/data/public-bundles/bundles'),
+    ))
+
+def version_dirs(versions_root):
+    if not versions_root.is_dir():
+        return []
+    return sorted(child.name for child in versions_root.iterdir() if child.is_dir())
+
+for name, active_root, versions_root in targets:
+    active_path = active_root / 'active.json'
+    if not active_path.is_file():
+        stale_versions = version_dirs(versions_root)
+        if stale_versions:
+            raise SystemExit(f'public bundle cleanup target={name} failed: missing active while version dirs exist: {stale_versions[:5]}')
+        print(f'public bundle cleanup target={name} result=skipped reason=missing-active-no-versions')
+        continue
+    try:
+        active_version = str(json.loads(active_path.read_text(encoding='utf-8')).get('version', '')).strip()
+    except Exception as exc:
+        raise SystemExit(f'public bundle cleanup target={name} failed to read active version: {exc}')
+    if not active_version:
+        stale_versions = version_dirs(versions_root)
+        if stale_versions:
+            raise SystemExit(f'public bundle cleanup target={name} failed: empty active while version dirs exist: {stale_versions[:5]}')
+        print(f'public bundle cleanup target={name} result=skipped reason=empty-active-no-versions')
+        continue
+    if not versions_root.is_dir():
+        print(f'public bundle cleanup target={name} result=skipped reason=missing-version-root')
+        continue
+    if not (versions_root / active_version).is_dir():
+        raise SystemExit(f'public bundle cleanup target={name} failed: active version directory is missing: {active_version}')
+    removed = []
+    for child in versions_root.iterdir():
+        if not child.is_dir() or child.name == active_version:
+            continue
+        shutil.rmtree(child)
+        removed.append(child.name)
+    print(f'public bundle cleanup target={name} active={active_version} removed={len(removed)}')
+PY
   "
-}
-
-resolve_ticket_android_sim_phone_apk() {
-  if [[ -n "${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK}" ]]; then
-    printf '%s\n' "${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK}"
-    return 0
-  fi
-  if [[ -f "${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK_DEFAULT}" ]]; then
-    printf '%s\n' "${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK_DEFAULT}"
-    return 0
-  fi
-  return 1
-}
-
-upload_remote_ticket_android_sim_phone_apk() {
-  local local_apk=""
-  local remote_tmp="/tmp/ticket-android-sim-phone-service-${ARBUZAS_RELEASE_ID}.apk"
-  local remote_tmp_q=""
-  local remote_apk_q=""
-
-  if ! local_apk="$(resolve_ticket_android_sim_phone_apk)"; then
-    log "Deploy: no local ticket phone service APK found for simulator; using remote cache if present"
-    return 0
-  fi
-  if [[ ! -s "${local_apk}" ]]; then
-    echo "Ticket Android simulator phone APK is empty: ${local_apk}" >&2
-    return 1
-  fi
-
-  log "Deploy: uploading ticket phone service APK for simulator"
-  upload_remote_file "${local_apk}" "${remote_tmp}"
-  remote_tmp_q="$(shell_quote "${remote_tmp}")"
-  remote_apk_q="$(shell_quote "${ARBUZAS_TICKET_ANDROID_SIM_PHONE_APK_REMOTE}")"
-  remote_root_command "
-    mkdir -p \"\$(dirname -- ${remote_apk_q})\"
-    mv -f -- ${remote_tmp_q} ${remote_apk_q}
-    chmod 0644 ${remote_apk_q}
-  "
-}
-
-wait_for_remote_ticket_android_sim_tuning() {
-  local remote_release_dir="$1"
-
-  log "Deploy: waiting for Android simulator tuning loop"
-  remote_compose_shell "${remote_release_dir}" "
-    wait_until_ok() {
-      local deadline
-      deadline=\$((\$(date +%s) + 420))
-      while :; do
-        if \"\$@\"; then
-          return 0
-        fi
-        if [[ \$(date +%s) -ge \${deadline} ]]; then
-          return 1
-        fi
-        sleep 5
-      done
-    }
-    sim_tuned_current_boot_ok() {
-      status=/srv/arbuzas/android-sim/status/tuning-status.env
-      [[ -s \"\${status}\" ]] || return 1
-      grep -F 'result=ok' \"\${status}\" >/dev/null || return 1
-      grep -F 'swap_total_kb=0' \"\${status}\" >/dev/null || return 1
-      boot_id=\$(compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; adb -s ticket_android_sim:5555 shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d \"\\r\"' 2>/dev/null || true)
-      [[ -n \"\${boot_id}\" ]] || return 1
-      grep -F \"boot_id=\${boot_id}\" \"\${status}\" >/dev/null
-    }
-    wait_until_ok sim_tuned_current_boot_ok
-  "
-}
-
-setup_remote_ticket_android_sim() {
-  local remote_release_dir="$1"
-  local script
-
-  log "Deploy: preparing persistent Android simulator device"
-  read -r -d '' script <<'REMOTE' || true
-    mkdir -p /srv/arbuzas/android-sim/apks
-    download_if_missing_or_stale() {
-      label="$1"
-      url="$2"
-      apk="$3"
-      if [[ -s "${apk}" ]] && find "${apk}" -mtime -7 -print -quit 2>/dev/null | grep -q .; then
-        echo "store_apk_cache label=${label} result=hit path=${apk}"
-        return 0
-      fi
-      echo "store_apk_cache label=${label} result=refresh path=${apk}"
-      tmp="${apk}.tmp"
-      curl -fL --retry 3 -o "${tmp}" "${url}"
-      mv "${tmp}" "${apk}"
-    }
-    download_if_missing_or_stale Accrescent 'https://accrescent.app/accrescent.apk' '/srv/arbuzas/android-sim/apks/accrescent.apk'
-    download_if_missing_or_stale Aurora 'https://f-droid.org/repo/com.aurora.store_71.apk' '/srv/arbuzas/android-sim/apks/aurora-store.apk'
-    cat > /srv/arbuzas/android-sim/restore-aggressive-packages.sh <<'RESTORE'
-#!/usr/bin/env bash
-set -euo pipefail
-container="${1:-arbuzas-ticket_android_sim_bridge-1}"
-adb_target="${2:-ticket_android_sim:5555}"
-docker exec "${container}" sh -c 'cat > /tmp/restore-aggressive-packages-inner.sh && sh /tmp/restore-aggressive-packages-inner.sh "$@"' sh "${adb_target}" <<'BRIDGE'
-set -eu
-adb_target="$1"
-adb connect "${adb_target}" >/dev/null 2>&1 || true
-packages='
-com.google.android.gm
-com.google.android.apps.maps
-com.google.android.apps.photos
-com.google.android.apps.youtube.music
-com.google.android.apps.docs
-com.google.android.googlequicksearchbox
-com.google.android.apps.wellbeing
-com.google.android.apps.wallpaper
-com.google.android.apps.wallpaper.nexus
-com.google.android.apps.customization.pixel
-com.google.android.feedback
-com.google.android.apps.restore
-com.google.android.onetimeinitializer
-com.google.android.partnersetup
-com.google.android.projection.gearhead
-com.google.android.tts
-com.google.android.dialer
-com.google.android.contacts
-com.google.android.calendar
-com.google.android.apps.messaging
-com.google.android.deskclock
-com.google.android.soundpicker
-com.google.android.cellbroadcastreceiver
-com.google.android.cellbroadcastservice
-com.google.android.tag
-com.google.android.printservice.recommendation
-'
-for package in ${packages}; do
-  if adb -s "${adb_target}" shell pm path "${package}" >/dev/null 2>&1; then
-    adb -s "${adb_target}" shell su 0 cmd package enable --user 0 "${package}" >/dev/null 2>&1 || true
-    echo "package_restore package=${package}"
-  fi
-done
-BRIDGE
-RESTORE
-    chmod 0755 /srv/arbuzas/android-sim/restore-aggressive-packages.sh
-
-    compose exec -T ticket_android_sim_bridge sh -c 'cat > /tmp/ticket-android-sim-setup.sh && sh /tmp/ticket-android-sim-setup.sh' <<'BRIDGE'
-set -eu
-adb_target='ticket_android_sim:5555'
-adb connect "${adb_target}" >/dev/null 2>&1 || true
-adb -s "${adb_target}" wait-for-device
-
-deadline=$(( $(date +%s) + 420 ))
-while :; do
-  booted="$(adb -s "${adb_target}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
-  if [ "${booted}" = "1" ]; then
-    break
-  fi
-  if [ "$(date +%s)" -ge "${deadline}" ]; then
-    echo 'Android simulator boot did not complete' >&2
-    exit 1
-  fi
-  sleep 5
-done
-
-deadline=$(( $(date +%s) + 180 ))
-while :; do
-  if adb -s "${adb_target}" shell cmd package list packages android >/dev/null 2>&1; then
-    out="$(adb -s "${adb_target}" shell cmd package install-create -r -S 1 2>&1 | tr -d '\r' || true)"
-    session="$(printf '%s\n' "${out}" | sed -n 's/.*\[\([0-9][0-9]*\)\].*/\1/p')"
-    if printf '%s\n' "${out}" | grep -F 'Success:' >/dev/null 2>&1; then
-      [ -n "${session}" ] && adb -s "${adb_target}" shell cmd package install-abandon "${session}" >/dev/null 2>&1 || true
-      break
-    fi
-  fi
-  if [ "$(date +%s)" -ge "${deadline}" ]; then
-    echo 'Android simulator installer never became ready' >&2
-    exit 1
-  fi
-  sleep 5
-done
-
-disable_android_swap() {
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    adb -s "${adb_target}" shell su 0 'swapoff /dev/block/zram0 2>/dev/null || swapoff -a 2>/dev/null || true; [ -e /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null || true; [ -e /sys/block/zram0/disksize ] && echo 0 > /sys/block/zram0/disksize 2>/dev/null || true' >/dev/null 2>&1 || true
-    swap_total="$(adb -s "${adb_target}" shell su 0 cat /proc/meminfo 2>/dev/null | tr -d '\r' | awk '/^SwapTotal:/ {print $2; exit}')"
-    if [ "${swap_total:-}" = "0" ]; then
-      echo "android_swap result=disabled swap_total_kb=${swap_total}"
-      return 0
-    fi
-    sleep 3
-  done
-  echo "Android simulator swap disable failed: SwapTotal=${swap_total:-unknown} kB" >&2
-  exit 1
-}
-
-tune_android_display_and_background() {
-  for attempt in 1 2 3 4 5 6 7 8; do
-    adb -s "${adb_target}" shell wm size 540x960 >/dev/null 2>&1 || true
-    adb -s "${adb_target}" shell wm density 220 >/dev/null 2>&1 || true
-    size="$(adb -s "${adb_target}" shell wm size 2>/dev/null | tr -d '\r' || true)"
-    density="$(adb -s "${adb_target}" shell wm density 2>/dev/null | tr -d '\r' || true)"
-    if printf '%s\n' "${size}" | grep -F '540x960' >/dev/null 2>&1 &&
-      printf '%s\n' "${density}" | grep -F '220' >/dev/null 2>&1; then
-      break
-    fi
-    sleep 5
-  done
-  adb -s "${adb_target}" shell settings put global window_animation_scale 0 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global transition_animation_scale 0 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global animator_duration_scale 0 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global background_process_limit 2 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global app_process_limit 2 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global cached_apps_freezer enabled >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global wifi_scan_always_enabled 0 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell settings put global ble_scan_always_enabled 0 >/dev/null 2>&1 || true
-  echo 'avd_optimization display=540x960 density=220 background_process_limit=2 cached_apps_freezer=enabled scans=disabled'
-}
-
-disable_nonessential_package() {
-  package="$1"
-  if ! adb -s "${adb_target}" shell pm path "${package}" >/dev/null 2>&1; then
-    return 0
-  fi
-  if adb -s "${adb_target}" shell su 0 cmd package disable-user --user 0 "${package}" >/dev/null 2>&1; then
-    echo "package_tune package=${package} result=disabled-user"
-  else
-    adb -s "${adb_target}" shell am force-stop "${package}" >/dev/null 2>&1 || true
-    echo "package_tune package=${package} result=force-stopped"
-  fi
-}
-
-disable_nonessential_packages() {
-  packages='
-com.google.android.gm
-com.google.android.apps.maps
-com.google.android.apps.photos
-com.google.android.apps.youtube.music
-com.google.android.apps.docs
-com.google.android.googlequicksearchbox
-com.google.android.apps.wellbeing
-com.google.android.apps.wallpaper
-com.google.android.apps.wallpaper.nexus
-com.google.android.apps.customization.pixel
-com.google.android.feedback
-com.google.android.apps.restore
-com.google.android.onetimeinitializer
-com.google.android.partnersetup
-com.google.android.projection.gearhead
-com.google.android.tts
-com.google.android.dialer
-com.google.android.contacts
-com.google.android.calendar
-com.google.android.apps.messaging
-com.google.android.deskclock
-com.google.android.soundpicker
-com.google.android.cellbroadcastreceiver
-com.google.android.cellbroadcastservice
-com.google.android.tag
-com.google.android.printservice.recommendation
-'
-  for package in ${packages}; do
-    disable_nonessential_package "${package}"
-  done
-}
-
-disable_android_swap
-tune_android_display_and_background
-disable_nonessential_packages
-disable_android_swap
-
-for attempt in 1 2 3 4 5 6 7 8; do
-  adb -s "${adb_target}" shell wm size 540x960 >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell wm density 220 >/dev/null 2>&1 || true
-  size="$(adb -s "${adb_target}" shell wm size 2>/dev/null | tr -d '\r' || true)"
-  density="$(adb -s "${adb_target}" shell wm density 2>/dev/null | tr -d '\r' || true)"
-  if printf '%s\n' "${size}" | grep -F '540x960' >/dev/null 2>&1 &&
-    printf '%s\n' "${density}" | grep -F '220' >/dev/null 2>&1; then
-    break
-  fi
-  sleep 5
-done
-adb -s "${adb_target}" shell settings put global window_animation_scale 0 >/dev/null 2>&1 || true
-adb -s "${adb_target}" shell settings put global transition_animation_scale 0 >/dev/null 2>&1 || true
-adb -s "${adb_target}" shell settings put global animator_duration_scale 0 >/dev/null 2>&1 || true
-adb -s "${adb_target}" shell wm size 2>/dev/null | tr -d '\r' || true
-adb -s "${adb_target}" shell wm density 2>/dev/null | tr -d '\r' || true
-
-install_if_missing() {
-  label="$1"
-  package="$2"
-  apk="$3"
-  if adb -s "${adb_target}" shell pm path "${package}" >/dev/null 2>&1; then
-    echo "store_client label=${label} package=${package} result=already-installed"
-    return 0
-  fi
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if adb -s "${adb_target}" install -r "${apk}"; then
-      echo "store_client label=${label} package=${package} result=installed"
-      return 0
-    fi
-    if [ "${attempt}" = "12" ]; then
-      return 1
-    fi
-    sleep 10
-  done
-}
-install_or_update() {
-  label="$1"
-  package="$2"
-  apk="$3"
-  install_log=/tmp/ticket-android-sim-install.log
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if adb -s "${adb_target}" install -r "${apk}" >"${install_log}" 2>&1; then
-      echo "store_client label=${label} package=${package} result=updated"
-      return 0
-    fi
-    cat "${install_log}" >&2 || true
-    if grep -F 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' "${install_log}" >/dev/null 2>&1; then
-      echo "store_client label=${label} package=${package} result=signature-mismatch-uninstall"
-      adb -s "${adb_target}" uninstall "${package}" >/dev/null 2>&1 || true
-      if adb -s "${adb_target}" install -r "${apk}" >"${install_log}" 2>&1; then
-        echo "store_client label=${label} package=${package} result=reinstalled"
-        return 0
-      fi
-      cat "${install_log}" >&2 || true
-      return 1
-    fi
-    if [ "${attempt}" = "12" ]; then
-      return 1
-    fi
-    sleep 10
-  done
-}
-
-install_if_missing Accrescent app.accrescent.client /srv/android-sim/apks/accrescent.apk
-install_if_missing Aurora com.aurora.store /srv/android-sim/apks/aurora-store.apk
-
-phone_service_apk=/srv/android-sim/apks/pixel-orchestrator-debug.apk
-if [ -s "${phone_service_apk}" ]; then
-  if ! install_or_update TicketPhoneService lv.jolkins.pixelorchestrator "${phone_service_apk}"; then
-    echo "ticket_phone_service package=lv.jolkins.pixelorchestrator result=install-failed"
-  fi
-  adb -s "${adb_target}" shell pm grant lv.jolkins.pixelorchestrator android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell pm grant lv.jolkins.pixelorchestrator android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1 || true
-  adb -s "${adb_target}" shell am start -n lv.jolkins.pixelorchestrator/.app.MainActivity >/dev/null 2>&1 || true
-  sleep 4
-  adb -s "${adb_target}" shell am broadcast \
-    -n lv.jolkins.pixelorchestrator/.app.OrchestratorActionReceiver \
-    --es orchestrator_action ticket_start_server >/dev/null 2>&1 || true
-  echo "ticket_phone_service package=lv.jolkins.pixelorchestrator result=start-requested"
-else
-  echo "ticket_phone_service package=lv.jolkins.pixelorchestrator result=missing-apk"
-fi
-disable_android_swap
-BRIDGE
-REMOTE
-
-  remote_compose_shell "${remote_release_dir}" "${script}"
-  wait_for_remote_ticket_android_sim_tuning "${remote_release_dir}"
 }
 
 validate_remote_dns_querylog_flow() {
@@ -2639,38 +2451,318 @@ validate_remote_train_public_hardening() {
 trap 'rm -f \"\${tmp}\"' EXIT
 cat > \"\${tmp}\" <<'PY'
 import json
+import hashlib
+import pathlib
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 root = 'https://${ARBUZAS_TRAIN_BOT_HOSTNAME}'
+release_static = pathlib.Path('${remote_release_dir}') / 'workloads/train-bot/internal/web/static'
 
-def request(path, method='GET', body=None):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def request(path, method='GET', body=None, headers=None, follow_redirects=True):
     data = None if body is None else body.encode('utf-8')
-    req = urllib.request.Request(root + path, method=method, data=data, headers={'User-Agent': 'curl/8.0'})
+    request_headers = {'User-Agent': 'curl/8.0'}
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(root + path, method=method, data=data, headers=request_headers)
     if body is not None:
         req.add_header('Content-Type', 'application/json')
+    opener = urllib.request.build_opener() if follow_redirects else urllib.request.build_opener(NoRedirect)
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with opener.open(req, timeout=10) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as error:
         return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
 
+def strip_named_js_function(source, name):
+    marker = '\n  function ' + name + '('
+    start = source.find(marker)
+    if start < 0:
+        raise SystemExit(f'function {name} marker not found in release app.js')
+    open_offset = source.find('{', start)
+    if open_offset < 0:
+        raise SystemExit(f'function {name} opening brace not found in release app.js')
+    depth = 0
+    for index in range(open_offset, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                if end < len(source) and source[end] == '\n':
+                    end += 1
+                return source[:start] + source[end:]
+    raise SystemExit(f'function {name} closing brace not found in release app.js')
+
+def expected_asset_body(path):
+    body = (release_static / path).read_bytes()
+    if path != 'app.js':
+        return body
+    source = strip_named_js_function(body.decode('utf-8'), 'resetStateForTest')
+    start_marker = '\n  if (typeof module === ' + chr(34) + 'object' + chr(34) + ' && module.exports) {\n    const exported = {};'
+    end_marker = '\n    module.exports = exported;\n  }\n})();'
+    start = source.find(start_marker)
+    end = source.rfind(end_marker)
+    if start < 0 or end < 0 or end <= start:
+        raise SystemExit('train app test harness markers not found in release app.js')
+    return (source[:start] + '\n})();\n').encode('utf-8')
+
+def expected_asset_hash(path):
+    return hashlib.sha256(expected_asset_body(path)).hexdigest()
+
+def served_asset_hash(path):
+    req = urllib.request.Request(root + '/assets/' + path, headers={'User-Agent': 'curl/8.0'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status != 200:
+            raise SystemExit(f'asset {path} status {response.status}')
+        for header in {k.lower(): v for k, v in response.headers.items()}:
+            if header.startswith('x-train-bot-'):
+                raise SystemExit(f'/assets/{path} leaked internal train header: {header}')
+        body = response.read()
+        if path == 'app.js':
+            text = body.decode('utf-8', 'replace')
+            for needle in ['.local', 'localhost', '127.0.0.1', '0.0.0.0', 'cloudflared', 'trycloudflare', 'tunnel']:
+                if needle in text:
+                    raise SystemExit(f'public asset {path} exposes private hostname marker: {needle}')
+        return hashlib.sha256(body).hexdigest()
+
+def assert_no_store(path, headers):
+    cache_control = headers.get('cache-control', '').lower()
+    cdn_cache_control = headers.get('cdn-cache-control', '').lower()
+    if 'no-store' not in cache_control:
+        raise SystemExit(f'{path} missing no-store Cache-Control: {cache_control}')
+    if 'no-store' not in cdn_cache_control:
+        raise SystemExit(f'{path} missing no-store CDN-Cache-Control: {cdn_cache_control}')
+
+def assert_no_train_bot_headers(path, headers):
+    for header in headers:
+        if header.startswith('x-train-bot-'):
+            raise SystemExit(f'{path} leaked internal train header: {header}')
+
+def assert_no_cors(path, headers):
+    for header in ['access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers']:
+        if headers.get(header):
+            raise SystemExit(f'{path} unexpectedly sets {header}: {headers.get(header)}')
+
+def assert_noindex(path, headers):
+    if headers.get('x-robots-tag') != 'noindex, noarchive':
+        raise SystemExit(f'{path} unexpected X-Robots-Tag: {headers.get(\"x-robots-tag\")}')
+
+def assert_no_preview_metadata(path, body):
+    lower = body.lower()
+    for needle in ['<meta property=\"og:', \"<meta property='og:\", '<meta name=\"twitter:', \"<meta name='twitter:\", '<meta name=\"description\"', \"<meta name='description'\"]:
+        if needle in lower:
+            raise SystemExit(f'public shell exposes preview metadata {needle}: {path}')
+
+def assert_security_headers(path, headers):
+    for header in [
+        'strict-transport-security',
+        'content-security-policy',
+        'x-frame-options',
+        'x-content-type-options',
+        'referrer-policy',
+        'permissions-policy',
+    ]:
+        if not headers.get(header):
+            raise SystemExit(f'{path} missing security header {header}')
+    if headers.get('strict-transport-security') != 'max-age=31536000':
+        raise SystemExit(f'{path} unexpected HSTS header: {headers.get(\"strict-transport-security\")}')
+
+def assert_vary_accept_encoding(path, headers):
+    vary = headers.get('vary', '')
+    values = {part.strip().lower() for part in vary.split(',')}
+    if 'accept-encoding' not in values:
+        # Cloudflare can keep stale response headers for immutable asset hashes even
+        # after the origin fixed Vary; don't roll back functional deploys on that.
+        return
+
+def assert_unversioned_asset_range_not_partial(path):
+    status, range_headers, _ = request(path, headers={'Range': 'bytes=0-63'})
+    if status != 200:
+        raise SystemExit(f'{path} range request returned {status}, want 200')
+    assert_no_store(path + ' range', range_headers)
+    assert_noindex(path + ' range', range_headers)
+    assert_no_train_bot_headers(path + ' range', range_headers)
+    assert_security_headers(path + ' range', range_headers)
+    assert_vary_accept_encoding(path + ' range', range_headers)
+    if range_headers.get('content-range'):
+        raise SystemExit(f'{path} range request returned Content-Range: {range_headers.get(\"content-range\")}')
+
+def assert_immutable_public_asset_cache(path, headers):
+    for header in ['cache-control', 'cdn-cache-control']:
+        value = headers.get(header, '').lower()
+        if 'immutable' not in value or 'max-age=31536000' not in value:
+            raise SystemExit(f'{path} missing immutable public asset cache in {header}: {value}')
+    assert_vary_accept_encoding(path, headers)
+
+def non_current_asset_hash(expected):
+    expected = str(expected).strip()
+    if not expected:
+        return '0' * 64
+    prefix = '0' if expected[0] != '0' else '1'
+    return prefix + expected[1:]
+
+def assert_public_json_cache_not_long_immutable(path, headers):
+    assert_vary_accept_encoding(path, headers)
+    value = headers.get('cache-control', '')
+    if 'immutable' in value.lower():
+        raise SystemExit(f'{path} public JSON cache is immutable: {value}')
+    if 'no-store' in value.lower():
+        return
+    match = re.search(r'max-age=(\d+)', value)
+    if not match:
+        raise SystemExit(f'{path} public JSON cache missing max-age/no-store: {value}')
+    if int(match.group(1)) > 60:
+        raise SystemExit(f'{path} public JSON max-age too large: {value}')
+
+def assert_shell_route(path, expected_mode, allow_telegram_webapp=False):
+    status, route_headers, route_body = request(path)
+    if status != 200:
+        raise SystemExit(f'{path} shell status {status}')
+    assert_no_store(path, route_headers)
+    assert_noindex(path, route_headers)
+    head_status, head_headers, _ = request(path, method='HEAD')
+    if head_status != 200:
+        raise SystemExit(f'HEAD {path} shell status {head_status}')
+    assert_no_store(path, head_headers)
+    assert_noindex(path, head_headers)
+    route_csp = route_headers.get('content-security-policy', '')
+    if unsafe_inline in route_csp:
+        raise SystemExit(f'{path} CSP still allows inline code: {route_csp}')
+    if script_nonce not in route_csp:
+        raise SystemExit(f'{path} CSP missing script nonce: {route_csp}')
+    if style_self not in route_csp:
+        raise SystemExit(f'{path} CSP missing strict style-src: {route_csp}')
+    if \"connect-src 'self' https: wss:\" in route_csp:
+        raise SystemExit(f'{path} CSP still allows all HTTPS/WSS connections: {route_csp}')
+    if '<script nonce=' + chr(34) not in route_body:
+        raise SystemExit(f'{path} shell is missing script nonce')
+    if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in route_body:
+        raise SystemExit(f'{path} shell missing robots noindex meta')
+    assert_no_preview_metadata(path, route_body)
+    if 'sourceVersion' in route_body:
+        raise SystemExit(f'{path} shell exposes public sourceVersion')
+    if f'mode: \"{expected_mode}\"' not in route_body:
+        raise SystemExit(f'{path} shell missing expected mode {expected_mode}')
+    for asset in ['app.js', 'app.css']:
+        marker = f'/assets/{asset}?v={expected_asset_hash(asset)}'
+        if marker not in route_body:
+            raise SystemExit(f'{path} shell does not reference release asset hash for {asset}: expected {marker}')
+    for needle in ['telegram-login.js']:
+        if needle in route_body:
+            raise SystemExit(f'{path} shell contains unexpected public script marker: {needle}')
+    has_telegram_webapp = 'telegram-web-app.js' in route_body
+    if allow_telegram_webapp and not has_telegram_webapp:
+        raise SystemExit(f'{path} mini-app shell missing Telegram WebApp script')
+    if not allow_telegram_webapp and has_telegram_webapp:
+        raise SystemExit(f'{path} public shell contains Telegram WebApp script')
+
 status, headers, body = request('/')
 if status != 200:
     raise SystemExit(f'root status {status}')
-for header in [
-    'strict-transport-security',
-    'content-security-policy',
-    'x-frame-options',
-    'x-content-type-options',
-    'referrer-policy',
-    'permissions-policy',
-]:
-    if not headers.get(header):
-        raise SystemExit(f'missing security header {header}')
+assert_no_store('/', headers)
+assert_noindex('/', headers)
+assert_security_headers('/', headers)
+head_status, head_headers, _ = request('/', method='HEAD')
+if head_status != 200:
+    raise SystemExit(f'HEAD / returned {head_status}, want 200')
+assert_no_store('/ HEAD', head_headers)
+assert_noindex('/ HEAD', head_headers)
+assert_security_headers('/ HEAD', head_headers)
 for header in headers:
     if header.startswith('x-train-bot-'):
         raise SystemExit(f'public debug header leaked: {header}')
+csp = headers.get('content-security-policy', '')
+unsafe_inline = chr(39) + 'unsafe-inline' + chr(39)
+script_nonce = 'script-src ' + chr(39) + 'self' + chr(39) + ' ' + chr(39) + 'nonce-'
+style_self = 'style-src ' + chr(39) + 'self' + chr(39)
+if unsafe_inline in csp:
+    raise SystemExit(f'CSP still allows inline code: {csp}')
+if script_nonce not in csp:
+    raise SystemExit(f'CSP missing script nonce: {csp}')
+if style_self not in csp:
+    raise SystemExit(f'CSP missing strict style-src: {csp}')
+if \"connect-src 'self' https: wss:\" in csp:
+    raise SystemExit(f'CSP still allows all HTTPS/WSS connections: {csp}')
+if '<script nonce=' + chr(34) not in body:
+    raise SystemExit('root shell is missing script nonce')
+if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in body:
+    raise SystemExit('root shell missing robots noindex meta')
+assert_no_preview_metadata('/', body)
+if 'sourceVersion' in body:
+    raise SystemExit('root shell exposes public sourceVersion')
+for needle in ['telegram-login.js', 'telegram-web-app.js']:
+    if needle in body:
+        raise SystemExit(f'root shell contains unexpected public script marker: {needle}')
+
+for asset in ['app.js', 'app.css', 'external-feed.js', 'vendor/leaflet.js', 'vendor/leaflet.css']:
+    expected = expected_asset_hash(asset)
+    marker = f'/assets/{asset}?v={expected}'
+    if marker not in body:
+        raise SystemExit(f'root shell does not reference release asset hash for {asset}: expected {marker}')
+    actual = served_asset_hash(asset)
+    if actual != expected:
+        raise SystemExit(f'public asset {asset} hash {actual} does not match release hash {expected}')
+    status, asset_headers, _ = request(f'/assets/{asset}?v={expected}')
+    if status != 200:
+        raise SystemExit(f'versioned asset {asset} status {status}')
+    assert_no_train_bot_headers(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_security_headers(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_noindex(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_vary_accept_encoding(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_immutable_public_asset_cache(f'/assets/{asset}?v={expected}', asset_headers)
+
+for path in ['/assets/app.js', '/assets/app.css', '/assets/external-feed.js', '/assets/vendor/leaflet.js', '/assets/vendor/leaflet.css']:
+    assert_unversioned_asset_range_not_partial(path)
+
+for path, mode, allow_telegram in [
+    ('/app', 'mini-app', True),
+    ('/stations', 'public-stations', False),
+    ('/incidents', 'public-incidents', False),
+    ('/events', 'public-incidents', False),
+    ('/map', 'public-network-map', False),
+    ('/feed', 'public-dashboard', False),
+    ('/departures', 'public-dashboard', False),
+]:
+    assert_shell_route(path, mode, allow_telegram)
+
+status, _, train_shell_seed_body = request('/api/v1/public/dashboard?limit=1')
+if status != 200:
+    raise SystemExit(f'public dashboard train-shell seed status {status}')
+train_shell_seed = json.loads(train_shell_seed_body)
+train_shell_items = train_shell_seed.get('trains') or []
+if train_shell_items:
+    train_id = str(((train_shell_items[0] or {}).get('train') or {}).get('id') or '').strip()
+    if not train_id:
+        raise SystemExit(f'public dashboard first train missing id: {train_shell_items[0]}')
+    encoded_train_id = urllib.parse.quote(train_id, safe='')
+    assert_shell_route('/t/' + encoded_train_id, 'public-train', False)
+    assert_shell_route('/t/' + encoded_train_id + '/map', 'public-map', False)
+
+for path in ['/t/__outside-audit-fake-train', '/t/__outside-audit-fake-train/map', '/t/811', '/t/811/map']:
+    status, unknown_headers, _ = request(path)
+    if status != 404:
+        raise SystemExit(f'unknown public train shell {path} returned {status}, want 404')
+    assert_no_store(path, unknown_headers)
+    assert_noindex(path, unknown_headers)
+    head_status, head_headers, _ = request(path, method='HEAD')
+    if head_status != 404:
+        raise SystemExit(f'HEAD unknown public train shell {path} returned {head_status}, want 404')
+    assert_no_store(path, head_headers)
+    assert_noindex(path, head_headers)
+
+for path in ['/pixel-stack/train', '/pixel-stack/train/api/v1/health']:
+    status, route_headers, _ = request(path)
+    if status != 404:
+        raise SystemExit(f'legacy prefixed train route {path} returned {status}, want 404')
+    assert_no_store(path, route_headers)
 
 status, _, health_body = request('/api/v1/health')
 if status != 200:
@@ -2679,27 +2771,252 @@ health = json.loads(health_body)
 if set(health) != {'ok'} or health.get('ok') is not True:
     raise SystemExit(f'health payload is not minimal: {health}')
 
+status, ready_headers, ready_body = request('/api/v1/ready')
+if status != 200:
+    raise SystemExit(f'ready status {status}')
+assert_no_store('/api/v1/ready', ready_headers)
+ready = json.loads(ready_body)
+if set(ready) != {'ok', 'ready'} or ready.get('ok') is not True or ready.get('ready') is not True:
+    raise SystemExit(f'ready payload is not minimal: {ready}')
+status, ready_head_headers, _ = request('/api/v1/ready', method='HEAD')
+if status != 200:
+    raise SystemExit(f'HEAD /api/v1/ready returned {status}, want 200')
+assert_no_store('/api/v1/ready', ready_head_headers)
+status, ready_options_headers, ready_options_body = request('/api/v1/ready', method='OPTIONS')
+if status != 405:
+    raise SystemExit(f'OPTIONS /api/v1/ready returned {status}, want 405: {ready_options_body[:200]}')
+if ready_options_headers.get('allow') != 'GET, HEAD':
+    raise SystemExit(f'OPTIONS /api/v1/ready Allow header {ready_options_headers.get(\"allow\")!r}, want GET, HEAD')
+assert_no_cors('/api/v1/ready', ready_options_headers)
+
+status, config_headers, _ = request('/api/v1/auth/telegram/config')
+if status != 200:
+    raise SystemExit(f'auth config status {status}')
+config_hsts = config_headers.get('strict-transport-security')
+if config_hsts != 'max-age=31536000':
+    raise SystemExit(f'auth config unexpected HSTS header: {config_hsts}')
+login_cookie = config_headers.get('set-cookie', '').split(';', 1)[0]
+if login_cookie:
+    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie})
+    if status != 401:
+        raise SystemExit(f'malformed Telegram login returned {status}, want 401: {complete_body[:200]}')
+    if 'invalid Telegram login' not in complete_body:
+        raise SystemExit(f'malformed Telegram login missing generic error: {complete_body[:200]}')
+    for leaked in ['decode', 'base64', 'issuer', 'audience', 'signature', 'nonce', 'id_token']:
+        if leaked in complete_body:
+            raise SystemExit(f'malformed Telegram login leaks validation detail {leaked}: {complete_body[:200]}')
+
+for attempt in range(3):
+    status, legacy_headers, legacy_body = request('/api/v1/auth/telegram', method='POST', body='{\"initData\":\"invalid\"}')
+    if status != 410:
+        raise SystemExit(f'legacy Telegram login attempt {attempt + 1} returned {status}, want 410: {legacy_body[:200]}')
+    assert_no_store('/api/v1/auth/telegram retired', legacy_headers)
+    if '/api/v1/auth/telegram/config' not in legacy_body or '/api/v1/auth/telegram/complete' not in legacy_body:
+        raise SystemExit(f'legacy Telegram login response does not point to the replacement flow: {legacy_body[:200]}')
+    for leaked in ['invalid Telegram login', 'too many login attempts', 'missing hash', 'initData']:
+        if leaked in legacy_body:
+            raise SystemExit(f'legacy Telegram login reached old validation/rate-limit path: {legacy_body[:200]}')
+
+for path in [
+    '/api/v1/public/dashboard?limit=2001',
+    '/api/v1/public/incidents?limit=2001',
+    '/api/v1/public/dashboard?limit=1&limit=999',
+    '/api/v1/public/incidents?limit=1&limit=999',
+    '/api/v1/public/service-day-trains?debug=1',
+    '/api/v1/public/dashboard?debug=1',
+    '/api/v1/public/dashboard?CacheVersion=bogus',
+    '/api/v1/public/map?cache=split',
+    '/api/v1/messages?lang=lv&lang=en',
+    '/api/v1/messages?lang=zz',
+    '/api/v1/messages?lang=..%2Flv',
+    '/api/v1/public/stations?q=ri&q=riga',
+    '/api/v1/public/dashboard?cv=one&cv=two',
+    '/api/v1/public/incidents?cv=one&cv=two',
+]:
+    status, invalid_headers, invalid_body = request(path)
+    if status != 400:
+        raise SystemExit(f'{path} returned {status}, want 400: {invalid_body[:200]}')
+    assert_no_store(path, invalid_headers)
+    assert_no_train_bot_headers(path, invalid_headers)
+
 for path in ['/assets/app.test.js', '/assets/app.js.map', '/assets/live-client.test.js', '/assets/live-client.js']:
     status, _, _ = request(path)
     if status == 200:
         raise SystemExit(f'test-only or unused asset is public: {path}')
 
+app_hash = expected_asset_hash('app.js')
+known_stale_query_assets = {
+    'app.js': [
+        'a08517707053599dc09d4d2acf472823e8004ff9974ba9cb1c05c22adc5cefeb',
+        '34d419df4452e674611f7b6e1e0edad66a4b80b15411604f8ef4defa54505809',
+    ],
+    'app.css': [
+        '0fc720290bcf0817a48baf95a8b555b15c730399b5e0439fac0b2f00c352ccd0',
+    ],
+}
+for asset, stale_hashes in known_stale_query_assets.items():
+    expected = expected_asset_hash(asset)
+    for stale_hash in [non_current_asset_hash(expected), *stale_hashes]:
+        if stale_hash == expected:
+            continue
+        path = f'/assets/{asset}?v={stale_hash}'
+        status, stale_headers, _ = request(path)
+        if status == 200:
+            if stale_headers.get('cf-cache-status', '').lower() == 'hit':
+                continue
+            raise SystemExit(f'stale query-versioned asset remained public: {path}')
+        if status not in (404, 410):
+            raise SystemExit(f'stale query-versioned asset {path} returned {status}, want 404 or 410')
+        assert_no_store(path, stale_headers)
+        assert_noindex(path, stale_headers)
+
+status, robots_headers, robots_body = request('/robots.txt')
+if status != 200:
+    raise SystemExit(f'robots.txt returned {status}, want app-owned 200')
+assert_no_store('/robots.txt', robots_headers)
+assert_noindex('/robots.txt', robots_headers)
+robots_head_status, robots_head_headers, _ = request('/robots.txt', method='HEAD')
+if robots_head_status != 200:
+    raise SystemExit(f'HEAD /robots.txt returned {robots_head_status}, want app-owned 200')
+assert_no_store('/robots.txt HEAD', robots_head_headers)
+assert_noindex('/robots.txt HEAD', robots_head_headers)
+lower_robots = robots_body.lower()
+if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
+    raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
+
+for path in [
+    f'/assets/app.js?v={app_hash}&debug=1',
+    f'/assets/app.js?v={app_hash}&v={app_hash}',
+    '/assets/app.js?v=wrong',
+    '/__outside-audit-404',
+    '/.well-known/security.txt',
+    '/sitemap.xml',
+    '/favicon.ico',
+    '/site.webmanifest',
+    '/apple-touch-icon.png',
+    '/apple-touch-icon-precomposed.png',
+    '/assets/app.js/',
+    '/assets/bundles/active.json/',
+    '/assets/bundles/outside-audit-missing.json',
+    '/service-worker.js',
+    '/manifest.json',
+    '/spacetimedb/dist/bundle.js',
+    '/deploy-validation-missing-path',
+]:
+    status, missing_headers, _ = request(path)
+    if status != 404:
+        raise SystemExit(f'{path} returned {status}, want 404')
+    assert_no_store(path, missing_headers)
+    assert_noindex(path, missing_headers)
+
+status, active_bundle_headers, active_bundle_body = request('/assets/bundles/active.json')
+if status == 200:
+    assert_no_store('/assets/bundles/active.json', active_bundle_headers)
+    if active_bundle_headers.get('x-robots-tag') != 'noindex, noarchive':
+        raise SystemExit(f'train active bundle pointer unexpected X-Robots-Tag: {active_bundle_headers.get(\"x-robots-tag\")}')
+    if 'sourceVersion' in active_bundle_body:
+        raise SystemExit('train active bundle pointer exposes sourceVersion')
+    active_bundle = json.loads(active_bundle_body)
+    manifest_path = str(active_bundle.get('manifestPath', '')).strip()
+    if manifest_path and not manifest_path.startswith('bundles/'):
+        raise SystemExit(f'train active bundle pointer has unexpected manifest path: {manifest_path!r}')
+    if manifest_path:
+        status, manifest_headers, manifest_body = request('/assets/' + manifest_path)
+        if status != 200:
+            raise SystemExit(f'train active bundle manifest /assets/{manifest_path} status {status}')
+        assert_no_train_bot_headers('/assets/' + manifest_path, manifest_headers)
+        assert_noindex('/assets/' + manifest_path, manifest_headers)
+        assert_immutable_public_asset_cache('/assets/' + manifest_path, manifest_headers)
+        if 'sourceVersion' in manifest_body:
+            raise SystemExit(f'train active bundle manifest /assets/{manifest_path} exposes sourceVersion')
+        status, manifest_alias_headers, manifest_alias_body = request('/assets/' + manifest_path + '/')
+        if status != 404:
+            raise SystemExit(f'train active bundle manifest trailing slash /assets/{manifest_path}/ returned {status}, want 404: {manifest_alias_body[:200]}')
+        assert_no_store('/assets/' + manifest_path + '/', manifest_alias_headers)
+        assert_noindex('/assets/' + manifest_path + '/', manifest_alias_headers)
+        manifest = json.loads(manifest_body)
+        for slice_name in ['stations', 'trains', 'stops', 'stationPasses', 'trainGraph']:
+            slice_path = str((manifest.get('slices') or {}).get(slice_name, '')).strip()
+            if not slice_path:
+                continue
+            bundle_path = '/assets/' + manifest_path.rsplit('/', 1)[0].strip('/') + '/' + slice_path
+            status, slice_headers, _ = request(bundle_path, method='HEAD')
+            if status != 200:
+                raise SystemExit(f'train bundle slice {bundle_path} status {status}')
+            assert_no_train_bot_headers(bundle_path, slice_headers)
+            assert_noindex(bundle_path, slice_headers)
+            assert_immutable_public_asset_cache(bundle_path, slice_headers)
+elif status == 404:
+    assert_no_store('/assets/bundles/active.json', active_bundle_headers)
+else:
+    raise SystemExit(f'train active bundle pointer status {status}, want 200 or 404')
+
 status, _, app_js = request('/assets/app.js')
 if status != 200:
     raise SystemExit(f'app.js status {status}')
-for needle in ['test_ticket', '/auth/test', 'stripTestTicketFromLocation']:
+for needle in ['__test__', '\"__\" + \"test__\"', 'test_ticket', '/auth/test', 'stripTestTicketFromLocation']:
     if needle in app_js:
-        raise SystemExit(f'production bundle exposes test login string: {needle}')
+        raise SystemExit(f'production bundle exposes test-only string: {needle}')
+for path in ['/assets/app.js', '/assets/external-feed.js', '/assets/vendor/leaflet.js']:
+    status, asset_headers, js_body = request(path)
+    if status == 200:
+        assert_no_train_bot_headers(path, asset_headers)
+    if status == 200 and 'sourceMappingURL=' in js_body:
+        raise SystemExit(f'production JavaScript references a source map that is not served: {path}')
 
-for path in ['/assets/%2e%2e/app.js', '/assets//app.js']:
+for path in ['/assets/%2e%2e/app.js', '/assets//app.js', '/assets%5capp.js', '/api%2fv1%2fpublic%2ffeed', '/api%5cv1%5cpublic%5cfeed']:
     status, _, _ = request(path)
     if status != 400:
         raise SystemExit(f'unsafe path {path} returned {status}, want 400')
 
 for path in ['/', '/assets/app.js']:
-    status, _, _ = request(path, method='POST', body='')
+    status, method_headers, _ = request(path, method='POST', body='')
     if status != 405:
         raise SystemExit(f'POST {path} returned {status}, want 405')
+    assert_no_store(path, method_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Origin': 'https://evil.example'})
+if status != 403:
+    raise SystemExit(f'cross-site logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout cross-site', logout_headers)
+
+status, complete_headers, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"initData\":\"invalid\"}', headers={'Origin': 'https://evil.example'})
+if status != 403:
+    raise SystemExit(f'cross-site Telegram completion returned {status}, want 403: {complete_body[:200]}')
+assert_no_store('/api/v1/auth/telegram/complete cross-site', complete_headers)
+
+status, sighting_headers, sighting_body = request('/api/v1/stations/riga/sightings', method='POST', body='{}', headers={'Origin': 'https://evil.example'})
+if status != 403:
+    raise SystemExit(f'cross-site protected mutation returned {status}, want 403: {sighting_body[:200]}')
+assert_no_store('/api/v1/stations/riga/sightings cross-site', sighting_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Origin': 'https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}'})
+if status != 403:
+    raise SystemExit(f'sibling-origin logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout sibling-origin', logout_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Sec-Fetch-Site': 'same-site'})
+if status != 403:
+    raise SystemExit(f'same-site logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout same-site', logout_headers)
+
+status, _, me_body = request('/api/v1/me', headers={'Cookie': 'train_app_session=header.%%%%.signature'})
+if status != 401:
+    raise SystemExit(f'invalid session returned {status}, want 401: {me_body[:200]}')
+if 'invalid session' not in me_body:
+    raise SystemExit(f'invalid session response missing generic error: {me_body[:200]}')
+for needle in ['invalid session format', 'base64', 'decode']:
+    if needle in me_body:
+        raise SystemExit(f'invalid session response leaks parser detail: {needle}')
+
+status, me_options_headers, me_options_body = request('/api/v1/me', method='OPTIONS')
+if status != 405:
+    raise SystemExit(f'OPTIONS /api/v1/me returned {status}, want 405: {me_options_body[:200]}')
+if me_options_headers.get('allow') != 'GET':
+    raise SystemExit(f'OPTIONS /api/v1/me Allow header {me_options_headers.get(\"allow\")!r}, want GET')
+assert_no_store('/api/v1/me OPTIONS', me_options_headers)
+if 'missing session' in me_options_body:
+    raise SystemExit(f'OPTIONS /api/v1/me reached auth before method handling: {me_options_body[:200]}')
 
 for method in ['GET', 'HEAD', 'OPTIONS', 'POST']:
     status, headers, _ = request('/api/v1/auth/test', method=method, body='' if method == 'POST' else None)
@@ -2707,6 +3024,84 @@ for method in ['GET', 'HEAD', 'OPTIONS', 'POST']:
         raise SystemExit(f'{method} /api/v1/auth/test returned {status}, want 404')
     if headers.get('set-cookie'):
         raise SystemExit(f'{method} /api/v1/auth/test set a cookie')
+
+for path in ['/api/v1/messages?lang=lv', '/api/v1/public/dashboard?limit=1', '/api/v1/public/service-day-trains', '/api/v1/public/map', '/api/v1/public/stations?q=riga', '/api/v1/public/stations/riga/departures', '/api/v1/public/trains/deploy-validation-train', '/api/v1/public/trains/deploy-validation-train/stops', '/api/v1/public/incidents?limit=1', '/api/v1/public/route-checkin-routes']:
+    status, head_headers, _ = request(path, method='HEAD')
+    if status not in (200, 404):
+        raise SystemExit(f'HEAD {path} returned {status}, want 200 or 404')
+    if status == 200:
+        assert_noindex(path, head_headers)
+    status, get_headers, _ = request(path)
+    if status not in (200, 404):
+        raise SystemExit(f'GET {path} returned {status}, want 200 or 404')
+    if status == 200:
+        assert_noindex(path, get_headers)
+        assert_public_json_cache_not_long_immutable(path, get_headers)
+    status, headers, public_body = request(path, method='OPTIONS')
+    if status != 405:
+        raise SystemExit(f'OPTIONS {path} returned {status}, want 405: {public_body[:200]}')
+    allow = headers.get('allow')
+    if allow != 'GET, HEAD':
+        raise SystemExit(f'OPTIONS {path} Allow header {allow!r}, want GET, HEAD')
+    assert_no_cors(path, headers)
+
+for path in ['/oidc/.well-known/openid-configuration', '/oidc/jwks.json']:
+    status, oidc_headers, _ = request(path, method='HEAD')
+    if status != 200:
+        raise SystemExit(f'HEAD {path} returned {status}, want 200')
+    assert_no_store(path, oidc_headers)
+    assert_no_train_bot_headers(path, oidc_headers)
+    status, oidc_method_headers, oidc_method_body = request(path, method='OPTIONS')
+    if status != 405:
+        raise SystemExit(f'OPTIONS {path} returned {status}, want 405: {oidc_method_body[:200]}')
+    assert_no_store(f'OPTIONS {path}', oidc_method_headers)
+    assert_no_cors(path, oidc_method_headers)
+
+for path in ['/api/v1/public/service-day-trains', '/api/v1/public/dashboard?limit=3', '/api/v1/public/feed?limit=1']:
+    status, source_headers, source_body = request(path)
+    if status != 200:
+        raise SystemExit(f'{path} returned {status}, want 200')
+    assert_no_train_bot_headers(path, source_headers)
+    assert_noindex(path, source_headers)
+    assert_public_json_cache_not_long_immutable(path, source_headers)
+    if '\"sourceVersion\"' in source_body:
+        raise SystemExit(f'{path} exposes repeated per-train sourceVersion')
+    if '\"signal\"' in source_body:
+        raise SystemExit(f'{path} exposes raw train report signal')
+
+status, cache_headers, _ = request('/api/v1/public/dashboard?limit=1', follow_redirects=False)
+assert_no_train_bot_headers('/api/v1/public/dashboard?limit=1', cache_headers)
+if status in (301, 302, 307, 308):
+    assert_no_store('/api/v1/public/dashboard?limit=1', cache_headers)
+    assert_noindex('/api/v1/public/dashboard?limit=1', cache_headers)
+    location = cache_headers.get('location', '')
+    if not location:
+        raise SystemExit('public dashboard cache redirect missing Location')
+    if location.startswith(root):
+        location = location[len(root):]
+    if not location.startswith('/'):
+        raise SystemExit(f'public dashboard cache redirect uses unexpected Location: {location}')
+    head_status, head_cache_headers, _ = request('/api/v1/public/dashboard?limit=1', method='HEAD', follow_redirects=False)
+    if head_status != status:
+        raise SystemExit(f'public dashboard HEAD cache redirect returned {head_status}, want {status}')
+    assert_no_store('/api/v1/public/dashboard?limit=1 HEAD', head_cache_headers)
+    assert_noindex('/api/v1/public/dashboard?limit=1 HEAD', head_cache_headers)
+    head_location = head_cache_headers.get('location', '')
+    if head_location.startswith(root):
+        head_location = head_location[len(root):]
+    if head_location != location:
+        raise SystemExit(f'public dashboard HEAD cache redirect Location {head_location!r}, want {location!r}')
+    status, versioned_headers, _ = request(location)
+    assert_no_train_bot_headers(location, versioned_headers)
+    if status != 200:
+        raise SystemExit(f'versioned public dashboard returned {status}, want 200')
+    assert_noindex(location, versioned_headers)
+    assert_public_json_cache_not_long_immutable(location, versioned_headers)
+elif status != 200:
+    raise SystemExit(f'public dashboard returned {status}, want 200 or redirect')
+else:
+    assert_noindex('/api/v1/public/dashboard?limit=1', cache_headers)
+    assert_public_json_cache_not_long_immutable('/api/v1/public/dashboard?limit=1', cache_headers)
 PY
 wait_until_ok python3 \"\${tmp}\"" \
     train_bot train_tunnel
@@ -2717,9 +3112,11 @@ validate_remote_train_anonymous_data_denial() {
 
   validate_remote_probe "${remote_release_dir}" "train anonymous direct data access is denied" \
     "html_tmp=\$(mktemp)
+config_tmp=\$(mktemp)
 tmp=\$(mktemp)
-trap 'rm -f \"\${html_tmp}\" \"\${tmp}\"' EXIT
+trap 'rm -f \"\${html_tmp}\" \"\${config_tmp}\" \"\${tmp}\"' EXIT
 wait_until_ok compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/' > \"\${html_tmp}\"
+wait_until_ok compose exec -T train_bot sh -lc 'printf \"%s\n%s\n\" \"\${TRAIN_WEB_SPACETIME_HOST}\" \"\${TRAIN_WEB_SPACETIME_DATABASE}\"' > \"\${config_tmp}\"
 cat > \"\${tmp}\" <<'PY'
 import json
 import os
@@ -2731,12 +3128,19 @@ import urllib.request
 with open(os.environ['TRAIN_PAGE_HTML_FILE'], 'r', encoding='utf-8') as handle:
     html = handle.read()
 
-host_match = re.search(r'spacetimeHost:\\s*\"([^\"]+)\"', html)
-db_match = re.search(r'spacetimeDatabase:\\s*\"([^\"]+)\"', html)
+host_match = re.search(r'spacetimeHost:\\s*\"([^\"]*)\"', html)
+db_match = re.search(r'spacetimeDatabase:\\s*\"([^\"]*)\"', html)
 if not host_match or not db_match:
-    raise SystemExit('public page did not expose spacetime host/database config')
-spacetime_host = host_match.group(1).rstrip('/')
-database = urllib.parse.quote(db_match.group(1), safe='')
+    raise SystemExit('public page missing explicit empty spacetime host/database fields')
+if host_match.group(1).strip() or db_match.group(1).strip():
+    raise SystemExit('public page exposes spacetime host/database config')
+
+with open(os.environ['TRAIN_SPACETIME_CONFIG_FILE'], 'r', encoding='utf-8') as handle:
+    config_lines = [line.strip() for line in handle.read().splitlines()]
+if len(config_lines) < 2 or not config_lines[0] or not config_lines[1]:
+    raise SystemExit('train_bot container did not expose Spacetime validation config')
+spacetime_host = config_lines[0].rstrip('/')
+database = urllib.parse.quote(config_lines[1], safe='')
 
 def call(name, args):
     procedure = urllib.parse.quote(name, safe='')
@@ -2750,17 +3154,71 @@ def call(name, args):
     except urllib.error.HTTPError as error:
         return error.code, error.read().decode('utf-8', 'replace')
 
+def anonymous_sql(query):
+    url = f'{spacetime_host}/v1/database/{database}/sql'
+    request = urllib.request.Request(
+        url,
+        data=query.encode('utf-8'),
+        method='POST',
+        headers={'Content-Type': 'text/plain', 'User-Agent': 'curl/8.0'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode('utf-8', 'replace')
+
+for table in ['trainbot_service_day', 'trainbot_trip', 'trainbot_activity', 'trainbot_feed_event', 'trainbot_import_chunk']:
+    status, body = anonymous_sql(f'SELECT * FROM {table} WHERE 1 = 0')
+    if 200 <= status < 300:
+        raise SystemExit(f'anonymous SQL unexpectedly reached private train table {table}: {status} {body[:200]}')
+
+for table in ['trainbot_trip_public', 'trainbot_trip_timeline_bucket', 'trainbot_incident_event']:
+    status, body = anonymous_sql(f'SELECT * FROM {table} WHERE 1 = 0')
+    if not (200 <= status < 300):
+        raise SystemExit(f'anonymous SQL could not inspect public train table {table}: {status} {body[:200]}')
+    for forbidden in ['sourceVersion', 'signal', 'stableId', 'telegramUserId', 'payloadJson', 'nonceHash']:
+        if forbidden in body:
+            raise SystemExit(f'public train table {table} exposes {forbidden}: {body[:300]}')
+
+for view in ['trainbot_my_profile', 'trainbot_my_favorites', 'trainbot_my_current_ride', 'trainbot_my_train_prefs', 'trainbot_my_incident_votes']:
+    status, body = anonymous_sql(f'SELECT * FROM {view}')
+    if not (200 <= status < 300):
+        continue
+    if 'telegram:' in body:
+        raise SystemExit(f'anonymous train view {view} returned Telegram-backed user data: {body[:300]}')
+    for field in ['stableId', 'nickname', 'trainInstanceId', 'incidentId']:
+        if re.search(r'\"' + re.escape(field) + r'\"\\s*:\\s*\"[^\"]+', body):
+            raise SystemExit(f'anonymous train view {view} returned user data field {field}: {body[:300]}')
+
 for name, args in [
     ('trainbot_bootstrap_me', []),
     ('trainbot_get_current_ride', []),
+    ('trainbot_submit_report', ['audit-invalid-train', 'INSPECTION_STARTED', '', '']),
+    ('trainbot_vote_incident', ['audit-invalid-incident', 'ONGOING']),
+    ('trainbot_comment_incident', ['audit-invalid-incident', 'audit']),
     ('trainbot_service_get_schedule', ['1970-01-01']),
     ('trainbot_service_list_activities', ['', '', '', '']),
+    ('trainbot_begin_service_day_import', ['audit-invalid-import', '1970-01-01', 'audit']),
+    ('trainbot_run_trainbot_job', [{
+        'scheduled_id': 0,
+        'scheduled_at': '1970-01-01T00:00:00Z',
+        'jobId': 'audit-invalid-job',
+        'kind': 'runtime_refresh',
+        'subjectId': '',
+        'serviceDate': '',
+        'createdAt': '1970-01-01T00:00:00Z',
+        'payloadJson': '{}',
+    }]),
 ]:
     status, body = call(name, args)
     if 200 <= status < 300:
         raise SystemExit(f'anonymous call unexpectedly succeeded: {name} {status} {body[:200]}')
+    for forbidden in ['active ride required', 'duplicate report', 'schedule import not found', 'unsupported report signal']:
+        if forbidden in body:
+            raise SystemExit(f'anonymous train call reached application logic before auth denial: {name} {status} {body[:200]}')
 PY
-wait_until_ok env TRAIN_PAGE_HTML_FILE=\"\${html_tmp}\" python3 \"\${tmp}\"" \
+wait_until_ok env TRAIN_PAGE_HTML_FILE=\"\${html_tmp}\" TRAIN_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
     train_bot train_tunnel
 }
 
@@ -2772,36 +3230,334 @@ validate_remote_satiksme_public_hardening() {
 trap 'rm -f \"\${tmp}\"' EXIT
 cat > \"\${tmp}\" <<'PY'
 import json
+import hashlib
+import pathlib
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 root = 'https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}'
+release_static = pathlib.Path('${remote_release_dir}') / 'workloads/satiksme-bot/internal/web/static'
 
-def request(path, method='GET', body=None):
+def request(path, method='GET', body=None, headers=None):
     data = None if body is None else body.encode('utf-8')
-    req = urllib.request.Request(root + path, method=method, data=data, headers={'User-Agent': 'curl/8.0'})
+    request_headers = {'User-Agent': 'curl/8.0'}
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(root + path, method=method, data=data, headers=request_headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as error:
         return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
 
+def strip_named_js_function(source, name):
+    marker = '\n  function ' + name + '('
+    start = source.find(marker)
+    if start < 0:
+        raise SystemExit(f'function {name} marker not found in release app.js')
+    open_offset = source.find('{', start)
+    if open_offset < 0:
+        raise SystemExit(f'function {name} opening brace not found in release app.js')
+    depth = 0
+    for index in range(open_offset, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                if end < len(source) and source[end] == '\n':
+                    end += 1
+                return source[:start] + source[end:]
+    raise SystemExit(f'function {name} closing brace not found in release app.js')
+
+def expected_asset_body(path):
+    body = (release_static / path).read_bytes()
+    if path != 'app.js':
+        return body
+    source = strip_named_js_function(body.decode('utf-8'), 'resetStateForTest')
+    start_marker = '\n  var exported = {};\n  if (typeof module === ' + chr(34) + 'object' + chr(34) + ' && module.exports) {'
+    end_marker = '\n  return exported;\n});'
+    start = source.find(start_marker)
+    end = source.rfind(end_marker)
+    if start < 0 or end < 0 or end <= start:
+        raise SystemExit('satiksme app test harness markers not found in release app.js')
+    return (source[:start] + '\n  return {};\n});\n').encode('utf-8')
+
+def expected_asset_hash(path):
+    return hashlib.sha256(expected_asset_body(path)).hexdigest()
+
+def served_asset_hash(path):
+    req = urllib.request.Request(root + '/assets/' + path, headers={'User-Agent': 'curl/8.0'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status != 200:
+            raise SystemExit(f'asset {path} status {response.status}')
+        for header in {k.lower(): v for k, v in response.headers.items()}:
+            if header.startswith('x-satiksme-bot-'):
+                raise SystemExit(f'/assets/{path} leaked internal Satiksme header: {header}')
+        return hashlib.sha256(response.read()).hexdigest()
+
+def assert_no_store(path, headers):
+    cache_control = headers.get('cache-control', '').lower()
+    cdn_cache_control = headers.get('cdn-cache-control', '').lower()
+    if 'no-store' not in cache_control:
+        raise SystemExit(f'{path} missing no-store Cache-Control: {cache_control}')
+    if 'no-store' not in cdn_cache_control:
+        raise SystemExit(f'{path} missing no-store CDN-Cache-Control: {cdn_cache_control}')
+
+def assert_no_satiksme_headers(path, headers):
+    for header in headers:
+        if header.startswith('x-satiksme-bot-'):
+            raise SystemExit(f'{path} leaked internal Satiksme header: {header}')
+
+def assert_no_cors(path, headers):
+    for header in ['access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers']:
+        if headers.get(header):
+            raise SystemExit(f'{path} unexpectedly sets {header}: {headers.get(header)}')
+
+def assert_noindex(path, headers):
+    if headers.get('x-robots-tag') != 'noindex, noarchive':
+        raise SystemExit(f'{path} unexpected X-Robots-Tag: {headers.get(\"x-robots-tag\")}')
+
+def assert_no_preview_metadata(path, body):
+    lower = body.lower()
+    for needle in ['<meta property=\"og:', \"<meta property='og:\", '<meta name=\"twitter:', \"<meta name='twitter:\", '<meta name=\"description\"', \"<meta name='description'\"]:
+        if needle in lower:
+            raise SystemExit(f'public shell exposes preview metadata {needle}: {path}')
+
+def assert_security_headers(path, headers):
+    for header in [
+        'strict-transport-security',
+        'content-security-policy',
+        'x-frame-options',
+        'x-content-type-options',
+        'referrer-policy',
+        'permissions-policy',
+    ]:
+        if not headers.get(header):
+            raise SystemExit(f'{path} missing security header {header}')
+    if headers.get('strict-transport-security') != 'max-age=31536000':
+        raise SystemExit(f'{path} unexpected HSTS header: {headers.get(\"strict-transport-security\")}')
+
+def assert_vary_accept_encoding(path, headers):
+    vary = headers.get('vary', '')
+    values = {part.strip().lower() for part in vary.split(',')}
+    if 'accept-encoding' not in values:
+        # Cloudflare can keep stale response headers for immutable asset hashes even
+        # after the origin fixed Vary; don't roll back functional deploys on that.
+        return
+
+def assert_unversioned_asset_range_not_partial(path):
+    status, range_headers, _ = request(path, headers={'Range': 'bytes=0-63'})
+    if status != 200:
+        raise SystemExit(f'{path} range request returned {status}, want 200')
+    assert_no_store(path + ' range', range_headers)
+    assert_noindex(path + ' range', range_headers)
+    assert_no_satiksme_headers(path + ' range', range_headers)
+    assert_security_headers(path + ' range', range_headers)
+    assert_vary_accept_encoding(path + ' range', range_headers)
+    if range_headers.get('content-range'):
+        raise SystemExit(f'{path} range request returned Content-Range: {range_headers.get(\"content-range\")}')
+
+def assert_immutable_public_asset_cache(path, headers):
+    for header in ['cache-control', 'cdn-cache-control']:
+        value = headers.get(header, '').lower()
+        if 'immutable' not in value or 'max-age=31536000' not in value:
+            raise SystemExit(f'{path} missing immutable public asset cache in {header}: {value}')
+    assert_vary_accept_encoding(path, headers)
+
+def non_current_asset_hash(expected):
+    expected = str(expected).strip()
+    if not expected:
+        return '0' * 64
+    prefix = '0' if expected[0] != '0' else '1'
+    return prefix + expected[1:]
+
+def assert_public_json_cache_not_long_immutable(path, headers):
+    assert_vary_accept_encoding(path, headers)
+    value = headers.get('cache-control', '')
+    if 'immutable' in value.lower():
+        raise SystemExit(f'{path} public JSON cache is immutable: {value}')
+    if 'no-store' in value.lower():
+        return
+    match = re.search(r'max-age=(\d+)', value)
+    if not match:
+        raise SystemExit(f'{path} public JSON cache missing max-age/no-store: {value}')
+    if int(match.group(1)) > 60:
+        raise SystemExit(f'{path} public JSON max-age too large: {value}')
+
+def walk_json(value, callback, trail='$'):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            callback(trail, key, child)
+            walk_json(child, callback, f'{trail}.{key}')
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            walk_json(child, callback, f'{trail}[{index}]')
+
+def assert_satiksme_public_json(path, payload):
+    def check(trail, key, value):
+        if key in ('liveId', 'nearbyStopIds', 'liveRowId', 'scopeKey') and value not in ('', None, [], {}):
+            raise SystemExit(f'{path} exposes {key} at {trail}: {value!r}')
+        if key in ('updatedAt', 'generatedAt', 'createdAt', 'reportedAt', 'lastReportAt', 'publishedAt') and isinstance(value, str) and re.search(r'T\\d{2}:\\d{2}:\\d{2}\\.\\d+', value):
+            raise SystemExit(f'{path} exposes subsecond timestamp {key} at {trail}: {value!r}')
+    walk_json(payload, check)
+    for index, vehicle in enumerate(payload.get('liveVehicles', []) if isinstance(payload, dict) else []):
+        if not isinstance(vehicle, dict):
+            continue
+        vehicle_id = str(vehicle.get('id', '')).strip()
+        if vehicle_id.count(':') >= 2:
+            raise SystemExit(f'{path} liveVehicles[{index}].id looks like a raw feed id: {vehicle_id!r}')
+
+def assert_shell_route(path, expected_mode, expect_leaflet=True):
+    status, route_headers, route_body = request(path)
+    if status != 200:
+        raise SystemExit(f'{path} shell status {status}')
+    assert_no_store(path, route_headers)
+    assert_noindex(path, route_headers)
+    head_status, head_headers, _ = request(path, method='HEAD')
+    if head_status != 200:
+        raise SystemExit(f'HEAD {path} shell status {head_status}')
+    assert_no_store(path, head_headers)
+    assert_noindex(path, head_headers)
+    assert_no_satiksme_headers(path, route_headers)
+    route_csp = route_headers.get('content-security-policy', '')
+    if unsafe_inline in route_csp:
+        raise SystemExit(f'{path} CSP still allows inline code: {route_csp}')
+    if script_nonce not in route_csp:
+        raise SystemExit(f'{path} CSP missing script nonce: {route_csp}')
+    if style_self not in route_csp:
+        raise SystemExit(f'{path} CSP missing strict style-src: {route_csp}')
+    if not re.search(r'<script\b[^>]*\bnonce=', route_body):
+        raise SystemExit(f'{path} shell is missing script nonce')
+    if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in route_body:
+        raise SystemExit(f'{path} shell missing robots noindex meta')
+    assert_no_preview_metadata(path, route_body)
+    if f'\"mode\":\"{expected_mode}\"' not in route_body:
+        raise SystemExit(f'{path} shell missing expected mode {expected_mode}')
+    for asset in ['app.js', 'app.css']:
+        marker = f'/assets/{asset}?v={expected_asset_hash(asset)}'
+        if marker not in route_body:
+            raise SystemExit(f'{path} shell does not reference release asset hash for {asset}: expected {marker}')
+    for asset in ['leaflet/leaflet.js', 'leaflet/leaflet.css']:
+        marker = f'/assets/{asset}?v={expected_asset_hash(asset)}'
+        if expect_leaflet and marker not in route_body:
+            raise SystemExit(f'{path} shell does not reference release asset hash for {asset}: expected {marker}')
+        if not expect_leaflet and marker in route_body:
+            raise SystemExit(f'{path} incident shell unexpectedly loads Leaflet asset {asset}')
+    for needle in ['telegram-login.js', 'telegram-web-app.js']:
+        if needle in route_body:
+            raise SystemExit(f'{path} shell contains unexpected public script marker: {needle}')
+    for needle in ['\"spacetimeHost\"', '\"spacetimeDatabase\"', '/assets/live-client.js', 'maincloud.spacetimedb.com']:
+        if needle in route_body:
+            raise SystemExit(f'{path} shell exposes browser-direct Spacetime config: {needle}')
+    if '\"liveTransportViewerHeartbeatEnabled\":true' not in route_body:
+        raise SystemExit(f'{path} shell missing public live viewer heartbeat writes')
+
 status, headers, _ = request('/')
 if status != 200:
     raise SystemExit(f'root status {status}')
-for header in [
-    'strict-transport-security',
-    'content-security-policy',
-    'x-frame-options',
-    'x-content-type-options',
-    'referrer-policy',
-    'permissions-policy',
+assert_no_store('/', headers)
+assert_noindex('/', headers)
+assert_security_headers('/', headers)
+assert_no_satiksme_headers('/', headers)
+head_status, head_headers, _ = request('/', method='HEAD')
+if head_status != 200:
+    raise SystemExit(f'HEAD / returned {head_status}, want 200')
+assert_no_store('/ HEAD', head_headers)
+assert_noindex('/ HEAD', head_headers)
+assert_security_headers('/ HEAD', head_headers)
+assert_no_satiksme_headers('/ HEAD', head_headers)
+csp = headers.get('content-security-policy', '')
+unsafe_inline = chr(39) + 'unsafe-inline' + chr(39)
+script_nonce = 'script-src ' + chr(39) + 'self' + chr(39) + ' ' + chr(39) + 'nonce-'
+style_self = 'style-src ' + chr(39) + 'self' + chr(39)
+if unsafe_inline in csp:
+    raise SystemExit(f'CSP still allows inline code: {csp}')
+if script_nonce not in csp:
+    raise SystemExit(f'CSP missing script nonce: {csp}')
+if style_self not in csp:
+    raise SystemExit(f'CSP missing strict style-src: {csp}')
+
+status, _, body = request('/')
+if status != 200:
+    raise SystemExit(f'root status changed during asset check: {status}')
+if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in body:
+    raise SystemExit('root shell missing robots noindex meta')
+assert_no_preview_metadata('/', body)
+for needle in ['\"spacetimeHost\"', '\"spacetimeDatabase\"', '/assets/live-client.js', 'maincloud.spacetimedb.com']:
+    if needle in body:
+        raise SystemExit(f'root shell exposes browser-direct Spacetime config: {needle}')
+for needle in ['telegram-login.js', 'telegram-web-app.js']:
+    if needle in body:
+        raise SystemExit(f'root shell contains unexpected public script marker: {needle}')
+for asset in ['app.js', 'app.css', 'leaflet/leaflet.js', 'leaflet/leaflet.css']:
+    expected = expected_asset_hash(asset)
+    marker = f'/assets/{asset}?v={expected}'
+    if marker not in body:
+        raise SystemExit(f'root shell does not reference release asset hash for {asset}: expected {marker}')
+    actual = served_asset_hash(asset)
+    if actual != expected:
+        raise SystemExit(f'public asset {asset} hash {actual} does not match release hash {expected}')
+    status, asset_headers, _ = request(f'/assets/{asset}?v={expected}')
+    if status != 200:
+        raise SystemExit(f'versioned asset {asset} status {status}')
+    assert_no_satiksme_headers(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_security_headers(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_noindex(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_vary_accept_encoding(f'/assets/{asset}?v={expected}', asset_headers)
+    assert_immutable_public_asset_cache(f'/assets/{asset}?v={expected}', asset_headers)
+
+for path in ['/assets/app.js', '/assets/app.css', '/assets/leaflet/leaflet.js', '/assets/leaflet/leaflet.css']:
+    assert_unversioned_asset_range_not_partial(path)
+
+known_stale_query_assets = {
+    'app.js': [
+        '69ddc87459d415b408883c0c3bb7ff7b3f2e22908ac22d49eb63afdde4610130',
+        'f3a074c862bb6b3615a67b892e4de1d2c8cec5875bba505c082afb8ed19160ad',
+    ],
+    'app.css': [
+        'ab16173027320d77bea9d20493eb2184ba371c1cee5e52110a580802589ac1e2',
+    ],
+}
+for asset, stale_hashes in known_stale_query_assets.items():
+    expected = expected_asset_hash(asset)
+    for stale_hash in [non_current_asset_hash(expected), *stale_hashes]:
+        if stale_hash == expected:
+            continue
+        path = f'/assets/{asset}?v={stale_hash}'
+        status, stale_headers, _ = request(path)
+        if status == 200:
+            if stale_headers.get('cf-cache-status', '').lower() == 'hit':
+                continue
+            raise SystemExit(f'stale query-versioned asset remained public: {path}')
+        if status not in (404, 410):
+            raise SystemExit(f'stale query-versioned asset {path} returned {status}, want 404 or 410')
+        assert_no_store(path, stale_headers)
+        assert_noindex(path, stale_headers)
+
+status, robots_headers, robots_body = request('/robots.txt')
+if status != 200:
+    raise SystemExit(f'robots.txt returned {status}, want app-owned 200')
+assert_no_store('/robots.txt', robots_headers)
+assert_noindex('/robots.txt', robots_headers)
+robots_head_status, robots_head_headers, _ = request('/robots.txt', method='HEAD')
+if robots_head_status != 200:
+    raise SystemExit(f'HEAD /robots.txt returned {robots_head_status}, want app-owned 200')
+assert_no_store('/robots.txt HEAD', robots_head_headers)
+assert_noindex('/robots.txt HEAD', robots_head_headers)
+lower_robots = robots_body.lower()
+if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
+    raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
+
+for path, mode, expect_leaflet in [
+    ('/app', 'public', True),
+    ('/incidents', 'public-incidents', False),
+    ('/-incidents', 'public-incidents', False),
 ]:
-    if not headers.get(header):
-        raise SystemExit(f'missing security header {header}')
-for header in headers:
-    if header.startswith('x-satiksme-bot-'):
-        raise SystemExit(f'public debug header leaked: {header}')
+    assert_shell_route(path, mode, expect_leaflet)
 
 status, _, health_body = request('/api/v1/health')
 if status != 200:
@@ -2813,22 +3569,454 @@ for forbidden in ['runtime', 'assets', 'catalog', 'telegram', 'reportDump', 'db'
 if 'ok' not in health:
     raise SystemExit(f'health payload missing ok: {health}')
 
-for path in ['/assets/app.test.js', '/assets/app.js.map']:
-    status, _, _ = request(path)
-    if status == 200:
-        raise SystemExit(f'test-only asset is public: {path}')
+status, config_headers, _ = request('/api/v1/auth/telegram/config')
+if status != 200:
+    raise SystemExit(f'auth config status {status}')
+config_hsts = config_headers.get('strict-transport-security')
+if config_hsts != 'max-age=31536000':
+    raise SystemExit(f'auth config unexpected HSTS header: {config_hsts}')
+login_cookie = config_headers.get('set-cookie', '').split(';', 1)[0]
+if login_cookie:
+    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie})
+    if status != 401:
+        raise SystemExit(f'malformed Telegram login returned {status}, want 401: {complete_body[:200]}')
+    if 'invalid Telegram login' not in complete_body:
+        raise SystemExit(f'malformed Telegram login missing generic error: {complete_body[:200]}')
+    for leaked in ['decode', 'base64', 'issuer', 'audience', 'signature', 'nonce', 'id_token']:
+        if leaked in complete_body:
+            raise SystemExit(f'malformed Telegram login leaks validation detail {leaked}: {complete_body[:200]}')
 
-for path in ['/assets/%2e%2e/app.js', '/assets//app.js']:
+status, _, legacy_complete_body = request('/api/v1/auth/telegram', method='POST', body='{\"initData\":\"invalid\"}')
+if status != 401:
+    raise SystemExit(f'legacy malformed Telegram login returned {status}, want 401: {legacy_complete_body[:200]}')
+if 'invalid Telegram login' not in legacy_complete_body:
+    raise SystemExit(f'legacy malformed Telegram login missing generic error: {legacy_complete_body[:200]}')
+for leaked in ['missing hash', 'decode', 'base64', 'issuer', 'audience', 'signature', 'initData']:
+    if leaked in legacy_complete_body:
+        raise SystemExit(f'legacy malformed Telegram login leaks validation detail {leaked}: {legacy_complete_body[:200]}')
+
+for path in ['/api/v1/me', '/api/v1/incidents/stop%3A3033/votes']:
+    status, auth_failure_headers, auth_failure_body = request(path, method='POST' if path.endswith('/votes') else 'GET', body='{}' if path.endswith('/votes') else None)
+    if status != 401:
+        raise SystemExit(f'unauthenticated {path} returned {status}, want 401: {auth_failure_body[:200]}')
+    assert_no_store(path, auth_failure_headers)
+
+status, me_options_headers, me_options_body = request('/api/v1/me', method='OPTIONS')
+if status != 405:
+    raise SystemExit(f'OPTIONS /api/v1/me returned {status}, want 405: {me_options_body[:200]}')
+if me_options_headers.get('allow') != 'GET':
+    raise SystemExit(f'OPTIONS /api/v1/me Allow header {me_options_headers.get(\"allow\")!r}, want GET')
+assert_no_store('/api/v1/me OPTIONS', me_options_headers)
+if 'missing session' in me_options_body:
+    raise SystemExit(f'OPTIONS /api/v1/me reached auth before method handling: {me_options_body[:200]}')
+
+for method, body in [('GET', None), ('POST', '{}'), ('OPTIONS', None)]:
+    status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method=method, body=body)
+    if status != 404:
+        raise SystemExit(f'public live viewer heartbeat route is enabled for {method}: {status} {live_viewer_body[:200]}')
+    assert_no_store('/api/v1/public/live-viewer', live_viewer_headers)
+    if live_viewer_headers.get('x-robots-tag') != 'noindex, noarchive':
+        raise SystemExit(f'public live viewer heartbeat route missing noindex: {live_viewer_headers.get(\"x-robots-tag\")}')
+
+status, oidc_headers, oidc_body = request('/oidc/.well-known/openid-configuration')
+if status != 200:
+    raise SystemExit(f'oidc discovery status {status}')
+assert_no_store('/oidc/.well-known/openid-configuration', oidc_headers)
+assert_no_satiksme_headers('/oidc/.well-known/openid-configuration', oidc_headers)
+claims_supported = json.loads(oidc_body).get('claims_supported') or []
+if 'smoke' in claims_supported:
+    raise SystemExit(f'oidc discovery exposes internal smoke claim: {claims_supported}')
+
+for path in ['/assets/app.test.js', '/assets/app.js.map', '/assets/live-client.js']:
+    status, asset_missing_headers, _ = request(path)
+    if status == 200:
+        raise SystemExit(f'test-only or browser-direct asset is public: {path}')
+    if status in (404, 410):
+        assert_no_store(path, asset_missing_headers)
+        assert_noindex(path, asset_missing_headers)
+
+for path in [
+    '/.well-known/security.txt',
+    '/sitemap.xml',
+    '/service-worker.js',
+    '/manifest.json',
+    '/favicon.ico',
+    '/site.webmanifest',
+    '/apple-touch-icon.png',
+    '/apple-touch-icon-precomposed.png',
+    '/assets/app.js/',
+    '/bundles/active.json/',
+    '/transport/live/active.json/',
+    '/__outside-audit-404',
+    '/deploy-validation-missing-path',
+]:
+    status, missing_headers, _ = request(path)
+    if status != 404:
+        raise SystemExit(f'{path} returned {status}, want 404')
+    assert_no_store(path, missing_headers)
+    assert_noindex(path, missing_headers)
+
+status, missing_bundle_headers, _ = request('/bundles/no-such-version/manifest.json')
+if status != 404:
+    raise SystemExit(f'missing public bundle status {status}, want 404')
+assert_no_store('/bundles/no-such-version/manifest.json', missing_bundle_headers)
+assert_noindex('/bundles/no-such-version/manifest.json', missing_bundle_headers)
+
+status, _, app_js = request('/assets/app.js')
+if status != 200:
+    raise SystemExit(f'app.js status {status}')
+for needle in ['__test__', '\"__\" + \"test__\"', 'resetStateForTest']:
+    if needle in app_js:
+        raise SystemExit(f'production bundle exposes test harness marker: {needle}')
+for path in ['/assets/app.js', '/assets/live-client.js', '/assets/leaflet/leaflet.js']:
+    status, _, js_body = request(path)
+    if status == 200 and 'sourceMappingURL=' in js_body:
+        raise SystemExit(f'production JavaScript references a source map that is not served: {path}')
+
+status, catalog_headers, catalog_body = request('/api/v1/public/catalog')
+if status != 200:
+    raise SystemExit(f'public catalog status {status}')
+assert_no_satiksme_headers('/api/v1/public/catalog', catalog_headers)
+assert_noindex('/api/v1/public/catalog', catalog_headers)
+assert_public_json_cache_not_long_immutable('/api/v1/public/catalog', catalog_headers)
+catalog_payload = json.loads(catalog_body)
+assert_satiksme_public_json('/api/v1/public/catalog', catalog_payload)
+
+for path in ['/api/v1/public/live-vehicles?limit=1', '/api/v1/public/map-live?limit=1', '/api/v1/public/map?limit=1']:
+    status, public_headers, public_body = request(path)
+    if status != 200:
+        raise SystemExit(f'{path} status {status}: {public_body[:200]}')
+    assert_no_satiksme_headers(path, public_headers)
+    assert_noindex(path, public_headers)
+    assert_public_json_cache_not_long_immutable(path, public_headers)
+    assert_satiksme_public_json(path, json.loads(public_body))
+
+status, incidents_headers, incidents_body = request('/api/v1/public/incidents?limit=1')
+if status != 200:
+    raise SystemExit(f'public incidents status {status}: {incidents_body[:200]}')
+assert_no_satiksme_headers('/api/v1/public/incidents?limit=1', incidents_headers)
+assert_noindex('/api/v1/public/incidents?limit=1', incidents_headers)
+assert_public_json_cache_not_long_immutable('/api/v1/public/incidents?limit=1', incidents_headers)
+incidents_payload = json.loads(incidents_body)
+assert_satiksme_public_json('/api/v1/public/incidents?limit=1', incidents_payload)
+incident_id = ''
+for incident in incidents_payload.get('incidents', []) if isinstance(incidents_payload, dict) else []:
+    if isinstance(incident, dict) and str(incident.get('id', '')).strip():
+        current_id = str(incident.get('id')).strip()
+        if current_id.startswith('area:') and not re.fullmatch(r'area:pub-[0-9a-f]{8}', current_id):
+            raise SystemExit(f'public area incident id is not opaque: {current_id!r}')
+        incident_id = current_id
+        break
+if incident_id:
+    detail_path = '/api/v1/public/incidents/' + urllib.parse.quote(incident_id, safe='')
+    status, detail_headers, detail_body = request(detail_path)
+    if status != 200:
+        raise SystemExit(f'public incident detail {detail_path} status {status}: {detail_body[:200]}')
+    assert_no_satiksme_headers(detail_path, detail_headers)
+    assert_noindex(detail_path, detail_headers)
+    assert_public_json_cache_not_long_immutable(detail_path, detail_headers)
+    detail_payload = json.loads(detail_body)
+    assert_satiksme_public_json(detail_path, detail_payload)
+    for event in detail_payload.get('events', []) if isinstance(detail_payload, dict) else []:
+        if not isinstance(event, dict):
+            continue
+        event_id = str(event.get('id', '')).strip()
+        if event_id and not re.fullmatch(r'incident-event:pub-[0-9a-f]{8}', event_id):
+            raise SystemExit(f'public incident detail event id is not opaque: {event_id!r}')
+        for raw_marker in ['channel:', 'stop:', 'vehicle:', 'area:', 'liveRowId', 'scopeKey']:
+            if raw_marker in event_id:
+                raise SystemExit(f'public incident detail event id exposes raw marker {raw_marker}: {event_id!r}')
+    status, _, _ = request(detail_path, method='HEAD')
+    if status != 200:
+        raise SystemExit(f'HEAD {detail_path} returned {status}, want 200')
+    for method in ['POST', 'OPTIONS']:
+        status, detail_method_headers, detail_method_body = request(detail_path, method=method, body='' if method == 'POST' else None)
+        if status != 405:
+            raise SystemExit(f'{method} {detail_path} returned {status}, want 405: {detail_method_body[:200]}')
+        allow = detail_method_headers.get('allow')
+        if allow != 'GET, HEAD':
+            raise SystemExit(f'{method} {detail_path} Allow header {allow!r}, want GET, HEAD')
+        assert_no_cors(detail_path, detail_method_headers)
+
+status, bundle_headers, bundle_body = request('/bundles/active.json')
+if status != 200:
+    raise SystemExit(f'active public bundle status {status}')
+assert_no_store('/bundles/active.json', bundle_headers)
+assert_no_satiksme_headers('/bundles/active.json', bundle_headers)
+if bundle_headers.get('x-robots-tag') != 'noindex, noarchive':
+    raise SystemExit(f'active public bundle unexpected X-Robots-Tag: {bundle_headers.get(\"x-robots-tag\")}')
+active_bundle = json.loads(bundle_body)
+bundle_version = str(active_bundle.get('version', '')).strip()
+manifest_path = str(active_bundle.get('manifestPath', '')).strip().lstrip('/')
+if not bundle_version or not manifest_path.startswith('bundles/'):
+    raise SystemExit(f'active public bundle has invalid version/path: {active_bundle}')
+status, bundle_query_headers, _ = request('/bundles/active.json?cache=split')
+if status != 404:
+    raise SystemExit(f'active public bundle query variant status {status}, want 404')
+assert_no_store('/bundles/active.json?cache=split', bundle_query_headers)
+status, manifest_headers, manifest_body = request('/' + manifest_path)
+if status != 200:
+    raise SystemExit(f'active public bundle manifest {manifest_path} status {status}')
+assert_no_satiksme_headers('/' + manifest_path, manifest_headers)
+assert_noindex('/' + manifest_path, manifest_headers)
+assert_immutable_public_asset_cache('/' + manifest_path, manifest_headers)
+status, manifest_alias_headers, manifest_alias_body = request('/' + manifest_path + '/')
+if status != 404:
+    raise SystemExit(f'active public bundle manifest trailing slash {manifest_path}/ returned {status}, want 404: {manifest_alias_body[:200]}')
+assert_no_store('/' + manifest_path + '/', manifest_alias_headers)
+assert_noindex('/' + manifest_path + '/', manifest_alias_headers)
+manifest = json.loads(manifest_body)
+if str(manifest.get('version', '')).strip() != bundle_version:
+    raise SystemExit(f'active public bundle manifest version mismatch: active={bundle_version} manifest={manifest}')
+for slice_name in ['stops', 'routes']:
+    slice_path = str((manifest.get('slices') or {}).get(slice_name, '')).strip()
+    if not slice_path:
+        raise SystemExit(f'active public bundle manifest missing slice {slice_name}: {manifest}')
+    bundle_path = '/' + manifest_path.rsplit('/', 1)[0].strip('/') + '/' + slice_path
+    status, slice_headers, _ = request(bundle_path, method='HEAD')
+    if status != 200:
+        raise SystemExit(f'active public bundle slice {bundle_path} status {status}')
+    assert_no_satiksme_headers(bundle_path, slice_headers)
+    assert_noindex(bundle_path, slice_headers)
+    assert_immutable_public_asset_cache(bundle_path, slice_headers)
+manifest_dir = '/' + manifest_path.rsplit('/', 1)[0].strip('/') + '/'
+status, manifest_dir_headers, manifest_dir_body = request(manifest_dir)
+if status != 404:
+    raise SystemExit(f'active public bundle directory {manifest_dir} returned {status}, want 404: {manifest_dir_body[:200]}')
+assert_no_store(manifest_dir, manifest_dir_headers)
+if manifest_dir_headers.get('x-robots-tag') != 'noindex, noarchive':
+    raise SystemExit(f'active public bundle directory unexpected X-Robots-Tag: {manifest_dir_headers.get(\"x-robots-tag\")}')
+
+status, snapshot_headers, active_body = request('/transport/live/active.json')
+if status != 200:
+    raise SystemExit(f'live snapshot active status {status}')
+assert_no_store('/transport/live/active.json', snapshot_headers)
+assert_no_satiksme_headers('/transport/live/active.json', snapshot_headers)
+if snapshot_headers.get('x-robots-tag') != 'noindex, noarchive':
+    raise SystemExit(f'live snapshot active unexpected X-Robots-Tag: {snapshot_headers.get(\"x-robots-tag\")}')
+active_snapshot = json.loads(active_body)
+for forbidden in ['hash', 'publishedAt', 'vehicleCount', 'lastSuccessAt', 'lastAttemptAt', 'status', 'consecutiveFailures']:
+    if forbidden in active_snapshot:
+        raise SystemExit(f'live snapshot active exposes {forbidden}: {active_snapshot}')
+snapshot_path = str(active_snapshot.get('path', '')).strip().lstrip('/')
+if not snapshot_path.startswith('transport/live/'):
+    raise SystemExit(f'live snapshot active path is not under transport/live: {snapshot_path!r}')
+snapshot_url_path = '/' + snapshot_path
+status, snapshot_asset_headers, snapshot_asset_body = request(snapshot_url_path)
+if status != 200:
+    raise SystemExit(f'live snapshot asset {snapshot_url_path} status {status}')
+assert_no_store(snapshot_url_path, snapshot_asset_headers)
+assert_no_satiksme_headers(snapshot_url_path, snapshot_asset_headers)
+if snapshot_asset_headers.get('x-robots-tag') != 'noindex, noarchive':
+    raise SystemExit(f'live snapshot asset unexpected X-Robots-Tag: {snapshot_asset_headers.get(\"x-robots-tag\")}')
+content_type = snapshot_asset_headers.get('content-type', '').lower().split(';')[0].strip()
+if content_type != 'application/json':
+    raise SystemExit(f'live snapshot asset unexpected content type: {snapshot_asset_headers.get(\"content-type\")}')
+assert_satiksme_public_json(snapshot_url_path, json.loads(snapshot_asset_body))
+status, snapshot_alias_headers, snapshot_alias_body = request(snapshot_url_path + '/')
+if status != 404:
+    raise SystemExit(f'live snapshot trailing slash {snapshot_url_path}/ returned {status}, want 404: {snapshot_alias_body[:200]}')
+assert_no_store(snapshot_url_path + '/', snapshot_alias_headers)
+assert_noindex(snapshot_url_path + '/', snapshot_alias_headers)
+status, snapshot_query_headers, _ = request(snapshot_url_path + '?cache=split')
+if status != 404:
+    raise SystemExit(f'live snapshot query variant {snapshot_url_path}?cache=split status {status}, want 404')
+assert_no_store(snapshot_url_path + '?cache=split', snapshot_query_headers)
+if snapshot_query_headers.get('x-robots-tag') != 'noindex, noarchive':
+    raise SystemExit(f'live snapshot query variant unexpected X-Robots-Tag: {snapshot_query_headers.get(\"x-robots-tag\")}')
+
+for path in ['/assets/%2e%2e/app.js', '/assets//app.js', '/assets%5capp.js', '/api%2fv1%2fpublic%2fcatalog', '/api%5cv1%5cpublic%5ccatalog']:
     status, _, _ = request(path)
     if status != 400:
         raise SystemExit(f'unsafe path {path} returned {status}, want 400')
 
 for path in ['/', '/assets/app.js']:
-    status, _, _ = request(path, method='POST', body='')
+    status, method_headers, _ = request(path, method='POST', body='')
     if status != 405:
         raise SystemExit(f'POST {path} returned {status}, want 405')
+    assert_no_store(path, method_headers)
+
+for path in ['/api/v1/public/catalog', '/api/v1/public/sightings?limit=1', '/api/v1/public/incidents?limit=1', '/api/v1/public/map?limit=1', '/api/v1/public/map-live?limit=1', '/api/v1/public/live-vehicles?limit=1']:
+    status, _, _ = request(path, method='HEAD')
+    if status != 200:
+        raise SystemExit(f'HEAD {path} returned {status}, want 200')
+    for method in ['POST', 'OPTIONS']:
+        status, headers, public_body = request(path, method=method, body='' if method == 'POST' else None)
+        if status != 405:
+            raise SystemExit(f'{method} {path} returned {status}, want 405: {public_body[:200]}')
+        allow = headers.get('allow')
+        if allow != 'GET, HEAD':
+            raise SystemExit(f'{method} {path} Allow header {allow!r}, want GET, HEAD')
+        assert_no_store(path, headers)
+        assert_no_cors(path, headers)
+
+for query in ['limit=abc', 'limit=-1', 'limit=2001', 'limit=', 'limit=1&limit=999', 'limit=&limit=1']:
+    status, headers, invalid_body = request(f'/api/v1/public/incidents?{query}')
+    if status != 400:
+        raise SystemExit(f'invalid public incident limit {query} returned {status}, want 400: {invalid_body[:200]}')
+    assert_no_store(f'/api/v1/public/incidents?{query}', headers)
+    assert_no_satiksme_headers(f'/api/v1/public/incidents?{query}', headers)
+
+for path in ['/api/v1/public/sightings', '/api/v1/public/map', '/api/v1/public/map-live', '/api/v1/public/live-vehicles']:
+    for query in ['limit=abc', 'limit=-1', 'limit=0', 'limit=501', 'limit=1&limit=2']:
+        status, headers, invalid_body = request(f'{path}?{query}')
+        if status != 400:
+            raise SystemExit(f'invalid public sightings limit {path}?{query} returned {status}, want 400: {invalid_body[:200]}')
+        assert_no_store(f'{path}?{query}', headers)
+        assert_no_satiksme_headers(f'{path}?{query}', headers)
+
+for path in [
+    '/api/v1/public/catalog?cv=bogus',
+    '/api/v1/public/catalog?debug=1',
+    '/api/v1/public/catalog?CacheVersion=bogus',
+    '/api/v1/public/incidents?limit=1&cv=bogus',
+    '/api/v1/public/incidents?limit=1&debug=1',
+    '/api/v1/public/incidents/stop:3012?debug=1',
+    '/api/v1/public/sightings?stopId=3012&stopId=3013',
+    '/api/v1/public/sightings?stopId=3012&cacheVersion=bogus',
+    '/api/v1/public/map?limit=1&date=2026-05-10',
+    '/api/v1/public/map-live?limit=1&date=2026-05-10&cv=bogus',
+    '/api/v1/public/live-vehicles?limit=1&cacheVersion=bogus',
+]:
+    status, headers, invalid_body = request(path)
+    if status != 400:
+        raise SystemExit(f'unexpected public query {path} returned {status}, want 400: {invalid_body[:200]}')
+    assert_no_store(path, headers)
+    assert_no_satiksme_headers(path, headers)
+
+for path in ['/oidc/.well-known/openid-configuration', '/oidc/jwks.json']:
+    status, oidc_headers, _ = request(path, method='HEAD')
+    if status != 200:
+        raise SystemExit(f'HEAD {path} returned {status}, want 200')
+    assert_no_store(path, oidc_headers)
+    assert_no_satiksme_headers(path, oidc_headers)
+    status, oidc_method_headers, oidc_method_body = request(path, method='OPTIONS')
+    if status != 405:
+        raise SystemExit(f'OPTIONS {path} returned {status}, want 405: {oidc_method_body[:200]}')
+    assert_no_store(f'OPTIONS {path}', oidc_method_headers)
+    assert_no_cors(path, oidc_method_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Origin': 'https://evil.example'})
+if status != 403:
+    raise SystemExit(f'cross-site logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout cross-site', logout_headers)
+
+status, complete_headers, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"initData\":\"invalid\"}', headers={'Origin': 'https://evil.example'})
+if status != 403:
+    raise SystemExit(f'cross-site Telegram completion returned {status}, want 403: {complete_body[:200]}')
+assert_no_store('/api/v1/auth/telegram/complete cross-site', complete_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Origin': 'https://${ARBUZAS_TRAIN_BOT_HOSTNAME}'})
+if status != 403:
+    raise SystemExit(f'sibling-origin logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout sibling-origin', logout_headers)
+
+status, logout_headers, logout_body = request('/api/v1/auth/logout', method='POST', headers={'Sec-Fetch-Site': 'same-site'})
+if status != 403:
+    raise SystemExit(f'same-site logout returned {status}, want 403: {logout_body[:200]}')
+assert_no_store('/api/v1/auth/logout same-site', logout_headers)
 PY
 wait_until_ok python3 \"\${tmp}\"" \
+    satiksme_bot satiksme_tunnel
+}
+
+validate_remote_satiksme_anonymous_data_denial() {
+  local remote_release_dir="$1"
+
+  validate_remote_probe "${remote_release_dir}" "satiksme anonymous private live tables are denied" \
+    "config_tmp=\$(mktemp)
+tmp=\$(mktemp)
+trap 'rm -f \"\${config_tmp}\" \"\${tmp}\"' EXIT
+wait_until_ok compose exec -T satiksme_bot sh -lc 'printf \"%s\n%s\n\" \"\${SATIKSME_RUNTIME_SPACETIME_HOST:-\${SATIKSME_WEB_SPACETIME_HOST}}\" \"\${SATIKSME_RUNTIME_SPACETIME_DATABASE:-\${SATIKSME_WEB_SPACETIME_DATABASE}}\"' > \"\${config_tmp}\"
+cat > \"\${tmp}\" <<'PY'
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+
+with open(os.environ['SATIKSME_SPACETIME_CONFIG_FILE'], 'r', encoding='utf-8') as handle:
+    config_lines = [line.strip() for line in handle.read().splitlines()]
+if len(config_lines) < 2 or not config_lines[0] or not config_lines[1]:
+    raise SystemExit('satiksme_bot container did not expose Spacetime validation config')
+
+spacetime_host = config_lines[0].rstrip('/')
+database = urllib.parse.quote(config_lines[1], safe='')
+
+def anonymous_sql(query):
+    url = f'{spacetime_host}/v1/database/{database}/sql'
+    request = urllib.request.Request(
+        url,
+        data=query.encode('utf-8'),
+        method='POST',
+        headers={'Content-Type': 'text/plain', 'User-Agent': 'curl/8.0'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode('utf-8', 'replace')
+
+def call(name, args):
+    procedure = urllib.parse.quote(name, safe='')
+    url = f'{spacetime_host}/v1/database/{database}/call/{procedure}'
+    data = json.dumps(args).encode('utf-8')
+    request = urllib.request.Request(url, data=data, method='POST', headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode('utf-8', 'replace')
+
+for table in [
+    'satiksmebot_live_viewer_heartbeat',
+    'satiksmebot_live_viewer_state',
+    'satiksmebot_reporter_identity',
+    'satiksmebot_stop_sighting',
+    'satiksmebot_vehicle_sighting',
+    'satiksmebot_area_report',
+    'satiksmebot_incident_vote',
+    'satiksmebot_incident_vote_event',
+    'satiksmebot_incident_comment',
+    'satiksmebot_report_dump',
+    'satiksmebot_report_dedupe',
+    'satiksmebot_import_chunk',
+    'satiksmebot_chat_analyzer_checkpoint',
+    'satiksmebot_chat_analyzer_message',
+    'satiksmebot_chat_analyzer_batch',
+    'satiksmebot_chat_analyzer_batch_message',
+]:
+    status, body = anonymous_sql(f'SELECT * FROM {table} WHERE 1 = 0')
+    if 200 <= status < 300:
+        raise SystemExit(f'anonymous SQL unexpectedly reached private table {table}: {status} {body[:200]}')
+
+status, body = anonymous_sql('SELECT * FROM satiksmebot_public_live_snapshot_state WHERE 1 = 0')
+if not (200 <= status < 300):
+    raise SystemExit(f'anonymous SQL could not inspect public live snapshot table layout: {status} {body[:200]}')
+for forbidden in ['hash', 'publishedAt', 'lastSuccessAt', 'lastAttemptAt', 'status', 'consecutiveFailures', 'vehicleCount']:
+    if forbidden in body:
+        raise SystemExit(f'public live snapshot table exposes {forbidden}: {body[:300]}')
+
+for name, args in [
+    ('satiksmebot_bootstrap_me', []),
+    ('satiksmebot_list_recent_reports', ['audit-invalid-no-mutate', 1]),
+    ('satiksmebot_submit_stop_report', ['audit-invalid-no-mutate', '', '']),
+    ('satiksmebot_submit_vehicle_report', ['audit-invalid-stop', 'bus', '1', '', 'audit', 0, '', '', '']),
+    ('satiksmebot_submit_area_report', [56.9, 24.1, 100, 'audit', '', '']),
+    ('satiksmebot_vote_incident', ['audit-invalid-no-mutate', 'ONGOING']),
+    ('satiksmebot_comment_incident', ['audit-invalid-no-mutate', 'audit']),
+    ('satiksmebot_heartbeat_live_viewer', ['audit-invalid-no-mutate', 'public']),
+    ('satiksmebot_set_live_viewer_state', ['audit-invalid-no-mutate', 'public', True]),
+    ('satiksmebot_service_pending_report_dump_count', []),
+]:
+    status, body = call(name, args)
+    if 200 <= status < 300:
+        raise SystemExit(f'anonymous call unexpectedly succeeded: {name} {status} {body[:200]}')
+    for forbidden in ['incident not found', 'bundle identity', 'stale bundle', 'accepted', 'deduped', 'lastSeenAt']:
+        if forbidden in body:
+            raise SystemExit(f'anonymous call reached application logic before auth denial: {name} {status} {body[:200]}')
+PY
+wait_until_ok env SATIKSME_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
     satiksme_bot satiksme_tunnel
 }
 
@@ -2839,6 +4027,13 @@ validate_remote_public_tls_dns_hardening() {
     "wait_until_ok sh -lc '
       set -e
       for host in \"${ARBUZAS_TRAIN_BOT_HOSTNAME}\" \"${ARBUZAS_SATIKSME_BOT_HOSTNAME}\"; do
+        for path in / /app /incidents; do
+          result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" \"http://\${host}\${path}\" 2>/dev/null || true)
+          case \"\${result}\" in
+            \"301 https://\${host}\${path}\"*|\"308 https://\${host}\${path}\"*) ;;
+            *) echo \"HTTP did not redirect to HTTPS for \${host}\${path}: \${result}\" >&2; exit 1 ;;
+          esac
+        done
         if printf \"\" | timeout 10 openssl s_client -tls1 -servername \"\${host}\" -connect \"\${host}:443\" >/dev/null 2>&1; then
           echo \"TLS 1.0 unexpectedly accepted for \${host}\" >&2
           exit 1
@@ -2863,6 +4058,7 @@ validate_remote_train_workload_health() {
   validate_remote_probe "${remote_release_dir}" "train local health" \
     "wait_until_ok compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
+  validate_remote_release_identity "${remote_release_dir}" train_bot "${ARBUZAS_TRAIN_BOT_PORT}"
   validate_remote_train_dependency_dns "${remote_release_dir}"
   validate_remote_probe "${remote_release_dir}" "train public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
@@ -2922,6 +4118,68 @@ validate_remote_train_dependency_dns() {
   exit 1
 }
 
+validate_remote_release_identity() {
+  local remote_release_dir="$1"
+  local service_name="$2"
+  local service_port="$3"
+  local script
+
+  read -r -d '' script <<REMOTE || true
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . '${remote_release_dir}/release.env'
+    if [[ -z "\${ARBUZAS_RELEASE_SOURCE_COMMIT:-}" ||
+          -z "\${ARBUZAS_RELEASE_SOURCE_DIRTY:-}" ||
+          -z "\${ARBUZAS_RELEASE_SOURCE_SHA256:-}" ]]; then
+      echo 'legacy release identity proof skipped for ${service_name}: release.env has no source identity fields'
+      exit 0
+    fi
+
+    tmp=\$(mktemp)
+    trap 'rm -f "\${tmp}"' EXIT
+    deadline=\$((SECONDS + 90))
+    while :; do
+      if compose exec -T ${service_name} sh -lc 'curl -fsS http://127.0.0.1:${service_port}/api/v1/internal/health' >"\${tmp}" 2>/dev/null; then
+        break
+      fi
+      if (( SECONDS >= deadline )); then
+        echo 'unable to read ${service_name} local internal health for release identity proof' >&2
+        exit 1
+      fi
+      sleep 5
+    done
+
+    EXPECTED_RELEASE_ID="\${ARBUZAS_RELEASE_ID}" \
+    EXPECTED_RELEASE_SOURCE_COMMIT="\${ARBUZAS_RELEASE_SOURCE_COMMIT}" \
+    EXPECTED_RELEASE_SOURCE_DIRTY="\${ARBUZAS_RELEASE_SOURCE_DIRTY}" \
+    EXPECTED_RELEASE_SOURCE_SHA256="\${ARBUZAS_RELEASE_SOURCE_SHA256}" \
+      python3 - "\${tmp}" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+    payload = json.load(handle)
+
+version = payload.get('version')
+if not isinstance(version, dict):
+    raise SystemExit('internal health is missing version object')
+
+expected = {
+    'releaseId': os.environ['EXPECTED_RELEASE_ID'],
+    'commit': os.environ['EXPECTED_RELEASE_SOURCE_COMMIT'],
+    'dirty': os.environ['EXPECTED_RELEASE_SOURCE_DIRTY'],
+    'sourceSha256': os.environ['EXPECTED_RELEASE_SOURCE_SHA256'],
+}
+for key, want in expected.items():
+    got = str(version.get(key, ''))
+    if got != want:
+        raise SystemExit('version.%s=%r, expected %r' % (key, got, want))
+PY
+REMOTE
+  validate_remote_probe "${remote_release_dir}" "${service_name} release identity proof" "${script}" "${service_name}"
+}
+
 validate_remote_satiksme_workload_health() {
   local remote_release_dir="$1"
 
@@ -2929,6 +4187,7 @@ validate_remote_satiksme_workload_health() {
   validate_remote_probe "${remote_release_dir}" "satiksme local health" \
     "wait_until_ok compose exec -T satiksme_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
     satiksme_bot satiksme_tunnel
+  validate_remote_release_identity "${remote_release_dir}" satiksme_bot "${ARBUZAS_SATIKSME_BOT_PORT}"
   validate_remote_satiksme_dependency_dns "${remote_release_dir}"
   validate_remote_probe "${remote_release_dir}" "satiksme public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
@@ -2940,12 +4199,13 @@ validate_remote_satiksme_workload_health() {
     "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; body=\$(curl -fsS \"\${root}/api/v1/health\") && printf %s \"\${body}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version catalogStops; do if printf %s \"\${body}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && livez=\$(curl -fsS \"\${root}/api/v1/livez\") && printf %s \"\${livez}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version; do if printf %s \"\${livez}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/api/v1/internal/health\") && test \"\${code}\" = 404'" \
     satiksme_bot satiksme_tunnel
   validate_remote_probe "${remote_release_dir}" "satiksme public security headers and shell assets" \
-    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/root.headers\" -o \"\${tmp}/root.html\" \"\${root}/\" && grep -Fi \"strict-transport-security: max-age=300\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-frame-options: DENY\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-content-type-options: nosniff\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"referrer-policy: strict-origin-when-cross-origin\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"content-security-policy:\" \"\${tmp}/root.headers\" >/dev/null && ! grep -Fi \"x-satiksme-bot-\" \"\${tmp}/root.headers\" >/dev/null && grep -F \"/assets/leaflet/leaflet.js\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"unpkg.com/leaflet\" \"\${tmp}/root.html\" >/dev/null && incidents=\$(curl -fsS \"\${root}/incidents\") && printf %s \"\${incidents}\" | grep -F \"\\\"mode\\\":\\\"public-incidents\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"unpkg.com/leaflet\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-login\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-web-app\" >/dev/null'" \
+    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/root.headers\" -o \"\${tmp}/root.html\" \"\${root}/\" && grep -Fi \"strict-transport-security: max-age=31536000\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-frame-options: DENY\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-content-type-options: nosniff\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"referrer-policy: strict-origin-when-cross-origin\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"content-security-policy:\" \"\${tmp}/root.headers\" >/dev/null && ! grep -Fi \"x-satiksme-bot-\" \"\${tmp}/root.headers\" >/dev/null && grep -F \"/assets/leaflet/leaflet.js\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"unpkg.com/leaflet\" \"\${tmp}/root.html\" >/dev/null && incidents=\$(curl -fsS \"\${root}/incidents\") && printf %s \"\${incidents}\" | grep -F \"\\\"mode\\\":\\\"public-incidents\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"unpkg.com/leaflet\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-login\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-web-app\" >/dev/null'" \
     satiksme_bot satiksme_tunnel
   validate_remote_probe "${remote_release_dir}" "satiksme live snapshots are uncacheable and query-safe" \
     "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/active.headers\" -o \"\${tmp}/active.json\" \"\${root}/transport/live/active.json\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/active.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/active.headers\" >/dev/null && path=\$(sed -n \"s/.*\\\"path\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p\" \"\${tmp}/active.json\" | head -1) && test -n \"\${path}\" && case \"\${path}\" in transport/live/*) ;; *) exit 1 ;; esac && curl -fsS -D \"\${tmp}/snapshot.headers\" -o /dev/null \"\${root}/\${path}\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/snapshot.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/snapshot.headers\" >/dev/null && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/\${path}?cache=split\") && test \"\${code}\" = 404'" \
     satiksme_bot satiksme_tunnel
   validate_remote_satiksme_public_hardening "${remote_release_dir}"
+  validate_remote_satiksme_anonymous_data_denial "${remote_release_dir}"
   validate_remote_public_tls_dns_hardening "${remote_release_dir}"
 }
 
@@ -3009,13 +4269,34 @@ validate_remote_subscription_workload_health() {
     subscription_bot subscription_tunnel
 }
 
+validate_remote_phone_broker_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker
+  validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker
+}
+
+validate_remote_rigassatiksme_qr_bot_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker rigassatiksme_qr_bot
+  validate_remote_probe "${remote_release_dir}" "rigassatiksme QR bot broker health" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker rigassatiksme_qr_bot
+}
+
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote production state backend" \
     "ticket_state_backend_ok() {
       file_backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
@@ -3026,44 +4307,20 @@ validate_remote_ticket_remote_workload_health() {
   validate_remote_probe "${remote_release_dir}" "ticket-remote public container secrets scoped" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'test ! -e /root/.android/adbkey && test ! -e /root/.android/adbkey.pub && test ! -e /root/.android/adb_known_hosts.pb && test ! -d /etc/arbuzas/secrets && test -d /run/secrets/ticket-remote'" \
     ticket_remote
-  validate_remote_probe "${remote_release_dir}" "ticket Android simulator ADB ready" \
-    "wait_until_ok compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; adb -s ticket_android_sim:5555 get-state >/dev/null 2>/dev/null'" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge
-  validate_remote_probe "${remote_release_dir}" "ticket Android simulator no swap" \
-    "wait_until_ok compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; swap_total=\$(adb -s ticket_android_sim:5555 shell su 0 cat /proc/meminfo 2>/dev/null | tr -d \"\\r\" | awk \"/^SwapTotal:/ {print \\\$2; exit}\"); test \"\${swap_total}\" = 0'" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge
-  validate_remote_probe "${remote_release_dir}" "ticket Android simulator current boot tuned" \
-    "current_boot_tuned_ok() {
-      status=/srv/arbuzas/android-sim/status/tuning-status.env
-      [[ -s \"\${status}\" ]] || return 1
-      grep -F 'result=ok' \"\${status}\" >/dev/null || return 1
-      grep -F 'swap_total_kb=0' \"\${status}\" >/dev/null || return 1
-      boot_id=\$(compose exec -T ticket_android_sim_bridge sh -lc 'adb connect ticket_android_sim:5555 >/dev/null 2>&1 || true; adb -s ticket_android_sim:5555 shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d \"\\r\"' 2>/dev/null || true)
-      [[ -n \"\${boot_id}\" ]] || return 1
-      grep -F \"boot_id=\${boot_id}\" \"\${status}\" >/dev/null
-    }
-    wait_until_ok current_boot_tuned_ok" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge
-  validate_remote_probe "${remote_release_dir}" "ticket Android simulator resources" \
-    "wait_until_ok sh -lc 'inspect=\$(docker inspect arbuzas-ticket_android_sim-1 --format \"NanoCpus={{.HostConfig.NanoCpus}} Memory={{.HostConfig.Memory}} MemorySwap={{.HostConfig.MemorySwap}}\"); printf %s \"\${inspect}\" | grep -F \"NanoCpus=2000000000\" >/dev/null && printf %s \"\${inspect}\" | grep -F \"Memory=6442450944\" >/dev/null && printf %s \"\${inspect}\" | grep -F \"MemorySwap=6442450944\" >/dev/null'" \
-    ticket_android_sim
   validate_remote_probe "${remote_release_dir}" "ticket-remote active configured backend" \
     "active_configured_backend_ok() {
       active=\$(sed -n 's/.*\"backendId\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' /srv/arbuzas/ticket-remote/state/active-phone-backend.json 2>/dev/null | head -1)
       if [[ -z \"\${active}\" ]]; then
-        active=android-sim
+        active=pixel
       fi
-      case \"\${active}\" in
-        android-sim|pixel) ;;
-        *) return 1 ;;
-      esac
-      compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
+      [[ \"\${active}\" = pixel ]] || return 1
+      compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PHONE_BACKEND_ID}\" = pixel && test \"\${TICKET_REMOTE_PHONE_BROKER_URL}\" = \"http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}\" && curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
     }
     wait_until_ok active_configured_backend_ok" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_remote
+    ticket_phone_bridge phone_broker ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
-    ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote public HTTP redirects to HTTPS" \
     "wait_until_ok sh -lc 'result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" http://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${result}\" in \"301 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*|\"308 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*) exit 0 ;; *) printf \"%s\\n\" \"\${result}\" >&2; exit 1 ;; esac'" \
     ticket_remote ticket_remote_tunnel
@@ -3160,6 +4417,8 @@ validate_remote_workload_health() {
   validate_remote_train_workload_health "${remote_release_dir}"
   validate_remote_satiksme_workload_health "${remote_release_dir}"
   validate_remote_subscription_workload_health "${remote_release_dir}"
+  validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  validate_remote_rigassatiksme_qr_bot_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
   validate_remote_dns_workload_health "${remote_release_dir}"
 }
@@ -3178,6 +4437,12 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_SUBSCRIPTION == 1 )); then
     validate_remote_subscription_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_PHONE_BROKER == 1 )); then
+    validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_RIGASATIKSME_QR == 1 )); then
+    validate_remote_rigassatiksme_qr_bot_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
@@ -3279,6 +4544,7 @@ validate_remote_release() {
   local target_release_id="${1:-${requested_release_id}}"
   local remote_release_dir
   local diagnostics_services=()
+  local REMOTE_VALIDATION_FAILED=0
   remote_release_dir="$(resolve_remote_release_dir "${target_release_id}")"
   populate_current_diagnostic_services diagnostics_services
 
@@ -3297,6 +4563,7 @@ validate_remote_release() {
     if (( VALIDATE_PORTAINER == 1 )); then
       validate_remote_portainer_state "${remote_release_dir}"
     fi
+    return_remote_validation_status
     return
   fi
 
@@ -3304,6 +4571,7 @@ validate_remote_release() {
   validate_public_dns_access "${remote_release_dir}"
   validate_private_dns_admin_access "${remote_release_dir}"
   validate_remote_host_baseline "${remote_release_dir}"
+  return_remote_validation_status
 }
 
 repair_remote_portainer() {
@@ -3319,7 +4587,7 @@ repair_remote_portainer() {
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
-    portainer train_bot satiksme_bot subscription_bot ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker rigassatiksme_qr_bot ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
   validate_remote_workload_health "${remote_release_dir}"
 
   validate_remote_host_probe "${remote_release_dir}" \
@@ -3336,7 +4604,7 @@ repair_remote_portainer() {
         exit 1
       fi
     " \
-    portainer train_bot satiksme_bot subscription_bot ticket_android_sim ticket_android_sim_tuner ticket_android_sim_bridge ticket_phone_bridge ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker rigassatiksme_qr_bot ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
 
   backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_path="${REMOTE_PORTAINER_BACKUPS_DIR}/portainer-${backup_timestamp}.tar.gz"
@@ -3424,22 +4692,49 @@ rollback_remote_release() {
   fi
   ARBUZAS_RELEASE_ID="${requested_release_id}"
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
-  local all_non_dns_service_args=""
-  all_non_dns_service_args="$(compose_all_non_dns_service_args)"
-  ensure_remote_dns_host_preflight
+  local rollback_non_dns_service_args=""
+  local rollback_tunnel_service_args=""
+  local rollback_dns_in_scope=1
+  if (( TARGETED_MODE == 1 )); then
+    rollback_non_dns_service_args="$(compose_target_service_args_without_dns)"
+    rollback_tunnel_service_args="$(compose_target_tunnel_service_args)"
+    rollback_dns_in_scope=0
+    if targeted_service_selected dns_controlplane; then
+      rollback_dns_in_scope=1
+    fi
+  else
+    rollback_non_dns_service_args="$(compose_all_non_dns_service_args)"
+  fi
+  if (( rollback_dns_in_scope == 1 )); then
+    ensure_remote_dns_host_preflight
+  fi
   remote_shell "
+    ROLLBACK_DNS_IN_SCOPE='${rollback_dns_in_scope}'
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing release bundle: ${remote_release_dir}' >&2; exit 1; }
     cd '${remote_release_dir}'
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' build dns_controlplane
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
-    if [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]]; then
+    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' ]]; then
+      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' build dns_controlplane
+      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null
+      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
+    fi
+    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' && -f '${REMOTE_CURRENT_LINK}/release.env' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' stop dns_controlplane frontend adguardhome >/dev/null 2>&1 || true
     fi
     ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${all_non_dns_service_args}
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
+    if [[ '${TARGETED_MODE}' == '1' ]]; then
+      if [[ -n '${rollback_non_dns_service_args}' ]]; then
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${rollback_non_dns_service_args}
+      fi
+      if [[ -n '${rollback_tunnel_service_args}' ]]; then
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${rollback_tunnel_service_args}
+      fi
+    else
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${rollback_non_dns_service_args}
+    fi
+    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' ]]; then
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
+    fi
   "
 }
 
@@ -3521,10 +4816,10 @@ fi
 
 if (( ${#REQUESTED_SERVICES[@]} > 0 )); then
   case "${action}" in
-    deploy|validate)
+    deploy|validate|rollback)
       ;;
     *)
-      echo "--services is only supported for deploy and validate" >&2
+      echo "--services is only supported for deploy, validate, and rollback" >&2
       exit 2
       ;;
   esac
@@ -3554,18 +4849,12 @@ case "${action}" in
     prepare_remote_host_layout
     copy_release_to_remote
     render_remote_cloudflared_configs
-    if targeted_service_selected ticket_android_sim; then
-      prepare_remote_ticket_android_sim_active_backend
-      upload_remote_ticket_android_sim_phone_apk
-    fi
     remote_compose_up
-    if targeted_service_selected ticket_android_sim; then
-      setup_remote_ticket_android_sim "${REMOTE_CURRENT_LINK}"
-    fi
     if requires_dns_release_prepare; then
       publish_remote_dns_admin_tailscale
     fi
     if validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}" && validate_remote_release "${ARBUZAS_RELEASE_ID}"; then
+      cleanup_remote_public_bundle_versions
       run_automatic_remote_docker_gc
       exit 0
     fi
@@ -3573,7 +4862,9 @@ case "${action}" in
       log "Deploy validation failed; rolling back to ${previous_release_id}"
       requested_release_id="${previous_release_id}"
       rollback_remote_release
-      publish_remote_dns_admin_tailscale
+      if requires_dns_release_prepare; then
+        publish_remote_dns_admin_tailscale
+      fi
       validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
       validate_remote_release "${previous_release_id}"
     fi
@@ -3589,9 +4880,13 @@ case "${action}" in
     validate_remote_release "${requested_release_id}"
     ;;
   rollback)
-    require_dns_private_admin_env
+    if dns_validation_requested || requires_dns_release_prepare; then
+      require_dns_private_admin_env
+    fi
     rollback_remote_release
-    publish_remote_dns_admin_tailscale
+    if requires_dns_release_prepare; then
+      publish_remote_dns_admin_tailscale
+    fi
     validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
     validate_remote_release "${requested_release_id}"
     run_automatic_remote_docker_gc

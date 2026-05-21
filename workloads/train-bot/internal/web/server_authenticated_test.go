@@ -254,14 +254,17 @@ func TestServeHTTPLocationReportCreatesPublicAreaIncident(t *testing.T) {
 	if err := json.Unmarshal(detailRes.Body.Bytes(), &detailPayload); err != nil {
 		t.Fatalf("decode area incident detail: %v", err)
 	}
-	if detailPayload.Summary.Scope != "area" || detailPayload.Summary.SubjectName != "near the station tunnel" {
+	if detailPayload.Summary.Scope != "area" || detailPayload.Summary.SubjectName != "Inspection near this location" {
 		t.Fatalf("unexpected area incident summary: %+v", detailPayload.Summary)
 	}
-	if detailPayload.Summary.Location == nil || detailPayload.Summary.Location.Kind != "area" || detailPayload.Summary.Location.RadiusMeters != 100 {
-		t.Fatalf("expected area radius in incident location, got %+v", detailPayload.Summary.Location)
+	if detailPayload.Summary.Location == nil || detailPayload.Summary.Location.Kind != "area" || detailPayload.Summary.Location.RadiusMeters != 250 {
+		t.Fatalf("expected coarse area radius in incident location, got %+v", detailPayload.Summary.Location)
 	}
 	if detailPayload.Summary.Location.Latitude == nil || detailPayload.Summary.Location.Longitude == nil {
 		t.Fatalf("expected area coordinates in incident location, got %+v", detailPayload.Summary.Location)
+	}
+	if *detailPayload.Summary.Location.Latitude != 56.947 || *detailPayload.Summary.Location.Longitude != 24.106 {
+		t.Fatalf("expected coarsened area coordinates, got %+v", detailPayload.Summary.Location)
 	}
 }
 

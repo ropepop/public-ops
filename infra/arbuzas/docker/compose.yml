@@ -19,6 +19,11 @@ services:
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/train-bot.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     working_dir: /srv/train-bot
     environment:
       TZ: ${ARBUZAS_TZ}
@@ -81,18 +86,25 @@ services:
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/satiksme-bot.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     working_dir: /srv/satiksme-bot
     environment:
       TZ: ${ARBUZAS_TZ}
       SATIKSME_WEB_ENABLED: "true"
       SATIKSME_WEB_BIND_ADDR: 0.0.0.0
       SATIKSME_WEB_PORT: ${ARBUZAS_SATIKSME_BOT_PORT}
+      SATIKSME_WEB_PUBLIC_BASE_URL: https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}
       DB_PATH: /srv/satiksme-bot/state/satiksme_bot.db
       SINGLE_INSTANCE_LOCK_PATH: /srv/satiksme-bot/run/satiksme-bot.lock
       SATIKSME_CATALOG_MIRROR_DIR: /srv/satiksme-bot/data/catalog/source
       SATIKSME_CATALOG_OUTPUT_PATH: /srv/satiksme-bot/data/catalog/generated/catalog.json
       SATIKSME_WEB_BUNDLE_DIR: /srv/satiksme-bot/data/public-bundles
       SATIKSME_WEB_LIVE_SNAPSHOT_DIR: /srv/satiksme-bot/state/live-snapshot
+      SATIKSME_WEB_LIVE_VIEWER_HEARTBEAT_ENABLED: "true"
       SATIKSME_CHAT_ANALYZER_SESSION_FILE: /srv/satiksme-bot/state/chat-analyzer.session
       SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER: google
       SATIKSME_CHAT_ANALYZER_MODEL_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
@@ -118,12 +130,14 @@ services:
         export SATIKSME_WEB_ENABLED="true"
         export SATIKSME_WEB_BIND_ADDR="0.0.0.0"
         export SATIKSME_WEB_PORT="${ARBUZAS_SATIKSME_BOT_PORT}"
+        export SATIKSME_WEB_PUBLIC_BASE_URL="https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}"
         export DB_PATH="/srv/satiksme-bot/state/satiksme_bot.db"
         export SINGLE_INSTANCE_LOCK_PATH="/srv/satiksme-bot/run/satiksme-bot.lock"
         export SATIKSME_CATALOG_MIRROR_DIR="/srv/satiksme-bot/data/catalog/source"
         export SATIKSME_CATALOG_OUTPUT_PATH="/srv/satiksme-bot/data/catalog/generated/catalog.json"
         export SATIKSME_WEB_BUNDLE_DIR="/srv/satiksme-bot/data/public-bundles"
         export SATIKSME_WEB_LIVE_SNAPSHOT_DIR="/srv/satiksme-bot/state/live-snapshot"
+        export SATIKSME_WEB_LIVE_VIEWER_HEARTBEAT_ENABLED="true"
         export SATIKSME_CHAT_ANALYZER_SESSION_FILE="${SATIKSME_CHAT_ANALYZER_SESSION_FILE:-/srv/satiksme-bot/state/chat-analyzer.session}"
         export SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER="${SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER:-google}"
         export SATIKSME_CHAT_ANALYZER_MODEL_BASE_URL="${SATIKSME_CHAT_ANALYZER_MODEL_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}"
@@ -211,82 +225,6 @@ services:
       - /etc/arbuzas/env/subscription-bot.env:/srv/subscription-bot/.env:ro
       - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
 
-  ticket_android_sim:
-    image: halimqarroum/docker-android:api-33
-    privileged: true
-    tty: true
-    stdin_open: true
-    cpus: "2.0"
-    mem_limit: 6g
-    memswap_limit: 6g
-    mem_swappiness: 0
-    entrypoint:
-      - /bin/bash
-      - -c
-      - |
-        set -e
-        rm -rf /root/.android/avd/running/* 2>/dev/null || true
-        find /data -maxdepth 3 \( -name '*.lock' -o -name '*.pid' \) -delete 2>/dev/null || true
-        cd /opt
-        exec /opt/start-emulator.sh
-    environment:
-      DISABLE_ANIMATION: "true"
-      DISABLE_HIDDEN_POLICY: "true"
-      SKIP_AUTH: "false"
-      MEMORY: "4096"
-      CORES: "2"
-    devices:
-      - /dev/kvm:/dev/kvm
-    volumes:
-      - /srv/arbuzas/android-sim/google-apis/avd:/data
-      - /etc/arbuzas/secrets/android-adb/adbkey:/root/.android/adbkey:ro
-      - /etc/arbuzas/secrets/android-adb/adbkey.pub:/root/.android/adbkey.pub:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-
-  ticket_android_sim_tuner:
-    image: arbuzas/ticket-phone-bridge:${ARBUZAS_RELEASE_ID}
-    build:
-      context: ../../..
-      dockerfile: infra/arbuzas/docker/images/ticket-phone-bridge.Dockerfile
-    depends_on:
-      - ticket_android_sim
-    command:
-      - /usr/local/bin/ticket-android-sim-tune-loop
-    environment:
-      TZ: ${ARBUZAS_TZ}
-      TICKET_ANDROID_SIM_ADB_TARGET: ticket_android_sim:5555
-      TICKET_ANDROID_SIM_STATUS_DIR: /srv/android-sim/status
-      TICKET_ANDROID_SIM_APK_DIR: /srv/android-sim/apks
-      TICKET_ANDROID_SIM_DISPLAY_SIZE: 540x960
-      TICKET_ANDROID_SIM_DISPLAY_DENSITY: "220"
-    volumes:
-      - /etc/arbuzas/secrets/android-adb/adbkey:/root/.android/adbkey:ro
-      - /etc/arbuzas/secrets/android-adb/adbkey.pub:/root/.android/adbkey.pub:ro
-      - /srv/arbuzas/android-sim:/srv/android-sim
-    restart: unless-stopped
-
-  ticket_android_sim_bridge:
-    image: arbuzas/ticket-phone-bridge:${ARBUZAS_RELEASE_ID}
-    build:
-      context: ../../..
-      dockerfile: infra/arbuzas/docker/images/ticket-phone-bridge.Dockerfile
-    depends_on:
-      - ticket_android_sim
-    environment:
-      TZ: ${ARBUZAS_TZ}
-      TICKET_PHONE_ADB_TARGET: ticket_android_sim:5555
-      TICKET_PHONE_DEVICE_PORT: "9388"
-      TICKET_PHONE_ADB_FORWARD_PORT: "19389"
-      TICKET_PHONE_BRIDGE_PORT: "9388"
-      TICKET_PHONE_RETRY_DELAY: "2"
-    volumes:
-      - /etc/arbuzas/secrets/android-adb/adbkey:/root/.android/adbkey:ro
-      - /etc/arbuzas/secrets/android-adb/adbkey.pub:/root/.android/adbkey.pub:ro
-      - /srv/arbuzas/android-sim/apks:/srv/android-sim/apks:ro
-    restart: unless-stopped
-
   ticket_phone_bridge:
     image: arbuzas/ticket-phone-bridge:${ARBUZAS_RELEASE_ID}
     build:
@@ -307,6 +245,96 @@ services:
       - /etc/arbuzas/secrets/android-adb/adbkey:/root/.android/adbkey:ro
       - /etc/arbuzas/secrets/android-adb/adbkey.pub:/root/.android/adbkey.pub:ro
       - /etc/arbuzas/secrets/android-adb/adb_known_hosts.pb:/root/.android/adb_known_hosts.pb:ro
+
+  phone_broker:
+    image: arbuzas/phone-broker:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/phone-broker.Dockerfile
+    working_dir: /srv/phone-broker
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      PHONE_BROKER_BIND_ADDR: 0.0.0.0
+      PHONE_BROKER_PORT: ${ARBUZAS_PHONE_BROKER_PORT}
+      PHONE_BROKER_UPSTREAM_BASE_URL: http://ticket_phone_bridge:9388
+      PHONE_BROKER_STATE_PATH: /srv/phone-broker/state/jobs.json
+      PHONE_BROKER_TICKET_GRACE: 10s
+      PHONE_BROKER_MAX_TICKET_QR_BLOCK: 15s
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        export PHONE_BROKER_BIND_ADDR="0.0.0.0"
+        export PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT}"
+        export PHONE_BROKER_UPSTREAM_BASE_URL="$${PHONE_BROKER_UPSTREAM_BASE_URL:-http://ticket_phone_bridge:9388}"
+        export PHONE_BROKER_STATE_PATH="$${PHONE_BROKER_STATE_PATH:-/srv/phone-broker/state/jobs.json}"
+        export PHONE_BROKER_TICKET_GRACE="$${PHONE_BROKER_TICKET_GRACE:-10s}"
+        export PHONE_BROKER_MAX_TICKET_QR_BLOCK="$${PHONE_BROKER_MAX_TICKET_QR_BLOCK:-15s}"
+        mkdir -p /srv/phone-broker/run /srv/phone-broker/state
+        exec /usr/local/bin/phone-broker
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    depends_on:
+      - ticket_phone_bridge
+    volumes:
+      - /srv/arbuzas/phone-broker:/srv/phone-broker
+
+  rigassatiksme_qr_bot:
+    image: arbuzas/rigassatiksme-qr-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/rigassatiksme-qr-bot.Dockerfile
+    working_dir: /srv/rigassatiksme-qr-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      PHONE_BROKER_BASE_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
+      RIGASATIKSME_QR_ACCESS_STATE_PATH: /srv/rigassatiksme-qr-bot/state/access.json
+      RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN: "false"
+      RIGASATIKSME_QR_ADMIN_USER_IDS: ${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}
+      RIGASATIKSME_QR_SPACETIME_HOST: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}
+      RIGASATIKSME_QR_SPACETIME_DATABASE: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}
+      RIGASATIKSME_QR_SPACETIME_TOKEN: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/rigassatiksme-qr-bot/.env
+        set +a
+        export PHONE_BROKER_BASE_URL="http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}"
+        export RIGASATIKSME_QR_ACCESS_STATE_PATH="$${RIGASATIKSME_QR_ACCESS_STATE_PATH:-/srv/rigassatiksme-qr-bot/state/access.json}"
+        export RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN="$${RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN:-false}"
+        export RIGASATIKSME_QR_ADMIN_USER_IDS="$${RIGASATIKSME_QR_ADMIN_USER_IDS:-${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}}"
+        export RIGASATIKSME_QR_SPACETIME_HOST="$${RIGASATIKSME_QR_SPACETIME_HOST:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}}"
+        export RIGASATIKSME_QR_SPACETIME_DATABASE="$${RIGASATIKSME_QR_SPACETIME_DATABASE:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}}"
+        export RIGASATIKSME_QR_SPACETIME_TOKEN="$${RIGASATIKSME_QR_SPACETIME_TOKEN:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}}"
+        export RIGASATIKSME_QR_JOB_POLL_INTERVAL="$${RIGASATIKSME_QR_JOB_POLL_INTERVAL:-250ms}"
+        export RIGASATIKSME_QR_JOB_POLL_TIMEOUT="$${RIGASATIKSME_QR_JOB_POLL_TIMEOUT:-10m}"
+        mkdir -p /srv/rigassatiksme-qr-bot/run /srv/rigassatiksme-qr-bot/state
+        exec /usr/local/bin/rigassatiksme-qr-bot
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    depends_on:
+      - phone_broker
+    volumes:
+      - /srv/arbuzas/rigassatiksme-qr-bot:/srv/rigassatiksme-qr-bot
+      - /etc/arbuzas/env/rigassatiksme-qr-bot.env:/srv/rigassatiksme-qr-bot/.env:ro
 
   ticket_remote:
     image: arbuzas/ticket-remote:${ARBUZAS_RELEASE_ID}
@@ -329,14 +357,13 @@ services:
       TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL: https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback
       TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL: ticket@jolkins.id.lv
       TICKET_REMOTE_COOKIE_TTL: 720h
-      TICKET_REMOTE_PHONE_BACKENDS: android-sim|Android simulator|http://ticket_android_sim_bridge:9388;pixel|Pixel|http://ticket_phone_bridge:9388
-      TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID: android-sim
+      TICKET_REMOTE_PHONE_BACKENDS: pixel|Pixel|http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
+      TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID: pixel
       TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE: /srv/ticket-remote/state/active-phone-backend.json
-      TICKET_REMOTE_PHONE_BACKEND_ID: android-sim
-      TICKET_REMOTE_PHONE_ATTACH_NAME: Android simulator
-      TICKET_REMOTE_PHONE_BASE_URL: http://ticket_android_sim_bridge:9388
-      TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID: android-sim
-      TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET: ticket_android_sim:5555
+      TICKET_REMOTE_PHONE_BACKEND_ID: pixel
+      TICKET_REMOTE_PHONE_ATTACH_NAME: Pixel
+      TICKET_REMOTE_PHONE_BASE_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
+      TICKET_REMOTE_PHONE_BROKER_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
     command:
       - /bin/sh
       - -lc
@@ -357,14 +384,13 @@ services:
         export TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL="$${TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL:-https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback}"
         export TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL="$${TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL:-ticket@jolkins.id.lv}"
         export TICKET_REMOTE_COOKIE_TTL="$${TICKET_REMOTE_COOKIE_TTL:-720h}"
-        export TICKET_REMOTE_PHONE_BACKENDS="$${TICKET_REMOTE_PHONE_BACKENDS:-android-sim|Android simulator|http://ticket_android_sim_bridge:9388;pixel|Pixel|http://ticket_phone_bridge:9388}"
-        export TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID="$${TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID:-android-sim}"
+        export TICKET_REMOTE_PHONE_BACKENDS="$${TICKET_REMOTE_PHONE_BACKENDS:-pixel|Pixel|http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
+        export TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID="$${TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID:-pixel}"
         export TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE="$${TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE:-/srv/ticket-remote/state/active-phone-backend.json}"
-        export TICKET_REMOTE_PHONE_BACKEND_ID="$${TICKET_REMOTE_PHONE_BACKEND_ID:-android-sim}"
-        export TICKET_REMOTE_PHONE_ATTACH_NAME="$${TICKET_REMOTE_PHONE_ATTACH_NAME:-Android simulator}"
-        export TICKET_REMOTE_PHONE_BASE_URL="$${TICKET_REMOTE_PHONE_BASE_URL:-http://ticket_android_sim_bridge:9388}"
-        export TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID="$${TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID:-android-sim}"
-        export TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET="$${TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET:-ticket_android_sim:5555}"
+        export TICKET_REMOTE_PHONE_BACKEND_ID="$${TICKET_REMOTE_PHONE_BACKEND_ID:-pixel}"
+        export TICKET_REMOTE_PHONE_ATTACH_NAME="$${TICKET_REMOTE_PHONE_ATTACH_NAME:-Pixel}"
+        export TICKET_REMOTE_PHONE_BASE_URL="$${TICKET_REMOTE_PHONE_BASE_URL:-http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
+        export TICKET_REMOTE_PHONE_BROKER_URL="$${TICKET_REMOTE_PHONE_BROKER_URL:-http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
         mkdir -p /srv/ticket-remote/run /srv/ticket-remote/state
         exec /usr/local/bin/ticket-remote
     healthcheck:
@@ -383,9 +409,7 @@ services:
       - 1.0.0.1
       - 8.8.8.8
     depends_on:
-      - ticket_android_sim_bridge
-      - ticket_android_sim_tuner
-      - ticket_phone_bridge
+      - phone_broker
     volumes:
       - /srv/arbuzas/ticket-remote:/srv/ticket-remote
       - /etc/arbuzas/env/ticket-remote.env:/srv/ticket-remote/.env:ro

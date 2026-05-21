@@ -6,12 +6,12 @@
 
 ```bash
 ../../tools/arbuzas/deploy.sh deploy \
-  --services ticket_phone_bridge,ticket_remote,ticket_remote_tunnel \
+  --services ticket_phone_bridge,phone_broker,ticket_remote,ticket_remote_tunnel \
   --ssh-host arbuzas \
   --ssh-user ropepop
 
 ../../tools/arbuzas/deploy.sh validate \
-  --services ticket_phone_bridge,ticket_remote,ticket_remote_tunnel \
+  --services ticket_phone_bridge,phone_broker,ticket_remote,ticket_remote_tunnel \
   --ssh-host arbuzas \
   --ssh-user ropepop
 ```
@@ -42,10 +42,13 @@ Configure a self-hosted Access app for `ticket.jolkins.id.lv`.
 
 ## Pixel Backend
 
-The phone backend is private to Ops through `ticket_phone_bridge`. The bridge connects to the Pixel over ADB on Tailscale, forwards the Pixel's local ticket stream port inside Docker, and exposes it only to `ticket_remote`.
+The phone backend is private to Ops through `phone_broker`, which is the only Arbuzas service ticket_remote should use for phone sessions. The broker owns priority between ticket viewing and lower-priority phone automation, then talks privately to `ticket_phone_bridge`.
+`ticket_phone_bridge` connects to the Pixel over ADB on Tailscale, forwards the Pixel's local ticket stream port inside Docker, and exposes it only inside the private Docker network.
 The bridge uses the ADB key files in `/etc/arbuzas/secrets/android-adb/`, mounted read-only into the bridge container. Keep those files scoped to the bridge; they are what let Ops reach the already-authorized Pixel without asking Android to approve a new container identity.
 
-The browser never receives the phone URL and never talks directly to the Pixel. Browser clients talk to `ticket_remote`; `ticket_remote` talks privately to the Pixel through `ticket_phone_bridge`. The normal public stream path is H.264 over the existing HTTPS `/api/v1/stream` WebSocket, decoded in the browser with WebCodecs. Do not add public media ports, a separate media service, or a second public tunnel unless there is a fresh decision to redesign the deployment.
+The browser never receives the phone URL and never talks directly to the Pixel. Browser clients talk to `ticket_remote`; `ticket_remote` talks privately through `phone_broker`. The normal public stream path is H.264 over the existing HTTPS `/api/v1/stream` WebSocket, decoded in the browser with WebCodecs. Do not add public media ports, a separate media service, or a second public tunnel unless there is a fresh decision to redesign the deployment.
+
+Pixel stream compute tuning must preserve the current capture profile: 900 px target width, 10 FPS, 5 Mbps, FFmpeg H.264 baseline/ultrafast settings, and the existing keyframe cadence. The intended optimization boundary is duplicate/orphan process removal only: one root surface capture helper and one FFmpeg encoder while streaming, and no helper, encoder, or wrapper process left after stop.
 
 `/api/v1/health.directStream` is the first place to check stream delivery: it records active browser video clients, phone relay state, last config, last frame, last keyframe, reconnect count, and recent browser decoder telemetry.
 

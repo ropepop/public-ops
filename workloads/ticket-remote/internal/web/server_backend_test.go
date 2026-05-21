@@ -86,7 +86,7 @@ func TestAdminPhoneBackendSwitchPersistsAndUpdatesRelay(t *testing.T) {
 func TestAdminPhoneBackendSwitchRequiresAdmin(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
 	store := state.NewMemoryStore()
-	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://sim.test", "http://pixel.test")
+	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
 	if _, err := store.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", "member@example.com", state.RoleMember); err != nil {
 		t.Fatal(err)
 	}
@@ -135,11 +135,11 @@ func TestAdminPhoneBackendsListsHealth(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.ActiveBackendID != "android-sim" || len(payload.Backends) != 2 {
+	if payload.ActiveBackendID != "lab-pixel" || len(payload.Backends) != 2 {
 		t.Fatalf("payload = %#v", payload)
 	}
 	if !payload.Backends[0].Active || !payload.Backends[0].HealthOK {
-		t.Fatalf("sim backend health = %#v", payload.Backends[0])
+		t.Fatalf("lab backend health = %#v", payload.Backends[0])
 	}
 }
 
@@ -156,9 +156,9 @@ func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:  "android-sim",
-		AttachName: "Android simulator",
-		BaseURL:    "http://sim.test",
+		BackendID:  "lab-pixel",
+		AttachName: "Lab Pixel",
+		BaseURL:    "http://lab.test",
 	})
 	handler, err := NewServer(config.Config{
 		PublicBaseURL: "http://ticket.test",
@@ -170,11 +170,11 @@ func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 			DevEmail: "ticket@jolkins.id.lv",
 		},
 		Phone: config.PhoneConfig{
-			BackendID:        "android-sim",
-			AttachName:       "Android simulator",
-			BaseURL:          "http://sim.test",
-			Backends:         []config.PhoneBackend{{ID: "android-sim", AttachName: "Android simulator", BaseURL: "http://sim.test"}},
-			DefaultBackendID: "android-sim",
+			BackendID:        "lab-pixel",
+			AttachName:       "Lab Pixel",
+			BaseURL:          "http://lab.test",
+			Backends:         []config.PhoneBackend{{ID: "lab-pixel", AttachName: "Lab Pixel", BaseURL: "http://lab.test"}},
+			DefaultBackendID: "lab-pixel",
 		},
 	}, store, relay)
 	if err != nil {
@@ -195,7 +195,7 @@ func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.State.Phone == nil || payload.State.Phone.ID != "android-sim" {
+	if payload.State.Phone == nil || payload.State.Phone.ID != "lab-pixel" {
 		t.Fatalf("state phone = %#v", payload.State.Phone)
 	}
 }
@@ -203,22 +203,22 @@ func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 func newBackendSwitchServer(t *testing.T, store state.Store, activeFile string, simURL string, pixelURL string) (http.Handler, *phone.Relay) {
 	t.Helper()
 	backends := []config.PhoneBackend{
-		{ID: "android-sim", AttachName: "Android simulator", BaseURL: simURL},
+		{ID: "lab-pixel", AttachName: "Lab Pixel", BaseURL: simURL},
 		{ID: "pixel", AttachName: "Pixel", BaseURL: pixelURL},
 	}
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
 		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "android-sim",
+		PhoneBackendID:  "lab-pixel",
 		PhoneBaseURL:    simURL,
-		PhoneAttachName: "Android simulator",
+		PhoneAttachName: "Lab Pixel",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         "android-sim",
-		AttachName:        "Android simulator",
+		BackendID:         "lab-pixel",
+		AttachName:        "Lab Pixel",
 		BaseURL:           simURL,
 		RequestTimeout:    50 * time.Millisecond,
 		NoViewerStopDelay: time.Hour,
@@ -233,11 +233,11 @@ func newBackendSwitchServer(t *testing.T, store state.Store, activeFile string, 
 			DevEmail: "ticket@jolkins.id.lv",
 		},
 		Phone: config.PhoneConfig{
-			BackendID:         "android-sim",
-			AttachName:        "Android simulator",
+			BackendID:         "lab-pixel",
+			AttachName:        "Lab Pixel",
 			BaseURL:           simURL,
 			Backends:          backends,
-			DefaultBackendID:  "android-sim",
+			DefaultBackendID:  "lab-pixel",
 			ActiveBackendFile: activeFile,
 		},
 	}, store, relay)

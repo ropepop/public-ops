@@ -2,8 +2,10 @@ package reports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +171,140 @@ func TestIncidentDetailIgnoresVotesAndCommentsOlderThan24Hours(t *testing.T) {
 	}
 	if len(detail.Comments) != 1 || detail.Comments[0].ID != "comment-recent" {
 		t.Fatalf("detail.Comments = %#v", detail.Comments)
+	}
+}
+
+func TestPublicIncidentFallbackRedactsReporterNicknames(t *testing.T) {
+	ctx, st, svc := newIncidentTestService(t)
+	now := time.Date(2026, 3, 20, 18, 55, 0, 0, time.UTC)
+	catalog := &model.Catalog{
+		Stops: []model.Stop{{ID: "3012", Name: "Centrāltirgus"}},
+	}
+	incidentID := StopIncidentID("3012")
+
+	if err := st.InsertStopSighting(ctx, model.StopSighting{
+		ID:        "stop-recent",
+		StopID:    "3012",
+		UserID:    11,
+		CreatedAt: now.Add(-20 * time.Minute),
+	}); err != nil {
+		t.Fatalf("InsertStopSighting() error = %v", err)
+	}
+	if _, err := svc.VoteIncident(ctx, catalog, incidentID, 22, model.IncidentVoteOngoing, now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("VoteIncident() error = %v", err)
+	}
+	comment, err := svc.AddIncidentComment(ctx, catalog, incidentID, 33, "vēl stāv", now.Add(-5*time.Minute))
+	if err != nil {
+		t.Fatalf("AddIncidentComment() error = %v", err)
+	}
+	if comment.Nickname != publicIncidentActorLabel {
+		t.Fatalf("comment.Nickname = %q, want public label", comment.Nickname)
+	}
+
+	active, err := svc.ListActiveIncidents(ctx, catalog, now, 0, 0)
+	if err != nil {
+		t.Fatalf("ListActiveIncidents() error = %v", err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("len(active) = %d, want 1", len(active))
+	}
+	if active[0].LastReporter != publicIncidentActorLabel {
+		t.Fatalf("active[0].LastReporter = %q, want public label", active[0].LastReporter)
+	}
+
+	visible, err := svc.ListMapVisibleIncidents(ctx, catalog, now, 0)
+	if err != nil {
+		t.Fatalf("ListMapVisibleIncidents() error = %v", err)
+	}
+	if len(visible) != 1 {
+		t.Fatalf("len(visible) = %d, want 1", len(visible))
+	}
+	if visible[0].LastReporter != publicIncidentActorLabel {
+		t.Fatalf("visible[0].LastReporter = %q, want public label", visible[0].LastReporter)
+	}
+
+	detail, err := svc.IncidentDetail(ctx, catalog, incidentID, now, 0)
+	if err != nil {
+		t.Fatalf("IncidentDetail() error = %v", err)
+	}
+	if detail.Summary.LastReporter != publicIncidentActorLabel {
+		t.Fatalf("detail.Summary.LastReporter = %q, want public label", detail.Summary.LastReporter)
+	}
+	for _, event := range detail.Events {
+		if event.Nickname != publicIncidentActorLabel {
+			t.Fatalf("event %q Nickname = %q, want public label", event.ID, event.Nickname)
+		}
+		if event.ID != "" {
+			t.Fatalf("event ID = %q, want omitted public ID", event.ID)
+		}
+		if strings.Contains(event.ID, "stop-recent") || strings.Contains(event.ID, "channel:") {
+			t.Fatalf("event ID exposes raw source ID: %q", event.ID)
+		}
+		if event.Kind != "" {
+			t.Fatalf("event Kind = %q, want omitted public source kind", event.Kind)
+		}
+	}
+	if len(detail.Comments) != 1 {
+		t.Fatalf("len(detail.Comments) = %d, want 1", len(detail.Comments))
+	}
+	if detail.Comments[0].Nickname != publicIncidentActorLabel {
+		t.Fatalf("detail.Comments[0].Nickname = %q, want public label", detail.Comments[0].Nickname)
+	}
+}
+
+func TestPublicAreaIncidentIDsDoNotExposeUserText(t *testing.T) {
+	ctx, _, svc := newIncidentTestService(t)
+	now := time.Date(2026, 3, 20, 18, 55, 0, 0, time.UTC)
+	_, _, err := svc.SubmitAreaReport(ctx, 44, model.AreaReportInput{
+		Latitude:     56.9532,
+		Longitude:    24.1534,
+		RadiusMeters: 250,
+		Description:  "Kontrole pie centra",
+	}, now)
+	if err != nil {
+		t.Fatalf("SubmitAreaReport() error = %v", err)
+	}
+
+	active, err := svc.ListActiveIncidents(ctx, &model.Catalog{}, now, 0, 0)
+	if err != nil {
+		t.Fatalf("ListActiveIncidents() error = %v", err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("len(active) = %d, want 1", len(active))
+	}
+	if !strings.HasPrefix(active[0].ID, "area:pub-") {
+		t.Fatalf("area incident ID = %q, want opaque public ID", active[0].ID)
+	}
+	if strings.Contains(active[0].ID, "kontrole") || strings.Contains(active[0].ID, "centra") || strings.Contains(active[0].ID, "56953") {
+		t.Fatalf("area incident ID exposes source text or location bucket: %q", active[0].ID)
+	}
+	if active[0].Area == nil || active[0].Area.Description != "Kontrole pie centra" {
+		t.Fatalf("area public description should remain in area payload, got %+v", active[0].Area)
+	}
+}
+
+func TestAddIncidentCommentCapsUserCommentActions(t *testing.T) {
+	ctx, st, svc := newIncidentTestService(t)
+	now := time.Date(2026, 3, 20, 18, 55, 0, 0, time.UTC)
+	catalog := &model.Catalog{Stops: []model.Stop{{ID: "3012", Name: "Centrāltirgus"}}}
+	incidentID := StopIncidentID("3012")
+	if err := st.InsertStopSighting(ctx, model.StopSighting{
+		ID:        "stop-recent",
+		StopID:    "3012",
+		UserID:    11,
+		CreatedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("InsertStopSighting() error = %v", err)
+	}
+
+	for index := 0; index < 10; index++ {
+		if _, err := svc.AddIncidentComment(ctx, catalog, incidentID, 77, fmt.Sprintf("comment %d", index), now.Add(time.Duration(index)*time.Minute)); err != nil {
+			t.Fatalf("AddIncidentComment(%d) error = %v", index, err)
+		}
+	}
+	var rateErr *RateLimitError
+	if _, err := svc.AddIncidentComment(ctx, catalog, incidentID, 77, "one too many", now.Add(10*time.Minute)); !errors.As(err, &rateErr) || rateErr.Reason != "comment_action_limit" {
+		t.Fatalf("AddIncidentComment(limit) error = %v, want comment_action_limit", err)
 	}
 }
 

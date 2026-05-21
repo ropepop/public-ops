@@ -1,8 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,7 +35,7 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-const smokeRequestHeader = "X-Satiksme-Smoke"
+const maxJSONBodyBytes = 64 * 1024
 
 type CatalogReader interface {
 	Current() *model.Catalog
@@ -47,23 +51,29 @@ type catalogPayloadReader interface {
 	CatalogETag() string
 }
 
+type liveViewerStateStore interface {
+	SetLiveViewerState(ctx context.Context, sessionID string, page string, visible bool) error
+}
+
 type Server struct {
-	cfg            config.Config
-	reports        *reports.Service
-	catalog        CatalogReader
-	store          store.Store
-	dump           *bot.DumpDispatcher
-	runtimeState   *runtime.State
-	release        releaseInfo
-	loc            *time.Location
-	liveHTTPClient *http.Client
-	pathPrefix     string
-	sessionSecret  []byte
-	spacetime      *spacetimeTokenIssuer
-	telegramLogin  *telegramweb.LoginVerifier
-	static         fs.FS
-	pageTemplate   *template.Template
-	bundleStore    *staticBundleStore
+	cfg              config.Config
+	reports          *reports.Service
+	catalog          CatalogReader
+	store            store.Store
+	dump             *bot.DumpDispatcher
+	runtimeState     *runtime.State
+	release          releaseInfo
+	loc              *time.Location
+	liveHTTPClient   *http.Client
+	pathPrefix       string
+	sessionSecret    []byte
+	spacetime        *spacetimeTokenIssuer
+	telegramLogin    *telegramweb.LoginVerifier
+	authConfigRate   *clientRateLimiter
+	authCompleteRate *clientRateLimiter
+	static           fs.FS
+	pageTemplate     *template.Template
+	bundleStore      *staticBundleStore
 }
 
 type pageData struct {
@@ -73,6 +83,7 @@ type pageData struct {
 	LeafletJSURL    string
 	LiveClientJSURL string
 	ConfigJS        template.JS
+	ScriptNonce     string
 }
 
 func NewServer(
@@ -102,26 +113,29 @@ func NewServer(
 	}
 
 	server := &Server{
-		cfg:            cfg,
-		reports:        reportsSvc,
-		catalog:        catalog,
-		store:          st,
-		dump:           dump,
-		runtimeState:   runtimeState,
-		release:        release,
-		loc:            loc,
-		liveHTTPClient: &http.Client{Timeout: time.Duration(cfg.HTTPTimeoutSec) * time.Second},
-		pathPrefix:     pathPrefix,
-		static:         static,
+		cfg:              cfg,
+		reports:          reportsSvc,
+		catalog:          catalog,
+		store:            st,
+		dump:             dump,
+		runtimeState:     runtimeState,
+		release:          release,
+		loc:              loc,
+		liveHTTPClient:   &http.Client{Timeout: time.Duration(cfg.HTTPTimeoutSec) * time.Second},
+		pathPrefix:       pathPrefix,
+		authConfigRate:   newClientRateLimiter(authConfigRequestsPerMinute, authRateLimitWindow),
+		authCompleteRate: newClientRateLimiter(authCompleteRequestsPerMinute, authRateLimitWindow),
+		static:           static,
 		pageTemplate: template.Must(template.New("shell").Parse(`<!doctype html>
 <html lang="lv">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, noarchive">
   <title>Kontrole</title>
   <link rel="stylesheet" href="{{.AppCSSURL}}">
   {{if .LeafletCSSURL}}<link rel="stylesheet" href="{{.LeafletCSSURL}}">{{end}}
-  <script data-cfasync="false">window.SATIKSME_APP_CONFIG = {{.ConfigJS}};</script>
+  <script data-cfasync="false" nonce="{{.ScriptNonce}}">window.SATIKSME_APP_CONFIG = {{.ConfigJS}};</script>
   {{if .LeafletJSURL}}<script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>{{end}}
   {{if .LiveClientJSURL}}<script data-cfasync="false" defer src="{{.LiveClientJSURL}}"></script>{{end}}
   <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
@@ -167,8 +181,117 @@ func mustStaticSubFS() fs.FS {
 	if err != nil {
 		panic(err)
 	}
-	return sub
+	return productionStaticFS{sub: sub}
 }
+
+type productionStaticFS struct {
+	sub fs.FS
+}
+
+func (p productionStaticFS) Open(name string) (fs.File, error) {
+	clean := cleanStaticAssetName(name)
+	if clean != "app.js" {
+		return p.sub.Open(name)
+	}
+	body, err := fs.ReadFile(p.sub, name)
+	if err != nil {
+		return nil, err
+	}
+	body, err = stripSatiksmeAppTestHarness(body)
+	if err != nil {
+		return nil, err
+	}
+	return &memoryStaticFile{
+		Reader: bytes.NewReader(body),
+		name:   path.Base(clean),
+		size:   int64(len(body)),
+	}, nil
+}
+
+func (p productionStaticFS) ReadFile(name string) ([]byte, error) {
+	body, err := fs.ReadFile(p.sub, name)
+	if err != nil {
+		return nil, err
+	}
+	if cleanStaticAssetName(name) == "app.js" {
+		return stripSatiksmeAppTestHarness(body)
+	}
+	return body, nil
+}
+
+func cleanStaticAssetName(name string) string {
+	return strings.TrimPrefix(path.Clean("/"+name), "/")
+}
+
+func stripSatiksmeAppTestHarness(body []byte) ([]byte, error) {
+	source := string(body)
+	var err error
+	source, err = stripNamedJSFunction(source, "resetStateForTest")
+	if err != nil {
+		return nil, err
+	}
+	start := strings.Index(source, "\n  var exported = {};\n  if (typeof module === \"object\" && module.exports) {")
+	end := strings.LastIndex(source, "\n  return exported;\n});")
+	if start < 0 || end < 0 || end <= start {
+		return nil, fmt.Errorf("satiksme app test harness markers not found")
+	}
+	next := source[:start] + "\n  return {};\n});\n"
+	return []byte(next), nil
+}
+
+func stripNamedJSFunction(source string, name string) (string, error) {
+	start := strings.Index(source, "\n  function "+name+"(")
+	if start < 0 {
+		return "", fmt.Errorf("function %s marker not found", name)
+	}
+	openOffset := strings.Index(source[start:], "{")
+	if openOffset < 0 {
+		return "", fmt.Errorf("function %s opening brace not found", name)
+	}
+	depth := 0
+	for index := start + openOffset; index < len(source); index++ {
+		switch source[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end := index + 1
+				if end < len(source) && source[end] == '\n' {
+					end++
+				}
+				return source[:start] + source[end:], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("function %s closing brace not found", name)
+}
+
+type memoryStaticFile struct {
+	*bytes.Reader
+	name string
+	size int64
+}
+
+func (f *memoryStaticFile) Stat() (fs.FileInfo, error) {
+	return memoryStaticFileInfo{name: f.name, size: f.size}, nil
+}
+
+func (f *memoryStaticFile) Close() error {
+	return nil
+}
+
+type memoryStaticFileInfo struct {
+	name string
+	size int64
+}
+
+func (i memoryStaticFileInfo) Name() string       { return i.name }
+func (i memoryStaticFileInfo) Size() int64        { return i.size }
+func (i memoryStaticFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i memoryStaticFileInfo) ModTime() time.Time { return time.Time{} }
+func (i memoryStaticFileInfo) IsDir() bool        { return false }
+func (i memoryStaticFileInfo) Sys() any           { return nil }
 
 func (s *Server) AppURL() string {
 	if !s.cfg.SatiksmeWebEnabled {
@@ -226,9 +349,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad path")
 		return
 	}
-	path := strings.TrimRight(r.URL.Path, "/")
 	basePath := strings.TrimRight(s.pathPrefix, "/")
+	if trailingSlashAlias(r.URL.Path, basePath) {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	path := strings.TrimRight(r.URL.Path, "/")
 	switch {
+	case path == strings.TrimRight(basePath+"/robots.txt", "/"):
+		s.serveRobotsTxt(w, r)
 	case path == strings.TrimRight(basePath+"/oidc/.well-known/openid-configuration", "/"):
 		if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return
@@ -261,20 +392,52 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAPI(w, r, strings.TrimPrefix(path, basePath+"/api/v1"))
 	default:
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 	}
 }
 
+func trailingSlashAlias(requestPath string, basePath string) bool {
+	if requestPath == "/" {
+		return false
+	}
+	if basePath != "" && requestPath == basePath+"/" {
+		return false
+	}
+	return strings.HasSuffix(requestPath, "/")
+}
+
+func (s *Server) serveRobotsTxt(w http.ResponseWriter, r *http.Request) {
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte("User-agent: *\nDisallow: /\n"))
+}
+
 func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 	s.setNoStoreHeaders(w)
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	s.setNoIndexHeaders(w)
+	scriptNonce, err := newCSPNonce()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to prepare page")
+		return
+	}
+	s.setShellSecurityHeaders(w, scriptNonce)
 	basePath := strings.TrimRight(s.pathPrefix, "/")
 	bundleActiveURL := basePath + "/bundles/active.json"
 	if s.bundleStore == nil {
 		bundleActiveURL = ""
 	}
-	browserSpacetimeEnabled := s.browserSpacetimeConfigured()
 	browserDirectDataEnabled := s.browserDirectDataEnabled()
 	liveSnapshotLookupEnabled := s.browserLiveSnapshotLookupEnabled()
+	exposeSpacetimeConfig := browserDirectDataEnabled
 	cfg := map[string]any{
 		"basePath":          basePath,
 		"publicBaseURL":     s.cfg.SatiksmeWebPublicBaseURL,
@@ -284,17 +447,23 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 		"bundleActiveURL":   bundleActiveURL,
 		"liveVehiclesURL":   basePath + "/api/v1/public/live-vehicles",
 	}
-	if browserSpacetimeEnabled {
+	if exposeSpacetimeConfig {
 		cfg["spacetimeEnabled"] = browserDirectDataEnabled
-		cfg["spacetimeDirectOnly"] = browserDirectDataEnabled
+		cfg["spacetimeDirectOnly"] = s.cfg.SatiksmeWebSpacetimeDirectOnly
 		cfg["spacetimeHost"] = s.cfg.SatiksmeWebSpacetimeHost
 		cfg["spacetimeDatabase"] = s.cfg.SatiksmeWebSpacetimeDatabase
 		cfg["liveTransportRealtimeEnabled"] = browserDirectDataEnabled
+	}
+	if liveSnapshotLookupEnabled {
 		cfg["liveTransportSnapshotLookupEnabled"] = liveSnapshotLookupEnabled
+	}
+	if s.browserLiveViewerHeartbeatEnabled() {
+		cfg["liveTransportViewerHeartbeatEnabled"] = true
+		cfg["liveTransportViewerHeartbeatURL"] = basePath + "/api/v1/public/live-viewer"
 	}
 	raw, _ := json.Marshal(cfg)
 	liveClientURL := ""
-	if browserSpacetimeEnabled && s.release.LiveClientHash != "" {
+	if exposeSpacetimeConfig && s.release.LiveClientHash != "" {
 		liveClientURL = s.release.AssetURL(basePath, "live-client.js")
 	}
 	leafletCSSURL := ""
@@ -311,6 +480,7 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 		LeafletJSURL:    leafletJSURL,
 		LiveClientJSURL: liveClientURL,
 		ConfigJS:        template.JS(raw),
+		ScriptNonce:     scriptNonce,
 	})
 }
 
@@ -332,7 +502,20 @@ func (s *Server) browserDirectDataEnabled() bool {
 }
 
 func (s *Server) browserLiveSnapshotLookupEnabled() bool {
-	return s.browserSpacetimeConfigured() && s.release.LiveClientHash != ""
+	return s.browserLiveSnapshotFileEnabled() ||
+		(s.browserDirectDataEnabled() && s.release.LiveClientHash != "")
+}
+
+func (s *Server) browserLiveSnapshotFileEnabled() bool {
+	return strings.TrimSpace(s.cfg.SatiksmeWebLiveSnapshotDir) != ""
+}
+
+func (s *Server) browserLiveViewerHeartbeatEnabled() bool {
+	if !s.cfg.SatiksmeWebLiveViewerHeartbeatEnabled {
+		return false
+	}
+	_, ok := s.store.(liveViewerStateStore)
+	return ok
 }
 
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath string) {
@@ -340,8 +523,9 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath str
 		return
 	}
 	assetPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/assets/")
-	if excludedGenericPublicAsset(assetPath) || !s.allowAssetQuery(r, assetPath) {
+	if excludedGenericPublicAsset(assetPath) || s.excludedPublicAsset(assetPath) || !s.allowAssetQuery(r, assetPath) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
@@ -351,12 +535,22 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath str
 		s.setImmutableHeaders(w)
 	} else {
 		s.setNoStoreHeaders(w)
+		r = requestWithoutRange(r)
 	}
+	w.Header().Set("Vary", "Accept-Encoding")
 	http.StripPrefix(basePath+"/assets/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
+}
+
+func (s *Server) excludedPublicAsset(assetPath string) bool {
+	cleanPath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+assetPath)), "/")
+	return cleanPath == "live-client.js" && !s.browserDirectDataEnabled()
 }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string) {
 	now := time.Now().In(s.loc)
+	if !s.allowUnsafeAPIRequest(w, r) {
+		return
+	}
 	switch {
 	case route == "/health":
 		s.handleHealth(w, r)
@@ -378,6 +572,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		s.handlePublicMapLive(w, r, now)
 	case route == "/public/live-vehicles":
 		s.handlePublicLiveVehicles(w, r, now)
+	case route == "/public/live-viewer":
+		s.handlePublicLiveViewer(w, r)
 	case route == "/auth/telegram/start":
 		s.handleDeprecatedAuthTelegramStart(w, r)
 	case route == "/auth/telegram/callback":
@@ -391,6 +587,9 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	case route == "/auth/logout":
 		s.handleAuthLogout(w, r, now)
 	case route == "/me":
+		if !allowMethods(w, r, http.MethodGet) {
+			return
+		}
 		claims, ok := s.requireSession(w, r, now)
 		if !ok {
 			return
@@ -436,20 +635,96 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	}
 }
 
+func (s *Server) allowUnsafeAPIRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !unsafeHTTPMethod(r.Method) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site", "same-site":
+		writeError(w, http.StatusForbidden, "cross-site request forbidden")
+		return false
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !s.sameOriginRequest(r, origin) {
+		writeError(w, http.StatusForbidden, "cross-site request forbidden")
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("Origin")) == "" {
+		if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" && !s.sameOriginRequest(r, referer) {
+			writeError(w, http.StatusForbidden, "cross-site request forbidden")
+			return false
+		}
+	}
+	return true
+}
+
+func unsafeHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) sameOriginRequest(r *http.Request, raw string) bool {
+	origin := requestOrigin(raw)
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range []string{
+		requestOrigin(s.PublicURL()),
+		requestHostOrigin(r),
+	} {
+		if allowed != "" && origin == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func requestOrigin(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+}
+
+func requestHostOrigin(r *http.Request) string {
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		first := strings.ToLower(strings.TrimSpace(strings.Split(forwarded, ",")[0]))
+		if first == "http" || first == "https" {
+			scheme = first
+		}
+	}
+	return scheme + "://" + strings.ToLower(host)
+}
+
 type healthSnapshot struct {
 	ok      bool
 	reasons []string
 	payload map[string]any
 }
 
+type healthSnapshotOptions struct {
+	checkStore bool
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	now := time.Now().UTC()
-	snapshot := s.healthSnapshot(r.Context(), now)
+	snapshot := s.healthSnapshot(r.Context(), now, healthSnapshotOptions{})
 	status := http.StatusOK
 	if !snapshot.ok {
 		status = http.StatusServiceUnavailable
@@ -462,8 +737,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -471,6 +745,7 @@ func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	if !isLocalRequest(r) {
 		http.NotFound(w, r)
 		return
@@ -479,7 +754,7 @@ func (s *Server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	snapshot := s.healthSnapshot(r.Context(), time.Now().UTC())
+	snapshot := s.healthSnapshot(r.Context(), time.Now().UTC(), healthSnapshotOptions{checkStore: true})
 	status := http.StatusOK
 	if !snapshot.ok {
 		status = http.StatusServiceUnavailable
@@ -487,13 +762,16 @@ func (s *Server) handleInternalHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, snapshot.payload)
 }
 
-func (s *Server) healthSnapshot(ctx context.Context, now time.Time) healthSnapshot {
+func (s *Server) healthSnapshot(ctx context.Context, now time.Time, options healthSnapshotOptions) healthSnapshot {
 	catalogStatus := runtime.CatalogStatus{}
 	if s.catalog != nil {
 		catalogStatus = s.catalog.Status()
 	}
 	stale := s.catalogStale(catalogStatus, now)
-	dbWritable, dbError := s.dbStatus(ctx)
+	dbWritable, dbError := true, ""
+	if options.checkStore {
+		dbWritable, dbError = s.dbStatus(ctx)
+	}
 	var telegramStatus runtime.TelegramStatus
 	var dumpStatus runtime.DumpStatus
 	startedAt := time.Time{}
@@ -515,7 +793,7 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time) healthSnapsh
 		ok = false
 		reasons = append(reasons, "catalog_unavailable")
 	}
-	if !dbWritable {
+	if options.checkStore && !dbWritable {
 		ok = false
 		reasons = append(reasons, "db_unwritable")
 	}
@@ -568,10 +846,12 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time) healthSnapsh
 		"degraded": len(reasons) > 0,
 		"reasons":  reasons,
 		"version": map[string]any{
-			"display":   version.Display(),
-			"commit":    s.release.Commit,
-			"buildTime": s.release.BuildTime,
-			"dirty":     s.release.Dirty,
+			"display":      version.Display(),
+			"commit":       s.release.Commit,
+			"buildTime":    s.release.BuildTime,
+			"dirty":        s.release.Dirty,
+			"releaseId":    s.release.ReleaseID,
+			"sourceSha256": s.release.SourceSHA256,
 		},
 		"runtime": map[string]any{
 			"instanceId":     s.release.Instance,
@@ -633,8 +913,14 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time) healthSnapsh
 }
 
 func (s *Server) handlePublicCatalog(w http.ResponseWriter, r *http.Request) {
-	s.setRevalidateHeaders(w)
 	s.setNoIndexHeaders(w)
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r) {
+		return
+	}
+	s.setRevalidateHeaders(w)
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
@@ -643,25 +929,22 @@ func (s *Server) handlePublicCatalog(w http.ResponseWriter, r *http.Request) {
 	if payloadReader, ok := s.catalog.(catalogPayloadReader); ok {
 		if etag := payloadReader.CatalogETag(); etag != "" {
 			if strings.TrimSpace(r.Header.Get("If-None-Match")) == etag {
+				w.Header().Set("Vary", "Accept-Encoding")
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
 			w.Header().Set("ETag", etag)
 		}
-		if payload := payloadReader.CatalogJSON(); len(payload) > 0 {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(payload)
-			return
-		}
 	}
-	writeJSON(w, http.StatusOK, catalog)
+	writeJSON(w, http.StatusOK, publicCatalog(catalog))
 }
 
 func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r, "limit") {
 		return
 	}
 	catalog := s.catalog.Current()
@@ -669,7 +952,11 @@ func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, n
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
-	limit := parseIncidentLimit(r)
+	limit, ok := parseIncidentLimit(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
 	viewerID := int64(0)
 	if claims, ok := s.optionalSession(r, now); ok {
 		viewerID = claims.UserID
@@ -680,15 +967,17 @@ func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"generatedAt": now.UTC(),
+		"generatedAt": publicTimestamp(now),
 		"incidents":   items,
 	})
 }
 
 func (s *Server) handlePublicIncidentDetail(w http.ResponseWriter, r *http.Request, incidentID string, now time.Time) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r) {
 		return
 	}
 	catalog := s.catalog.Current()
@@ -714,13 +1003,23 @@ func (s *Server) handlePublicIncidentDetail(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handlePublicSightings(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r, "limit", "stopId") {
+		return
+	}
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
 	stopID := strings.TrimSpace(r.URL.Query().Get("stopId"))
-	limit := parseSightingsLimit(r, 100)
+	limit, ok := parseSightingsLimit(r, 100)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
 	visible, err := s.reports.VisibleSightings(r.Context(), catalog, stopID, now, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unable to load sightings")
@@ -731,12 +1030,23 @@ func (s *Server) handlePublicSightings(w http.ResponseWriter, r *http.Request, n
 
 func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r, "limit") {
+		return
+	}
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
-	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
+	limit, ok := parseSightingsLimit(r, 300)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
@@ -750,9 +1060,16 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
 	}
-	writeJSON(w, http.StatusOK, model.PublicMapPayload{
-		GeneratedAt:   catalog.GeneratedAt,
-		Stops:         catalog.Stops,
+	writeJSON(w, http.StatusOK, struct {
+		GeneratedAt   time.Time               `json:"generatedAt"`
+		Stops         []publicBundleStop      `json:"stops"`
+		Sightings     model.VisibleSightings  `json:"sightings"`
+		StopIncidents []model.IncidentSummary `json:"stopIncidents,omitempty"`
+		AreaIncidents []model.IncidentSummary `json:"areaIncidents,omitempty"`
+		LiveVehicles  []model.LiveVehicle     `json:"liveVehicles"`
+	}{
+		GeneratedAt:   publicTimestamp(catalog.GeneratedAt),
+		Stops:         publicBundleStops(catalog.Stops),
 		Sightings:     visible,
 		StopIncidents: stopIncidents,
 		AreaIncidents: areaIncidents,
@@ -762,12 +1079,23 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 
 func (s *Server) handlePublicMapLive(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r, "limit") {
+		return
+	}
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
-	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
+	limit, ok := parseSightingsLimit(r, 300)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unable to load map")
 		return
@@ -782,7 +1110,7 @@ func (s *Server) handlePublicMapLive(w http.ResponseWriter, r *http.Request, now
 		return
 	}
 	writeJSON(w, http.StatusOK, model.PublicLiveMapPayload{
-		GeneratedAt:   catalog.GeneratedAt,
+		GeneratedAt:   publicTimestamp(catalog.GeneratedAt),
 		Sightings:     visible,
 		StopIncidents: stopIncidents,
 		AreaIncidents: areaIncidents,
@@ -792,12 +1120,23 @@ func (s *Server) handlePublicMapLive(w http.ResponseWriter, r *http.Request, now
 
 func (s *Server) handlePublicLiveVehicles(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
+	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if !s.allowPublicQuery(w, r, "limit") {
+		return
+	}
 	catalog := s.catalog.Current()
 	if catalog == nil {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
-	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, parseSightingsLimit(r, 300))
+	limit, ok := parseSightingsLimit(r, 300)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	visible, err := s.reports.VisibleSightings(r.Context(), catalog, "", now, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "unable to load live vehicles")
 		return
@@ -825,6 +1164,55 @@ func (s *Server) handlePublicLiveVehicles(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"liveVehicles": liveVehicles,
 	})
+}
+
+func (s *Server) handlePublicLiveViewer(w http.ResponseWriter, r *http.Request) {
+	s.setNoStoreHeaders(w)
+	if !s.browserLiveViewerHeartbeatEnabled() {
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	if !allowMethods(w, r, http.MethodPost) {
+		return
+	}
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if contentType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported media type")
+		return
+	}
+	liveStore, ok := s.store.(liveViewerStateStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "live viewer heartbeat unavailable")
+		return
+	}
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Page      string `json:"page"`
+		Visible   bool   `json:"visible"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid live viewer heartbeat")
+		return
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	page := strings.TrimSpace(req.Page)
+	if sessionID == "" || len(sessionID) > 160 {
+		writeError(w, http.StatusBadRequest, "invalid live viewer session")
+		return
+	}
+	if page == "" {
+		page = "public"
+	}
+	if len(page) > 80 {
+		writeError(w, http.StatusBadRequest, "invalid live viewer page")
+		return
+	}
+	if err := liveStore.SetLiveViewerState(r.Context(), sessionID, page, req.Visible); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "live viewer heartbeat failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) publicMapState(ctx context.Context, catalog *model.Catalog, visible model.VisibleSightings, now time.Time, viewerID int64) ([]model.IncidentSummary, []model.IncidentSummary, []model.LiveVehicle, error) {
@@ -859,17 +1247,21 @@ func (s *Server) publicLiveVehicles(ctx context.Context, catalog *model.Catalog,
 	}
 	live.ApplyVehicleSightingCounts(liveVehicles, visible.VehicleSightings)
 	live.ApplyVehicleIncidents(liveVehicles, incidents)
-	return liveVehicles, nil
+	return live.PublicLiveVehicles(liveVehicles), nil
 }
 
 func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet) {
 		return
 	}
 	if strings.TrimSpace(s.telegramBotID()) == "" || s.telegramLogin == nil {
 		writeError(w, http.StatusServiceUnavailable, "Telegram Login is not configured")
+		return
+	}
+	if ok, retryAfter := s.authConfigRate.allow(authRateLimitKey(r), now); !ok {
+		setAuthRetryAfter(w, retryAfter)
+		writeError(w, http.StatusTooManyRequests, "too many login requests")
 		return
 	}
 	nonceClaims, cookie, err := issueLoginNonceCookie(
@@ -896,8 +1288,15 @@ func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Request, now time.Time) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodPost) {
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	if ok, retryAfter := s.authCompleteRate.allow(authRateLimitKey(r), now); !ok {
+		setAuthRetryAfter(w, retryAfter)
+		writeError(w, http.StatusTooManyRequests, "too many login attempts")
 		return
 	}
 	var payload struct {
@@ -905,8 +1304,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		InitData   string         `json:"initData"`
 		WidgetAuth map[string]any `json:"widgetAuth"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	idToken := strings.TrimSpace(payload.IDToken)
@@ -932,7 +1330,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		}
 		claims, verifyErr := s.telegramLogin.VerifyIDToken(r.Context(), idToken, loginNonce.Nonce, now)
 		if verifyErr != nil {
-			writeError(w, http.StatusUnauthorized, verifyErr.Error())
+			writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
 		firstName := strings.TrimSpace(claims.Name)
@@ -952,13 +1350,13 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	case len(payload.WidgetAuth) > 0:
 		auth, err = s.widgetAuthFromPayload(payload.WidgetAuth, now)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, err.Error())
+			writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
 	case initData != "":
 		auth, err = s.initDataAuthFromPayload(initData, now)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, err.Error())
+			writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
 	default:
@@ -967,7 +1365,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := verifyTelegramAuthAge(auth, time.Duration(s.cfg.SatiksmeWebTelegramAuthMaxAgeSec)*time.Second, now); err != nil {
-		writeError(w, http.StatusUnauthorized, err.Error())
+		writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 		return
 	}
 	cookie, err := issueSessionCookie(s.sessionSecret, auth, now)
@@ -989,8 +1387,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleDeprecatedAuthTelegramStart(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet) {
 		return
 	}
 	writeError(w, http.StatusGone, "Telegram browser login now uses /api/v1/auth/telegram/config and /api/v1/auth/telegram/complete")
@@ -998,8 +1395,7 @@ func (s *Server) handleDeprecatedAuthTelegramStart(w http.ResponseWriter, r *htt
 
 func (s *Server) handleDeprecatedAuthTelegramCallback(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodGet) {
 		return
 	}
 	writeError(w, http.StatusGone, "Telegram browser login now uses /api/v1/auth/telegram/config and /api/v1/auth/telegram/complete")
@@ -1007,8 +1403,7 @@ func (s *Server) handleDeprecatedAuthTelegramCallback(w http.ResponseWriter, r *
 
 func (s *Server) handleDeprecatedAuthTelegram(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodPost) {
 		return
 	}
 	writeError(w, http.StatusGone, "Telegram browser login now uses /api/v1/auth/telegram/config and /api/v1/auth/telegram/complete")
@@ -1016,8 +1411,7 @@ func (s *Server) handleDeprecatedAuthTelegram(w http.ResponseWriter, r *http.Req
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request, _ time.Time) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !allowMethods(w, r, http.MethodPost) {
 		return
 	}
 	http.SetCookie(w, clearSessionCookie(s.cookiePath()))
@@ -1228,17 +1622,20 @@ func (s *Server) serveBundleActive(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.bundleStore == nil {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.bundleStore.invalidate()
 	s.setNoStoreHeaders(w)
 	s.setNoIndexHeaders(w)
+	w.Header().Set("Vary", "Accept-Encoding")
 	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebBundleDir, "active.json"))
 }
 
@@ -1248,11 +1645,13 @@ func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, basePa
 	}
 	if s.bundleStore == nil {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
@@ -1260,12 +1659,22 @@ func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, basePa
 	clean := filepath.Clean(relative)
 	if clean == "." || strings.HasPrefix(clean, "..") || excludedGenericPublicAsset(clean) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	fullPath := filepath.Join(s.cfg.SatiksmeWebBundleDir, "bundles", clean)
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.setImmutableHeaders(w)
 	s.setNoIndexHeaders(w)
-	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebBundleDir, "bundles", clean))
+	w.Header().Set("Vary", "Accept-Encoding")
+	http.ServeFile(w, r, fullPath)
 }
 
 func (s *Server) serveLiveSnapshotActive(w http.ResponseWriter, r *http.Request) {
@@ -1274,17 +1683,34 @@ func (s *Server) serveLiveSnapshotActive(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.TrimSpace(s.cfg.SatiksmeWebLiveSnapshotDir) == "" {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	active, err := live.ReadSnapshotActiveState(s.cfg.SatiksmeWebLiveSnapshotDir)
+	if err != nil {
+		s.setNoStoreHeaders(w)
+		writeError(w, http.StatusInternalServerError, "live snapshot active unavailable")
+		return
+	}
+	if active == nil {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.setNoStoreHeaders(w)
 	s.setNoIndexHeaders(w)
-	http.ServeFile(w, r, filepath.Join(s.cfg.SatiksmeWebLiveSnapshotDir, "active.json"))
+	writeJSON(w, http.StatusOK, map[string]string{
+		"version": active.Version,
+		"path":    active.Path,
+	})
 }
 
 func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, basePath string) {
@@ -1293,11 +1719,13 @@ func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, 
 	}
 	if strings.TrimSpace(s.cfg.SatiksmeWebLiveSnapshotDir) == "" {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	if hasQueryString(r) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
@@ -1305,6 +1733,7 @@ func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, 
 	clean := filepath.Clean(relative)
 	if clean == "." || strings.HasPrefix(clean, "..") || strings.Contains(clean, string(filepath.Separator)+".") || excludedGenericPublicAsset(clean) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
@@ -1316,12 +1745,15 @@ func (s *Server) serveLiveSnapshotAsset(w http.ResponseWriter, r *http.Request, 
 	info, err := os.Stat(fullPath)
 	if err != nil || info.IsDir() {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	s.setNoStoreHeaders(w)
 	s.setNoIndexHeaders(w)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Vary", "Accept-Encoding")
+	r = requestWithoutRange(r)
 	http.ServeFile(w, r, fullPath)
 }
 
@@ -1338,8 +1770,7 @@ func (s *Server) handleStopReport(w http.ResponseWriter, r *http.Request, now ti
 	var payload struct {
 		StopID string `json:"stopId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	catalog := s.catalog.Current()
@@ -1348,8 +1779,7 @@ func (s *Server) handleStopReport(w http.ResponseWriter, r *http.Request, now ti
 		writeError(w, http.StatusBadRequest, "unknown stop")
 		return
 	}
-	options := reports.SubmitOptions{Hidden: isSmokeRequest(r)}
-	result, item, err := s.reports.SubmitStopSightingWithOptions(r.Context(), claims.UserID, payload.StopID, now, options)
+	result, item, err := s.reports.SubmitStopSighting(r.Context(), claims.UserID, payload.StopID, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1372,7 +1802,11 @@ func (s *Server) handleRecentReports(w http.ResponseWriter, r *http.Request, cla
 		return
 	}
 	stopID := strings.TrimSpace(r.URL.Query().Get("stopId"))
-	limit := parseSightingsLimit(r, 100)
+	limit, ok := parseSightingsLimit(r, 100)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
 	visible, err := s.reports.UserSightings(r.Context(), catalog, claims.UserID, stopID, now, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1392,8 +1826,7 @@ func (s *Server) handleVehicleReport(w http.ResponseWriter, r *http.Request, now
 		return
 	}
 	var payload model.VehicleReportInput
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	payload.StopID = ""
@@ -1401,8 +1834,7 @@ func (s *Server) handleVehicleReport(w http.ResponseWriter, r *http.Request, now
 		writeError(w, http.StatusBadRequest, "mode and routeLabel are required")
 		return
 	}
-	options := reports.SubmitOptions{Hidden: isSmokeRequest(r)}
-	result, item, err := s.reports.SubmitVehicleSightingWithOptions(r.Context(), claims.UserID, payload, now, options)
+	result, item, err := s.reports.SubmitVehicleSighting(r.Context(), claims.UserID, payload, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1424,16 +1856,14 @@ func (s *Server) handleAreaReport(w http.ResponseWriter, r *http.Request, now ti
 		return
 	}
 	var payload model.AreaReportInput
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	if _, err := reports.NormalizeAreaReportInput(payload); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	options := reports.SubmitOptions{Hidden: isSmokeRequest(r)}
-	result, item, err := s.reports.SubmitAreaReportWithOptions(r.Context(), claims.UserID, payload, now, options)
+	result, item, err := s.reports.SubmitAreaReport(r.Context(), claims.UserID, payload, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1453,8 +1883,7 @@ func (s *Server) handleIncidentVote(w http.ResponseWriter, r *http.Request, clai
 	var payload struct {
 		Value string `json:"value"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	value, ok := model.ParseIncidentVoteValue(payload.Value)
@@ -1493,8 +1922,7 @@ func (s *Server) handleIncidentComment(w http.ResponseWriter, r *http.Request, c
 	var payload struct {
 		Body string `json:"body"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if !decodeJSON(w, r, &payload) {
 		return
 	}
 	catalog := s.catalog.Current()
@@ -1504,6 +1932,11 @@ func (s *Server) handleIncidentComment(w http.ResponseWriter, r *http.Request, c
 	}
 	comment, err := s.reports.AddIncidentComment(r.Context(), catalog, incidentID, claims.UserID, payload.Body, now)
 	if err != nil {
+		var rateErr *reports.RateLimitError
+		if errors.As(err, &rateErr) {
+			writeError(w, http.StatusTooManyRequests, rateErr.Error())
+			return
+		}
 		if strings.Contains(strings.ToLower(err.Error()), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -1540,8 +1973,28 @@ func (s *Server) optionalSession(r *http.Request, now time.Time) (sessionClaims,
 	return claims, true
 }
 
-func isSmokeRequest(r *http.Request) bool {
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get(smokeRequestHeader)), "1")
+func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	defer r.Body.Close()
+	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return false
+	}
+	return true
+}
+
+func requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	contentType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
+	if strings.EqualFold(contentType, "application/json") {
+		return true
+	}
+	writeError(w, http.StatusUnsupportedMediaType, "unsupported media type")
+	return false
 }
 
 func (s *Server) findStop(catalog *model.Catalog, stopID string) (model.Stop, bool) {
@@ -1557,23 +2010,60 @@ func findStop(catalog *model.Catalog, stopID string) (model.Stop, bool) {
 	return model.FindStopByAnyID(catalog, stopID)
 }
 
-func parseSightingsLimit(r *http.Request, fallback int) int {
-	limit := fallback
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 500 {
-			limit = parsed
-		}
+func parseSightingsLimit(r *http.Request, fallback int) (int, bool) {
+	values, ok := r.URL.Query()["limit"]
+	if !ok {
+		return fallback, true
 	}
-	return limit
+	if len(values) != 1 {
+		return 0, false
+	}
+	raw := strings.TrimSpace(values[0])
+	if raw == "" {
+		return fallback, true
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 || parsed > 500 {
+		return 0, false
+	}
+	return parsed, true
 }
 
-func parseIncidentLimit(r *http.Request) int {
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 2000 {
-			return parsed
+func parseIncidentLimit(r *http.Request) (int, bool) {
+	values, ok := r.URL.Query()["limit"]
+	if !ok {
+		return 0, true
+	}
+	if len(values) != 1 {
+		return 0, false
+	}
+	raw := strings.TrimSpace(values[0])
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 || parsed > 2000 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func (s *Server) allowPublicQuery(w http.ResponseWriter, r *http.Request, allowedKeys ...string) bool {
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	allowed := make(map[string]bool, len(allowedKeys))
+	for _, key := range allowedKeys {
+		allowed[key] = true
+	}
+	for key, values := range r.URL.Query() {
+		if !allowed[key] || len(values) != 1 {
+			s.setNoStoreHeaders(w)
+			writeError(w, http.StatusBadRequest, "invalid query")
+			return false
 		}
 	}
-	return 0
+	return true
 }
 
 func (s *Server) dbStatus(ctx context.Context) (bool, string) {
@@ -1601,31 +2091,51 @@ func (s *Server) catalogStale(status runtime.CatalogStatus, now time.Time) bool 
 
 func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 	h := w.Header()
-	h.Set("Strict-Transport-Security", "max-age=300")
+	h.Set("Strict-Transport-Security", "max-age=31536000")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	h.Set("Permissions-Policy", "geolocation=(self), camera=(), microphone=(), payment=(), usb=(), fullscreen=(self)")
-	h.Set("Content-Security-Policy", s.contentSecurityPolicy())
+	h.Set("Content-Security-Policy", s.contentSecurityPolicy(""))
 }
 
-func (s *Server) contentSecurityPolicy() string {
+func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string) {
+	s.setSecurityHeaders(w)
+	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce))
+}
+
+func (s *Server) contentSecurityPolicy(scriptNonce string) string {
 	connectSources := []string{"'self'"}
-	addCSPConnectSources(&connectSources, s.cfg.SatiksmeWebSpacetimeHost)
+	if s.browserDirectDataEnabled() {
+		addCSPConnectSources(&connectSources, s.cfg.SatiksmeWebSpacetimeHost)
+	}
+	scriptSources := []string{"'self'"}
+	if strings.TrimSpace(scriptNonce) != "" {
+		scriptSources = append(scriptSources, "'nonce-"+strings.TrimSpace(scriptNonce)+"'")
+	}
+	scriptSources = append(scriptSources, "https://oauth.telegram.org")
 	return strings.Join([]string{
 		"default-src 'self'",
 		"base-uri 'self'",
 		"object-src 'none'",
 		"frame-ancestors 'none'",
 		"form-action 'self' https://oauth.telegram.org",
-		"script-src 'self' 'unsafe-inline' https://oauth.telegram.org",
-		"style-src 'self' 'unsafe-inline'",
+		"script-src " + strings.Join(scriptSources, " "),
+		"style-src 'self'",
 		"img-src 'self' data: blob: https://*.tile.openstreetmap.org",
 		"font-src 'self' data:",
 		"connect-src " + strings.Join(connectSources, " "),
 		"frame-src https://oauth.telegram.org https://telegram.org",
 		"worker-src 'self' blob:",
 	}, "; ")
+}
+
+func newCSPNonce() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate CSP nonce: %w", err)
+	}
+	return base64.RawStdEncoding.EncodeToString(raw[:]), nil
 }
 
 func addCSPConnectSources(sources *[]string, raw string) {
@@ -1689,6 +2199,16 @@ func (s *Server) setImmutableHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "public, max-age=31536000, immutable")
 }
 
+func requestWithoutRange(r *http.Request) *http.Request {
+	if strings.TrimSpace(r.Header.Get("Range")) == "" {
+		return r
+	}
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	clone.Header.Del("Range")
+	return clone
+}
+
 func (s *Server) setNoIndexHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Robots-Tag", "noindex, noarchive")
 }
@@ -1724,12 +2244,16 @@ func allowMethods(w http.ResponseWriter, r *http.Request, methods ...string) boo
 
 func unsafePublicPath(r *http.Request) bool {
 	escaped := r.URL.EscapedPath()
+	lowerEscaped := strings.ToLower(escaped)
+	if strings.Contains(lowerEscaped, "%2f") || strings.Contains(lowerEscaped, "%5c") {
+		return true
+	}
 	decoded, err := url.PathUnescape(escaped)
 	if err != nil {
 		return true
 	}
 	for _, candidate := range []string{r.URL.Path, escaped, decoded} {
-		if strings.Contains(candidate, "//") {
+		if strings.Contains(candidate, "//") || strings.Contains(candidate, "\\") {
 			return true
 		}
 		for _, segment := range strings.Split(candidate, "/") {
@@ -1782,14 +2306,24 @@ func emptyToNil(value string) any {
 	return value
 }
 
+func publicTimestamp(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC().Truncate(time.Second)
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Robots-Tag", "noindex, noarchive")
+	w.Header().Set("Vary", "Accept-Encoding")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("CDN-Cache-Control", "no-store")
 	writeJSON(w, status, map[string]string{"error": message})
 }

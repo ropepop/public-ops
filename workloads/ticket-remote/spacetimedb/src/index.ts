@@ -152,6 +152,23 @@ function cleanEmail(value: string): string {
   return String(value || '').trim().toLowerCase();
 }
 
+function accountPublicId(email: string): string {
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const normalized = cleanEmail(email);
+  let hash = 2166136261 >>> 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash ^= normalized.charCodeAt(i) & 0xff;
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  let value = hash % (36 * 36 * 36 * 36);
+  let out = '';
+  for (let i = 0; i < 4; i += 1) {
+    out = alphabet[value % 36] + out;
+    value = Math.floor(value / 36);
+  }
+  return out;
+}
+
 function cleanRole(value: string): string {
   const role = String(value || '').trim().toLowerCase();
   if (role === 'owner' || role === 'admin') return role;
@@ -332,6 +349,7 @@ function snapshot(tx: any, ticketId: string, now: string): string {
   const members = rowsFrom(tx.db.ticketremote_ticket_member.ticketId.filter(ticket.id))
     .map((row) => ({
       email: row.email,
+      publicId: accountPublicId(row.email),
       role: row.role,
       active: row.active,
       updatedAt: row.updatedAt,
@@ -373,6 +391,11 @@ function snapshot(tx: any, ticketId: string, now: string): string {
 
 function publicSnapshot(tx: any, ticketId: string, now: string): any {
   const full = JSON.parse(snapshot(tx, ticketId, now)).state;
+  const memberPublicIds = new Map(
+    (Array.isArray(full.members) ? full.members : [])
+      .filter((member: any) => member && member.active !== false)
+      .map((member: any) => [cleanEmail(member.email), String(member.publicId || accountPublicId(member.email)).trim()])
+  );
   const activeViewers = Array.isArray(full.viewers)
     ? full.viewers.filter((viewer: any) => viewer && viewer.connected !== false)
     : [];
@@ -380,8 +403,9 @@ function publicSnapshot(tx: any, ticketId: string, now: string): any {
   return {
     ticket: full.ticket,
     viewerCount: viewerCount,
-    viewerPresence: activeViewers.map((_viewer: any, index: number) => ({
-      label: `Skatītājs ${index + 1}`,
+    viewerPresence: activeViewers.map((viewer: any) => ({
+      publicId: memberPublicIds.get(cleanEmail(viewer.email)) || accountPublicId(viewer.email),
+      label: memberPublicIds.get(cleanEmail(viewer.email)) || accountPublicId(viewer.email),
     })),
     activeControl: full.activeControl ? {
       ownerEmail: full.activeControl.email,

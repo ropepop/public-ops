@@ -2,6 +2,8 @@
 
 Train bot, public web app, and Telegram entrypoints for the Arbuzas production stack.
 
+For agent-specific context, test-login rules, and public verification pitfalls, start with [AGENTS.md](./AGENTS.md).
+
 ## Runtime Shape
 
 The active production runtime is Docker on Arbuzas:

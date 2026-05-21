@@ -1,12 +1,22 @@
 package store
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"satiksmebot/internal/model"
+	"satiksmebot/internal/spacetime"
 )
 
 func TestSpacetimePayloadsExposeStableTelegramIdentity(t *testing.T) {
@@ -27,6 +37,73 @@ func TestSpacetimePayloadsExposeStableTelegramIdentity(t *testing.T) {
 
 	assertIdentityJSON(t, stop)
 	assertIdentityJSON(t, vote)
+}
+
+func TestSpacetimeCommentCountFallsBackWhenProcedureMissing(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/call/satiksmebot_service_count_incident_comments_by_user_since"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"External attempt to call nonexistent procedure \"satiksmebot_service_count_incident_comments_by_user_since\" failed."}`))
+		case strings.HasSuffix(r.URL.Path, "/call/satiksmebot_service_count_incident_comments_by_incident_since"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"External attempt to call nonexistent procedure \"satiksmebot_service_count_incident_comments_by_incident_since\" failed."}`))
+		case strings.HasSuffix(r.URL.Path, "/call/satiksmebot_service_list_incident_comments"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"comments": []map[string]any{
+					{
+						"id":         "comment-old",
+						"incidentId": "stop:1",
+						"userId":     1001,
+						"nickname":   "Amber 001",
+						"body":       "old",
+						"createdAt":  "2026-03-18T10:00:00Z",
+					},
+					{
+						"id":         "comment-new",
+						"incidentId": "stop:1",
+						"userId":     1002,
+						"nickname":   "Amber 002",
+						"body":       "new",
+						"createdAt":  "2026-03-18T11:45:00Z",
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	syncer, err := spacetime.NewSyncer(spacetime.SyncConfig{
+		Host:              server.URL,
+		Database:          "satiksme-bot-test",
+		JWTPrivateKeyFile: writeStoreTestRSAKey(t),
+		HTTPTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSyncer() error = %v", err)
+	}
+	st := NewSpacetimeStore(syncer)
+	since := time.Date(2026, time.March, 18, 11, 30, 0, 0, time.UTC)
+
+	userCount, err := st.CountIncidentCommentsByUserSince(context.Background(), 1002, since)
+	if err != nil {
+		t.Fatalf("CountIncidentCommentsByUserSince() error = %v", err)
+	}
+	if userCount != 0 {
+		t.Fatalf("CountIncidentCommentsByUserSince() = %d, want missing-procedure fallback 0", userCount)
+	}
+
+	incidentCount, err := st.CountIncidentCommentsByIncidentSince(context.Background(), "stop:1", since)
+	if err != nil {
+		t.Fatalf("CountIncidentCommentsByIncidentSince() error = %v", err)
+	}
+	if incidentCount != 1 {
+		t.Fatalf("CountIncidentCommentsByIncidentSince() = %d, want existing-list fallback 1", incidentCount)
+	}
 }
 
 func TestSpacetimeReportDumpPayloadUsesLowerCamelFields(t *testing.T) {
@@ -196,4 +273,22 @@ func assertIdentityJSON(t *testing.T, value any) {
 	if payload["userId"] != "777001" {
 		t.Fatalf("userId = %#v, want 777001 in %s", payload["userId"], string(body))
 	}
+}
+
+func writeStoreTestRSAKey(t *testing.T) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey() error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "jwt-key.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
 }

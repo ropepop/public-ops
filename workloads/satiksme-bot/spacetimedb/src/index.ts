@@ -9,7 +9,7 @@ import {
 
 const SATIKSMEBOT_DB_PREFIX = 'satiksmebot_';
 const SATIKSMEBOT_SCHEMA_MODULE = 'satiksme-bot';
-const SATIKSMEBOT_SCHEMA_VERSION = '2026-04-30-area-reports-v1';
+const SATIKSMEBOT_SCHEMA_VERSION = '2026-05-11-public-direct-privacy-v2';
 const VISIBLE_SIGHTING_WINDOW_MS = 30 * 60 * 1000;
 const INCIDENT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const INCIDENT_RESOLVED_VOTE_COUNT = 2;
@@ -19,6 +19,10 @@ const MAP_REPORT_WINDOW_MS = 30 * 60 * 1000;
 const MAP_REPORT_LIMIT = 5;
 const VOTE_ACTION_WINDOW_MS = 60 * 60 * 1000;
 const VOTE_ACTION_LIMIT = 20;
+const COMMENT_ACTION_WINDOW_MS = 60 * 60 * 1000;
+const COMMENT_ACTION_LIMIT = 10;
+const INCIDENT_COMMENT_ACTION_LIMIT = 50;
+const PUBLIC_INCIDENT_ACTOR_LABEL = 'anonīmi';
 const DEFAULT_AREA_RADIUS_METERS = 100;
 const MAX_AREA_RADIUS_METERS = 500;
 
@@ -26,8 +30,11 @@ function named(suffix: string): string {
   return `${SATIKSMEBOT_DB_PREFIX}${suffix}`;
 }
 
+function publicIncidentNickname(): string {
+  return PUBLIC_INCIDENT_ACTOR_LABEL;
+}
+
 const vehicleContextDoc = t.object('SatiksmeVehicleContextDoc', {
-  scopeKey: t.string(),
   stopId: t.string(),
   stopName: t.string(),
   mode: t.string(),
@@ -35,11 +42,9 @@ const vehicleContextDoc = t.object('SatiksmeVehicleContextDoc', {
   direction: t.string(),
   destination: t.string(),
   departureSeconds: t.u32(),
-  liveRowId: t.string(),
 });
 
 const areaContextDoc = t.object('SatiksmeAreaContextDoc', {
-  scopeKey: t.string(),
   latitude: t.number(),
   longitude: t.number(),
   radiusMeters: t.u32(),
@@ -62,13 +67,11 @@ const satiksmebot_stop_catalog = table(
   { name: named('stop_catalog'), public: true },
   {
     id: t.string().primaryKey(),
-    liveId: t.string(),
     name: t.string(),
     latitude: t.number(),
     longitude: t.number(),
     modes: t.array(t.string()),
     routeLabels: t.array(t.string()),
-    nearbyStopIds: t.array(t.string()),
   }
 );
 
@@ -310,7 +313,6 @@ const satiksmebot_public_vehicle_sighting = table(
     direction: t.string(),
     destination: t.string(),
     departureSeconds: t.u32(),
-    liveRowId: t.string(),
     createdAt: t.string().index(),
   }
 );
@@ -346,7 +348,6 @@ const satiksmebot_public_incident = table(
     resolved: t.bool(),
     vehicle: t.option(vehicleContextDoc),
     area: t.option(areaContextDoc).default({
-      scopeKey: '',
       latitude: 0,
       longitude: 0,
       radiusMeters: 0,
@@ -384,19 +385,12 @@ const satiksmebot_public_live_snapshot_state = table(
     feed: t.string().primaryKey(),
     version: t.string(),
     path: t.string(),
-    hash: t.string(),
-    publishedAt: t.string(),
-    lastSuccessAt: t.string(),
-    lastAttemptAt: t.string(),
-    status: t.string(),
-    consecutiveFailures: t.u32(),
-    vehicleCount: t.u32(),
     updatedAt: t.string().index(),
   }
 );
 
 const satiksmebot_live_viewer_heartbeat = table(
-  { name: named('live_viewer_heartbeat'), public: true },
+  { name: named('live_viewer_heartbeat') },
   {
     sessionId: t.string().primaryKey(),
     page: t.string().index(),
@@ -581,11 +575,55 @@ function stopIncidentID(stopId: string): string {
 }
 
 function vehicleIncidentID(scopeKey: string): string {
-  return `vehicle:${sanitizeIncidentKey(scopeKey)}`;
+  return `vehicle:pub-${fnv1a32Hex(scopeKey)}`;
+}
+
+function fnv1a32Hex(value: string): string {
+  let hash = 2166136261 >>> 0;
+  const input = value.trim() || 'unknown';
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+function publicAreaIncidentID(scopeKey: string): string {
+  return `area:pub-${fnv1a32Hex(scopeKey)}`;
+}
+
+function publicAreaReportID(reportId: string): string {
+  return `area-report:pub-${fnv1a32Hex(reportId)}`;
+}
+
+function publicStopSightingID(reportId: string): string {
+  return `stop-report:pub-${fnv1a32Hex(reportId)}`;
+}
+
+function publicVehicleSightingID(reportId: string): string {
+  return `vehicle-report:pub-${fnv1a32Hex(reportId)}`;
+}
+
+function publicIncidentEventID(incidentId: string, eventId: string, createdAt: string): string {
+  const seed = [
+    asString(incidentId).trim(),
+    asString(eventId).trim(),
+    asString(createdAt).trim(),
+  ].join('|');
+  return `incident-event:pub-${fnv1a32Hex(seed)}`;
+}
+
+function publicIncidentCommentID(incidentId: string, commentId: string, createdAt: string): string {
+  const seed = [
+    asString(incidentId).trim(),
+    asString(commentId).trim(),
+    asString(createdAt).trim(),
+  ].join('|');
+  return `incident-comment:pub-${fnv1a32Hex(seed)}`;
 }
 
 function areaIncidentID(scopeKey: string): string {
-  return `area:${sanitizeIncidentKey(scopeKey)}`;
+  return publicAreaIncidentID(scopeKey);
 }
 
 function vehicleScopeKey(payload: any): string {
@@ -595,7 +633,7 @@ function vehicleScopeKey(payload: any): string {
   const destination = asString(payload?.destination).trim().toLowerCase();
   const liveRowId = asString(payload?.liveRowId).trim();
   if (liveRowId) {
-    return `live:${mode}:${routeLabel}:${direction}:${liveRowId}`;
+    return `live:${mode}:${routeLabel}:${direction}:pub-${fnv1a32Hex(liveRowId)}`;
   }
   return `fallback:${mode}:${routeLabel}:${direction}:${destination}`;
 }
@@ -610,6 +648,58 @@ function normalizeAreaRadius(value: unknown): number {
 
 function roundCoordinate(value: number): number {
   return Math.round(value * 100000) / 100000;
+}
+
+function publicAreaCoordinate(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function publicAreaRadius(value: unknown): number {
+  const radius = normalizeAreaRadius(value);
+  return radius < 250 ? 250 : radius;
+}
+
+function publicAreaContext(row: any) {
+  if (!row || typeof row !== 'object') {
+    return undefined;
+  }
+  const latitude = Number(row.latitude);
+  const longitude = Number(row.longitude);
+  const radiusMeters = publicAreaRadius(row.radiusMeters);
+  if (!validCoordinate(latitude, -90, 90) || !validCoordinate(longitude, -180, 180) || radiusMeters <= 0) {
+    return undefined;
+  }
+  return {
+    latitude: publicAreaCoordinate(latitude),
+    longitude: publicAreaCoordinate(longitude),
+    radiusMeters,
+    description: asString(row.description).trim(),
+  };
+}
+
+function publicVehicleContext(row: any, stopName: string) {
+  return {
+    stopId: asString(row.stopId).trim(),
+    stopName,
+    mode: asString(row.mode).trim(),
+    routeLabel: asString(row.routeLabel).trim(),
+    direction: asString(row.direction).trim(),
+    destination: asString(row.destination).trim(),
+    departureSeconds: Number(row.departureSeconds) || 0,
+  };
+}
+
+function publicAreaReportPayload(row: any) {
+  const area = publicAreaContext(row);
+  return {
+    id: publicAreaReportID(asString(row.id).trim()),
+    incidentId: asString(row.incidentId).trim(),
+    latitude: Number(area?.latitude) || 0,
+    longitude: Number(area?.longitude) || 0,
+    radiusMeters: Number(area?.radiusMeters) || 0,
+    description: asString(area?.description).trim(),
+    createdAt: asString(row.createdAt).trim(),
+  };
 }
 
 function validCoordinate(value: number, min: number, max: number): boolean {
@@ -716,12 +806,20 @@ function sessionFromTx(tx: any) {
   };
 }
 
+function requireReporterSession(tx: any) {
+  const session = sessionFromTx(tx);
+  if (!session.roles.includes('satiksme_viewer') || !session.stableId.startsWith('telegram:')) {
+    throw new SenderError('telegram auth required');
+  }
+  return session;
+}
+
 function optionalViewerStableId(tx: any): string {
-  const auth = tx.senderAuth;
-  if (!auth || !auth.hasJWT || !auth.jwt) {
+  try {
+    return requireReporterSession(tx).stableId;
+  } catch (_) {
     return '';
   }
-  return asString(auth.jwt.subject).trim();
 }
 
 function requireServiceRole(tx: any): void {
@@ -732,7 +830,7 @@ function requireServiceRole(tx: any): void {
 }
 
 function ensureReporter(tx: any) {
-  const session = sessionFromTx(tx);
+  const session = requireReporterSession(tx);
   const currentAt = nowISO(tx);
   const existing = tx.db.satiksmebot_reporter_identity.stableId.find(session.stableId);
   const next = {
@@ -833,13 +931,11 @@ function sanitizeStopCatalogRow(item: any): any | null {
   }
   return {
     id,
-    liveId: asString(item?.liveId).trim(),
     name: asString(item?.name).trim(),
     latitude: Number(item?.latitude) || 0,
     longitude: Number(item?.longitude) || 0,
     modes: Array.isArray(item?.modes) ? item.modes.map((value: any) => asString(value).trim()).filter(Boolean) : [],
     routeLabels: Array.isArray(item?.routeLabels) ? item.routeLabels.map((value: any) => asString(value).trim()).filter(Boolean) : [],
-    nearbyStopIds: Array.isArray(item?.nearbyStopIds) ? item.nearbyStopIds.map((value: any) => asString(value).trim()).filter(Boolean) : [],
   };
 }
 
@@ -964,22 +1060,7 @@ function areaReportRowToJSON(row: any) {
 }
 
 function incidentAreaContext(row: any) {
-  if (!row || typeof row !== 'object') {
-    return undefined;
-  }
-  const latitude = Number(row.latitude);
-  const longitude = Number(row.longitude);
-  const radiusMeters = Number(row.radiusMeters) || 0;
-  if (!validCoordinate(latitude, -90, 90) || !validCoordinate(longitude, -180, 180) || radiusMeters <= 0) {
-    return undefined;
-  }
-  return {
-    scopeKey: asString(row.scopeKey).trim(),
-    latitude,
-    longitude,
-    radiusMeters,
-    description: asString(row.description).trim(),
-  };
+  return publicAreaContext(row);
 }
 
 function incidentVoteRowToJSON(row: any) {
@@ -1052,7 +1133,7 @@ function sanitizeVehicleSighting(tx: any, item: any): any {
     hidden: item?.hidden === true,
     createdAt: trimOptional(asString(item?.createdAt)) || new Date().toISOString(),
   };
-  payload.scopeKey = payload.scopeKey || vehicleScopeKey(payload);
+  payload.scopeKey = payload.liveRowId ? vehicleScopeKey(payload) : (payload.scopeKey || vehicleScopeKey(payload));
   return payload;
 }
 
@@ -1316,13 +1397,6 @@ function liveSnapshotStateRowToJSON(row: any) {
     feed: asString(row.feed).trim(),
     version: asString(row.version).trim(),
     path: asString(row.path).trim(),
-    hash: asString(row.hash).trim(),
-    publishedAt: asString(row.publishedAt).trim(),
-    lastSuccessAt: asString(row.lastSuccessAt).trim(),
-    lastAttemptAt: asString(row.lastAttemptAt).trim(),
-    status: asString(row.status).trim(),
-    consecutiveFailures: Number(row.consecutiveFailures) || 0,
-    vehicleCount: Number(row.vehicleCount) || 0,
     updatedAt: asString(row.updatedAt).trim(),
   };
 }
@@ -1383,6 +1457,38 @@ function countIncidentVoteEventsForStableIdSince(tx: any, stableId: string, sour
     }
   }
   return count;
+}
+
+function countIncidentCommentsForStableIdSince(tx: any, stableId: string, sinceMs: number): number {
+  let count = 0;
+  for (const row of rowsFrom(tx.db.satiksmebot_incident_comment.stableId.filter(stableId.trim()))) {
+    const createdMs = parseISO(asString(row.createdAt))?.getTime() || 0;
+    if (createdMs >= sinceMs) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function countIncidentCommentsForIncidentSince(tx: any, incidentId: string, sinceMs: number): number {
+  let count = 0;
+  for (const row of rowsFrom(tx.db.satiksmebot_incident_comment.incidentId.filter(incidentId.trim()))) {
+    const createdMs = parseISO(asString(row.createdAt))?.getTime() || 0;
+    if (createdMs >= sinceMs) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function enforceIncidentCommentLimit(tx: any, incidentId: string, stableId: string) {
+  const sinceMs = nowDate(tx).getTime() - COMMENT_ACTION_WINDOW_MS;
+  if (countIncidentCommentsForStableIdSince(tx, stableId, sinceMs) >= COMMENT_ACTION_LIMIT) {
+    throw new SenderError('Pārāk daudz komentāru. Jānogaida.');
+  }
+  if (countIncidentCommentsForIncidentSince(tx, incidentId, sinceMs) >= INCIDENT_COMMENT_ACTION_LIMIT) {
+    throw new SenderError('Pārāk daudz komentāru šajā ziņojumā. Jānogaida.');
+  }
 }
 
 function countPublicVoteActionsForStableIdSince(tx: any, stableId: string, sinceMs: number): number {
@@ -1571,8 +1677,7 @@ function refreshPublicProjections(tx: any): void {
       id: asString(row.id).trim(),
       kind: 'report',
       name: incidentVoteLabel('ONGOING'),
-      nickname: trimOptional(asString(tx.db.satiksmebot_reporter_identity.stableId.find(asString(row.stableId).trim())?.nickname))
-        || genericNickname(asString(row.stableId).trim()),
+      nickname: publicIncidentNickname(),
       createdAt,
     };
     const current = incidents.get(incidentId) || {
@@ -1592,13 +1697,13 @@ function refreshPublicProjections(tx: any): void {
     if (!current.lastReportAt || compareTimeDescending(createdAt, current.lastReportAt) < 0) {
       current.lastReportName = event.name;
       current.lastReportAt = createdAt;
-      current.lastReporter = event.nickname;
+      current.lastReporter = publicIncidentNickname();
       current.subjectName = stopName || stopId;
     }
     incidents.set(incidentId, current);
     if (createdMs >= visibleSinceMs) {
       tx.db.satiksmebot_public_stop_sighting.insert({
-        id: asString(row.id).trim(),
+        id: publicStopSightingID(asString(row.id).trim()),
         incidentId,
         stopId,
         stopName: stopName || stopId,
@@ -1616,30 +1721,20 @@ function refreshPublicProjections(tx: any): void {
     const stopId = asString(row.stopId).trim();
     const stop = stopCatalogRow(tx, stopId);
     const stopName = asString(stop?.name).trim();
-    const incidentId = vehicleIncidentID(asString(row.scopeKey).trim());
+    const publicScopeKey = vehicleScopeKey(row);
+    const incidentId = vehicleIncidentID(publicScopeKey);
     const event = {
       id: asString(row.id).trim(),
       kind: 'report',
       name: incidentVoteLabel('ONGOING'),
-      nickname: trimOptional(asString(tx.db.satiksmebot_reporter_identity.stableId.find(asString(row.stableId).trim())?.nickname))
-        || genericNickname(asString(row.stableId).trim()),
+      nickname: publicIncidentNickname(),
       createdAt,
     };
-    const vehicle = {
-      scopeKey: asString(row.scopeKey).trim(),
-      stopId,
-      stopName,
-      mode: asString(row.mode).trim(),
-      routeLabel: asString(row.routeLabel).trim(),
-      direction: asString(row.direction).trim(),
-      destination: asString(row.destination).trim(),
-      departureSeconds: Number(row.departureSeconds) || 0,
-      liveRowId: asString(row.liveRowId).trim(),
-    };
+    const vehicle = publicVehicleContext(row, stopName);
     const current = incidents.get(incidentId) || {
       id: incidentId,
       scope: 'vehicle',
-      subjectId: asString(row.scopeKey).trim(),
+      subjectId: '',
       subjectName: vehicleIncidentSubjectName(row, stopName),
       stopId,
       lastReportName: '',
@@ -1653,7 +1748,7 @@ function refreshPublicProjections(tx: any): void {
     if (!current.lastReportAt || compareTimeDescending(createdAt, current.lastReportAt) < 0) {
       current.lastReportName = event.name;
       current.lastReportAt = createdAt;
-      current.lastReporter = event.nickname;
+      current.lastReporter = publicIncidentNickname();
       current.subjectName = vehicleIncidentSubjectName(row, stopName);
       current.stopId = stopId;
       current.vehicle = vehicle;
@@ -1661,7 +1756,7 @@ function refreshPublicProjections(tx: any): void {
     incidents.set(incidentId, current);
     if (createdMs >= visibleSinceMs) {
       tx.db.satiksmebot_public_vehicle_sighting.insert({
-        id: asString(row.id).trim(),
+        id: publicVehicleSightingID(asString(row.id).trim()),
         incidentId,
         stopId,
         stopName,
@@ -1670,7 +1765,6 @@ function refreshPublicProjections(tx: any): void {
         direction: asString(row.direction).trim(),
         destination: asString(row.destination).trim(),
         departureSeconds: Number(row.departureSeconds) || 0,
-        liveRowId: asString(row.liveRowId).trim(),
         createdAt,
       });
     }
@@ -1688,21 +1782,14 @@ function refreshPublicProjections(tx: any): void {
       id: asString(row.id).trim(),
       kind: 'report',
       name: incidentVoteLabel('ONGOING'),
-      nickname: trimOptional(asString(tx.db.satiksmebot_reporter_identity.stableId.find(asString(row.stableId).trim())?.nickname))
-        || genericNickname(asString(row.stableId).trim()),
+      nickname: publicIncidentNickname(),
       createdAt,
     };
-    const area = {
-      scopeKey,
-      latitude: Number(row.latitude) || 0,
-      longitude: Number(row.longitude) || 0,
-      radiusMeters: Number(row.radiusMeters) || 0,
-      description: asString(row.description).trim(),
-    };
+    const area = publicAreaContext(row);
     const current = incidents.get(incidentId) || {
       id: incidentId,
       scope: 'area',
-      subjectId: scopeKey,
+      subjectId: '',
       subjectName: areaIncidentSubjectName(row),
       stopId: '',
       lastReportName: '',
@@ -1716,7 +1803,7 @@ function refreshPublicProjections(tx: any): void {
     if (!current.lastReportAt || compareTimeDescending(createdAt, current.lastReportAt) < 0) {
       current.lastReportName = event.name;
       current.lastReportAt = createdAt;
-      current.lastReporter = event.nickname;
+      current.lastReporter = publicIncidentNickname();
       current.subjectName = areaIncidentSubjectName(row);
       current.stopId = '';
       current.vehicle = null;
@@ -1724,15 +1811,11 @@ function refreshPublicProjections(tx: any): void {
     }
     incidents.set(incidentId, current);
     if (createdMs >= visibleSinceMs) {
-      tx.db.satiksmebot_public_area_report.insert({
-        id: asString(row.id).trim(),
+      tx.db.satiksmebot_public_area_report.insert(publicAreaReportPayload({
+        ...row,
         incidentId,
-        latitude: Number(row.latitude) || 0,
-        longitude: Number(row.longitude) || 0,
-        radiusMeters: Number(row.radiusMeters) || 0,
-        description: asString(row.description).trim(),
         createdAt,
-      });
+      }));
     }
   }
 
@@ -1754,7 +1837,7 @@ function refreshPublicProjections(tx: any): void {
         id,
         kind: asString(event.source).trim(),
         name: incidentVoteLabel(asString(event.value)),
-        nickname: asString(event.nickname).trim(),
+        nickname: publicIncidentNickname(),
         createdAt: asString(event.createdAt).trim(),
       });
     }
@@ -1784,7 +1867,7 @@ function refreshPublicProjections(tx: any): void {
       const latestEvent = voteEvents.slice().sort((left: any, right: any) => compareTimeDescending(asString(left.createdAt), asString(right.createdAt)))[0];
       incident.lastReportName = incidentVoteLabel(asString(latestEvent.value));
       incident.lastReportAt = asString(latestEvent.createdAt).trim();
-      incident.lastReporter = asString(latestEvent.nickname).trim();
+      incident.lastReporter = publicIncidentNickname();
     }
     tx.db.satiksmebot_public_incident.insert({
       id: incident.id,
@@ -1794,30 +1877,30 @@ function refreshPublicProjections(tx: any): void {
       stopId: incident.stopId,
       lastReportName: incident.lastReportName,
       lastReportAt: incident.lastReportAt,
-      lastReporter: incident.lastReporter,
+      lastReporter: publicIncidentNickname(),
       commentCount: comments.length,
       ongoingVotes,
       clearedVotes,
       active,
       resolved,
       vehicle: incident.vehicle || undefined,
-      area: incident.area || undefined,
+      area: publicAreaContext(incident.area) || undefined,
     });
     for (const event of unifiedEvents) {
       tx.db.satiksmebot_public_incident_event.insert({
-        id: event.id,
+        id: publicIncidentEventID(incident.id, event.id, event.createdAt),
         incidentId: incident.id,
         kind: event.kind,
         name: event.name,
-        nickname: event.nickname,
+        nickname: publicIncidentNickname(),
         createdAt: event.createdAt,
       });
     }
     for (const comment of comments) {
       tx.db.satiksmebot_public_incident_comment.insert({
-        id: asString(comment.id).trim(),
+        id: publicIncidentCommentID(incident.id, asString(comment.id).trim(), asString(comment.createdAt).trim()),
         incidentId: incident.id,
-        nickname: asString(comment.nickname).trim(),
+        nickname: publicIncidentNickname(),
         body: asString(comment.body).trim(),
         createdAt: asString(comment.createdAt).trim(),
       });
@@ -1840,7 +1923,7 @@ function incidentSummaryPayload(tx: any, row: any, viewerStableId: string) {
     stopId: asString(row.stopId).trim(),
     lastReportName: asString(row.lastReportName).trim(),
     lastReportAt: asString(row.lastReportAt).trim(),
-    lastReporter: asString(row.lastReporter).trim(),
+    lastReporter: publicIncidentNickname(),
     commentCount: Number(row.commentCount) || 0,
     votes: {
       ongoing: Number(row.ongoingVotes) || 0,
@@ -1877,20 +1960,11 @@ function visibleSightingsPayload(tx: any, stopId: string, limit: number) {
       direction: asString(row.direction).trim(),
       destination: asString(row.destination).trim(),
       departureSeconds: Number(row.departureSeconds) || 0,
-      liveRowId: asString(row.liveRowId).trim(),
       createdAt: asString(row.createdAt).trim(),
     }));
   let areaReports = cleanStopId ? [] : rowsFrom(tx.db.satiksmebot_public_area_report.iter())
     .sort((left, right) => compareTimeDescending(asString(left.createdAt), asString(right.createdAt)))
-    .map((row) => ({
-      id: asString(row.id).trim(),
-      incidentId: asString(row.incidentId).trim(),
-      latitude: Number(row.latitude) || 0,
-      longitude: Number(row.longitude) || 0,
-      radiusMeters: Number(row.radiusMeters) || 0,
-      description: asString(row.description).trim(),
-      createdAt: asString(row.createdAt).trim(),
-    }));
+    .map((row) => publicAreaReportPayload(row));
   if (limit > 0) {
     stopSightings = stopSightings.slice(0, limit);
     vehicleSightings = vehicleSightings.slice(0, limit);
@@ -2305,7 +2379,7 @@ function publicIncidentDetailPayload(tx: any, incidentId: string) {
       id: asString(item.id).trim(),
       kind: asString(item.kind).trim(),
       name: asString(item.name).trim(),
-      nickname: asString(item.nickname).trim(),
+      nickname: publicIncidentNickname(),
       createdAt: asString(item.createdAt).trim(),
     }));
   const comments = rowsFrom(tx.db.satiksmebot_public_incident_comment.incidentId.filter(summary.id))
@@ -2313,7 +2387,7 @@ function publicIncidentDetailPayload(tx: any, incidentId: string) {
     .map((item) => ({
       id: asString(item.id).trim(),
       incidentId: summary.id,
-      nickname: asString(item.nickname).trim(),
+      nickname: publicIncidentNickname(),
       body: asString(item.body).trim(),
       createdAt: asString(item.createdAt).trim(),
     }));
@@ -2327,13 +2401,6 @@ function upsertLiveSnapshotStatePayload(tx: any, stateJson: string) {
     feed,
     version: asString(item?.version).trim(),
     path: asString(item?.path).trim(),
-    hash: asString(item?.hash).trim(),
-    publishedAt: asString(item?.publishedAt).trim(),
-    lastSuccessAt: asString(item?.lastSuccessAt).trim(),
-    lastAttemptAt: asString(item?.lastAttemptAt).trim(),
-    status: asString(item?.status).trim() || 'idle',
-    consecutiveFailures: asInt(item?.consecutiveFailures),
-    vehicleCount: asInt(item?.vehicleCount),
     updatedAt: nowISO(tx),
   };
   tx.db.satiksmebot_public_live_snapshot_state.feed.delete(feed);
@@ -2544,7 +2611,7 @@ export const listRecentReports = spacetimedb.procedure(
   { stopId: t.string(), limit: t.u32() },
   t.string(),
   (ctx, { stopId, limit }) => ctx.withTx((tx) => {
-    const session = sessionFromTx(tx);
+    const session = requireReporterSession(tx);
     return serialize(userSightingsPayload(tx, session.stableId, stopId, Number(limit) || 0));
   })
 );
@@ -2561,6 +2628,7 @@ export const heartbeatLiveViewer = spacetimedb.reducer(
   { sessionId: t.string(), page: t.string() },
   (ctx, { sessionId, page }) => {
     const tx = ctx;
+    requireServiceRole(tx);
     heartbeatLiveViewerPayload(tx, sessionId, page);
   }
 );
@@ -2570,6 +2638,7 @@ export const setLiveViewerState = spacetimedb.reducer(
   { sessionId: t.string(), page: t.string(), visible: t.bool() },
   (ctx, { sessionId, page, visible }) => {
     const tx = ctx;
+    requireServiceRole(tx);
     setLiveViewerStatePayload(tx, sessionId, page, visible === true);
   }
 );
@@ -2656,6 +2725,7 @@ export const commentIncident = spacetimedb.procedure(
   (ctx, { incidentId, body }) => ctx.withTx((tx) => {
     const reporter = ensureReporter(tx);
     incidentMustExist(tx, incidentId);
+    const stableId = asString(reporter.stableId).trim();
     const trimmedBody = asString(body).trim();
     if (!trimmedBody) {
       throw new SenderError('comment is required');
@@ -2663,9 +2733,10 @@ export const commentIncident = spacetimedb.procedure(
     if (Array.from(trimmedBody).length > 280) {
       throw new SenderError('comment is too long');
     }
+    enforceIncidentCommentLimit(tx, incidentId, stableId);
     const next = sanitizeIncidentComment(tx, {
       incidentId,
-      stableId: asString(reporter.stableId).trim(),
+      stableId,
       userId: asString(reporter.userId).trim(),
       nickname: asString(reporter.nickname).trim(),
       body: trimmedBody,
@@ -2677,7 +2748,7 @@ export const commentIncident = spacetimedb.procedure(
     return serialize({
       id: next.id,
       incidentId: next.incidentId,
-      nickname: next.nickname,
+      nickname: publicIncidentNickname(),
       body: next.body,
       createdAt: next.createdAt,
     });
@@ -3087,6 +3158,27 @@ export const serviceCountIncidentVoteEventsByUserSince = spacetimedb.procedure(
     requireServiceRole(tx);
     const stableId = `telegram:${userId.trim()}`;
     return serialize({ count: countIncidentVoteEventsForStableIdSince(tx, stableId, asString(source).trim(), parseISO(sinceIso)?.getTime() || 0) });
+  })
+);
+
+export const serviceCountIncidentCommentsByUserSince = spacetimedb.procedure(
+  { name: named('service_count_incident_comments_by_user_since') },
+  { userId: t.string(), sinceIso: t.string() },
+  t.string(),
+  (ctx, { userId, sinceIso }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    const stableId = `telegram:${userId.trim()}`;
+    return serialize({ count: countIncidentCommentsForStableIdSince(tx, stableId, parseISO(sinceIso)?.getTime() || 0) });
+  })
+);
+
+export const serviceCountIncidentCommentsByIncidentSince = spacetimedb.procedure(
+  { name: named('service_count_incident_comments_by_incident_since') },
+  { incidentId: t.string(), sinceIso: t.string() },
+  t.string(),
+  (ctx, { incidentId, sinceIso }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize({ count: countIncidentCommentsForIncidentSince(tx, incidentId, parseISO(sinceIso)?.getTime() || 0) });
   })
 );
 

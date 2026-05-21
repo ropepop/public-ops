@@ -32,6 +32,7 @@ type Config struct {
 	SatiksmeWebTelegramAuthStateTTLSec        int
 	SatiksmeWebBundleDir                      string
 	SatiksmeWebLiveSnapshotDir                string
+	SatiksmeWebLiveViewerHeartbeatEnabled     bool
 	SatiksmeWebSpacetimeEnabled               bool
 	SatiksmeWebSpacetimeHost                  string
 	SatiksmeWebSpacetimeDatabase              string
@@ -184,6 +185,10 @@ func loadCommon() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	webLiveViewerHeartbeatEnabled, err := envOrBoolStrict("SATIKSME_WEB_LIVE_VIEWER_HEARTBEAT_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	webSpacetimeTokenTTLSec, err := envOrIntStrict("SATIKSME_WEB_SPACETIME_TOKEN_TTL_SEC", 24*60*60)
 	if err != nil {
 		return Config{}, err
@@ -327,6 +332,7 @@ func loadCommon() (Config, error) {
 		SatiksmeWebTelegramAuthStateTTLSec:        authStateTTL,
 		SatiksmeWebBundleDir:                      strings.TrimSpace(envOr("SATIKSME_WEB_BUNDLE_DIR", "")),
 		SatiksmeWebLiveSnapshotDir:                strings.TrimSpace(envOr("SATIKSME_WEB_LIVE_SNAPSHOT_DIR", "")),
+		SatiksmeWebLiveViewerHeartbeatEnabled:     webLiveViewerHeartbeatEnabled,
 		SatiksmeWebSpacetimeEnabled:               webSpacetimeEnabled,
 		SatiksmeWebSpacetimeHost:                  strings.TrimRight(strings.TrimSpace(envOr("SATIKSME_WEB_SPACETIME_HOST", "")), "/"),
 		SatiksmeWebSpacetimeDatabase:              strings.TrimSpace(envOr("SATIKSME_WEB_SPACETIME_DATABASE", "")),

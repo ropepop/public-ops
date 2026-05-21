@@ -20,6 +20,5 @@ export default __t.row({
   direction: __t.string(),
   destination: __t.string(),
   departureSeconds: __t.u32(),
-  liveRowId: __t.string(),
   createdAt: __t.string(),
 });

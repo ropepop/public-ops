@@ -83,7 +83,7 @@ type FavoriteRouteView struct {
 }
 
 type PublicTrainView struct {
-	Train            domain.TrainInstance     `json:"train"`
+	Train            PublicTrainInstance      `json:"train"`
 	Status           domain.TrainStatus       `json:"status"`
 	Riders           int                      `json:"riders"`
 	Timeline         []reports.TimelineEvent  `json:"timeline"`
@@ -729,9 +729,9 @@ func (s *Service) buildPublicTrainViews(ctx context.Context, trains []domain.Tra
 			return nil, err
 		}
 		out = append(out, PublicTrainView{
-			Train:            train,
-			Status:           status,
-			Riders:           riders,
+			Train:            PublicTrainInstanceFor(train),
+			Status:           PublicTrainStatus(status),
+			Riders:           PublicRiderCount(riders),
 			Timeline:         timeline,
 			StationSightings: nil,
 		})
@@ -819,9 +819,9 @@ func (s *Service) PublicTrain(ctx context.Context, trainID string, now time.Time
 		return nil, err
 	}
 	return &PublicTrainView{
-		Train:            view.TrainCard.Train,
-		Status:           view.TrainCard.Status,
-		Riders:           view.TrainCard.Riders,
+		Train:            PublicTrainInstanceFor(view.TrainCard.Train),
+		Status:           PublicTrainStatus(view.TrainCard.Status),
+		Riders:           PublicRiderCount(view.TrainCard.Riders),
 		Timeline:         view.Timeline,
 		StationSightings: view.StationSightings,
 	}, nil
@@ -851,6 +851,7 @@ func (s *Service) PublicStationDepartures(ctx context.Context, now time.Time, st
 			if err != nil {
 				return nil, err
 			}
+			redactPublicStationTrainCards(cards)
 			lastDeparture = &cards[0]
 		}
 	}
@@ -863,6 +864,7 @@ func (s *Service) PublicStationDepartures(ctx context.Context, now time.Time, st
 	if err != nil {
 		return nil, err
 	}
+	redactPublicStationTrainCards(cards)
 	if limit > 0 && len(cards) > limit {
 		cards = cards[:limit]
 	}
@@ -877,6 +879,13 @@ func (s *Service) PublicStationDepartures(ctx context.Context, now time.Time, st
 		Upcoming:        cards,
 		RecentSightings: recentSightings,
 	}, nil
+}
+
+func redactPublicStationTrainCards(cards []StationTrainCard) {
+	for index := range cards {
+		cards[index].TrainCard.Riders = PublicRiderCount(cards[index].TrainCard.Riders)
+		cards[index].TrainCard.Status = PublicTrainStatus(cards[index].TrainCard.Status)
+	}
 }
 
 func (s *Service) StationDepartures(ctx context.Context, userID int64, now time.Time, stationID string, pastWindow, futureWindow time.Duration) (*StationDeparturesView, error) {
@@ -964,6 +973,10 @@ func (s *Service) TrainStops(ctx context.Context, userID int64, now time.Time, t
 	card, err := s.trainCard(ctx, userID, *train, now)
 	if err != nil {
 		return nil, err
+	}
+	if userID == 0 {
+		card.Riders = PublicRiderCount(card.Riders)
+		card.Status = PublicTrainStatus(card.Status)
 	}
 	stops, err := s.store.ListTrainStops(ctx, trainID)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,6 +27,34 @@ type captureBundleSync struct {
 	serviceDate   string
 	generatedAt   time.Time
 	sourceVersion string
+}
+
+func TestProductionAppBundleDoesNotExposeTestHarnessMarker(t *testing.T) {
+	t.Parallel()
+
+	body, err := fs.ReadFile(mustStaticSubFS(), "app.js")
+	if err != nil {
+		t.Fatalf("read app.js: %v", err)
+	}
+	for _, forbidden := range []string{"__test__", `"__" + "test__"`} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("production app.js exposes the test harness marker %q", forbidden)
+		}
+	}
+}
+
+func TestProductionStaticJSDoesNotReferenceSourceMaps(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"static/app.js", "static/external-feed.js", "static/live-client.js", "static/vendor/leaflet.js"} {
+		body, err := staticFS.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(body), "sourceMappingURL=") {
+			t.Fatalf("%s references a source map that is not publicly served", path)
+		}
+	}
 }
 
 func (c *captureBundleSync) PublishActiveBundle(_ context.Context, version string, serviceDate string, generatedAt time.Time, sourceVersion string) error {
@@ -81,6 +110,30 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(bundleDir, manifest.Version, manifest.Slices.TrainGraph)); err != nil {
 		t.Fatalf("missing graph slice: %v", err)
 	}
+	trainSliceBody, err := os.ReadFile(filepath.Join(bundleDir, manifest.Version, manifest.Slices.Trains))
+	if err != nil {
+		t.Fatalf("read train slice: %v", err)
+	}
+	if strings.Contains(string(trainSliceBody), "sourceVersion") {
+		t.Fatalf("public train slice exposes per-train sourceVersion: %s", trainSliceBody)
+	}
+	if manifest.SourceVersion == "" || manifest.Freshness.Source == "" {
+		t.Fatalf("in-memory manifest should retain source metadata for internal sync: %+v", manifest)
+	}
+	manifestBody, err := os.ReadFile(filepath.Join(bundleDir, manifest.Version, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if strings.Contains(string(manifestBody), "sourceVersion") {
+		t.Fatalf("public manifest exposes sourceVersion: %s", manifestBody)
+	}
+	activeBody, err := os.ReadFile(filepath.Join(bundleDir, "active.json"))
+	if err != nil {
+		t.Fatalf("read active bundle pointer: %v", err)
+	}
+	if strings.Contains(string(activeBody), "sourceVersion") {
+		t.Fatalf("public active bundle pointer exposes sourceVersion: %s", activeBody)
+	}
 
 	server := newStaticBundleTestServer(t, appSvc, bundleDir)
 	server.now = func() time.Time { return now }
@@ -98,6 +151,49 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	if !strings.Contains(shellBody, `externalTrainGraphURL: "/pixel-stack/train/assets/bundles/`+manifest.Version+`/train-graph.json"`) {
 		t.Fatalf("expected bundled graph bootstrap, body=%s", shellBody)
 	}
+	if strings.Contains(shellBody, "sourceVersion") {
+		t.Fatalf("public shell exposes sourceVersion: %s", shellBody)
+	}
+
+	activeReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/assets/bundles/active.json", nil)
+	activeRes := httptest.NewRecorder()
+	server.ServeHTTP(activeRes, activeReq)
+	if activeRes.Code != http.StatusOK {
+		t.Fatalf("unexpected active bundle pointer status: got %d body=%s", activeRes.Code, activeRes.Body.String())
+	}
+	if got := activeRes.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("active bundle pointer Cache-Control = %q, want no-store", got)
+	}
+	if got := activeRes.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("active bundle pointer X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
+
+	manifestReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/assets/bundles/"+manifest.Version+"/manifest.json", nil)
+	manifestRes := httptest.NewRecorder()
+	server.ServeHTTP(manifestRes, manifestReq)
+	if manifestRes.Code != http.StatusOK {
+		t.Fatalf("unexpected bundle manifest status: got %d body=%s", manifestRes.Code, manifestRes.Body.String())
+	}
+	if got := manifestRes.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
+		t.Fatalf("versioned bundle manifest Cache-Control = %q, want immutable", got)
+	}
+	if got := manifestRes.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+		t.Fatalf("versioned bundle manifest X-Robots-Tag = %q, want noindex, noarchive", got)
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		bundleRootReq := httptest.NewRequest(method, "/pixel-stack/train/assets/bundles/", nil)
+		bundleRootRes := httptest.NewRecorder()
+		server.ServeHTTP(bundleRootRes, bundleRootReq)
+		if bundleRootRes.Code != http.StatusNotFound {
+			t.Fatalf("%s bundle root status = %d, want 404 body=%s", method, bundleRootRes.Code, bundleRootRes.Body.String())
+		}
+		if got := bundleRootRes.Header().Get("Cache-Control"); got != "no-store, no-cache, must-revalidate, max-age=0" {
+			t.Fatalf("%s bundle root Cache-Control = %q", method, got)
+		}
+		if got := bundleRootRes.Header().Get("X-Robots-Tag"); got != "noindex, noarchive" {
+			t.Fatalf("%s bundle root X-Robots-Tag = %q, want noindex, noarchive", method, got)
+		}
+	}
 
 	mapReq := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/map", nil)
 	mapRes := httptest.NewRecorder()
@@ -114,6 +210,9 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	server.ServeHTTP(dashboardRes, dashboardReq)
 	if dashboardRes.Code != http.StatusOK {
 		t.Fatalf("unexpected dashboard status: got %d body=%s", dashboardRes.Code, dashboardRes.Body.String())
+	}
+	if strings.Contains(dashboardRes.Body.String(), "sourceVersion") {
+		t.Fatalf("public dashboard exposes per-train sourceVersion: %s", dashboardRes.Body.String())
 	}
 	var payload struct {
 		Trains []struct {
@@ -146,6 +245,9 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	if trainRes.Code != http.StatusOK {
 		t.Fatalf("unexpected public train status: got %d body=%s", trainRes.Code, trainRes.Body.String())
 	}
+	if strings.Contains(trainRes.Body.String(), "sourceVersion") {
+		t.Fatalf("public train payload exposes sourceVersion: %s", trainRes.Body.String())
+	}
 	var trainPayload struct {
 		Riders int `json:"riders"`
 		Train  struct {
@@ -160,7 +262,80 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	}
 }
 
-func TestStaticBundleServerPreservesRiderCountWhenTrainStopsFallbackUsesBundle(t *testing.T) {
+func TestStaticBundlePublisherRemovesOldPublicBundleVersions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.February, 26, 8, 0, 0, 0, loc)
+	appSvc := newStaticBundleTestService(t, now, loc)
+	bundleDir := filepath.Join(t.TempDir(), "bundles")
+	oldVersionDir := filepath.Join(bundleDir, "2026-01-01-oldbundle")
+	if err := os.MkdirAll(oldVersionDir, 0o755); err != nil {
+		t.Fatalf("create old bundle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(oldVersionDir, "manifest.json"), []byte(`{"sourceVersion":"stale"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write old manifest: %v", err)
+	}
+
+	publisher := NewStaticBundlePublisher(bundleDir, appSvc, loc, nil)
+	manifest, err := publisher.PublishManifest(ctx, now)
+	if err != nil {
+		t.Fatalf("publish static bundle: %v", err)
+	}
+	if manifest == nil || manifest.Version == "" {
+		t.Fatalf("manifest = %#v", manifest)
+	}
+	if _, err := os.Stat(oldVersionDir); !os.IsNotExist(err) {
+		t.Fatalf("old public bundle dir still exists, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bundleDir, manifest.Version, "manifest.json")); err != nil {
+		t.Fatalf("active bundle manifest missing after cleanup: %v", err)
+	}
+}
+
+func TestStaticBundlePublisherDoesNotMutateImmutableManifestForSameVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	now := time.Date(2026, time.February, 26, 8, 0, 0, 0, loc)
+	appSvc := newStaticBundleTestService(t, now, loc)
+	bundleDir := filepath.Join(t.TempDir(), "bundles")
+	publisher := NewStaticBundlePublisher(bundleDir, appSvc, loc, nil)
+
+	first, err := publisher.PublishManifest(ctx, now)
+	if err != nil {
+		t.Fatalf("publish first static bundle: %v", err)
+	}
+	firstBody, err := os.ReadFile(filepath.Join(bundleDir, first.Version, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read first manifest: %v", err)
+	}
+
+	second, err := publisher.PublishManifest(ctx, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("publish second static bundle: %v", err)
+	}
+	secondBody, err := os.ReadFile(filepath.Join(bundleDir, second.Version, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read second manifest: %v", err)
+	}
+	if first.Version != second.Version {
+		t.Fatalf("version changed for unchanged bundle input: first=%q second=%q", first.Version, second.Version)
+	}
+	if string(firstBody) != string(secondBody) {
+		t.Fatalf("immutable manifest changed for same version:\nfirst=%s\nsecond=%s", firstBody, secondBody)
+	}
+}
+
+func TestStaticBundleServerBucketsRiderCountWhenTrainStopsFallbackUsesBundle(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -221,8 +396,8 @@ func TestStaticBundleServerPreservesRiderCountWhenTrainStopsFallbackUsesBundle(t
 	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode train stops payload: %v", err)
 	}
-	if payload.TrainCard.Riders != 1 {
-		t.Fatalf("expected live rider count in public train stops payload, got %d", payload.TrainCard.Riders)
+	if payload.TrainCard.Riders != 0 {
+		t.Fatalf("expected single rider hidden in public train stops payload, got %d", payload.TrainCard.Riders)
 	}
 }
 

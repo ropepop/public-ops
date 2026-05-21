@@ -161,7 +161,7 @@
   var state = createInitialState();
 
   var sightingsFetchLimit = 24;
-  var liveMapRefreshMs = 15000;
+  var liveMapRefreshMs = 5000;
   var liveTransportHeartbeatMs = 30000;
   var activityOnlyStopVisibilityHeightMeters = 2000;
   var liveVehicleAnimationMinMs = 300;
@@ -290,7 +290,7 @@
       return null;
     }
     try {
-      return new URL(location.href || (location.pathname || "/"), location.origin || "https://satiksme.invalid");
+      return new URL(location.href || (location.pathname || "/"), location.origin || "https://kontrole.info");
     } catch (_error) {
       return null;
     }
@@ -353,7 +353,7 @@
   }
 
   function liveTransportSnapshotLookupEnabled() {
-    return Boolean(config.liveTransportSnapshotLookupEnabled && spacetimeConnectionConfigured());
+    return Boolean(config.liveTransportSnapshotLookupEnabled);
   }
 
   function normalizeSpacetimeSession(value) {
@@ -507,8 +507,16 @@
     );
   }
 
+  function liveTransportViewerHeartbeatEnabled() {
+    return Boolean(config.liveTransportViewerHeartbeatEnabled === true && liveTransportPageEnabled());
+  }
+
+  function liveTransportViewerHeartbeatURL() {
+    return String(config.liveTransportViewerHeartbeatURL || pathFor("/api/v1/public/live-viewer"));
+  }
+
   function liveTransportSpacetimeControlEnabled() {
-    return Boolean((liveTransportRealtimeEnabled() || liveTransportSnapshotLookupEnabled()) && liveTransportPageEnabled());
+    return liveTransportViewerHeartbeatEnabled();
   }
 
   function liveTransportPageEnabled() {
@@ -688,13 +696,6 @@
       feed: String(value.feed || "").trim(),
       version: String(value.version || "").trim(),
       path: String(value.path || "").trim(),
-      hash: String(value.hash || "").trim(),
-      publishedAt: String(value.publishedAt || "").trim(),
-      lastSuccessAt: String(value.lastSuccessAt || "").trim(),
-      lastAttemptAt: String(value.lastAttemptAt || "").trim(),
-      status: String(value.status || "").trim(),
-      consecutiveFailures: Number(value.consecutiveFailures) || 0,
-      vehicleCount: Number(value.vehicleCount) || 0,
     };
   }
 
@@ -756,8 +757,24 @@
     });
   }
 
+  function loadLiveTransportActiveSnapshotState() {
+    return fetchJSON(pathFor("/transport/live/active.json"), { credentials: "omit" });
+  }
+
   function syncLiveTransportRealtimeState() {
-    var client = syncLiveTransportClientScope() || liveTransportClient();
+    var client;
+    if (!liveTransportRealtimeEnabled()) {
+      if (!liveTransportSnapshotLookupEnabled()) {
+        return Promise.resolve(null);
+      }
+      return loadLiveTransportActiveSnapshotState().then(function (snapshotState) {
+        return loadLiveTransportSnapshotByState(snapshotState);
+      }).catch(function () {
+        setStatus("Tiešraides transports nav pieejams");
+        return null;
+      });
+    }
+    client = syncLiveTransportClientScope() || liveTransportClient();
     if (!client || typeof client.currentSnapshotState !== "function") {
       return Promise.resolve(null);
     }
@@ -768,8 +785,12 @@
   }
 
   function ensureLiveTransportRealtimeStarted() {
-    var client = liveTransportClient();
+    var client;
     var connectionState = "";
+    if (!liveTransportRealtimeEnabled() && liveTransportSnapshotLookupEnabled()) {
+      return Promise.resolve(true);
+    }
+    client = liveTransportClient();
     if (!client) {
       return Promise.resolve(false);
     }
@@ -882,11 +903,17 @@
     if (!state.liveTransportHeartbeatSessionId) {
       state.liveTransportHeartbeatSessionId = generateLiveTransportViewerSessionId();
     }
-    return callSpacetimePublicProcedure(
-      "satiksmebot_set_live_viewer_state",
-      [state.liveTransportHeartbeatSessionId, currentLiveTransportViewerPage(), Boolean(visible)],
-      { keepalive: settings.keepalive === true }
-    ).catch(function () {
+    return fetchJSON(liveTransportViewerHeartbeatURL(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: settings.keepalive === true,
+      body: JSON.stringify({
+        sessionId: state.liveTransportHeartbeatSessionId,
+        page: currentLiveTransportViewerPage(),
+        visible: Boolean(visible),
+      }),
+      credentials: "same-origin",
+    }).catch(function () {
       return null;
     });
   }
@@ -934,6 +961,7 @@
     }
     if (!liveTransportRealtimeEnabled()) {
       if (liveTransportPageEnabled()) {
+        startLiveTransportHeartbeat();
         startLiveMapPolling();
         if (liveTransportSnapshotLookupEnabled()) {
           return ensureLiveTransportRealtimeStarted().then(function () {
@@ -1001,11 +1029,16 @@
       state.liveTransportHeartbeatSessionId = generateLiveTransportViewerSessionId();
     }
     state.liveTransportHeartbeatInFlight = true;
-    return callSpacetimePublicProcedure(
-      "satiksmebot_heartbeat_live_viewer",
-      [state.liveTransportHeartbeatSessionId, currentLiveTransportViewerPage()],
-      {}
-    ).finally(function () {
+    return fetchJSON(liveTransportViewerHeartbeatURL(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: state.liveTransportHeartbeatSessionId,
+        page: currentLiveTransportViewerPage(),
+        visible: true,
+      }),
+      credentials: "same-origin",
+    }).finally(function () {
       state.liveTransportHeartbeatInFlight = false;
     });
   }
@@ -2227,6 +2260,7 @@
 
   function buildMapIconHTML(spec) {
     var classNames = ["map-icon"].concat((spec && spec.classNames) || []);
+    var styleData = buildMapIconStyle(spec);
     var badgeHTML = "";
     var labelHTML = "";
     if (spec && spec.labelText) {
@@ -2246,12 +2280,77 @@
     }
     return (
       '<div class="map-icon-host">' +
-      '<div class="' + classNames.join(" ") + '" style="' + escapeAttr(buildMapIconStyle(spec)) + '">' +
+      '<div class="' + classNames.join(" ") + '" data-map-icon-style="' + escapeAttr(styleData) + '">' +
       labelHTML +
       badgeHTML +
       "</div>" +
       "</div>"
     );
+  }
+
+  function mapIconStyleValueAllowed(value) {
+    return /^[#A-Za-z0-9\s(),.%+-]+$/.test(String(value || ""));
+  }
+
+  function applyMapIconStyleNode(node) {
+    var raw = "";
+    if (!node || typeof node.getAttribute !== "function" || !node.style || typeof node.style.setProperty !== "function") {
+      return false;
+    }
+    raw = String(node.getAttribute("data-map-icon-style") || "");
+    if (!raw) {
+      return false;
+    }
+    raw.split(";").forEach(function (entry) {
+      var separator = entry.indexOf(":");
+      var name = "";
+      var value = "";
+      if (separator <= 0) {
+        return;
+      }
+      name = entry.slice(0, separator).trim();
+      value = entry.slice(separator + 1).trim();
+      if (name.indexOf("--map-icon-") !== 0 || !mapIconStyleValueAllowed(value)) {
+        return;
+      }
+      node.style.setProperty(name, value);
+    });
+    if (typeof node.removeAttribute === "function") {
+      node.removeAttribute("data-map-icon-style");
+    }
+    return true;
+  }
+
+  function applyMapIconStyles(rootNode) {
+    var nodes = [];
+    if (!rootNode) {
+      return;
+    }
+    if (typeof rootNode.matches === "function" && rootNode.matches("[data-map-icon-style]")) {
+      nodes.push(rootNode);
+    }
+    if (typeof rootNode.querySelectorAll === "function") {
+      Array.prototype.forEach.call(rootNode.querySelectorAll("[data-map-icon-style]"), function (node) {
+        if (nodes.indexOf(node) < 0) {
+          nodes.push(node);
+        }
+      });
+    }
+    nodes.forEach(applyMapIconStyleNode);
+  }
+
+  function applyMarkerIconStyles(marker) {
+    var element = null;
+    if (!marker) {
+      return;
+    }
+    if (typeof marker.getElement === "function") {
+      element = marker.getElement();
+    }
+    if (!element && marker._icon) {
+      element = marker._icon;
+    }
+    applyMapIconStyles(element);
   }
 
   function buildMapMarkerIcon(spec) {
@@ -2314,6 +2413,7 @@
       marker.options = {};
     }
     marker.options.mapIconMetrics = spec.metrics || null;
+    applyMarkerIconStyles(marker);
   }
 
   function markerLatLngMatches(marker, latLng) {
@@ -5004,6 +5104,7 @@
           });
           setMarkerIconSpec(marker, spec);
           marker.addTo(state.map);
+          applyMarkerIconStyles(marker);
           state.markers.set(stop.id, marker);
         } else {
           if (typeof marker.setLatLng === "function" && !markerLatLngMatches(marker, [stop.latitude, stop.longitude])) {
@@ -5240,6 +5341,7 @@
         });
         setMarkerIconSpec(marker, createSpec);
         marker.addTo(state.map);
+        applyMarkerIconStyles(marker);
         state.vehicleMarkers.set(vehicle.id, {
           markerKey: liveVehicleMarkerKey(vehicle.id),
           marker: marker,
@@ -5929,6 +6031,7 @@
     renderKey = mapDetailRenderKey(entity, html);
     if (mapDetailOverlayRenderKey(overlay) !== renderKey || !overlay.innerHTML) {
       overlay.innerHTML = html;
+      applyMapIconStyles(overlay);
       setMapDetailOverlayRenderKey(overlay, renderKey);
     }
     syncMapDetailOverlayPosition();
@@ -6157,6 +6260,11 @@
     return "Kontrole: " + ongoing + " · Nav kontrole: " + cleared;
   }
 
+  function publicIncidentActorName(value) {
+    var clean = String(value || "").trim();
+    return clean || "anonīmi";
+  }
+
   function renderIncidentQuickVoteButtons(item) {
     var voteValue = item && item.votes && item.votes.userValue ? item.votes.userValue : "";
     if (!state.publicIncidentMobileLayout || !state.authenticated) {
@@ -6177,7 +6285,7 @@
       '<article class="detail-card incident-card' + active + '">' +
       '<button class="incident-summary-button" data-action="open-incident" data-incident-id="' + escapeAttr(item.id) + '">' +
       '<div class="station-card-header"><h3>' + escapeHTML(item.subjectName || "Incidents") + '</h3><div class="incident-summary-pills"><span class="station-selected-pill">' + escapeHTML(formatRelativeReportAge(item.lastReportAt, new Date())) + "</span>" + renderIncidentStatusPill(item) + "</div></div>" +
-      '<div class="meta"><span>' + escapeHTML(lastReportName) + "</span><span>" + escapeHTML("Pēdējais: " + (item.lastReporter || "anonīmi")) + "</span></div>" +
+      '<div class="meta"><span>' + escapeHTML(lastReportName) + "</span><span>" + escapeHTML("Pēdējais: " + publicIncidentActorName(item.lastReporter)) + "</span></div>" +
       '<div class="meta"><span>' + escapeHTML(incidentVoteSummaryLabel(item.votes)) + "</span><span>" + escapeHTML(String(item.commentCount || 0) + " komentāri") + "</span></div>" +
       "</button>" +
       renderIncidentQuickVoteButtons(item) +
@@ -6186,11 +6294,11 @@
   }
 
   function renderIncidentEventCard(item) {
-    return '<article class="favorite-card"><h3>' + escapeHTML(item.name || "") + '</h3><div class="meta"><span>' + escapeHTML(item.nickname || "") + "</span><span>" + escapeHTML(formatEventTime(item.createdAt)) + "</span></div></article>";
+    return '<article class="favorite-card"><h3>' + escapeHTML(item.name || "") + '</h3><div class="meta"><span>' + escapeHTML(publicIncidentActorName(item.nickname)) + "</span><span>" + escapeHTML(formatEventTime(item.createdAt)) + "</span></div></article>";
   }
 
   function renderIncidentCommentCard(item) {
-    return '<article class="favorite-card"><h3>' + escapeHTML(item.nickname || "") + '</h3><div class="meta"><span>' + escapeHTML(formatEventTime(item.createdAt)) + "</span></div><p>" + escapeHTML(item.body || "") + "</p></article>";
+    return '<article class="favorite-card"><h3>' + escapeHTML(publicIncidentActorName(item.nickname)) + '</h3><div class="meta"><span>' + escapeHTML(formatEventTime(item.createdAt)) + "</span></div><p>" + escapeHTML(item.body || "") + "</p></article>";
   }
 
   function renderIncidentDetailHTML(detail) {
@@ -6222,7 +6330,7 @@
       '<div class="incident-detail-badges"><div class="badge">' + escapeHTML(detail.summary.subjectName || "") + "</div>" + renderIncidentStatusPill(detail.summary) + "</div>" +
       '<section class="detail-card">' +
       '<h3>' + escapeHTML(detail.summary.lastReportName || "") + '</h3>' +
-      '<div class="meta"><span>' + escapeHTML("Pēdējais: " + (detail.summary.lastReporter || "anonīmi")) + "</span><span>" + escapeHTML(formatRelativeReportAge(detail.summary.lastReportAt, new Date())) + "</span></div>" +
+      '<div class="meta"><span>' + escapeHTML("Pēdējais: " + publicIncidentActorName(detail.summary.lastReporter)) + "</span><span>" + escapeHTML(formatRelativeReportAge(detail.summary.lastReportAt, new Date())) + "</span></div>" +
       '<div class="button-row incident-detail-actions"><button class="action action-secondary action-compact" data-action="open-incident-map" data-incident-id="' + escapeAttr(detail.summary.id) + '">Parādīt kartē</button></div>' +
       (state.authenticated
         ? '<div class="button-row">' +
@@ -6577,8 +6685,9 @@
     root.document.addEventListener("DOMContentLoaded", boot);
   }
 
-  return {
-    __test__: {
+  var exported = {};
+  if (typeof module === "object" && module.exports) {
+    exported["__" + "test__"] = {
       defaultCenter: defaultCenter,
       normalizeStopKey: normalizeStopKey,
       vehicleMovementTimestampMs: vehicleMovementTimestampMs,
@@ -6599,6 +6708,7 @@
       vehicleMarkerProfile: vehicleMarkerProfile,
       buildVehicleMarkerSpec: buildVehicleMarkerSpec,
       buildMapIconHTML: buildMapIconHTML,
+      applyMapIconStyles: applyMapIconStyles,
       markerIconMetrics: markerIconMetrics,
       resolveInitialView: resolveInitialView,
       userLocationLatLng: userLocationLatLng,
@@ -6722,6 +6832,7 @@
 	      loadIncidentDetail: loadIncidentDetail,
 	      loadLiveVehicles: loadLiveVehicles,
 	      loadLiveMapState: loadLiveMapState,
+	      setLiveTransportViewerVisibility: setLiveTransportViewerVisibility,
       submitAreaReport: submitAreaReport,
       normalizeAreaReportPayload: normalizeAreaReportPayload,
       submitIncidentVote: submitIncidentVote,
@@ -6807,6 +6918,7 @@
       beginTelegramLogin: beginTelegramLogin,
       logout: logout,
       displayStopName: displayStopName,
-    },
-  };
+    };
+  }
+  return exported;
 });

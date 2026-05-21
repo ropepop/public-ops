@@ -131,10 +131,11 @@ func (p *SnapshotPublisher) Publish(now time.Time, vehicles []model.LiveVehicle)
 	}
 
 	version := now.UTC().Format("20060102T150405Z") + "-" + hash[:12]
-	payloadVehicles := snapshotVehiclesForPayload(vehicles, now.UTC())
+	publicNow := now.UTC().Truncate(time.Second)
+	payloadVehicles := snapshotVehiclesForPayload(vehicles, publicNow)
 	payload := model.LiveTransportSnapshot{
 		Version:     version,
-		GeneratedAt: now.UTC(),
+		GeneratedAt: publicNow,
 		Vehicles:    payloadVehicles,
 	}
 	payloadBody, err := json.MarshalIndent(payload, "", "  ")
@@ -208,7 +209,7 @@ func snapshotVehiclesForPayload(vehicles []model.LiveVehicle, now time.Time) []m
 		next.Incidents = nil
 		out = append(out, next)
 	}
-	return out
+	return PublicLiveVehicles(out)
 }
 
 func (p *SnapshotPublisher) cleanupOldSnapshots() error {

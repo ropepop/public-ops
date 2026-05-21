@@ -304,8 +304,13 @@ func TestServiceGetTripFallbackAvoidsUnsupportedOrderByAndSortsStops(t *testing.
 		switch {
 		case strings.Contains(query, "FROM trainbot_trip_public"):
 			writeSQLRows(t, w,
-				[]string{"id", "serviceDate", "fromStationId", "fromStationName", "toStationId", "toStationName", "departureAt", "arrivalAt", "sourceVersion"},
-				[][]any{{"train-1", "2026-04-10", "riga", "Riga", "jelgava", "Jelgava", "2026-04-10T06:00:00Z", "2026-04-10T06:45:00Z", "agg-2026-04-10"}},
+				[]string{"id", "serviceDate", "fromStationId", "fromStationName", "toStationId", "toStationName", "departureAt", "arrivalAt"},
+				[][]any{{"train-1", "2026-04-10", "riga", "Riga", "jelgava", "Jelgava", "2026-04-10T06:00:00Z", "2026-04-10T06:45:00Z"}},
+			)
+		case strings.Contains(query, "FROM trainbot_service_day"):
+			writeSQLRows(t, w,
+				[]string{"sourceVersion"},
+				[][]any{{"agg-2026-04-10"}},
 			)
 		case strings.Contains(query, "FROM trainbot_trip_stop"):
 			writeSQLRows(t, w,
@@ -335,6 +340,9 @@ func TestServiceGetTripFallbackAvoidsUnsupportedOrderByAndSortsStops(t *testing.
 	if trip == nil || trip.ID != "train-1" {
 		t.Fatalf("unexpected trip: %+v", trip)
 	}
+	if trip.SourceVersion != "agg-2026-04-10" {
+		t.Fatalf("unexpected trip source version: %q", trip.SourceVersion)
+	}
 	if len(trip.Stops) != 2 || trip.Stops[0].StationID != "riga" || trip.Stops[1].StationID != "jelgava" {
 		t.Fatalf("expected stops to be sorted in Go, got %+v", trip.Stops)
 	}
@@ -344,8 +352,8 @@ func TestServiceGetTripFallbackAvoidsUnsupportedOrderByAndSortsStops(t *testing.
 	if trip.Stops[0].Latitude == nil || *trip.Stops[0].Latitude != 56.9496 || trip.Stops[1].Longitude == nil || *trip.Stops[1].Longitude != 23.7128 {
 		t.Fatalf("expected optional coordinates to be unwrapped, got %+v", trip.Stops)
 	}
-	if len(queries) != 2 {
-		t.Fatalf("expected trip and stop queries, got %d: %v", len(queries), queries)
+	if len(queries) != 3 {
+		t.Fatalf("expected trip, service day, and stop queries, got %d: %v", len(queries), queries)
 	}
 }
 

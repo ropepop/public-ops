@@ -154,7 +154,7 @@ func IssueSessionCookie(secret []byte, cfg SessionConfig, auth Auth, now time.Ti
 		HttpOnly: true,
 		MaxAge:   int(sessionTTL.Seconds()),
 		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
+		SameSite: http.SameSiteLaxMode,
 	}, nil
 }
 

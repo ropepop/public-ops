@@ -257,7 +257,6 @@ func TestQuickClaimTapRejectsBecauseControlModeWasRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
-	waitForPhoneMessage(t, messages, `"type":"start"`)
 
 	err = conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"quick_claim_tap","inputId":"quick-1","x":20,"y":20,"snapTarget":"control_code_button"}`))
 	if err != nil {
@@ -310,7 +309,6 @@ func TestTapRejectedEvenForLegacyActiveControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "test complete")
-	waitForPhoneMessage(t, messages, `"type":"start"`)
 
 	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"tap","inputId":"tap-1","x":101,"y":202}`)); err != nil {
 		t.Fatal(err)

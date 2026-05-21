@@ -53,6 +53,7 @@ security-audits/
 **/cookie-jar*.txt
 
 # Local reports and ad hoc screenshots
+/ops/reports/
 /ops/reports/*.db
 /ops/reports/*.log
 /*.png

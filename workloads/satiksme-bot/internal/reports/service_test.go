@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,87 @@ func TestSubmitVehicleSightingUsesFallbackScopeWithoutLiveID(t *testing.T) {
 	}
 	if item.StopID != "" {
 		t.Fatalf("StopID = %q, want empty", item.StopID)
+	}
+}
+
+func TestPublicVehicleSightingsAndIncidentsRedactLiveRowID(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore() error = %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	svc := NewService(st, 3*time.Minute, 90*time.Second, 30*time.Minute)
+	now := time.Date(2026, 3, 10, 14, 0, 0, 0, time.UTC)
+	result, item, err := svc.SubmitVehicleSighting(ctx, 5, model.VehicleReportInput{
+		Mode:             "bus",
+		RouteLabel:       "22",
+		Direction:        "a-b",
+		Destination:      "Lidosta",
+		DepartureSeconds: 68420,
+		LiveRowID:        "67133",
+	}, now)
+	if err != nil || !result.Accepted {
+		t.Fatalf("SubmitVehicleSighting() = %+v, err=%v", result, err)
+	}
+
+	visible, err := svc.VisibleSightings(ctx, &model.Catalog{}, "", now.Add(time.Minute), 20)
+	if err != nil {
+		t.Fatalf("VisibleSightings() error = %v", err)
+	}
+	if len(visible.VehicleSightings) != 1 {
+		t.Fatalf("visible.VehicleSightings = %+v, want 1", visible.VehicleSightings)
+	}
+	if got := visible.VehicleSightings[0].LiveRowID; got != "" {
+		t.Fatalf("public vehicle sighting liveRowId = %q, want empty", got)
+	}
+	if !strings.HasPrefix(visible.VehicleSightings[0].ID, "vehicle-report:pub-") || strings.Contains(visible.VehicleSightings[0].ID, item.ID) {
+		t.Fatalf("public vehicle sighting ID = %q, want non-raw public ID for %q", visible.VehicleSightings[0].ID, item.ID)
+	}
+
+	incidents, err := svc.ListActiveIncidents(ctx, &model.Catalog{}, now.Add(time.Minute), 0, 20)
+	if err != nil {
+		t.Fatalf("ListActiveIncidents() error = %v", err)
+	}
+	if len(incidents) != 1 || incidents[0].Vehicle == nil {
+		t.Fatalf("incidents = %+v, want vehicle incident", incidents)
+	}
+	if incidents[0].SubjectID != "" || incidents[0].Vehicle.ScopeKey != "" || incidents[0].Vehicle.LiveRowID != "" {
+		t.Fatalf("public vehicle incident exposes raw keys: subjectID=%q vehicle=%+v", incidents[0].SubjectID, incidents[0].Vehicle)
+	}
+}
+
+func TestPublicStopSightingsUseOpaquePublicIDs(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore() error = %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	svc := NewService(st, 3*time.Minute, 90*time.Second, 30*time.Minute)
+	now := time.Date(2026, 3, 10, 14, 0, 0, 0, time.UTC)
+	result, item, err := svc.SubmitStopSighting(ctx, 5, "3012", now)
+	if err != nil || !result.Accepted {
+		t.Fatalf("SubmitStopSighting() = %+v, err=%v", result, err)
+	}
+
+	visible, err := svc.VisibleSightings(ctx, &model.Catalog{}, "", now.Add(time.Minute), 20)
+	if err != nil {
+		t.Fatalf("VisibleSightings() error = %v", err)
+	}
+	if len(visible.StopSightings) != 1 {
+		t.Fatalf("visible.StopSightings = %+v, want 1", visible.StopSightings)
+	}
+	if !strings.HasPrefix(visible.StopSightings[0].ID, "stop-report:pub-") || strings.Contains(visible.StopSightings[0].ID, item.ID) {
+		t.Fatalf("public stop sighting ID = %q, want non-raw public ID for %q", visible.StopSightings[0].ID, item.ID)
 	}
 }
 
@@ -245,6 +327,11 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 	if result.IncidentID != AreaIncidentID(item.ScopeKey) {
 		t.Fatalf("IncidentID = %q, want %q", result.IncidentID, AreaIncidentID(item.ScopeKey))
 	}
+	for _, fragment := range []string{"56950", "24110", "kontrole"} {
+		if strings.Contains(result.IncidentID, fragment) {
+			t.Fatalf("IncidentID = %q exposes area fragment %q", result.IncidentID, fragment)
+		}
+	}
 
 	visible, err := svc.VisibleSightings(ctx, &model.Catalog{}, "", now.Add(time.Minute), 20)
 	if err != nil {
@@ -252,6 +339,12 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 	}
 	if len(visible.AreaReports) != 1 || visible.AreaReports[0].RadiusMeters != 500 {
 		t.Fatalf("visible.AreaReports = %+v, want capped report", visible.AreaReports)
+	}
+	if !strings.HasPrefix(visible.AreaReports[0].ID, "area-report:pub-") || strings.Contains(visible.AreaReports[0].ID, item.ID) {
+		t.Fatalf("visible.AreaReports[0].ID = %q, want non-raw public area report id for %q", visible.AreaReports[0].ID, item.ID)
+	}
+	if visible.AreaReports[0].Latitude != 56.95 || visible.AreaReports[0].Longitude != 24.11 {
+		t.Fatalf("visible area coordinates = (%f,%f), want public-rounded coordinates", visible.AreaReports[0].Latitude, visible.AreaReports[0].Longitude)
 	}
 	filtered, err := svc.VisibleSightings(ctx, &model.Catalog{}, "3012", now.Add(time.Minute), 20)
 	if err != nil {
@@ -271,6 +364,12 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 	if incidents[0].Area.Description != "kontrole starp pieturām pie tuneļa" {
 		t.Fatalf("Area.Description = %q", incidents[0].Area.Description)
 	}
+	if incidents[0].SubjectID != "" || incidents[0].Area.ScopeKey != "" {
+		t.Fatalf("area incident exposes scope keys: SubjectID=%q Area.ScopeKey=%q", incidents[0].SubjectID, incidents[0].Area.ScopeKey)
+	}
+	if incidents[0].Area.Latitude != 56.95 || incidents[0].Area.Longitude != 24.11 {
+		t.Fatalf("incident area coordinates = (%f,%f), want public-rounded coordinates", incidents[0].Area.Latitude, incidents[0].Area.Longitude)
+	}
 	if incidents[0].Votes.UserValue != model.IncidentVoteOngoing {
 		t.Fatalf("Votes.UserValue = %q, want ONGOING", incidents[0].Votes.UserValue)
 	}
@@ -278,7 +377,7 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 
 func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	ctx := context.Background()
-	now := time.Date(2026, 4, 30, 15, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 4, 30, 15, 0, 0, 123456789, time.UTC)
 	st := &publicReadModelStoreStub{
 		sightings: model.VisibleSightings{
 			StopSightings: []model.PublicStopSighting{{
@@ -294,6 +393,7 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 				Scope:        "stop",
 				SubjectName:  "Centraltirgus",
 				LastReportAt: now.Add(-time.Minute),
+				LastReporter: "Amber Scout 171",
 				Active:       true,
 			},
 			{
@@ -301,6 +401,7 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 				Scope:        "stop",
 				SubjectName:  "Old",
 				LastReportAt: now.Add(-2 * time.Minute),
+				LastReporter: "Amber Scout 172",
 				Resolved:     true,
 			},
 		},
@@ -310,7 +411,26 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 				Scope:        "stop",
 				SubjectName:  "Centraltirgus",
 				LastReportAt: now.Add(-time.Minute),
+				LastReporter: "Amber Scout 171",
 				Active:       true,
+			},
+			Events: []model.IncidentEvent{
+				{
+					ID:        "event-private",
+					Kind:      "vote",
+					Name:      "Kontrole",
+					Nickname:  "Amber Scout 173",
+					CreatedAt: now.Add(-time.Minute),
+				},
+			},
+			Comments: []model.IncidentComment{
+				{
+					ID:         "comment-private",
+					IncidentID: "stop:3012",
+					Nickname:   "Amber Scout 174",
+					Body:       "vēl stāv",
+					CreatedAt:  now.Add(-30 * time.Second),
+				},
 			},
 		},
 	}
@@ -337,6 +457,12 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	if len(active) != 2 {
 		t.Fatalf("len(active) = %d, want 2", len(active))
 	}
+	if active[0].LastReporter != publicIncidentActorLabel || active[1].LastReporter != publicIncidentActorLabel {
+		t.Fatalf("active reporters = %q, %q; want public labels", active[0].LastReporter, active[1].LastReporter)
+	}
+	if active[0].LastReportAt.Nanosecond() != 0 {
+		t.Fatalf("active[0].LastReportAt = %s, want second-granularity public timestamp", active[0].LastReportAt.Format(time.RFC3339Nano))
+	}
 
 	mapVisible, err := svc.ListMapVisibleIncidents(ctx, &model.Catalog{}, now, 77)
 	if err != nil {
@@ -348,6 +474,9 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	if len(mapVisible) != 1 || mapVisible[0].ID != "stop:3012" {
 		t.Fatalf("mapVisible = %+v, want only unresolved public incident", mapVisible)
 	}
+	if mapVisible[0].LastReporter != publicIncidentActorLabel {
+		t.Fatalf("mapVisible[0].LastReporter = %q, want public label", mapVisible[0].LastReporter)
+	}
 
 	detail, err := svc.IncidentDetail(ctx, &model.Catalog{}, " stop:3012 ", now, 77)
 	if err != nil {
@@ -358,6 +487,24 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	}
 	if detail.Summary.ID != "stop:3012" {
 		t.Fatalf("IncidentDetail() = %+v, want public detail", detail)
+	}
+	if detail.Summary.LastReporter != publicIncidentActorLabel {
+		t.Fatalf("detail.Summary.LastReporter = %q, want public label", detail.Summary.LastReporter)
+	}
+	if detail.Summary.LastReportAt.Nanosecond() != 0 {
+		t.Fatalf("detail.Summary.LastReportAt = %s, want second-granularity public timestamp", detail.Summary.LastReportAt.Format(time.RFC3339Nano))
+	}
+	if len(detail.Events) != 1 || detail.Events[0].Nickname != publicIncidentActorLabel {
+		t.Fatalf("detail.Events = %+v, want public labels", detail.Events)
+	}
+	if detail.Events[0].CreatedAt.Nanosecond() != 0 {
+		t.Fatalf("detail.Events[0].CreatedAt = %s, want second-granularity public timestamp", detail.Events[0].CreatedAt.Format(time.RFC3339Nano))
+	}
+	if len(detail.Comments) != 1 || detail.Comments[0].Nickname != publicIncidentActorLabel {
+		t.Fatalf("detail.Comments = %+v, want public labels", detail.Comments)
+	}
+	if detail.Comments[0].CreatedAt.Nanosecond() != 0 {
+		t.Fatalf("detail.Comments[0].CreatedAt = %s, want second-granularity public timestamp", detail.Comments[0].CreatedAt.Format(time.RFC3339Nano))
 	}
 }
 

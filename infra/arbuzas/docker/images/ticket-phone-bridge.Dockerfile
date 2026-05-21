@@ -8,6 +8,5 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY infra/arbuzas/docker/images/ticket-phone-bridge-loop.sh /usr/local/bin/ticket-phone-bridge-loop
-COPY infra/arbuzas/docker/images/ticket-android-sim-tune-loop.sh /usr/local/bin/ticket-android-sim-tune-loop
 
 CMD ["/usr/local/bin/ticket-phone-bridge-loop"]

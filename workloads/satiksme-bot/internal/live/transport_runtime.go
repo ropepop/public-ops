@@ -140,7 +140,10 @@ func RunTransportSnapshotLoop(ctx context.Context, settings TransportRuntimeSett
 			graceUntil = now.Add(settings.ViewerGracePeriod)
 		}
 		hadActiveViewers = activeViewers > 0
-		shouldPoll := startupRefresh || activeViewers > 0 || (!graceUntil.IsZero() && now.Before(graceUntil))
+		// Public map clients consume static snapshot files anonymously and may not
+		// write viewer heartbeats. Keep the file snapshot warm whenever this runtime
+		// is enabled; viewer activity still shortens polling back to the base interval.
+		shouldPoll := settings.Publisher.Enabled() || startupRefresh || activeViewers > 0 || (!graceUntil.IsZero() && now.Before(graceUntil))
 		if !shouldPoll {
 			resetTimer(settings.IdleCheckInterval)
 			continue

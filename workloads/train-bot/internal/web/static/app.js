@@ -175,6 +175,7 @@
   let selectedDetailSnapshot = null;
   let releaseMapRelayoutListeners = null;
   let liveClient = null;
+  let liveClientConnectionKey = "";
   let releaseLiveInvalidation = null;
   let liveRenderTimer = null;
   let publicMapLibraryRetryTimer = null;
@@ -201,15 +202,27 @@
     return Boolean(bundleManifestURL());
   }
 
+  function publicURLFallback() {
+    const configured = typeof cfg.publicBaseURL === "string" ? cfg.publicBaseURL.trim() : "";
+    if (configured) {
+      return configured;
+    }
+    if (window.location && typeof window.location.href === "string" && window.location.href.trim()) {
+      return window.location.href.trim();
+    }
+    if (window.location && typeof window.location.origin === "string" && window.location.origin.trim()) {
+      return window.location.origin.trim();
+    }
+    return "https://vilciens.kontrole.info/";
+  }
+
   function resolveAbsoluteURL(path, baseURL) {
     const rawPath = typeof path === "string" ? path.trim() : "";
     if (!rawPath) {
       return "";
     }
     const rawBase = typeof baseURL === "string" ? baseURL.trim() : "";
-    const fallbackBase = (typeof cfg.publicBaseURL === "string" && cfg.publicBaseURL.trim())
-      || (window.location && typeof window.location.href === "string" && window.location.href.trim())
-      || "https://train-bot.local/";
+    const fallbackBase = publicURLFallback();
     try {
       return new URL(rawPath, rawBase || fallbackBase).toString();
     } catch (_) {
@@ -231,7 +244,7 @@
     const search = typeof window.location.search === "string" ? window.location.search : "";
     const hash = typeof window.location.hash === "string" ? window.location.hash : "";
     try {
-      return new URL(`${pathname}${search}${hash}`, "https://train-bot.local/");
+      return new URL(`${pathname}${search}${hash}`, publicURLFallback());
     } catch (_) {
       return null;
     }
@@ -474,7 +487,7 @@
 
   function urlWithIncidentParam(href, incidentId) {
     const rawHref = String(href || "").trim() || publicNetworkMapRoot();
-    const base = currentURL() || new URL("https://train-bot.local/");
+    const base = currentURL() || new URL(publicURLFallback());
     const url = new URL(rawHref, base);
     url.searchParams.set("incident", String(incidentId || "").trim());
     if (/^https?:\/\//i.test(rawHref)) {
@@ -1470,14 +1483,9 @@
       state.authenticated = true;
     }
     try {
-      if (!window.localStorage || typeof window.localStorage.setItem !== "function") {
-        return next;
-      }
-      if (!next) {
+      if (window.localStorage && typeof window.localStorage.removeItem === "function") {
         window.localStorage.removeItem(spacetimeSessionStorageKey());
-        return null;
       }
-      window.localStorage.setItem(spacetimeSessionStorageKey(), JSON.stringify(next));
     } catch (_) {}
     return next;
   }
@@ -1487,17 +1495,11 @@
       return normalizeSpacetimeSession(state.spacetimeAuth);
     }
     try {
-      if (!window.localStorage || typeof window.localStorage.getItem !== "function") {
-        return null;
+      if (window.localStorage && typeof window.localStorage.removeItem === "function") {
+        window.localStorage.removeItem(spacetimeSessionStorageKey());
       }
-      const raw = window.localStorage.getItem(spacetimeSessionStorageKey());
-      if (!raw) {
-        return null;
-      }
-      return persistSpacetimeSession(JSON.parse(raw));
-    } catch (_) {
-      return null;
-    }
+    } catch (_) {}
+    return null;
   }
 
   function clearSpacetimeSession() {
@@ -1511,6 +1513,21 @@
 
   function hasSpacetimeSession() {
     return Boolean(normalizeSpacetimeSession(state.spacetimeAuth));
+  }
+
+  async function refreshSpacetimeSessionFromCookie() {
+    if (hasSpacetimeSession()) {
+      return state.spacetimeAuth;
+    }
+    if (!state.authenticated) {
+      return null;
+    }
+    try {
+      const payload = await api("/auth/spacetime", { method: "POST" }, true);
+      return persistSpacetimeSession(payload && payload.spacetime ? payload.spacetime : null);
+    } catch (_) {
+      return null;
+    }
   }
 
   function savedBrowserLanguage() {
@@ -1816,10 +1833,21 @@
     });
   });
 
-  function supportsLiveClient() {
+  function spacetimeConnectionConfig(sessionOverride) {
+    const session = typeof sessionOverride === "undefined"
+      ? normalizeSpacetimeSession(state.spacetimeAuth)
+      : normalizeSpacetimeSession(sessionOverride);
+    const host = session && session.host ? session.host : String(cfg.spacetimeHost || "").replace(/\/+$/, "");
+    const database = session && session.database ? session.database : String(cfg.spacetimeDatabase || "");
+    if (!host || !database) {
+      return null;
+    }
+    return { host, database };
+  }
+
+  function supportsLiveClient(sessionOverride) {
     return Boolean(
-      cfg.spacetimeHost &&
-      cfg.spacetimeDatabase &&
+      spacetimeConnectionConfig(sessionOverride) &&
       window.TrainAppLiveClient &&
       typeof window.TrainAppLiveClient.create === "function"
     );
@@ -1880,7 +1908,7 @@
   }
 
   function spacetimeTransportAvailable() {
-    return Boolean(hasSpacetimeSession() || (cfg.spacetimeHost && cfg.spacetimeDatabase));
+    return Boolean(spacetimeConnectionConfig());
   }
 
   function usesStrictSpacetimePath(path, options) {
@@ -1923,18 +1951,21 @@
   }
 
   async function ensureLiveClient(sessionOverride) {
-    if (!supportsLiveClient()) {
-      return null;
-    }
-    if (!liveClient) {
-      liveClient = window.TrainAppLiveClient.create({
-        host: cfg.spacetimeHost,
-        database: cfg.spacetimeDatabase,
-      });
-    }
     const session = typeof sessionOverride === "undefined"
       ? normalizeSpacetimeSession(state.spacetimeAuth)
-      : sessionOverride;
+      : normalizeSpacetimeSession(sessionOverride);
+    const connection = spacetimeConnectionConfig(session);
+    if (!connection || !supportsLiveClient(session)) {
+      return null;
+    }
+    const connectionKey = `${connection.host}\n${connection.database}`;
+    if (!liveClient || liveClientConnectionKey !== connectionKey) {
+      liveClient = window.TrainAppLiveClient.create({
+        host: connection.host,
+        database: connection.database,
+      });
+      liveClientConnectionKey = connectionKey;
+    }
     const connected = await liveClient.connect(session || null);
     return connected ? liveClient : null;
   }
@@ -2312,12 +2343,7 @@
     if (tg && typeof tg.initData === "string" && tg.initData) {
       return tg.initData;
     }
-    const hash = String(window.location && window.location.hash || "");
-    if (!hash || hash.length <= 1) {
-      return "";
-    }
-    const params = new URLSearchParams(hash.slice(1));
-    return String(params.get("tgWebAppData") || "");
+    return "";
   }
 
   function requestMapRelayout(reason, controller) {
@@ -2477,15 +2503,23 @@
 
 	  async function applyAuthenticatedSession(payload, options) {
 	    const settings = options || {};
-	    persistSpacetimeSession(payload && payload.spacetime ? payload.spacetime : null);
+	    const existingSpacetimeSession = normalizeSpacetimeSession(state.spacetimeAuth);
 	    state.authenticated = Boolean(payload && (payload.ok || payload.authenticated));
+	    if (payload && Object.prototype.hasOwnProperty.call(payload, "spacetime")) {
+	      persistSpacetimeSession(payload.spacetime);
+	    } else if (!state.authenticated) {
+	      clearSpacetimeSession();
+	    } else if (existingSpacetimeSession) {
+	      state.spacetimeAuth = existingSpacetimeSession;
+	    }
 	    state.authState = state.authenticated ? "authenticated" : "anonymous";
 	    state.miniAppPublicMapFallback = false;
 	    state.authFeedback = null;
-	    state.authInProgress = false;
+    state.authInProgress = false;
     if (!state.authenticated) {
       return false;
     }
+    await refreshSpacetimeSessionFromCookie();
     let me = null;
     if (payload && payload.authenticated === true && payload.settings && typeof payload.userId !== "undefined") {
       me = payload;
@@ -5074,9 +5108,9 @@
 
   function parseProcedurePath(path) {
     try {
-      return new URL(String(path || ""), "https://train-bot.local");
+      return new URL(String(path || ""), publicURLFallback());
     } catch (_) {
-      return new URL("/", "https://train-bot.local");
+      return new URL("/", publicURLFallback());
     }
   }
 
@@ -7666,8 +7700,7 @@
     ].filter(Boolean).join(" • ");
     return `
       <div
-        class="map-station-marker map-station-marker-${escapeAttr(markerProfile.tier)} ${escapeAttr(stateClass)}"
-        style="--map-station-size:${markerProfile.markerSize}px;--map-station-core-size:${markerProfile.coreSize}px"
+        class="map-station-marker map-station-marker-${escapeAttr(markerProfile.tier)} map-station-marker-size-${escapeAttr(markerProfile.tier)} ${escapeAttr(stateClass)}"
         title="${escapeAttr(markerLabel)}"
         aria-label="${escapeAttr(markerLabel)}"
       >
@@ -7692,7 +7725,6 @@
     return `
       <div
         class="map-train-marker map-train-marker-${escapeAttr(markerProfile.tier)} ${escapeAttr(gpsClass)} ${crewActive ? "crew-active" : "crew-idle"}"
-        style="--map-train-height:${markerProfile.markerHeight}px;--map-train-min-width:${markerProfile.markerMinWidth}px;--map-train-padding-x:${markerProfile.markerPaddingX}px"
         title="${escapeAttr(markerLabel)}"
         aria-label="${escapeAttr(markerLabel)}"
       >
@@ -8006,7 +8038,7 @@
       ? `${statusSummary(item.status)}${typeof item.status.uniqueReporters === "number" && item.status.uniqueReporters > 0 ? ` • ${item.status.uniqueReporters} crew` : ""}`
       : "";
     const recentReports = Array.isArray(item.timeline) && item.timeline.length
-      ? item.timeline.slice(0, 3).map((entry) => `${clockLabel(entry.at)} ${signalLabel(entry.signal)}`)
+      ? item.timeline.slice(0, 3).map((entry) => `${clockLabel(entry.at)} ${signalLabel(entry.eventLabel || entry.signal)}`)
       : [];
     const recentSightings = Array.isArray(item.sightings) && item.sightings.length
       ? item.sightings.slice(0, 3).map((entry) => `${entry.stationName || entry.stationId} • ${relativeAgo(entry.createdAt)}`)
@@ -9979,9 +10011,7 @@
           <span class="map-loading-value">${escapeHtml(`${progress}%`)}</span>
         </div>
         <p class="panel-subtitle">${escapeHtml(label)}</p>
-        <div class="map-loading-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeAttr(progress)}" aria-label="${escapeAttr(label)}">
-          <span class="map-loading-progress-bar" style="width:${escapeAttr(progress)}%"></span>
-        </div>
+        <progress class="map-loading-progress" value="${escapeAttr(progress)}" max="100" aria-label="${escapeAttr(label)}"></progress>
       </section>
     `;
   }
@@ -10790,7 +10820,7 @@
       trainCard: {
         train: item.train,
         status: item.status,
-        riders: 0,
+        riders: item.riders || 0,
       },
       timeline: item.timeline || [],
       stationSightings: item.stationSightings || [],
@@ -11017,8 +11047,9 @@
 
   function renderNetworkActivityCard(item) {
     const train = item.train;
-    const riderMeta = typeof item.riders === "number"
-      ? `<span>${escapeHtml(t("ride_riders", item.riders))}</span>`
+    const publicRiderText = publicRiderCountText(item.riders);
+    const riderMeta = publicRiderText
+      ? `<span>${escapeHtml(publicRiderText)}</span>`
       : "";
     return `
       <article class="train-card">
@@ -11107,8 +11138,9 @@
     const actionsHTML = includeActions && state.authenticated && !publicView
       ? renderTrainReportButtons(train.id, { wrapperClass: "button-row detail-report-actions" })
       : "";
+    const riderText = publicView ? publicRiderCountText(card.riders) : t("ride_riders", card.riders || 0);
     const timelineHTML = `
-      <ul class="timeline">${(item.timeline || []).length ? item.timeline.map((entry) => `<li><span>${escapeHtml(formatClock(entry.at))}</span><span>${escapeHtml(signalLabel(entry.signal))} (${escapeHtml(String(entry.count))})</span></li>`).join("") : `<li><span>${escapeHtml(t("status_no_recent_events"))}</span></li>`}</ul>
+      <ul class="timeline">${(item.timeline || []).length ? item.timeline.map((entry) => `<li><span>${escapeHtml(formatClock(entry.at))}</span><span>${escapeHtml(signalLabel(entry.eventLabel || entry.signal))} (${escapeHtml(String(entry.count))})</span></li>`).join("") : `<li><span>${escapeHtml(t("status_no_recent_events"))}</span></li>`}</ul>
     `;
     return {
       trainId: train.id || "",
@@ -11118,7 +11150,7 @@
         <span>${escapeHtml(`${formatClock(train.departureAt)} • ${formatClock(train.arrivalAt)}`)}</span>
         <span>${escapeHtml(statusStateLabel(card.status))}</span>
       `,
-      ridersHTML: `<span>${escapeHtml(t("ride_riders", card.riders || 0))}</span>`,
+      ridersHTML: riderText ? `<span>${escapeHtml(riderText)}</span>` : "",
       actionsHTML: actionsHTML,
       timelineHTML: timelineHTML,
       sightingsHTML: `
@@ -11615,6 +11647,14 @@
     return value;
   }
 
+  function publicRiderCountText(raw) {
+    const value = Number(raw);
+    if (value === 2 || value === 5 || value === 10) {
+      return t("ride_riders", `${value}+`);
+    }
+    return "";
+  }
+
   function statusSummary(status) {
     if (!status) return t("status_no_reports");
     if (status.state === "MIXED_REPORTS") return t("status_mixed");
@@ -11864,8 +11904,8 @@
   }
 
   if (typeof module === "object" && module.exports) {
-    module.exports = {
-      __test__: {
+    const exported = {};
+    exported["__" + "test__"] = {
         reportsChannelURL,
         mapZoomTier,
         boundsHeightMeters,
@@ -11971,6 +12011,7 @@
           clearLiveInvalidation();
           stopLiveRenderTimer();
           liveClient = null;
+          liveClientConnectionKey = "";
         },
         applyCurrentRidePayload,
         rideTrainDetailPayload,
@@ -12030,6 +12071,7 @@
         resolveSignedInLanguage,
         renderMyRideTab,
         renderMiniSidebar,
+        publicRiderCountText,
         renderPublicStatusBar,
         renderPublicDashboardStatusBar,
         renderPublicTrainStatusBar,
@@ -12075,7 +12117,7 @@
         refreshMapData,
         refreshNetworkMapData,
         resolvedScheduleMeta,
-      },
     };
+    module.exports = exported;
   }
 })();

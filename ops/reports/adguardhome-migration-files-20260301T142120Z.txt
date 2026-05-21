@@ -1,1 +1,0 @@
-/data/local/pixel-stack/chroots/adguardhome/etc/pixel-stack/remote-dns/state/pihole-migration-payload.json

@@ -40,7 +40,6 @@ func newSpacetimeTokenIssuer(cfg config.Config) (*spacetimeTokenIssuer, error) {
 			"given_name",
 			"language",
 			"roles",
-			"smoke",
 		},
 		TokenIDPrefix: "satiksme",
 	}, "satiksme web Spacetime private key")
@@ -64,7 +63,7 @@ func (i *spacetimeTokenIssuer) jwks() map[string]any {
 
 func (s *Server) handleSpacetimeOpenIDConfiguration(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -77,7 +76,7 @@ func (s *Server) handleSpacetimeOpenIDConfiguration(w http.ResponseWriter, r *ht
 
 func (s *Server) handleSpacetimeJWKS(w http.ResponseWriter, r *http.Request) {
 	s.setNoStoreHeaders(w)
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}

@@ -320,6 +320,26 @@ func (s *RoutedStore) ListIncidentComments(ctx context.Context, incidentID strin
 	return s.state.ListIncidentComments(ctx, incidentID, limit)
 }
 
+func (s *RoutedStore) CountIncidentCommentsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	type counter interface {
+		CountIncidentCommentsByUserSince(context.Context, int64, time.Time) (int, error)
+	}
+	if state, ok := s.state.(counter); ok {
+		return state.CountIncidentCommentsByUserSince(ctx, userID, since)
+	}
+	return 0, nil
+}
+
+func (s *RoutedStore) CountIncidentCommentsByIncidentSince(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	type counter interface {
+		CountIncidentCommentsByIncidentSince(context.Context, string, time.Time) (int, error)
+	}
+	if state, ok := s.state.(counter); ok {
+		return state.CountIncidentCommentsByIncidentSince(ctx, incidentID, since)
+	}
+	return 0, nil
+}
+
 func (s *RoutedStore) CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (CleanupResult, error) {
 	if s.schedule == s.state {
 		return s.schedule.CleanupExpired(ctx, now, retention, loc)

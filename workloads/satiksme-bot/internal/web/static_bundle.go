@@ -23,6 +23,28 @@ type staticBundleSync interface {
 	PublishCatalogBundle(ctx context.Context, snapshot spacetime.BundleSnapshot) error
 }
 
+type publicBundleStop struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Latitude    float64  `json:"latitude"`
+	Longitude   float64  `json:"longitude"`
+	Modes       []string `json:"modes"`
+	RouteLabels []string `json:"routeLabels"`
+}
+
+type publicBundleRoute struct {
+	Label   string   `json:"label"`
+	Mode    string   `json:"mode"`
+	Name    string   `json:"name"`
+	StopIDs []string `json:"stopIds"`
+}
+
+type publicCatalogPayload struct {
+	GeneratedAt time.Time           `json:"generatedAt"`
+	Stops       []publicBundleStop  `json:"stops"`
+	Routes      []publicBundleRoute `json:"routes"`
+}
+
 type staticBundleManifest struct {
 	Version          string               `json:"version"`
 	GeneratedAt      string               `json:"generatedAt"`
@@ -95,11 +117,13 @@ func (p *StaticBundlePublisher) PublishCatalog(ctx context.Context, catalog *mod
 	if !p.Enabled() || catalog == nil {
 		return nil, nil
 	}
-	stopsBody, err := json.Marshal(catalog.Stops)
+	publicStops := publicBundleStops(catalog.Stops)
+	publicRoutes := publicBundleRoutes(catalog.Routes)
+	stopsBody, err := json.Marshal(publicStops)
 	if err != nil {
 		return nil, fmt.Errorf("marshal bundle stops: %w", err)
 	}
-	routesBody, err := json.Marshal(catalog.Routes)
+	routesBody, err := json.Marshal(publicRoutes)
 	if err != nil {
 		return nil, fmt.Errorf("marshal bundle routes: %w", err)
 	}
@@ -157,6 +181,9 @@ func (p *StaticBundlePublisher) PublishCatalog(ctx context.Context, catalog *mod
 	if err := writeJSONFile(filepath.Join(p.dir, "active.json"), append(activeBody, '\n')); err != nil {
 		return nil, err
 	}
+	if err := removeOldStaticBundleVersions(filepath.Join(p.dir, "bundles"), manifest.Version); err != nil {
+		return nil, err
+	}
 	if p.syncer != nil {
 		if err := p.syncer.PublishCatalogBundle(ctx, spacetime.BundleSnapshot{
 			Version:     manifest.Version,
@@ -168,6 +195,45 @@ func (p *StaticBundlePublisher) PublishCatalog(ctx context.Context, catalog *mod
 		}
 	}
 	return manifest, nil
+}
+
+func publicBundleStops(stops []model.Stop) []publicBundleStop {
+	out := make([]publicBundleStop, 0, len(stops))
+	for _, stop := range stops {
+		out = append(out, publicBundleStop{
+			ID:          stop.ID,
+			Name:        stop.Name,
+			Latitude:    stop.Latitude,
+			Longitude:   stop.Longitude,
+			Modes:       append([]string(nil), stop.Modes...),
+			RouteLabels: append([]string(nil), stop.RouteLabels...),
+		})
+	}
+	return out
+}
+
+func publicBundleRoutes(routes []model.Route) []publicBundleRoute {
+	out := make([]publicBundleRoute, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, publicBundleRoute{
+			Label:   route.Label,
+			Mode:    route.Mode,
+			Name:    route.Name,
+			StopIDs: append([]string(nil), route.StopIDs...),
+		})
+	}
+	return out
+}
+
+func publicCatalog(catalog *model.Catalog) publicCatalogPayload {
+	if catalog == nil {
+		return publicCatalogPayload{}
+	}
+	return publicCatalogPayload{
+		GeneratedAt: publicTimestamp(catalog.GeneratedAt),
+		Stops:       publicBundleStops(catalog.Stops),
+		Routes:      publicBundleRoutes(catalog.Routes),
+	}
 }
 
 func (s *staticBundleStore) activeState() (*staticBundleActiveState, error) {
@@ -213,6 +279,29 @@ func (s *staticBundleStore) invalidate() {
 func writeJSONFile(path string, body []byte) error {
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+func removeOldStaticBundleVersions(parentDir string, activeVersion string) error {
+	activeVersion = strings.TrimSpace(activeVersion)
+	if strings.TrimSpace(parentDir) == "" || activeVersion == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read static bundle versions: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == activeVersion {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(parentDir, entry.Name())); err != nil {
+			return fmt.Errorf("remove old static bundle version %s: %w", entry.Name(), err)
+		}
 	}
 	return nil
 }

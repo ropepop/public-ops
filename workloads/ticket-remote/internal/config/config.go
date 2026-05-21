@@ -10,8 +10,12 @@ import (
 	"time"
 
 	"ticketremote/internal/auth"
+	"ticketremote/internal/phone"
 	"ticketremote/internal/state"
 )
+
+const defaultOIDCIssuer = "https://auth.spacetimedb.com/oidc"
+const defaultNoViewerStopDelay = 8 * time.Second
 
 type Config struct {
 	BindAddr            string
@@ -26,13 +30,13 @@ type Config struct {
 	Access              auth.AccessConfig
 	State               state.StoreConfig
 	Phone               PhoneConfig
-	SimulatorSetup      SimulatorSetupConfig
 }
 
 type PhoneConfig struct {
 	BackendID         string
 	AttachName        string
 	BaseURL           string
+	BrokerBaseURL     string
 	Backends          []PhoneBackend
 	DefaultBackendID  string
 	ActiveBackendFile string
@@ -48,11 +52,16 @@ type PhoneBackend struct {
 	BaseURL    string `json:"baseUrl"`
 }
 
-type SimulatorSetupConfig struct {
-	BackendID string
-	ADBTarget string
-	ADBPath   string
-	Timeout   time.Duration
+func (cfg PhoneConfig) RelayConfig() phone.RelayConfig {
+	return phone.RelayConfig{
+		BackendID:         cfg.BackendID,
+		AttachName:        cfg.AttachName,
+		BaseURL:           cfg.BaseURL,
+		RequestTimeout:    cfg.RequestTimeout,
+		ReconnectMinDelay: cfg.ReconnectMinDelay,
+		ReconnectMaxDelay: cfg.ReconnectMaxDelay,
+		NoViewerStopDelay: cfg.NoViewerStopDelay,
+	}
 }
 
 func Load() (Config, error) {
@@ -84,40 +93,37 @@ func Load() (Config, error) {
 		Port:                getenvInt("TICKET_REMOTE_PORT", 9338),
 		Production:          getenvBool("TICKET_REMOTE_PRODUCTION", false),
 		PublicBaseURL:       strings.TrimRight(getenv("TICKET_REMOTE_PUBLIC_BASE_URL", "https://ticket.jolkins.id.lv"), "/"),
-		TicketID:            getenv("TICKET_REMOTE_TICKET_ID", "vivi-default"),
-		TicketDisplayName:   getenv("TICKET_REMOTE_TICKET_DISPLAY_NAME", "ViVi timed ticket"),
+		TicketID:            getenv("TICKET_REMOTE_TICKET_ID", state.DefaultTicketID),
+		TicketDisplayName:   getenv("TICKET_REMOTE_TICKET_DISPLAY_NAME", state.DefaultTicketName),
 		BootstrapAdminEmail: normalizeEmail(getenv("TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL", "ticket@jolkins.id.lv")),
 		CookieName:          getenv("TICKET_REMOTE_COOKIE_NAME", "ticket_remote_session"),
 		CookieTTL:           getenvDuration("TICKET_REMOTE_COOKIE_TTL", 30*24*time.Hour),
 		Access: auth.AccessConfig{
-			Mode:     getenv("TICKET_REMOTE_AUTH_MODE", "spacetime"),
-			DevEmail: normalizeEmail(getenv("TICKET_REMOTE_DEV_EMAIL", "ticket@jolkins.id.lv")),
-			HTTPTimeout: getenvDuration(
-				"TICKET_REMOTE_AUTH_HTTP_TIMEOUT",
-				10*time.Second,
-			),
+			Mode:              getenv("TICKET_REMOTE_AUTH_MODE", "spacetime"),
+			DevEmail:          normalizeEmail(getenv("TICKET_REMOTE_DEV_EMAIL", "ticket@jolkins.id.lv")),
+			HTTPTimeout:       getenvDuration("TICKET_REMOTE_AUTH_HTTP_TIMEOUT", auth.DefaultHTTPTimeout),
 			AuthCookieName:    getenv("TICKET_REMOTE_AUTH_COOKIE_NAME", "ticket_remote_auth"),
 			SessionSigningKey: getenv("TICKET_REMOTE_SESSION_SIGNING_KEY", ""),
 			TeamDomain:        strings.TrimRight(getenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", ""), "/"),
 			Audience:          getenv("TICKET_REMOTE_CF_ACCESS_AUDIENCE", ""),
-			OIDCIssuer:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
+			OIDCIssuer:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", defaultOIDCIssuer), "/"),
 			OIDCClientID:      getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
 			OIDCScope:         getenv("TICKET_REMOTE_SPACETIME_AUTH_SCOPE", "openid profile email"),
 			OIDCRedirect:      strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL", ""), "/"),
 		},
 		State: state.StoreConfig{
 			Backend:              getenv("TICKET_REMOTE_STATE_BACKEND", "auto"),
-			TicketID:             getenv("TICKET_REMOTE_TICKET_ID", "vivi-default"),
+			TicketID:             getenv("TICKET_REMOTE_TICKET_ID", state.DefaultTicketID),
 			SpacetimeHost:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_HOST", "https://maincloud.spacetimedb.com"), "/"),
 			SpacetimeDatabase:    getenv("TICKET_REMOTE_SPACETIME_DATABASE", ""),
 			SpacetimeBearerToken: getenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", ""),
-			SpacetimeIssuer:      getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", "ticket-remote-runtime"),
-			SpacetimeAudience:    getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", "spacetimedb"),
+			SpacetimeIssuer:      getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", state.DefaultSpacetimeIssuer),
+			SpacetimeAudience:    getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", state.DefaultSpacetimeAudience),
 			SpacetimeKeyFile:     getenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", ""),
-			ServiceSubject:       getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", "service:ticket-remote"),
-			ServiceRoles:         splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", "ticketremote_service")),
-			TokenTTL:             getenvDuration("TICKET_REMOTE_SPACETIME_TOKEN_TTL", 5*time.Minute),
-			HTTPTimeout:          getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", 10*time.Second),
+			ServiceSubject:       getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", state.DefaultSpacetimeServiceSubject),
+			ServiceRoles:         splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", state.DefaultSpacetimeServiceRole)),
+			TokenTTL:             getenvDuration("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
+			HTTPTimeout:          getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", state.DefaultSpacetimeHTTPTimeout),
 			AuthIssuer:           strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
 			AuthAudience:         getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
 		},
@@ -125,19 +131,14 @@ func Load() (Config, error) {
 			BackendID:         activePhone.ID,
 			AttachName:        activePhone.AttachName,
 			BaseURL:           activePhone.BaseURL,
+			BrokerBaseURL:     strings.TrimRight(getenv("TICKET_REMOTE_PHONE_BROKER_URL", ""), "/"),
 			Backends:          phoneBackends,
 			DefaultBackendID:  defaultPhoneID,
 			ActiveBackendFile: activeBackendFile,
-			RequestTimeout:    getenvDuration("TICKET_REMOTE_PHONE_REQUEST_TIMEOUT", 10*time.Second),
-			ReconnectMinDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MIN_DELAY", 500*time.Millisecond),
-			ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", 5*time.Second),
-			NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", 20*time.Second),
-		},
-		SimulatorSetup: SimulatorSetupConfig{
-			BackendID: getenv("TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID", "android-sim"),
-			ADBTarget: getenv("TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET", "ticket_android_sim:5555"),
-			ADBPath:   getenv("TICKET_REMOTE_SIMULATOR_SETUP_ADB_PATH", "adb"),
-			Timeout:   getenvDuration("TICKET_REMOTE_SIMULATOR_SETUP_TIMEOUT", 8*time.Second),
+			RequestTimeout:    getenvDuration("TICKET_REMOTE_PHONE_REQUEST_TIMEOUT", phone.DefaultRequestTimeout),
+			ReconnectMinDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MIN_DELAY", phone.DefaultReconnectMinDelay),
+			ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", phone.DefaultReconnectMaxDelay),
+			NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", defaultNoViewerStopDelay),
 		},
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
@@ -184,15 +185,6 @@ func Load() (Config, error) {
 	}
 	if len(cfg.Phone.Backends) == 0 {
 		return Config{}, fmt.Errorf("at least one ticket phone backend is required")
-	}
-	if cfg.SimulatorSetup.BackendID == "" {
-		return Config{}, fmt.Errorf("TICKET_REMOTE_SIMULATOR_SETUP_BACKEND_ID is required")
-	}
-	if cfg.SimulatorSetup.ADBTarget == "" {
-		return Config{}, fmt.Errorf("TICKET_REMOTE_SIMULATOR_SETUP_ADB_TARGET is required")
-	}
-	if cfg.SimulatorSetup.ADBPath == "" {
-		return Config{}, fmt.Errorf("TICKET_REMOTE_SIMULATOR_SETUP_ADB_PATH is required")
 	}
 	return cfg, nil
 }

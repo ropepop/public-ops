@@ -14,12 +14,5 @@ export default __t.row({
   feed: __t.string().primaryKey(),
   version: __t.string(),
   path: __t.string(),
-  hash: __t.string(),
-  publishedAt: __t.string(),
-  lastSuccessAt: __t.string(),
-  lastAttemptAt: __t.string(),
-  status: __t.string(),
-  consecutiveFailures: __t.u32(),
-  vehicleCount: __t.u32(),
   updatedAt: __t.string(),
 });

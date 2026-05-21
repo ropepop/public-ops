@@ -3,6 +3,8 @@ package reports
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +59,36 @@ func TestIncidentSummariesExposeExplicitMapTargets(t *testing.T) {
 	assertIncidentMapTarget(t, items, matchedStation.IncidentID, "train", "train-target", "", "")
 	assertIncidentMapTarget(t, items, stationReport.IncidentID, "station", "", "riga", "")
 	assertIncidentMapTarget(t, items, areaReport.IncidentID, "area", "", "", areaReport.IncidentID)
+	assertAreaIncidentIsPubliclyCoarsened(t, items, areaReport.IncidentID)
+}
+
+func assertAreaIncidentIsPubliclyCoarsened(t *testing.T, items []domain.IncidentSummary, incidentID string) {
+	t.Helper()
+	if !strings.HasPrefix(incidentID, "area:pub-") {
+		t.Fatalf("area incident ID = %q, want opaque public ID", incidentID)
+	}
+	for _, item := range items {
+		if item.ID != incidentID {
+			continue
+		}
+		if item.SubjectID != "" {
+			t.Fatalf("area incident subject ID = %q, want blank", item.SubjectID)
+		}
+		if item.SubjectName != "Inspection near this location" {
+			t.Fatalf("area incident subject name = %q", item.SubjectName)
+		}
+		if item.Location == nil || item.Location.Latitude == nil || item.Location.Longitude == nil {
+			t.Fatalf("area incident missing public location: %+v", item.Location)
+		}
+		if *item.Location.Latitude != 56.947 || *item.Location.Longitude != 24.106 {
+			t.Fatalf("area incident location = %.6f, %.6f; want coarsened coordinates", *item.Location.Latitude, *item.Location.Longitude)
+		}
+		if item.Location.RadiusMeters != 250 || item.Location.Description != "" {
+			t.Fatalf("area incident location = %+v, want coarse radius and no description", item.Location)
+		}
+		return
+	}
+	t.Fatalf("area incident %q not found in %+v", incidentID, items)
 }
 
 func TestListActiveIncidentsUsesSameDayActivityOrdering(t *testing.T) {
@@ -183,6 +215,60 @@ func TestIncidentDetailIncludesNewestActivityFirst(t *testing.T) {
 	}
 	if len(detail.Comments) != 1 || detail.Comments[0].Body != "Still checking" {
 		t.Fatalf("expected comments to remain available in their own section, got %+v", detail.Comments)
+	}
+}
+
+func TestVoteIncidentRejectsRepeatedSameVoteInsideWindow(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-15 * time.Minute)
+	seedTrain(t, st, "train-vote-limit", dep, dep.Add(45*time.Minute))
+	seedTrainStops(t, st, "train-vote-limit", dep, dep.Add(45*time.Minute))
+
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+	report, err := svc.SubmitReport(ctx, 50, "train-vote-limit", domain.SignalInspectionStarted, now.Add(-10*time.Minute))
+	if err != nil {
+		t.Fatalf("submit report: %v", err)
+	}
+	if _, err := svc.VoteIncident(ctx, report.IncidentID, 51, domain.IncidentVoteOngoing, now.Add(-2*time.Minute)); err != nil {
+		t.Fatalf("first vote: %v", err)
+	}
+
+	_, err = svc.VoteIncident(ctx, report.IncidentID, 51, domain.IncidentVoteOngoing, now.Add(-1*time.Minute))
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.Reason != "same_vote" {
+		t.Fatalf("expected same-vote rate limit, got %v", err)
+	}
+}
+
+func TestAddIncidentCommentCapsUserCommentActions(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-15 * time.Minute)
+	seedTrain(t, st, "train-comment-limit", dep, dep.Add(45*time.Minute))
+	seedTrainStops(t, st, "train-comment-limit", dep, dep.Add(45*time.Minute))
+
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+	report, err := svc.SubmitReport(ctx, 60, "train-comment-limit", domain.SignalInspectionStarted, now.Add(-10*time.Minute))
+	if err != nil {
+		t.Fatalf("submit report: %v", err)
+	}
+	for i := 0; i < commentActionLimit; i++ {
+		if _, err := svc.AddIncidentComment(ctx, report.IncidentID, 61, "Still here", now.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("comment %d: %v", i, err)
+		}
+	}
+
+	_, err = svc.AddIncidentComment(ctx, report.IncidentID, 61, "Still here", now.Add(time.Duration(commentActionLimit)*time.Second))
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.Reason != "comment_action_limit" {
+		t.Fatalf("expected comment action rate limit, got %v", err)
 	}
 }
 

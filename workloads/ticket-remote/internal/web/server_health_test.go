@@ -16,7 +16,7 @@ import (
 	"ticketremote/internal/state"
 )
 
-func TestHealthUsesCachedStateAsHealthyWhenFreshLookupFails(t *testing.T) {
+func TestHealthUsesFreshCachedStateWithoutStateLookup(t *testing.T) {
 	memoryStore := state.NewMemoryStore()
 	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
@@ -80,11 +80,11 @@ func TestHealthUsesCachedStateAsHealthyWhenFreshLookupFails(t *testing.T) {
 	if len(payload.Reasons) != 0 {
 		t.Fatalf("cached health should not report hard reasons: %#v", payload.Reasons)
 	}
-	if payload.StateBackendFresh {
-		t.Fatalf("stateBackendFresh should report false when cache is used")
+	if !payload.StateBackendFresh {
+		t.Fatalf("stateBackendFresh should report true when a fresh cached snapshot is used")
 	}
-	if payload.StateBackendWarning == "" {
-		t.Fatal("expected state backend warning")
+	if payload.StateBackendWarning != "" {
+		t.Fatalf("fresh cached health should not warn: %q", payload.StateBackendWarning)
 	}
 	if strings.Contains(payload.StateBackendWarning, "Stack backtrace") || strings.Contains(payload.StateBackendWarning, "\n") {
 		t.Fatalf("warning was not sanitized: %q", payload.StateBackendWarning)

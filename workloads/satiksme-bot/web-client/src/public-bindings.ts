@@ -6,6 +6,7 @@ import {
   procedures as __procedures,
   reducers as __reducers,
   schema as __schema,
+  t as __t,
   table as __table,
   type DbConnectionConfig as __DbConnectionConfig,
   type ErrorContextInterface as __ErrorContextInterface,
@@ -17,12 +18,50 @@ import {
 } from "spacetimedb";
 
 import PublicAreaReportRow from "./generated/satiksmebot_public_area_report_table";
-import PublicIncidentRow from "./generated/satiksmebot_public_incident_table";
 import PublicIncidentCommentRow from "./generated/satiksmebot_public_incident_comment_table";
 import PublicIncidentEventRow from "./generated/satiksmebot_public_incident_event_table";
 import PublicLiveSnapshotStateRow from "./generated/satiksmebot_public_live_snapshot_state_table";
 import PublicStopSightingRow from "./generated/satiksmebot_public_stop_sighting_table";
 import PublicVehicleSightingRow from "./generated/satiksmebot_public_vehicle_sighting_table";
+
+const PublicVehicleContextDoc = __t.object("SatiksmeVehicleContextDoc", {
+  stopId: __t.string(),
+  stopName: __t.string(),
+  mode: __t.string(),
+  routeLabel: __t.string(),
+  direction: __t.string(),
+  destination: __t.string(),
+  departureSeconds: __t.u32(),
+});
+
+const PublicAreaContextDoc = __t.object("SatiksmeAreaContextDoc", {
+  latitude: __t.f64(),
+  longitude: __t.f64(),
+  radiusMeters: __t.u32(),
+  description: __t.string(),
+});
+
+const PublicIncidentRow = __t.row({
+  id: __t.string().primaryKey(),
+  scope: __t.string(),
+  subjectId: __t.string(),
+  subjectName: __t.string(),
+  stopId: __t.string(),
+  lastReportName: __t.string(),
+  lastReportAt: __t.string(),
+  lastReporter: __t.string(),
+  commentCount: __t.u32(),
+  ongoingVotes: __t.u32(),
+  clearedVotes: __t.u32(),
+  active: __t.bool(),
+  resolved: __t.bool(),
+  get vehicle() {
+    return __t.option(PublicVehicleContextDoc);
+  },
+  get area() {
+    return __t.option(PublicAreaContextDoc);
+  },
+});
 
 const tablesSchema = __schema({
   satiksmebot_public_area_report: __table({

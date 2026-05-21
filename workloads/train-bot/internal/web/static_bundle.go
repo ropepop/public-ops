@@ -28,7 +28,7 @@ type activeBundleSync interface {
 type staticBundleManifest struct {
 	Version          string                `json:"version"`
 	ServiceDate      string                `json:"serviceDate"`
-	SourceVersion    string                `json:"sourceVersion"`
+	SourceVersion    string                `json:"-"`
 	TransformVersion string                `json:"transformVersion"`
 	GeneratedAt      string                `json:"generatedAt"`
 	Counts           staticBundleCounts    `json:"counts"`
@@ -46,7 +46,7 @@ type staticBundleCounts struct {
 type staticBundleFreshness struct {
 	ServiceDate string `json:"serviceDate"`
 	GeneratedAt string `json:"generatedAt"`
-	Source      string `json:"sourceVersion"`
+	Source      string `json:"-"`
 }
 
 type staticBundleSliceSet struct {
@@ -60,7 +60,7 @@ type staticBundleSliceSet struct {
 type staticBundleActiveState struct {
 	Version          string                `json:"version"`
 	ServiceDate      string                `json:"serviceDate"`
-	SourceVersion    string                `json:"sourceVersion"`
+	SourceVersion    string                `json:"-"`
 	TransformVersion string                `json:"transformVersion"`
 	GeneratedAt      string                `json:"generatedAt"`
 	ManifestPath     string                `json:"manifestPath"`
@@ -166,7 +166,7 @@ func (p *staticBundlePublisher) PublishManifest(ctx context.Context, now time.Ti
 	graphPayload := buildStaticBundleGraphPayload(base.Trains, base.Stops)
 	slices := map[string]any{
 		"stations.json":       base.Stations,
-		"trains.json":         base.Trains,
+		"trains.json":         publicStaticBundleTrains(base.Trains),
 		"stops.json":          base.Stops,
 		"station-passes.json": stationPasses,
 		"train-graph.json":    graphPayload,
@@ -178,7 +178,13 @@ func (p *staticBundlePublisher) PublishManifest(ctx context.Context, now time.Ti
 	hasher.Write([]byte(strings.TrimSpace(base.ServiceDate)))
 	hasher.Write([]byte{0})
 	hasher.Write([]byte(strings.TrimSpace(base.SourceVersion)))
-	for name, payload := range slices {
+	sliceNames := make([]string, 0, len(slices))
+	for name := range slices {
+		sliceNames = append(sliceNames, name)
+	}
+	sort.Strings(sliceNames)
+	for _, name := range sliceNames {
+		payload := slices[name]
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
 			return nil, fmt.Errorf("marshal static bundle slice %s: %w", name, marshalErr)
@@ -190,7 +196,11 @@ func (p *staticBundlePublisher) PublishManifest(ctx context.Context, now time.Ti
 		hasher.Write(body)
 	}
 	version := fmt.Sprintf("%s-%s", strings.TrimSpace(base.ServiceDate), hex.EncodeToString(hasher.Sum(nil))[:12])
+	versionDir := filepath.Join(p.dir, version)
 	generatedAt := now.UTC().Format(time.RFC3339)
+	if existingGeneratedAt := existingStaticBundleGeneratedAt(versionDir, version); existingGeneratedAt != "" {
+		generatedAt = existingGeneratedAt
+	}
 	manifest := &staticBundleManifest{
 		Version:          version,
 		ServiceDate:      strings.TrimSpace(base.ServiceDate),
@@ -219,7 +229,6 @@ func (p *staticBundlePublisher) PublishManifest(ctx context.Context, now time.Ti
 	if err := os.MkdirAll(p.dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create static bundle dir: %w", err)
 	}
-	versionDir := filepath.Join(p.dir, version)
 	if err := os.MkdirAll(versionDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create static bundle version dir: %w", err)
 	}
@@ -251,12 +260,30 @@ func (p *staticBundlePublisher) PublishManifest(ctx context.Context, now time.Ti
 	if err := writeJSONFile(filepath.Join(p.dir, "active.json"), append(activeBody, '\n')); err != nil {
 		return nil, err
 	}
+	if err := removeOldStaticBundleVersions(p.dir, manifest.Version); err != nil {
+		return nil, err
+	}
 	if p.syncer != nil {
 		if syncErr := p.syncer.PublishActiveBundle(ctx, manifest.Version, manifest.ServiceDate, now.UTC(), manifest.SourceVersion); syncErr != nil {
 			return nil, syncErr
 		}
 	}
 	return manifest, nil
+}
+
+func existingStaticBundleGeneratedAt(versionDir string, version string) string {
+	body, err := os.ReadFile(filepath.Join(versionDir, "manifest.json"))
+	if err != nil {
+		return ""
+	}
+	var manifest staticBundleManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return ""
+	}
+	if strings.TrimSpace(manifest.Version) != strings.TrimSpace(version) {
+		return ""
+	}
+	return strings.TrimSpace(manifest.GeneratedAt)
 }
 
 func (s *staticBundleStore) activeState() (*staticBundleActiveState, error) {
@@ -483,7 +510,7 @@ func (d *staticBundleData) publicDashboard(now time.Time, limit int) map[string]
 	for _, train := range items {
 		card := d.defaultTrainCard(train)
 		out = append(out, trainapp.PublicTrainView{
-			Train:            card.Train,
+			Train:            trainapp.PublicTrainInstanceFor(card.Train),
 			Status:           card.Status,
 			Riders:           card.Riders,
 			Timeline:         nil,
@@ -505,7 +532,7 @@ func (d *staticBundleData) publicServiceDayTrains(now time.Time) map[string]any 
 	for _, train := range items {
 		card := d.defaultTrainCard(train)
 		out = append(out, trainapp.PublicTrainView{
-			Train:            card.Train,
+			Train:            trainapp.PublicTrainInstanceFor(card.Train),
 			Status:           card.Status,
 			Riders:           card.Riders,
 			Timeline:         nil,
@@ -516,6 +543,14 @@ func (d *staticBundleData) publicServiceDayTrains(now time.Time) map[string]any 
 		"generatedAt": now.UTC(),
 		"trains":      out,
 	}, now)
+}
+
+func publicStaticBundleTrains(trains []domain.TrainInstance) []trainapp.PublicTrainInstance {
+	out := make([]trainapp.PublicTrainInstance, 0, len(trains))
+	for _, train := range trains {
+		out = append(out, trainapp.PublicTrainInstanceFor(train))
+	}
+	return out
 }
 
 func (d *staticBundleData) publicTrain(now time.Time, trainID string) map[string]any {
@@ -896,6 +931,29 @@ func writeJSONFile(path string, body []byte) error {
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("rename static bundle file %s: %w", path, err)
+	}
+	return nil
+}
+
+func removeOldStaticBundleVersions(parentDir string, activeVersion string) error {
+	activeVersion = strings.TrimSpace(activeVersion)
+	if strings.TrimSpace(parentDir) == "" || activeVersion == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read static bundle versions: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == activeVersion {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(parentDir, entry.Name())); err != nil {
+			return fmt.Errorf("remove old static bundle version %s: %w", entry.Name(), err)
+		}
 	}
 	return nil
 }

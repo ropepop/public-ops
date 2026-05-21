@@ -1,8 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,28 +34,37 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
+const (
+	maxJSONBodyBytes   = 64 * 1024
+	defaultPublicLimit = 60
+	maxPublicLimit     = 2000
+)
+
 type RideNotifier interface {
 	NotifyRideUsers(ctx context.Context, reporterID int64, trainID string, signal domain.SignalType, now time.Time) error
 	NotifyStationSighting(ctx context.Context, event domain.StationSighting, now time.Time) error
 }
 
 type Server struct {
-	cfg             config.Config
-	app             *trainapp.Service
-	catalog         *i18n.Catalog
-	loc             *time.Location
-	now             func() time.Time
-	pathPrefix      string
-	sessionSecret   []byte
-	testLogin       *testLoginBroker
-	spacetime       *spacetimeTokenIssuer
-	telegramLogin   *telegramweb.LoginVerifier
-	notifier        RideNotifier
-	static          fs.FS
-	release         releaseInfo
-	pageTemplate    *template.Template
-	publicEdgeCache *publicEdgeCache
-	bundleStore     *staticBundleStore
+	cfg                 config.Config
+	app                 *trainapp.Service
+	catalog             *i18n.Catalog
+	loc                 *time.Location
+	now                 func() time.Time
+	pathPrefix          string
+	sessionSecret       []byte
+	testLogin           *testLoginBroker
+	spacetime           *spacetimeTokenIssuer
+	spacetimeIssueToken func(telegramAuth, time.Time) (spacetimeIssuedToken, error)
+	telegramLogin       *telegramweb.LoginVerifier
+	authConfigRate      *clientRateLimiter
+	authCompleteRate    *clientRateLimiter
+	notifier            RideNotifier
+	static              fs.FS
+	release             releaseInfo
+	pageTemplate        *template.Template
+	publicEdgeCache     *publicEdgeCache
+	bundleStore         *staticBundleStore
 }
 
 type pageData struct {
@@ -74,9 +87,10 @@ type pageData struct {
 	BundleVersion           string
 	BundleServiceDate       string
 	BundleGeneratedAt       string
-	BundleSourceVersion     string
 	BundleTransformVersion  string
 	ScheduleJSON            template.JS
+	ScriptNonce             string
+	TelegramWebAppScript    bool
 	AppCSSURL               string
 	LeafletCSSURL           string
 	LeafletJSURL            string
@@ -112,23 +126,26 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
 	}
 
 	server := &Server{
-		cfg:        cfg,
-		app:        appSvc,
-		catalog:    catalog,
-		loc:        loc,
-		now:        time.Now,
-		pathPrefix: pathPrefix,
-		static:     staticFiles,
-		release:    release,
+		cfg:              cfg,
+		app:              appSvc,
+		catalog:          catalog,
+		loc:              loc,
+		now:              time.Now,
+		pathPrefix:       pathPrefix,
+		authConfigRate:   newClientRateLimiter(authConfigRequestsPerMinute, authRateLimitWindow),
+		authCompleteRate: newClientRateLimiter(authCompleteRequestsPerMinute, authRateLimitWindow),
+		static:           staticFiles,
+		release:          release,
 		pageTemplate: template.Must(template.New("shell").Parse(`<!doctype html>
 <html lang="{{.HTMLLang}}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, noarchive">
   <title>vivi kontrole bot</title>
   <link rel="stylesheet" href="{{.AppCSSURL}}">
   <link rel="stylesheet" href="{{.LeafletCSSURL}}">
-  <script>
+  <script nonce="{{.ScriptNonce}}">
     window.TRAIN_APP_CONFIG = {
       basePath: {{.BasePath}},
       publicBaseURL: {{.PublicBaseURL}},
@@ -149,14 +166,12 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
       bundleServiceDate: {{.BundleServiceDate}},
       bundleFreshness: {
         generatedAt: {{.BundleGeneratedAt}},
-        sourceVersion: {{.BundleSourceVersion}},
         transformVersion: {{.BundleTransformVersion}}
       },
       schedule: {{.ScheduleJSON}}
     };
   </script>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script async src="https://oauth.telegram.org/js/telegram-login.js?3"></script>
+  {{if .TelegramWebAppScript}}<script src="https://telegram.org/js/telegram-web-app.js"></script>{{end}}
   <script defer src="{{.LeafletJSURL}}"></script>
   <script defer src="{{.ExternalFeedJSURL}}"></script>
   <script defer src="{{.AppJSURL}}"></script>
@@ -234,12 +249,16 @@ func productionTrainPublicBaseURL(rawURL string) bool {
 
 func unsafePublicPath(r *http.Request) bool {
 	escaped := r.URL.EscapedPath()
+	lowerEscaped := strings.ToLower(escaped)
+	if strings.Contains(lowerEscaped, "%2f") || strings.Contains(lowerEscaped, "%5c") {
+		return true
+	}
 	decoded, err := url.PathUnescape(escaped)
 	if err != nil {
 		return true
 	}
 	for _, candidate := range []string{r.URL.Path, escaped, decoded} {
-		if strings.Contains(candidate, "//") {
+		if strings.Contains(candidate, "//") || strings.Contains(candidate, "\\") {
 			return true
 		}
 		for _, segment := range strings.Split(candidate, "/") {
@@ -256,8 +275,117 @@ func mustStaticSubFS() fs.FS {
 	if err != nil {
 		panic(err)
 	}
-	return sub
+	return productionStaticFS{sub: sub}
 }
+
+type productionStaticFS struct {
+	sub fs.FS
+}
+
+func (p productionStaticFS) Open(name string) (fs.File, error) {
+	clean := cleanStaticAssetName(name)
+	if clean != "app.js" {
+		return p.sub.Open(name)
+	}
+	body, err := fs.ReadFile(p.sub, name)
+	if err != nil {
+		return nil, err
+	}
+	body, err = stripTrainAppTestHarness(body)
+	if err != nil {
+		return nil, err
+	}
+	return &memoryStaticFile{
+		Reader: bytes.NewReader(body),
+		name:   path.Base(clean),
+		size:   int64(len(body)),
+	}, nil
+}
+
+func (p productionStaticFS) ReadFile(name string) ([]byte, error) {
+	body, err := fs.ReadFile(p.sub, name)
+	if err != nil {
+		return nil, err
+	}
+	if cleanStaticAssetName(name) == "app.js" {
+		return stripTrainAppTestHarness(body)
+	}
+	return body, nil
+}
+
+func cleanStaticAssetName(name string) string {
+	return strings.TrimPrefix(path.Clean("/"+name), "/")
+}
+
+func stripTrainAppTestHarness(body []byte) ([]byte, error) {
+	source := string(body)
+	var err error
+	source, err = stripNamedJSFunction(source, "resetStateForTest")
+	if err != nil {
+		return nil, err
+	}
+	start := strings.Index(source, "\n  if (typeof module === \"object\" && module.exports) {\n    const exported = {};")
+	end := strings.LastIndex(source, "\n    module.exports = exported;\n  }\n})();")
+	if start < 0 || end < 0 || end <= start {
+		return nil, fmt.Errorf("train app test harness markers not found")
+	}
+	next := source[:start] + "\n})();\n"
+	return []byte(next), nil
+}
+
+func stripNamedJSFunction(source string, name string) (string, error) {
+	start := strings.Index(source, "\n  function "+name+"(")
+	if start < 0 {
+		return "", fmt.Errorf("function %s marker not found", name)
+	}
+	openOffset := strings.Index(source[start:], "{")
+	if openOffset < 0 {
+		return "", fmt.Errorf("function %s opening brace not found", name)
+	}
+	depth := 0
+	for index := start + openOffset; index < len(source); index++ {
+		switch source[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end := index + 1
+				if end < len(source) && source[end] == '\n' {
+					end++
+				}
+				return source[:start] + source[end:], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("function %s closing brace not found", name)
+}
+
+type memoryStaticFile struct {
+	*bytes.Reader
+	name string
+	size int64
+}
+
+func (f *memoryStaticFile) Stat() (fs.FileInfo, error) {
+	return memoryStaticFileInfo{name: f.name, size: f.size}, nil
+}
+
+func (f *memoryStaticFile) Close() error {
+	return nil
+}
+
+type memoryStaticFileInfo struct {
+	name string
+	size int64
+}
+
+func (i memoryStaticFileInfo) Name() string       { return i.name }
+func (i memoryStaticFileInfo) Size() int64        { return i.size }
+func (i memoryStaticFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i memoryStaticFileInfo) ModTime() time.Time { return time.Time{} }
+func (i memoryStaticFileInfo) IsDir() bool        { return false }
+func (i memoryStaticFileInfo) Sys() any           { return nil }
 
 func (s *Server) SetNotifier(notifier RideNotifier) {
 	s.notifier = notifier
@@ -319,19 +447,40 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "bad path")
 		return
 	}
-	path := strings.TrimRight(r.URL.Path, "/")
 	basePath := strings.TrimRight(s.pathPrefix, "/")
+	if trailingSlashAlias(r.URL.Path, basePath) {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	path := strings.TrimRight(r.URL.Path, "/")
 	if s.serveHTTPForBasePath(w, r, path, basePath) {
 		return
 	}
-	if basePath != legacyBasePath && s.serveHTTPForBasePath(w, r, path, legacyBasePath) {
+	if basePath != "" && basePath != legacyBasePath && s.serveHTTPForBasePath(w, r, path, legacyBasePath) {
 		return
 	}
+	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	http.NotFound(w, r)
+}
+
+func trailingSlashAlias(requestPath string, basePath string) bool {
+	if requestPath == "/" {
+		return false
+	}
+	if basePath != "" && requestPath == basePath+"/" {
+		return false
+	}
+	return strings.HasSuffix(requestPath, "/")
 }
 
 func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, path string, basePath string) bool {
 	switch {
+	case path == strings.TrimRight(basePath+"/robots.txt", "/"):
+		s.serveRobotsTxt(w, r)
+		return true
 	case path == strings.TrimRight(basePath+"/oidc/.well-known/openid-configuration", "/"):
 		if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 			return true
@@ -369,21 +518,31 @@ func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, pa
 		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-dashboard", ""))
 		return true
 	case strings.HasPrefix(path, basePath+"/t/") && strings.HasSuffix(path, "/map"):
+		if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return true
+		}
 		trainID := strings.TrimSuffix(strings.TrimPrefix(path, basePath+"/t/"), "/map")
 		trainID = strings.Trim(trainID, "/")
 		if trainID == "" || strings.Contains(trainID, "/") {
+			s.setNoStoreHeaders(w)
+			s.setNoIndexHeaders(w)
 			http.NotFound(w, r)
 			return true
 		}
-		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-map", trainID))
+		s.servePublicTrainShell(w, r, basePath, "public-map", trainID)
 		return true
 	case strings.HasPrefix(path, basePath+"/t/"):
+		if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+			return true
+		}
 		trainID := strings.TrimPrefix(path, basePath+"/t/")
 		if trainID == "" || strings.Contains(trainID, "/") {
+			s.setNoStoreHeaders(w)
+			s.setNoIndexHeaders(w)
 			http.NotFound(w, r)
 			return true
 		}
-		s.serveShellPage(w, r, http.StatusOK, s.newPageData(basePath, "public-train", trainID))
+		s.servePublicTrainShell(w, r, basePath, "public-train", trainID)
 		return true
 	case strings.HasPrefix(path, basePath+"/assets/"):
 		s.serveAsset(w, r, basePath)
@@ -396,13 +555,31 @@ func (s *Server) serveHTTPForBasePath(w http.ResponseWriter, r *http.Request, pa
 	}
 }
 
+func (s *Server) serveRobotsTxt(w http.ResponseWriter, r *http.Request) {
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte("User-agent: *\nDisallow: /\n"))
+}
+
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string) {
 	nowFn := s.now
 	if nowFn == nil {
 		nowFn = time.Now
 	}
 	now := nowFn().In(s.loc)
+	if !s.allowUnsafeAPIRequest(w, r) {
+		return
+	}
 	switch {
+	case route == "/internal/health":
+		s.handleInternalHealth(w, r, now)
 	case route == "/health":
 		s.handleHealth(w, r, now)
 	case route == "/ready":
@@ -444,6 +621,15 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 		s.handleAuthTelegramComplete(w, r, now)
 	case route == "/auth/telegram":
 		s.handleAuthTelegram(w, r, now)
+	case route == "/auth/spacetime":
+		if !s.allowMethods(w, r, http.MethodPost) {
+			return
+		}
+		claims, ok := s.requireSession(w, r, now)
+		if !ok {
+			return
+		}
+		s.handleAuthSpacetime(w, r, claims, now)
 	case route == "/auth/logout":
 		s.handleAuthLogout(w, r, now)
 	case route == "/auth/test":
@@ -451,6 +637,9 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	case route == "/session":
 		s.handleSession(w, r, now)
 	case route == "/me":
+		if !s.allowMethods(w, r, http.MethodGet) {
+			return
+		}
 		claims, ok := s.requireSession(w, r, now)
 		if !ok {
 			return
@@ -587,11 +776,140 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request, route string)
 	}
 }
 
+func (s *Server) servePublicTrainShell(w http.ResponseWriter, r *http.Request, basePath string, mode string, trainID string) {
+	nowFn := s.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn().In(s.loc)
+	exists, err := s.publicTrainShellExists(r.Context(), trainID, now)
+	if err != nil {
+		s.writeAppError(w, err)
+		return
+	}
+	if !exists {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
+		http.NotFound(w, r)
+		return
+	}
+	s.serveShell(w, http.StatusOK, s.newPageData(basePath, mode, trainID))
+}
+
+func (s *Server) publicTrainShellExists(ctx context.Context, trainID string, now time.Time) (bool, error) {
+	cleanTrainID := strings.TrimSpace(trainID)
+	if cleanTrainID == "" {
+		return false, nil
+	}
+	if data, ok, err := s.bundleData(); err != nil {
+		return false, err
+	} else if ok {
+		_, exists := data.trainsByID[cleanTrainID]
+		return exists, nil
+	}
+	if !s.appScheduleContext(now).Available {
+		return true, nil
+	}
+	if _, err := s.app.PublicTrain(ctx, cleanTrainID, now); err != nil {
+		if errors.Is(err, trainapp.ErrNotFound) {
+			return false, nil
+		}
+		return true, nil
+	}
+	return true, nil
+}
+
+func (s *Server) allowUnsafeAPIRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !unsafeHTTPMethod(r.Method) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site", "same-site":
+		s.writeError(w, http.StatusForbidden, "cross-site request forbidden")
+		return false
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !s.sameOriginRequest(r, origin) {
+		s.writeError(w, http.StatusForbidden, "cross-site request forbidden")
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("Origin")) == "" {
+		if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" && !s.sameOriginRequest(r, referer) {
+			s.writeError(w, http.StatusForbidden, "cross-site request forbidden")
+			return false
+		}
+	}
+	return true
+}
+
+func unsafeHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) sameOriginRequest(r *http.Request, raw string) bool {
+	origin := requestOrigin(raw)
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range []string{
+		requestOrigin(s.cfg.TrainWebPublicBaseURL),
+		requestHostOrigin(r),
+	} {
+		if allowed != "" && origin == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func requestOrigin(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+}
+
+func requestHostOrigin(r *http.Request) string {
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		first := strings.ToLower(strings.TrimSpace(strings.Split(forwarded, ",")[0]))
+		if first == "http" || first == "https" {
+			scheme = first
+		}
+	}
+	return scheme + "://" + strings.ToLower(host)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, now time.Time) {
 	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleInternalHealth(w http.ResponseWriter, r *http.Request, now time.Time) {
+	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
+	if !isLocalRequest(r) {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.healthPayload(now, true))
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request, now time.Time) {
@@ -612,11 +930,14 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request, now time.Ti
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	lang := trainapp.ParseLanguage(r.URL.Query().Get("lang"))
+	lang, ok := parsePublicMessagesLanguage(r.URL.Query().Get("lang"))
+	if !ok {
+		s.writeError(w, http.StatusBadRequest, "unsupported language")
+		return
+	}
 	decision, handled := s.beginPublicEdgeCache(w, r, s.now(), publicEdgeCacheMessagesRoute(string(lang)))
 	if handled {
 		return
@@ -627,19 +948,47 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}, decision)
 }
 
+func parsePublicMessagesLanguage(raw string) (domain.Language, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return domain.DefaultLanguage, true
+	}
+	if strings.EqualFold(trimmed, string(domain.LanguageLV)) {
+		return domain.LanguageLV, true
+	}
+	if strings.EqualFold(trimmed, string(domain.LanguageEN)) {
+		return domain.LanguageEN, true
+	}
+	return domain.DefaultLanguage, false
+}
+
+func parsePublicLimit(r *http.Request) (int, bool) {
+	values, ok := r.URL.Query()["limit"]
+	if !ok {
+		return defaultPublicLimit, true
+	}
+	if len(values) != 1 {
+		return 0, false
+	}
+	raw := strings.TrimSpace(values[0])
+	if raw == "" {
+		return defaultPublicLimit, true
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 || parsed > maxPublicLimit {
+		return 0, false
+	}
+	return parsed, true
+}
+
 func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	limit := 60
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 0 {
-			s.writeError(w, http.StatusBadRequest, "invalid limit")
-			return
-		}
-		limit = parsed
+	limit, ok := parsePublicLimit(r)
+	if !ok {
+		s.writeError(w, http.StatusBadRequest, "invalid limit")
+		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheIncidentsRoute(limit))
 	if handled {
@@ -662,8 +1011,7 @@ func (s *Server) handlePublicIncidents(w http.ResponseWriter, r *http.Request, n
 }
 
 func (s *Server) handlePublicIncidentDetail(w http.ResponseWriter, r *http.Request, incidentID string, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheIncidentDetailRoute(incidentID))
@@ -683,18 +1031,13 @@ func (s *Server) handlePublicIncidentDetail(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handlePublicDashboard(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	limit := 60
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 0 {
-			s.writeError(w, http.StatusBadRequest, "invalid limit")
-			return
-		}
-		limit = parsed
+	limit, ok := parsePublicLimit(r)
+	if !ok {
+		s.writeError(w, http.StatusBadRequest, "invalid limit")
+		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheDashboardRoute(limit))
 	if handled {
@@ -716,8 +1059,7 @@ func (s *Server) handlePublicDashboard(w http.ResponseWriter, r *http.Request, n
 }
 
 func (s *Server) handlePublicServiceDayTrains(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheServiceDayTrainsRoute())
@@ -740,8 +1082,7 @@ func (s *Server) handlePublicServiceDayTrains(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheNetworkMapRoute())
@@ -764,8 +1105,7 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 }
 
 func (s *Server) handlePublicStations(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheStationSearchRoute(r.URL.Query().Get("q")))
@@ -791,8 +1131,7 @@ func (s *Server) handlePublicStations(w http.ResponseWriter, r *http.Request, no
 }
 
 func (s *Server) handlePublicStationDepartures(w http.ResponseWriter, r *http.Request, stationID string, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheStationDeparturesRoute(stationID))
@@ -815,8 +1154,7 @@ func (s *Server) handlePublicStationDepartures(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handlePublicTrain(w http.ResponseWriter, r *http.Request, trainID string, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheTrainRoute(trainID))
@@ -839,8 +1177,7 @@ func (s *Server) handlePublicTrain(w http.ResponseWriter, r *http.Request, train
 }
 
 func (s *Server) handlePublicTrainStops(w http.ResponseWriter, r *http.Request, trainID string, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheTrainStopsRoute(trainID))
@@ -864,8 +1201,11 @@ func (s *Server) handlePublicTrainStops(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handlePublicRouteCheckInRoutes(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet, http.MethodHead) {
+		return
+	}
+	if r.URL.RawQuery != "" {
+		s.writeError(w, http.StatusBadRequest, "invalid query")
 		return
 	}
 	routes, err := s.app.RouteCheckInRoutes(r.Context(), now)
@@ -873,22 +1213,26 @@ func (s *Server) handlePublicRouteCheckInRoutes(w http.ResponseWriter, r *http.R
 		s.writeAppError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writePublicJSON(w, http.StatusOK, map[string]any{
 		"routes":                 routes,
 		"defaultDurationMinutes": trainapp.RouteCheckInDefaultMinutes,
 		"minDurationMinutes":     trainapp.RouteCheckInMinMinutes,
 		"maxDurationMinutes":     trainapp.RouteCheckInMaxMinutes,
 		"schedule":               s.appScheduleContext(now),
-	})
+	}, nil)
 }
 
 func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodGet) {
 		return
 	}
 	if strings.TrimSpace(s.telegramBotID()) == "" || s.telegramLogin == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Telegram Login is not configured")
+		return
+	}
+	if ok, retryAfter := s.authConfigRate.allow(authRateLimitKey(r), now); !ok {
+		setAuthRetryAfter(w, retryAfter)
+		s.writeError(w, http.StatusTooManyRequests, "too many login requests")
 		return
 	}
 	nonceClaims, cookie, err := issueLoginNonceCookie(
@@ -913,8 +1257,15 @@ func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodPost) {
+		return
+	}
+	if !s.requireJSONContentType(w, r) {
+		return
+	}
+	if ok, retryAfter := s.authCompleteRate.allow(authRateLimitKey(r), now); !ok {
+		setAuthRetryAfter(w, retryAfter)
+		s.writeError(w, http.StatusTooManyRequests, "too many login attempts")
 		return
 	}
 	var body struct {
@@ -922,8 +1273,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		InitData   string         `json:"initData"`
 		WidgetAuth map[string]any `json:"widgetAuth"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !s.decodeJSON(w, r, &body) {
 		return
 	}
 	var auth telegramAuth
@@ -946,7 +1296,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		}
 		claims, verifyErr := s.telegramLogin.VerifyIDToken(r.Context(), strings.TrimSpace(body.IDToken), loginNonce.Nonce, now)
 		if verifyErr != nil {
-			s.writeError(w, http.StatusUnauthorized, verifyErr.Error())
+			s.writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
 		firstName := strings.TrimSpace(claims.Name)
@@ -969,7 +1319,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	case strings.TrimSpace(body.InitData) != "":
 		auth, err = s.initDataAuthFromPayload(body.InitData, now)
 		if err != nil {
-			s.writeError(w, http.StatusUnauthorized, err.Error())
+			s.writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
 	default:
@@ -977,7 +1327,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := verifyTelegramAuthAge(auth, time.Duration(s.cfg.TrainWebTelegramAuthMaxAgeSec)*time.Second, now); err != nil {
-		s.writeError(w, http.StatusUnauthorized, err.Error())
+		s.writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 		return
 	}
 	resolvedLanguage := s.resolveSignedInLanguage(r.Context(), auth.User.ID, auth.User.LanguageCode)
@@ -998,33 +1348,15 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, http.StatusOK, payload)
 }
 
-func (s *Server) handleAuthTelegram(w http.ResponseWriter, r *http.Request, now time.Time) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+func (s *Server) handleAuthTelegram(w http.ResponseWriter, r *http.Request, _ time.Time) {
+	if !s.allowMethods(w, r, http.MethodPost) {
 		return
 	}
-	var body struct {
-		InitData string `json:"initData"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	auth, err := validateTelegramInitData(body.InitData, s.cfg.BotToken, time.Duration(s.cfg.TrainWebTelegramAuthMaxAgeSec)*time.Second, now)
-	if err != nil {
-		s.writeError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	resolvedLanguage := s.resolveSignedInLanguage(r.Context(), auth.User.ID, auth.User.LanguageCode)
-	if err := s.writeAuthenticatedSession(w, auth, resolvedLanguage, now); err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	s.writeRetired(w, "Telegram browser login now uses /api/v1/auth/telegram/config and /api/v1/auth/telegram/complete.")
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request, _ time.Time) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodPost) {
 		return
 	}
 	http.SetCookie(w, clearSessionCookie(s.cookiePath()))
@@ -1037,15 +1369,13 @@ func (s *Server) handleAuthTest(w http.ResponseWriter, r *http.Request, now time
 		s.writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	if r.Method != http.MethodPost {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if !s.allowMethods(w, r, http.MethodPost) {
 		return
 	}
 	var body struct {
 		Ticket string `json:"ticket"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !s.decodeJSON(w, r, &body) {
 		return
 	}
 	_, meta, err := s.testLogin.Consume(body.Ticket, now)
@@ -1168,21 +1498,66 @@ func (s *Server) authPayload(auth telegramAuth, resolvedLanguage domain.Language
 		"baseUrl":       s.cfg.TrainWebPublicBaseURL,
 	}
 	if s.spacetime != nil {
-		token, err := s.spacetime.issueTelegramToken(auth, now)
+		spacetimePayload, err := s.spacetimeSessionPayload(auth, now)
 		if err != nil {
 			return nil, err
 		}
-		payload["spacetime"] = map[string]any{
-			"enabled":   true,
-			"host":      s.cfg.TrainWebSpacetimeHost,
-			"database":  s.cfg.TrainWebSpacetimeDatabase,
-			"token":     token.Token,
-			"expiresAt": token.ExpiresAt.UTC().Format(time.RFC3339),
-			"issuer":    s.spacetime.issuer,
-			"audience":  s.spacetime.audience,
-		}
+		payload["spacetime"] = spacetimePayload
 	}
 	return payload, nil
+}
+
+func (s *Server) spacetimeSessionPayload(auth telegramAuth, now time.Time) (map[string]any, error) {
+	issueToken := s.spacetime.issueTelegramToken
+	if s.spacetimeIssueToken != nil {
+		issueToken = s.spacetimeIssueToken
+	}
+	token, err := issueToken(auth, now)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"enabled":   true,
+		"host":      s.cfg.TrainWebSpacetimeHost,
+		"database":  s.cfg.TrainWebSpacetimeDatabase,
+		"token":     token.Token,
+		"expiresAt": token.ExpiresAt.UTC().Format(time.RFC3339),
+		"issuer":    s.spacetime.issuer,
+		"audience":  s.spacetime.audience,
+	}, nil
+}
+
+func (s *Server) handleAuthSpacetime(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
+	if s.spacetime == nil {
+		s.writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true,
+			"spacetime": map[string]any{
+				"enabled": false,
+			},
+		})
+		return
+	}
+	language := strings.TrimSpace(claims.Language)
+	if language == "" {
+		language = string(domain.DefaultLanguage)
+	}
+	auth := telegramAuth{
+		AuthDate: time.Unix(claims.IssuedAt, 0).UTC(),
+		User: telegramUser{
+			ID:           claims.UserID,
+			LanguageCode: language,
+		},
+	}
+	payload, err := s.spacetimeSessionPayload(auth, now)
+	if err != nil {
+		log.Printf("train web Spacetime token issue failed: %v", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to issue token")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"spacetime": payload,
+	})
 }
 
 func (s *Server) cookiePath() string {
@@ -1248,7 +1623,7 @@ func (s *Server) nicknameForUser(userID int64) string {
 }
 
 func (s *Server) handleSpacetimeOpenIDConfiguration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -1260,7 +1635,7 @@ func (s *Server) handleSpacetimeOpenIDConfiguration(w http.ResponseWriter, r *ht
 }
 
 func (s *Server) handleSpacetimeJWKS(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -1888,15 +2263,24 @@ func (s *Server) requireSession(w http.ResponseWriter, r *http.Request, now time
 	}
 	claims, err := parseSession(s.sessionSecret, cookie.Value, now)
 	if err != nil {
-		s.writeError(w, http.StatusUnauthorized, err.Error())
+		s.writeError(w, http.StatusUnauthorized, "invalid session")
 		return sessionClaims{}, false
 	}
 	return claims, true
 }
 
 func (s *Server) serveShell(w http.ResponseWriter, status int, data pageData) {
+	scriptNonce, err := newCSPNonce()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to prepare page")
+		return
+	}
+	data.ScriptNonce = scriptNonce
+	s.setShellSecurityHeaders(w, scriptNonce, data.TelegramWebAppScript)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	s.setNoStoreHeaders(w)
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	s.setNoIndexHeaders(w)
 	w.WriteHeader(status)
 	_ = s.pageTemplate.Execute(w, data)
 }
@@ -1919,17 +2303,50 @@ func (s *Server) allowMethods(w http.ResponseWriter, r *http.Request, methods ..
 	return false
 }
 
+func isLocalRequest(r *http.Request) bool {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	defer r.Body.Close()
 	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
 		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}
 	return true
 }
 
+func (s *Server) requireJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	contentType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
+	if strings.EqualFold(contentType, "application/json") {
+		return true
+	}
+	s.writeError(w, http.StatusUnsupportedMediaType, "unsupported media type")
+	return false
+}
+
 func (s *Server) writeAppError(w http.ResponseWriter, err error) {
+	var rateLimitErr *reports.RateLimitError
 	switch {
+	case errors.As(err, &rateLimitErr):
+		if rateLimitErr.Remaining > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(rateLimitErr.Remaining.Round(time.Second).Seconds()), 10))
+		}
+		s.writeError(w, http.StatusTooManyRequests, err.Error())
 	case errors.Is(err, trainapp.ErrNotFound):
 		s.writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, trainapp.ErrCheckInUnavailable):
@@ -1961,7 +2378,9 @@ func (s *Server) writeRetired(w http.ResponseWriter, message string) {
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Vary", "Accept-Encoding")
 	s.setNoStoreHeaders(w)
+	s.setNoIndexHeaders(w)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
@@ -1977,7 +2396,6 @@ func (s *Server) newPageData(basePath string, mode string, trainID string) pageD
 	bundleVersion := ""
 	bundleServiceDate := ""
 	bundleGeneratedAt := ""
-	bundleSourceVersion := ""
 	bundleTransformVersion := ""
 	graphURL := ""
 	if s.bundleStore != nil {
@@ -1986,7 +2404,6 @@ func (s *Server) newPageData(basePath string, mode string, trainID string) pageD
 			bundleVersion = metadata.Version
 			bundleServiceDate = metadata.ServiceDate
 			bundleGeneratedAt = metadata.GeneratedAt
-			bundleSourceVersion = metadata.SourceVersion
 			bundleTransformVersion = metadata.TransformVersion
 		}
 		if manifest, err := s.bundleStore.activeManifest(); err == nil && manifest != nil {
@@ -2006,16 +2423,16 @@ func (s *Server) newPageData(basePath string, mode string, trainID string) pageD
 		ExternalTrainMapBaseURL: s.cfg.ExternalTrainMapBaseURL,
 		ExternalTrainMapWsURL:   s.cfg.ExternalTrainMapWsURL,
 		ExternalTrainGraphURL:   graphURL,
-		SpacetimeHost:           s.cfg.TrainWebSpacetimeHost,
-		SpacetimeDatabase:       s.cfg.TrainWebSpacetimeDatabase,
+		SpacetimeHost:           "",
+		SpacetimeDatabase:       "",
 		PublicEdgeCacheEnabled:  s.cfg.TrainWebPublicEdgeCacheEnabled,
 		BundleManifestURL:       bundleManifestURL,
 		BundleVersion:           bundleVersion,
 		BundleServiceDate:       bundleServiceDate,
 		BundleGeneratedAt:       bundleGeneratedAt,
-		BundleSourceVersion:     bundleSourceVersion,
 		BundleTransformVersion:  bundleTransformVersion,
 		ScheduleJSON:            scheduleJSON,
+		TelegramWebAppScript:    mode == "mini-app",
 		AppCSSURL:               s.release.AssetURL(basePath, "app.css"),
 		LeafletCSSURL:           s.release.AssetURL(basePath, "vendor/leaflet.css"),
 		LeafletJSURL:            s.release.AssetURL(basePath, "vendor/leaflet.js"),
@@ -2029,11 +2446,13 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath str
 		return
 	}
 	assetPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, basePath), "/assets/")
-	if excludedTrainPublicAsset(assetPath) {
+	if excludedTrainPublicAsset(assetPath) || !s.allowAssetQuery(r, assetPath) {
 		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
+	s.setNoIndexHeaders(w)
 	if s.bundleStore != nil && strings.HasPrefix(assetPath, "bundles/") {
 		s.serveBundleAsset(w, r, strings.TrimPrefix(assetPath, "bundles/"))
 		return
@@ -2043,8 +2462,22 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, basePath str
 		s.setImmutableHeaders(w)
 	} else {
 		s.setNoStoreHeaders(w)
+		r = requestWithoutRange(r)
 	}
+	w.Header().Set("Vary", "Accept-Encoding")
 	http.StripPrefix(basePath+"/assets/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
+}
+
+func (s *Server) allowAssetQuery(r *http.Request, assetPath string) bool {
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	query := r.URL.Query()
+	values, ok := query["v"]
+	if !ok || len(query) != 1 || len(values) != 1 {
+		return false
+	}
+	return strings.TrimSpace(values[0]) != "" && strings.TrimSpace(values[0]) == s.release.AssetHash(assetPath)
 }
 
 func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, relativePath string) {
@@ -2053,20 +2486,32 @@ func (s *Server) serveBundleAsset(w http.ResponseWriter, r *http.Request, relati
 	}
 	cleanRelativePath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+relativePath)), "/")
 	if cleanRelativePath == "" || cleanRelativePath == "." || strings.HasPrefix(cleanRelativePath, "..") || excludedGenericPublicAsset(cleanRelativePath) {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	if s.bundleStore == nil || strings.TrimSpace(s.bundleStore.dir) == "" {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
 	assetPath := filepath.Join(s.bundleStore.dir, cleanRelativePath)
 	info, err := os.Stat(assetPath)
 	if err != nil || info.IsDir() {
+		s.setNoStoreHeaders(w)
+		s.setNoIndexHeaders(w)
 		http.NotFound(w, r)
 		return
 	}
-	s.setImmutableHeaders(w)
+	if cleanRelativePath == "active.json" {
+		s.setNoStoreHeaders(w)
+	} else {
+		s.setImmutableHeaders(w)
+	}
+	s.setNoIndexHeaders(w)
+	w.Header().Set("Vary", "Accept-Encoding")
 	http.ServeFile(w, r, assetPath)
 }
 
@@ -2087,11 +2532,75 @@ func (s *Server) setReleaseHeaders(w http.ResponseWriter) {
 
 func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' https://telegram.org https://oauth.telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: wss:; frame-src https://telegram.org https://oauth.telegram.org")
+	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy("", false))
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), payment=(), usb=(), geolocation=(self)")
+}
+
+func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string, allowTelegramScript bool) {
+	s.setSecurityHeaders(w)
+	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce, allowTelegramScript))
+}
+
+func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramScript bool) string {
+	scriptSources := []string{"'self'"}
+	frameSources := []string{"'none'"}
+	connectSources := []string{"'self'"}
+	if s.cfg.ExternalTrainMapEnabled {
+		addCSPURLSource(&connectSources, s.cfg.ExternalTrainMapBaseURL)
+		addCSPURLSource(&connectSources, s.cfg.ExternalTrainMapWsURL)
+	}
+	addCSPURLSource(&connectSources, s.cfg.TrainWebSpacetimeHost)
+	if strings.TrimSpace(scriptNonce) != "" {
+		scriptSources = append(scriptSources, "'nonce-"+strings.TrimSpace(scriptNonce)+"'")
+	}
+	if allowTelegramScript {
+		scriptSources = append(scriptSources, "https://telegram.org")
+		frameSources = []string{"https://telegram.org"}
+	}
+	return strings.Join([]string{
+		"default-src 'self'",
+		"base-uri 'self'",
+		"object-src 'none'",
+		"frame-ancestors 'none'",
+		"form-action 'self'",
+		"script-src " + strings.Join(scriptSources, " "),
+		"style-src 'self'",
+		"img-src 'self' data: https://*.tile.openstreetmap.org",
+		"connect-src " + strings.Join(connectSources, " "),
+		"frame-src " + strings.Join(frameSources, " "),
+	}, "; ")
+}
+
+func addCSPURLSource(sources *[]string, raw string) {
+	if sources == nil {
+		return
+	}
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "wss" {
+		return
+	}
+	source := scheme + "://" + strings.ToLower(parsed.Host)
+	for _, existing := range *sources {
+		if existing == source {
+			return
+		}
+	}
+	*sources = append(*sources, source)
+}
+
+func newCSPNonce() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate CSP nonce: %w", err)
+	}
+	return base64.RawStdEncoding.EncodeToString(raw[:]), nil
 }
 
 func (s *Server) setNoStoreHeaders(w http.ResponseWriter) {
@@ -2100,8 +2609,21 @@ func (s *Server) setNoStoreHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 }
 
+func (s *Server) setNoIndexHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Robots-Tag", "noindex, noarchive")
+}
+
 func (s *Server) setImmutableHeaders(w http.ResponseWriter) {
 	s.setImmutableHeadersWithTTL(w, 31536000)
+}
+
+func (s *Server) setPublicCacheHeadersWithTTL(w http.ResponseWriter, ttlSec int) {
+	if ttlSec <= 0 {
+		ttlSec = 60
+	}
+	value := fmt.Sprintf("public, max-age=%d", ttlSec)
+	w.Header().Set("Cache-Control", value)
+	w.Header().Set("CDN-Cache-Control", value)
 }
 
 func (s *Server) setImmutableHeadersWithTTL(w http.ResponseWriter, ttlSec int) {
@@ -2109,6 +2631,16 @@ func (s *Server) setImmutableHeadersWithTTL(w http.ResponseWriter, ttlSec int) {
 	w.Header().Set("Cache-Control", value)
 	w.Header().Set("CDN-Cache-Control", value)
 	w.Header().Set("Cloudflare-CDN-Cache-Control", value)
+}
+
+func requestWithoutRange(r *http.Request) *http.Request {
+	if strings.TrimSpace(r.Header.Get("Range")) == "" {
+		return r
+	}
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	clone.Header.Del("Range")
+	return clone
 }
 
 func (s *Server) bundleData() (*staticBundleData, bool, error) {
@@ -2260,10 +2792,10 @@ func (s *Server) applyBundleTrainCardRiderCount(ctx context.Context, payload map
 	switch card := payload["trainCard"].(type) {
 	case map[string]any:
 		if card != nil {
-			card["riders"] = len(users)
+			card["riders"] = trainapp.PublicRiderCount(len(users))
 		}
 	case trainapp.TrainCard:
-		card.Riders = len(users)
+		card.Riders = trainapp.PublicRiderCount(len(users))
 		payload["trainCard"] = card
 	}
 }
@@ -2284,9 +2816,11 @@ func (s *Server) healthPayload(now time.Time, liveness bool) map[string]any {
 		"scheduleFallbackActive": scheduleCtx.FallbackActive,
 		"scheduleSameDayFresh":   scheduleCtx.SameDayFresh,
 		"version": map[string]any{
-			"commit":    s.release.Commit,
-			"buildTime": s.release.BuildTime,
-			"dirty":     s.release.Dirty,
+			"commit":       s.release.Commit,
+			"buildTime":    s.release.BuildTime,
+			"dirty":        s.release.Dirty,
+			"releaseId":    s.release.ReleaseID,
+			"sourceSha256": s.release.SourceSHA256,
 		},
 		"runtime": map[string]any{
 			"instanceId": s.release.Instance,
