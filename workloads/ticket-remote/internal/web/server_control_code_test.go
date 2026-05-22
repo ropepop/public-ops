@@ -80,14 +80,89 @@ func TestControlCodeRequestQueuesPhoneCommandAndRoutesResultPrivately(t *testing
 	}
 	if strings.Contains(privateResult, `"imageBase64"`) ||
 		strings.Contains(privateResult, `"imageMime"`) ||
-		strings.Contains(privateResult, `"captureRequired"`) ||
-		strings.Contains(privateResult, `"capture"`) {
-		t.Fatalf("marker-driven result must not require browser capture or echo image bytes: %s", privateResult)
+		!strings.Contains(privateResult, `"captureRequired":true`) ||
+		!strings.Contains(privateResult, `"captureReason":"waiting_for_browser_capture"`) {
+		t.Fatalf("marker result should require browser capture without image bytes: %s", privateResult)
 	}
-	assertNoPhoneMessageContaining(t, messages, `"type":"control_code_browser_capture"`, 250*time.Millisecond)
+	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", response.Request.ID, 42, 77)
+	if !capture.OK || capture.Request.CaptureAcknowledgedAt == "" {
+		t.Fatalf("browser capture ack failed: %#v", capture)
+	}
+	ack := waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
+	if !strings.Contains(ack, `"requestId":"`+response.Request.ID+`"`) || !strings.Contains(ack, `"ok":true`) {
+		t.Fatalf("phone capture ack mismatch: %s", ack)
+	}
 	assertNoBrowserMessageContaining(t, other, response.Request.ID, 250*time.Millisecond)
 	assertNoBrowserMessageContaining(t, other, `"popup_ready"`, 250*time.Millisecond)
 	assertNoBrowserMessageContaining(t, other, `"totalDurationMillis"`, 250*time.Millisecond)
+}
+
+func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
+	messages := make(chan string, 20)
+	phoneResults := make(chan string, 20)
+	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
+	defer phoneServer.Close()
+	leaseEvents := make(chan brokerLeaseEvent, 8)
+	broker := newTicketLeaseBrokerRecorder(t, leaseEvents)
+	defer broker.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	server.cfg.Phone.BrokerBaseURL = broker.URL
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	requester := dialTicketControlClientWithSession(t, httpServer, "ticket@jolkins.id.lv", "requester-session")
+	defer requester.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
+	controlLeaseID := "control-code:" + response.Request.ID
+	acquire := expectBrokerLeaseEventWithLease(t, leaseEvents, "/api/v1/phone/leases/ticket", controlLeaseID)
+	if acquire.LeaseID != "control-code:"+response.Request.ID || acquire.RequestID != response.Request.ID || acquire.Reason != "control_code_request" {
+		t.Fatalf("control-code lease acquire = %#v request=%#v", acquire, response.Request)
+	}
+	phoneCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	for _, snippet := range []string{
+		`"owner":"ticket"`,
+		`"app":"vivi"`,
+		`"flow":"control_code"`,
+		`"requestId":"` + response.Request.ID + `"`,
+	} {
+		if !strings.Contains(phoneCommand, snippet) {
+			t.Fatalf("phone command missing %q: %s", snippet, phoneCommand)
+		}
+	}
+
+	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_root"}`
+	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
+	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", response.Request.ID, 42, 77)
+	if !capture.OK {
+		t.Fatalf("browser capture failed: %#v", capture)
+	}
+	waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
+
+	select {
+	case event := <-leaseEvents:
+		if event.Path == "/api/v1/phone/leases/ticket/release" {
+			t.Fatalf("ticket lease released before phone cleanup: %#v", event)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"ticket_detail"}`
+	release := expectBrokerLeaseEventWithLease(t, leaseEvents, "/api/v1/phone/leases/ticket/release", controlLeaseID)
+	if release.LeaseID != "control-code:"+response.Request.ID || release.RequestID != response.Request.ID {
+		t.Fatalf("control-code lease release = %#v", release)
+	}
 }
 
 func TestControlCodeAsyncFlowAcceptsDigitLengthsTwoThroughEight(t *testing.T) {
@@ -137,12 +212,16 @@ func TestControlCodeAsyncFlowAcceptsDigitLengthsTwoThroughEight(t *testing.T) {
 		}
 		server.codeMu.Unlock()
 
+		capture := postControlCodeCaptureRaw(t, httpServer.URL, email, sessionID, response.Request.ID, streamEpoch, minFrameSequence)
+		if !capture.OK {
+			t.Fatalf("length %d browser capture ack failed: %#v", length, capture)
+		}
 		phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"return_to_raw_complete"}`
 		waitForControlCodeServerIdle(t, server, response.Request.ID)
 	}
 }
 
-func TestControlCodeFrameReadyCompletesWithoutBrowserCaptureTimeout(t *testing.T) {
+func TestControlCodeFrameReadyRequiresBrowserCaptureBeforeCleanup(t *testing.T) {
 	server := newTicketWebServer(t, newTicketMemoryStore(t, "http://phone.test"), phone.NewRelay(phone.RelayConfig{BaseURL: "http://phone.test"}), "http://phone.test")
 	req := &controlCodeRequest{
 		ID:          "req-marker",
@@ -163,12 +242,12 @@ func TestControlCodeFrameReadyCompletesWithoutBrowserCaptureTimeout(t *testing.T
 	server.codeMu.Lock()
 	defer server.codeMu.Unlock()
 	got := server.codeRequests[req.ID]
-	if got.Status != controlCodeSucceeded || !got.CleanupPending {
-		t.Fatalf("frame-ready marker should complete without browser capture: %#v", got)
+	if got.Status != controlCodeSucceeded || !got.CleanupPending || !got.CaptureRequired {
+		t.Fatalf("frame-ready marker should wait for browser capture before cleanup: %#v", got)
 	}
 }
 
-func TestControlCodeRawReturnAfterMarkerDoesNotFailResult(t *testing.T) {
+func TestControlCodeRawReturnBeforeBrowserCaptureFailsResult(t *testing.T) {
 	messages := make(chan string, 20)
 	phoneResults := make(chan string, 20)
 	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
@@ -204,8 +283,8 @@ func TestControlCodeRawReturnAfterMarkerDoesNotFailResult(t *testing.T) {
 	server.codeMu.Lock()
 	got := server.codeRequests[request.Request.ID]
 	server.codeMu.Unlock()
-	if got == nil || got.Status != controlCodeSucceeded {
-		t.Fatalf("raw return must not depend on a later browser capture: %#v", got)
+	if got == nil || got.Status != controlCodeFailed || got.Reason != "result_window_closed_before_capture" {
+		t.Fatalf("raw return before browser capture must fail the result: %#v", got)
 	}
 }
 
@@ -288,6 +367,73 @@ func TestControlCodePrepareSendsPhonePrepareWithoutQueueingRequest(t *testing.T)
 	}
 }
 
+func TestControlCodeRequestWaitsForSocketAfterDirectPhoneStart(t *testing.T) {
+	messages := make(chan string, 20)
+	startRequests := make(chan struct{}, 5)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			startRequests <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session":
+			time.Sleep(controlCodeRelayConnectWait + 300*time.Millisecond)
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone control websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			for {
+				_, data, err := conn.Read(r.Context())
+				if err != nil {
+					return
+				}
+				messages <- string(data)
+			}
+		case "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone video websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			_, _, _ = conn.Read(r.Context())
+			<-r.Context().Done()
+		case "/api/v1/session/stop":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
+
+	select {
+	case <-startRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control-code relay prep did not call direct phone session start")
+	}
+	phoneCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	if !strings.Contains(phoneCommand, `"requestId":"`+response.Request.ID+`"`) || !strings.Contains(phoneCommand, `"digits":"12345"`) {
+		t.Fatalf("phone command mismatch after delayed socket readiness: %s", phoneCommand)
+	}
+}
+
 func TestControlCodeResultRoutesOnlyToRequestingSession(t *testing.T) {
 	messages := make(chan string, 10)
 	phoneResults := make(chan string, 10)
@@ -323,9 +469,8 @@ func TestControlCodeResultRoutesOnlyToRequestingSession(t *testing.T) {
 	if !strings.Contains(privateResult, `"streamEpoch":42`) ||
 		!strings.Contains(privateResult, `"frameSequence":77`) ||
 		!strings.Contains(privateResult, `"minFrameSequence":77`) ||
-		strings.Contains(privateResult, `"captureRequired"`) ||
-		strings.Contains(privateResult, `"capture"`) {
-		t.Fatalf("requesting session should receive a marker result without capture fields: %s", privateResult)
+		!strings.Contains(privateResult, `"captureRequired":true`) {
+		t.Fatalf("requesting session should receive marker result awaiting browser capture: %s", privateResult)
 	}
 	assertNoBrowserMessageContaining(t, sameEmailOtherSession, response.Request.ID, 250*time.Millisecond)
 }
@@ -358,19 +503,23 @@ func TestControlCodeFrameReadyMovesRequestToSucceededAndRoutesOnlyToRequester(t 
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated","totalDurationMillis":432,"phases":{"popup_opened":50}}`
+	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual","resultProofAt":"2026-05-22T10:23:45.123Z","totalDurationMillis":432,"phases":{"popup_opened":50}}`
 
 	result := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	for _, snippet := range []string{
 		`"value":"12345"`,
 		`"reason":"generated"`,
+		`"resultProof":"phone_visual"`,
+		`"resultFrameEpoch":42`,
+		`"resultMinFrameSequence":77`,
+		`"resultProofAt":"2026-05-22T10:23:45.123Z"`,
 		`"cleanupPending":true`,
 	} {
 		if !strings.Contains(result, snippet) {
 			t.Fatalf("marker update missing %q: %s", snippet, result)
 		}
 	}
-	for _, stale := range []string{`"captureRequired"`, `"capture"`, `"source":"browser_canvas_local"`} {
+	for _, stale := range []string{`"source":"browser_canvas_local"`} {
 		if strings.Contains(result, stale) {
 			t.Fatalf("marker update should not include browser capture field %q: %s", stale, result)
 		}
@@ -378,7 +527,7 @@ func TestControlCodeFrameReadyMovesRequestToSucceededAndRoutesOnlyToRequester(t 
 	assertNoBrowserMessageContaining(t, otherSession, response.Request.ID, 250*time.Millisecond)
 }
 
-func TestControlCodeFrameReadyDoesNotAckPhoneOrRequireBrowserPost(t *testing.T) {
+func TestControlCodeFrameReadyRequiresBrowserPostBeforePhoneCleanup(t *testing.T) {
 	messages := make(chan string, 30)
 	phoneResults := make(chan string, 30)
 	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
@@ -407,13 +556,17 @@ func TestControlCodeFrameReadyDoesNotAckPhoneOrRequireBrowserPost(t *testing.T) 
 	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"cleanupPending":true`) ||
+		!strings.Contains(privateResult, `"captureRequired":true`) ||
 		strings.Contains(privateResult, `"source":"browser_canvas_local"`) ||
-		strings.Contains(privateResult, `"captureRequired"`) ||
 		strings.Contains(privateResult, `"imageBase64"`) ||
 		strings.Contains(privateResult, `"imageMime"`) {
-		t.Fatalf("requester did not receive marker-only result: %s", privateResult)
+		t.Fatalf("requester did not receive capture-required result: %s", privateResult)
 	}
-	assertNoPhoneMessageContaining(t, messages, `"type":"control_code_browser_capture"`, 250*time.Millisecond)
+	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", response.Request.ID, 42, 77)
+	if !capture.OK || capture.Request.CaptureAcknowledgedAt == "" {
+		t.Fatalf("browser capture ack failed: %#v", capture)
+	}
+	waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
 }
 
 func TestControlCodeFrameReadyIsIdempotentForOwningSession(t *testing.T) {
@@ -638,9 +791,9 @@ func TestControlCodeResultDeliveryKeepsQueueBlockedUntilPhoneCleanup(t *testing.
 	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + first.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"cleanupPending":true`) ||
-		strings.Contains(privateResult, `"captureRequired"`) ||
+		!strings.Contains(privateResult, `"captureRequired":true`) ||
 		strings.Contains(privateResult, `"imageBase64"`) {
-		t.Fatalf("requester did not receive cleanup-pending result: %s", privateResult)
+		t.Fatalf("requester did not receive browser-capture-pending result: %s", privateResult)
 	}
 	assertNoPhoneMessageContaining(t, messages, `"type":"control_code_browser_capture"`, 250*time.Millisecond)
 	assertNoPhoneMessageContaining(t, messages, `"requestId":"`+second.Request.ID+`"`, 250*time.Millisecond)
@@ -681,6 +834,8 @@ func TestControlCodeCleanupAttentionKeepsSuccessfulResultVisible(t *testing.T) {
 
 	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + request.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
 	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
+	postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", request.Request.ID, 42, 77)
+	waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
 
 	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + request.Request.ID + `","ok":false,"reason":"control_code_cleanup_attention_needed"}`
 	update := waitForBrowserMessage(t, requester, `"cleanupReason":"control_code_cleanup_attention_needed"`)
@@ -917,18 +1072,20 @@ func TestControlCodeCloseRequiresRequestingSession(t *testing.T) {
 func TestControlCodeSucceededViewExpiresAfterSixtySeconds(t *testing.T) {
 	server := newTicketWebServer(t, newTicketMemoryStore(t, "http://127.0.0.1:1"), phone.NewRelay(phone.RelayConfig{BaseURL: "http://127.0.0.1:1"}), "http://127.0.0.1:1")
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	capturedAt := now.Add(5 * time.Second)
 	req := &controlCodeRequest{
-		ID:          "req-expire",
-		SessionID:   "session",
-		Email:       "ticket@jolkins.id.lv",
-		Digits:      "1234",
-		Status:      controlCodeSucceeded,
-		RequestedAt: now.Add(-5 * time.Second),
-		CompletedAt: now,
+		ID:                    "req-expire",
+		SessionID:             "session",
+		Email:                 "ticket@jolkins.id.lv",
+		Digits:                "1234",
+		Status:                controlCodeSucceeded,
+		RequestedAt:           now.Add(-5 * time.Second),
+		CompletedAt:           now,
+		CaptureAcknowledgedAt: capturedAt,
 	}
 	server.codeMu.Lock()
 	view := server.controlCodeViewLocked(req, now)
-	expiredView := server.controlCodeViewLocked(req, now.Add(61*time.Second))
+	expiredView := server.controlCodeViewLocked(req, capturedAt.Add(61*time.Second))
 	server.codeMu.Unlock()
 
 	if view.Status != controlCodeSucceeded {
@@ -941,11 +1098,41 @@ func TestControlCodeSucceededViewExpiresAfterSixtySeconds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse result expiry: %v", err)
 	}
-	if !expiresAt.Equal(now.Add(60 * time.Second)) {
-		t.Fatalf("expiresAt = %s, want %s", expiresAt, now.Add(60*time.Second))
+	if !expiresAt.Equal(capturedAt.Add(60 * time.Second)) {
+		t.Fatalf("expiresAt = %s, want %s", expiresAt, capturedAt.Add(60*time.Second))
 	}
 	if expiredView.Status != controlCodeExpired {
 		t.Fatalf("expired status = %q, want expired", expiredView.Status)
+	}
+}
+
+func TestControlCodePendingBrowserCaptureDoesNotExpireOrStartDisplayTTL(t *testing.T) {
+	server := newTicketWebServer(t, newTicketMemoryStore(t, "http://127.0.0.1:1"), phone.NewRelay(phone.RelayConfig{BaseURL: "http://127.0.0.1:1"}), "http://127.0.0.1:1")
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	req := &controlCodeRequest{
+		ID:              "req-capture-pending",
+		SessionID:       "session",
+		Email:           "ticket@jolkins.id.lv",
+		Digits:          "1234",
+		Status:          controlCodeSucceeded,
+		RequestedAt:     now.Add(-2 * time.Minute),
+		CompletedAt:     now.Add(-70 * time.Second),
+		CaptureRequired: true,
+		CaptureReason:   "waiting_for_browser_capture",
+		CleanupPending:  true,
+	}
+	server.codeMu.Lock()
+	view := server.controlCodeViewLocked(req, now)
+	server.codeMu.Unlock()
+
+	if view.Status != controlCodeSucceeded {
+		t.Fatalf("status = %q, want succeeded while browser capture is pending", view.Status)
+	}
+	if !view.CaptureRequired || view.CaptureReason != "waiting_for_browser_capture" {
+		t.Fatalf("capture state changed before browser proof: %#v", view)
+	}
+	if view.ResultExpiresAt != "" || view.ResultRemainingMS != 0 {
+		t.Fatalf("pending browser capture should not expose a result countdown: %#v", view)
 	}
 }
 
@@ -1219,6 +1406,35 @@ func postControlCodeCloseRaw(t *testing.T, serverURL string, email string, sessi
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"requestId": requestID})
 	req, err := http.NewRequest(http.MethodPost, serverURL+"/api/v1/control-code/close", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Ticket-Remote-Email", email)
+	if sessionID != "" {
+		req.AddCookie(&http.Cookie{Name: "ticket_remote_session", Value: sessionID})
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var decoded controlCodeRequestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
+
+func postControlCodeCaptureRaw(t *testing.T, serverURL string, email string, sessionID string, requestID string, frameEpoch int64, frameSequence int64) controlCodeRequestResponse {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"requestId":              requestID,
+		"candidateFrameEpoch":    frameEpoch,
+		"candidateFrameSequence": frameSequence,
+		"acceptedReason":         "candidate_frame_at_or_after_phone_marker",
+	})
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/api/v1/control-code/capture", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

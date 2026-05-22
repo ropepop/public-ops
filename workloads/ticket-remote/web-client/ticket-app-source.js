@@ -138,6 +138,7 @@
 
   let ws = null;
   let videoWs = null;
+  const activeVideoSockets = new Set();
   let reconnectTimer = null;
   let hiddenVideoCloseTimer = null;
   let configured = false;
@@ -195,6 +196,13 @@
   let controlCodeResultCaptureTimer = null;
   let controlCodeResultCaptureRequestID = '';
   let controlCodeResultCapturedRequestID = '';
+  let controlCodeCaptureAckInFlightRequestID = '';
+  let pendingControlCodeBaselineFrameFingerprint = null;
+  let controlCodeBaselineFrameFingerprint = null;
+  let controlCodeBaselineRequestID = '';
+  let lastControlCodeCaptureDebug = null;
+  let lastControlCodeCaptureKeyframeRequestAt = 0;
+  let lastControlCodeCaptureKeyframeRetryCount = 0;
   const localSessionID = String(cfg.sessionId || '').trim();
   const ownedControlCodeRequestIDs = new Set();
   const locallyClosedControlCodeRequestIDs = new Set();
@@ -207,6 +215,8 @@
   let screenWakeLockUnavailableLogged = false;
   let ticketFullscreenAttempted = false;
   let toolbarAnchorLogged = false;
+  let idleDisconnected = false;
+  let idleDisconnectTimer = null;
   const intentionallyClosedVideoSockets = new WeakSet();
   let lastTouchEndAt = 0;
   let lastTouchEndX = 0;
@@ -227,14 +237,81 @@
   const hiddenVideoCloseDelayMs = 3000;
   const backgroundRecoveryHiddenMs = 30000;
   const resumeVideoReconnectDelayMs = 600;
+  const idleDisconnectMs = 15 * 60 * 1000;
   const recoveryKeyframeDebounceMs = 2000;
   const recoveryDecoderResetDebounceMs = 5000;
   const recoveryVideoReconnectDebounceMs = 8000;
   const recoveryServerRecoverDebounceMs = 12000;
+  const controlCodeFingerprintGridWidth = 12;
+  const controlCodeFingerprintGridHeight = 16;
+  const controlCodeFingerprintDifferenceThreshold = 14;
+  const controlCodeFingerprintChangedCellsThreshold = 14;
+  const controlCodeCaptureKeyframeRetryMs = 650;
   const FRAME_ENVELOPE_MAGIC = 0x54534632;
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
   const doubleTapSuppressMs = 420;
   const doubleTapSuppressPx = 28;
+
+  function closeEarlyVideo(reason) {
+    const early = window.TICKET_EARLY_VIDEO;
+    if (!early || early.claimed) return;
+    early.claimed = true;
+    early.queue = [];
+    const socket = early.ws;
+    early.ws = null;
+    if (!socket) return;
+    try { socket.close(1000, reason || 'app_loaded'); } catch (_) {}
+  }
+
+  function scheduleViewerIdleDisconnect(reason) {
+    if (idleDisconnected) return;
+    if (idleDisconnectTimer) {
+      clearTimeout(idleDisconnectTimer);
+      idleDisconnectTimer = null;
+    }
+    idleDisconnectTimer = setTimeout(() => expireViewerIdle(reason || 'idle_timeout'), idleDisconnectMs);
+  }
+
+  function noteViewerActivity(event, reason) {
+    if (idleDisconnected) return;
+    if (event && event.isTrusted === false) return;
+    scheduleViewerIdleDisconnect(reason || (event && event.type) || 'activity');
+  }
+
+  function expireViewerIdle(reason) {
+    if (idleDisconnected) return;
+    idleDisconnected = true;
+    if (idleDisconnectTimer) {
+      clearTimeout(idleDisconnectTimer);
+      idleDisconnectTimer = null;
+    }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (hiddenVideoCloseTimer) {
+      clearTimeout(hiddenVideoCloseTimer);
+      hiddenVideoCloseTimer = null;
+    }
+    closeEarlyVideo('idle_disconnect');
+    closeDirectVideo();
+    resetStreamState({ preserveFrame: true });
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
+    if (spacetimeClient && typeof spacetimeClient.close === 'function') {
+      spacetimeClient.close();
+    }
+    spacetimeClient = null;
+    releaseScreenWakeLock('idle_disconnect');
+    setConnected('Apturēts');
+    setStatus('Straume apturēta pēc 15 minūtēm bez darbības.');
+    showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pārlādē lapu, lai turpinātu.', true);
+    document.body.dataset.streamFreshness = 'IDLE_DISCONNECTED';
+    publishStreamDebug();
+    clientLog('viewer_idle_disconnected', reason || 'idle_timeout');
+  }
 
   function layoutViewportRect() {
     const fallbackWidth = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || 1));
@@ -528,7 +605,7 @@
     ['Connection failed', 'Savienojums neizdevās'],
     ['Video connection failed', 'Video savienojums neizdevās'],
     ['control_mode_removed', 'Kontroles režīms ir aizstāts ar koda pieprasījumiem'],
-    ['invalid_code', 'Ievadi 2-9 ciparus'],
+    ['invalid_code', 'Ievadi 2-8 ciparus'],
     ['rate_limited', 'Minūtē var pieprasīt divus kodus'],
     ['phone_timeout', 'Tālrunis nepaspēja izveidot kodu'],
     ['phone_unavailable', 'Tālrunis pašlaik nav pieejams'],
@@ -746,9 +823,11 @@
   function showEmpty(message, showStart) {
     hideStreamResumeSpinner();
     emptyMessage.textContent = localizePublicMessage(message);
-    startStreamButton.hidden = true;
+    startStreamButton.hidden = !showStart;
     emptyState.hidden = false;
     document.body.dataset.streamReady = 'false';
+    document.body.dataset.streamLive = 'false';
+    document.body.dataset.streamFreshness = 'WAITING';
     keepFirstScreenPinned();
   }
 
@@ -798,6 +877,7 @@
   }
 
   function connect() {
+    if (idleDisconnected) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     clearTimeout(reconnectTimer);
     keepFirstScreenPinned();
@@ -826,6 +906,7 @@
       });
     };
     ws.onclose = () => {
+      if (idleDisconnected) return;
       setConnected('Savienojas no jauna');
       configured = false;
       streamUnsupported = false;
@@ -901,12 +982,13 @@
     }
     preserveCurrentFrame('close_direct_video');
     closeDecoder();
-    if (videoWs) {
-      const socket = videoWs;
+    const sockets = new Set(activeVideoSockets);
+    if (videoWs) sockets.add(videoWs);
+    videoWs = null;
+    sockets.forEach((socket) => {
       intentionallyClosedVideoSockets.add(socket);
-      try { socket.close(); } catch (_) {}
-      if (videoWs === socket) videoWs = null;
-    }
+      try { socket.close(1000, 'client_closed'); } catch (_) {}
+    });
   }
 
   function controlCodeKeepsVideoAliveWhileHidden() {
@@ -958,6 +1040,7 @@
   }
 
   function connectDirectVideo() {
+    if (idleDisconnected) return;
     if (document.visibilityState === 'hidden' && !controlCodeKeepsVideoAliveWhileHidden()) {
       pauseVideoWhileHidden('connect_direct_video_hidden');
       return;
@@ -976,21 +1059,32 @@
       return;
     }
     videoWs = socket;
+    activeVideoSockets.add(socket);
     socket.binaryType = 'arraybuffer';
     socket.onopen = () => {
+      if (idleDisconnected || videoWs !== socket) {
+        intentionallyClosedVideoSockets.add(socket);
+        try { socket.close(1000, 'stale_video_socket'); } catch (_) {}
+        return;
+      }
       videoConnectedAt = performance.now();
       showStreamWaiting('Saņem video konfigurāciju...');
       requestKeyframe('video_socket_open');
     };
     socket.onmessage = (event) => {
+      if (idleDisconnected || videoWs !== socket) return;
       handleVideoSocketMessage(event).catch((error) => {
         sendVideoClientLog('video_message_failed', error && error.message || 'message failed');
         requestKeyframe('video_message_failed');
       });
     };
     socket.onclose = () => {
+      activeVideoSockets.delete(socket);
       if (videoWs === socket) videoWs = null;
-      if (intentionallyClosedVideoSockets.has(socket)) return;
+      if (intentionallyClosedVideoSockets.has(socket)) {
+        intentionallyClosedVideoSockets.delete(socket);
+        return;
+      }
       resetStreamState({ preserveFrame: true });
       showStreamWaiting('Atjauno straumi...');
       if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
@@ -1095,7 +1189,8 @@
       hasFallbackFrame: fallbackFrameAvailable,
       lastFallbackFrameAt,
       streamResumeSpinnerVisible: streamResumeSpinnerVisible(),
-      latestStreamStatus
+      latestStreamStatus,
+      controlCodeCapture: lastControlCodeCaptureDebug
     };
   }
 
@@ -1539,6 +1634,7 @@
   }
 
   async function connectSpacetimeState() {
+    if (idleDisconnected) return;
     if (!usesDirectSpacetimeAuth() || spacetimeClient || !window.TicketSpacetime || spacetimeDirectUnavailable) return;
     let token = '';
     try {
@@ -1624,7 +1720,7 @@
   }
 
   function controlCodeDetailText(request) {
-    if (!request) return 'Ievadi 2-9 ciparus, tālrunis kodu izveidos automātiski.';
+    if (!request) return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
     if (request.status === 'queued') {
       const position = Number(request.queuePosition || 0);
       return position > 1 ? `Rindā: ${position}. vieta` : 'Pieprasījums rindā';
@@ -1633,7 +1729,7 @@
     if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
     if (request.status === 'failed') return localizePublicMessage(request.reason || request.message || 'Kodu neizdevās izveidot');
     if (request.status === 'expired' || request.status === 'closed') return 'Vari pieprasīt jaunu kodu.';
-    return 'Ievadi 2-9 ciparus, tālrunis kodu izveidos automātiski.';
+    return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
   }
 
   function scheduleControlCodeTicker(request) {
@@ -1682,25 +1778,471 @@
     }
     controlCodeResultCaptureRequestID = '';
     controlCodeResultCapturedRequestID = '';
+    controlCodeCaptureAckInFlightRequestID = '';
+    pendingControlCodeBaselineFrameFingerprint = null;
+    controlCodeBaselineFrameFingerprint = null;
+    controlCodeBaselineRequestID = '';
+    lastControlCodeCaptureDebug = null;
+    lastControlCodeCaptureKeyframeRequestAt = 0;
+    lastControlCodeCaptureKeyframeRetryCount = 0;
     codeResultImage.hidden = true;
     codeResultImage.removeAttribute('src');
+    publishStreamDebug();
+  }
+
+  function controlCodeFingerprintRegion() {
+    return {
+      x: 0.12,
+      y: 0.16,
+      width: 0.76,
+      height: 0.36
+    };
+  }
+
+  function canvasRegionFingerprint(region) {
+    if (!hasRenderedFrame || !canvas.width || !canvas.height || !region) return null;
+    const width = Math.max(1, Math.round(Number(region.width || 0) * canvas.width));
+    const height = Math.max(1, Math.round(Number(region.height || 0) * canvas.height));
+    const x = Math.max(0, Math.min(canvas.width - width, Math.round(Number(region.x || 0) * canvas.width)));
+    const y = Math.max(0, Math.min(canvas.height - height, Math.round(Number(region.y || 0) * canvas.height)));
+    try {
+      const values = [];
+      let total = 0;
+      let darkCells = 0;
+      let lightCells = 0;
+      for (let row = 0; row < controlCodeFingerprintGridHeight; row++) {
+        for (let col = 0; col < controlCodeFingerprintGridWidth; col++) {
+          const px = Math.max(0, Math.min(canvas.width - 1, x + Math.round((col + 0.5) * width / controlCodeFingerprintGridWidth)));
+          const py = Math.max(0, Math.min(canvas.height - 1, y + Math.round((row + 0.5) * height / controlCodeFingerprintGridHeight)));
+          const pixel = ctx.getImageData(px, py, 1, 1).data;
+          const luminance = Math.round((pixel[0] * 0.299) + (pixel[1] * 0.587) + (pixel[2] * 0.114));
+          values.push(luminance);
+          total += luminance;
+          if (luminance <= 80) darkCells++;
+          if (luminance >= 175) lightCells++;
+        }
+      }
+      const mean = values.length ? total / values.length : 0;
+      let varianceTotal = 0;
+      values.forEach((value) => {
+        const delta = value - mean;
+        varianceTotal += delta * delta;
+      });
+      return {
+        values,
+        mean,
+        contrastScore: values.length ? Math.sqrt(varianceTotal / values.length) : 0,
+        darkCellRatio: values.length ? darkCells / values.length : 0,
+        lightCellRatio: values.length ? lightCells / values.length : 0,
+        frameEpoch: lastRenderedFrameEpoch,
+        frameSequence: lastRenderedFrameSequence,
+        at: Date.now(),
+        region: { x, y, width, height }
+      };
+    } catch (error) {
+      reportClientFault('control_code_fingerprint_failed', error);
+      return null;
+    }
+  }
+
+  function fingerprintDifferenceScore(left, right) {
+    if (!left || !right || !Array.isArray(left.values) || !Array.isArray(right.values)) {
+      return { score: 0, changedCells: 0 };
+    }
+    const length = Math.min(left.values.length, right.values.length);
+    if (!length) return { score: 0, changedCells: 0 };
+    let total = 0;
+    let changedCells = 0;
+    for (let index = 0; index < length; index++) {
+      const delta = Math.abs(Number(left.values[index] || 0) - Number(right.values[index] || 0));
+      total += delta;
+      if (delta >= 24) changedCells++;
+    }
+    return {
+      score: total / length,
+      changedCells
+    };
+  }
+
+  function controlCodePopupFrameProof() {
+    function regionOrangeCellRatio(region) {
+      if (!hasRenderedFrame || !canvas.width || !canvas.height || !region) return 0;
+      const width = Math.max(1, Math.round(Number(region.width || 0) * canvas.width));
+      const height = Math.max(1, Math.round(Number(region.height || 0) * canvas.height));
+      const x = Math.max(0, Math.min(canvas.width - width, Math.round(Number(region.x || 0) * canvas.width)));
+      const y = Math.max(0, Math.min(canvas.height - height, Math.round(Number(region.y || 0) * canvas.height)));
+      try {
+        const imageData = ctx.getImageData(x, y, Math.min(width, canvas.width - x), Math.min(height, canvas.height - y));
+        const cols = 10;
+        const rows = 5;
+        let sampled = 0;
+        let orange = 0;
+        for (let row = 0; row < rows; row++) {
+          for (let col = 0; col < cols; col++) {
+            const px = Math.max(0, Math.min(imageData.width - 1, Math.round((col + 0.5) * imageData.width / cols)));
+            const py = Math.max(0, Math.min(imageData.height - 1, Math.round((row + 0.5) * imageData.height / rows)));
+            const offset = (py * imageData.width + px) * 4;
+            const red = imageData.data[offset] || 0;
+            const green = imageData.data[offset + 1] || 0;
+            const blue = imageData.data[offset + 2] || 0;
+            if (red >= 155 && green >= 80 && green <= 190 && blue <= 95 && red - green >= 20 && green - blue >= 25) {
+              orange++;
+            }
+            sampled++;
+          }
+        }
+        return sampled ? orange / sampled : 0;
+      } catch (error) {
+        reportClientFault('control_code_popup_orange_proof_failed', error);
+        return 0;
+      }
+    }
+    const keyboard = canvasRegionFingerprint({
+      x: 0.08,
+      y: 0.62,
+      width: 0.84,
+      height: 0.34
+    });
+    const dialog = canvasRegionFingerprint({
+      x: 0.16,
+      y: 0.38,
+      width: 0.68,
+      height: 0.22
+    });
+    const inputLine = canvasRegionFingerprint({
+      x: 0.24,
+      y: 0.52,
+      width: 0.52,
+      height: 0.045
+    });
+    const okButton = canvasRegionFingerprint({
+      x: 0.64,
+      y: 0.51,
+      width: 0.18,
+      height: 0.07
+    });
+    const keyboardVisible = Boolean(keyboard &&
+      keyboard.lightCellRatio >= 0.58 &&
+      keyboard.mean >= 150 &&
+      keyboard.contrastScore <= 95);
+    const dialogVisible = Boolean(dialog &&
+      dialog.lightCellRatio >= 0.42 &&
+      dialog.mean >= 118 &&
+      dialog.darkCellRatio <= 0.30 &&
+      dialog.contrastScore <= 98);
+    const inputLineVisible = Boolean(inputLine &&
+      inputLine.darkCellRatio >= 0.08 &&
+      inputLine.contrastScore >= 18);
+    const okButtonOrangeRatio = regionOrangeCellRatio({
+      x: 0.64,
+      y: 0.51,
+      width: 0.18,
+      height: 0.07
+    });
+    const okButtonVisible = okButtonOrangeRatio >= 0.08 || Boolean(okButton &&
+      okButton.mean >= 105 &&
+      okButton.mean <= 220 &&
+      okButton.contrastScore <= 85 &&
+      okButton.lightCellRatio >= 0.18);
+    return {
+      keyboardVisible: dialogVisible && keyboardVisible,
+      popupVisible: dialogVisible && (okButtonVisible || inputLineVisible),
+      keyboardLightCellRatio: keyboard ? Math.round(Number(keyboard.lightCellRatio || 0) * 100) / 100 : 0,
+      keyboardMean: keyboard ? Math.round(Number(keyboard.mean || 0) * 10) / 10 : 0,
+      keyboardContrastScore: keyboard ? Math.round(Number(keyboard.contrastScore || 0) * 10) / 10 : 0,
+      popupLightCellRatio: dialog ? Math.round(Number(dialog.lightCellRatio || 0) * 100) / 100 : 0,
+      popupDarkCellRatio: dialog ? Math.round(Number(dialog.darkCellRatio || 0) * 100) / 100 : 0,
+      popupContrastScore: dialog ? Math.round(Number(dialog.contrastScore || 0) * 10) / 10 : 0,
+      popupInputLineDarkCellRatio: inputLine ? Math.round(Number(inputLine.darkCellRatio || 0) * 100) / 100 : 0,
+      okButtonOrangeRatio: Math.round(okButtonOrangeRatio * 100) / 100,
+      okButtonVisible,
+      inputLineVisible
+    };
+  }
+
+  function controlCodeResultChipProof() {
+    if (!canvas.width || !canvas.height) {
+      return {
+        chipVisible: false,
+        chipDarkRatio: 0,
+        chipLightRatio: 0,
+        chipRows: 0
+      };
+    }
+    const x = Math.max(0, Math.round(canvas.width * 0.14));
+    const y = Math.max(0, Math.round(canvas.height * 0.47));
+    const width = Math.max(1, Math.round(canvas.width * 0.72));
+    const height = Math.max(1, Math.round(canvas.height * 0.08));
+    const cols = 52;
+    const rows = 12;
+    let imageData;
+    try {
+      imageData = ctx.getImageData(x, y, Math.min(width, canvas.width - x), Math.min(height, canvas.height - y));
+    } catch (error) {
+      reportClientFault('control_code_chip_proof_failed', error);
+      return {
+        chipVisible: false,
+        chipDarkRatio: 0,
+        chipLightRatio: 0,
+        chipRows: 0
+      };
+    }
+    const data = imageData.data;
+    const sampleWidth = imageData.width;
+    const sampleHeight = imageData.height;
+    let sampled = 0;
+    let dark = 0;
+    let light = 0;
+    let chipRows = 0;
+    for (let row = 0; row < rows; row++) {
+      let rowDark = 0;
+      for (let col = 0; col < cols; col++) {
+        const px = Math.max(0, Math.min(sampleWidth - 1, Math.round((col + 0.5) * sampleWidth / cols)));
+        const py = Math.max(0, Math.min(sampleHeight - 1, Math.round((row + 0.5) * sampleHeight / rows)));
+        const offset = (py * sampleWidth + px) * 4;
+        const red = data[offset] || 0;
+        const green = data[offset + 1] || 0;
+        const blue = data[offset + 2] || 0;
+        const luminance = Math.round((red * 299 + green * 587 + blue * 114) / 1000);
+        if (luminance <= 80) {
+          dark++;
+          rowDark++;
+        }
+        if (luminance >= 175) {
+          light++;
+        }
+        sampled++;
+      }
+      if (rowDark >= 40) {
+        chipRows++;
+      }
+    }
+    const chipDarkRatio = sampled ? dark / sampled : 0;
+    const chipLightRatio = sampled ? light / sampled : 0;
+    return {
+      chipVisible: chipRows >= 3 && chipDarkRatio >= 0.42 && chipLightRatio <= 0.58,
+      chipDarkRatio: Math.round(chipDarkRatio * 100) / 100,
+      chipLightRatio: Math.round(chipLightRatio * 100) / 100,
+      chipRows
+    };
+  }
+
+  function controlCodeGeneratedFrameProof() {
+    const chip = controlCodeResultChipProof();
+    const resultBar = canvasRegionFingerprint({
+      x: 0.14,
+      y: 0.47,
+      width: 0.72,
+      height: 0.08
+    });
+    const codeArea = canvasRegionFingerprint({
+      x: 0.18,
+      y: 0.16,
+      width: 0.64,
+      height: 0.28
+    });
+    const generatedBarVisible = Boolean(resultBar &&
+      Number(resultBar.darkCellRatio || 0) >= 0.24 &&
+      Number(resultBar.lightCellRatio || 0) >= 0.22 &&
+      Number(resultBar.contrastScore || 0) >= 60);
+    const generatedCodeVisible = Boolean(codeArea &&
+      Number(codeArea.darkCellRatio || 0) >= 0.06 &&
+      Number(codeArea.lightCellRatio || 0) >= 0.18 &&
+      Number(codeArea.contrastScore || 0) >= 42);
+    return {
+      generatedVisible: chip.chipVisible && generatedCodeVisible,
+      generatedChipVisible: chip.chipVisible,
+      generatedChipDarkRatio: chip.chipDarkRatio,
+      generatedChipLightRatio: chip.chipLightRatio,
+      generatedChipRows: chip.chipRows,
+      generatedBarVisible,
+      generatedCodeVisible,
+      generatedBarDarkCellRatio: resultBar ? Math.round(Number(resultBar.darkCellRatio || 0) * 100) / 100 : 0,
+      generatedBarLightCellRatio: resultBar ? Math.round(Number(resultBar.lightCellRatio || 0) * 100) / 100 : 0,
+      generatedBarContrastScore: resultBar ? Math.round(Number(resultBar.contrastScore || 0) * 10) / 10 : 0,
+      generatedCodeDarkCellRatio: codeArea ? Math.round(Number(codeArea.darkCellRatio || 0) * 100) / 100 : 0,
+      generatedCodeLightCellRatio: codeArea ? Math.round(Number(codeArea.lightCellRatio || 0) * 100) / 100 : 0,
+      generatedCodeContrastScore: codeArea ? Math.round(Number(codeArea.contrastScore || 0) * 10) / 10 : 0
+    };
+  }
+
+  function rememberControlCodeBaselineFrame(requestID) {
+    requestID = String(requestID || '').trim();
+    if (!requestID) return false;
+    if (controlCodeBaselineRequestID === requestID && controlCodeBaselineFrameFingerprint) return true;
+    controlCodeBaselineRequestID = requestID;
+    controlCodeBaselineFrameFingerprint = pendingControlCodeBaselineFrameFingerprint || canvasRegionFingerprint(controlCodeFingerprintRegion());
+    pendingControlCodeBaselineFrameFingerprint = null;
+    lastControlCodeCaptureKeyframeRequestAt = 0;
+    lastControlCodeCaptureKeyframeRetryCount = 0;
+    lastControlCodeCaptureDebug = {
+      requestId: requestID,
+      baselineCaptured: Boolean(controlCodeBaselineFrameFingerprint),
+      baselineFrameEpoch: controlCodeBaselineFrameFingerprint ? controlCodeBaselineFrameFingerprint.frameEpoch : 0,
+      baselineFrameSequence: controlCodeBaselineFrameFingerprint ? controlCodeBaselineFrameFingerprint.frameSequence : 0,
+      candidateAccepted: false,
+      candidateRejectedReason: controlCodeBaselineFrameFingerprint ? 'waiting_for_marker' : 'baseline_missing'
+    };
+    publishStreamDebug();
+    return Boolean(controlCodeBaselineFrameFingerprint);
   }
 
   function controlCodeMarkerReady(request) {
     if (!request || request.status !== 'succeeded') return false;
-    const markerEpoch = Number(request.streamEpoch || 0);
-    const markerSequence = Number(request.minFrameSequence || request.frameSequence || 0);
+    const markerEpoch = Number(request.resultFrameEpoch || request.streamEpoch || 0);
+    const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
     if (!markerEpoch || !markerSequence || !hasRenderedFrame) return false;
     return lastRenderedFrameEpoch === markerEpoch && lastRenderedFrameSequence >= markerSequence;
   }
 
-  function captureControlCodeResultScreenshot(request) {
+  function controlCodeMarkerReceivedAgeMillis(request) {
+    const raw = request && (request.resultProofAt || request.markerReceivedAt || request.completedAt || request.startedAt);
+    const parsed = Date.parse(raw || '');
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.round(Date.now() + serverClockSkewMs - parsed));
+  }
+
+  function controlCodeCandidateFrameProof(request) {
+    const requestID = String(request && request.requestId || '').trim();
+    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
+    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    const proof = {
+      accepted: false,
+      requestId: requestID,
+      resultProof: String(request && request.resultProof || '').trim(),
+      markerEpoch,
+      markerSequence,
+      markerReceivedAgeMillis: controlCodeMarkerReceivedAgeMillis(request),
+      candidateFrameEpoch: lastRenderedFrameEpoch,
+      candidateFrameSequence: lastRenderedFrameSequence,
+      candidateAccepted: false,
+      candidateRejectedReason: '',
+      fingerprintDifferenceScore: 0,
+      fingerprintChangedCells: 0,
+      keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
+    };
+    if (!request || request.status !== 'succeeded') {
+      proof.candidateRejectedReason = 'request_not_succeeded';
+      return proof;
+    }
+    if (request.resultWindowClosedAt || request.cleanupFrameEpoch || request.cleanupMinFrameSequence) {
+      proof.candidateRejectedReason = 'result_window_closed_before_capture';
+      return proof;
+    }
+    if (!requestID) {
+      proof.candidateRejectedReason = 'request_id_missing';
+      return proof;
+    }
+    if (!markerEpoch || !markerSequence || !hasRenderedFrame) {
+      proof.candidateRejectedReason = 'marker_waiting';
+      return proof;
+    }
+    if (lastRenderedFrameEpoch !== markerEpoch || lastRenderedFrameSequence < markerSequence) {
+      proof.candidateRejectedReason = 'frame_before_marker';
+      return proof;
+    }
+    const candidateFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
+    const difference = fingerprintDifferenceScore(controlCodeBaselineFrameFingerprint, candidateFingerprint);
+    proof.fingerprintDifferenceScore = Math.round(Number(difference.score || 0) * 10) / 10;
+    proof.fingerprintChangedCells = Number(difference.changedCells || 0);
+    if (controlCodeBaselineFrameFingerprint &&
+      proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
+      proof.fingerprintChangedCells < controlCodeFingerprintChangedCellsThreshold) {
+      proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';
+      return proof;
+    }
+    const popupProof = controlCodePopupFrameProof();
+    proof.popupKeyboardVisible = popupProof.keyboardVisible;
+    proof.popupVisible = popupProof.popupVisible;
+    proof.popupLightCellRatio = popupProof.popupLightCellRatio;
+    proof.popupDarkCellRatio = popupProof.popupDarkCellRatio;
+    proof.popupContrastScore = popupProof.popupContrastScore;
+    proof.keyboardLightCellRatio = popupProof.keyboardLightCellRatio;
+    proof.keyboardMean = popupProof.keyboardMean;
+    proof.keyboardContrastScore = popupProof.keyboardContrastScore;
+    if (popupProof.popupVisible) {
+      proof.candidateRejectedReason = popupProof.keyboardVisible ? 'control_popup_keyboard_frame' : 'control_popup_frame';
+      return proof;
+    }
+    const generatedProof = controlCodeGeneratedFrameProof();
+    proof.generatedVisible = generatedProof.generatedVisible;
+    proof.generatedChipVisible = generatedProof.generatedChipVisible;
+    proof.generatedChipDarkRatio = generatedProof.generatedChipDarkRatio;
+    proof.generatedChipLightRatio = generatedProof.generatedChipLightRatio;
+    proof.generatedChipRows = generatedProof.generatedChipRows;
+    proof.generatedBarVisible = generatedProof.generatedBarVisible;
+    proof.generatedCodeVisible = generatedProof.generatedCodeVisible;
+    proof.generatedBarDarkCellRatio = generatedProof.generatedBarDarkCellRatio;
+    proof.generatedBarLightCellRatio = generatedProof.generatedBarLightCellRatio;
+    proof.generatedBarContrastScore = generatedProof.generatedBarContrastScore;
+    proof.generatedCodeDarkCellRatio = generatedProof.generatedCodeDarkCellRatio;
+    proof.generatedCodeLightCellRatio = generatedProof.generatedCodeLightCellRatio;
+    proof.generatedCodeContrastScore = generatedProof.generatedCodeContrastScore;
+    if (!generatedProof.generatedVisible) {
+      proof.candidateRejectedReason = 'generated_frame_not_visible';
+      return proof;
+    }
+    proof.accepted = true;
+    proof.candidateAccepted = true;
+    proof.candidateRejectedReason = '';
+    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    return proof;
+  }
+
+  function noteControlCodeCandidateRejected(proof) {
+    proof = proof || {};
+    const now = performance.now();
+    const reason = String(proof.candidateRejectedReason || proof.reason || 'candidate_rejected');
+    if (now - lastControlCodeCaptureKeyframeRequestAt >= controlCodeCaptureKeyframeRetryMs) {
+      lastControlCodeCaptureKeyframeRequestAt = now;
+      lastControlCodeCaptureKeyframeRetryCount += 1;
+      requestKeyframe(`control_code_candidate_rejected_${reason}`);
+    }
+    lastControlCodeCaptureDebug = Object.assign({}, proof, {
+      accepted: false,
+      candidateAccepted: false,
+      candidateRejectedReason: reason,
+      keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount,
+      rejectedAt: Date.now()
+    });
+    publishStreamDebug();
+  }
+
+  async function confirmControlCodeBrowserCapture(request, proof) {
+    const requestID = String(request && request.requestId || '').trim();
+    if (!requestID || !proof || !proof.accepted) return false;
+    const payload = await postJSON('/api/v1/control-code/capture', {
+      requestId: requestID,
+      candidateFrameEpoch: Number(proof.candidateFrameEpoch || 0),
+      candidateFrameSequence: Number(proof.candidateFrameSequence || 0),
+      acceptedReason: String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
+    });
+    if (payload.request) renderControlCodeRequest(payload.request);
+    return true;
+  }
+
+  async function captureControlCodeResultScreenshot(request, proof) {
     if (!request || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
+    if (!proof || !proof.accepted) return false;
+    const requestID = String(request.requestId || '').trim();
+    if (!requestID) return false;
     try {
-      codeResultImage.src = canvas.toDataURL('image/png');
+      const capturedImage = canvas.toDataURL('image/png');
+      controlCodeCaptureAckInFlightRequestID = requestID;
+      try {
+        await confirmControlCodeBrowserCapture(request, proof);
+      } finally {
+        if (controlCodeCaptureAckInFlightRequestID === requestID) {
+          controlCodeCaptureAckInFlightRequestID = '';
+        }
+      }
+      if (!codeRequest || String(codeRequest.requestId || '').trim() !== requestID || codeRequest.status !== 'succeeded') {
+        return false;
+      }
+      codeResultImage.src = capturedImage;
       setControlCodeResultVisible(true);
       codeResultImage.hidden = false;
-      controlCodeResultCapturedRequestID = String(request.requestId || '').trim();
+      controlCodeResultCapturedRequestID = requestID;
       codeResultStatus.textContent = '';
       codeResultStatus.hidden = true;
       codeResultValue.hidden = true;
@@ -1710,9 +2252,17 @@
       codeResultTimer.textContent = '';
       codeResultArea.dataset.status = 'succeeded';
       codeResultArea.style.background = '#000';
+      lastControlCodeCaptureDebug = Object.assign({}, proof, {
+        accepted: proof.accepted,
+        candidateAccepted: true,
+        fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
+        capturedAt: Date.now()
+      });
+      publishStreamDebug();
       return true;
     } catch (error) {
-      reportClientFault('control_code_canvas_snapshot_failed', error);
+      reportClientFault('control_code_browser_capture_failed', error);
+      failControlCodeResultScreenshotWait();
       return false;
     }
   }
@@ -1740,13 +2290,20 @@
     if (!codeRequest || codeRequest.status !== 'succeeded') return false;
     const requestID = String(codeRequest.requestId || '').trim();
     if (!requestID || controlCodeResultCapturedRequestID === requestID) return false;
+    if (controlCodeCaptureAckInFlightRequestID === requestID) return true;
     if (!controlCodeMarkerReady(codeRequest)) return false;
+    const proof = controlCodeCandidateFrameProof(codeRequest);
+    if (!proof.accepted) {
+      noteControlCodeCandidateRejected(proof);
+      return false;
+    }
     if (controlCodeResultCaptureTimer) {
       clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
     }
     controlCodeResultCaptureRequestID = '';
-    return captureControlCodeResultScreenshot(codeRequest);
+    captureControlCodeResultScreenshot(codeRequest, proof);
+    return true;
   }
 
   function waitForControlCodeResultScreenshot(request) {
@@ -1771,8 +2328,6 @@
     setControlCodeResultVisible(true);
     keepControlCodeVideoAlive('control_code_wait_reconnect');
     if (maybeCaptureControlCodeResultImage()) return;
-    const startedAt = performance.now();
-    const timeoutMs = 4500;
     const tick = () => {
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
         if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
@@ -1781,10 +2336,6 @@
         return;
       }
       if (maybeCaptureControlCodeResultImage()) return;
-      if (performance.now() - startedAt >= timeoutMs) {
-        failControlCodeResultScreenshotWait();
-        return;
-      }
       controlCodeResultCaptureTimer = setTimeout(tick, 80);
     };
     if (!controlCodeResultCaptureTimer) controlCodeResultCaptureTimer = setTimeout(tick, 80);
@@ -1830,6 +2381,9 @@
     codeRequestDetail.textContent = controlCodeDetailText(current);
     requestCodeButton.disabled = Boolean(busy);
     codeSubmit.disabled = Boolean(busy);
+    if (requestID && current && (busy || current.status === 'succeeded')) {
+      rememberControlCodeBaselineFrame(requestID);
+    }
     if (busy) {
       keepControlCodeVideoAlive('control_code_request_active');
     }
@@ -1903,12 +2457,13 @@
   async function submitControlCodeRequest() {
     const digits = sanitizeControlDigits(codeDigits.value);
     codeDigits.value = digits;
-    if (digits.length < 2 || digits.length > 9) {
-      codeError.textContent = 'Ievadi 2-9 ciparus.';
+    if (digits.length < 2 || digits.length > 8) {
+      codeError.textContent = 'Ievadi 2-8 ciparus.';
       return;
     }
     codeError.textContent = '';
     codeSubmit.disabled = true;
+    pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
     try {
       const payload = await postJSON('/api/v1/control-code/request', { digits });
       if (payload.request) {
@@ -2173,7 +2728,18 @@
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && codeDialogOpen) closeControlCodeDialog();
   });
-  startStreamButton.addEventListener('click', () => restartStream('manual_start'));
+  startStreamButton.addEventListener('click', () => {
+    if (idleDisconnected) {
+      location.reload();
+      return;
+    }
+    restartStream('manual_start');
+  });
+
+  for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown', 'scroll', 'focus']) {
+    const target = eventName === 'focus' ? window : document;
+    target.addEventListener(eventName, (event) => noteViewerActivity(event, eventName), { capture: true, passive: true });
+  }
 
   function point(event) {
     const rect = canvas.getBoundingClientRect();
@@ -2386,6 +2952,7 @@
   }
 
   function chaseLiveStream() {
+    if (idleDisconnected) return;
     if (streamUnsupported) return;
     if (!viewerIsForeground()) {
       if (document.visibilityState === 'hidden') {
@@ -2501,6 +3068,7 @@
   }
 
   function recoverAfterVisibilityResume(reason) {
+    if (idleDisconnected) return;
     const now = performance.now();
     const hiddenMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
     const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : null;
@@ -2560,6 +3128,7 @@
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
+      noteViewerActivity(null, 'visibility_visible');
       recoverAfterVisibilityResume('visibility_resume');
     } else if (document.visibilityState === 'hidden') {
       lastHiddenAt = performance.now();
@@ -2568,6 +3137,7 @@
     }
   });
   window.addEventListener('pageshow', (event) => {
+    noteViewerActivity(event, 'pageshow');
     if (screenEngaged) {
       requestScreenWakeLock('pageshow');
     }
@@ -2576,10 +3146,13 @@
     chaseLiveStream();
   });
   window.addEventListener('focus', () => {
+    noteViewerActivity(null, 'focus');
+    if (idleDisconnected) return;
     refreshHealth();
     chaseLiveStream();
   });
   window.addEventListener('pagehide', () => {
+    closeEarlyVideo('pagehide');
     closeDirectVideo();
     if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {
       spacetimeClient.disconnectPresence();
@@ -2587,18 +3160,24 @@
   });
   window.addEventListener('load', () => scheduleFirstScreenPin(true));
   setInterval(() => {
+    if (idleDisconnected) return;
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
       spacetimeClient.heartbeat(true);
     }
     send({ type: 'heartbeat', reason: 'public_heartbeat' });
   }, 15000);
-  setInterval(refreshHealth, 15000);
+  setInterval(() => {
+    if (idleDisconnected) return;
+    refreshHealth();
+  }, 15000);
   setInterval(chaseLiveStream, 1000);
   updateViewportVars();
   scheduleFirstScreenPin(true);
   updateDetailsReveal();
   resizeCanvasBox();
+  scheduleViewerIdleDisconnect('initial_load');
   showEmpty('Savienojas...', false);
+  closeEarlyVideo('app_loaded');
   refreshHealth();
   connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
   connect();

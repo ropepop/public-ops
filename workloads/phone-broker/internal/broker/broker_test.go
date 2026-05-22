@@ -99,6 +99,167 @@ func TestTicketPresencePreemptsRunningQRJobAndRetriesAfterGrace(t *testing.T) {
 	}
 }
 
+func TestTicketLeaseBlocksQueuedQRJobUntilRelease(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	lease, err := b.AcquireTicketLease(ctx, TicketLeaseInput{
+		LeaseID:   "control-code:request-1",
+		RequestID: "request-1",
+		Reason:    "control_code_request",
+		TTL:       time.Second,
+		Now:       time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.ID != "control-code:request-1" || lease.Reason != "control_code_request" || lease.RequestID != "request-1" {
+		t.Fatalf("lease = %#v", lease)
+	}
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "12345", Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case command := <-upstream.commands:
+		t.Fatalf("QR command started while ticket lease was active: %#v", command)
+	case <-time.After(60 * time.Millisecond):
+	}
+	snap := b.Snapshot(time.Now())
+	if snap.CurrentOwner != "ticket" || snap.DesiredOwner != "ticket" || snap.ActiveLease == nil || snap.ActiveLease.ID != lease.ID || snap.BlockedJobs != 1 {
+		t.Fatalf("snapshot while leased = %#v", snap)
+	}
+
+	if err := b.ReleaseTicketLease(ctx, TicketLeaseInput{LeaseID: lease.ID, Now: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	command := upstream.WaitForCommand(t, "generate_control_code")
+	if command["requestId"] != job.ID {
+		t.Fatalf("generate requestId after lease release = %#v, want %q", command["requestId"], job.ID)
+	}
+}
+
+func TestTicketLeasePreemptsRunningQRJobWithFlowScopedCancel(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "12345", Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.WaitForCommand(t, "generate_control_code")
+
+	if _, err := b.AcquireTicketLease(ctx, TicketLeaseInput{
+		LeaseID:   "viewer:session-a",
+		RequestID: "session-a",
+		Reason:    "stream_viewer",
+		TTL:       time.Second,
+		Now:       time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancelCommand := upstream.WaitForCommand(t, "cancel_rigassatiksme_qr")
+	if cancelCommand["requestId"] != job.ID {
+		t.Fatalf("cancel requestId = %#v, want %q", cancelCommand["requestId"], job.ID)
+	}
+	if cancelCommand["owner"] != "rigassatiksme" || cancelCommand["app"] != "rigas_satiksme" || cancelCommand["flow"] != "monthly_ticket" {
+		t.Fatalf("cancel command is not flow-scoped: %#v", cancelCommand)
+	}
+	got, ok := b.Job(job.ID)
+	if !ok {
+		t.Fatal("job disappeared")
+	}
+	if got.Status != JobWaiting || got.Reason != "ticket_lease_active" {
+		t.Fatalf("preempted job = %#v, want waiting ticket_lease_active", got)
+	}
+	snap := b.Snapshot(time.Now())
+	if snap.LastPreemptionReason != "ticket_lease_active" || snap.LastPreemptionAt == "" {
+		t.Fatalf("snapshot missing preemption evidence: %#v", snap)
+	}
+}
+
+func TestTicketLeaseHTTPAPIExposesStateAndRelease(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{UpstreamBaseURL: upstream.URL, RunnerInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	body := strings.NewReader(`{"leaseId":"control-code:api-request","requestId":"api-request","reason":"control_code_request","ttlMillis":60000}`)
+	resp, err := http.Post(server.URL+"/api/v1/phone/leases/ticket", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		payload := readResponseBody(t, resp)
+		t.Fatalf("acquire status = %d, want 200; body=%s", resp.StatusCode, payload)
+	}
+	var acquired struct {
+		OK    bool                `json:"ok"`
+		Lease TicketLeaseSnapshot `json:"lease"`
+		State StateSnapshot       `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&acquired); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !acquired.OK || acquired.Lease.ID != "control-code:api-request" || acquired.State.CurrentOwner != "ticket" || acquired.State.ActiveLease == nil {
+		t.Fatalf("acquired response = %#v", acquired)
+	}
+
+	releaseBody := strings.NewReader(`{"leaseId":"control-code:api-request"}`)
+	resp, err = http.Post(server.URL+"/api/v1/phone/leases/ticket/release", "application/json", releaseBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		payload := readResponseBody(t, resp)
+		t.Fatalf("release status = %d, want 200; body=%s", resp.StatusCode, payload)
+	}
+	var released struct {
+		OK    bool          `json:"ok"`
+		State StateSnapshot `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&released); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !released.OK || released.State.ActiveLease != nil || released.State.CurrentOwner != "none" {
+		t.Fatalf("released response = %#v", released)
+	}
+}
+
 func TestTicketPreemptionsDoNotConsumeRecoverableQRFailureBudget(t *testing.T) {
 	upstream := newFakePhone(t)
 	defer upstream.Close()

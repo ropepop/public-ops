@@ -131,19 +131,23 @@ type clientTelemetryEvent struct {
 }
 
 type pixelTicketEvent struct {
-	Type                string           `json:"type"`
-	EventSeq            int64            `json:"eventSeq,omitempty"`
-	TicketState         string           `json:"ticketState"`
-	Reason              string           `json:"reason,omitempty"`
-	RequestID           string           `json:"requestId,omitempty"`
-	Value               string           `json:"value,omitempty"`
-	StreamEpoch         int64            `json:"streamEpoch,omitempty"`
-	FrameSequence       int64            `json:"frameSequence,omitempty"`
-	MinFrameSequence    int64            `json:"minFrameSequence,omitempty"`
-	PhoneUptimeMillis   int64            `json:"phoneUptimeMillis,omitempty"`
-	TotalDurationMillis int64            `json:"totalDurationMillis,omitempty"`
-	Phases              map[string]int64 `json:"phases,omitempty"`
-	At                  string           `json:"at,omitempty"`
+	Type                   string           `json:"type"`
+	EventSeq               int64            `json:"eventSeq,omitempty"`
+	TicketState            string           `json:"ticketState"`
+	Reason                 string           `json:"reason,omitempty"`
+	RequestID              string           `json:"requestId,omitempty"`
+	Value                  string           `json:"value,omitempty"`
+	StreamEpoch            int64            `json:"streamEpoch,omitempty"`
+	FrameSequence          int64            `json:"frameSequence,omitempty"`
+	MinFrameSequence       int64            `json:"minFrameSequence,omitempty"`
+	ResultProof            string           `json:"resultProof,omitempty"`
+	ResultFrameEpoch       int64            `json:"resultFrameEpoch,omitempty"`
+	ResultMinFrameSequence int64            `json:"resultMinFrameSequence,omitempty"`
+	ResultProofAt          string           `json:"resultProofAt,omitempty"`
+	PhoneUptimeMillis      int64            `json:"phoneUptimeMillis,omitempty"`
+	TotalDurationMillis    int64            `json:"totalDurationMillis,omitempty"`
+	Phases                 map[string]int64 `json:"phases,omitempty"`
+	At                     string           `json:"at,omitempty"`
 }
 
 func newDirectStreamHub() *directStreamHub {

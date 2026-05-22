@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -46,6 +45,9 @@ const (
 	defaultPhoneSendTimeout   = 2 * time.Second
 	defaultJobTimeout         = 75 * time.Second
 	defaultImageTTL           = 2 * time.Minute
+	defaultTicketLeaseTTL     = 45 * time.Second
+	minTicketLeaseTTL         = 3 * time.Second
+	maxTicketLeaseTTL         = 3 * time.Minute
 	maxRecoverableJobAttempts = 3
 
 	controlCodeHealthPollInterval   = 250 * time.Millisecond
@@ -83,6 +85,9 @@ type Broker struct {
 	ticketSockets         int
 	ticketGraceUntil      time.Time
 	ticketQRBlockUntil    time.Time
+	ticketLeases          map[string]ticketLease
+	lastPreemptionReason  string
+	lastPreemptionAt      time.Time
 	runningJobID          string
 	runningCancel         context.CancelFunc
 	runningControl        *websocket.Conn
@@ -100,6 +105,37 @@ type QRJobInput struct {
 type TicketPresenceInput struct {
 	Viewers int
 	Now     time.Time
+}
+
+type TicketLeaseInput struct {
+	LeaseID   string
+	RequestID string
+	Reason    string
+	TTL       time.Duration
+	Now       time.Time
+}
+
+type ticketLease struct {
+	ID         string
+	RequestID  string
+	Reason     string
+	AcquiredAt time.Time
+	UpdatedAt  time.Time
+	ExpiresAt  time.Time
+}
+
+type TicketLeaseSnapshot struct {
+	ID                   string `json:"id"`
+	Owner                string `json:"owner"`
+	RequestID            string `json:"requestId,omitempty"`
+	Reason               string `json:"reason,omitempty"`
+	AcquiredAt           string `json:"acquiredAt,omitempty"`
+	UpdatedAt            string `json:"updatedAt,omitempty"`
+	ExpiresAt            string `json:"expiresAt,omitempty"`
+	RemainingMillis      int64  `json:"remainingMillis,omitempty"`
+	BlockedJobs          int    `json:"blockedJobs,omitempty"`
+	LastPreemptionReason string `json:"lastPreemptionReason,omitempty"`
+	LastPreemptionAt     string `json:"lastPreemptionAt,omitempty"`
 }
 
 type QRJob struct {
@@ -145,16 +181,22 @@ type upstreamHealth struct {
 }
 
 type StateSnapshot struct {
-	CurrentOwner    string     `json:"currentOwner"`
-	DesiredOwner    string     `json:"desiredOwner"`
-	DesiredPriority []string   `json:"desiredPriority,omitempty"`
-	TicketViewers   int        `json:"ticketViewers"`
-	TicketSockets   int        `json:"ticketSockets"`
-	TicketActive    bool       `json:"ticketActive"`
-	QueueDepth      int        `json:"queueDepth"`
-	RunningQRJob    bool       `json:"runningQRJob,omitempty"`
-	RunningJobID    string     `json:"-"`
-	Jobs            []StateJob `json:"jobs,omitempty"`
+	CurrentOwner         string               `json:"currentOwner"`
+	DesiredOwner         string               `json:"desiredOwner"`
+	DesiredPriority      []string             `json:"desiredPriority,omitempty"`
+	ActiveLease          *TicketLeaseSnapshot `json:"activeLease,omitempty"`
+	LeaseReason          string               `json:"leaseReason,omitempty"`
+	LeaseRequestID       string               `json:"leaseRequestId,omitempty"`
+	BlockedJobs          int                  `json:"blockedJobs,omitempty"`
+	LastPreemptionReason string               `json:"lastPreemptionReason,omitempty"`
+	LastPreemptionAt     string               `json:"lastPreemptionAt,omitempty"`
+	TicketViewers        int                  `json:"ticketViewers"`
+	TicketSockets        int                  `json:"ticketSockets"`
+	TicketActive         bool                 `json:"ticketActive"`
+	QueueDepth           int                  `json:"queueDepth"`
+	RunningQRJob         bool                 `json:"runningQRJob,omitempty"`
+	RunningJobID         string               `json:"-"`
+	Jobs                 []StateJob           `json:"jobs,omitempty"`
 }
 
 type StateJob struct {
@@ -263,10 +305,11 @@ func New(cfg Config) (*Broker, error) {
 		cfg.ImageTTL = defaultImageTTL
 	}
 	b := &Broker{
-		cfg:    cfg,
-		jobs:   map[string]*QRJob{},
-		images: map[string]QRImage{},
-		wake:   make(chan struct{}, 1),
+		cfg:          cfg,
+		jobs:         map[string]*QRJob{},
+		images:       map[string]QRImage{},
+		ticketLeases: map[string]ticketLease{},
+		wake:         make(chan struct{}, 1),
 	}
 	if err := b.load(); err != nil {
 		return nil, err
@@ -295,6 +338,8 @@ func (b *Broker) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/state", b.handleState)
 	mux.HandleFunc("/api/v1/analytics", b.handleAnalytics)
 	mux.HandleFunc("/api/v1/ticket/presence", b.handleTicketPresence)
+	mux.HandleFunc("/api/v1/phone/leases/ticket", b.handleTicketLease)
+	mux.HandleFunc("/api/v1/phone/leases/ticket/release", b.handleTicketLeaseRelease)
 	mux.HandleFunc("/api/v1/qr/jobs", b.handleQRJobs)
 	mux.HandleFunc("/api/v1/qr/jobs/", b.handleQRJob)
 	mux.HandleFunc("/api/v1/session/start", b.proxyHTTP)
@@ -364,6 +409,72 @@ func (b *Broker) UpdateTicketPresence(ctx context.Context, input TicketPresenceI
 	b.mu.Unlock()
 	b.signalRunner()
 	return err
+}
+
+func (b *Broker) AcquireTicketLease(ctx context.Context, input TicketLeaseInput) (TicketLeaseSnapshot, error) {
+	_ = ctx
+	now := input.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	leaseID := strings.TrimSpace(input.LeaseID)
+	if leaseID == "" {
+		leaseID = "ticket:" + randomID()
+	}
+	reason := strings.TrimSpace(input.Reason)
+	if reason == "" {
+		reason = "ticket_active"
+	}
+	ttl := normalizeTicketLeaseTTL(input.TTL)
+	lease := ticketLease{
+		ID:         leaseID,
+		RequestID:  strings.TrimSpace(input.RequestID),
+		Reason:     reason,
+		AcquiredAt: now.UTC(),
+		UpdatedAt:  now.UTC(),
+		ExpiresAt:  now.Add(ttl).UTC(),
+	}
+	b.mu.Lock()
+	if b.ticketLeases == nil {
+		b.ticketLeases = map[string]ticketLease{}
+	}
+	b.pruneExpiredTicketLeasesLocked(now)
+	if previous, ok := b.ticketLeases[leaseID]; ok && !previous.AcquiredAt.IsZero() {
+		lease.AcquiredAt = previous.AcquiredAt
+	}
+	b.ticketLeases[leaseID] = lease
+	if b.runningJobID != "" {
+		b.preemptRunningLocked(now, "ticket_lease_active")
+	}
+	blockedJobs := b.queueDepthLocked()
+	snapshot := ticketLeaseSnapshot(lease, now, blockedJobs, b.lastPreemptionReason, b.lastPreemptionAt)
+	b.mu.Unlock()
+	b.signalRunner()
+	return snapshot, nil
+}
+
+func (b *Broker) ReleaseTicketLease(ctx context.Context, input TicketLeaseInput) error {
+	_ = ctx
+	now := input.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	leaseID := strings.TrimSpace(input.LeaseID)
+	requestID := strings.TrimSpace(input.RequestID)
+	b.mu.Lock()
+	b.pruneExpiredTicketLeasesLocked(now)
+	if leaseID != "" {
+		delete(b.ticketLeases, leaseID)
+	} else if requestID != "" {
+		for id, lease := range b.ticketLeases {
+			if strings.TrimSpace(lease.RequestID) == requestID {
+				delete(b.ticketLeases, id)
+			}
+		}
+	}
+	b.mu.Unlock()
+	b.signalRunner()
+	return nil
 }
 
 func (b *Broker) Job(id string) (QRJob, bool) {
@@ -444,6 +555,7 @@ func (b *Broker) Snapshot(now time.Time) StateSnapshot {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneExpiredTicketLeasesLocked(now)
 	jobs := make([]StateJob, 0, len(b.order))
 	for _, id := range b.order {
 		if job := b.jobs[id]; job != nil {
@@ -452,17 +564,38 @@ func (b *Broker) Snapshot(now time.Time) StateSnapshot {
 	}
 	queueDepth := b.queueDepthLocked()
 	desiredOwner, desiredPriority := b.desiredPriorityLocked(now, queueDepth)
+	blockedJobs := 0
+	if b.ticketBlocksQRLocked(now) {
+		blockedJobs = queueDepth
+	}
+	activeLease := b.activeTicketLeaseSnapshotLocked(now, blockedJobs)
+	leaseReason := ""
+	leaseRequestID := ""
+	if activeLease != nil {
+		leaseReason = activeLease.Reason
+		leaseRequestID = activeLease.RequestID
+	}
+	lastPreemptionAt := ""
+	if !b.lastPreemptionAt.IsZero() {
+		lastPreemptionAt = b.lastPreemptionAt.UTC().Format(time.RFC3339Nano)
+	}
 	return StateSnapshot{
-		CurrentOwner:    b.currentOwnerLocked(now),
-		DesiredOwner:    desiredOwner,
-		DesiredPriority: desiredPriority,
-		TicketViewers:   b.ticketViewers,
-		TicketSockets:   b.ticketSockets,
-		TicketActive:    b.ticketActiveLocked(now),
-		QueueDepth:      queueDepth,
-		RunningQRJob:    b.runningJobID != "",
-		RunningJobID:    b.runningJobID,
-		Jobs:            jobs,
+		CurrentOwner:         b.currentOwnerLocked(now),
+		DesiredOwner:         desiredOwner,
+		DesiredPriority:      desiredPriority,
+		ActiveLease:          activeLease,
+		LeaseReason:          leaseReason,
+		LeaseRequestID:       leaseRequestID,
+		BlockedJobs:          blockedJobs,
+		LastPreemptionReason: b.lastPreemptionReason,
+		LastPreemptionAt:     lastPreemptionAt,
+		TicketViewers:        b.ticketViewers,
+		TicketSockets:        b.ticketSockets,
+		TicketActive:         b.ticketActiveLocked(now),
+		QueueDepth:           queueDepth,
+		RunningQRJob:         b.runningJobID != "",
+		RunningJobID:         b.runningJobID,
+		Jobs:                 jobs,
 	}
 }
 
@@ -711,71 +844,23 @@ func (b *Broker) runQRJob(runCtx context.Context, job QRJob, cancel context.Canc
 		if msgType != websocket.MessageText {
 			continue
 		}
-		var payload struct {
-			Type        string `json:"type"`
-			RequestID   string `json:"requestId"`
-			OK          bool   `json:"ok"`
-			Accepted    *bool  `json:"accepted"`
-			Reason      string `json:"reason"`
-			TicketState string `json:"ticketState"`
-			Value       string `json:"value"`
-			ImageMIME   string `json:"imageMime"`
-			ImageBase64 string `json:"imageBase64"`
-			SourceApp   string `json:"sourceApp"`
-			TicketFlow  string `json:"ticketFlow"`
-		}
+		var payload rigasSatiksmeQRPhoneMessage
 		if err := json.Unmarshal(data, &payload); err != nil {
 			continue
 		}
 		if strings.TrimSpace(payload.RequestID) != job.ID {
 			continue
 		}
-		switch payload.Type {
-		case "rigassatiksme_qr_result":
-			if !payload.OK {
-				reason := normalizeRigasSatiksmeQRFailureReason(payload.Reason)
-				b.finishRunningJob(job.ID, false, reason, "", nil)
-				return
-			}
-			if strings.TrimSpace(payload.SourceApp) != expectedRigasSatiksmeSourceApp ||
-				strings.TrimSpace(payload.TicketFlow) != expectedRigasSatiksmeTicketFlow {
-				b.finishRunningJob(job.ID, false, "wrong_qr_source", "", nil)
-				return
-			}
-			image, err := base64.StdEncoding.DecodeString(strings.TrimSpace(payload.ImageBase64))
-			if err != nil || len(image) == 0 {
-				b.finishRunningJob(job.ID, false, "qr_image_missing", "", nil)
-				return
-			}
-			mime := strings.TrimSpace(payload.ImageMIME)
-			if mime == "" {
-				mime = "image/png"
-			}
-			image, mime = cropRigasSatiksmeGeneratedScreenshotArtifact(image, mime)
-			b.finishRunningJob(job.ID, true, "generated", mime, image)
-			return
-		case "ticket_state_event":
-			if strings.TrimSpace(payload.TicketState) == "generated_result" {
-				// This marker proves the Pixel/Riga Satiksme app reached the generated QR
-				// screen, but it is not itself a QR image. Keep waiting for the app-captured
-				// rigassatiksme_qr_result image instead of synthesizing a QR from the digits.
-				continue
-			}
-		case "control_code_result":
-			accepted := payload.OK
-			if payload.Accepted != nil {
-				accepted = *payload.Accepted
-			}
-			if accepted {
-				// A successful control_code_result without image bytes is only a state marker.
-				// The Telegram bot must return the QR rendered by the app flow, not a locally
-				// generated QR for the submitted five digits.
-				continue
-			}
-			reason := normalizeRigasSatiksmeQRFailureReason(payload.Reason)
-			b.finishRunningJob(job.ID, false, reason, "", nil)
-			return
+		decision := evaluateRigasSatiksmeQRPhoneMessage(payload)
+		if !decision.Final {
+			continue
 		}
+		if decision.OK {
+			b.finishRunningJob(job.ID, true, decision.Reason, decision.MIME, decision.Image)
+		} else {
+			b.finishRunningJob(job.ID, false, decision.Reason, "", nil)
+		}
+		return
 	}
 }
 
@@ -917,6 +1002,7 @@ func (b *Broker) openQRPhoneControl(ctx context.Context, job QRJob) (*websocket.
 		"type":         "generate_control_code",
 		"requestId":    job.ID,
 		"digits":       job.Code,
+		"owner":        "rigassatiksme",
 		"app":          "rigas_satiksme",
 		"flow":         "monthly_ticket",
 		"resultImage":  true,
@@ -987,6 +1073,8 @@ func (b *Broker) preemptRunningLocked(now time.Time, reason string) {
 	if b.runningJobID == "" {
 		return
 	}
+	b.lastPreemptionReason = strings.TrimSpace(reason)
+	b.lastPreemptionAt = now.UTC()
 	job := b.jobs[b.runningJobID]
 	if job != nil && job.Status == JobRunning {
 		job.Status = JobWaiting
@@ -1017,6 +1105,9 @@ func (b *Broker) sendCancelToConn(conn *websocket.Conn, requestID string, reason
 		"type":      "cancel_rigassatiksme_qr",
 		"requestId": requestID,
 		"reason":    reason,
+		"owner":     "rigassatiksme",
+		"app":       "rigas_satiksme",
+		"flow":      "monthly_ticket",
 	})
 }
 
@@ -1159,6 +1250,63 @@ func (b *Broker) handleTicketPresence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := b.UpdateTicketPresence(r.Context(), TicketPresenceInput{Viewers: req.Viewers, Now: time.Now()}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": b.Snapshot(time.Now())})
+}
+
+func (b *Broker) handleTicketLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		LeaseID   string `json:"leaseId"`
+		RequestID string `json:"requestId"`
+		Reason    string `json:"reason"`
+		TTLMillis int64  `json:"ttlMillis"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad_request"})
+		return
+	}
+	lease, err := b.AcquireTicketLease(r.Context(), TicketLeaseInput{
+		LeaseID:   req.LeaseID,
+		RequestID: req.RequestID,
+		Reason:    req.Reason,
+		TTL:       time.Duration(req.TTLMillis) * time.Millisecond,
+		Now:       time.Now(),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"lease": lease,
+		"state": b.Snapshot(time.Now()),
+	})
+}
+
+func (b *Broker) handleTicketLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		LeaseID   string `json:"leaseId"`
+		RequestID string `json:"requestId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad_request"})
+		return
+	}
+	if err := b.ReleaseTicketLease(r.Context(), TicketLeaseInput{
+		LeaseID:   req.LeaseID,
+		RequestID: req.RequestID,
+		Now:       time.Now(),
+	}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -1324,11 +1472,94 @@ func (b *Broker) websocketURL(targetPath string) (string, error) {
 	return parsed.String(), nil
 }
 
+func normalizeTicketLeaseTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return defaultTicketLeaseTTL
+	}
+	if ttl < minTicketLeaseTTL {
+		return minTicketLeaseTTL
+	}
+	if ttl > maxTicketLeaseTTL {
+		return maxTicketLeaseTTL
+	}
+	return ttl
+}
+
+func (b *Broker) pruneExpiredTicketLeasesLocked(now time.Time) {
+	if b.ticketLeases == nil {
+		return
+	}
+	for id, lease := range b.ticketLeases {
+		if !lease.ExpiresAt.IsZero() && !now.Before(lease.ExpiresAt) {
+			delete(b.ticketLeases, id)
+		}
+	}
+}
+
+func ticketLeaseSnapshot(lease ticketLease, now time.Time, blockedJobs int, preemptionReason string, preemptionAt time.Time) TicketLeaseSnapshot {
+	remainingMillis := int64(lease.ExpiresAt.Sub(now) / time.Millisecond)
+	if remainingMillis < 0 {
+		remainingMillis = 0
+	}
+	snapshot := TicketLeaseSnapshot{
+		ID:                   lease.ID,
+		Owner:                "ticket",
+		RequestID:            lease.RequestID,
+		Reason:               lease.Reason,
+		AcquiredAt:           lease.AcquiredAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:            lease.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		ExpiresAt:            lease.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		RemainingMillis:      remainingMillis,
+		BlockedJobs:          blockedJobs,
+		LastPreemptionReason: strings.TrimSpace(preemptionReason),
+	}
+	if !preemptionAt.IsZero() {
+		snapshot.LastPreemptionAt = preemptionAt.UTC().Format(time.RFC3339Nano)
+	}
+	return snapshot
+}
+
+func (b *Broker) activeTicketLeaseLocked(now time.Time) (ticketLease, bool) {
+	b.pruneExpiredTicketLeasesLocked(now)
+	var selected ticketLease
+	found := false
+	for _, lease := range b.ticketLeases {
+		if lease.ID == "" {
+			continue
+		}
+		if !lease.ExpiresAt.IsZero() && !now.Before(lease.ExpiresAt) {
+			continue
+		}
+		if !found || lease.ExpiresAt.After(selected.ExpiresAt) || (lease.ExpiresAt.Equal(selected.ExpiresAt) && lease.UpdatedAt.After(selected.UpdatedAt)) {
+			selected = lease
+			found = true
+		}
+	}
+	return selected, found
+}
+
+func (b *Broker) activeTicketLeaseSnapshotLocked(now time.Time, blockedJobs int) *TicketLeaseSnapshot {
+	lease, ok := b.activeTicketLeaseLocked(now)
+	if !ok {
+		return nil
+	}
+	snapshot := ticketLeaseSnapshot(lease, now, blockedJobs, b.lastPreemptionReason, b.lastPreemptionAt)
+	return &snapshot
+}
+
+func (b *Broker) ticketLeaseActiveLocked(now time.Time) bool {
+	_, ok := b.activeTicketLeaseLocked(now)
+	return ok
+}
+
 func (b *Broker) ticketActiveLocked(now time.Time) bool {
-	return b.ticketViewers > 0 || b.ticketSockets > 0 || (!b.ticketGraceUntil.IsZero() && now.Before(b.ticketGraceUntil))
+	return b.ticketLeaseActiveLocked(now) || b.ticketViewers > 0 || b.ticketSockets > 0 || (!b.ticketGraceUntil.IsZero() && now.Before(b.ticketGraceUntil))
 }
 
 func (b *Broker) ticketBlocksQRLocked(now time.Time) bool {
+	if b.ticketLeaseActiveLocked(now) {
+		return true
+	}
 	if b.ticketViewers > 0 {
 		return !b.ticketQRBlockUntil.IsZero() && now.Before(b.ticketQRBlockUntil)
 	}

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -74,6 +75,11 @@ func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
 func TestRelayViewerCountPublishesPhoneBrokerPresence(t *testing.T) {
 	presenceUpdates := make(chan int, 4)
 	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/phone/leases/ticket" || r.URL.Path == "/api/v1/phone/leases/ticket/release" {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
 		if r.URL.Path != "/api/v1/ticket/presence" {
 			t.Fatalf("broker path = %s", r.URL.Path)
 		}
@@ -102,6 +108,86 @@ func TestRelayViewerCountPublishesPhoneBrokerPresence(t *testing.T) {
 
 	server.removeRelayViewer("session-b")
 	expectBrokerPresence(t, presenceUpdates, 0)
+}
+
+func TestRelayViewerPublishesPhoneBrokerTicketLeaseLifecycle(t *testing.T) {
+	events := make(chan brokerLeaseEvent, 8)
+	broker := newTicketLeaseBrokerRecorder(t, events)
+	defer broker.Close()
+
+	server := newTicketSetupTestServer(t, "pixel")
+	server.cfg.Phone.BrokerBaseURL = broker.URL
+
+	server.addRelayViewer("session-a")
+	acquire := expectBrokerLeaseEvent(t, events, "/api/v1/phone/leases/ticket")
+	if acquire.LeaseID != "viewer:session-a" || acquire.RequestID != "session-a" || acquire.Reason != "stream_viewer" || acquire.TTLMillis <= 0 {
+		t.Fatalf("viewer lease acquire = %#v", acquire)
+	}
+
+	server.removeRelayViewer("session-a")
+	release := expectBrokerLeaseEvent(t, events, "/api/v1/phone/leases/ticket/release")
+	if release.LeaseID != "viewer:session-a" {
+		t.Fatalf("viewer lease release = %#v", release)
+	}
+}
+
+type brokerLeaseEvent struct {
+	Path      string
+	LeaseID   string `json:"leaseId"`
+	RequestID string `json:"requestId"`
+	Reason    string `json:"reason"`
+	TTLMillis int64  `json:"ttlMillis"`
+}
+
+func newTicketLeaseBrokerRecorder(t *testing.T, events chan<- brokerLeaseEvent) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/ticket/presence":
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/api/v1/phone/leases/ticket", "/api/v1/phone/leases/ticket/release":
+			var event brokerLeaseEvent
+			if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+				t.Fatalf("decode broker lease event: %v", err)
+			}
+			event.Path = r.URL.Path
+			events <- event
+			_, _ = w.Write([]byte(`{"ok":true,"state":{"currentOwner":"ticket"},"lease":{"id":"` + event.LeaseID + `","owner":"ticket"}}`))
+		default:
+			t.Fatalf("broker path = %s", r.URL.Path)
+		}
+	}))
+}
+
+func expectBrokerLeaseEvent(t *testing.T, events <-chan brokerLeaseEvent, path string) brokerLeaseEvent {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.Path == path {
+				return event
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for broker lease event %s", path)
+		}
+	}
+}
+
+func expectBrokerLeaseEventWithLease(t *testing.T, events <-chan brokerLeaseEvent, path string, leaseID string) brokerLeaseEvent {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.Path == path && event.LeaseID == leaseID {
+				return event
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for broker lease event %s %s", path, leaseID)
+		}
+	}
 }
 
 func expectBrokerPresence(t *testing.T, updates <-chan int, want int) {
@@ -474,13 +560,18 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function connectDirectVideo()",
 		"function switchToAvcAdapter(reason)",
 		"intentionallyClosedVideoSockets",
+		"activeVideoSockets",
+		"function closeEarlyVideo(reason)",
+		"closeEarlyVideo('app_loaded')",
 		"new VideoDecoder({",
 		"avc: { format: 'annexb' }",
 		"const preferAvc=Boolean(options.preferAvc)",
 		"requestReason:`${reason}_avc_adapter`",
 		"configure_avc_decoder",
 		"ctx.drawImage(frame, 0, 0, canvas.width, canvas.height)",
-		"codeResultImage.src = canvas.toDataURL('image/png')",
+		"const capturedImage=canvas.toDataURL('image/png')",
+		"await confirmControlCodeBrowserCapture(request,proof)",
+		"codeResultImage.src=capturedImage",
 		"function controlCodeMarkerReady(request)",
 		"function waitForControlCodeResultScreenshot(request)",
 		"status === 'succeeded'",
@@ -503,6 +594,15 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"window.visualViewport",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
+		"idleDisconnected=false",
+		"idleDisconnectTimer=null",
+		"function expireViewerIdle(reason)",
+		"closeEarlyVideo('idle_disconnect')",
+		"resetStreamState({preserveFrame:true})",
+		"showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pārlādē lapu, lai turpinātu.', true)",
+		"document.body.dataset.streamFreshness='IDLE_DISCONNECTED'",
+		"startStreamButton.addEventListener('click'",
+		"location.reload()",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer JS missing %q", snippet)
@@ -527,15 +627,12 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"canvas.toBlob",
 		"FileReader",
 		"uploadControlCodeCapture",
-		"captureRequired",
-		"/api/v1/control-code/capture",
-		"confirmControlCodeBrowserCapture",
 		"controlCodeCapturedImages",
 		"imageBase64",
 		"imageMime",
 	} {
 		if strings.Contains(js, snippet) {
-			t.Fatalf("ticket viewer JS must rely on phone stream markers, not browser capture confirmations: found %q", snippet)
+			t.Fatalf("ticket viewer JS must not upload browser image bytes: found %q", snippet)
 		}
 	}
 	for _, snippet := range []string{
@@ -545,6 +642,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"lastRenderedFrameSequence",
 		"minFrameSequence",
 		`canvas.toDataURL("image/png")`,
+		"/api/v1/control-code/capture",
+		"confirmControlCodeBrowserCapture",
 		"captureControlCodeResultScreenshot",
 	} {
 		if !strings.Contains(js, snippet) {
@@ -906,7 +1005,7 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"rememberOwnedControlCodeRequest(payload.request)",
 		"locallyClosedControlCodeRequestIDs.add(String(requestID))",
 		"return String(value || '').replace(/\\D/g, '')",
-		"digits.length < 2 || digits.length > 9",
+		"digits.length < 2 || digits.length > 8",
 		"postJSON('/api/v1/control-code/request',{digits})",
 		"renderControlCodeRequest(payload.request)",
 		"closeCurrentControlCode(false)",
