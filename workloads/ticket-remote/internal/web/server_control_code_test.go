@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,6 +96,51 @@ func TestControlCodeRequestQueuesPhoneCommandAndRoutesResultPrivately(t *testing
 	assertNoBrowserMessageContaining(t, other, response.Request.ID, 250*time.Millisecond)
 	assertNoBrowserMessageContaining(t, other, `"popup_ready"`, 250*time.Millisecond)
 	assertNoBrowserMessageContaining(t, other, `"totalDurationMillis"`, 250*time.Millisecond)
+}
+
+func TestControlCodeRequestRetriesWhenPhoneDoesNotAcceptDispatch(t *testing.T) {
+	messages := make(chan string, 20)
+	phoneResults := make(chan string, 20)
+	phoneServer := newTicketPhoneControlCodeTestServerWithOptions(t, messages, phoneResults, ticketPhoneControlCodeTestOptions{
+		skipGenerateHealthAccepts: 1,
+	})
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: 10 * time.Millisecond,
+		ReconnectMaxDelay: 10 * time.Millisecond,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	requester := dialTicketControlClientWithSession(t, httpServer, "ticket@jolkins.id.lv", "requester-session")
+	defer requester.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
+	firstCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	if !strings.Contains(firstCommand, `"requestId":"`+response.Request.ID+`"`) {
+		t.Fatalf("first phone command mismatch: %s", firstCommand)
+	}
+	secondCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	if !strings.Contains(secondCommand, `"requestId":"`+response.Request.ID+`"`) ||
+		!strings.Contains(secondCommand, `"dispatchAttempt":2`) {
+		t.Fatalf("retry phone command mismatch: %s", secondCommand)
+	}
+
+	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit"}`
+	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
+	if !strings.Contains(privateResult, `"requestId":"`+response.Request.ID+`"`) ||
+		!strings.Contains(privateResult, `"resultProof":"phone_visual_raw_ticket_after_submit"`) {
+		t.Fatalf("requester did not receive private result after retry: %s", privateResult)
+	}
 }
 
 func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
@@ -525,6 +571,40 @@ func TestControlCodeFrameReadyMovesRequestToSucceededAndRoutesOnlyToRequester(t 
 		}
 	}
 	assertNoBrowserMessageContaining(t, otherSession, response.Request.ID, 250*time.Millisecond)
+}
+
+func TestControlCodeFrameReadyPreservesPhonePostSubmitVisualProof(t *testing.T) {
+	messages := make(chan string, 20)
+	phoneResults := make(chan string, 20)
+	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	requester := dialTicketControlClientWithSession(t, httpServer, "ticket@jolkins.id.lv", "requester-session")
+	defer requester.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
+	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit","resultProofAt":"2026-05-22T10:23:45.123Z"}`
+
+	result := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
+	if !strings.Contains(result, `"resultProof":"phone_visual_raw_ticket_after_submit"`) {
+		t.Fatalf("marker update must preserve trusted post-submit phone proof: %s", result)
+	}
 }
 
 func TestControlCodeFrameReadyRequiresBrowserPostBeforePhoneCleanup(t *testing.T) {
@@ -1224,12 +1304,31 @@ func TestControlCodePruneDropsOldInactiveRequestsOnly(t *testing.T) {
 	}
 }
 
+type ticketPhoneControlCodeTestOptions struct {
+	skipGenerateHealthAccepts int
+}
+
 func newTicketPhoneControlCodeTestServer(t *testing.T, messages chan<- string, results <-chan string) *httptest.Server {
+	return newTicketPhoneControlCodeTestServerWithOptions(t, messages, results, ticketPhoneControlCodeTestOptions{})
+}
+
+func newTicketPhoneControlCodeTestServerWithOptions(t *testing.T, messages chan<- string, results <-chan string, options ticketPhoneControlCodeTestOptions) *httptest.Server {
 	t.Helper()
+	var mu sync.Mutex
+	controlCodeRequest := map[string]any{}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/session/start":
 			w.WriteHeader(http.StatusOK)
+		case "/api/v1/health":
+			mu.Lock()
+			request := cloneMapForControlCodeTest(controlCodeRequest)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":                 true,
+				"controlCodeRequest": request,
+			})
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -1247,7 +1346,22 @@ func newTicketPhoneControlCodeTestServer(t *testing.T, messages chan<- string, r
 				if err != nil {
 					return
 				}
-				messages <- string(data)
+				message := string(data)
+				var payload map[string]any
+				if err := json.Unmarshal(data, &payload); err == nil && payload["type"] == "generate_control_code" {
+					mu.Lock()
+					if options.skipGenerateHealthAccepts > 0 {
+						options.skipGenerateHealthAccepts--
+					} else {
+						controlCodeRequest = map[string]any{
+							"requestId": payload["requestId"],
+							"status":    "running",
+							"reason":    "accepted",
+						}
+					}
+					mu.Unlock()
+				}
+				messages <- message
 			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
@@ -1264,6 +1378,17 @@ func newTicketPhoneControlCodeTestServer(t *testing.T, messages chan<- string, r
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func cloneMapForControlCodeTest(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func dialTicketControlClient(t *testing.T, server *httptest.Server, email string) *websocket.Conn {

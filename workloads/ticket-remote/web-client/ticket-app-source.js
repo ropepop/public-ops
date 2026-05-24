@@ -247,6 +247,9 @@
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
   const controlCodeCaptureKeyframeRetryMs = 650;
+  const controlCodeGeneratedChipScanStartY = 0.50;
+  const controlCodeGeneratedChipScanEndY = 0.61;
+  const controlCodeGeneratedChipScanStepY = 0.01;
   const FRAME_ENVELOPE_MAGIC = 0x54534632;
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
   const doubleTapSuppressMs = 420;
@@ -1183,6 +1186,9 @@
       lastPacketSequence,
       lastAcceptedFrameSequence,
       lastAcceptedFrameTimestamp,
+      lastRenderedFrameEpoch,
+      lastRenderedFrameSequence,
+      lastRenderedFrameTimestamp,
       needsKeyFrame,
       firstFrameReceived,
       hasRenderedFrame,
@@ -1960,19 +1966,25 @@
     };
   }
 
-  function controlCodeResultChipProof() {
+  function emptyControlCodeResultChipProof() {
+    return {
+      chipVisible: false,
+      chipDarkRatio: 0,
+      chipLightRatio: 0,
+      chipRows: 0,
+      chipY: 0,
+      chipScore: 0
+    };
+  }
+
+  function sampleControlCodeResultChipRegion(yRatio) {
     if (!canvas.width || !canvas.height) {
-      return {
-        chipVisible: false,
-        chipDarkRatio: 0,
-        chipLightRatio: 0,
-        chipRows: 0
-      };
+      return emptyControlCodeResultChipProof();
     }
     const x = Math.max(0, Math.round(canvas.width * 0.14));
-    const y = Math.max(0, Math.round(canvas.height * 0.47));
+    const y = Math.max(0, Math.round(canvas.height * yRatio));
     const width = Math.max(1, Math.round(canvas.width * 0.72));
-    const height = Math.max(1, Math.round(canvas.height * 0.08));
+    const height = Math.max(1, Math.round(canvas.height * 0.06));
     const cols = 52;
     const rows = 12;
     let imageData;
@@ -1980,12 +1992,7 @@
       imageData = ctx.getImageData(x, y, Math.min(width, canvas.width - x), Math.min(height, canvas.height - y));
     } catch (error) {
       reportClientFault('control_code_chip_proof_failed', error);
-      return {
-        chipVisible: false,
-        chipDarkRatio: 0,
-        chipLightRatio: 0,
-        chipRows: 0
-      };
+      return emptyControlCodeResultChipProof();
     }
     const data = imageData.data;
     const sampleWidth = imageData.width;
@@ -2013,33 +2020,47 @@
         }
         sampled++;
       }
-      if (rowDark >= 40) {
+      if (rowDark >= 32) {
         chipRows++;
       }
     }
     const chipDarkRatio = sampled ? dark / sampled : 0;
     const chipLightRatio = sampled ? light / sampled : 0;
+    const chipScore = Math.max(0, (chipRows * 10) + (chipDarkRatio * 80) - (chipLightRatio * 20));
     return {
-      chipVisible: chipRows >= 3 && chipDarkRatio >= 0.42 && chipLightRatio <= 0.58,
+      chipVisible: chipRows >= 4 && chipDarkRatio >= 0.34 && chipLightRatio <= 0.62 && chipScore >= 34,
       chipDarkRatio: Math.round(chipDarkRatio * 100) / 100,
       chipLightRatio: Math.round(chipLightRatio * 100) / 100,
-      chipRows
+      chipRows,
+      chipY: Math.round(Number(yRatio || 0) * 1000) / 1000,
+      chipScore: Math.round(chipScore * 10) / 10
     };
+  }
+
+  function controlCodeResultChipProof() {
+    let bestChip = emptyControlCodeResultChipProof();
+    for (let yRatio = controlCodeGeneratedChipScanStartY; yRatio <= controlCodeGeneratedChipScanEndY + 0.0001; yRatio += controlCodeGeneratedChipScanStepY) {
+      const candidate = sampleControlCodeResultChipRegion(yRatio);
+      if (!bestChip || candidate.chipScore > bestChip.chipScore) {
+        bestChip = candidate;
+      }
+    }
+    return bestChip;
   }
 
   function controlCodeGeneratedFrameProof() {
     const chip = controlCodeResultChipProof();
     const resultBar = canvasRegionFingerprint({
       x: 0.14,
-      y: 0.47,
+      y: chip.chipY || 0.55,
       width: 0.72,
-      height: 0.08
+      height: 0.06
     });
     const codeArea = canvasRegionFingerprint({
       x: 0.18,
-      y: 0.16,
+      y: Math.max(0.12, chip.chipY - 0.34),
       width: 0.64,
-      height: 0.28
+      height: 0.30
     });
     const generatedBarVisible = Boolean(resultBar &&
       Number(resultBar.darkCellRatio || 0) >= 0.24 &&
@@ -2049,12 +2070,17 @@
       Number(codeArea.darkCellRatio || 0) >= 0.06 &&
       Number(codeArea.lightCellRatio || 0) >= 0.18 &&
       Number(codeArea.contrastScore || 0) >= 42);
+    const generatedCodeScore = codeArea
+      ? (Number(codeArea.darkCellRatio || 0) * 100) + (Number(codeArea.lightCellRatio || 0) * 40) + Number(codeArea.contrastScore || 0)
+      : 0;
     return {
       generatedVisible: chip.chipVisible && generatedCodeVisible,
       generatedChipVisible: chip.chipVisible,
       generatedChipDarkRatio: chip.chipDarkRatio,
       generatedChipLightRatio: chip.chipLightRatio,
       generatedChipRows: chip.chipRows,
+      generatedChipY: chip.chipY,
+      generatedChipScore: chip.chipScore,
       generatedBarVisible,
       generatedCodeVisible,
       generatedBarDarkCellRatio: resultBar ? Math.round(Number(resultBar.darkCellRatio || 0) * 100) / 100 : 0,
@@ -2062,7 +2088,8 @@
       generatedBarContrastScore: resultBar ? Math.round(Number(resultBar.contrastScore || 0) * 10) / 10 : 0,
       generatedCodeDarkCellRatio: codeArea ? Math.round(Number(codeArea.darkCellRatio || 0) * 100) / 100 : 0,
       generatedCodeLightCellRatio: codeArea ? Math.round(Number(codeArea.lightCellRatio || 0) * 100) / 100 : 0,
-      generatedCodeContrastScore: codeArea ? Math.round(Number(codeArea.contrastScore || 0) * 10) / 10 : 0
+      generatedCodeContrastScore: codeArea ? Math.round(Number(codeArea.contrastScore || 0) * 10) / 10 : 0,
+      generatedCodeScore: Math.round(generatedCodeScore * 10) / 10
     };
   }
 
@@ -2087,12 +2114,26 @@
     return Boolean(controlCodeBaselineFrameFingerprint);
   }
 
+  function controlCodeRenderedFrameEpoch() {
+    if (lastRenderedFrameEpoch) return lastRenderedFrameEpoch;
+    if (hasRenderedFrame && currentStreamEpoch) return currentStreamEpoch;
+    return 0;
+  }
+
+  function controlCodeRenderedFrameSequence() {
+    if (lastRenderedFrameSequence) return lastRenderedFrameSequence;
+    if (hasRenderedFrame && lastAcceptedFrameSequence) return lastAcceptedFrameSequence;
+    return 0;
+  }
+
   function controlCodeMarkerReady(request) {
     if (!request || request.status !== 'succeeded') return false;
     const markerEpoch = Number(request.resultFrameEpoch || request.streamEpoch || 0);
     const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
     if (!markerEpoch || !markerSequence || !hasRenderedFrame) return false;
-    return lastRenderedFrameEpoch === markerEpoch && lastRenderedFrameSequence >= markerSequence;
+    const renderedEpoch = controlCodeRenderedFrameEpoch();
+    const renderedSequence = controlCodeRenderedFrameSequence();
+    return renderedEpoch === markerEpoch && renderedSequence >= markerSequence;
   }
 
   function controlCodeMarkerReceivedAgeMillis(request) {
@@ -2100,6 +2141,12 @@
     const parsed = Date.parse(raw || '');
     if (!Number.isFinite(parsed)) return 0;
     return Math.max(0, Math.round(Date.now() + serverClockSkewMs - parsed));
+  }
+
+  function controlCodeTrustedPhonePostSubmitProof(resultProof) {
+    resultProof = String(resultProof || '').trim();
+    return resultProof === 'phone_visual_raw_ticket_after_submit' ||
+      resultProof === 'phone_visual_root_confirmed';
   }
 
   function controlCodeCandidateFrameProof(request) {
@@ -2113,8 +2160,8 @@
       markerEpoch,
       markerSequence,
       markerReceivedAgeMillis: controlCodeMarkerReceivedAgeMillis(request),
-      candidateFrameEpoch: lastRenderedFrameEpoch,
-      candidateFrameSequence: lastRenderedFrameSequence,
+      candidateFrameEpoch: controlCodeRenderedFrameEpoch(),
+      candidateFrameSequence: controlCodeRenderedFrameSequence(),
       candidateAccepted: false,
       candidateRejectedReason: '',
       fingerprintDifferenceScore: 0,
@@ -2137,20 +2184,17 @@
       proof.candidateRejectedReason = 'marker_waiting';
       return proof;
     }
-    if (lastRenderedFrameEpoch !== markerEpoch || lastRenderedFrameSequence < markerSequence) {
+    const renderedEpoch = controlCodeRenderedFrameEpoch();
+    const renderedSequence = controlCodeRenderedFrameSequence();
+    if (renderedEpoch !== markerEpoch || renderedSequence < markerSequence) {
       proof.candidateRejectedReason = 'frame_before_marker';
       return proof;
     }
     const candidateFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
     const difference = fingerprintDifferenceScore(controlCodeBaselineFrameFingerprint, candidateFingerprint);
+    const trustedPhonePostSubmitProof = controlCodeTrustedPhonePostSubmitProof(proof.resultProof);
     proof.fingerprintDifferenceScore = Math.round(Number(difference.score || 0) * 10) / 10;
     proof.fingerprintChangedCells = Number(difference.changedCells || 0);
-    if (controlCodeBaselineFrameFingerprint &&
-      proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
-      proof.fingerprintChangedCells < controlCodeFingerprintChangedCellsThreshold) {
-      proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';
-      return proof;
-    }
     const popupProof = controlCodePopupFrameProof();
     proof.popupKeyboardVisible = popupProof.keyboardVisible;
     proof.popupVisible = popupProof.popupVisible;
@@ -2164,12 +2208,29 @@
       proof.candidateRejectedReason = popupProof.keyboardVisible ? 'control_popup_keyboard_frame' : 'control_popup_frame';
       return proof;
     }
+    if (trustedPhonePostSubmitProof) {
+      proof.trustedPhonePostSubmitProof = true;
+      proof.generatedVisible = true;
+      proof.accepted = true;
+      proof.candidateAccepted = true;
+      proof.candidateRejectedReason = '';
+      proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;
+      return proof;
+    }
+    if (controlCodeBaselineFrameFingerprint &&
+      proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
+      proof.fingerprintChangedCells < controlCodeFingerprintChangedCellsThreshold) {
+      proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';
+      return proof;
+    }
     const generatedProof = controlCodeGeneratedFrameProof();
     proof.generatedVisible = generatedProof.generatedVisible;
     proof.generatedChipVisible = generatedProof.generatedChipVisible;
     proof.generatedChipDarkRatio = generatedProof.generatedChipDarkRatio;
     proof.generatedChipLightRatio = generatedProof.generatedChipLightRatio;
     proof.generatedChipRows = generatedProof.generatedChipRows;
+    proof.generatedChipY = generatedProof.generatedChipY;
+    proof.generatedChipScore = generatedProof.generatedChipScore;
     proof.generatedBarVisible = generatedProof.generatedBarVisible;
     proof.generatedCodeVisible = generatedProof.generatedCodeVisible;
     proof.generatedBarDarkCellRatio = generatedProof.generatedBarDarkCellRatio;
@@ -2178,6 +2239,7 @@
     proof.generatedCodeDarkCellRatio = generatedProof.generatedCodeDarkCellRatio;
     proof.generatedCodeLightCellRatio = generatedProof.generatedCodeLightCellRatio;
     proof.generatedCodeContrastScore = generatedProof.generatedCodeContrastScore;
+    proof.generatedCodeScore = generatedProof.generatedCodeScore;
     if (!generatedProof.generatedVisible) {
       proof.candidateRejectedReason = 'generated_frame_not_visible';
       return proof;
@@ -2187,6 +2249,25 @@
     proof.candidateRejectedReason = '';
     proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
     return proof;
+  }
+
+  function noteControlCodeMarkerWaiting(request) {
+    const requestID = String(request && request.requestId || '').trim();
+    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
+    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    lastControlCodeCaptureDebug = {
+      requestId: requestID,
+      resultProof: String(request && request.resultProof || '').trim(),
+      markerEpoch,
+      markerSequence,
+      markerReceivedAgeMillis: controlCodeMarkerReceivedAgeMillis(request),
+      candidateFrameEpoch: controlCodeRenderedFrameEpoch(),
+      candidateFrameSequence: controlCodeRenderedFrameSequence(),
+      candidateAccepted: false,
+      candidateRejectedReason: 'marker_waiting',
+      keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
+    };
+    publishStreamDebug();
   }
 
   function noteControlCodeCandidateRejected(proof) {
@@ -2291,7 +2372,10 @@
     const requestID = String(codeRequest.requestId || '').trim();
     if (!requestID || controlCodeResultCapturedRequestID === requestID) return false;
     if (controlCodeCaptureAckInFlightRequestID === requestID) return true;
-    if (!controlCodeMarkerReady(codeRequest)) return false;
+    if (!controlCodeMarkerReady(codeRequest)) {
+      noteControlCodeMarkerWaiting(codeRequest);
+      return false;
+    }
     const proof = controlCodeCandidateFrameProof(codeRequest);
     if (!proof.accepted) {
       noteControlCodeCandidateRejected(proof);

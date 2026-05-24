@@ -311,7 +311,7 @@ func TestTicketPreemptionsDoNotConsumeRecoverableQRFailureBudget(t *testing.T) {
 	if command["requestId"] != job.ID {
 		t.Fatalf("post-ticket generate requestId = %#v, want %q", command["requestId"], job.ID)
 	}
-	upstream.SendControlCodeFailure(t, job.ID, "rs_monthly_ticket_control_missing")
+	upstream.SendControlCodeFailure(t, job.ID, "qr_image_missing")
 
 	retry := upstream.WaitForCommand(t, "generate_control_code")
 	if retry["requestId"] != job.ID {
@@ -329,13 +329,95 @@ func TestTicketPreemptionsDoNotConsumeRecoverableQRFailureBudget(t *testing.T) {
 	}
 }
 
-func TestQueuedQRStartsAfterTicketViewerPriorityWindow(t *testing.T) {
+func TestTicketLeasePreemptionsDoNotConsumeRecoverableQRFailureBudget(t *testing.T) {
 	upstream := newFakePhone(t)
 	defer upstream.Close()
 
 	b, err := New(Config{
 		UpstreamBaseURL:  upstream.URL,
-		TicketGrace:      time.Second,
+		TicketGrace:      8 * time.Millisecond,
+		RunnerInterval:   2 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{
+		ChatID: "1001",
+		UserID: "42",
+		Code:   "12345",
+		Now:    time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < maxRecoverableJobAttempts+2; i++ {
+		command := upstream.WaitForCommand(t, "generate_control_code")
+		if command["requestId"] != job.ID {
+			t.Fatalf("preempted generate requestId = %#v, want %q", command["requestId"], job.ID)
+		}
+		leaseID := "control-code:lease-preemption"
+		if _, err := b.AcquireTicketLease(ctx, TicketLeaseInput{
+			LeaseID:   leaseID,
+			RequestID: "lease-preemption",
+			Reason:    "control_code_request",
+			TTL:       time.Second,
+			Now:       time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		cancelCommand := upstream.WaitForCommand(t, "cancel_rigassatiksme_qr")
+		if cancelCommand["requestId"] != job.ID {
+			t.Fatalf("cancel requestId = %#v, want %q", cancelCommand["requestId"], job.ID)
+		}
+		got, ok := b.Job(job.ID)
+		if !ok {
+			t.Fatal("job disappeared")
+		}
+		if got.Reason != "ticket_lease_active" {
+			t.Fatalf("preempted reason = %q, want ticket_lease_active", got.Reason)
+		}
+		if err := b.ReleaseTicketLease(ctx, TicketLeaseInput{LeaseID: leaseID, Now: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	command := upstream.WaitForCommand(t, "generate_control_code")
+	if command["requestId"] != job.ID {
+		t.Fatalf("post-lease generate requestId = %#v, want %q", command["requestId"], job.ID)
+	}
+	upstream.SendControlCodeFailure(t, job.ID, "qr_image_missing")
+
+	retry := upstream.WaitForCommand(t, "generate_control_code")
+	if retry["requestId"] != job.ID {
+		t.Fatalf("recoverable retry requestId = %#v, want %q", retry["requestId"], job.ID)
+	}
+	upstream.SendResult(t, job.ID, "image/png", []byte("app image after ticket lease preemptions"))
+
+	got := waitForJobStatus(t, b, job.ID, JobSucceeded)
+	if got.Reason != "generated" {
+		t.Fatalf("job reason = %q, want generated", got.Reason)
+	}
+	image, ok := b.JobImage(job.ID)
+	if !ok || string(image.Bytes) != "app image after ticket lease preemptions" {
+		t.Fatalf("image = %#v ok=%v", image, ok)
+	}
+}
+
+func TestQueuedQRWaitsUntilTicketViewerLeaves(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      5 * time.Millisecond,
 		MaxTicketQRBlock: 45 * time.Millisecond,
 		RunnerInterval:   5 * time.Millisecond,
 		PhoneSendTimeout: 200 * time.Millisecond,
@@ -364,9 +446,14 @@ func TestQueuedQRStartsAfterTicketViewerPriorityWindow(t *testing.T) {
 
 	select {
 	case command := <-upstream.commands:
-		t.Fatalf("QR command started before bounded ticket viewer priority expired: %#v", command)
-	case <-time.After(25 * time.Millisecond):
+		t.Fatalf("QR command started while ticket viewer was present: %#v", command)
+	case <-time.After(75 * time.Millisecond):
 	}
+
+	if err := b.UpdateTicketPresence(ctx, TicketPresenceInput{Viewers: 0, Now: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Millisecond)
 
 	first := upstream.WaitForCommand(t, "generate_control_code")
 	if first["requestId"] != job.ID {
@@ -374,7 +461,7 @@ func TestQueuedQRStartsAfterTicketViewerPriorityWindow(t *testing.T) {
 	}
 }
 
-func TestTicketViewerSocketReconnectAfterPriorityWindowDoesNotPreemptRunningQR(t *testing.T) {
+func TestTicketViewerPresencePreemptsRunningQREvenAfterPriorityWindow(t *testing.T) {
 	upstream := newFakePhone(t)
 	defer upstream.Close()
 
@@ -393,15 +480,11 @@ func TestTicketViewerSocketReconnectAfterPriorityWindowDoesNotPreemptRunningQR(t
 	defer cancel()
 	go b.Run(ctx)
 
-	now := time.Now()
-	if err := b.UpdateTicketPresence(ctx, TicketPresenceInput{Viewers: 1, Now: now}); err != nil {
-		t.Fatal(err)
-	}
 	job, err := b.EnqueueQRJob(ctx, QRJobInput{
 		ChatID: "1001",
 		UserID: "42",
 		Code:   "12345",
-		Now:    now,
+		Now:    time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -412,19 +495,21 @@ func TestTicketViewerSocketReconnectAfterPriorityWindowDoesNotPreemptRunningQR(t
 		t.Fatalf("generate requestId = %#v, want %q", first["requestId"], job.ID)
 	}
 
-	b.beginTicketSocket()
-	defer b.endTicketSocket()
-
-	select {
-	case command := <-upstream.commands:
-		t.Fatalf("ticket viewer reconnect after bounded priority window should not preempt running QR, got command %#v", command)
-	case <-time.After(20 * time.Millisecond):
+	time.Sleep(45 * time.Millisecond)
+	if err := b.UpdateTicketPresence(ctx, TicketPresenceInput{Viewers: 1, Now: time.Now()}); err != nil {
+		t.Fatal(err)
 	}
 
-	upstream.SendResult(t, job.ID, "image/png", []byte("qr image after reconnect"))
-	got := waitForJobStatus(t, b, job.ID, JobSucceeded)
-	if got.Reason != "generated" {
-		t.Fatalf("job reason = %q, want generated", got.Reason)
+	cancelCommand := upstream.WaitForCommand(t, "cancel_rigassatiksme_qr")
+	if cancelCommand["requestId"] != job.ID {
+		t.Fatalf("cancel requestId = %#v, want %q", cancelCommand["requestId"], job.ID)
+	}
+	got, ok := b.Job(job.ID)
+	if !ok {
+		t.Fatal("job disappeared")
+	}
+	if got.Status != JobWaiting || got.Reason != "ticket_active" {
+		t.Fatalf("preempted job = %#v, want waiting ticket_active", got)
 	}
 }
 
@@ -467,7 +552,7 @@ func TestQueuedQRStartsWithTicketSocketsButNoViewers(t *testing.T) {
 	}
 }
 
-func TestQRJobUsesPhoneControlCodeProtocolAndRequiresAppGeneratedImage(t *testing.T) {
+func TestQRJobUsesRigasSatiksmeBatchProtocolAndRequiresAppGeneratedImage(t *testing.T) {
 	upstream := newFakePhone(t)
 	defer upstream.Close()
 
@@ -490,15 +575,9 @@ func TestQRJobUsesPhoneControlCodeProtocolAndRequiresAppGeneratedImage(t *testin
 		t.Fatal(err)
 	}
 
-	command := upstream.WaitForCommand(t, "generate_control_code")
+	command := upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
 	if starts := upstream.StartRequests(); starts != 0 {
 		t.Fatalf("QR control path sent %d session/start requests; RS automation must not prewarm ViVi", starts)
-	}
-	if command["digits"] != "54321" {
-		t.Fatalf("generate command digits = %#v", command["digits"])
-	}
-	if command["resultImage"] != true {
-		t.Fatalf("generate command resultImage = %#v, want true", command["resultImage"])
 	}
 	if command["app"] != "rigas_satiksme" {
 		t.Fatalf("generate command app = %#v, want rigas_satiksme", command["app"])
@@ -506,8 +585,16 @@ func TestQRJobUsesPhoneControlCodeProtocolAndRequiresAppGeneratedImage(t *testin
 	if command["flow"] != "monthly_ticket" {
 		t.Fatalf("generate command flow = %#v, want monthly_ticket", command["flow"])
 	}
-	if command["requestId"] != job.ID {
-		t.Fatalf("generate requestId = %#v, want %q", command["requestId"], job.ID)
+	jobs, _ := command["jobs"].([]any)
+	if len(jobs) != 1 {
+		t.Fatalf("batch jobs len = %d, want 1: %#v", len(jobs), jobs)
+	}
+	first, _ := jobs[0].(map[string]any)
+	if first["requestId"] != job.ID {
+		t.Fatalf("generate requestId = %#v, want %q", first["requestId"], job.ID)
+	}
+	if first["digits"] != "54321" {
+		t.Fatalf("generate command digits = %#v", first["digits"])
 	}
 	upstream.SendGeneratedTicketState(t, job.ID, "54321")
 	assertJobNotSucceededBriefly(t, b, job.ID)
@@ -741,7 +828,7 @@ func TestQRJobReconnectsControlSocketAndStillAcceptsAppImage(t *testing.T) {
 	}
 }
 
-func TestQRJobRetriesHealthSuccessWithoutImageAndRequiresAppImage(t *testing.T) {
+func TestQRJobReconnectsAfterDisconnectedHealthSuccessWithoutBurningAttempt(t *testing.T) {
 	upstream := newFakePhone(t)
 	upstream.closeAfterGenerateWithHealth = true
 	upstream.closeAfterGenerateHealthDelay = 50 * time.Millisecond
@@ -774,23 +861,64 @@ func TestQRJobRetriesHealthSuccessWithoutImageAndRequiresAppImage(t *testing.T) 
 		t.Fatalf("job unexpectedly stored an image from health-only success")
 	}
 
-	retry := upstream.WaitForCommand(t, "generate_control_code")
-	if retry["requestId"] != job.ID {
-		t.Fatalf("retry requestId = %#v, want %q", retry["requestId"], job.ID)
+	reconnect := upstream.WaitForCommand(t, "generate_control_code")
+	if reconnect["requestId"] != job.ID {
+		t.Fatalf("reconnected requestId = %#v, want %q", reconnect["requestId"], job.ID)
 	}
-	upstream.SendResult(t, job.ID, "image/png", []byte("app image after health-only retry"))
+	upstream.SendResult(t, job.ID, "image/png", []byte("app image after health-only reconnect"))
 
 	got := waitForJobStatus(t, b, job.ID, JobSucceeded)
-	if got.Attempts != 2 || got.Reason != "generated" {
-		t.Fatalf("completed retry job = %#v, want generated after two attempts", got)
+	if got.Attempts != 1 || got.Reason != "generated" {
+		t.Fatalf("completed reconnected job = %#v, want generated on the original attempt", got)
 	}
 	image, ok := b.JobImage(job.ID)
-	if !ok || image.MIME != "image/png" || string(image.Bytes) != "app image after health-only retry" {
+	if !ok || image.MIME != "image/png" || string(image.Bytes) != "app image after health-only reconnect" {
 		t.Fatalf("completed retry image = %#v ok=%v", image, ok)
 	}
 }
 
-func TestQRJobRetriesHealthFailedGeneratedAsImageMissing(t *testing.T) {
+func TestQRJobDoesNotLetOpenSocketHealthSuccessPreemptAppImage(t *testing.T) {
+	upstream := newFakePhone(t)
+	upstream.setHealthAfterGenerateNoClose = true
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "98765", Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	command := upstream.WaitForCommand(t, "generate_control_code")
+	if command["requestId"] != job.ID {
+		t.Fatalf("generate requestId = %#v, want %q", command["requestId"], job.ID)
+	}
+	time.Sleep(2 * controlCodeHealthPollInterval)
+	got, ok := b.Job(job.ID)
+	if !ok || got.Status != JobRunning || got.Attempts != 1 {
+		t.Fatalf("job after open-socket health success = %#v ok=%v, want still running first attempt", got, ok)
+	}
+
+	upstream.SendResult(t, job.ID, "image/png", []byte("app image after health generated"))
+	got = waitForJobStatus(t, b, job.ID, JobSucceeded)
+	if got.Attempts != 1 || got.Reason != "generated" {
+		t.Fatalf("completed job = %#v, want generated on first attempt", got)
+	}
+}
+
+func TestQRJobReconnectsAfterHealthFailedGeneratedWithoutBurningAttempt(t *testing.T) {
 	upstream := newFakePhone(t)
 	upstream.closeAfterGenerateWithHealth = true
 	upstream.closeAfterGenerateHealthStatus = "failed"
@@ -827,8 +955,8 @@ func TestQRJobRetriesHealthFailedGeneratedAsImageMissing(t *testing.T) {
 	upstream.SendResult(t, job.ID, "image/png", []byte("app image after failed generated health retry"))
 
 	got := waitForJobStatus(t, b, job.ID, JobSucceeded)
-	if got.Attempts != 2 || got.Reason != "generated" {
-		t.Fatalf("completed retry job = %#v, want generated after health failed/generated retry", got)
+	if got.Attempts != 1 || got.Reason != "generated" {
+		t.Fatalf("completed reconnected job = %#v, want generated without treating shared health as an RS result", got)
 	}
 }
 
@@ -889,6 +1017,370 @@ func TestNormalizeRigasSatiksmeQRFailureReasonTreatsGeneratedAsImageMissing(t *t
 	}
 	if got := normalizeRigasSatiksmeQRFailureReason("rs_monthly_ticket_flow_failed"); got != "rs_monthly_ticket_flow_failed" {
 		t.Fatalf("specific failure reason = %q", got)
+	}
+	if got := normalizeRigasSatiksmeQRFailureReason("rs_monthly_ticket_unknown_state"); got != "rs_monthly_ticket_unknown_state" {
+		t.Fatalf("semantic failure reason = %q", got)
+	}
+}
+
+func TestSemanticRigasSatiksmeFailureRetryPolicy(t *testing.T) {
+	transient := []string{
+		"phone_timeout",
+		"qr_image_missing",
+	}
+	for _, reason := range transient {
+		if !shouldRetryQRJob(reason, 1) {
+			t.Fatalf("reason %q should retry once", reason)
+		}
+	}
+	stable := []string{
+		"wrong_code",
+		"rs_auth_blocked",
+		"rs_phone_automation_unavailable",
+		"rs_app_launch_failed",
+		"rs_app_foreground_failed",
+		"rs_register_trip_missing",
+		"rs_manual_code_field_missing",
+		"rs_confirm_button_missing",
+		"rs_monthly_ticket_unknown_state",
+		"rs_monthly_ticket_state_timeout",
+	}
+	for _, reason := range stable {
+		if shouldRetryQRJob(reason, 1) {
+			t.Fatalf("reason %q should not retry", reason)
+		}
+	}
+}
+
+func TestQRJobsWithinBurstWindowUseRigasSatiksmeBatchCommand(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "11111", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "22222", Now: now.Add(90 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	command := upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	if command["owner"] != "rigassatiksme" || command["app"] != "rigas_satiksme" || command["flow"] != "monthly_ticket" {
+		t.Fatalf("batch envelope = %#v, want RS monthly-ticket owner/app/flow", command)
+	}
+	if command["ticketPriorityActive"] != false {
+		t.Fatalf("ticketPriorityActive = %#v, want false", command["ticketPriorityActive"])
+	}
+	jobs, ok := command["jobs"].([]any)
+	if !ok || len(jobs) != 2 {
+		t.Fatalf("batch jobs = %#v, want 2 jobs", command["jobs"])
+	}
+	firstPayload, _ := jobs[0].(map[string]any)
+	secondPayload, _ := jobs[1].(map[string]any)
+	if firstPayload["requestId"] != firstJob.ID || firstPayload["digits"] != "11111" {
+		t.Fatalf("first batch job = %#v", firstPayload)
+	}
+	if secondPayload["requestId"] != secondJob.ID || secondPayload["digits"] != "22222" {
+		t.Fatalf("second batch job = %#v", secondPayload)
+	}
+}
+
+func TestQRJobsWithinBurstUseSingleRigasSatiksmeBatchCommand(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "68803", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	command := upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	if command["owner"] != "rigassatiksme" || command["app"] != "rigas_satiksme" || command["flow"] != "monthly_ticket" {
+		t.Fatalf("batch envelope = %#v, want RS monthly-ticket owner/app/flow", command)
+	}
+	jobs, ok := command["jobs"].([]any)
+	if !ok || len(jobs) != 3 {
+		t.Fatalf("batch jobs = %#v, want 3 jobs", command["jobs"])
+	}
+	want := []struct {
+		id   string
+		code string
+	}{
+		{firstJob.ID, "68803"},
+		{secondJob.ID, "58011"},
+		{thirdJob.ID, "27515"},
+	}
+	for index, expected := range want {
+		item, ok := jobs[index].(map[string]any)
+		if !ok {
+			t.Fatalf("job %d payload = %#v", index, jobs[index])
+		}
+		if item["requestId"] != expected.id || item["digits"] != expected.code {
+			t.Fatalf("job %d = %#v, want requestId=%q digits=%q", index, item, expected.id, expected.code)
+		}
+	}
+}
+
+func TestRigasSatiksmeBatchResultsCompleteMatchingJobsOutOfOrder(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "68803", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	upstream.SendResult(t, secondJob.ID, "image/png", []byte("second image"))
+	upstream.SendFailedRigasSatiksmeResult(t, thirdJob.ID, "code_rejected_by_rs")
+	upstream.SendResult(t, firstJob.ID, "image/png", []byte("first image"))
+
+	second := waitForJobStatus(t, b, secondJob.ID, JobSucceeded)
+	if second.Reason != "generated" {
+		t.Fatalf("second job = %#v", second)
+	}
+	third := waitForJobStatus(t, b, thirdJob.ID, JobFailed)
+	if third.Reason != "code_rejected_by_rs" {
+		t.Fatalf("third job = %#v", third)
+	}
+	first := waitForJobStatus(t, b, firstJob.ID, JobSucceeded)
+	if first.Reason != "generated" {
+		t.Fatalf("first job = %#v", first)
+	}
+	firstImage, ok := b.JobImage(firstJob.ID)
+	if !ok || string(firstImage.Bytes) != "first image" {
+		t.Fatalf("first image = %#v ok=%v", firstImage, ok)
+	}
+	secondImage, ok := b.JobImage(secondJob.ID)
+	if !ok || string(secondImage.Bytes) != "second image" {
+		t.Fatalf("second image = %#v ok=%v", secondImage, ok)
+	}
+}
+
+func TestTicketLeasePreemptsRunningRigasSatiksmeBatchWithoutBurningAttempts(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "68803", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	batchID, _ := command["batchId"].(string)
+	if batchID == "" {
+		t.Fatalf("batch command missing batchId: %#v", command)
+	}
+
+	if _, err := b.AcquireTicketLease(ctx, TicketLeaseInput{
+		LeaseID:   "viewer:batch-preempt",
+		RequestID: "batch-preempt",
+		Reason:    "stream_viewer",
+		TTL:       time.Second,
+		Now:       time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cancelCommand := upstream.WaitForCommand(t, "cancel_rigassatiksme_qr_batch")
+	if cancelCommand["batchId"] != batchID {
+		t.Fatalf("cancel batchId = %#v, want %q", cancelCommand["batchId"], batchID)
+	}
+	requestIDs, ok := cancelCommand["requestIds"].([]any)
+	if !ok || len(requestIDs) != 3 {
+		t.Fatalf("cancel requestIds = %#v, want 3", cancelCommand["requestIds"])
+	}
+	for _, jobID := range []string{firstJob.ID, secondJob.ID, thirdJob.ID} {
+		got, ok := b.Job(jobID)
+		if !ok {
+			t.Fatalf("job %s disappeared", jobID)
+		}
+		if got.Status != JobWaiting || got.Reason != "ticket_lease_active" || got.Attempts != 1 {
+			t.Fatalf("preempted job %s = %#v, want waiting ticket_lease_active after one attempt", jobID, got)
+		}
+	}
+}
+
+func TestQRJobDoesNotFinalizeFromSharedControlCodeHealth(t *testing.T) {
+	upstream := newFakePhone(t)
+	upstream.setHealthAfterGenerateNoClose = true
+	upstream.closeAfterGenerateHealthStatus = "failed"
+	upstream.closeAfterGenerateHealthReason = "wrong_code"
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "54321", Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	command := upstream.WaitForCommand(t, "generate_control_code")
+	if command["requestId"] != job.ID {
+		t.Fatalf("generate requestId = %#v, want %q", command["requestId"], job.ID)
+	}
+
+	time.Sleep(2 * controlCodeHealthPollInterval)
+	got, ok := b.Job(job.ID)
+	if !ok || got.Status != JobRunning || got.Attempts != 1 {
+		t.Fatalf("job after shared control-code health = %#v ok=%v, want still running first RS attempt", got, ok)
+	}
+	upstream.SendResult(t, job.ID, "image/png", []byte("explicit rs result"))
+	got = waitForJobStatus(t, b, job.ID, JobSucceeded)
+	if got.Reason != "generated" || got.Attempts != 1 {
+		t.Fatalf("job after explicit RS result = %#v", got)
+	}
+}
+
+func TestRigasSatiksmeBatchReconcilesFinalFailureFromRSHealth(t *testing.T) {
+	upstream := newFakePhone(t)
+	upstream.closeAfterBatchCommandWithRigasSatiksmeHealth = true
+	upstream.closeAfterBatchHealthJobIndex = 1
+	upstream.closeAfterBatchHealthStatus = "failed"
+	upstream.closeAfterBatchHealthReason = "rs_manual_code_field_missing"
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "68803", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80 * time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	second := waitForJobStatus(t, b, secondJob.ID, JobFailed)
+	if second.Reason != "rs_manual_code_field_missing" {
+		t.Fatalf("reconciled second job = %#v", second)
+	}
+	retry := upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	retryJobs, _ := retry["jobs"].([]any)
+	if len(retryJobs) != 1 {
+		t.Fatalf("retry batch jobs = %#v, want one remaining job", retryJobs)
+	}
+	retryJob, _ := retryJobs[0].(map[string]any)
+	if retryJob["requestId"] != firstJob.ID {
+		t.Fatalf("retry batch requestId = %#v, want %q", retryJob["requestId"], firstJob.ID)
+	}
+	upstream.SendFailedRigasSatiksmeResult(t, firstJob.ID, "code_rejected_by_rs")
+	first := waitForJobStatus(t, b, firstJob.ID, JobFailed)
+	if first.Reason != "code_rejected_by_rs" {
+		t.Fatalf("remaining first job = %#v", first)
+	}
+	if snap := b.Snapshot(time.Now()); snap.RunningQRJob {
+		t.Fatalf("running QR job remained after RS health reconciliation: %#v", snap)
 	}
 }
 
@@ -972,7 +1464,7 @@ func TestQRJobFailsFromControlCodeResultReason(t *testing.T) {
 	}
 }
 
-func TestQRJobRetriesRecoverableRigasSatiksmePhoneFailures(t *testing.T) {
+func TestQRJobFinalizesSpecificRigasSatiksmePhoneFailuresWithoutBrokerRetry(t *testing.T) {
 	upstream := newFakePhone(t)
 	defer upstream.Close()
 
@@ -1001,25 +1493,9 @@ func TestQRJobRetriesRecoverableRigasSatiksmePhoneFailures(t *testing.T) {
 	}
 	upstream.SendControlCodeFailure(t, job.ID, "rs_monthly_ticket_stale_code")
 
-	second := upstream.WaitForCommand(t, "generate_control_code")
-	if second["requestId"] != job.ID {
-		t.Fatalf("retry requestId = %#v, want %q", second["requestId"], job.ID)
-	}
-	if second["digits"] != "54321" {
-		t.Fatalf("retry digits = %#v, want 54321", second["digits"])
-	}
-	got, ok := b.Job(job.ID)
-	if !ok {
-		t.Fatalf("job disappeared")
-	}
-	if got.Attempts != 2 || got.Status != JobRunning {
-		t.Fatalf("retry job = %#v, want running on second attempt", got)
-	}
-
-	upstream.SendResult(t, job.ID, "image/png", []byte("rs image after retry"))
-	got = waitForJobStatus(t, b, job.ID, JobSucceeded)
-	if got.Attempts != 2 || got.Reason != "generated" {
-		t.Fatalf("succeeded retry job = %#v, want generated after two attempts", got)
+	got := waitForJobStatus(t, b, job.ID, JobFailed)
+	if got.Attempts != 1 || got.Reason != "rs_monthly_ticket_stale_code" {
+		t.Fatalf("specific phone failure = %#v, want final failure without retry", got)
 	}
 }
 
@@ -1297,6 +1773,15 @@ func TestAnalyticsEndpointSummarizesUserImpactWithoutSensitiveFields(t *testing.
 	failedJob.StartedAt = base.Add(150 * time.Second).Format(time.RFC3339Nano)
 	failedJob.CompletedAt = base.Add(164 * time.Second).Format(time.RFC3339Nano)
 	failedJob.UpdatedAt = failedJob.CompletedAt
+	failedJob.Phone = RSQRPhoneSummary{
+		SourceApp:           expectedRigasSatiksmeSourceApp,
+		TicketFlow:          expectedRigasSatiksmeTicketFlow,
+		TotalDurationMillis: 14000,
+		Phases: map[string]int64{
+			"rs_monthly_ticket_start_state":    1200,
+			"rs_monthly_ticket_proof_finished": 9000,
+		},
+	}
 	succeededJob := b.jobs[slowSuccess.ID]
 	succeededJob.Status = JobSucceeded
 	succeededJob.Reason = "generated"
@@ -1351,6 +1836,9 @@ func TestAnalyticsEndpointSummarizesUserImpactWithoutSensitiveFields(t *testing.
 	if incident.ActorHash == "" || incident.ActorHash == "secret-user-a" || incident.Reason != "rs_monthly_ticket_image_capture_failed" || incident.TotalSec <= 0 || incident.QueueSec <= 0 || incident.FinalAttemptSec <= 0 {
 		t.Fatalf("analytics incident missing sanitized actor/reason/timings: %#v", incident)
 	}
+	if incident.Phone.TotalDurationMillis != 14000 || incident.Phone.Phases["rs_monthly_ticket_start_state"] != 1200 || incident.Phone.SourceApp != expectedRigasSatiksmeSourceApp {
+		t.Fatalf("analytics incident missing safe phone phase summary: %#v", incident.Phone)
+	}
 	if len(decoded.Analytics.RSQR.UserImpact) != 2 {
 		t.Fatalf("analytics user impact len = %d, want 2: %#v", len(decoded.Analytics.RSQR.UserImpact), decoded.Analytics.RSQR.UserImpact)
 	}
@@ -1361,6 +1849,84 @@ func TestAnalyticsEndpointSummarizesUserImpactWithoutSensitiveFields(t *testing.
 	failedImpact := impactByActor[incident.ActorHash]
 	if failedImpact.ActorHash == "" || failedImpact.Jobs != 1 || failedImpact.Failed != 1 || failedImpact.Retried != 1 || failedImpact.LastReason != "rs_monthly_ticket_image_capture_failed" || failedImpact.LastAt == "" {
 		t.Fatalf("analytics user impact missing failed actor rollup: %#v", failedImpact)
+	}
+}
+
+func TestAnalyticsMarksRSSuccessSlowAtFifteenSecondTarget(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{UpstreamBaseURL: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Date(2026, 5, 23, 0, 0, 0, 0, time.UTC)
+	job, err := b.EnqueueQRJob(context.Background(), QRJobInput{ChatID: "chat", UserID: "user", Code: "12345", Now: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b.mu.Lock()
+	stored := b.jobs[job.ID]
+	stored.Status = JobSucceeded
+	stored.Reason = "generated"
+	stored.Attempts = 1
+	stored.StartedAt = base.Format(time.RFC3339Nano)
+	stored.CompletedAt = base.Add(16 * time.Second).Format(time.RFC3339Nano)
+	stored.UpdatedAt = stored.CompletedAt
+	b.mu.Unlock()
+
+	analytics := b.Analytics(base.Add(20 * time.Second))
+	if analytics.RSQR.Totals.SlowSuccess != 1 {
+		t.Fatalf("slow success count = %d, want 1 for RS success over 15 seconds", analytics.RSQR.Totals.SlowSuccess)
+	}
+	if len(analytics.RSQR.RecentIncidents) != 1 || !analytics.RSQR.RecentIncidents[0].SlowSuccess {
+		t.Fatalf("recent incidents should include slow 16s RS success: %#v", analytics.RSQR.RecentIncidents)
+	}
+}
+
+func TestQRJobStoresPhonePhaseSummaryFromRigasSatiksmeResult(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	job, err := b.EnqueueQRJob(ctx, QRJobInput{
+		ChatID: "secret-chat",
+		UserID: "secret-user",
+		Code:   "24680",
+		Now:    time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.WaitForCommand(t, "generate_control_code")
+	upstream.SendFailedRigasSatiksmeResultWithPhases(t, job.ID, "rs_monthly_ticket_stale_code", map[string]int64{
+		"rs_monthly_ticket_start_state":    1100,
+		"rs_monthly_ticket_proof_finished": 8200,
+	})
+
+	got := waitForJobStatus(t, b, job.ID, JobFailed)
+	if got.Attempts != 1 || got.Reason != "rs_monthly_ticket_stale_code" {
+		t.Fatalf("specific phone failure = %#v, want final failure without retry", got)
+	}
+	b.mu.Lock()
+	stored := cloneJob(*b.jobs[job.ID])
+	b.mu.Unlock()
+	if stored.Phone.TotalDurationMillis != 0 || stored.Phone.Phases["rs_monthly_ticket_start_state"] != 1100 {
+		t.Fatalf("final phone failure should retain phone phase summary for incident tracing: %#v", stored.Phone)
 	}
 }
 
@@ -1416,6 +1982,51 @@ func TestDurableStateRestoresQueuedAndRunningJobs(t *testing.T) {
 	}
 }
 
+func TestHealthExposesUpstreamControlCodeRequestForCommandAcceptance(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+	upstream.mu.Lock()
+	upstream.controlCodeRequest = map[string]any{
+		"requestId": "req-accepted",
+		"status":    "running",
+		"reason":    "generated",
+	}
+	upstream.mu.Unlock()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		PhoneSendTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readResponseBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d body = %s", resp.StatusCode, body)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := payload["controlCodeRequest"].(map[string]any)
+	if !ok {
+		t.Fatalf("health did not expose upstream controlCodeRequest: %s", body)
+	}
+	if raw["requestId"] != "req-accepted" || raw["status"] != "running" {
+		t.Fatalf("controlCodeRequest = %#v", raw)
+	}
+	if _, ok := payload["state"].(map[string]any); !ok {
+		t.Fatalf("health response lost broker state: %s", body)
+	}
+}
+
 func assertJobBodyRedacted(t *testing.T, body []byte, forbidden ...string) {
 	t.Helper()
 	text := string(body)
@@ -1438,16 +2049,22 @@ func readResponseBody(t *testing.T, resp *http.Response) []byte {
 
 type fakePhone struct {
 	*httptest.Server
-	commands                       chan map[string]any
-	currentResults                 chan map[string]any
-	closeAfterGenerateWithHealth   bool
-	closeAfterGenerateHealthDelay  time.Duration
-	closeAfterGenerateHealthStatus string
-	closeAfterGenerateHealthReason string
-	disconnectNextGenerate         bool
-	startRequests                  int
-	controlCodeRequest             map[string]any
-	mu                             sync.Mutex
+	commands                                      chan map[string]any
+	currentResults                                chan map[string]any
+	closeAfterGenerateWithHealth                  bool
+	setHealthAfterGenerateNoClose                 bool
+	closeAfterGenerateHealthDelay                 time.Duration
+	closeAfterGenerateHealthStatus                string
+	closeAfterGenerateHealthReason                string
+	closeAfterBatchCommandWithRigasSatiksmeHealth bool
+	closeAfterBatchHealthJobIndex                 int
+	closeAfterBatchHealthStatus                   string
+	closeAfterBatchHealthReason                   string
+	disconnectNextGenerate                        bool
+	startRequests                                 int
+	controlCodeRequest                            map[string]any
+	rigasSatiksmeBatch                            map[string]any
+	mu                                            sync.Mutex
 }
 
 func newFakePhone(t *testing.T) *fakePhone {
@@ -1467,11 +2084,13 @@ func newFakePhone(t *testing.T) *fakePhone {
 		case "/api/v1/health":
 			f.mu.Lock()
 			controlCodeRequest := cloneMap(f.controlCodeRequest)
+			rigasSatiksmeBatch := cloneMap(f.rigasSatiksmeBatch)
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok":                 true,
 				"controlCodeRequest": controlCodeRequest,
+				"rigasSatiksmeBatch": rigasSatiksmeBatch,
 			})
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
@@ -1502,7 +2121,8 @@ func newFakePhone(t *testing.T) *fakePhone {
 					continue
 				}
 				f.commands <- command
-				if command["type"] == "generate_control_code" {
+				generateCommand, isGenerateCommand := fakeLegacyGenerateCommand(command)
+				if isGenerateCommand {
 					f.mu.Lock()
 					disconnect := f.disconnectNextGenerate
 					if disconnect {
@@ -1513,9 +2133,9 @@ func newFakePhone(t *testing.T) *fakePhone {
 						return
 					}
 				}
-				if f.closeAfterGenerateWithHealth && command["type"] == "generate_control_code" {
-					requestID, _ := command["requestId"].(string)
-					value, _ := command["digits"].(string)
+				if f.closeAfterGenerateWithHealth && isGenerateCommand {
+					requestID, _ := generateCommand["requestId"].(string)
+					value, _ := generateCommand["digits"].(string)
 					f.mu.Lock()
 					f.closeAfterGenerateWithHealth = false
 					status := f.closeAfterGenerateHealthStatus
@@ -1549,6 +2169,67 @@ func newFakePhone(t *testing.T) *fakePhone {
 					}
 					return
 				}
+				if f.setHealthAfterGenerateNoClose && isGenerateCommand {
+					requestID, _ := generateCommand["requestId"].(string)
+					value, _ := generateCommand["digits"].(string)
+					f.mu.Lock()
+					f.setHealthAfterGenerateNoClose = false
+					status := f.closeAfterGenerateHealthStatus
+					reason := f.closeAfterGenerateHealthReason
+					if status == "" {
+						status = "succeeded"
+					}
+					if reason == "" {
+						reason = "generated"
+					}
+					f.controlCodeRequest = map[string]any{
+						"requestId": requestID,
+						"status":    status,
+						"reason":    reason,
+						"value":     value,
+					}
+					f.mu.Unlock()
+				}
+				if command["type"] == "generate_rigassatiksme_qr_batch" {
+					f.mu.Lock()
+					closeWithHealth := f.closeAfterBatchCommandWithRigasSatiksmeHealth
+					jobIndex := f.closeAfterBatchHealthJobIndex
+					status := f.closeAfterBatchHealthStatus
+					reason := f.closeAfterBatchHealthReason
+					f.closeAfterBatchCommandWithRigasSatiksmeHealth = false
+					f.mu.Unlock()
+					if closeWithHealth {
+						jobs, _ := command["jobs"].([]any)
+						if jobIndex < 0 || jobIndex >= len(jobs) {
+							jobIndex = 0
+						}
+						requestID := ""
+						if jobIndex < len(jobs) {
+							if item, ok := jobs[jobIndex].(map[string]any); ok {
+								requestID, _ = item["requestId"].(string)
+							}
+						}
+						if status == "" {
+							status = "failed"
+						}
+						if reason == "" {
+							reason = "rs_monthly_ticket_unknown_state"
+						}
+						f.mu.Lock()
+						f.rigasSatiksmeBatch = map[string]any{
+							"batchId":             command["batchId"],
+							"status":              "completed",
+							"lastResultRequestId": requestID,
+							"lastResultStatus":    status,
+							"lastResultReason":    reason,
+							"phases": map[string]any{
+								"rs_monthly_ticket_drive_started": float64(25),
+							},
+						}
+						f.mu.Unlock()
+						return
+					}
+				}
 			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
@@ -1580,10 +2261,61 @@ func (f *fakePhone) WaitForCommand(t *testing.T, commandType string) map[string]
 			if command["type"] == commandType {
 				return command
 			}
+			if commandType == "generate_control_code" {
+				if legacy, ok := fakeLegacyGenerateCommand(command); ok {
+					return legacy
+				}
+			}
+			if commandType == "cancel_rigassatiksme_qr" {
+				if legacy, ok := fakeLegacyCancelCommand(command); ok {
+					return legacy
+				}
+			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for %s command", commandType)
 		}
 	}
+}
+
+func fakeLegacyGenerateCommand(command map[string]any) (map[string]any, bool) {
+	if command["type"] == "generate_control_code" {
+		return command, true
+	}
+	if command["type"] != "generate_rigassatiksme_qr_batch" {
+		return nil, false
+	}
+	jobs, _ := command["jobs"].([]any)
+	if len(jobs) != 1 {
+		return nil, false
+	}
+	job, _ := jobs[0].(map[string]any)
+	if job == nil {
+		return nil, false
+	}
+	legacy := cloneMap(command)
+	legacy["type"] = "generate_control_code"
+	legacy["requestId"] = job["requestId"]
+	legacy["digits"] = job["digits"]
+	legacy["createdAt"] = job["createdAt"]
+	legacy["resultImage"] = true
+	return legacy, true
+}
+
+func fakeLegacyCancelCommand(command map[string]any) (map[string]any, bool) {
+	if command["type"] == "cancel_rigassatiksme_qr" {
+		return command, true
+	}
+	if command["type"] != "cancel_rigassatiksme_qr_batch" {
+		return nil, false
+	}
+	requestIDs, _ := command["requestIds"].([]any)
+	if len(requestIDs) != 1 {
+		return nil, false
+	}
+	legacy := cloneMap(command)
+	legacy["type"] = "cancel_rigassatiksme_qr"
+	legacy["requestId"] = requestIDs[0]
+	return legacy, true
 }
 
 func (f *fakePhone) SendResult(t *testing.T, requestID string, mime string, image []byte) {
@@ -1611,11 +2343,20 @@ func (f *fakePhone) SendResultWithSource(t *testing.T, requestID string, mime st
 
 func (f *fakePhone) SendFailedRigasSatiksmeResult(t *testing.T, requestID string, reason string) {
 	t.Helper()
+	f.SendFailedRigasSatiksmeResultWithPhases(t, requestID, reason, nil)
+}
+
+func (f *fakePhone) SendFailedRigasSatiksmeResultWithPhases(t *testing.T, requestID string, reason string, phases map[string]int64) {
+	t.Helper()
 	f.mu.Lock()
 	results := f.currentResults
 	f.mu.Unlock()
 	if results == nil {
 		t.Fatalf("no active phone session for result")
+	}
+	phasePayload := map[string]any{}
+	for key, value := range phases {
+		phasePayload[key] = value
 	}
 	results <- map[string]any{
 		"type":      "rigassatiksme_qr_result",
@@ -1623,6 +2364,7 @@ func (f *fakePhone) SendFailedRigasSatiksmeResult(t *testing.T, requestID string
 		"ok":        false,
 		"accepted":  false,
 		"reason":    reason,
+		"phases":    phasePayload,
 	}
 }
 

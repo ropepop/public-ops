@@ -96,9 +96,13 @@ Safety constraints:
 Semantics:
 
 - `retried` means `attempts > 1`; it includes slow successes that should still be investigated.
-- `slowSuccess` currently means successful RS QR delivery took at least 60 seconds end-to-end.
+- `slowSuccess` currently means successful RS QR delivery took at least 15 seconds end-to-end; this is the per-job incident signal that supports the 15-second average target.
 - `userImpact` groups all retained broker jobs by safe actor hash so watchdog/steward runs can start from affected users instead of aggregate health.
 - `recentIncidents` includes failures, non-user cancellations, running jobs, retried jobs, and slow successes.
+- `recentIncidents[].phone` may include safe Pixel phase timings such as source app, ticket flow, total duration, and per-phase milliseconds. It must not include RS codes, raw user IDs, tokens, cookies, or session values.
+- RS monthly-ticket reasons must preserve Pixel's named phone result when one exists. `phone_timeout` means no final Pixel outcome arrived before the broker deadline; it must not replace reasons such as `rs_phone_automation_unavailable`, `rs_app_launch_failed`, `rs_app_foreground_failed`, `wrong_code`, `code_rejected_by_rs`, `rs_monthly_ticket_missing`, `rs_manual_code_field_missing`, `rs_manual_code_button_missing`, `rs_monthly_ticket_stale_code`, `rs_monthly_ticket_unknown_state`, `rs_monthly_ticket_state_timeout`, or `rs_monthly_ticket_image_capture_failed`. Non-critical cleanup may be delayed briefly after a final result so rapidly arriving RS work can stay inside the warm RS app.
+- Public ticket viewer presence and ticket leases are hard phone-priority signals, not bounded grace windows. While an authenticated viewer is present or a ViVi control-code lease is active, broker desired owner is `ticket`, queued RS jobs stay waiting, and a running RS job is canceled back to waiting without consuming RS retry budget. During that time the phone must remain on ViVi/ticket work rather than RS.
+- Current operational timing targets are: public `ticket.jolkins.id.lv` load to live ViVi ticket in 5 seconds or less, RS final image or named final failure in 15 seconds or less on average, and public stream frame delay remaining within the existing live freshness threshold (`visibleFrame`/`directStream` last-frame age at or below 1500 ms during close-out).
 - Broker analytics are a starting point; they do not replace image semantics or live ViVi/public verification.
 
 ## Watchdog contract
@@ -134,7 +138,7 @@ Current alerting thresholds:
 
 - waiting RS QR job: 90 seconds
 - running RS QR job: 85 seconds
-- slow success: 60 seconds total
+- slow success: 15 seconds total
 - retried success: any success with more than one attempt
 - failed/canceled job: always an incident unless cancellation is explicit user cancellation
 
@@ -142,6 +146,9 @@ These thresholds are operational and may be tightened as latency work improves, 
 
 ## Architecture update notes
 
+- 2026-05-23: RS QR analytics now preserve safe phone-side phase summaries from Pixel result messages. This keeps broker triage aligned with the phone as source of truth while keeping sensitive values out of watchdog and steward output.
+- 2026-05-23: Broker ticket priority is hard while public viewers or ticket leases are active. The old bounded viewer-priority window is not the production contract; RS must wait or be preempted for the full ticket presence/lease duration, and `ticket_lease_active` preemptions must not burn RS retry attempts.
+- 2026-05-23: RS monthly-ticket work is batch-aware. Broker commands include an `rsQueueHint` with pending RS demand and ticket-priority state; Pixel sends each final RS result before ViVi cleanup, routes non-critical cleanup through an idle delay so a rapidly arriving next RS job can continue in RS, uses semantic RS field focus before non-touch digit entry when Flutter accessibility text replacement is ineffective, activates Flutter controls from matched labels with parent-bound fallback, uses small bounded settle windows after stale-ticket back navigation and Flutter screen changes, retries visible semantic controls after transient failed activation, and public ticket priority still preempts RS. After submit, a stale control ticket that does not prove the requested digits is a final `rs_monthly_ticket_stale_code` result rather than an unknown reset loop; returning to the manual-code choice after submit is `code_rejected_by_rs` rather than a retried/stalled input loop. Broker health polling reconciles named Pixel failures while the control socket is open and reconciles image-missing generated health only after socket disconnect; an open control socket must wait for the explicit `rigassatiksme_qr_result` image so health cannot race a still-arriving screenshot into `qr_image_missing`.
 - Added a broker analytics endpoint and schemas so agents no longer need to parse raw job state for first-pass triage.
 - Watchdog output now carries broker analytics summaries when available.
 - The steward close-out bar is raised from "current health green" to "real affected users explained, fixed/recovered, and product semantics verified." 

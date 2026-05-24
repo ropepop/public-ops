@@ -52,11 +52,16 @@ const (
 
 	controlCodeHealthPollInterval   = 250 * time.Millisecond
 	controlCodeDisconnectResultWait = 12 * time.Second
+	healthUpstreamProbeTimeout      = 250 * time.Millisecond
+	rigasSatiksmeBatchBurstWindow   = 250 * time.Millisecond
+	rigasSatiksmeBatchMaxJobs       = 3
 
 	websocketProxyReadLimitBytes = 8 << 20
 
 	expectedRigasSatiksmeSourceApp  = "com.flutter.rspassenger"
 	expectedRigasSatiksmeTicketFlow = "rigas_satiksme_android_monthly_ticket_control"
+
+	rsQRSlowSuccessThresholdSeconds = 15
 )
 
 var qrCodePattern = regexp.MustCompile(`^[0-9]{5}$`)
@@ -89,6 +94,8 @@ type Broker struct {
 	lastPreemptionReason  string
 	lastPreemptionAt      time.Time
 	runningJobID          string
+	runningJobIDs         []string
+	runningBatchID        string
 	runningCancel         context.CancelFunc
 	runningControl        *websocket.Conn
 	runningControlWriteMu sync.Mutex
@@ -139,17 +146,18 @@ type TicketLeaseSnapshot struct {
 }
 
 type QRJob struct {
-	ID          string `json:"id"`
-	ChatID      string `json:"chatId"`
-	UserID      string `json:"userId"`
-	Code        string `json:"code,omitempty"`
-	Status      string `json:"status"`
-	Reason      string `json:"reason,omitempty"`
-	Attempts    int    `json:"attempts"`
-	CreatedAt   string `json:"createdAt"`
-	UpdatedAt   string `json:"updatedAt"`
-	StartedAt   string `json:"startedAt,omitempty"`
-	CompletedAt string `json:"completedAt,omitempty"`
+	ID          string           `json:"id"`
+	ChatID      string           `json:"chatId"`
+	UserID      string           `json:"userId"`
+	Code        string           `json:"code,omitempty"`
+	Status      string           `json:"status"`
+	Reason      string           `json:"reason,omitempty"`
+	Attempts    int              `json:"attempts"`
+	CreatedAt   string           `json:"createdAt"`
+	UpdatedAt   string           `json:"updatedAt"`
+	StartedAt   string           `json:"startedAt,omitempty"`
+	CompletedAt string           `json:"completedAt,omitempty"`
+	Phone       RSQRPhoneSummary `json:"phone,omitempty"`
 }
 
 type publicQRJob struct {
@@ -176,8 +184,19 @@ type upstreamControlCodeRequest struct {
 	Value     string `json:"value"`
 }
 
+type upstreamRigasSatiksmeBatch struct {
+	BatchID             string           `json:"batchId"`
+	Status              string           `json:"status"`
+	ActiveRequestID     string           `json:"activeRequestId"`
+	LastResultRequestID string           `json:"lastResultRequestId"`
+	LastResultStatus    string           `json:"lastResultStatus"`
+	LastResultReason    string           `json:"lastResultReason"`
+	Phases              map[string]int64 `json:"phases"`
+}
+
 type upstreamHealth struct {
 	ControlCodeRequest upstreamControlCodeRequest `json:"controlCodeRequest"`
+	RigasSatiksmeBatch upstreamRigasSatiksmeBatch `json:"rigasSatiksmeBatch"`
 }
 
 type StateSnapshot struct {
@@ -258,20 +277,28 @@ type RSQRUserImpact struct {
 }
 
 type RSQRIncident struct {
-	TraceID         string  `json:"traceId"`
-	Seq             int     `json:"seq"`
-	ActorHash       string  `json:"actorHash,omitempty"`
-	Status          string  `json:"status"`
-	Reason          string  `json:"reason,omitempty"`
-	Attempts        int     `json:"attempts,omitempty"`
-	CreatedAt       string  `json:"createdAt,omitempty"`
-	StartedAt       string  `json:"startedAt,omitempty"`
-	CompletedAt     string  `json:"completedAt,omitempty"`
-	TotalSec        float64 `json:"totalSec,omitempty"`
-	QueueSec        float64 `json:"queueSec,omitempty"`
-	FinalAttemptSec float64 `json:"finalAttemptSec,omitempty"`
-	Retried         bool    `json:"retried,omitempty"`
-	SlowSuccess     bool    `json:"slowSuccess,omitempty"`
+	TraceID         string           `json:"traceId"`
+	Seq             int              `json:"seq"`
+	ActorHash       string           `json:"actorHash,omitempty"`
+	Status          string           `json:"status"`
+	Reason          string           `json:"reason,omitempty"`
+	Attempts        int              `json:"attempts,omitempty"`
+	CreatedAt       string           `json:"createdAt,omitempty"`
+	StartedAt       string           `json:"startedAt,omitempty"`
+	CompletedAt     string           `json:"completedAt,omitempty"`
+	TotalSec        float64          `json:"totalSec,omitempty"`
+	QueueSec        float64          `json:"queueSec,omitempty"`
+	FinalAttemptSec float64          `json:"finalAttemptSec,omitempty"`
+	Retried         bool             `json:"retried,omitempty"`
+	SlowSuccess     bool             `json:"slowSuccess,omitempty"`
+	Phone           RSQRPhoneSummary `json:"phone,omitempty"`
+}
+
+type RSQRPhoneSummary struct {
+	SourceApp           string           `json:"sourceApp,omitempty"`
+	TicketFlow          string           `json:"ticketFlow,omitempty"`
+	TotalDurationMillis int64            `json:"totalDurationMillis,omitempty"`
+	Phases              map[string]int64 `json:"phases,omitempty"`
 }
 
 type persistedState struct {
@@ -519,12 +546,14 @@ func (b *Broker) CancelLatestJob(ctx context.Context, userID string, now time.Ti
 		job.Reason = "user_canceled"
 		job.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
 		job.CompletedAt = job.UpdatedAt
-		if b.runningJobID == job.ID {
-			b.sendCancelToRunningLocked(job.ID, "user_canceled")
+		if b.isRunningJobLocked(job.ID) {
+			b.sendCancelToRunningLocked("user_canceled")
 			if b.runningCancel != nil {
 				b.runningCancel()
 			}
 			b.runningJobID = ""
+			b.runningJobIDs = nil
+			b.runningBatchID = ""
 			b.runningCancel = nil
 			b.runningControl = nil
 		}
@@ -593,7 +622,7 @@ func (b *Broker) Snapshot(now time.Time) StateSnapshot {
 		TicketSockets:        b.ticketSockets,
 		TicketActive:         b.ticketActiveLocked(now),
 		QueueDepth:           queueDepth,
-		RunningQRJob:         b.runningJobID != "",
+		RunningQRJob:         b.runningJobID != "" || len(b.runningJobIDs) > 0,
 		RunningJobID:         b.runningJobID,
 		Jobs:                 jobs,
 	}
@@ -651,7 +680,7 @@ func (b *Broker) Analytics(now time.Time) AnalyticsSnapshot {
 		if job.Status == JobSucceeded && totalSec > 0 {
 			latencies = append(latencies, totalSec)
 		}
-		slowSuccess := job.Status == JobSucceeded && totalSec >= 60
+		slowSuccess := job.Status == JobSucceeded && totalSec >= rsQRSlowSuccessThresholdSeconds
 		if slowSuccess {
 			analytics.RSQR.Totals.SlowSuccess++
 		}
@@ -702,6 +731,7 @@ func (b *Broker) Analytics(now time.Time) AnalyticsSnapshot {
 				FinalAttemptSec: finalAttemptSec,
 				Retried:         job.Attempts > 1,
 				SlowSuccess:     slowSuccess,
+				Phone:           cloneRSQRPhoneSummary(job.Phone),
 			})
 		}
 	}
@@ -715,58 +745,97 @@ func (b *Broker) Analytics(now time.Time) AnalyticsSnapshot {
 
 func (b *Broker) tick(parent context.Context) {
 	now := time.Now()
-	var job QRJob
+	var jobs []QRJob
 	var cancel context.CancelFunc
 	var runCtx context.Context
 	b.mu.Lock()
-	if b.runningJobID != "" || b.ticketBlocksQRLocked(now) {
+	if b.runningJobID != "" || len(b.runningJobIDs) > 0 || b.ticketBlocksQRLocked(now) {
 		b.mu.Unlock()
 		return
 	}
-	for _, id := range b.order {
-		candidate := b.jobs[id]
-		if candidate == nil || candidate.Status != JobWaiting {
-			continue
+	jobs = b.selectRigasSatiksmeBatchLocked(now)
+	if len(jobs) > 0 {
+		startedAt := now.UTC().Format(time.RFC3339Nano)
+		ids := make([]string, 0, len(jobs))
+		for _, selected := range jobs {
+			candidate := b.jobs[selected.ID]
+			if candidate == nil || candidate.Status != JobWaiting {
+				continue
+			}
+			candidate.Status = JobRunning
+			previousReason := strings.TrimSpace(candidate.Reason)
+			// Ticket-priority preemption pauses the RS job; it should not consume the
+			// retry budget reserved for real phone/app result failures.
+			if !isTicketPriorityPreemptionReason(previousReason) || candidate.Attempts == 0 {
+				candidate.Attempts++
+			}
+			candidate.Reason = ""
+			candidate.StartedAt = startedAt
+			candidate.UpdatedAt = startedAt
+			ids = append(ids, candidate.ID)
 		}
-		candidate.Status = JobRunning
-		previousReason := strings.TrimSpace(candidate.Reason)
-		// Ticket-priority preemption pauses the RS job; it should not consume the
-		// retry budget reserved for real phone/app result failures.
-		if previousReason != "ticket_active" || candidate.Attempts == 0 {
-			candidate.Attempts++
-		}
-		candidate.Reason = ""
-		candidate.StartedAt = now.UTC().Format(time.RFC3339Nano)
-		candidate.UpdatedAt = candidate.StartedAt
-		job = cloneJob(*candidate)
 		var runCancel context.CancelFunc
 		runCtx, runCancel = context.WithCancel(parent)
 		cancel = runCancel
-		b.runningJobID = candidate.ID
+		b.runningJobIDs = ids
+		if len(ids) > 0 {
+			b.runningJobID = ids[0]
+			b.runningBatchID = "rsbatch-" + randomID()
+		}
 		b.runningCancel = runCancel
 		_ = b.saveLocked()
-		break
 	}
 	b.mu.Unlock()
-	if job.ID == "" {
+	if len(jobs) == 0 {
 		return
 	}
-	go b.runQRJob(runCtx, job, cancel)
+	go b.runQRBatch(runCtx, jobs, cancel)
 }
 
-func (b *Broker) runQRJob(runCtx context.Context, job QRJob, cancel context.CancelFunc) {
+func (b *Broker) selectRigasSatiksmeBatchLocked(now time.Time) []QRJob {
+	var selected []QRJob
+	var firstWaitingCreated time.Time
+	for _, id := range b.order {
+		job := b.jobs[id]
+		if job == nil || job.Status != JobWaiting {
+			continue
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, job.CreatedAt)
+		if err != nil {
+			createdAt = now
+		}
+		if len(selected) == 0 {
+			firstWaitingCreated = createdAt
+		}
+		selected = append(selected, cloneJob(*job))
+		if len(selected) >= rigasSatiksmeBatchMaxJobs {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	if len(selected) < rigasSatiksmeBatchMaxJobs && now.Sub(firstWaitingCreated) < rigasSatiksmeBatchBurstWindow {
+		return nil
+	}
+	return selected
+}
+
+func (b *Broker) runQRBatch(runCtx context.Context, jobs []QRJob, cancel context.CancelFunc) {
 	defer cancel()
 	ctx, timeoutCancel := context.WithTimeout(runCtx, b.cfg.JobTimeout)
 	defer timeoutCancel()
 
-	conn, err := b.openQRPhoneControl(ctx, job)
+	conn, err := b.openQRPhoneBatchControl(ctx, jobs)
 	if err != nil {
-		b.finishRunningJob(job.ID, false, "phone_unavailable", "", nil)
+		for _, job := range jobs {
+			b.finishRunningJob(job.ID, false, "phone_unavailable", "", nil)
+		}
 		return
 	}
 	defer func() {
 		if conn != nil {
-			_ = conn.Close(websocket.StatusNormalClosure, "job finished")
+			_ = conn.Close(websocket.StatusNormalClosure, "batch finished")
 		}
 	}()
 
@@ -775,92 +844,149 @@ func (b *Broker) runQRJob(runCtx context.Context, job QRJob, cancel context.Canc
 		data    []byte
 		err     error
 	}
-
-	for {
+	startPhoneRead := func(readConn *websocket.Conn) <-chan phoneReadResult {
 		readDone := make(chan phoneReadResult, 1)
-		readConn := conn
 		go func() {
 			msgType, data, err := readConn.Read(context.Background())
 			readDone <- phoneReadResult{msgType: msgType, data: data, err: err}
 		}()
+		return readDone
+	}
 
+	pending := make(map[string]QRJob, len(jobs))
+	jobOrder := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		pending[job.ID] = job
+		jobOrder = append(jobOrder, job.ID)
+	}
+	pendingJobs := func() []QRJob {
+		out := make([]QRJob, 0, len(pending))
+		for _, id := range jobOrder {
+			if job, ok := pending[id]; ok {
+				out = append(out, job)
+			}
+		}
+		return out
+	}
+	readConn := conn
+	readDone := startPhoneRead(readConn)
+	for len(pending) > 0 {
 		var result phoneReadResult
 		select {
 		case <-ctx.Done():
+			stillRunning := make([]string, 0, len(pending))
 			b.mu.Lock()
-			current := b.jobs[job.ID]
-			status := ""
-			if current != nil {
-				status = current.Status
+			for id := range pending {
+				current := b.jobs[id]
+				status := ""
+				if current != nil {
+					status = current.Status
+				}
+				if status != JobWaiting && status != JobCanceled {
+					stillRunning = append(stillRunning, id)
+				}
 			}
 			b.mu.Unlock()
-			if status == JobWaiting || status == JobCanceled {
+			if len(stillRunning) == 0 {
 				return
 			}
-			b.sendCancelToConn(readConn, job.ID, "job_timeout")
-			b.finishRunningJob(job.ID, false, "phone_timeout", "", nil)
-			_ = readConn.Close(websocket.StatusNormalClosure, "job timeout")
+			b.sendCancelBatchToConn(readConn, b.currentRunningBatchID(), stillRunning, "job_timeout")
+			for _, id := range stillRunning {
+				b.finishRunningJob(id, false, "phone_timeout", "", nil)
+			}
+			_ = readConn.Close(websocket.StatusNormalClosure, "batch timeout")
 			return
 		case result = <-readDone:
 		}
 
 		msgType, data, err := result.msgType, result.data, result.err
 		if err != nil {
-			b.mu.Lock()
-			current := b.jobs[job.ID]
-			status := ""
-			if current != nil {
-				status = current.Status
-			}
-			b.mu.Unlock()
-			if status == JobWaiting || status == JobCanceled {
-				return
-			}
 			select {
-			case <-ctx.Done():
-				b.sendCancelToConn(conn, job.ID, "job_timeout")
-				b.finishRunningJob(job.ID, false, "phone_timeout", "", nil)
+			case <-runCtx.Done():
 				return
 			default:
 			}
-			if b.finishFromUpstreamControlCodeHealth(ctx, job.ID) {
+			for id := range pending {
+				if b.finishFromUpstreamRigasSatiksmeBatchHealthOnce(ctx, id) {
+					delete(pending, id)
+				}
+			}
+			if len(pending) == 0 {
 				return
 			}
 			select {
 			case <-ctx.Done():
-				b.sendCancelToConn(conn, job.ID, "job_timeout")
-				b.finishRunningJob(job.ID, false, "phone_timeout", "", nil)
-				return
+				continue
 			case <-time.After(500 * time.Millisecond):
 			}
-			_ = conn.Close(websocket.StatusInternalError, "qr control reconnect")
-			nextConn, reconnectErr := b.openQRPhoneControl(ctx, job)
+			_ = readConn.Close(websocket.StatusInternalError, "qr batch control reconnect")
+			nextConn, reconnectErr := b.openQRPhoneBatchControl(ctx, pendingJobs())
 			if reconnectErr != nil {
+				readConn = conn
+				readDone = startPhoneRead(readConn)
 				continue
 			}
 			conn = nextConn
+			readConn = nextConn
+			readDone = startPhoneRead(readConn)
 			continue
 		}
 		if msgType != websocket.MessageText {
+			readDone = startPhoneRead(readConn)
 			continue
 		}
 		var payload rigasSatiksmeQRPhoneMessage
 		if err := json.Unmarshal(data, &payload); err != nil {
+			readDone = startPhoneRead(readConn)
 			continue
 		}
-		if strings.TrimSpace(payload.RequestID) != job.ID {
+		requestID := strings.TrimSpace(payload.RequestID)
+		if _, ok := pending[requestID]; !ok {
+			readDone = startPhoneRead(readConn)
 			continue
 		}
 		decision := evaluateRigasSatiksmeQRPhoneMessage(payload)
 		if !decision.Final {
+			readDone = startPhoneRead(readConn)
 			continue
 		}
 		if decision.OK {
-			b.finishRunningJob(job.ID, true, decision.Reason, decision.MIME, decision.Image)
+			b.finishRunningJobWithPhone(requestID, true, decision.Reason, decision.MIME, decision.Image, decision.Phone)
 		} else {
-			b.finishRunningJob(job.ID, false, decision.Reason, "", nil)
+			b.finishRunningJobWithPhone(requestID, false, decision.Reason, "", nil, decision.Phone)
 		}
-		return
+		delete(pending, requestID)
+		if len(pending) > 0 {
+			readDone = startPhoneRead(readConn)
+		}
+	}
+}
+
+func (b *Broker) currentRunningBatchID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.runningBatchID
+}
+
+func (b *Broker) finishFromUpstreamRigasSatiksmeBatchHealthOnce(ctx context.Context, jobID string) bool {
+	health, err := b.fetchUpstreamHealth(ctx)
+	if err != nil {
+		return false
+	}
+	result := health.RigasSatiksmeBatch
+	if strings.TrimSpace(result.LastResultRequestID) != jobID {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(result.LastResultStatus))
+	switch status {
+	case "failed", "failure", "error", "canceled", "cancelled":
+		reason := normalizeRigasSatiksmeQRFailureReason(result.LastResultReason)
+		b.finishRunningJobWithPhone(jobID, false, reason, "", nil, RSQRPhoneSummary{
+			Phases: sanitizeRSQRPhonePhases(result.Phases),
+		})
+		return true
+	default:
+		return false
 	}
 }
 
@@ -910,61 +1036,6 @@ func normalizeRigasSatiksmeQRFailureReason(reason string) string {
 	return clean
 }
 
-func (b *Broker) finishFromUpstreamControlCodeHealth(ctx context.Context, jobID string) bool {
-	_ = ctx // Use an independent short poll window; the websocket read context may already be canceled.
-	pollCtx, cancel := context.WithTimeout(context.Background(), controlCodeDisconnectResultWait)
-	defer cancel()
-	ticker := time.NewTicker(controlCodeHealthPollInterval)
-	defer ticker.Stop()
-	for {
-		finished, matched := b.finishFromUpstreamControlCodeHealthOnce(pollCtx, jobID)
-		if finished {
-			return true
-		}
-		if !matched {
-			return false
-		}
-		b.mu.Lock()
-		current := b.jobs[jobID]
-		stillRunning := current != nil && current.Status == JobRunning
-		b.mu.Unlock()
-		if !stillRunning {
-			return true
-		}
-		select {
-		case <-pollCtx.Done():
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
-func (b *Broker) finishFromUpstreamControlCodeHealthOnce(ctx context.Context, jobID string) (bool, bool) {
-	health, err := b.fetchUpstreamHealth(ctx)
-	if err != nil {
-		return false, true
-	}
-	result := health.ControlCodeRequest
-	if strings.TrimSpace(result.RequestID) != jobID {
-		return false, false
-	}
-	status := strings.ToLower(strings.TrimSpace(result.Status))
-	switch status {
-	case "succeeded", "success", "generated":
-		// Health success is a terminal app-state signal only. Without an explicit
-		// app-captured QR image on the control socket, do not synthesize one from the
-		// submitted digits or control-code value.
-		b.finishRunningJob(jobID, false, "qr_image_missing", "", nil)
-		return true, true
-	case "failed", "failure", "error", "canceled", "cancelled":
-		reason := normalizeRigasSatiksmeQRFailureReason(result.Reason)
-		b.finishRunningJob(jobID, false, reason, "", nil)
-		return true, true
-	default:
-		return false, true
-	}
-}
-
 func (b *Broker) fetchUpstreamHealth(ctx context.Context) (upstreamHealth, error) {
 	var health upstreamHealth
 	healthCtx, cancel := context.WithTimeout(ctx, b.cfg.PhoneSendTimeout)
@@ -988,27 +1059,42 @@ func (b *Broker) fetchUpstreamHealth(ctx context.Context) (upstreamHealth, error
 	return health, nil
 }
 
-func (b *Broker) openQRPhoneControl(ctx context.Context, job QRJob) (*websocket.Conn, error) {
+func (b *Broker) openQRPhoneBatchControl(ctx context.Context, jobs []QRJob) (*websocket.Conn, error) {
 	conn, err := b.openPhoneControl(ctx, false)
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now()
+	batchID := ""
 	b.mu.Lock()
-	if b.runningJobID == job.ID {
+	if len(jobs) > 0 && b.runningJobID == jobs[0].ID {
 		b.runningControl = conn
+		batchID = b.runningBatchID
 	}
+	ticketPriorityActive := b.ticketBlocksQRLocked(now)
 	b.mu.Unlock()
+	if batchID == "" {
+		batchID = "rsbatch-" + randomID()
+	}
+	jobPayloads := make([]map[string]any, 0, len(jobs))
+	for _, job := range jobs {
+		jobPayloads = append(jobPayloads, map[string]any{
+			"requestId": job.ID,
+			"digits":    job.Code,
+			"createdAt": job.CreatedAt,
+		})
+	}
 	if err := b.writePhoneJSON(ctx, conn, map[string]any{
-		"type":         "generate_control_code",
-		"requestId":    job.ID,
-		"digits":       job.Code,
-		"owner":        "rigassatiksme",
-		"app":          "rigas_satiksme",
-		"flow":         "monthly_ticket",
-		"resultImage":  true,
-		"serverSentAt": time.Now().UTC().Format(time.RFC3339Nano),
+		"type":                 "generate_rigassatiksme_qr_batch",
+		"batchId":              batchID,
+		"owner":                "rigassatiksme",
+		"app":                  "rigas_satiksme",
+		"flow":                 "monthly_ticket",
+		"jobs":                 jobPayloads,
+		"ticketPriorityActive": ticketPriorityActive,
+		"serverSentAt":         time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
-		_ = conn.Close(websocket.StatusInternalError, "send qr command failed")
+		_ = conn.Close(websocket.StatusInternalError, "send qr batch command failed")
 		return nil, err
 	}
 	return conn, nil
@@ -1033,6 +1119,10 @@ func (b *Broker) openPhoneControl(ctx context.Context, startSession bool) (*webs
 }
 
 func (b *Broker) finishRunningJob(id string, ok bool, reason string, mime string, image []byte) {
+	b.finishRunningJobWithPhone(id, ok, reason, mime, image, RSQRPhoneSummary{})
+}
+
+func (b *Broker) finishRunningJobWithPhone(id string, ok bool, reason string, mime string, image []byte, phone RSQRPhoneSummary) {
 	now := time.Now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1042,6 +1132,9 @@ func (b *Broker) finishRunningJob(id string, ok bool, reason string, mime string
 	}
 	cleanReason := strings.TrimSpace(reason)
 	job.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
+	if !isZeroRSQRPhoneSummary(phone) {
+		job.Phone = cloneRSQRPhoneSummary(phone)
+	}
 	if ok {
 		job.Status = JobSucceeded
 		job.Reason = cleanReason
@@ -1060,40 +1153,120 @@ func (b *Broker) finishRunningJob(id string, ok bool, reason string, mime string
 		job.Reason = cleanReason
 		job.CompletedAt = job.UpdatedAt
 	}
-	if b.runningJobID == id {
-		b.runningJobID = ""
-		b.runningCancel = nil
-		b.runningControl = nil
+	if b.isRunningJobLocked(id) {
+		b.removeRunningJobLocked(id)
 	}
 	_ = b.saveLocked()
 	b.signalRunnerLocked()
 }
 
-func (b *Broker) preemptRunningLocked(now time.Time, reason string) {
-	if b.runningJobID == "" {
-		return
-	}
-	b.lastPreemptionReason = strings.TrimSpace(reason)
-	b.lastPreemptionAt = now.UTC()
-	job := b.jobs[b.runningJobID]
-	if job != nil && job.Status == JobRunning {
-		job.Status = JobWaiting
-		job.Reason = reason
-		job.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
-	}
-	b.sendCancelToRunningLocked(b.runningJobID, reason)
-	if b.runningCancel != nil {
-		b.runningCancel()
+func (b *Broker) removeRunningJobLocked(id string) {
+	if len(b.runningJobIDs) > 0 {
+		filtered := b.runningJobIDs[:0]
+		for _, runningID := range b.runningJobIDs {
+			if runningID != id {
+				filtered = append(filtered, runningID)
+			}
+		}
+		b.runningJobIDs = filtered
+		if len(b.runningJobIDs) > 0 {
+			b.runningJobID = b.runningJobIDs[0]
+			return
+		}
 	}
 	b.runningJobID = ""
+	b.runningJobIDs = nil
+	b.runningBatchID = ""
 	b.runningCancel = nil
 	b.runningControl = nil
 }
 
-func (b *Broker) sendCancelToRunningLocked(requestID string, reason string) {
+func (b *Broker) isRunningJobLocked(id string) bool {
+	if b.runningJobID == id {
+		return true
+	}
+	for _, runningID := range b.runningJobIDs {
+		if runningID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func isZeroRSQRPhoneSummary(summary RSQRPhoneSummary) bool {
+	return strings.TrimSpace(summary.SourceApp) == "" &&
+		strings.TrimSpace(summary.TicketFlow) == "" &&
+		summary.TotalDurationMillis == 0 &&
+		len(summary.Phases) == 0
+}
+
+func cloneRSQRPhoneSummary(summary RSQRPhoneSummary) RSQRPhoneSummary {
+	out := RSQRPhoneSummary{
+		SourceApp:           strings.TrimSpace(summary.SourceApp),
+		TicketFlow:          strings.TrimSpace(summary.TicketFlow),
+		TotalDurationMillis: summary.TotalDurationMillis,
+	}
+	if len(summary.Phases) > 0 {
+		out.Phases = make(map[string]int64, len(summary.Phases))
+		for key, value := range summary.Phases {
+			cleanKey := strings.TrimSpace(key)
+			if cleanKey == "" {
+				continue
+			}
+			if value < 0 {
+				value = 0
+			}
+			out.Phases[cleanKey] = value
+		}
+		if len(out.Phases) == 0 {
+			out.Phases = nil
+		}
+	}
+	return out
+}
+
+func (b *Broker) preemptRunningLocked(now time.Time, reason string) {
+	if b.runningJobID == "" && len(b.runningJobIDs) == 0 {
+		return
+	}
+	b.lastPreemptionReason = strings.TrimSpace(reason)
+	b.lastPreemptionAt = now.UTC()
+	runningIDs := append([]string(nil), b.runningJobIDs...)
+	if len(runningIDs) == 0 && b.runningJobID != "" {
+		runningIDs = []string{b.runningJobID}
+	}
+	for _, id := range runningIDs {
+		job := b.jobs[id]
+		if job != nil && job.Status == JobRunning {
+			job.Status = JobWaiting
+			job.Reason = reason
+			job.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	b.sendCancelToRunningLocked(reason)
+	if b.runningCancel != nil {
+		b.runningCancel()
+	}
+	b.runningJobID = ""
+	b.runningJobIDs = nil
+	b.runningBatchID = ""
+	b.runningCancel = nil
+	b.runningControl = nil
+}
+
+func (b *Broker) sendCancelToRunningLocked(reason string) {
 	conn := b.runningControl
 	if conn == nil {
 		return
+	}
+	runningIDs := append([]string(nil), b.runningJobIDs...)
+	if b.runningBatchID != "" {
+		b.sendCancelBatchToConn(conn, b.runningBatchID, runningIDs, reason)
+		return
+	}
+	requestID := b.runningJobID
+	if len(runningIDs) == 1 {
+		requestID = runningIDs[0]
 	}
 	b.sendCancelToConn(conn, requestID, reason)
 }
@@ -1108,6 +1281,20 @@ func (b *Broker) sendCancelToConn(conn *websocket.Conn, requestID string, reason
 		"owner":     "rigassatiksme",
 		"app":       "rigas_satiksme",
 		"flow":      "monthly_ticket",
+	})
+}
+
+func (b *Broker) sendCancelBatchToConn(conn *websocket.Conn, batchID string, requestIDs []string, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	_ = b.writePhoneJSON(ctx, conn, map[string]any{
+		"type":       "cancel_rigassatiksme_qr_batch",
+		"batchId":    batchID,
+		"requestIds": requestIDs,
+		"reason":     reason,
+		"owner":      "rigassatiksme",
+		"app":        "rigas_satiksme",
+		"flow":       "monthly_ticket",
 	})
 }
 
@@ -1215,10 +1402,26 @@ func (b *Broker) handleHealth(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"ok":    true,
 		"state": b.Snapshot(time.Now()),
-	})
+	}
+	if health, ok := b.upstreamHealthSnapshot(r.Context()); ok {
+		if strings.TrimSpace(health.ControlCodeRequest.RequestID) != "" {
+			response["controlCodeRequest"] = health.ControlCodeRequest
+		}
+		if strings.TrimSpace(health.RigasSatiksmeBatch.BatchID) != "" {
+			response["rigasSatiksmeBatch"] = health.RigasSatiksmeBatch
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (b *Broker) upstreamHealthSnapshot(ctx context.Context) (upstreamHealth, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, healthUpstreamProbeTimeout)
+	defer cancel()
+	health, err := b.fetchUpstreamHealth(probeCtx)
+	return health, err == nil
 }
 
 func (b *Broker) handleState(w http.ResponseWriter, r *http.Request) {
@@ -1398,12 +1601,14 @@ func (b *Broker) handleQRJobCancel(w http.ResponseWriter, r *http.Request, id st
 		job.Reason = "user_canceled"
 		job.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
 		job.CompletedAt = job.UpdatedAt
-		if b.runningJobID == job.ID {
-			b.sendCancelToRunningLocked(job.ID, "user_canceled")
+		if b.isRunningJobLocked(job.ID) {
+			b.sendCancelToRunningLocked("user_canceled")
 			if b.runningCancel != nil {
 				b.runningCancel()
 			}
 			b.runningJobID = ""
+			b.runningJobIDs = nil
+			b.runningBatchID = ""
 			b.runningCancel = nil
 			b.runningControl = nil
 		}
@@ -1561,16 +1766,25 @@ func (b *Broker) ticketBlocksQRLocked(now time.Time) bool {
 		return true
 	}
 	if b.ticketViewers > 0 {
-		return !b.ticketQRBlockUntil.IsZero() && now.Before(b.ticketQRBlockUntil)
+		return true
 	}
 	return !b.ticketGraceUntil.IsZero() && now.Before(b.ticketGraceUntil)
+}
+
+func isTicketPriorityPreemptionReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "ticket_active", "ticket_lease_active":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Broker) currentOwnerLocked(now time.Time) string {
 	if b.ticketBlocksQRLocked(now) {
 		return "ticket"
 	}
-	if b.runningJobID != "" {
+	if b.runningJobID != "" || len(b.runningJobIDs) > 0 {
 		return "rigassatiksme"
 	}
 	if b.ticketActiveLocked(now) {
@@ -1580,7 +1794,7 @@ func (b *Broker) currentOwnerLocked(now time.Time) string {
 }
 
 func (b *Broker) desiredPriorityLocked(now time.Time, queueDepth int) (string, []string) {
-	qrDesired := queueDepth > 0 || b.runningJobID != ""
+	qrDesired := queueDepth > 0 || b.runningJobID != "" || len(b.runningJobIDs) > 0
 	if qrDesired {
 		if b.ticketBlocksQRLocked(now) {
 			return "ticket", []string{"ticket", "rigassatiksme"}
@@ -1626,15 +1840,7 @@ func shouldRetryQRJob(reason string, attempts int) bool {
 	}
 	switch strings.TrimSpace(reason) {
 	case "phone_timeout",
-		"qr_image_missing",
-		"rs_tickets_menu_missing",
-		"rs_manual_code_button_missing",
-		"rs_monthly_ticket_missing",
-		"rs_monthly_ticket_control_missing",
-		"rs_monthly_ticket_image_capture_failed",
-		"rs_monthly_ticket_stale_code",
-		"rs_monthly_ticket_flow_failed",
-		"rs_monthly_ticket_flow_timeout":
+		"qr_image_missing":
 		return true
 	default:
 		return false
@@ -1822,6 +2028,7 @@ func cloneJob(job QRJob) QRJob {
 	if job.Status == "" {
 		job.Status = JobWaiting
 	}
+	job.Phone = cloneRSQRPhoneSummary(job.Phone)
 	return job
 }
 

@@ -695,6 +695,79 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 	}
 }
 
+func TestAuthenticatedIndexSessionCookiePrewarmStartsPhone(t *testing.T) {
+	phoneStart := make(chan struct{}, 1)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			select {
+			case phoneStart <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session", "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test complete")
+			<-r.Context().Done()
+		case "/api/v1/session/stop":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:           "spacetime",
+			AuthCookieName: "ticket_remote_auth",
+		},
+		Phone: config.PhoneConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := server.auth.IssueServerSession(auth.Identity{
+		Email:         "ticket@jolkins.id.lv",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-phoneStart:
+	case <-time.After(3 * time.Second):
+		t.Fatal("authenticated index server-session prewarm did not start the phone")
+	}
+}
+
 func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

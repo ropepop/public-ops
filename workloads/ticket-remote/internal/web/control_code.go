@@ -29,6 +29,9 @@ const (
 	controlCodePhoneSendTTL     = 2 * time.Second
 	controlCodePhoneResultWait  = 75 * time.Second
 	controlCodePhoneCleanupWait = 20 * time.Second
+	controlCodePhoneAcceptWait  = 900 * time.Millisecond
+	controlCodePhoneAcceptPoll  = 50 * time.Millisecond
+	controlCodePhoneAcceptHTTP  = 250 * time.Millisecond
 	controlCodeRequestPruneAge  = 5 * time.Minute
 	controlCodePrepareRelayHold = 8 * time.Second
 	controlCodeRelayConnectWait = 1500 * time.Millisecond
@@ -137,6 +140,12 @@ type controlCodeRelayPreparationHealth struct {
 	CompletedAgoMillis   int64  `json:"completedAgoMillis,omitempty"`
 
 	completedAt time.Time
+}
+
+type phoneControlCodeRequestProbe struct {
+	RequestID string
+	Status    string
+	Reason    string
 }
 
 func cleanControlCodeDigits(value string) string {
@@ -405,22 +414,141 @@ func (s *Server) dispatchControlCodeRequest(requestID string) {
 	}
 
 	serverSentAt := time.Now().UTC()
-	ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneSendTTL)
-	err := s.relay.SendJSON(ctx, map[string]any{
-		"type":         "generate_control_code",
-		"owner":        "ticket",
-		"app":          "vivi",
-		"flow":         "control_code",
-		"requestId":    requestID,
-		"digits":       digits,
-		"serverSentAt": serverSentAt.Format(time.RFC3339Nano),
-	})
-	cancel()
-	if err != nil {
-		s.completeControlCodeRequest(requestID, false, "phone_unavailable", "", 0, nil, false)
+	command := map[string]any{
+		"type":            "generate_control_code",
+		"owner":           "ticket",
+		"app":             "vivi",
+		"flow":            "control_code",
+		"requestId":       requestID,
+		"digits":          digits,
+		"serverSentAt":    serverSentAt.Format(time.RFC3339Nano),
+		"dispatchAttempt": 1,
+	}
+	if ok, reason := s.sendControlCodeCommandWithAcceptance(requestID, command); !ok {
+		s.completeControlCodeRequest(requestID, false, reason, "", 0, nil, false)
 		return
 	}
 	go s.timeoutControlCodeRequest(requestID, time.Now().Add(controlCodePhoneResultWait))
+}
+
+func (s *Server) sendControlCodeCommandWithAcceptance(requestID string, command map[string]any) (bool, string) {
+	if err := s.sendControlCodeCommand(command); err != nil {
+		return false, "phone_unavailable"
+	}
+	if s.waitForPhoneControlCodeAccepted(requestID, controlCodePhoneAcceptWait) {
+		return true, ""
+	}
+	if !s.controlCodeRequestStillRunning(requestID) {
+		return true, ""
+	}
+
+	command["serverSentAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	command["dispatchAttempt"] = 2
+	if err := s.sendControlCodeCommand(command); err != nil {
+		return false, "phone_unavailable"
+	}
+	if s.waitForPhoneControlCodeAccepted(requestID, controlCodePhoneAcceptWait) {
+		return true, ""
+	}
+	if !s.controlCodeRequestStillRunning(requestID) {
+		return true, ""
+	}
+
+	s.relay.Reconnect("control_code_dispatch_not_accepted:" + requestID)
+	if !s.preparePhoneRelayForControlCode("control_code_dispatch_retry", controlCodeRelayConnectWait) {
+		return false, "phone_command_not_accepted"
+	}
+	command["serverSentAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	command["dispatchAttempt"] = 3
+	if err := s.sendControlCodeCommand(command); err != nil {
+		return false, "phone_unavailable"
+	}
+	if s.waitForPhoneControlCodeAccepted(requestID, controlCodePhoneAcceptWait) {
+		return true, ""
+	}
+	if !s.controlCodeRequestStillRunning(requestID) {
+		return true, ""
+	}
+	return false, "phone_command_not_accepted"
+}
+
+func (s *Server) sendControlCodeCommand(command map[string]any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneSendTTL)
+	defer cancel()
+	return s.relay.SendJSON(ctx, command)
+}
+
+func (s *Server) controlCodeRequestStillRunning(requestID string) bool {
+	s.codeMu.Lock()
+	defer s.codeMu.Unlock()
+	req := s.codeRequests[strings.TrimSpace(requestID)]
+	return req != nil && req.Status == controlCodeRunning
+}
+
+func (s *Server) waitForPhoneControlCodeAccepted(requestID string, timeout time.Duration) bool {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if !s.controlCodeRequestStillRunning(requestID) {
+			return true
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneAcceptHTTP)
+		probe, ok := s.fetchPhoneControlCodeRequest(ctx)
+		cancel()
+		if ok && probe.RequestID == requestID {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(controlCodePhoneAcceptPoll)
+	}
+}
+
+func (s *Server) fetchPhoneControlCodeRequest(ctx context.Context) (phoneControlCodeRequestProbe, bool) {
+	backend := s.activePhoneBackend()
+	baseURL := strings.TrimRight(strings.TrimSpace(backend.BaseURL), "/")
+	if baseURL == "" {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/health", nil)
+	if err != nil {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		return phoneControlCodeRequestProbe{}, false
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	if data, ok := payload["data"].(map[string]any); ok {
+		payload = data
+	}
+	raw, ok := payload["controlCodeRequest"].(map[string]any)
+	if !ok {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	requestID, _ := raw["requestId"].(string)
+	if strings.TrimSpace(requestID) == "" {
+		return phoneControlCodeRequestProbe{}, false
+	}
+	status, _ := raw["status"].(string)
+	reason, _ := raw["reason"].(string)
+	return phoneControlCodeRequestProbe{
+		RequestID: strings.TrimSpace(requestID),
+		Status:    strings.TrimSpace(status),
+		Reason:    strings.TrimSpace(reason),
+	}, true
 }
 
 func (s *Server) timeoutControlCodeRequest(requestID string, deadline time.Time) {
@@ -533,6 +661,10 @@ func cleanControlCodeResultProof(value string) string {
 		return "phone_root"
 	case "phone_visual":
 		return "phone_visual"
+	case "phone_visual_root_confirmed":
+		return "phone_visual_root_confirmed"
+	case "phone_visual_raw_ticket_after_submit":
+		return "phone_visual_raw_ticket_after_submit"
 	case "browser_frame":
 		return "browser_frame"
 	default:

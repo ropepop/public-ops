@@ -94,7 +94,21 @@
         "queueSec": { "type": "number", "minimum": 0 },
         "finalAttemptSec": { "type": "number", "minimum": 0 },
         "retried": { "type": "boolean" },
-        "slowSuccess": { "type": "boolean" }
+        "slowSuccess": { "type": "boolean" },
+        "phone": { "$ref": "#/$defs/phoneSummary" }
+      },
+      "additionalProperties": false
+    },
+    "phoneSummary": {
+      "type": "object",
+      "properties": {
+        "sourceApp": { "type": "string" },
+        "ticketFlow": { "type": "string" },
+        "totalDurationMillis": { "type": "integer", "minimum": 0 },
+        "phases": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
       },
       "additionalProperties": false
     }

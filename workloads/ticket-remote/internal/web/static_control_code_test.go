@@ -93,9 +93,6 @@ func TestControlCodeBrowserCaptureAckIsNonBlockingAndTimerless(t *testing.T) {
 
 func TestControlCodePostConfirmationStressAllowsWaitingModalButRejectsEarlyCapture(t *testing.T) {
 	source := ticketAppSource(t)
-	readyGate := substringBetween(t, source,
-		"function controlCodeMarkerReady(request) {",
-		"  function controlCodeMarkerReceivedAgeMillis(request) {")
 	maybeCapture := substringBetween(t, source,
 		"function maybeCaptureControlCodeResultImage() {",
 		"  function waitForControlCodeResultScreenshot(request) {")
@@ -103,13 +100,24 @@ func TestControlCodePostConfirmationStressAllowsWaitingModalButRejectsEarlyCaptu
 		"function waitForControlCodeResultScreenshot(request) {",
 		"  function rememberOwnedControlCodeRequest(request) {")
 
-	if !strings.Contains(readyGate, "lastRenderedFrameEpoch === markerEpoch && lastRenderedFrameSequence >= markerSequence") {
-		t.Fatalf("control-code capture must be gated by the rendered frame marker")
+	for _, needle := range []string{
+		"function controlCodeRenderedFrameEpoch()",
+		"function controlCodeRenderedFrameSequence()",
+		"if (hasRenderedFrame && currentStreamEpoch) return currentStreamEpoch;",
+		"if (hasRenderedFrame && lastAcceptedFrameSequence) return lastAcceptedFrameSequence;",
+		"const renderedEpoch = controlCodeRenderedFrameEpoch();",
+		"const renderedSequence = controlCodeRenderedFrameSequence();",
+		"return renderedEpoch === markerEpoch && renderedSequence >= markerSequence;",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code capture marker gate must use rendered-frame metadata with accepted-frame fallback, missing %q", needle)
+		}
 	}
-	gateIndex := strings.Index(maybeCapture, "if (!controlCodeMarkerReady(codeRequest)) return false;")
+	gateIndex := strings.Index(maybeCapture, "if (!controlCodeMarkerReady(codeRequest)) {")
+	waitingIndex := strings.Index(maybeCapture, "noteControlCodeMarkerWaiting(codeRequest);")
 	proofIndex := strings.Index(maybeCapture, "const proof = controlCodeCandidateFrameProof(codeRequest);")
 	captureIndex := strings.Index(maybeCapture, "captureControlCodeResultScreenshot(codeRequest, proof);")
-	if gateIndex < 0 || proofIndex < 0 || captureIndex < 0 || gateIndex > proofIndex || proofIndex > captureIndex {
+	if gateIndex < 0 || waitingIndex < 0 || proofIndex < 0 || captureIndex < 0 || gateIndex > waitingIndex || waitingIndex > proofIndex || proofIndex > captureIndex {
 		t.Fatalf("control-code capture must stay behind marker readiness and browser frame proof even when the waiting modal is visible")
 	}
 	if !strings.Contains(waitForScreenshot, "codeResultArea.dataset.status = 'waiting';") ||
@@ -168,6 +176,10 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"if (popupProof.popupVisible)",
 		"const generatedProof = controlCodeGeneratedFrameProof();",
 		"if (!generatedProof.generatedVisible)",
+		"candidateFrameEpoch: controlCodeRenderedFrameEpoch()",
+		"candidateFrameSequence: controlCodeRenderedFrameSequence()",
+		"const renderedEpoch = controlCodeRenderedFrameEpoch();",
+		"const renderedSequence = controlCodeRenderedFrameSequence();",
 	} {
 		if !strings.Contains(candidateProof, needle) {
 			t.Fatalf("candidate frame proof must reject stale/popup frames before capture, missing %q", needle)
@@ -185,10 +197,10 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 			t.Fatalf("generated frame proof must require the generated control-code chip, missing %q", needle)
 		}
 	}
-	acceptIndex := strings.Index(candidateProof, "proof.accepted = true;")
+	acceptIndex := strings.Index(candidateProof, "proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';")
 	generatedIndex := strings.Index(candidateProof, "if (!generatedProof.generatedVisible)")
 	if acceptIndex < 0 || generatedIndex < 0 || generatedIndex > acceptIndex {
-		t.Fatalf("candidate frame must prove generated visuals before acceptance")
+		t.Fatalf("browser-generated candidate frame must prove generated visuals before fallback acceptance")
 	}
 	for _, needle := range []string{
 		"const proof = controlCodeCandidateFrameProof(codeRequest);",
@@ -215,8 +227,89 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 			t.Fatalf("successful capture must publish browser proof debug, missing %q", needle)
 		}
 	}
-	if !strings.Contains(debugPublisher, "controlCodeCapture: lastControlCodeCaptureDebug") {
-		t.Fatalf("stream debug must expose control-code capture proof state")
+	for _, needle := range []string{
+		"lastRenderedFrameEpoch",
+		"lastRenderedFrameSequence",
+		"lastRenderedFrameTimestamp",
+		"controlCodeCapture: lastControlCodeCaptureDebug",
+	} {
+		if !strings.Contains(debugPublisher, needle) {
+			t.Fatalf("stream debug must expose browser frame/capture proof state, missing %q", needle)
+		}
+	}
+}
+
+func TestControlCodeCaptureTrustsPhonePostSubmitTicketProof(t *testing.T) {
+	source := ticketAppSource(t)
+	candidateProof := substringBetween(t, source,
+		"function controlCodeCandidateFrameProof(request) {",
+		"  function noteControlCodeCandidateRejected(proof) {")
+
+	for _, needle := range []string{
+		"function controlCodeTrustedPhonePostSubmitProof(resultProof) {",
+		"resultProof === 'phone_visual_raw_ticket_after_submit'",
+		"resultProof === 'phone_visual_root_confirmed'",
+		"const trustedPhonePostSubmitProof = controlCodeTrustedPhonePostSubmitProof(proof.resultProof);",
+		"if (trustedPhonePostSubmitProof) {",
+		"proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("trusted post-submit phone proof path missing %q", needle)
+		}
+	}
+
+	popupRejectIndex := strings.Index(candidateProof, "if (popupProof.popupVisible)")
+	trustedAcceptIndex := strings.Index(candidateProof, "if (trustedPhonePostSubmitProof) {")
+	generatedRejectIndex := strings.Index(candidateProof, "if (!generatedProof.generatedVisible)")
+	if popupRejectIndex < 0 || trustedAcceptIndex < 0 || generatedRejectIndex < 0 {
+		t.Fatalf("candidate proof must keep popup rejection, trusted phone acceptance, and generated visual fallback")
+	}
+	if popupRejectIndex > trustedAcceptIndex {
+		t.Fatalf("trusted phone proof must still reject visible control-code popups before capture")
+	}
+	if trustedAcceptIndex > generatedRejectIndex {
+		t.Fatalf("trusted phone proof must bypass stale generated-chip detection after the phone already proved the ViVi ticket result")
+	}
+}
+
+func TestControlCodeGeneratedProofScansLowerResultStrip(t *testing.T) {
+	source := ticketAppSource(t)
+	generatedProof := substringBetween(t, source,
+		"function controlCodeGeneratedFrameProof() {",
+		"  function rememberControlCodeBaselineFrame(requestID) {")
+	chipProof := substringBetween(t, source,
+		"function controlCodeResultChipProof() {",
+		"  function controlCodeGeneratedFrameProof() {")
+	candidateProof := substringBetween(t, source,
+		"function controlCodeCandidateFrameProof(request) {",
+		"  function noteControlCodeCandidateRejected(proof) {")
+
+	for _, needle := range []string{
+		"const controlCodeGeneratedChipScanStartY = 0.50;",
+		"const controlCodeGeneratedChipScanEndY = 0.61;",
+		"const controlCodeGeneratedChipScanStepY = 0.01;",
+		"for (let yRatio = controlCodeGeneratedChipScanStartY;",
+		"sampleControlCodeResultChipRegion(yRatio)",
+		"candidate.chipScore > bestChip.chipScore",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("generated chip proof must scan the real lower result strip, missing %q", needle)
+		}
+	}
+	if strings.Contains(chipProof, "Math.round(canvas.height * 0.47)") {
+		t.Fatalf("generated chip proof must not depend on the old fixed upper strip y=0.47")
+	}
+	if !strings.Contains(generatedProof, "y: Math.max(0.12, chip.chipY - 0.34)") {
+		t.Fatalf("generated code-area proof must be anchored to the detected result strip")
+	}
+	for _, needle := range []string{
+		"proof.generatedChipY = generatedProof.generatedChipY;",
+		"proof.generatedChipScore = generatedProof.generatedChipScore;",
+		"proof.generatedCodeScore = generatedProof.generatedCodeScore;",
+	} {
+		if !strings.Contains(candidateProof, needle) {
+			t.Fatalf("candidate proof debug must expose generated proof details, missing %q", needle)
+		}
 	}
 }
 
