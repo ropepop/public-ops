@@ -1133,6 +1133,97 @@ func TestPresenceUpdatesUseBackgroundTimeoutLongerThanPageLookup(t *testing.T) {
 	}
 }
 
+func TestSpacetimePresenceFallbackWritesForExistingServerSession(t *testing.T) {
+	memoryStore := state.NewMemoryStore()
+	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		DisplayName:     "ViVi timed ticket",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://127.0.0.1:1",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := &spacetimeBackendCountingStore{Store: memoryStore}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           "http://127.0.0.1:1",
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:              "spacetime",
+			OIDCIssuer:        "https://auth.spacetimedb.com/oidc",
+			OIDCClientID:      "client_test",
+			OIDCScope:         "openid profile email",
+			OIDCRedirect:      "http://ticket.test/auth/callback",
+			AuthCookieName:    "ticket_remote_auth",
+			SessionSigningKey: "test-signing-key",
+		},
+		State: state.StoreConfig{
+			Backend:           "spacetime",
+			SpacetimeDatabase: "ticket-remote-prod-v2",
+		},
+		Phone: config.PhoneConfig{
+			BackendID:  "pixel",
+			AttachName: "Pixel",
+			BaseURL:    "http://127.0.0.1:1",
+			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: "http://127.0.0.1:1"}},
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.usesDirectSpacetimePresence() {
+		t.Fatal("test server should use direct Spacetime presence")
+	}
+	ticketServer := httptest.NewServer(server)
+	defer ticketServer.Close()
+	defer relay.Close()
+
+	token, _, err := server.auth.IssueServerSession(auth.Identity{
+		Email:         "ticket@jolkins.id.lv",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
+	header := http.Header{"Cookie": []string{"ticket_remote_auth=" + token}}
+	conn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial browser control websocket: %v", err)
+	}
+	_ = readNextTextMessageOfType(t, ctx, conn, "state")
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat","reason":"direct_presence_active"}`)); err != nil {
+		t.Fatalf("write direct heartbeat: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := store.heartbeats.Load(); got != 0 {
+		t.Fatalf("direct Spacetime heartbeat should not write through server, got %d writes", got)
+	}
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat","reason":"spacetime_direct_unavailable","presenceFallback":true}`)); err != nil {
+		t.Fatalf("write fallback heartbeat: %v", err)
+	}
+	waitForAtomicCount(t, &store.heartbeats, 1, time.Second, "fallback heartbeat")
+
+	_ = conn.Close(websocket.StatusNormalClosure, "test complete")
+	waitForAtomicCount(t, &store.disconnects, 1, time.Second, "fallback disconnect")
+}
+
 func TestLiveFramesAreSharedDuringControlSession(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
@@ -2000,6 +2091,41 @@ type blockingHeartbeatStore struct {
 	state.Store
 	heartbeatStarted chan struct{}
 	releaseHeartbeat chan struct{}
+}
+
+type spacetimeBackendCountingStore struct {
+	state.Store
+	heartbeats  atomic.Int32
+	disconnects atomic.Int32
+}
+
+func (s *spacetimeBackendCountingStore) Backend() string {
+	return "spacetime"
+}
+
+func (s *spacetimeBackendCountingStore) HeartbeatPresence(ctx context.Context, input state.PresenceInput) (state.Snapshot, error) {
+	s.heartbeats.Add(1)
+	return s.Store.HeartbeatPresence(ctx, input)
+}
+
+func (s *spacetimeBackendCountingStore) DisconnectPresence(ctx context.Context, ticketID string, sessionID string, now time.Time) (state.Snapshot, error) {
+	s.disconnects.Add(1)
+	return s.Store.DisconnectPresence(ctx, ticketID, sessionID, now)
+}
+
+func waitForAtomicCount(t *testing.T, counter *atomic.Int32, want int32, timeout time.Duration, label string) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		if got := counter.Load(); got >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("%s count = %d, want at least %d", label, counter.Load(), want)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 type blockingSnapshotStore struct {

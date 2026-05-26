@@ -53,6 +53,7 @@ func TestAdminCanAllowUserIntoQuotaGroupAndQuotaIsEnforced(t *testing.T) {
 	if broker.createCount != 1 || broker.createdCode != "12345" {
 		t.Fatalf("first authorized request not queued: count=%d code=%q", broker.createCount, broker.createdCode)
 	}
+	telegram.waitForPhoto(t)
 
 	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
 		t.Fatal(err)
@@ -62,6 +63,147 @@ func TestAdminCanAllowUserIntoQuotaGroupAndQuotaIsEnforced(t *testing.T) {
 	}
 	if !telegram.hasMessageContaining("daily limit") {
 		t.Fatalf("quota denial message missing: %#v", telegram.messages)
+	}
+}
+
+func TestFailedQueuedJobDoesNotUseDailyQuota(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobFailed, Reason: "code_rejected_by_rs"},
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: time.Second, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 1")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	telegram.waitForMessageContaining(t, "failed")
+	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if broker.createCount != 2 {
+		t.Fatalf("second request after failed job should be queued, create count=%d", broker.createCount)
+	}
+}
+
+func TestCanceledQueuedJobDoesNotUseDailyQuota(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobCanceled, Reason: "user_canceled"},
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: time.Second, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 1")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	telegram.waitForMessageContaining(t, "cancelled")
+	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if broker.createCount != 2 {
+		t.Fatalf("second request after canceled job should be queued, create count=%d", broker.createCount)
+	}
+}
+
+func TestSuccessfulQueuedJobUsesDailyQuotaOnce(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobSucceeded},
+		image:     []byte("png image"),
+		mime:      "image/png",
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: time.Second, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 1")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	telegram.waitForPhoto(t)
+	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if broker.createCount != 1 {
+		t.Fatalf("second request after successful job should be denied, create count=%d", broker.createCount)
+	}
+	if !telegram.hasMessageContaining("daily limit") {
+		t.Fatalf("quota denial message missing after success: %#v", telegram.messages)
+	}
+}
+
+func TestPendingReservationBlocksConcurrentOverLimitRequest(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobRunning},
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 1")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if broker.createCount != 1 {
+		t.Fatalf("pending reservation should block second request, create count=%d", broker.createCount)
+	}
+	if !telegram.hasMessageContaining("daily limit") {
+		t.Fatalf("pending reservation denial missing daily limit text: %#v", telegram.messages)
+	}
+}
+
+func TestQueueErrorReleasesPendingReservation(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{createErr: context.Canceled}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: time.Second, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 1")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	broker.createErr = nil
+	broker.createJob = QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting}
+	broker.job = QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobRunning}
+	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
+		t.Fatal(err)
+	}
+
+	if broker.createCount != 2 {
+		t.Fatalf("queue error should release reservation for retry, create count=%d", broker.createCount)
 	}
 }
 
@@ -467,10 +609,39 @@ func TestAccessStatusIncludesUserGroupAndChatQuota(t *testing.T) {
 	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
 		t.Fatal(err)
 	}
+	telegram.waitForPhoto(t)
 	if err := service.HandleMessage(context.Background(), withText(user, "/access")); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"group: riders", "user quota: 1/5", "group quota: 1/3", "chat quota: 1/2"} {
+		if !telegram.hasMessageContaining(want) {
+			t.Fatalf("access status missing %q: %#v", want, telegram.messages)
+		}
+	}
+}
+
+func TestAccessStatusIncludesPendingReservations(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobRunning},
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond, Access: access}, telegram, broker)
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	if err := service.HandleMessage(context.Background(), withText(admin, "/allow_user 42 2")); err != nil {
+		t.Fatal(err)
+	}
+
+	user := Message{ChatID: 42, ChatType: "private", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), withText(user, "/access")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"user quota: 0/2", "user pending: 1"} {
 		if !telegram.hasMessageContaining(want) {
 			t.Fatalf("access status missing %q: %#v", want, telegram.messages)
 		}

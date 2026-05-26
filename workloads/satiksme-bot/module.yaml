@@ -13,6 +13,10 @@ components:
     redeploy:
       mode: compose_release
       release_root: /etc/arbuzas/releases
+  - id: satiksme_rs_acquisition
+    start: docker compose --profile rs_acquisition --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml up -d satiksme_rs_acquisition
+    stop: docker compose --profile rs_acquisition --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml stop satiksme_rs_acquisition
+    health: docker compose --profile rs_acquisition --project-name arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml ps satiksme_rs_acquisition >/dev/null
 observability:
   event_source: satiksme_bot
   evidence_root: ops/evidence/satiksme-bot

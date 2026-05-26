@@ -24,6 +24,7 @@ export const TicketremoteAuditEvent = __t.object("TicketremoteAuditEvent", {
   event: __t.string(),
   payloadJson: __t.string(),
   createdAt: __t.string(),
+  expiresAt: __t.string(),
 });
 export type TicketremoteAuditEvent = __Infer<typeof TicketremoteAuditEvent>;
 
@@ -34,6 +35,16 @@ export const TicketremoteAuthConfig = __t.object("TicketremoteAuthConfig", {
   updatedAt: __t.string(),
 });
 export type TicketremoteAuthConfig = __Infer<typeof TicketremoteAuthConfig>;
+
+export const TicketremoteCleanupSchedule = __t.object("TicketremoteCleanupSchedule", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+  ticketId: __t.string(),
+  batchSize: __t.u32(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteCleanupSchedule = __Infer<typeof TicketremoteCleanupSchedule>;
 
 export const TicketremoteControlSession = __t.object("TicketremoteControlSession", {
   id: __t.string(),
@@ -49,25 +60,44 @@ export const TicketremoteControlSession = __t.object("TicketremoteControlSession
 });
 export type TicketremoteControlSession = __Infer<typeof TicketremoteControlSession>;
 
-export const TicketremoteLiveState = __t.object("TicketremoteLiveState", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  stateJson: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremoteLiveState = __Infer<typeof TicketremoteLiveState>;
-
 export const TicketremotePhoneBackend = __t.object("TicketremotePhoneBackend", {
   id: __t.string(),
   ticketId: __t.string(),
+  backendId: __t.string(),
   attachName: __t.string(),
   baseUrl: __t.string(),
   desiredState: __t.string(),
+  streamState: __t.string(),
   healthJson: __t.string(),
   lastError: __t.string(),
   lastSeenAt: __t.string(),
 });
 export type TicketremotePhoneBackend = __Infer<typeof TicketremotePhoneBackend>;
+
+export const TicketremotePhoneStatus = __t.object("TicketremotePhoneStatus", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  attachName: __t.string(),
+  desiredState: __t.string(),
+  streamState: __t.string(),
+  lastSeenAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremotePhoneStatus = __Infer<typeof TicketremotePhoneStatus>;
+
+export const TicketremotePhoneStatusHistory = __t.object("TicketremotePhoneStatusHistory", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  attachName: __t.string(),
+  desiredState: __t.string(),
+  streamState: __t.string(),
+  lastError: __t.string(),
+  createdAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremotePhoneStatusHistory = __Infer<typeof TicketremotePhoneStatusHistory>;
 
 export const TicketremoteTicket = __t.object("TicketremoteTicket", {
   id: __t.string(),
@@ -88,6 +118,20 @@ export const TicketremoteTicketMember = __t.object("TicketremoteTicketMember", {
 });
 export type TicketremoteTicketMember = __Infer<typeof TicketremoteTicketMember>;
 
+export const TicketremoteTicketSummary = __t.object("TicketremoteTicketSummary", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  displayName: __t.string(),
+  viewerCount: __t.u32(),
+  phoneBackendId: __t.string(),
+  phoneAttachName: __t.string(),
+  phoneDesiredState: __t.string(),
+  phoneStreamState: __t.string(),
+  phoneLastSeenAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteTicketSummary = __Infer<typeof TicketremoteTicketSummary>;
+
 export const TicketremoteViewerPresence = __t.object("TicketremoteViewerPresence", {
   sessionId: __t.string(),
   ticketId: __t.string(),
@@ -97,6 +141,18 @@ export const TicketremoteViewerPresence = __t.object("TicketremoteViewerPresence
   connected: __t.bool(),
   createdAt: __t.string(),
   lastSeenAt: __t.string(),
+  expiresAt: __t.string(),
 });
 export type TicketremoteViewerPresence = __Infer<typeof TicketremoteViewerPresence>;
+
+export const TicketremoteViewerPublic = __t.object("TicketremoteViewerPublic", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  publicId: __t.string(),
+  label: __t.string(),
+  connected: __t.bool(),
+  lastSeenAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteViewerPublic = __Infer<typeof TicketremoteViewerPublic>;
 

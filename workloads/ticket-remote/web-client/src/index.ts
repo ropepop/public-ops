@@ -1,4 +1,4 @@
-import { DbConnection, tables } from "./generated/index";
+import { DbConnection } from "./generated/index";
 
 type TicketClientConfig = {
   host: string;
@@ -32,15 +32,16 @@ function maybeAccessor<T = any>(source: any, candidates: string[]): T | null {
   return null;
 }
 
-function asRowState(row: any): any | null {
-  if (!row) return null;
-  const raw = row.stateJson || row.state_json || row.stateJSON || "";
-  if (!raw) return null;
-  try {
-    return JSON.parse(String(raw));
-  } catch (_) {
-    return null;
-  }
+function sqlString(value: string): string {
+  return `'${String(value || "").replace(/'/g, "''")}'`;
+}
+
+function tableRows(table: any): any[] {
+  return Array.from(table && table.iter ? table.iter() : []) as any[];
+}
+
+function rowTicketId(row: any): string {
+  return String(row && (row.ticketId || row.ticket_id) || "");
 }
 
 class TicketSpacetimeClient {
@@ -53,6 +54,7 @@ class TicketSpacetimeClient {
   private connected = false;
   private connectionGeneration = 0;
   private manuallyDisconnected = false;
+  private lastHeartbeatAt = 0;
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
     this.cfg = cfg;
@@ -128,6 +130,9 @@ class TicketSpacetimeClient {
 
   heartbeat(connected = true): void {
     if (!this.isReady()) return;
+    const now = Date.now();
+    if (connected && this.lastHeartbeatAt && now - this.lastHeartbeatAt < 30000) return;
+    if (connected) this.lastHeartbeatAt = now;
     const reducer = this.reducer("memberHeartbeatPresence");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
@@ -176,40 +181,96 @@ class TicketSpacetimeClient {
   }
 
   private attachStateListeners(connection: DbConnection): void {
-    const table = this.liveStateTable(connection.db);
-    const publish = () => this.publishCurrentState();
-    if (table.onInsert) table.onInsert(publish);
-    if (table.onUpdate) table.onUpdate(publish);
-    if (table.onDelete) table.onDelete(publish);
-  }
-
-  private subscribeState(connection: DbConnection): void {
-    const tableQuery = pickAccessor(tables, [
-      "ticketremoteLiveState",
-      "ticketRemoteLiveState",
-      "ticketremote_live_state",
-    ]);
-    this.subscription = connection.subscriptionBuilder()
-      .onApplied(() => this.publishCurrentState())
-      .subscribe(tableQuery);
-  }
-
-  private publishCurrentState(): void {
-    if (!this.isReady()) return;
-    const table = this.liveStateTable(this.requireConnection().db);
-    const rows = Array.from(table.iter ? table.iter() : []) as any[];
-    const wanted = rows.find((row) => String(row.ticketId || row.ticket_id || "") === this.cfg.ticketId) || rows[0];
-    const state = asRowState(wanted);
-    if (state) {
-      this.handlers.onState?.(state);
+    const publish = () => this.publishFocusedState();
+    for (const table of this.focusedStateTables(connection.db)) {
+      if (table.onInsert) table.onInsert(publish);
+      if (table.onUpdate) table.onUpdate(publish);
+      if (table.onDelete) table.onDelete(publish);
     }
   }
 
-  private liveStateTable(source: any): any {
+  private subscribeState(connection: DbConnection): void {
+    const ticket = sqlString(this.cfg.ticketId);
+    this.subscription = connection.subscriptionBuilder()
+      .onApplied(() => this.publishFocusedState())
+      .subscribe([
+        `SELECT * FROM ticketremote_ticket_summary WHERE ticketId = ${ticket}`,
+        `SELECT * FROM ticketremote_viewer_public WHERE ticketId = ${ticket}`,
+        `SELECT * FROM ticketremote_phone_status WHERE ticketId = ${ticket}`,
+      ]);
+  }
+
+  private publishFocusedState(): void {
+    if (!this.isReady()) return;
+    const db = this.requireConnection().db;
+    const summary = tableRows(this.ticketSummaryTable(db))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
+    const viewers = tableRows(this.viewerPublicTable(db))
+      .filter((row) => rowTicketId(row) === this.cfg.ticketId && row.connected !== false)
+      .sort((a, b) => String(a.publicId || a.public_id || "").localeCompare(String(b.publicId || b.public_id || "")));
+    const phone = tableRows(this.phoneStatusTable(db))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
+    const updatedAt = String(
+      summary && (summary.updatedAt || summary.updated_at) ||
+      phone && (phone.updatedAt || phone.updated_at || phone.lastSeenAt || phone.last_seen_at) ||
+      new Date().toISOString()
+    );
+    const phoneBackendId = String(phone && (phone.backendId || phone.backend_id || phone.id) || summary && (summary.phoneBackendId || summary.phone_backend_id) || "");
+    const phoneAttachName = String(phone && (phone.attachName || phone.attach_name) || summary && (summary.phoneAttachName || summary.phone_attach_name) || phoneBackendId);
+    const phoneDesiredState = String(phone && (phone.desiredState || phone.desired_state) || summary && (summary.phoneDesiredState || summary.phone_desired_state) || "");
+    const phoneLastSeenAt = String(phone && (phone.lastSeenAt || phone.last_seen_at) || summary && (summary.phoneLastSeenAt || summary.phone_last_seen_at) || "");
+    this.handlers.onState?.({
+      ticket: {
+        id: this.cfg.ticketId,
+        displayName: String(summary && (summary.displayName || summary.display_name) || "ViVi timed ticket"),
+        updatedAt,
+      },
+      viewerCount: Number((summary ? (summary.viewerCount ?? summary.viewer_count) : undefined) ?? viewers.length),
+      viewerPresence: viewers.map((viewer) => ({
+        publicId: String(viewer.publicId || viewer.public_id || ""),
+        label: String(viewer.label || viewer.publicId || viewer.public_id || ""),
+      })),
+      activeControl: null,
+      phone: phoneBackendId ? {
+        id: phoneBackendId,
+        attachName: phoneAttachName,
+        desiredState: phoneDesiredState,
+        lastSeenAt: phoneLastSeenAt,
+      } : null,
+      serverTime: updatedAt,
+      stateBackend: "spacetime",
+    });
+  }
+
+  private focusedStateTables(source: any): any[] {
+    return [
+      this.ticketSummaryTable(source),
+      this.viewerPublicTable(source),
+      this.phoneStatusTable(source),
+    ];
+  }
+
+  private ticketSummaryTable(source: any): any {
     return pickAccessor(source, [
-      "ticketremoteLiveState",
-      "ticketRemoteLiveState",
-      "ticketremote_live_state",
+      "ticketremoteTicketSummary",
+      "ticketRemoteTicketSummary",
+      "ticketremote_ticket_summary",
+    ]);
+  }
+
+  private viewerPublicTable(source: any): any {
+    return pickAccessor(source, [
+      "ticketremoteViewerPublic",
+      "ticketRemoteViewerPublic",
+      "ticketremote_viewer_public",
+    ]);
+  }
+
+  private phoneStatusTable(source: any): any {
+    return pickAccessor(source, [
+      "ticketremotePhoneStatus",
+      "ticketRemotePhoneStatus",
+      "ticketremote_phone_status",
     ]);
   }
 

@@ -607,6 +607,13 @@ func (s *Server) handleControlCodePhoneResult(msg map[string]any) bool {
 	cleanupPending, _ := msg["cleanupPending"].(bool)
 	phases := controlCodePhasesFromMessage(msg["phases"])
 	totalDurationMillis := controlCodeInt64FromMessage(msg["totalDurationMillis"])
+	resultProof, _ := msg["resultProof"].(string)
+	if ok && cleanControlCodeResultProof(resultProof) == "phone_root_image" {
+		const reason = "control_code_phone_image_disabled"
+		s.completeControlCodeRequest(requestID, false, reason, "", totalDurationMillis, phases, true)
+		go s.sendControlCodeResultAckUntilCleanup(requestID, false, reason)
+		return true
+	}
 	s.completeControlCodeRequest(requestID, ok, reason, value, totalDurationMillis, phases, cleanupPending)
 	return true
 }
@@ -665,6 +672,8 @@ func cleanControlCodeResultProof(value string) string {
 		return "phone_visual_root_confirmed"
 	case "phone_visual_raw_ticket_after_submit":
 		return "phone_visual_raw_ticket_after_submit"
+	case "phone_root_image":
+		return "phone_root_image"
 	case "browser_frame":
 		return "browser_frame"
 	default:
@@ -1056,6 +1065,48 @@ func (s *Server) sendControlCodeBrowserCaptureAckUntilCleanup(requestID string, 
 	}
 }
 
+func (s *Server) sendControlCodeResultAck(requestID string, ok bool, reason string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneSendTTL)
+	defer cancel()
+	err := s.relay.SendJSON(ctx, map[string]any{
+		"type":      "control_code_result_ack",
+		"owner":     "ticket",
+		"app":       "vivi",
+		"flow":      "control_code",
+		"requestId": requestID,
+		"ok":        ok,
+		"accepted":  ok,
+		"reason":    strings.TrimSpace(reason),
+		"sentAt":    time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		log.Printf("ticket control-code result ack failed for %s: %v", requestID, err)
+	}
+	return err
+}
+
+func (s *Server) sendControlCodeResultAckUntilCleanup(requestID string, ok bool, reason string) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	delay := 150 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		if !s.controlCodeBrowserCaptureAckStillNeeded(requestID) {
+			return
+		}
+		if attempt == 1 || attempt%5 == 0 {
+			s.retainControlCodeRelay(requestID)
+			s.relay.EnsureActive("control_code_result_ack")
+		}
+		_ = s.sendControlCodeResultAck(requestID, ok, reason)
+		time.Sleep(delay)
+		if delay < time.Second {
+			delay += 150 * time.Millisecond
+		}
+	}
+}
+
 func (s *Server) closeControlCodeRequest(email string, sessionID string, requestID string, now time.Time) (controlCodeRequestView, bool) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	sessionID = strings.TrimSpace(sessionID)
@@ -1079,6 +1130,7 @@ func (s *Server) closeControlCodeRequest(email string, sessionID string, request
 		req.ResultWindowClosedAt = now.UTC()
 	}
 	req.Status = controlCodeClosed
+	req.Value = ""
 	if s.codeRunning == requestID && !req.CleanupPending {
 		s.codeRunning = ""
 		shouldStartNext = true

@@ -30,7 +30,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   go build -ldflags "$ldflags" -o /out/satiksme-bot ./cmd/bot; \
   go build -ldflags "$ldflags" -o /out/satiksme-chat-analyzer-session ./cmd/chat-analyzer-session; \
   go build -ldflags "$ldflags" -o /out/satiksme-chat-analyzer-dry-run ./cmd/chat-analyzer-dry-run; \
-  go build -ldflags "$ldflags" -o /out/satiksme-chat-analyzer-batch-once ./cmd/chat-analyzer-batch-once
+  go build -ldflags "$ldflags" -o /out/satiksme-chat-analyzer-batch-once ./cmd/chat-analyzer-batch-once; \
+  go build -ldflags "$ldflags" -o /out/rs-acquisition-campaign ./cmd/rs-acquisition-campaign
 
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
@@ -44,5 +45,6 @@ COPY --from=build /out/satiksme-bot /usr/local/bin/satiksme-bot
 COPY --from=build /out/satiksme-chat-analyzer-session /usr/local/bin/satiksme-chat-analyzer-session
 COPY --from=build /out/satiksme-chat-analyzer-dry-run /usr/local/bin/satiksme-chat-analyzer-dry-run
 COPY --from=build /out/satiksme-chat-analyzer-batch-once /usr/local/bin/satiksme-chat-analyzer-batch-once
+COPY --from=build /out/rs-acquisition-campaign /usr/local/bin/rs-acquisition-campaign
 
 CMD ["/usr/local/bin/satiksme-bot"]

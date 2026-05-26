@@ -7,6 +7,11 @@ import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
 import AuditEventReducer from "../audit_event_reducer";
+import ClaimControlReducer from "../claim_control_reducer";
+import CleanupExpiredNowReducer from "../cleanup_expired_now_reducer";
+import DisconnectPresenceProcedureReducer from "../disconnect_presence_procedure_reducer";
+import ExtendControlReducer from "../extend_control_reducer";
+import HeartbeatPresenceReducer from "../heartbeat_presence_reducer";
 import MemberClaimControlReducer from "../member_claim_control_reducer";
 import MemberDisconnectPresenceReducer from "../member_disconnect_presence_reducer";
 import MemberExtendControlReducer from "../member_extend_control_reducer";
@@ -15,9 +20,20 @@ import MemberReleaseControlReducer from "../member_release_control_reducer";
 import MemberRemoveMemberReducer from "../member_remove_member_reducer";
 import MemberRevokeControlReducer from "../member_revoke_control_reducer";
 import MemberUpsertMemberReducer from "../member_upsert_member_reducer";
+import ReleaseControlReducer from "../release_control_reducer";
+import RemoveMemberReducer from "../remove_member_reducer";
+import RevokeControlReducer from "../revoke_control_reducer";
 import ServiceBootstrapReducer from "../service_bootstrap_reducer";
+import UpdatePhoneReducer from "../update_phone_reducer";
+import UpdatePhoneStatusReducer from "../update_phone_status_reducer";
+import UpsertMemberReducer from "../upsert_member_reducer";
 
 export type AuditEventParams = __Infer<typeof AuditEventReducer>;
+export type ClaimControlParams = __Infer<typeof ClaimControlReducer>;
+export type CleanupExpiredNowParams = __Infer<typeof CleanupExpiredNowReducer>;
+export type DisconnectPresenceProcedureParams = __Infer<typeof DisconnectPresenceProcedureReducer>;
+export type ExtendControlParams = __Infer<typeof ExtendControlReducer>;
+export type HeartbeatPresenceParams = __Infer<typeof HeartbeatPresenceReducer>;
 export type MemberClaimControlParams = __Infer<typeof MemberClaimControlReducer>;
 export type MemberDisconnectPresenceParams = __Infer<typeof MemberDisconnectPresenceReducer>;
 export type MemberExtendControlParams = __Infer<typeof MemberExtendControlReducer>;
@@ -26,5 +42,11 @@ export type MemberReleaseControlParams = __Infer<typeof MemberReleaseControlRedu
 export type MemberRemoveMemberParams = __Infer<typeof MemberRemoveMemberReducer>;
 export type MemberRevokeControlParams = __Infer<typeof MemberRevokeControlReducer>;
 export type MemberUpsertMemberParams = __Infer<typeof MemberUpsertMemberReducer>;
+export type ReleaseControlParams = __Infer<typeof ReleaseControlReducer>;
+export type RemoveMemberParams = __Infer<typeof RemoveMemberReducer>;
+export type RevokeControlParams = __Infer<typeof RevokeControlReducer>;
 export type ServiceBootstrapParams = __Infer<typeof ServiceBootstrapReducer>;
+export type UpdatePhoneParams = __Infer<typeof UpdatePhoneReducer>;
+export type UpdatePhoneStatusParams = __Infer<typeof UpdatePhoneStatusReducer>;
+export type UpsertMemberParams = __Infer<typeof UpsertMemberReducer>;
 

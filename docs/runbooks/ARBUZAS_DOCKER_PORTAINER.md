@@ -12,10 +12,15 @@ This is the detailed operator runbook for the active Arbuzas runtime.
 
 ## Initial Setup
 
-1. Copy `infra/arbuzas/docker/env/arbuzas.example.env` to a private local env file if you need overrides.
-2. Make sure Arbuzas has Docker with the Compose plugin, Python 3, and SSH access.
-3. Make sure Arbuzas has `nginx` installed and running for the bare private DNS admin URL.
-4. Make sure these host files exist:
+1. Pull the current host variables/secrets into the local plaintext mirror:
+   ```bash
+   ./tools/arbuzas/deploy.sh mirror-pull --ssh-host arbuzas --ssh-user ropepop
+   ```
+2. Edit deployment variables and secrets under `infra/arbuzas/host-mirror/` first. Use `mirror-audit` before overwriting host drift, and use `deploy-config` for config-only updates that should avoid rebuilds and release uploads.
+3. Copy `infra/arbuzas/docker/env/arbuzas.example.env` to a private local env file if you need operator-only CLI overrides.
+4. Make sure Arbuzas has Docker with the Compose plugin, Python 3, and SSH access.
+5. Make sure Arbuzas has `nginx` installed and running for the bare private DNS admin URL.
+6. Make sure these host files exist, preferably via the local mirror:
    - `/etc/arbuzas/env/train-bot.env`
    - `/etc/arbuzas/env/satiksme-bot.env`
    - `/etc/arbuzas/env/subscription-bot.env`
@@ -26,8 +31,8 @@ This is the detailed operator runbook for the active Arbuzas runtime.
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
-5. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on Arbuzas.
-6. DNS on Arbuzas binds directly to host ports `443` and `853`.
+7. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on Arbuzas.
+8. DNS on Arbuzas binds directly to host ports `443` and `853`.
 
 ## Normal Release Flow
 
@@ -69,6 +74,12 @@ Run one live DNS observability database compaction pass without deploying:
 
 ```bash
 ./tools/arbuzas/deploy.sh compact-dns-db --ssh-host arbuzas --ssh-user "$USER"
+```
+
+Push only local mirror changes and restart/reload affected services without rebuilding or uploading a release bundle:
+
+```bash
+./tools/arbuzas/deploy.sh deploy-config --ssh-host arbuzas --ssh-user "$USER"
 ```
 
 Repair a stale or broken Portainer install on the active host:

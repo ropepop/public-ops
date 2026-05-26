@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DOCKER_ROOT="${REPO_ROOT}/infra/arbuzas/docker"
 DOCKER_DEFAULT_ENV_FILE="${DOCKER_ROOT}/env/arbuzas.env"
 LOCAL_RELEASES_ROOT="${REPO_ROOT}/output/arbuzas/releases"
+HOST_MIRROR_SCRIPT="${REPO_ROOT}/tools/arbuzas/host_mirror.py"
+HOST_MIRROR_ROOT="${ARBUZAS_HOST_MIRROR_ROOT:-${REPO_ROOT}/infra/arbuzas/host-mirror}"
 REMOTE_RELEASES_ROOT="/etc/arbuzas/releases"
 REMOTE_CURRENT_LINK="/etc/arbuzas/current"
 REMOTE_PORTAINER_DATA_DIR="/srv/arbuzas/portainer"
@@ -660,6 +662,10 @@ Actions:
   install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host
   validate-thinkpad-fan  Validate the live Arbuzas ThinkPad fan controller and current control mode
   repair-portainer  Backup and repair Portainer state in place, disable Docker Swarm, and restart Portainer on the standalone Docker socket
+  mirror-pull       Pull Arbuzas deployment variables and secrets from the host into the local plaintext mirror
+  mirror-audit      Compare the local Arbuzas mirror with the host and report drift before deploy
+  mirror-push       Push local Arbuzas mirror changes to the host when the host has not drifted
+  deploy-config     Push local mirror changes and restart/reload only affected services; no build or release upload
 
 Options:
   --release-id VALUE
@@ -2797,7 +2803,7 @@ if config_hsts != 'max-age=31536000':
     raise SystemExit(f'auth config unexpected HSTS header: {config_hsts}')
 login_cookie = config_headers.get('set-cookie', '').split(';', 1)[0]
 if login_cookie:
-    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie})
+    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie, 'Content-Type': 'application/json'})
     if status != 401:
         raise SystemExit(f'malformed Telegram login returned {status}, want 401: {complete_body[:200]}')
     if 'invalid Telegram login' not in complete_body:
@@ -3248,9 +3254,17 @@ def request(path, method='GET', body=None, headers=None):
     req = urllib.request.Request(root + path, method=method, data=data, headers=request_headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
+            response_headers = {k.lower(): v for k, v in response.headers.items()}
+            set_cookies = response.headers.get_all('Set-Cookie') or []
+            if set_cookies:
+                response_headers['set-cookie'] = '\n'.join(set_cookies)
+            return response.status, response_headers, response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as error:
-        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
+        error_headers = {k.lower(): v for k, v in error.headers.items()}
+        set_cookies = error.headers.get_all('Set-Cookie') or []
+        if set_cookies:
+            error_headers['set-cookie'] = '\n'.join(set_cookies)
+        return error.code, error_headers, error.read().decode('utf-8', 'replace')
 
 def strip_named_js_function(source, name):
     marker = '\n  function ' + name + '('
@@ -3411,7 +3425,7 @@ def assert_satiksme_public_json(path, payload):
         if vehicle_id.count(':') >= 2:
             raise SystemExit(f'{path} liveVehicles[{index}].id looks like a raw feed id: {vehicle_id!r}')
 
-def assert_shell_route(path, expected_mode, expect_leaflet=True):
+def assert_shell_route(path, expected_mode, expect_leaflet=True, expect_telegram_webapp=False):
     status, route_headers, route_body = request(path)
     if status != 200:
         raise SystemExit(f'{path} shell status {status}')
@@ -3447,9 +3461,18 @@ def assert_shell_route(path, expected_mode, expect_leaflet=True):
             raise SystemExit(f'{path} shell does not reference release asset hash for {asset}: expected {marker}')
         if not expect_leaflet and marker in route_body:
             raise SystemExit(f'{path} incident shell unexpectedly loads Leaflet asset {asset}')
-    for needle in ['telegram-login.js', 'telegram-web-app.js']:
+    for needle in ['telegram-login.js']:
         if needle in route_body:
             raise SystemExit(f'{path} shell contains unexpected public script marker: {needle}')
+    has_telegram_webapp = 'telegram-web-app.js' in route_body
+    if expect_telegram_webapp and not has_telegram_webapp:
+        raise SystemExit(f'{path} mini-app shell missing Telegram WebApp script')
+    if expect_telegram_webapp and '\"telegramMiniApp\":true' not in route_body:
+        raise SystemExit(f'{path} mini-app shell missing Telegram Mini App config flag')
+    if not expect_telegram_webapp and has_telegram_webapp:
+        raise SystemExit(f'{path} public shell contains Telegram WebApp script')
+    if not expect_telegram_webapp and '\"telegramMiniApp\"' in route_body:
+        raise SystemExit(f'{path} public shell exposes Telegram Mini App config flag')
     for needle in ['\"spacetimeHost\"', '\"spacetimeDatabase\"', '/assets/live-client.js', 'maincloud.spacetimedb.com']:
         if needle in route_body:
             raise SystemExit(f'{path} shell exposes browser-direct Spacetime config: {needle}')
@@ -3540,24 +3563,28 @@ for asset, stale_hashes in known_stale_query_assets.items():
 
 status, robots_headers, robots_body = request('/robots.txt')
 if status != 200:
-    raise SystemExit(f'robots.txt returned {status}, want app-owned 200')
-assert_no_store('/robots.txt', robots_headers)
-assert_noindex('/robots.txt', robots_headers)
+    raise SystemExit(f'robots.txt returned {status}, want 200')
 robots_head_status, robots_head_headers, _ = request('/robots.txt', method='HEAD')
 if robots_head_status != 200:
-    raise SystemExit(f'HEAD /robots.txt returned {robots_head_status}, want app-owned 200')
-assert_no_store('/robots.txt HEAD', robots_head_headers)
-assert_noindex('/robots.txt HEAD', robots_head_headers)
+    raise SystemExit(f'HEAD /robots.txt returned {robots_head_status}, want 200')
 lower_robots = robots_body.lower()
-if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
-    raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
+if 'begin cloudflare managed content' in lower_robots:
+    if 'user-agent:' not in lower_robots or 'content-signal:' not in lower_robots or 'ai-train=no' not in lower_robots:
+        raise SystemExit(f'Cloudflare-managed robots.txt is missing expected content signals: {robots_body[:200]}')
+else:
+    assert_no_store('/robots.txt', robots_headers)
+    assert_noindex('/robots.txt', robots_headers)
+    assert_no_store('/robots.txt HEAD', robots_head_headers)
+    assert_noindex('/robots.txt HEAD', robots_head_headers)
+    if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
+        raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
 
-for path, mode, expect_leaflet in [
-    ('/app', 'public', True),
-    ('/incidents', 'public-incidents', False),
-    ('/-incidents', 'public-incidents', False),
+for path, mode, expect_leaflet, expect_telegram_webapp in [
+    ('/app', 'public', True, True),
+    ('/incidents', 'public-incidents', False, False),
+    ('/-incidents', 'public-incidents', False, False),
 ]:
-    assert_shell_route(path, mode, expect_leaflet)
+    assert_shell_route(path, mode, expect_leaflet, expect_telegram_webapp)
 
 status, _, health_body = request('/api/v1/health')
 if status != 200:
@@ -3575,9 +3602,14 @@ if status != 200:
 config_hsts = config_headers.get('strict-transport-security')
 if config_hsts != 'max-age=31536000':
     raise SystemExit(f'auth config unexpected HSTS header: {config_hsts}')
-login_cookie = config_headers.get('set-cookie', '').split(';', 1)[0]
+login_cookie = ''
+for cookie_line in config_headers.get('set-cookie', '').splitlines():
+    cookie_pair = cookie_line.split(';', 1)[0]
+    if cookie_pair.startswith('satiksme_login_nonce='):
+        login_cookie = cookie_pair
+        break
 if login_cookie:
-    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie})
+    status, _, complete_body = request('/api/v1/auth/telegram/complete', method='POST', body='{\"idToken\":\"not.a.jwt\"}', headers={'Cookie': login_cookie, 'Content-Type': 'application/json'})
     if status != 401:
         raise SystemExit(f'malformed Telegram login returned {status}, want 401: {complete_body[:200]}')
     if 'invalid Telegram login' not in complete_body:
@@ -3586,14 +3618,11 @@ if login_cookie:
         if leaked in complete_body:
             raise SystemExit(f'malformed Telegram login leaks validation detail {leaked}: {complete_body[:200]}')
 
-status, _, legacy_complete_body = request('/api/v1/auth/telegram', method='POST', body='{\"initData\":\"invalid\"}')
-if status != 401:
-    raise SystemExit(f'legacy malformed Telegram login returned {status}, want 401: {legacy_complete_body[:200]}')
-if 'invalid Telegram login' not in legacy_complete_body:
-    raise SystemExit(f'legacy malformed Telegram login missing generic error: {legacy_complete_body[:200]}')
-for leaked in ['missing hash', 'decode', 'base64', 'issuer', 'audience', 'signature', 'initData']:
-    if leaked in legacy_complete_body:
-        raise SystemExit(f'legacy malformed Telegram login leaks validation detail {leaked}: {legacy_complete_body[:200]}')
+status, _, legacy_complete_body = request('/api/v1/auth/telegram', method='POST', body='{\"initData\":\"invalid\"}', headers={'Content-Type': 'application/json'})
+if status != 410:
+    raise SystemExit(f'legacy Telegram login returned {status}, want 410: {legacy_complete_body[:200]}')
+if '/api/v1/auth/telegram/complete' not in legacy_complete_body:
+    raise SystemExit(f'legacy Telegram login does not point at complete endpoint: {legacy_complete_body[:200]}')
 
 for path in ['/api/v1/me', '/api/v1/incidents/stop%3A3033/votes']:
     status, auth_failure_headers, auth_failure_body = request(path, method='POST' if path.endswith('/votes') else 'GET', body='{}' if path.endswith('/votes') else None)
@@ -3610,13 +3639,29 @@ assert_no_store('/api/v1/me OPTIONS', me_options_headers)
 if 'missing session' in me_options_body:
     raise SystemExit(f'OPTIONS /api/v1/me reached auth before method handling: {me_options_body[:200]}')
 
-for method, body in [('GET', None), ('POST', '{}'), ('OPTIONS', None)]:
-    status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method=method, body=body)
-    if status != 404:
-        raise SystemExit(f'public live viewer heartbeat route is enabled for {method}: {status} {live_viewer_body[:200]}')
-    assert_no_store('/api/v1/public/live-viewer', live_viewer_headers)
+status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method='GET')
+assert_no_store('/api/v1/public/live-viewer GET', live_viewer_headers)
+if status == 404:
     if live_viewer_headers.get('x-robots-tag') != 'noindex, noarchive':
         raise SystemExit(f'public live viewer heartbeat route missing noindex: {live_viewer_headers.get(\"x-robots-tag\")}')
+elif status == 405:
+    if live_viewer_headers.get('allow') != 'POST':
+        raise SystemExit(f'public live viewer heartbeat GET Allow header {live_viewer_headers.get(\"allow\")!r}, want POST')
+    heartbeat_body = '{\"sessionId\":\"deploy-validation\",\"page\":\"public\",\"visible\":false}'
+    status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method='POST', body=heartbeat_body, headers={'Content-Type': 'application/json'})
+    if status != 200:
+        raise SystemExit(f'public live viewer heartbeat POST returned {status}, want 200: {live_viewer_body[:200]}')
+    assert_no_store('/api/v1/public/live-viewer POST', live_viewer_headers)
+    if '\"ok\":true' not in live_viewer_body:
+        raise SystemExit(f'public live viewer heartbeat POST missing ok response: {live_viewer_body[:200]}')
+    status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method='OPTIONS')
+    if status != 405:
+        raise SystemExit(f'public live viewer heartbeat OPTIONS returned {status}, want 405: {live_viewer_body[:200]}')
+    assert_no_store('/api/v1/public/live-viewer OPTIONS', live_viewer_headers)
+    if live_viewer_headers.get('allow') != 'POST':
+        raise SystemExit(f'public live viewer heartbeat OPTIONS Allow header {live_viewer_headers.get(\"allow\")!r}, want POST')
+else:
+    raise SystemExit(f'public live viewer heartbeat route returned {status}, want disabled 404 or enabled 405: {live_viewer_body[:200]}')
 
 status, oidc_headers, oidc_body = request('/oidc/.well-known/openid-configuration')
 if status != 200:
@@ -4199,7 +4244,7 @@ validate_remote_satiksme_workload_health() {
     "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; body=\$(curl -fsS \"\${root}/api/v1/health\") && printf %s \"\${body}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version catalogStops; do if printf %s \"\${body}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && livez=\$(curl -fsS \"\${root}/api/v1/livez\") && printf %s \"\${livez}\" | grep -F ok >/dev/null && for needle in runtime assets catalog telegram reportDump db web bundle liveSnapshot version; do if printf %s \"\${livez}\" | grep -F \"\${needle}\" >/dev/null; then exit 1; fi; done && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/api/v1/internal/health\") && test \"\${code}\" = 404'" \
     satiksme_bot satiksme_tunnel
   validate_remote_probe "${remote_release_dir}" "satiksme public security headers and shell assets" \
-    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/root.headers\" -o \"\${tmp}/root.html\" \"\${root}/\" && grep -Fi \"strict-transport-security: max-age=31536000\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-frame-options: DENY\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-content-type-options: nosniff\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"referrer-policy: strict-origin-when-cross-origin\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"content-security-policy:\" \"\${tmp}/root.headers\" >/dev/null && ! grep -Fi \"x-satiksme-bot-\" \"\${tmp}/root.headers\" >/dev/null && grep -F \"/assets/leaflet/leaflet.js\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"unpkg.com/leaflet\" \"\${tmp}/root.html\" >/dev/null && incidents=\$(curl -fsS \"\${root}/incidents\") && printf %s \"\${incidents}\" | grep -F \"\\\"mode\\\":\\\"public-incidents\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"unpkg.com/leaflet\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-login\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-web-app\" >/dev/null'" \
+    "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/root.headers\" -o \"\${tmp}/root.html\" \"\${root}/\" && grep -Fi \"strict-transport-security: max-age=31536000\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-frame-options: DENY\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"x-content-type-options: nosniff\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"referrer-policy: strict-origin-when-cross-origin\" \"\${tmp}/root.headers\" >/dev/null && grep -Fi \"content-security-policy:\" \"\${tmp}/root.headers\" >/dev/null && ! grep -Fi \"x-satiksme-bot-\" \"\${tmp}/root.headers\" >/dev/null && grep -F \"/assets/leaflet/leaflet.js\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"unpkg.com/leaflet\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"telegram-web-app\" \"\${tmp}/root.html\" >/dev/null && ! grep -F \"\\\"telegramMiniApp\\\"\" \"\${tmp}/root.html\" >/dev/null && app=\$(curl -fsS \"\${root}/app\") && printf %s \"\${app}\" | grep -F \"\\\"mode\\\":\\\"public\\\"\" >/dev/null && printf %s \"\${app}\" | grep -F \"\\\"telegramMiniApp\\\":true\" >/dev/null && printf %s \"\${app}\" | grep -F \"telegram-web-app.js\" >/dev/null && printf %s \"\${app}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${app}\" | grep -F \"telegram-login\" >/dev/null && incidents=\$(curl -fsS \"\${root}/incidents\") && printf %s \"\${incidents}\" | grep -F \"\\\"mode\\\":\\\"public-incidents\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"\\\"telegramMiniApp\\\"\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"unpkg.com/leaflet\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"/assets/leaflet/leaflet.js\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-login\" >/dev/null && ! printf %s \"\${incidents}\" | grep -F \"telegram-web-app\" >/dev/null'" \
     satiksme_bot satiksme_tunnel
   validate_remote_probe "${remote_release_dir}" "satiksme live snapshots are uncacheable and query-safe" \
     "wait_until_ok sh -lc 'root=https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}; tmp=\$(mktemp -d); trap \"rm -rf \\\"\${tmp}\\\"\" EXIT; curl -fsS -D \"\${tmp}/active.headers\" -o \"\${tmp}/active.json\" \"\${root}/transport/live/active.json\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/active.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/active.headers\" >/dev/null && path=\$(sed -n \"s/.*\\\"path\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p\" \"\${tmp}/active.json\" | head -1) && test -n \"\${path}\" && case \"\${path}\" in transport/live/*) ;; *) exit 1 ;; esac && curl -fsS -D \"\${tmp}/snapshot.headers\" -o /dev/null \"\${root}/\${path}\" && grep -Fi \"cache-control: no-store\" \"\${tmp}/snapshot.headers\" >/dev/null && grep -Fi \"x-robots-tag: noindex\" \"\${tmp}/snapshot.headers\" >/dev/null && code=\$(curl -sS -o /dev/null -w \"%{http_code}\" \"\${root}/\${path}?cache=split\") && test \"\${code}\" = 404'" \
@@ -4738,9 +4783,102 @@ rollback_remote_release() {
   "
 }
 
+run_host_mirror() {
+  local mirror_action="$1"
+  shift || true
+  local args=()
+  args=("${HOST_MIRROR_SCRIPT}" "${mirror_action}" --profile arbuzas --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)")
+  if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
+    args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
+  fi
+  python3 "${args[@]}" "$@"
+}
+
+run_host_mirror_push() {
+  local changed_paths_file="$1"
+  local args=()
+  args=("${HOST_MIRROR_SCRIPT}" push --profile arbuzas --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)" --changed-paths-file "${changed_paths_file}")
+  if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
+    args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
+  fi
+  python3 "${args[@]}"
+}
+
+host_mirror_affected_services() {
+  local changed_paths_file="$1"
+  python3 "${HOST_MIRROR_SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths_file}"
+}
+
+csv_join_services() {
+  local joined=""
+  local service_name
+  for service_name in "$@"; do
+    if [[ -z "${joined}" ]]; then
+      joined="${service_name}"
+    else
+      joined="${joined},${service_name}"
+    fi
+  done
+  printf '%s' "${joined}"
+}
+
+deploy_config_from_mirror() {
+  local changed_paths_file
+  local affected_output=""
+  local -a affected_services=()
+  local -a non_dns_services=()
+  local service_name=""
+  local non_dns_args=""
+  local has_dns=0
+  changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
+  trap 'rm -f "${changed_paths_file}"' RETURN
+
+  run_host_mirror_push "${changed_paths_file}"
+  affected_output="$(host_mirror_affected_services "${changed_paths_file}")"
+  if [[ -z "${affected_output}" ]]; then
+    log "Deploy config: mirror is already in sync; no services need restart"
+    return 0
+  fi
+
+  while IFS= read -r service_name; do
+    [[ -n "${service_name}" ]] || continue
+    affected_services+=("${service_name}")
+    if [[ "${service_name}" == "dns_controlplane" ]]; then
+      has_dns=1
+    else
+      non_dns_services+=("${service_name}")
+    fi
+  done <<< "${affected_output}"
+
+  log "Deploy config: affected services $(csv_join_services "${affected_services[@]}")"
+  remote_shell "
+    [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]] || { echo 'missing active release: ${REMOTE_CURRENT_LINK}/release.env' >&2; exit 1; }
+    [[ -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing active compose file under ${REMOTE_CURRENT_LINK}' >&2; exit 1; }
+  "
+
+  if (( ${#non_dns_services[@]} > 0 )); then
+    non_dns_args=""
+    for service_name in "${non_dns_services[@]}"; do
+      non_dns_args+=" ${service_name}"
+    done
+    remote_shell "
+      cd '${REMOTE_CURRENT_LINK}'
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${non_dns_args}
+    "
+  fi
+
+  if (( has_dns == 1 )); then
+    remote_shell "
+      cd '${REMOTE_CURRENT_LINK}'
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
+    "
+  fi
+}
+
 while (( $# > 0 )); do
   case "$1" in
-    deploy|validate|rollback|cleanup-docker|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer)
+    deploy|validate|rollback|cleanup-docker|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
       if [[ -n "${action}" ]]; then
         echo "Only one action is allowed" >&2
         exit 2
@@ -4830,10 +4968,34 @@ resolve_requested_services
 require_cmd ssh
 require_cmd scp
 require_cmd python3
-require_cmd go
-require_cmd curl
+case "${action}" in
+  mirror-pull|mirror-audit|mirror-push|deploy-config)
+    ;;
+  *)
+    require_cmd go
+    require_cmd curl
+    ;;
+esac
 
 case "${action}" in
+  mirror-pull)
+    run_host_mirror pull
+    ;;
+  mirror-audit)
+    run_host_mirror audit
+    ;;
+  mirror-push)
+    changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
+    trap 'rm -f "${changed_paths_file}"' EXIT
+    run_host_mirror_push "${changed_paths_file}"
+    if [[ -s "${changed_paths_file}" ]]; then
+      log "Mirror push changed:"
+      sed 's/^/  /' "${changed_paths_file}"
+    fi
+    ;;
+  deploy-config)
+    deploy_config_from_mirror
+    ;;
   deploy)
     require_cmd tar
     if dns_validation_requested || requires_dns_release_prepare; then
@@ -4845,6 +5007,9 @@ case "${action}" in
     if (( TARGETED_MODE == 1 )); then
       log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]}"
     fi
+    mirror_changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
+    trap 'rm -f "${mirror_changed_paths_file}"' EXIT
+    run_host_mirror_push "${mirror_changed_paths_file}"
     prepare_local_release_bundle
     prepare_remote_host_layout
     copy_release_to_remote

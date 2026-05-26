@@ -67,7 +67,6 @@ func NewService(client MessageClient, pollTimeout int, appURL, publicURL, report
 		reportsURL:   strings.TrimSpace(reportsURL),
 		runtimeState: runtimeState,
 	}
-	service.incidentsURL = resolveIncidentsURL(service.appURL, service.publicURL)
 	service.replyMarkup = service.newReplyKeyboard()
 	service.inlineMarkup = service.newInlineKeyboard()
 	return service
@@ -116,10 +115,8 @@ func (s *Service) Start(ctx context.Context) error {
 func (s *Service) handleMessage(ctx context.Context, message telegram.Message) error {
 	text := normalizeTelegramMessageText(message.Text)
 	switch text {
-	case "/start", "/menu", "", mapCommand, mainOpenMap, legacyPublicSite, mainReportsFeed:
+	case "/start", "/menu", "", mapCommand, incidentsCommand, legacyIncidentsCommand, "/-incidents", mainOpenMap, mainIncidents, legacyPublicSite, mainReportsFeed:
 		return s.sendWelcome(ctx, message.Chat.ID)
-	case incidentsCommand, legacyIncidentsCommand, "/-incidents", mainIncidents:
-		return s.sendIncidents(ctx, message.Chat.ID)
 	default:
 		return s.sendWelcome(ctx, message.Chat.ID)
 	}
@@ -128,22 +125,13 @@ func (s *Service) handleMessage(ctx context.Context, message telegram.Message) e
 func (s *Service) sendWelcome(ctx context.Context, chatID int64) error {
 	lines := []string{
 		"Kontrole — satiksmes karte un kontroles ziņojumi Rīgā.",
-		"Atver Kontroli, lai redzētu pieturas, aktīvo transportu un jaunākos ziņojumus vienuviet.",
+		"Atver Kontroli, lai redzētu pieturas, aktīvo transportu un ziņojumus vienuviet.",
 	}
 	return s.sendMenuMessage(ctx, chatID, lines...)
 }
 
 func (s *Service) sendIncidents(ctx context.Context, chatID int64) error {
-	incidents, ok := s.menuDestination(mainIncidents)
-	if !ok {
-		return s.sendMessageLines(ctx, chatID, "Pēdējo 24 stundu incidentu skats nav konfigurēts.")
-	}
-	lines := []string{
-		"Kontroles plūsma rāda pēdējo 24 stundu ziņojumus, anonīmus balsojumus un komentārus.",
-		"Komanda: " + incidentsCommand,
-		"Atvērt: " + incidents.url,
-	}
-	return s.sendMessageLines(ctx, chatID, lines...)
+	return s.sendWelcome(ctx, chatID)
 }
 
 func (s *Service) configureBot(ctx context.Context) {
@@ -153,8 +141,6 @@ func (s *Service) configureBot(ctx context.Context) {
 	}
 	commands := []telegram.BotCommand{
 		{Command: "start", Description: "Atvērt Kontroli"},
-		{Command: strings.TrimPrefix(mapCommand, "/"), Description: "Atvērt satiksmes karti"},
-		{Command: strings.TrimPrefix(incidentsCommand, "/"), Description: "Skatīt kontroles plūsmu"},
 		{Command: "menu", Description: "Parādīt saites"},
 	}
 	if err := configurator.SetMyCommands(ctx, commands); err != nil {
@@ -190,10 +176,8 @@ func (s *Service) welcomeMarkup() any {
 
 func (s *Service) newReplyKeyboard() telegram.ReplyKeyboardMarkup {
 	firstRow := s.replyRow(mainOpenMap)
-	secondRow := s.replyRow(mainIncidents)
-	thirdRow := s.replyRow(mainReportsFeed)
-	rows := make([][]telegram.KeyboardButton, 0, 3)
-	for _, row := range [][]telegram.KeyboardButton{firstRow, secondRow, thirdRow} {
+	rows := make([][]telegram.KeyboardButton, 0, 1)
+	for _, row := range [][]telegram.KeyboardButton{firstRow} {
 		if len(row) == 0 {
 			continue
 		}
@@ -206,10 +190,9 @@ func (s *Service) newReplyKeyboard() telegram.ReplyKeyboardMarkup {
 }
 
 func (s *Service) newInlineKeyboard() telegram.InlineKeyboardMarkup {
-	firstRow := s.inlineRow(mainOpenMap, mainIncidents)
-	secondRow := s.inlineRow(mainReportsFeed)
-	rows := make([][]telegram.InlineKeyboardButton, 0, 2)
-	for _, row := range [][]telegram.InlineKeyboardButton{firstRow, secondRow} {
+	firstRow := s.inlineRow(mainOpenMap)
+	rows := make([][]telegram.InlineKeyboardButton, 0, 1)
+	for _, row := range [][]telegram.InlineKeyboardButton{firstRow} {
 		if len(row) == 0 {
 			continue
 		}
@@ -242,11 +225,8 @@ func (s *Service) sendMessageLines(ctx context.Context, chatID int64, lines ...s
 }
 
 func (s *Service) menuSummaryLines() []string {
-	lines := []string{
-		"Komanda kartei: " + mapCommand,
-		"Komanda plūsmai: " + incidentsCommand,
-	}
-	for _, action := range []string{mainOpenMap, mainIncidents, mainReportsFeed} {
+	lines := []string{}
+	for _, action := range []string{mainOpenMap} {
 		destination, ok := s.menuDestination(action)
 		if !ok {
 			continue
@@ -302,27 +282,6 @@ func (s *Service) menuDestination(action string) (menuDestination, bool) {
 			lineLabel:   "Kontrole",
 			url:         s.appURL,
 			webApp:      true,
-		}, true
-	case mainIncidents:
-		if s.incidentsURL == "" {
-			return menuDestination{}, false
-		}
-		return menuDestination{
-			replyLabel:  mainIncidents,
-			inlineLabel: mainIncidents,
-			lineLabel:   mainIncidents,
-			url:         s.incidentsURL,
-			webApp:      true,
-		}, true
-	case mainReportsFeed:
-		if s.reportsURL == "" {
-			return menuDestination{}, false
-		}
-		return menuDestination{
-			replyLabel:  mainReportsFeed,
-			inlineLabel: "Ziņojumi",
-			lineLabel:   mainReportsFeed,
-			url:         s.reportsURL,
 		}, true
 	default:
 		return menuDestination{}, false

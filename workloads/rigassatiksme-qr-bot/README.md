@@ -15,6 +15,8 @@ Telegram bot that accepts one 5-digit Riga Satiksme ticket code, queues QR gener
 
 Admin users are bootstrapped with `RIGASATIKSME_QR_ADMIN_USER_IDS`. The default regular-user quota is `RIGASATIKSME_QR_DEFAULT_USER_DAILY_LIMIT` (defaults to `20`) and can be changed at runtime with `/admin set_default_limit`.
 
+Daily quota counts only successful QR jobs. Queued/running jobs reserve capacity while pending, but failed, canceled, rejected, or not-registered outcomes release the reservation and do not reduce the user's daily quota.
+
 - `/admin` — list admin commands.
 - `/admin add_user <telegram_user_id|@username> [daily_limit=<default>] [group]` (alias: `/admin add`) — allow a regular user by Telegram numeric user ID, or by `@username`. Username adds first try to resolve the numeric ID immediately via Telegram `getChat(@username)` and any native `text_mention` IDs in the admin message; if Telegram does not expose the ID, the grant is queued and later activates when that user sends `/start` or any message such as `/access` to the bot, or when a native text mention provides the ID. `0` means inherited/unlimited, negative means unlimited.
 - `/admin add @user1 @user2 ...` — resolve or queue multiple username grants with the current default tickets/day limit.
@@ -47,3 +49,9 @@ QR jobs use `phone-broker`. `phone-broker` exposes current and desired owner pri
 - idle: `desiredPriority=[]`, `desiredOwner="none"`
 
 Ticket usage still preempts QR generation; QR jobs wait/retry and report `ticket_active` while the ticket page is using the phone.
+
+## Agent verification safety
+
+Agents must not type RS QR test digits into Telegram unless the selected chat is proven to be the `rs biļete` bot before every send. Use `tools/rigassatiksme/telegram_target_locked_stress.swift --select ...` for Telegram Desktop stress checks; it screenshots the selected-chat header and refuses to type if target proof fails.
+
+If the Telegram window cannot be target-verified, use direct `phone-broker` stress jobs or the fake-Telegram live-smoke harness for phone/broker validation, then state that the real Telegram UI path was not exercised.

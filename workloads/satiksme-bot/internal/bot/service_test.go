@@ -62,7 +62,7 @@ func TestSendWelcomePrefersInlineWebAppMarkup(t *testing.T) {
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"https://t.me/satiksme_bot_reports",
 		nil,
@@ -77,30 +77,26 @@ func TestSendWelcomePrefersInlineWebAppMarkup(t *testing.T) {
 	if !strings.Contains(client.messages[0].text, "Kontrole — satiksmes karte") {
 		t.Fatalf("welcome text = %q", client.messages[0].text)
 	}
-	if !strings.Contains(client.messages[0].text, "/notiek") {
-		t.Fatalf("welcome text missing incidents command: %q", client.messages[0].text)
+	if !strings.Contains(client.messages[0].text, "https://kontrole.info/app") {
+		t.Fatalf("welcome text missing mini app url: %q", client.messages[0].text)
 	}
-	if !strings.Contains(client.messages[0].text, "/karte") {
-		t.Fatalf("welcome text missing map command: %q", client.messages[0].text)
+	for _, forbidden := range []string{"/notiek", "/karte", "https://kontrole.info/incidents", "https://t.me/satiksme_bot_reports"} {
+		if strings.Contains(client.messages[0].text, forbidden) {
+			t.Fatalf("welcome text should be a minimal wrapper, found %q in %q", forbidden, client.messages[0].text)
+		}
 	}
 	markup, ok := client.messages[0].opts.ReplyMarkup.(telegram.InlineKeyboardMarkup)
 	if !ok {
 		t.Fatalf("reply markup type = %T, want telegram.InlineKeyboardMarkup", client.messages[0].opts.ReplyMarkup)
 	}
-	if len(markup.InlineKeyboard) != 2 {
+	if len(markup.InlineKeyboard) != 1 || len(markup.InlineKeyboard[0]) != 1 {
 		t.Fatalf("inline keyboard = %#v", markup.InlineKeyboard)
 	}
 	if markup.InlineKeyboard[0][0].Text != mainOpenMap {
 		t.Fatalf("website button text = %q", markup.InlineKeyboard[0][0].Text)
 	}
-	if markup.InlineKeyboard[0][0].WebApp == nil || markup.InlineKeyboard[0][0].WebApp.URL != "https://kontrole.info" {
+	if markup.InlineKeyboard[0][0].WebApp == nil || markup.InlineKeyboard[0][0].WebApp.URL != "https://kontrole.info/app" {
 		t.Fatalf("website button = %#v", markup.InlineKeyboard[0][0])
-	}
-	if markup.InlineKeyboard[0][1].Text != mainIncidents {
-		t.Fatalf("incidents button text = %q", markup.InlineKeyboard[0][1].Text)
-	}
-	if markup.InlineKeyboard[0][1].WebApp == nil || markup.InlineKeyboard[0][1].WebApp.URL != "https://kontrole.info/incidents" {
-		t.Fatalf("incidents button = %#v", markup.InlineKeyboard[0][1])
 	}
 }
 
@@ -109,7 +105,7 @@ func TestConfigureBotSetsCommandsMenuButtonAndMetadata(t *testing.T) {
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"https://t.me/satiksme_bot_reports",
 		nil,
@@ -117,22 +113,19 @@ func TestConfigureBotSetsCommandsMenuButtonAndMetadata(t *testing.T) {
 
 	service.configureBot(context.Background())
 
-	if len(client.configuredCmds) != 4 {
-		t.Fatalf("len(configuredCmds) = %d, want 4", len(client.configuredCmds))
+	if len(client.configuredCmds) != 2 {
+		t.Fatalf("len(configuredCmds) = %d, want 2", len(client.configuredCmds))
 	}
 	if client.configuredCmds[0].Description != "Atvērt Kontroli" {
 		t.Fatalf("configured command description = %q", client.configuredCmds[0].Description)
 	}
-	if client.configuredCmds[1].Command != "karte" {
-		t.Fatalf("configured map command = %#v", client.configuredCmds[1])
-	}
-	if client.configuredCmds[2].Command != "notiek" {
-		t.Fatalf("configured incidents command = %#v", client.configuredCmds[2])
+	if client.configuredCmds[1].Command != "menu" {
+		t.Fatalf("configured menu command = %#v", client.configuredCmds[1])
 	}
 	if client.configuredMenu == nil {
 		t.Fatalf("configuredMenu = nil, want menu button")
 	}
-	if client.configuredMenu.Type != "web_app" || client.configuredMenu.Text != mainOpenMap || client.configuredMenu.WebApp == nil || client.configuredMenu.WebApp.URL != "https://kontrole.info" {
+	if client.configuredMenu.Type != "web_app" || client.configuredMenu.Text != mainOpenMap || client.configuredMenu.WebApp == nil || client.configuredMenu.WebApp.URL != "https://kontrole.info/app" {
 		t.Fatalf("configuredMenu = %#v", client.configuredMenu)
 	}
 	if client.configuredName != botName {
@@ -146,12 +139,12 @@ func TestConfigureBotSetsCommandsMenuButtonAndMetadata(t *testing.T) {
 	}
 }
 
-func TestHandleMessageSendsIncidentsForCommandVariants(t *testing.T) {
+func TestHandleMessageRoutesLegacyCommandsToWebsiteWrapper(t *testing.T) {
 	client := &fakeMessageClient{}
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"https://t.me/satiksme_bot_reports",
 		nil,
@@ -171,11 +164,11 @@ func TestHandleMessageSendsIncidentsForCommandVariants(t *testing.T) {
 		t.Fatalf("len(messages) = %d, want 4", len(client.messages))
 	}
 	for i, message := range client.messages {
-		if !strings.Contains(message.text, "https://kontrole.info/incidents") {
+		if !strings.Contains(message.text, "https://kontrole.info/app") {
 			t.Fatalf("message[%d] text = %q", i, message.text)
 		}
-		if !strings.Contains(message.text, "/notiek") {
-			t.Fatalf("message[%d] missing /notiek command: %q", i, message.text)
+		if strings.Contains(message.text, "/notiek") || strings.Contains(message.text, "https://kontrole.info/incidents") {
+			t.Fatalf("message[%d] should not expose the old incidents shortcut: %q", i, message.text)
 		}
 	}
 }
@@ -185,7 +178,7 @@ func TestHandleMessageAcceptsAddressedStartAndMenuCommands(t *testing.T) {
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"https://t.me/satiksme_bot_reports",
 		nil,
@@ -219,13 +212,13 @@ func TestHandleMessageShortcutButtonsReuseUnifiedMenu(t *testing.T) {
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
-	for _, text := range []string{mainOpenMap, legacyPublicSite, mainReportsFeed} {
+	for _, text := range []string{mainOpenMap, legacyPublicSite, mainReportsFeed, mainIncidents} {
 		err := service.handleMessage(context.Background(), telegram.Message{
 			Text: text,
 			Chat: telegram.Chat{ID: 42},
@@ -235,48 +228,38 @@ func TestHandleMessageShortcutButtonsReuseUnifiedMenu(t *testing.T) {
 		}
 	}
 
-	if len(client.messages) != 3 {
-		t.Fatalf("len(messages) = %d, want 3", len(client.messages))
+	if len(client.messages) != 4 {
+		t.Fatalf("len(messages) = %d, want 4", len(client.messages))
 	}
 	for i, message := range client.messages {
-		if !strings.Contains(message.text, incidentsCommand) {
-			t.Fatalf("message[%d] missing incidents command: %q", i, message.text)
+		if !strings.Contains(message.text, "https://kontrole.info/app") {
+			t.Fatalf("message[%d] missing mini app url: %q", i, message.text)
 		}
-		if !strings.Contains(message.text, mapCommand) {
-			t.Fatalf("message[%d] missing map command: %q", i, message.text)
-		}
-		if !strings.Contains(message.text, "https://kontrole.info/incidents") {
-			t.Fatalf("message[%d] missing incidents url: %q", i, message.text)
-		}
-		if !strings.Contains(message.text, "https://kontrole.info") {
-			t.Fatalf("message[%d] missing public url: %q", i, message.text)
-		}
-		if !strings.Contains(message.text, "https://t.me/satiksme_bot_reports") {
-			t.Fatalf("message[%d] missing reports url: %q", i, message.text)
+		for _, forbidden := range []string{incidentsCommand, mapCommand, "https://kontrole.info/incidents", "https://t.me/satiksme_bot_reports"} {
+			if strings.Contains(message.text, forbidden) {
+				t.Fatalf("message[%d] should be a minimal wrapper, found %q in %q", i, forbidden, message.text)
+			}
 		}
 	}
 }
 
-func TestReplyKeyboardSkipsUnavailableDestinations(t *testing.T) {
+func TestReplyKeyboardOnlyOpensMiniApp(t *testing.T) {
 	client := &fakeMessageClient{}
 	service := NewService(
 		client,
 		30,
-		"https://kontrole.info",
+		"https://kontrole.info/app",
 		"https://kontrole.info",
 		"",
 		nil,
 	)
 
-	if len(service.replyMarkup.Keyboard) != 2 {
-		t.Fatalf("len(reply keyboard rows) = %d, want 2", len(service.replyMarkup.Keyboard))
+	if len(service.replyMarkup.Keyboard) != 1 || len(service.replyMarkup.Keyboard[0]) != 1 {
+		t.Fatalf("reply keyboard = %#v", service.replyMarkup.Keyboard)
 	}
-	for rowIndex, row := range service.replyMarkup.Keyboard {
-		for _, button := range row {
-			if button.Text == mainReportsFeed {
-				t.Fatalf("reply keyboard row %d unexpectedly contains reports button", rowIndex)
-			}
-		}
+	button := service.replyMarkup.Keyboard[0][0]
+	if button.Text != mainOpenMap || button.WebApp == nil || button.WebApp.URL != "https://kontrole.info/app" {
+		t.Fatalf("reply keyboard button = %#v", button)
 	}
 }
 

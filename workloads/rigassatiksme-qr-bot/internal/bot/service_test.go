@@ -111,6 +111,21 @@ func TestServiceRejectsInvalidCode(t *testing.T) {
 	}
 }
 
+func TestCleanReasonMapsRsAppAttentionToActionableText(t *testing.T) {
+	if got := cleanReason("rs_app_attention_required"); got != "RS app needs attention. Open it once and retry." {
+		t.Fatalf("cleanReason(rs_app_attention_required) = %q", got)
+	}
+	if got := cleanReason("rs_monthly_ticket_unknown_state"); got != "RS app needs attention. Open it once and retry." {
+		t.Fatalf("cleanReason(rs_monthly_ticket_unknown_state) = %q", got)
+	}
+}
+
+func TestCleanReasonMapsStaleCodeToActionableText(t *testing.T) {
+	if got := cleanReason("rs_monthly_ticket_stale_code"); got != "RS kept showing the previous QR after the new code was submitted. I did not send a stale image." {
+		t.Fatalf("cleanReason(rs_monthly_ticket_stale_code) = %q", got)
+	}
+}
+
 func TestServiceCancelsLatestJob(t *testing.T) {
 	broker := &fakeBroker{
 		cancelJob: QRJob{ID: "job-1", UserID: "42", ChatID: "1001", Status: JobCanceled},
@@ -163,6 +178,7 @@ func stripedPNGWithSystemBars(t *testing.T, width int, height int, topBar int, b
 
 type fakeBroker struct {
 	createJob    QRJob
+	createErr    error
 	job          QRJob
 	image        []byte
 	mime         string
@@ -176,6 +192,9 @@ type fakeBroker struct {
 func (b *fakeBroker) CreateQRJob(ctx context.Context, chatID string, userID string, code string) (QRJob, error) {
 	b.createdCode = code
 	b.createCount++
+	if b.createErr != nil {
+		return QRJob{}, b.createErr
+	}
 	return b.createJob, nil
 }
 
@@ -257,6 +276,26 @@ func (t *fakeTelegram) waitForPhoto(tst *testing.T) sentPhoto {
 		select {
 		case <-deadline:
 			tst.Fatalf("timed out waiting for photo")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func (t *fakeTelegram) waitForMessageContaining(tst *testing.T, part string) string {
+	tst.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		t.mu.Lock()
+		for _, message := range t.messages {
+			if strings.Contains(strings.ToLower(message), strings.ToLower(part)) {
+				t.mu.Unlock()
+				return message
+			}
+		}
+		t.mu.Unlock()
+		select {
+		case <-deadline:
+			tst.Fatalf("timed out waiting for message containing %q", part)
 		case <-time.After(5 * time.Millisecond):
 		}
 	}

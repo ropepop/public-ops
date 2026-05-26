@@ -48,6 +48,8 @@ The bridge uses the ADB key files in `/etc/arbuzas/secrets/android-adb/`, mounte
 
 The browser never receives the phone URL and never talks directly to the Pixel. Browser clients talk to `ticket_remote`; `ticket_remote` talks privately through `phone_broker`. The normal public stream path is H.264 over the existing HTTPS `/api/v1/stream` WebSocket, decoded in the browser with WebCodecs. Do not add public media ports, a separate media service, or a second public tunnel unless there is a fresh decision to redesign the deployment.
 
+For ViVi control-code requests, Pixel proves that the generated screen exists, then the requester browser captures a stable stream-resolution result from its rendered live stream. `ticket_remote` must not accept or expose Pixel screenshot payloads (`phone_root_image`, `imageMime`, or `imageBase64`) for ViVi control-code results. The detailed contract lives in the Pixel ticket streaming architecture doc.
+
 Pixel stream compute tuning must preserve the current capture profile: 900 px target width, 10 FPS, 5 Mbps, FFmpeg H.264 baseline/ultrafast settings, and the existing keyframe cadence. The intended optimization boundary is duplicate/orphan process removal only: one root surface capture helper and one FFmpeg encoder while streaming, and no helper, encoder, or wrapper process left after stop.
 
 `/api/v1/health.directStream` is the first place to check stream delivery: it records active browser video clients, phone relay state, last config, last frame, last keyframe, reconnect count, and recent browser decoder telemetry.

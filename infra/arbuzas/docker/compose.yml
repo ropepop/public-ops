@@ -179,6 +179,60 @@ services:
       - /etc/arbuzas/env/satiksme-bot.env:/srv/satiksme-bot/.env:ro
       - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
 
+  satiksme_rs_acquisition:
+    profiles:
+      - rs_acquisition
+    image: arbuzas/satiksme-bot:${ARBUZAS_RELEASE_ID}
+    working_dir: /srv/satiksme-bot
+    depends_on:
+      - satiksme_bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      RS_ACQUISITION_ENABLED: ${RS_ACQUISITION_ENABLED:-false}
+      RS_ACQUISITION_STATE_PATH: /srv/satiksme-bot/state/rs-acquisition/campaign.db
+      RS_ACQUISITION_SENDER_SESSION_FILE: /srv/satiksme-bot/state/rs-acquisition/iamhdzs.session
+      RS_ACQUISITION_SOURCE_SESSION_FILE: /srv/satiksme-bot/state/chat-analyzer.session
+      RS_ACQUISITION_EXPECT_SENDER: iamhdzs
+      RS_ACQUISITION_TIMEZONE: Europe/Riga
+      RS_ACQUISITION_DAILY_LIMIT: "10"
+      RS_ACQUISITION_DAILY_REGISTRATIONS: "4"
+      RS_ACQUISITION_GROUP_NAME: Rīgas Zaķi
+      RS_ACQUISITION_POLL_INTERVAL: 1m
+      RS_ACQUISITION_INCLUDE_MEMBERS: ${RS_ACQUISITION_INCLUDE_MEMBERS:-false}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/satiksme-bot/.env
+        set +a
+        export RS_ACQUISITION_ENABLED="$${RS_ACQUISITION_ENABLED:-false}"
+        export RS_ACQUISITION_STATE_PATH="$${RS_ACQUISITION_STATE_PATH:-/srv/satiksme-bot/state/rs-acquisition/campaign.db}"
+        export RS_ACQUISITION_SENDER_SESSION_FILE="$${RS_ACQUISITION_SENDER_SESSION_FILE:-/srv/satiksme-bot/state/rs-acquisition/iamhdzs.session}"
+        export RS_ACQUISITION_SOURCE_SESSION_FILE="$${RS_ACQUISITION_SOURCE_SESSION_FILE:-/srv/satiksme-bot/state/chat-analyzer.session}"
+        export RS_ACQUISITION_EXPECT_SENDER="$${RS_ACQUISITION_EXPECT_SENDER:-iamhdzs}"
+        export RS_ACQUISITION_TIMEZONE="$${RS_ACQUISITION_TIMEZONE:-Europe/Riga}"
+        export RS_ACQUISITION_DAILY_LIMIT="$${RS_ACQUISITION_DAILY_LIMIT:-10}"
+        export RS_ACQUISITION_DAILY_REGISTRATIONS="$${RS_ACQUISITION_DAILY_REGISTRATIONS:-4}"
+        export RS_ACQUISITION_GROUP_NAME="$${RS_ACQUISITION_GROUP_NAME:-Rīgas Zaķi}"
+        export RS_ACQUISITION_POLL_INTERVAL="$${RS_ACQUISITION_POLL_INTERVAL:-1m}"
+        export RS_ACQUISITION_INCLUDE_MEMBERS="$${RS_ACQUISITION_INCLUDE_MEMBERS:-false}"
+        mkdir -p /srv/satiksme-bot/state/rs-acquisition
+        if [ "$${RS_ACQUISITION_ENABLED}" != "true" ]; then
+          echo "RS acquisition daemon disabled; set RS_ACQUISITION_ENABLED=true to run."
+          sleep infinity
+        fi
+        exec /usr/local/bin/rs-acquisition-campaign daemon
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - /srv/arbuzas/satiksme-bot:/srv/satiksme-bot
+      - /etc/arbuzas/env/satiksme-bot.env:/srv/satiksme-bot/.env:ro
+      - /etc/arbuzas/secrets:/etc/arbuzas/secrets:ro
+
   subscription_bot:
     image: arbuzas/subscription-bot:${ARBUZAS_RELEASE_ID}
     build:

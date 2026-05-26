@@ -98,6 +98,60 @@ func TestControlCodeRequestQueuesPhoneCommandAndRoutesResultPrivately(t *testing
 	assertNoBrowserMessageContaining(t, other, `"totalDurationMillis"`, 250*time.Millisecond)
 }
 
+func TestControlCodePhoneRootImageResultIsRejectedAndNeverExposesImageBytes(t *testing.T) {
+	messages := make(chan string, 30)
+	phoneResults := make(chan string, 30)
+	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
+	defer phoneServer.Close()
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	if _, err := store.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", "other@jolkins.id.lv", state.RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	requester := dialTicketControlClientWithSession(t, httpServer, "ticket@jolkins.id.lv", "requester-session")
+	defer requester.Close(websocket.StatusNormalClosure, "test complete")
+	other := dialTicketControlClient(t, httpServer, "other@jolkins.id.lv")
+	defer other.Close(websocket.StatusNormalClosure, "test complete")
+	waitForPhoneMessage(t, messages, `"type":"start"`)
+
+	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
+	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
+	const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	phoneResults <- `{"type":"control_code_result","requestId":"` + response.Request.ID + `","ok":true,"reason":"generated","value":"12345","resultProof":"phone_root_image","imageMime":"image/png","imageBase64":"` + tinyPNGBase64 + `","totalDurationMillis":321,"phases":{"phone_command_received":0,"result_image_png_ready":318},"cleanupPending":true}`
+
+	privateResult := waitForBrowserMessage(t, requester, `"reason":"control_code_phone_image_disabled"`)
+	if !strings.Contains(privateResult, `"type":"control_code_request"`) ||
+		!strings.Contains(privateResult, `"status":"failed"`) ||
+		!strings.Contains(privateResult, `"reason":"control_code_phone_image_disabled"`) ||
+		strings.Contains(privateResult, `"resultProof":"phone_root_image"`) ||
+		strings.Contains(privateResult, `"imageMime":"image/png"`) ||
+		strings.Contains(privateResult, `"imageBase64"`) ||
+		strings.Contains(privateResult, tinyPNGBase64) {
+		t.Fatalf("phone image result should fail without exposing image bytes: %s", privateResult)
+	}
+	ack := waitForPhoneMessageText(t, messages, `"type":"control_code_result_ack"`)
+	if !strings.Contains(ack, `"requestId":"`+response.Request.ID+`"`) ||
+		!strings.Contains(ack, `"ok":false`) ||
+		!strings.Contains(ack, `"reason":"control_code_phone_image_disabled"`) {
+		t.Fatalf("phone image rejection ack mismatch: %s", ack)
+	}
+	assertNoBrowserMessageContaining(t, other, response.Request.ID, 250*time.Millisecond)
+	assertNoBrowserMessageContaining(t, other, tinyPNGBase64, 250*time.Millisecond)
+}
+
 func TestControlCodeRequestRetriesWhenPhoneDoesNotAcceptDispatch(t *testing.T) {
 	messages := make(chan string, 20)
 	phoneResults := make(chan string, 20)

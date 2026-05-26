@@ -35,6 +35,11 @@ import {
 
 // Import all reducer arg schemas
 import AuditEventReducer from "./audit_event_reducer";
+import ClaimControlReducer from "./claim_control_reducer";
+import CleanupExpiredNowReducer from "./cleanup_expired_now_reducer";
+import DisconnectPresenceProcedureReducer from "./disconnect_presence_procedure_reducer";
+import ExtendControlReducer from "./extend_control_reducer";
+import HeartbeatPresenceReducer from "./heartbeat_presence_reducer";
 import MemberClaimControlReducer from "./member_claim_control_reducer";
 import MemberDisconnectPresenceReducer from "./member_disconnect_presence_reducer";
 import MemberExtendControlReducer from "./member_extend_control_reducer";
@@ -43,49 +48,94 @@ import MemberReleaseControlReducer from "./member_release_control_reducer";
 import MemberRemoveMemberReducer from "./member_remove_member_reducer";
 import MemberRevokeControlReducer from "./member_revoke_control_reducer";
 import MemberUpsertMemberReducer from "./member_upsert_member_reducer";
+import ReleaseControlReducer from "./release_control_reducer";
+import RemoveMemberReducer from "./remove_member_reducer";
+import RevokeControlReducer from "./revoke_control_reducer";
 import ServiceBootstrapReducer from "./service_bootstrap_reducer";
+import UpdatePhoneReducer from "./update_phone_reducer";
+import UpdatePhoneStatusReducer from "./update_phone_status_reducer";
+import UpsertMemberReducer from "./upsert_member_reducer";
 
 // Import all procedure arg schemas
-import * as TicketremoteClaimControlProcedure from "./ticketremote_claim_control_procedure";
-import * as TicketremoteDisconnectPresenceProcedure from "./ticketremote_disconnect_presence_procedure";
-import * as TicketremoteExtendControlProcedure from "./ticketremote_extend_control_procedure";
 import * as TicketremoteGetStateProcedure from "./ticketremote_get_state_procedure";
-import * as TicketremoteHeartbeatPresenceProcedure from "./ticketremote_heartbeat_presence_procedure";
-import * as TicketremoteReleaseControlProcedure from "./ticketremote_release_control_procedure";
-import * as TicketremoteRemoveMemberProcedure from "./ticketremote_remove_member_procedure";
-import * as TicketremoteRevokeControlProcedure from "./ticketremote_revoke_control_procedure";
-import * as TicketremoteUpdatePhoneProcedure from "./ticketremote_update_phone_procedure";
-import * as TicketremoteUpsertMemberProcedure from "./ticketremote_upsert_member_procedure";
 
 // Import all table schema definitions
-import TicketremoteLiveStateRow from "./ticketremote_live_state_table";
+import TicketremotePhoneStatusRow from "./ticketremote_phone_status_table";
+import TicketremoteTicketSummaryRow from "./ticketremote_ticket_summary_table";
+import TicketremoteViewerPublicRow from "./ticketremote_viewer_public_table";
 
 /** Type-only namespace exports for generated type groups. */
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
-  ticketremote_live_state: __table({
-    name: 'ticketremote_live_state',
+  ticketremote_phone_status: __table({
+    name: 'ticketremote_phone_status',
     indexes: [
-      { accessor: 'id', name: 'ticketremote_live_state_id_idx_btree', algorithm: 'btree', columns: [
+      { accessor: 'id', name: 'ticketremote_phone_status_id_idx_btree', algorithm: 'btree', columns: [
         'id',
       ] },
-      { accessor: 'ticketId', name: 'ticketremote_live_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
+      { accessor: 'ticketId', name: 'ticketremote_phone_status_ticket_id_idx_btree', algorithm: 'btree', columns: [
         'ticketId',
       ] },
-      { accessor: 'updatedAt', name: 'ticketremote_live_state_updated_at_idx_btree', algorithm: 'btree', columns: [
+      { accessor: 'updatedAt', name: 'ticketremote_phone_status_updated_at_idx_btree', algorithm: 'btree', columns: [
         'updatedAt',
       ] },
     ],
     constraints: [
-      { name: 'ticketremote_live_state_id_key', constraint: 'unique', columns: ['id'] },
+      { name: 'ticketremote_phone_status_id_key', constraint: 'unique', columns: ['id'] },
     ],
-  }, TicketremoteLiveStateRow),
+  }, TicketremotePhoneStatusRow),
+  ticketremote_ticket_summary: __table({
+    name: 'ticketremote_ticket_summary',
+    indexes: [
+      { accessor: 'id', name: 'ticketremote_ticket_summary_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_ticket_summary_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+      { accessor: 'updatedAt', name: 'ticketremote_ticket_summary_updated_at_idx_btree', algorithm: 'btree', columns: [
+        'updatedAt',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_ticket_summary_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteTicketSummaryRow),
+  ticketremote_viewer_public: __table({
+    name: 'ticketremote_viewer_public',
+    indexes: [
+      { accessor: 'expiresAt', name: 'ticketremote_viewer_public_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'expiresAt',
+      ] },
+      { accessor: 'id', name: 'ticketremote_viewer_public_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'lastSeenAt', name: 'ticketremote_viewer_public_last_seen_at_idx_btree', algorithm: 'btree', columns: [
+        'lastSeenAt',
+      ] },
+      { accessor: 'ticketExpiresAt', name: 'ticketremote_viewer_public_ticket_id_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'expiresAt',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_viewer_public_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_viewer_public_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteViewerPublicRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("ticketremote_audit", AuditEventReducer),
+  __reducerSchema("ticketremote_claim_control", ClaimControlReducer),
+  __reducerSchema("ticketremote_cleanup_expired", CleanupExpiredNowReducer),
+  __reducerSchema("ticketremote_disconnect_presence", DisconnectPresenceProcedureReducer),
+  __reducerSchema("ticketremote_extend_control", ExtendControlReducer),
+  __reducerSchema("ticketremote_heartbeat_presence", HeartbeatPresenceReducer),
   __reducerSchema("ticketremote_member_claim_control", MemberClaimControlReducer),
   __reducerSchema("ticketremote_member_disconnect_presence", MemberDisconnectPresenceReducer),
   __reducerSchema("ticketremote_member_extend_control", MemberExtendControlReducer),
@@ -94,21 +144,18 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_remove_member", MemberRemoveMemberReducer),
   __reducerSchema("ticketremote_member_revoke_control", MemberRevokeControlReducer),
   __reducerSchema("ticketremote_member_upsert_member", MemberUpsertMemberReducer),
+  __reducerSchema("ticketremote_release_control", ReleaseControlReducer),
+  __reducerSchema("ticketremote_remove_member", RemoveMemberReducer),
+  __reducerSchema("ticketremote_revoke_control", RevokeControlReducer),
   __reducerSchema("ticketremote_service_bootstrap", ServiceBootstrapReducer),
+  __reducerSchema("ticketremote_update_phone", UpdatePhoneReducer),
+  __reducerSchema("ticketremote_update_phone_status", UpdatePhoneStatusReducer),
+  __reducerSchema("ticketremote_upsert_member", UpsertMemberReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */
 const proceduresSchema = __procedures(
-  __procedureSchema("ticketremote_claim_control", TicketremoteClaimControlProcedure.params, TicketremoteClaimControlProcedure.returnType),
-  __procedureSchema("ticketremote_disconnect_presence", TicketremoteDisconnectPresenceProcedure.params, TicketremoteDisconnectPresenceProcedure.returnType),
-  __procedureSchema("ticketremote_extend_control", TicketremoteExtendControlProcedure.params, TicketremoteExtendControlProcedure.returnType),
   __procedureSchema("ticketremote_get_state", TicketremoteGetStateProcedure.params, TicketremoteGetStateProcedure.returnType),
-  __procedureSchema("ticketremote_heartbeat_presence", TicketremoteHeartbeatPresenceProcedure.params, TicketremoteHeartbeatPresenceProcedure.returnType),
-  __procedureSchema("ticketremote_release_control", TicketremoteReleaseControlProcedure.params, TicketremoteReleaseControlProcedure.returnType),
-  __procedureSchema("ticketremote_remove_member", TicketremoteRemoveMemberProcedure.params, TicketremoteRemoveMemberProcedure.returnType),
-  __procedureSchema("ticketremote_revoke_control", TicketremoteRevokeControlProcedure.params, TicketremoteRevokeControlProcedure.returnType),
-  __procedureSchema("ticketremote_update_phone", TicketremoteUpdatePhoneProcedure.params, TicketremoteUpdatePhoneProcedure.returnType),
-  __procedureSchema("ticketremote_upsert_member", TicketremoteUpsertMemberProcedure.params, TicketremoteUpsertMemberProcedure.returnType),
 );
 
 /** The remote SpacetimeDB module schema, both runtime and type information. */

@@ -76,6 +76,7 @@
   let spacetimeDirectUnavailableLogged = false;
   let directSpacetimeToken = '';
   let directSpacetimeTokenExpiresAt = 0;
+  let spacetimeClientScriptPromise = null;
 
   if (!cfg.authenticated) {
     startAuthRedirect();
@@ -203,6 +204,12 @@
   let lastControlCodeCaptureDebug = null;
   let lastControlCodeCaptureKeyframeRequestAt = 0;
   let lastControlCodeCaptureKeyframeRetryCount = 0;
+  let controlCodeSafeGeneratedFrameRequestID = '';
+  let controlCodeSafeGeneratedFrameEpoch = 0;
+  let controlCodeSafeGeneratedFrameSequence = 0;
+  let controlCodeSafeGeneratedFrameCount = 0;
+  let controlCodeFrozenFrameCanvas = null;
+  let controlCodeFrozenFrameKey = '';
   const localSessionID = String(cfg.sessionId || '').trim();
   const ownedControlCodeRequestIDs = new Set();
   const locallyClosedControlCodeRequestIDs = new Set();
@@ -264,6 +271,23 @@
     early.ws = null;
     if (!socket) return;
     try { socket.close(1000, reason || 'app_loaded'); } catch (_) {}
+  }
+
+  function claimEarlyVideoSocket() {
+    const early = window.TICKET_EARLY_VIDEO;
+    if (!early || early.claimed) return null;
+    early.claimed = true;
+    const socket = early.ws;
+    const queued = Array.isArray(early.queue) ? early.queue.slice() : [];
+    early.queue = [];
+    early.ws = null;
+    if (!socket || early.error || early.closed || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+      if (socket) {
+        try { socket.close(1000, 'early_video_unusable'); } catch (_) {}
+      }
+      return null;
+    }
+    return { socket, queued, openedAt: Number(early.openedAt || 0) };
   }
 
   function scheduleViewerIdleDisconnect(reason) {
@@ -845,7 +869,23 @@
       keepFirstScreenPinned();
       return;
     }
-    showEmpty(message, false);
+    showQuietStreamLoading();
+  }
+
+  function showQuietStreamLoading() {
+    redrawPreservedFrame();
+    emptyMessage.textContent = '';
+    startStreamButton.hidden = true;
+    emptyState.hidden = true;
+    document.body.dataset.streamReady = 'true';
+    updateStreamFreshnessStatus('stream_recovery');
+    showStreamResumeSpinner();
+    keepFirstScreenPinned();
+  }
+
+  function showStreamRecovery() {
+    preserveCurrentFrame('stream_recovery');
+    showQuietStreamLoading();
   }
 
   function hideEmpty() {
@@ -889,7 +929,7 @@
     ws = safeWebSocket(socketURL(), 'control');
     if (!ws) {
       setConnected('Savienojuma kļūme');
-      showStreamWaiting('Atjauno straumi...');
+      showStreamRecovery();
       reconnectTimer = setTimeout(connect, 1500);
       return;
     }
@@ -900,7 +940,7 @@
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
       connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
-      send({ type: 'heartbeat', reason: 'public_connected' });
+      send(heartbeatMessage('public_connected'));
       connectDirectVideo();
     };
     ws.onmessage = (event) => {
@@ -915,13 +955,13 @@
       streamUnsupported = false;
       keepFirstScreenPinned();
       closeDirectVideo();
-      showStreamWaiting('Atjauno straumi...');
+      showStreamRecovery();
       reconnectTimer = setTimeout(connect, 1000);
     };
     ws.onerror = () => {
       setConnected('Savienojuma kļūme');
       if (!streamUnsupported) {
-        showStreamWaiting('Atjauno straumi...');
+        showStreamRecovery();
       }
       clientLog('websocket_error', 'socket error');
     };
@@ -974,7 +1014,7 @@
     preserveCurrentFrame(`restart_stream:${reason || 'unknown'}`);
     closeDirectVideo();
     resetStreamState({ preserveFrame });
-    showStreamWaiting('Atjauno straumi...');
+    showStreamRecovery();
     setTimeout(connectDirectVideo, 250);
   }
 
@@ -1053,27 +1093,39 @@
       hiddenVideoCloseTimer = null;
     }
     if (videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)) return;
+    const early = claimEarlyVideoSocket();
+    if (early && adoptVideoSocket(early.socket, early.queued, early.openedAt, 'early_video_socket')) {
+      document.body.dataset.videoPath = 'https-h264';
+      return;
+    }
     closeDirectVideo();
     document.body.dataset.videoPath = 'https-h264';
     const socket = safeWebSocket(streamURL(), 'video');
     if (!socket) {
-      showStreamWaiting('Atjauno straumi...');
+      showStreamRecovery();
       setTimeout(connectDirectVideo, 1500);
       return;
     }
+    adoptVideoSocket(socket, [], 0, 'video_socket_open');
+  }
+
+  function noteVideoSocketOpen(socket, reason) {
+    if (idleDisconnected || videoWs !== socket) {
+      intentionallyClosedVideoSockets.add(socket);
+      try { socket.close(1000, 'stale_video_socket'); } catch (_) {}
+      return;
+    }
+    if (videoConnectedAt <= 0) videoConnectedAt = performance.now();
+    showStreamWaiting('Saņem video konfigurāciju...');
+    requestKeyframe(reason || 'video_socket_open');
+  }
+
+  function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {
+    if (!socket) return false;
     videoWs = socket;
     activeVideoSockets.add(socket);
     socket.binaryType = 'arraybuffer';
-    socket.onopen = () => {
-      if (idleDisconnected || videoWs !== socket) {
-        intentionallyClosedVideoSockets.add(socket);
-        try { socket.close(1000, 'stale_video_socket'); } catch (_) {}
-        return;
-      }
-      videoConnectedAt = performance.now();
-      showStreamWaiting('Saņem video konfigurāciju...');
-      requestKeyframe('video_socket_open');
-    };
+    socket.onopen = () => noteVideoSocketOpen(socket, reason || 'video_socket_open');
     socket.onmessage = (event) => {
       if (idleDisconnected || videoWs !== socket) return;
       handleVideoSocketMessage(event).catch((error) => {
@@ -1089,7 +1141,7 @@
         return;
       }
       resetStreamState({ preserveFrame: true });
-      showStreamWaiting('Atjauno straumi...');
+      showStreamRecovery();
       if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
         setTimeout(connectDirectVideo, 1000);
       }
@@ -1098,6 +1150,16 @@
       if (intentionallyClosedVideoSockets.has(socket)) return;
       clientLog('direct_video_websocket_error', 'socket error');
     };
+    if (socket.readyState === WebSocket.OPEN) {
+      if (openedAt > 0) videoConnectedAt = openedAt;
+      noteVideoSocketOpen(socket, reason || 'early_video_socket_open');
+    }
+    queuedMessages.forEach((queued) => {
+      handleVideoSocketMessage(queued).catch((error) => {
+        sendVideoClientLog('video_message_failed', error && error.message || 'queued message failed');
+      });
+    });
+    return true;
   }
 
   function sendVideoSignal(value) {
@@ -1456,7 +1518,7 @@
       sendVideoClientLog('decoded_frame_render_failed', `${source || 'decoder'}:${error && error.message || 'draw failed'}`);
       needsKeyFrame = true;
       preserveCurrentFrame('decoded_frame_render_failed');
-      showStreamWaiting('Atjauno straumi...');
+      showStreamRecovery();
       requestKeyframe('decoded_frame_render_failed');
     } finally {
       try { frame.close(); } catch (_) {}
@@ -1618,6 +1680,14 @@
     return false;
   }
 
+  function heartbeatMessage(reason) {
+    const msg = { type: 'heartbeat', reason: reason || 'public_heartbeat' };
+    if (spacetimeDirectUnavailable) {
+      msg.presenceFallback = true;
+    }
+    return msg;
+  }
+
   async function fetchAuthSessionToken() {
     if (!usesDirectSpacetimeAuth()) {
       throw new Error('Direct SpacetimeAuth is disabled for this ticket session.');
@@ -1639,11 +1709,33 @@
     return fetchAuthSessionToken();
   }
 
+  async function loadSpacetimeClientScript() {
+    if (window.TicketSpacetime) return window.TicketSpacetime;
+    if (spacetimeClientScriptPromise) return spacetimeClientScriptPromise;
+    spacetimeClientScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      const assetVersion = encodeURIComponent(String(cfg.assetVersion || pageVersion || Date.now()));
+      script.src = `/static/spacetime-client.js?v=${assetVersion}`;
+      script.async = true;
+      script.onload = () => {
+        if (window.TicketSpacetime) {
+          resolve(window.TicketSpacetime);
+          return;
+        }
+        reject(new Error('Spacetime client did not initialize.'));
+      };
+      script.onerror = () => reject(new Error('Spacetime client failed to load.'));
+      document.head.appendChild(script);
+    });
+    return spacetimeClientScriptPromise;
+  }
+
   async function connectSpacetimeState() {
     if (idleDisconnected) return;
-    if (!usesDirectSpacetimeAuth() || spacetimeClient || !window.TicketSpacetime || spacetimeDirectUnavailable) return;
+    if (!usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
     let token = '';
     try {
+      await loadSpacetimeClientScript();
       token = await spacetimeToken();
     } catch (error) {
       spacetimeDirectUnavailable = true;
@@ -1651,6 +1743,7 @@
         spacetimeDirectUnavailableLogged = true;
         clientLog('spacetime_direct_unavailable', error && error.message);
       }
+      send(heartbeatMessage('spacetime_direct_unavailable'));
       return;
     }
     const st = cfg.spacetime || {};
@@ -1791,6 +1884,8 @@
     lastControlCodeCaptureDebug = null;
     lastControlCodeCaptureKeyframeRequestAt = 0;
     lastControlCodeCaptureKeyframeRetryCount = 0;
+    resetControlCodeSafeGeneratedFrame('clear_capture');
+    clearControlCodeFrozenCandidateFrame();
     codeResultImage.hidden = true;
     codeResultImage.removeAttribute('src');
     publishStreamDebug();
@@ -1921,6 +2016,12 @@
       width: 0.52,
       height: 0.045
     });
+    const dimOverlay = canvasRegionFingerprint({
+      x: 0.08,
+      y: 0.30,
+      width: 0.84,
+      height: 0.44
+    });
     const okButton = canvasRegionFingerprint({
       x: 0.64,
       y: 0.51,
@@ -1945,20 +2046,39 @@
       width: 0.18,
       height: 0.07
     });
+    const dialogGhostVisible = Boolean(dialog &&
+      dialog.lightCellRatio >= 0.24 &&
+      dialog.mean >= 82 &&
+      dialog.darkCellRatio <= 0.30 &&
+      dialog.contrastScore <= 106 &&
+      okButtonOrangeRatio >= 0.03);
+    const dimOverlayVisible = Boolean(dimOverlay &&
+      dimOverlay.mean >= 68 &&
+      dimOverlay.mean <= 205 &&
+      dimOverlay.lightCellRatio >= 0.10 &&
+      dimOverlay.darkCellRatio >= 0.08 &&
+      dimOverlay.contrastScore <= 112);
     const okButtonVisible = okButtonOrangeRatio >= 0.08 || Boolean(okButton &&
       okButton.mean >= 105 &&
       okButton.mean <= 220 &&
       okButton.contrastScore <= 85 &&
       okButton.lightCellRatio >= 0.18);
+    const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);
+    const popupKeyboardVisible = dialogVisible && keyboardVisible;
     return {
-      keyboardVisible: dialogVisible && keyboardVisible,
+      keyboardVisible: popupKeyboardVisible,
       popupVisible: dialogVisible && (okButtonVisible || inputLineVisible),
+      dialogGhostVisible,
+      dimOverlayVisible,
+      unsafeOverlayVisible: popupVisible || popupKeyboardVisible || dialogGhostVisible || (dimOverlayVisible && (popupVisible || dialogGhostVisible || popupKeyboardVisible)),
       keyboardLightCellRatio: keyboard ? Math.round(Number(keyboard.lightCellRatio || 0) * 100) / 100 : 0,
       keyboardMean: keyboard ? Math.round(Number(keyboard.mean || 0) * 10) / 10 : 0,
       keyboardContrastScore: keyboard ? Math.round(Number(keyboard.contrastScore || 0) * 10) / 10 : 0,
       popupLightCellRatio: dialog ? Math.round(Number(dialog.lightCellRatio || 0) * 100) / 100 : 0,
       popupDarkCellRatio: dialog ? Math.round(Number(dialog.darkCellRatio || 0) * 100) / 100 : 0,
       popupContrastScore: dialog ? Math.round(Number(dialog.contrastScore || 0) * 10) / 10 : 0,
+      dimOverlayMean: dimOverlay ? Math.round(Number(dimOverlay.mean || 0) * 10) / 10 : 0,
+      dimOverlayContrastScore: dimOverlay ? Math.round(Number(dimOverlay.contrastScore || 0) * 10) / 10 : 0,
       popupInputLineDarkCellRatio: inputLine ? Math.round(Number(inputLine.darkCellRatio || 0) * 100) / 100 : 0,
       okButtonOrangeRatio: Math.round(okButtonOrangeRatio * 100) / 100,
       okButtonVisible,
@@ -2102,6 +2222,8 @@
     pendingControlCodeBaselineFrameFingerprint = null;
     lastControlCodeCaptureKeyframeRequestAt = 0;
     lastControlCodeCaptureKeyframeRetryCount = 0;
+    resetControlCodeSafeGeneratedFrame('baseline');
+    clearControlCodeFrozenCandidateFrame();
     lastControlCodeCaptureDebug = {
       requestId: requestID,
       baselineCaptured: Boolean(controlCodeBaselineFrameFingerprint),
@@ -2149,6 +2271,75 @@
       resultProof === 'phone_visual_root_confirmed';
   }
 
+  const controlCodeSafeGeneratedFrameRequiredCount = 2;
+
+  function controlCodeCandidateFrameKey(proof) {
+    return [
+      String(proof && proof.requestId || '').trim(),
+      Number(proof && proof.candidateFrameEpoch || 0),
+      Number(proof && proof.candidateFrameSequence || 0)
+    ].join(':');
+  }
+
+  function resetControlCodeSafeGeneratedFrame(reason) {
+    controlCodeSafeGeneratedFrameRequestID = '';
+    controlCodeSafeGeneratedFrameEpoch = 0;
+    controlCodeSafeGeneratedFrameSequence = 0;
+    controlCodeSafeGeneratedFrameCount = 0;
+    if (lastControlCodeCaptureDebug) {
+      lastControlCodeCaptureDebug.safeGeneratedFrameResetReason = reason || '';
+    }
+  }
+
+  function noteControlCodeSafeGeneratedFrame(proof) {
+    const requestID = String(proof && proof.requestId || '').trim();
+    const epoch = Number(proof && proof.candidateFrameEpoch || 0);
+    const sequence = Number(proof && proof.candidateFrameSequence || 0);
+    if (!requestID || !epoch || !sequence) {
+      resetControlCodeSafeGeneratedFrame('safe_frame_missing_metadata');
+      return 0;
+    }
+    if (requestID !== controlCodeSafeGeneratedFrameRequestID || epoch !== controlCodeSafeGeneratedFrameEpoch) {
+      controlCodeSafeGeneratedFrameRequestID = requestID;
+      controlCodeSafeGeneratedFrameEpoch = epoch;
+      controlCodeSafeGeneratedFrameSequence = sequence;
+      controlCodeSafeGeneratedFrameCount = 1;
+      return controlCodeSafeGeneratedFrameCount;
+    }
+    if (sequence > controlCodeSafeGeneratedFrameSequence) {
+      controlCodeSafeGeneratedFrameSequence = sequence;
+      controlCodeSafeGeneratedFrameCount += 1;
+    }
+    return controlCodeSafeGeneratedFrameCount;
+  }
+
+  function clearControlCodeFrozenCandidateFrame() {
+    controlCodeFrozenFrameCanvas = null;
+    controlCodeFrozenFrameKey = '';
+  }
+
+  function freezeControlCodeCandidateFrame(proof) {
+    if (!proof || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
+    const frozen = document.createElement('canvas');
+    frozen.width = canvas.width;
+    frozen.height = canvas.height;
+    const frozenContext = frozen.getContext('2d', { alpha: false });
+    if (!frozenContext) return false;
+    frozenContext.drawImage(canvas, 0, 0, canvas.width, canvas.height);
+    controlCodeFrozenFrameCanvas = frozen;
+    controlCodeFrozenFrameKey = controlCodeCandidateFrameKey(proof);
+    proof.frozenFrameKey = controlCodeFrozenFrameKey;
+    proof.frozenFrameAvailable = true;
+    return true;
+  }
+
+  function controlCodeFrozenCandidateFrameForProof(proof) {
+    if (!proof || !controlCodeFrozenFrameCanvas || !controlCodeFrozenFrameKey) return null;
+    if (controlCodeCandidateFrameKey(proof) !== controlCodeFrozenFrameKey) return null;
+    if (controlCodeFrozenFrameCanvas.width !== canvas.width || controlCodeFrozenFrameCanvas.height !== canvas.height) return null;
+    return controlCodeFrozenFrameCanvas;
+  }
+
   function controlCodeCandidateFrameProof(request) {
     const requestID = String(request && request.requestId || '').trim();
     const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
@@ -2166,6 +2357,8 @@
       candidateRejectedReason: '',
       fingerprintDifferenceScore: 0,
       fingerprintChangedCells: 0,
+      safeGeneratedFrameCount: controlCodeSafeGeneratedFrameCount,
+      frozenFrameKey: controlCodeFrozenFrameKey,
       keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
     };
     if (!request || request.status !== 'succeeded') {
@@ -2198,24 +2391,31 @@
     const popupProof = controlCodePopupFrameProof();
     proof.popupKeyboardVisible = popupProof.keyboardVisible;
     proof.popupVisible = popupProof.popupVisible;
+    proof.popupGhostVisible = popupProof.dialogGhostVisible;
+    proof.dimOverlayVisible = popupProof.dimOverlayVisible;
+    proof.unsafeOverlayVisible = popupProof.unsafeOverlayVisible;
     proof.popupLightCellRatio = popupProof.popupLightCellRatio;
     proof.popupDarkCellRatio = popupProof.popupDarkCellRatio;
     proof.popupContrastScore = popupProof.popupContrastScore;
+    proof.dimOverlayMean = popupProof.dimOverlayMean;
+    proof.dimOverlayContrastScore = popupProof.dimOverlayContrastScore;
     proof.keyboardLightCellRatio = popupProof.keyboardLightCellRatio;
     proof.keyboardMean = popupProof.keyboardMean;
     proof.keyboardContrastScore = popupProof.keyboardContrastScore;
-    if (popupProof.popupVisible) {
-      proof.candidateRejectedReason = popupProof.keyboardVisible ? 'control_popup_keyboard_frame' : 'control_popup_frame';
+    if (popupProof.unsafeOverlayVisible) {
+      resetControlCodeSafeGeneratedFrame('unsafe_overlay');
+      proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
+      if (popupProof.keyboardVisible) {
+        proof.candidateRejectedReason = 'control_popup_keyboard_frame';
+      } else if (popupProof.popupVisible) {
+        proof.candidateRejectedReason = 'control_popup_frame';
+      } else {
+        proof.candidateRejectedReason = 'control_popup_fade_frame';
+      }
       return proof;
     }
     if (trustedPhonePostSubmitProof) {
       proof.trustedPhonePostSubmitProof = true;
-      proof.generatedVisible = true;
-      proof.accepted = true;
-      proof.candidateAccepted = true;
-      proof.candidateRejectedReason = '';
-      proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;
-      return proof;
     }
     if (controlCodeBaselineFrameFingerprint &&
       proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
@@ -2241,7 +2441,19 @@
     proof.generatedCodeContrastScore = generatedProof.generatedCodeContrastScore;
     proof.generatedCodeScore = generatedProof.generatedCodeScore;
     if (!generatedProof.generatedVisible) {
+      resetControlCodeSafeGeneratedFrame('generated_not_visible');
+      proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
       proof.candidateRejectedReason = 'generated_frame_not_visible';
+      return proof;
+    }
+    const safeFrameCount = noteControlCodeSafeGeneratedFrame(proof);
+    proof.safeGeneratedFrameCount = safeFrameCount;
+    if (safeFrameCount < controlCodeSafeGeneratedFrameRequiredCount) {
+      proof.candidateRejectedReason = 'generated_frame_not_stable';
+      return proof;
+    }
+    if (!freezeControlCodeCandidateFrame(proof)) {
+      proof.candidateRejectedReason = 'candidate_frame_freeze_failed';
       return proof;
     }
     proof.accepted = true;
@@ -2302,13 +2514,30 @@
     return true;
   }
 
+  function captureControlCodeResultImage(proof) {
+    const sourceCanvas = controlCodeFrozenCandidateFrameForProof(proof);
+    if (!sourceCanvas) return '';
+    const captureCanvas = document.createElement('canvas');
+    captureCanvas.width = sourceCanvas.width;
+    captureCanvas.height = sourceCanvas.height;
+    const captureContext = captureCanvas.getContext('2d', { alpha: false });
+    if (!captureContext) return '';
+    captureContext.imageSmoothingEnabled = false;
+    captureContext.fillStyle = '#000';
+    captureContext.fillRect(0, 0, captureCanvas.width, captureCanvas.height);
+    captureContext.drawImage(sourceCanvas, 0, 0, captureCanvas.width, captureCanvas.height);
+    return captureCanvas.toDataURL('image/png');
+  }
+
   async function captureControlCodeResultScreenshot(request, proof) {
     if (!request || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
     if (!proof || !proof.accepted) return false;
     const requestID = String(request.requestId || '').trim();
     if (!requestID) return false;
     try {
-      const capturedImage = canvas.toDataURL('image/png');
+      if (!controlCodeFrozenCandidateFrameForProof(proof)) return false;
+      const capturedImage = captureControlCodeResultImage(proof);
+      if (!capturedImage) return false;
       controlCodeCaptureAckInFlightRequestID = requestID;
       try {
         await confirmControlCodeBrowserCapture(request, proof);
@@ -2337,6 +2566,10 @@
         accepted: proof.accepted,
         candidateAccepted: true,
         fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
+        capturedNaturalWidth: canvas.width,
+        capturedNaturalHeight: canvas.height,
+        controlCodeSafeGeneratedFrameCount,
+        controlCodeFrozenFrameKey,
         capturedAt: Date.now()
       });
       publishStreamDebug();
@@ -2402,14 +2635,15 @@
       codeResultImage.removeAttribute('src');
     }
     codeResultArea.dataset.status = 'waiting';
-    codeResultArea.style.background = 'rgba(0,0,0,.72)';
-    codeResultStatus.hidden = false;
-    codeResultStatus.textContent = 'Gaida koda attēlu...';
+    codeResultArea.style.background = '';
+    codeResultStatus.hidden = true;
+    codeResultStatus.textContent = '';
     codeResultValue.hidden = true;
     codeResultValue.textContent = '';
     codeResultValue.style.display = '';
-    codeResultTimer.hidden = false;
-    setControlCodeResultVisible(true);
+    codeResultTimer.hidden = true;
+    codeResultTimer.textContent = '';
+    setControlCodeResultVisible(false);
     keepControlCodeVideoAlive('control_code_wait_reconnect');
     if (maybeCaptureControlCodeResultImage()) return;
     const tick = () => {
@@ -2635,10 +2869,7 @@
         if (msg.data && msg.data.message) {
           setStatus(msg.data.message);
           if (msg.data.streamActive === false && !streamUnsupported) {
-            const waitingMessage = isTechnicalPublicStatusMessage(msg.data.message)
-              ? 'Straume atjaunojas...'
-              : `${localizePublicMessage(msg.data.message)} Restartē...`;
-            showStreamWaiting(waitingMessage);
+            showStreamRecovery();
           }
         }
       } else if (msg.type === 'phone') {
@@ -3175,7 +3406,7 @@
     }
     if (fallbackFrameAvailable) {
       redrawPreservedFrame();
-      if (longHidden || videoStale) showStreamWaiting('Atjauno straumi...');
+      if (longHidden || videoStale) showStreamRecovery();
     }
     if (screenEngaged) {
       requestScreenWakeLock(reason || 'visibility_visible');
@@ -3186,7 +3417,7 @@
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       connect();
     } else if (ws.readyState === WebSocket.OPEN) {
-      send({ type: 'heartbeat', reason });
+      send(heartbeatMessage(reason));
     }
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       connectDirectVideo();
@@ -3248,7 +3479,7 @@
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
       spacetimeClient.heartbeat(true);
     }
-    send({ type: 'heartbeat', reason: 'public_heartbeat' });
+    send(heartbeatMessage('public_heartbeat'));
   }, 15000);
   setInterval(() => {
     if (idleDisconnected) return;
@@ -3260,8 +3491,7 @@
   updateDetailsReveal();
   resizeCanvasBox();
   scheduleViewerIdleDisconnect('initial_load');
-  showEmpty('Savienojas...', false);
-  closeEarlyVideo('app_loaded');
+  showQuietStreamLoading();
   refreshHealth();
   connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
   connect();

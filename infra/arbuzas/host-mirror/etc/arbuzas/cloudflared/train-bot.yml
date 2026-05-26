@@ -1,0 +1,6 @@
+tunnel: bcd59ca6-e636-42c5-842a-0d24130834bb
+credentials-file: /etc/arbuzas/cloudflared/train-bot.json
+ingress:
+  - hostname: train-bot.jolkins.id.lv
+    service: http://127.0.0.1:9317
+  - service: http_status:404

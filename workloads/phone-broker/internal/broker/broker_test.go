@@ -1032,6 +1032,9 @@ func TestSemanticRigasSatiksmeFailureRetryPolicy(t *testing.T) {
 		if !shouldRetryQRJob(reason, 1) {
 			t.Fatalf("reason %q should retry once", reason)
 		}
+		if shouldRetryQRJob(reason, 2) {
+			t.Fatalf("reason %q should stop after one retry", reason)
+		}
 	}
 	stable := []string{
 		"wrong_code",
@@ -1042,6 +1045,8 @@ func TestSemanticRigasSatiksmeFailureRetryPolicy(t *testing.T) {
 		"rs_register_trip_missing",
 		"rs_manual_code_field_missing",
 		"rs_confirm_button_missing",
+		"rs_app_attention_required",
+		"rs_monthly_ticket_stale_code",
 		"rs_monthly_ticket_unknown_state",
 		"rs_monthly_ticket_state_timeout",
 	}
@@ -1216,6 +1221,59 @@ func TestRigasSatiksmeBatchResultsCompleteMatchingJobsOutOfOrder(t *testing.T) {
 	secondImage, ok := b.JobImage(secondJob.ID)
 	if !ok || string(secondImage.Bytes) != "second image" {
 		t.Fatalf("second image = %#v ok=%v", secondImage, ok)
+	}
+}
+
+func TestRigasSatiksmeBatchTimeoutScalesWithBatchSize(t *testing.T) {
+	upstream := newFakePhone(t)
+	defer upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstream.URL,
+		TicketGrace:      time.Millisecond,
+		RunnerInterval:   5 * time.Millisecond,
+		PhoneSendTimeout: 200 * time.Millisecond,
+		JobTimeout:       60 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	now := time.Now()
+	firstJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "68803", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80*time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190*time.Millisecond)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream.WaitForCommand(t, "generate_rigassatiksme_qr_batch")
+	time.Sleep(90 * time.Millisecond)
+	for _, job := range []QRJob{firstJob, secondJob, thirdJob} {
+		got, ok := b.Job(job.ID)
+		if !ok || got.Status != JobRunning || got.Attempts != 1 {
+			t.Fatalf("batch job after one per-job timeout = %#v ok=%v, want still running first attempt", got, ok)
+		}
+	}
+
+	upstream.SendResult(t, firstJob.ID, "image/png", []byte("first image"))
+	upstream.SendResult(t, secondJob.ID, "image/png", []byte("second image"))
+	upstream.SendResult(t, thirdJob.ID, "image/png", []byte("third image"))
+
+	for _, job := range []QRJob{firstJob, secondJob, thirdJob} {
+		got := waitForJobStatus(t, b, job.ID, JobSucceeded)
+		if got.Reason != "generated" || got.Attempts != 1 {
+			t.Fatalf("completed batch job = %#v, want generated on first attempt", got)
+		}
 	}
 }
 

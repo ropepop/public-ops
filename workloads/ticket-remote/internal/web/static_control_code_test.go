@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestControlCodeResultModalCanWaitBeforeRenderedAztecFrame(t *testing.T) {
+func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing.T) {
 	source := ticketAppSource(t)
 	waitForScreenshot := substringBetween(t, source,
 		"function waitForControlCodeResultScreenshot(request) {",
@@ -18,8 +18,9 @@ func TestControlCodeResultModalCanWaitBeforeRenderedAztecFrame(t *testing.T) {
 		"async function captureControlCodeResultScreenshot(request",
 		"  function failControlCodeResultScreenshotWait() {")
 
-	if strings.Contains(succeededBranch, "setControlCodeResultVisible(true);") {
-		t.Fatalf("succeeded status must delegate result display timing to the screenshot wait path")
+	if strings.Contains(succeededBranch, "showControlCodePhoneImageResult(current)") ||
+		strings.Contains(succeededBranch, "hasTrustedControlCodePhoneImage(current)") {
+		t.Fatalf("succeeded status must use the browser-local capture path, not a phone image shortcut")
 	}
 	if strings.Contains(waitForScreenshot, "canvas.toDataURL") || strings.Contains(waitForScreenshot, "captureControlCodeResultScreenshot(request)") {
 		t.Fatalf("waiting modal path must not snapshot the canvas directly before the rendered Aztec frame is ready")
@@ -27,33 +28,94 @@ func TestControlCodeResultModalCanWaitBeforeRenderedAztecFrame(t *testing.T) {
 
 	clearImageIndex := strings.Index(waitForScreenshot, "codeResultImage.removeAttribute('src');")
 	waitingStatusIndex := strings.Index(waitForScreenshot, "codeResultArea.dataset.status = 'waiting';")
-	visibleIndex := strings.Index(waitForScreenshot, "setControlCodeResultVisible(true);")
-	if clearImageIndex < 0 || waitingStatusIndex < 0 || visibleIndex < 0 {
-		t.Fatalf("waiting for the post-confirmation Aztec frame must show a stale-image-free waiting modal")
+	hiddenIndex := strings.Index(waitForScreenshot, "setControlCodeResultVisible(false);")
+	if clearImageIndex < 0 || waitingStatusIndex < 0 || hiddenIndex < 0 {
+		t.Fatalf("waiting for the post-confirmation Aztec frame must arm a stale-image-free quiet capture state")
 	}
-	if clearImageIndex > visibleIndex || waitingStatusIndex > visibleIndex {
-		t.Fatalf("waiting modal must clear stale images and set waiting status before it becomes visible")
+	if clearImageIndex > hiddenIndex || waitingStatusIndex > hiddenIndex {
+		t.Fatalf("quiet waiting state must clear stale images and set waiting status before ensuring the overlay is hidden")
+	}
+	for _, forbidden := range []string{
+		"codeResultArea.style.background = 'rgba(0,0,0,.72)';",
+		"codeResultStatus.textContent = 'Gaida koda attēlu...';",
+		"setControlCodeResultVisible(true);",
+	} {
+		if strings.Contains(waitForScreenshot, forbidden) {
+			t.Fatalf("waiting capture state must not show interim overlay chrome, found %q", forbidden)
+		}
 	}
 
 	captureVisibleIndex := strings.Index(captureScreenshot, "setControlCodeResultVisible(true);")
-	captureIndex := strings.Index(captureScreenshot, "const capturedImage = canvas.toDataURL('image/png');")
+	captureIndex := strings.Index(captureScreenshot, "const capturedImage = captureControlCodeResultImage(proof);")
 	ackIndex := strings.Index(captureScreenshot, "await confirmControlCodeBrowserCapture(request, proof);")
 	if captureVisibleIndex < 0 {
 		t.Fatalf("capturing the Aztec frame must reveal the private result modal")
 	}
 	if captureIndex < 0 {
-		t.Fatalf("capture function no longer snapshots the stream canvas")
+		t.Fatalf("capture function no longer snapshots the generated-code crop from the stream canvas")
+	}
+	freezeIndex := strings.Index(captureScreenshot, "controlCodeFrozenCandidateFrameForProof(proof)")
+	if freezeIndex < 0 || captureIndex < freezeIndex {
+		t.Fatalf("capturing the Aztec frame must use the frozen proven stream frame")
 	}
 	if ackIndex < 0 || captureVisibleIndex < ackIndex || ackIndex < captureIndex {
 		t.Fatalf("captured image must be locally snapped, browser-acked, then revealed")
 	}
 	if !strings.Contains(waitForScreenshot, "controlCodeResultCaptureRequestID = requestID;") ||
 		!strings.Contains(waitForScreenshot, "keepControlCodeVideoAlive('control_code_wait_reconnect');") {
-		t.Fatalf("waiting modal path must still arm the request id and keep the video stream alive")
+		t.Fatalf("quiet waiting path must still arm the request id and keep the video stream alive")
 	}
 	if strings.Contains(waitForScreenshot, "const timeoutMs =") ||
 		strings.Contains(waitForScreenshot, "failControlCodeResultScreenshotWait();") {
-		t.Fatalf("waiting modal must not give up locally while the phone is holding the generated code for browser capture")
+		t.Fatalf("quiet waiting path must not give up locally while the phone is holding the generated code for browser capture")
+	}
+}
+
+func TestControlCodePhoneImageResultDoesNotBypassBrowserFrameCapture(t *testing.T) {
+	source := ticketAppSource(t)
+	succeededBranch := substringBetween(t, source,
+		"    if (current.status === 'succeeded') {",
+		"    if (current.status === 'failed') {")
+
+	if strings.Contains(source, "function showControlCodePhoneImageResult(request)") ||
+		strings.Contains(source, "function hasTrustedControlCodePhoneImage(request)") {
+		t.Fatalf("public browser must not have a trusted phone-image display shortcut")
+	}
+	if strings.Contains(succeededBranch, "imageBase64") ||
+		strings.Contains(succeededBranch, "phone_root_image") {
+		t.Fatalf("succeeded branch must not inspect phone screenshot payloads")
+	}
+	if strings.Contains(source, "candidate_frame_at_or_after_${proof.resultProof}") ||
+		strings.Contains(source, "proof.generatedVisible = true;\n      proof.accepted = true") {
+		t.Fatalf("browser capture must not trust Pixel proof alone; it must require generated-screen pixels")
+	}
+	for _, needle := range []string{
+		"waitForControlCodeResultScreenshot(current);",
+		"scheduleControlCodeTicker(current);",
+		"const capturedImage = captureControlCodeResultImage(proof);",
+		"await confirmControlCodeBrowserCapture(request, proof);",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("browser-local capture path missing %q", needle)
+		}
+	}
+}
+
+func TestTicketViewerClaimsEarlyVideoSocketInsteadOfClosingItAtLoad(t *testing.T) {
+	source := ticketAppSource(t)
+	if strings.Contains(source, "closeEarlyVideo('app_loaded');") {
+		t.Fatalf("ticket viewer must claim the head-opened video socket instead of closing it at app load")
+	}
+	for _, needle := range []string{
+		"function claimEarlyVideoSocket() {",
+		"const queued = Array.isArray(early.queue) ? early.queue.slice() : [];",
+		"function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {",
+		"claimEarlyVideoSocket()",
+		"queuedMessages.forEach((queued) => {",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("ticket viewer missing early video reuse behavior: %q", needle)
+		}
 	}
 }
 
@@ -121,12 +183,16 @@ func TestControlCodePostConfirmationStressAllowsWaitingModalButRejectsEarlyCaptu
 		t.Fatalf("control-code capture must stay behind marker readiness and browser frame proof even when the waiting modal is visible")
 	}
 	if !strings.Contains(waitForScreenshot, "codeResultArea.dataset.status = 'waiting';") ||
-		!strings.Contains(waitForScreenshot, "setControlCodeResultVisible(true);") {
-		t.Fatalf("post-confirmation path should be allowed to show a waiting modal before capture")
+		!strings.Contains(waitForScreenshot, "setControlCodeResultVisible(false);") {
+		t.Fatalf("post-confirmation path should arm capture while keeping the waiting state visually quiet")
+	}
+	if strings.Contains(waitForScreenshot, "setControlCodeResultVisible(true);") ||
+		strings.Contains(waitForScreenshot, "Gaida koda attēlu") {
+		t.Fatalf("post-confirmation waiting path must not show interim waiting text or overlay")
 	}
 
 	badCaptures := 0
-	directCaptureBeforeMarker := strings.Contains(waitForScreenshot, "canvas.toDataURL") || gateIndex < 0 || captureIndex < 0 || gateIndex > captureIndex
+	directCaptureBeforeMarker := strings.Contains(waitForScreenshot, "captureControlCodeResultImage(") || gateIndex < 0 || captureIndex < 0 || gateIndex > captureIndex
 	for attempt := 0; attempt < 20; attempt++ {
 		minFrameSequence := int64(100 + attempt)
 		lastRenderedBeforeAztec := minFrameSequence - 1
@@ -239,7 +305,106 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 	}
 }
 
-func TestControlCodeCaptureTrustsPhonePostSubmitTicketProof(t *testing.T) {
+func TestControlCodeResultCaptureUsesStreamSizeFrozenFrame(t *testing.T) {
+	source := ticketAppSource(t)
+	captureImage := substringBetween(t, source,
+		"function captureControlCodeResultImage(proof) {",
+		"  async function captureControlCodeResultScreenshot(request, proof) {")
+	captureScreenshot := substringBetween(t, source,
+		"async function captureControlCodeResultScreenshot(request",
+		"  function failControlCodeResultScreenshotWait() {")
+
+	if strings.Contains(source, "function controlCodeResultCaptureRegion(") {
+		t.Fatalf("browser result must not compute a crop region for the normal requester image")
+	}
+	for _, needle := range []string{
+		"const captureCanvas = document.createElement('canvas');",
+		"const sourceCanvas = controlCodeFrozenCandidateFrameForProof(proof);",
+		"captureCanvas.width = sourceCanvas.width;",
+		"captureCanvas.height = sourceCanvas.height;",
+		"captureContext.imageSmoothingEnabled = false;",
+		"captureContext.drawImage(sourceCanvas, 0, 0, captureCanvas.width, captureCanvas.height);",
+		"return captureCanvas.toDataURL('image/png');",
+	} {
+		if !strings.Contains(captureImage, needle) {
+			t.Fatalf("browser result full-frame image missing %q", needle)
+		}
+	}
+	for _, forbidden := range []string{
+		"region.sx",
+		"region.sy",
+		"region.sw",
+		"region.sh",
+		"const scale =",
+		"const dx =",
+		"const dy =",
+	} {
+		if strings.Contains(captureImage, forbidden) {
+			t.Fatalf("browser result must not crop or scale the frozen stream frame, found %q", forbidden)
+		}
+	}
+	if strings.Contains(captureScreenshot, "canvas.toDataURL('image/png')") {
+		t.Fatalf("requester result must use the frozen proven stream frame, not the live canvas directly")
+	}
+	if !strings.Contains(captureScreenshot, "const capturedImage = captureControlCodeResultImage(proof);") {
+		t.Fatalf("requester result must use the browser-local full-frame image")
+	}
+}
+
+func TestControlCodeCaptureRejectsPopupFadeAndRequiresStableFrames(t *testing.T) {
+	source := ticketAppSource(t)
+	candidateProof := substringBetween(t, source,
+		"function controlCodeCandidateFrameProof(request) {",
+		"  function noteControlCodeCandidateRejected(proof) {")
+	popupProof := substringBetween(t, source,
+		"function controlCodePopupFrameProof() {",
+		"  function controlCodeResultChipProof() {")
+	debugPublisher := substringBetween(t, source,
+		"function publishStreamDebug() {",
+		"  function readUint64(view, offset) {")
+
+	for _, needle := range []string{
+		"dialogGhostVisible",
+		"dimOverlayVisible",
+		"unsafeOverlayVisible",
+		"const popupKeyboardVisible = dialogVisible && keyboardVisible;",
+		"popupVisible: dialogVisible && (okButtonVisible || inputLineVisible)",
+		"unsafeOverlayVisible: popupVisible || popupKeyboardVisible || dialogGhostVisible || (dimOverlayVisible && (popupVisible || dialogGhostVisible || popupKeyboardVisible))",
+	} {
+		if !strings.Contains(popupProof, needle) {
+			t.Fatalf("popup proof must expose fade/ghost overlay rejection, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"proof.popupGhostVisible = popupProof.dialogGhostVisible;",
+		"proof.dimOverlayVisible = popupProof.dimOverlayVisible;",
+		"proof.unsafeOverlayVisible = popupProof.unsafeOverlayVisible;",
+		"if (popupProof.unsafeOverlayVisible)",
+		"control_popup_fade_frame",
+		"const safeFrameCount = noteControlCodeSafeGeneratedFrame(proof);",
+		"if (safeFrameCount < controlCodeSafeGeneratedFrameRequiredCount)",
+		"generated_frame_not_stable",
+		"freezeControlCodeCandidateFrame(proof)",
+	} {
+		if !strings.Contains(candidateProof, needle) {
+			t.Fatalf("candidate frame proof must reject popup fade and require stable frames, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"controlCodeSafeGeneratedFrameCount",
+		"controlCodeFrozenFrameKey",
+		"popupGhostVisible",
+		"unsafeOverlayVisible",
+		"capturedNaturalWidth",
+		"capturedNaturalHeight",
+	} {
+		if !strings.Contains(source, needle) && !strings.Contains(debugPublisher, needle) {
+			t.Fatalf("capture debug must expose stable/frozen-frame state, missing %q", needle)
+		}
+	}
+}
+
+func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
@@ -251,24 +416,25 @@ func TestControlCodeCaptureTrustsPhonePostSubmitTicketProof(t *testing.T) {
 		"resultProof === 'phone_visual_root_confirmed'",
 		"const trustedPhonePostSubmitProof = controlCodeTrustedPhonePostSubmitProof(proof.resultProof);",
 		"if (trustedPhonePostSubmitProof) {",
-		"proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;",
+		"proof.trustedPhonePostSubmitProof = true;",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("trusted post-submit phone proof path missing %q", needle)
+			t.Fatalf("post-submit phone proof diagnostic path missing %q", needle)
 		}
+	}
+	if strings.Contains(candidateProof, "proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;") ||
+		strings.Contains(candidateProof, "proof.accepted = true;\n      proof.candidateAccepted = true") {
+		t.Fatalf("phone post-submit proof must not bypass browser generated-screen proof")
 	}
 
 	popupRejectIndex := strings.Index(candidateProof, "if (popupProof.popupVisible)")
-	trustedAcceptIndex := strings.Index(candidateProof, "if (trustedPhonePostSubmitProof) {")
+	trustedDiagnosticIndex := strings.Index(candidateProof, "if (trustedPhonePostSubmitProof) {")
 	generatedRejectIndex := strings.Index(candidateProof, "if (!generatedProof.generatedVisible)")
-	if popupRejectIndex < 0 || trustedAcceptIndex < 0 || generatedRejectIndex < 0 {
-		t.Fatalf("candidate proof must keep popup rejection, trusted phone acceptance, and generated visual fallback")
+	if popupRejectIndex < 0 || trustedDiagnosticIndex < 0 || generatedRejectIndex < 0 {
+		t.Fatalf("candidate proof must keep popup rejection, phone proof diagnostics, and generated visual enforcement")
 	}
-	if popupRejectIndex > trustedAcceptIndex {
-		t.Fatalf("trusted phone proof must still reject visible control-code popups before capture")
-	}
-	if trustedAcceptIndex > generatedRejectIndex {
-		t.Fatalf("trusted phone proof must bypass stale generated-chip detection after the phone already proved the ViVi ticket result")
+	if popupRejectIndex > trustedDiagnosticIndex || trustedDiagnosticIndex > generatedRejectIndex {
+		t.Fatalf("phone proof diagnostics must happen after popup rejection and before generated visual enforcement")
 	}
 }
 
@@ -330,6 +496,11 @@ func TestControlCodePopupProofTargetsCenteredEntryDialog(t *testing.T) {
 		"okButtonOrangeRatio",
 		"okButtonVisible",
 		"popupVisible: dialogVisible && (okButtonVisible || inputLineVisible)",
+		"dialogGhostVisible",
+		"dialog.darkCellRatio <= 0.30",
+		"dialog.contrastScore <= 106",
+		"dimOverlayVisible",
+		"unsafeOverlayVisible",
 	} {
 		if !strings.Contains(popupProof, needle) {
 			t.Fatalf("popup proof must target the centered ViVi entry dialog and OK button, missing %q", needle)
@@ -396,7 +567,7 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 		"const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));",
 		"if (longHidden || videoStale) {\n      clientLog('visibility_resume_recovery'",
 		"if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {\n      connect();",
-		"} else if (ws.readyState === WebSocket.OPEN) {\n      send({ type: 'heartbeat', reason });",
+		"} else if (ws.readyState === WebSocket.OPEN) {\n      send(heartbeatMessage(reason));",
 		"if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {\n      connectDirectVideo();",
 		"if (videoStale) {\n      setTimeout(() => {",
 	}
@@ -430,7 +601,8 @@ func TestTicketViewerDisconnectsAfterIdleTimeoutUntilReload(t *testing.T) {
 		"function noteViewerActivity(event, reason) {",
 		"function scheduleViewerIdleDisconnect(reason) {",
 		"function closeEarlyVideo(reason) {",
-		"closeEarlyVideo('app_loaded');",
+		"function claimEarlyVideoSocket() {",
+		"claimEarlyVideoSocket()",
 		"closeEarlyVideo('pagehide');",
 		"for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown', 'scroll', 'focus'])",
 		"document.addEventListener('visibilitychange'",

@@ -131,8 +131,10 @@ func (s *Service) HandleMessage(ctx context.Context, msg Message) error {
 
 func (s *Service) handleCode(ctx context.Context, msg Message, userID string, code string) error {
 	accessReq := accessRequestFromMessage(msg)
+	reservationID := ""
 	if s.access != nil {
-		decision, err := s.access.AuthorizeAndConsume(ctx, accessReq)
+		reservationID = quotaReservationID(msg, userID)
+		decision, err := s.access.AuthorizeAndReserve(ctx, accessReq, reservationID)
 		if err != nil {
 			return s.telegram.SendMessage(ctx, msg.ChatID, "I could not check ticket access. Please try again.")
 		}
@@ -143,14 +145,14 @@ func (s *Service) handleCode(ctx context.Context, msg Message, userID string, co
 	job, err := s.broker.CreateQRJob(ctx, strconv.FormatInt(msg.ChatID, 10), userID, code)
 	if err != nil {
 		if s.access != nil {
-			_ = s.access.Refund(context.Background(), accessReq)
+			_ = s.access.ReleaseReservation(context.Background(), reservationID)
 		}
 		return s.telegram.SendMessage(ctx, msg.ChatID, "I could not queue that code. Please try again.")
 	}
 	if err := s.telegram.SendMessage(ctx, msg.ChatID, "Your request is waiting. I will send the QR image here when it is ready."); err != nil {
 		return err
 	}
-	go s.waitAndDeliver(context.Background(), msg.ChatID, job.ID)
+	go s.waitAndDeliver(context.Background(), msg.ChatID, job.ID, reservationID)
 	return nil
 }
 
@@ -187,7 +189,7 @@ func (s *Service) handleAccessStatus(ctx context.Context, msg Message) error {
 	return s.telegram.SendMessage(ctx, msg.ChatID, text)
 }
 
-func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string) {
+func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string, reservationID string) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.PollTimeout)
 	defer cancel()
 	ticker := time.NewTicker(s.cfg.PollInterval)
@@ -197,6 +199,9 @@ func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string
 		if err == nil {
 			switch job.Status {
 			case JobSucceeded:
+				if s.access != nil {
+					_ = s.access.CommitReservation(context.Background(), reservationID)
+				}
 				image, mime, imageErr := s.broker.JobImage(ctx, jobID)
 				if imageErr != nil {
 					_ = s.telegram.SendMessage(ctx, chatID, "The QR was created, but the image expired before I could send it.")
@@ -205,9 +210,15 @@ func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string
 				_ = s.telegram.SendPhoto(ctx, chatID, image, mime, "")
 				return
 			case JobFailed:
+				if s.access != nil {
+					_ = s.access.ReleaseReservation(context.Background(), reservationID)
+				}
 				_ = s.telegram.SendMessage(ctx, chatID, fmt.Sprintf("The QR request failed: %s", cleanReason(job.Reason)))
 				return
 			case JobCanceled:
+				if s.access != nil {
+					_ = s.access.ReleaseReservation(context.Background(), reservationID)
+				}
 				_ = s.telegram.SendMessage(ctx, chatID, "The QR request was cancelled.")
 				return
 			}
@@ -219,6 +230,10 @@ func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string
 		case <-ticker.C:
 		}
 	}
+}
+
+func quotaReservationID(msg Message, userID string) string {
+	return fmt.Sprintf("qr:%s:%d:%d", strings.TrimSpace(userID), msg.ChatID, time.Now().UnixNano())
 }
 
 func statusText(job QRJob) string {
@@ -245,6 +260,12 @@ func cleanReason(reason string) string {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		return "unknown"
+	}
+	switch reason {
+	case "rs_app_attention_required", "rs_monthly_ticket_unknown_state":
+		return "RS app needs attention. Open it once and retry."
+	case "rs_monthly_ticket_stale_code":
+		return "RS kept showing the previous QR after the new code was submitted. I did not send a stale image."
 	}
 	return strings.ReplaceAll(reason, "_", " ")
 }

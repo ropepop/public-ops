@@ -69,24 +69,20 @@ func ValidateInitData(initData string, botToken string, maxAge time.Duration, no
 		return Auth{}, errors.New("missing hash")
 	}
 	values.Del("hash")
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	lines := make([]string, 0, len(keys))
-	for _, key := range keys {
-		lines = append(lines, fmt.Sprintf("%s=%s", key, values.Get(key)))
-	}
-	dataCheckString := strings.Join(lines, "\n")
 	secret := hmacSHA256([]byte("WebAppData"), []byte(botToken))
-	expected := hmacSHA256(secret, []byte(dataCheckString))
+	expected := hmacSHA256(secret, []byte(initDataCheckString(values, false)))
 	actual, err := hex.DecodeString(hashHex)
 	if err != nil {
 		return Auth{}, fmt.Errorf("decode hash: %w", err)
 	}
 	if len(actual) != len(expected) || subtle.ConstantTimeCompare(actual, expected) != 1 {
-		return Auth{}, errors.New("invalid Telegram initData signature")
+		if strings.TrimSpace(values.Get("signature")) == "" {
+			return Auth{}, errors.New("invalid Telegram initData signature")
+		}
+		expected = hmacSHA256(secret, []byte(initDataCheckString(values, true)))
+		if len(actual) != len(expected) || subtle.ConstantTimeCompare(actual, expected) != 1 {
+			return Auth{}, errors.New("invalid Telegram initData signature")
+		}
 	}
 
 	authRaw := strings.TrimSpace(values.Get("auth_date"))
@@ -118,6 +114,22 @@ func ValidateInitData(initData string, botToken string, maxAge time.Duration, no
 		AuthDate: authAt,
 		User:     user,
 	}, nil
+}
+
+func initDataCheckString(values url.Values, skipSignature bool) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if skipSignature && strings.EqualFold(key, "signature") {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("%s=%s", key, values.Get(key)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func IssueSessionCookie(secret []byte, cfg SessionConfig, auth Auth, now time.Time) (*http.Cookie, error) {

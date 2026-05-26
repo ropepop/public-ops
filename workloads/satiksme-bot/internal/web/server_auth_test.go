@@ -405,10 +405,10 @@ func TestAuthUnsupportedMethodsReturnAllowHeader(t *testing.T) {
 		{method: http.MethodOptions, path: "/api/v1/auth/telegram/config", allow: "GET"},
 		{method: http.MethodGet, path: "/api/v1/auth/telegram/complete", allow: "POST"},
 		{method: http.MethodOptions, path: "/api/v1/auth/telegram/complete", allow: "POST"},
-			{method: http.MethodGet, path: "/api/v1/auth/logout", allow: "POST"},
-			{method: http.MethodOptions, path: "/api/v1/auth/logout", allow: "POST"},
-			{method: http.MethodOptions, path: "/api/v1/me", allow: "GET"},
-		} {
+		{method: http.MethodGet, path: "/api/v1/auth/logout", allow: "POST"},
+		{method: http.MethodOptions, path: "/api/v1/auth/logout", allow: "POST"},
+		{method: http.MethodOptions, path: "/api/v1/me", allow: "GET"},
+	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		rec := httptest.NewRecorder()
 
@@ -769,11 +769,11 @@ func TestTelegramCompleteRejectsInvalidMiniAppInitData(t *testing.T) {
 	}
 }
 
-func TestAppRouteUsesPublicWebsiteShell(t *testing.T) {
+func TestPublicWebsiteShellsDoNotLoadTelegramBridge(t *testing.T) {
 	now := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
 	server, _ := newTelegramAuthTestServer(t, now)
 
-	for _, path := range []string{"/", "/app"} {
+	for _, path := range []string{"/", "/incidents"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		server.ServeHTTP(rec, req)
@@ -785,19 +785,72 @@ func TestAppRouteUsesPublicWebsiteShell(t *testing.T) {
 		if !strings.Contains(body, "<title>Kontrole</title>") {
 			t.Fatalf("%s body missing updated title: %s", path, body)
 		}
-		if !strings.Contains(body, "/assets/leaflet/leaflet.js") || strings.Contains(body, "unpkg.com/leaflet") {
+		if path == "/" && (!strings.Contains(body, "/assets/leaflet/leaflet.js") || strings.Contains(body, "unpkg.com/leaflet")) {
 			t.Fatalf("%s body should load self-hosted Leaflet only: %s", path, body)
+		}
+		if path == "/incidents" && strings.Contains(body, "/assets/leaflet/leaflet.js") {
+			t.Fatalf("%s body should not load Leaflet: %s", path, body)
 		}
 		if strings.Contains(body, "telegram.org/js/telegram-login") || strings.Contains(body, "telegram-web-app.js") {
 			t.Fatalf("%s body should lazy-load Telegram scripts only after login starts: %s", path, body)
 		}
-		if !strings.Contains(body, `"mode":"public"`) {
-			t.Fatalf("%s body missing public mode: %s", path, body)
+		wantMode := `"mode":"public"`
+		if path == "/incidents" {
+			wantMode = `"mode":"public-incidents"`
 		}
-		for _, forbidden := range []string{`"spacetimeEnabled"`, `"spacetimeDirectOnly"`, `"liveTransportViewerHeartbeatEnabled"`} {
+		if !strings.Contains(body, wantMode) {
+			t.Fatalf("%s body missing %s: %s", path, wantMode, body)
+		}
+		for _, forbidden := range []string{`"telegramMiniApp"`, `"spacetimeEnabled"`, `"spacetimeDirectOnly"`, `"liveTransportViewerHeartbeatEnabled"`} {
 			if strings.Contains(body, forbidden) {
 				t.Fatalf("%s body unexpectedly exposes public write/direct config %s", path, forbidden)
 			}
+		}
+	}
+}
+
+func TestAppRouteLoadsTelegramMiniAppBridgeBeforeWebsiteApp(t *testing.T) {
+	now := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
+	server, _ := newTelegramAuthTestServer(t, now)
+
+	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/app status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "<title>Kontrole</title>") {
+		t.Fatalf("/app body missing updated title: %s", body)
+	}
+	if !strings.Contains(body, "/assets/leaflet/leaflet.js") || strings.Contains(body, "unpkg.com/leaflet") {
+		t.Fatalf("/app body should load self-hosted Leaflet only: %s", body)
+	}
+	bridgeIndex := strings.Index(body, "https://telegram.org/js/telegram-web-app.js")
+	appIndex := strings.Index(body, "/assets/app.js")
+	if bridgeIndex < 0 {
+		t.Fatalf("/app body missing Telegram WebApp bridge: %s", body)
+	}
+	if appIndex < 0 || bridgeIndex > appIndex {
+		t.Fatalf("/app should load Telegram WebApp bridge before app.js: %s", body)
+	}
+	if strings.Contains(body, "telegram.org/js/telegram-login") {
+		t.Fatalf("/app body should not eager-load Telegram Login script: %s", body)
+	}
+	if !strings.Contains(body, `"mode":"public"`) {
+		t.Fatalf("/app body missing public mode: %s", body)
+	}
+	if !strings.Contains(body, `"telegramMiniApp":true`) {
+		t.Fatalf("/app body missing Telegram Mini App shell flag: %s", body)
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src ") || !strings.Contains(csp, "https://telegram.org") {
+		t.Fatalf("/app CSP missing Telegram script source: %q", csp)
+	}
+	for _, forbidden := range []string{`"spacetimeEnabled"`, `"spacetimeDirectOnly"`, `"liveTransportViewerHeartbeatEnabled"`} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("/app body unexpectedly exposes public write/direct config %s", forbidden)
 		}
 	}
 }

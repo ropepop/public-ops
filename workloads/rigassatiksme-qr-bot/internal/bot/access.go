@@ -21,6 +21,9 @@ const (
 type AccessController interface {
 	RecordUser(ctx context.Context, req AccessRequest) (string, error)
 	AuthorizeAndConsume(ctx context.Context, req AccessRequest) (AccessDecision, error)
+	AuthorizeAndReserve(ctx context.Context, req AccessRequest, reservationID string) (AccessDecision, error)
+	CommitReservation(ctx context.Context, reservationID string) error
+	ReleaseReservation(ctx context.Context, reservationID string) error
 	Refund(ctx context.Context, req AccessRequest) error
 	HandleAdminCommand(ctx context.Context, req AccessRequest, command string, args []string) (string, bool, error)
 	AccessStatus(ctx context.Context, req AccessRequest) (string, error)
@@ -84,6 +87,7 @@ type AccessState struct {
 	Groups                map[string]AccessGroup            `json:"groups,omitempty"`
 	Chats                 map[string]AccessChat             `json:"chats,omitempty"`
 	Usage                 map[string]DailyUsage             `json:"usage,omitempty"`
+	Reservations          map[string]AccessReservation      `json:"reservations,omitempty"`
 	KnownUsers            map[string]KnownAccessUser        `json:"knownUsers,omitempty"`
 	PendingUserGrants     map[string]PendingAccessUserGrant `json:"pendingUserGrants,omitempty"`
 	UpdatedAt             string                            `json:"updatedAt,omitempty"`
@@ -119,6 +123,19 @@ type AccessChat struct {
 type DailyUsage struct {
 	Date  string `json:"date"`
 	Count int    `json:"count"`
+}
+
+type AccessReservation struct {
+	ID        string                   `json:"id"`
+	Date      string                   `json:"date"`
+	Scopes    []AccessReservationScope `json:"scopes,omitempty"`
+	CreatedAt string                   `json:"createdAt,omitempty"`
+}
+
+type AccessReservationScope struct {
+	Key   string `json:"key"`
+	Label string `json:"label,omitempty"`
+	Limit int    `json:"limit,omitempty"`
 }
 
 type KnownAccessUser struct {
@@ -169,6 +186,7 @@ func NewAccessManager(cfg AccessConfig) (*AccessManager, error) {
 			Groups:            map[string]AccessGroup{},
 			Chats:             map[string]AccessChat{},
 			Usage:             map[string]DailyUsage{},
+			Reservations:      map[string]AccessReservation{},
 			KnownUsers:        map[string]KnownAccessUser{},
 			PendingUserGrants: map[string]PendingAccessUserGrant{},
 		},
@@ -264,58 +282,9 @@ func (m *AccessManager) AuthorizeAndConsume(_ context.Context, req AccessRequest
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureMapsLocked()
-	userID := cleanID(req.UserID)
-	chatID := cleanID(req.ChatID)
-	if userID == "" {
-		return AccessDecision{Allowed: false, Reason: "not_allowed"}, nil
-	}
-	if m.state.Admins[userID] {
-		return AccessDecision{Allowed: true, Remaining: unlimitedQuota}, nil
-	}
-	user, userOK := m.state.Users[userID]
-	if !userOK || !user.Active {
-		if !m.defaultOpen {
-			return AccessDecision{Allowed: false, Reason: "not_allowed"}, nil
-		}
-		user = AccessUser{UserID: userID, Active: true, DailyLimit: 0}
-	}
-	if req.Username != "" && userOK {
-		user.Username = cleanUsername(req.Username)
-		m.state.Users[userID] = user
-	}
-	var group AccessGroup
-	groupOK := false
-	if user.Group != "" {
-		group, groupOK = m.state.Groups[cleanGroupName(user.Group)]
-		if !groupOK || !group.Active {
-			return AccessDecision{Allowed: false, Reason: "group_not_allowed"}, nil
-		}
-	}
-	var chat AccessChat
-	if isGroupChat(req.ChatType, chatID) {
-		var chatOK bool
-		chat, chatOK = m.state.Chats[chatID]
-		if !chatOK || !chat.Active {
-			return AccessDecision{Allowed: false, Reason: "chat_not_allowed"}, nil
-		}
-	}
-	scopes := m.quotaScopesLocked(user, group, groupOK, chat, day)
-	remaining := unlimitedQuota
-	for _, scope := range scopes {
-		if scope.limit < 0 {
-			continue
-		}
-		usage := m.state.Usage[scope.key]
-		if usage.Date != day {
-			usage = DailyUsage{Date: day}
-		}
-		left := scope.limit - usage.Count
-		if left <= 0 {
-			return AccessDecision{Allowed: false, Reason: scope.label + "_daily_limit", Remaining: 0}, nil
-		}
-		if remaining == unlimitedQuota || left < remaining {
-			remaining = left
-		}
+	decision, scopes := m.authorizeScopesLocked(req, day, true)
+	if !decision.Allowed {
+		return decision, nil
 	}
 	for _, scope := range scopes {
 		if scope.limit < 0 {
@@ -332,10 +301,85 @@ func (m *AccessManager) AuthorizeAndConsume(_ context.Context, req AccessRequest
 	if err := m.saveLocked(); err != nil {
 		return AccessDecision{}, err
 	}
-	if remaining > 0 {
-		remaining--
+	return decision, nil
+}
+
+func (m *AccessManager) AuthorizeAndReserve(_ context.Context, req AccessRequest, reservationID string) (AccessDecision, error) {
+	now := m.requestTime(req)
+	day := usageDay(now)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	decision, scopes := m.authorizeScopesLocked(req, day, true)
+	if !decision.Allowed {
+		return decision, nil
 	}
-	return AccessDecision{Allowed: true, Remaining: remaining}, nil
+	if len(scopes) > 0 {
+		reservationID = strings.TrimSpace(reservationID)
+		if reservationID == "" {
+			return AccessDecision{}, fmt.Errorf("reservation ID is required")
+		}
+		m.state.Reservations[reservationID] = AccessReservation{
+			ID:        reservationID,
+			Date:      day,
+			Scopes:    reservationScopes(scopes),
+			CreatedAt: nowText(now),
+		}
+	}
+	m.touchLocked(now)
+	if err := m.saveLocked(); err != nil {
+		return AccessDecision{}, err
+	}
+	return decision, nil
+}
+
+func (m *AccessManager) CommitReservation(_ context.Context, reservationID string) error {
+	reservationID = strings.TrimSpace(reservationID)
+	if reservationID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	reservation, ok := m.state.Reservations[reservationID]
+	if !ok {
+		return nil
+	}
+	day := strings.TrimSpace(reservation.Date)
+	if day == "" {
+		day = usageDay(m.requestTime(AccessRequest{}))
+	}
+	for _, reserved := range reservation.Scopes {
+		key := strings.TrimSpace(reserved.Key)
+		if key == "" || reserved.Limit < 0 {
+			continue
+		}
+		usage := m.state.Usage[key]
+		if usage.Date != day {
+			usage = DailyUsage{Date: day}
+		}
+		usage.Count++
+		m.state.Usage[key] = usage
+	}
+	delete(m.state.Reservations, reservationID)
+	m.touchLocked(m.requestTime(AccessRequest{}))
+	return m.saveLocked()
+}
+
+func (m *AccessManager) ReleaseReservation(_ context.Context, reservationID string) error {
+	reservationID = strings.TrimSpace(reservationID)
+	if reservationID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	if _, ok := m.state.Reservations[reservationID]; !ok {
+		return nil
+	}
+	delete(m.state.Reservations, reservationID)
+	m.touchLocked(m.requestTime(AccessRequest{}))
+	return m.saveLocked()
 }
 
 func (m *AccessManager) Refund(_ context.Context, req AccessRequest) error {
@@ -442,6 +486,9 @@ func (m *AccessManager) AccessStatus(_ context.Context, req AccessRequest) (stri
 			count = usage.Count
 		}
 		parts = append(parts, fmt.Sprintf("%s quota: %d/%d today", scope.label, count, scope.limit))
+		if pending := m.reservedCountLocked(scope.key, day); pending > 0 {
+			parts = append(parts, fmt.Sprintf("%s pending: %d", scope.label, pending))
+		}
 	}
 	return strings.Join(parts, ". ") + ".", nil
 }
@@ -729,6 +776,97 @@ func (m *AccessManager) knownUserByUsernameLocked(username string) (KnownAccessU
 	return KnownAccessUser{}, false
 }
 
+func (m *AccessManager) authorizeScopesLocked(req AccessRequest, day string, includeReservations bool) (AccessDecision, []quotaScope) {
+	userID := cleanID(req.UserID)
+	chatID := cleanID(req.ChatID)
+	if userID == "" {
+		return AccessDecision{Allowed: false, Reason: "not_allowed"}, nil
+	}
+	if m.state.Admins[userID] {
+		return AccessDecision{Allowed: true, Remaining: unlimitedQuota}, nil
+	}
+	user, userOK := m.state.Users[userID]
+	if !userOK || !user.Active {
+		if !m.defaultOpen {
+			return AccessDecision{Allowed: false, Reason: "not_allowed"}, nil
+		}
+		user = AccessUser{UserID: userID, Active: true, DailyLimit: 0}
+	}
+	if req.Username != "" && userOK {
+		user.Username = cleanUsername(req.Username)
+		m.state.Users[userID] = user
+	}
+	var group AccessGroup
+	groupOK := false
+	if user.Group != "" {
+		group, groupOK = m.state.Groups[cleanGroupName(user.Group)]
+		if !groupOK || !group.Active {
+			return AccessDecision{Allowed: false, Reason: "group_not_allowed"}, nil
+		}
+	}
+	var chat AccessChat
+	if isGroupChat(req.ChatType, chatID) {
+		var chatOK bool
+		chat, chatOK = m.state.Chats[chatID]
+		if !chatOK || !chat.Active {
+			return AccessDecision{Allowed: false, Reason: "chat_not_allowed"}, nil
+		}
+	}
+	scopes := m.quotaScopesLocked(user, group, groupOK, chat, day)
+	remaining := unlimitedQuota
+	for _, scope := range scopes {
+		if scope.limit < 0 {
+			continue
+		}
+		usage := m.state.Usage[scope.key]
+		if usage.Date != day {
+			usage = DailyUsage{Date: day}
+		}
+		pending := 0
+		if includeReservations {
+			pending = m.reservedCountLocked(scope.key, day)
+		}
+		left := scope.limit - usage.Count - pending
+		if left <= 0 {
+			return AccessDecision{Allowed: false, Reason: scope.label + "_daily_limit", Remaining: 0}, nil
+		}
+		if remaining == unlimitedQuota || left < remaining {
+			remaining = left
+		}
+	}
+	if remaining > 0 {
+		remaining--
+	}
+	return AccessDecision{Allowed: true, Remaining: remaining}, scopes
+}
+
+func reservationScopes(scopes []quotaScope) []AccessReservationScope {
+	out := make([]AccessReservationScope, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope.key == "" {
+			continue
+		}
+		out = append(out, AccessReservationScope{Key: scope.key, Label: scope.label, Limit: scope.limit})
+	}
+	return out
+}
+
+func (m *AccessManager) reservedCountLocked(scopeKey string, day string) int {
+	count := 0
+	for _, reservation := range m.state.Reservations {
+		if reservation.Date != day {
+			continue
+		}
+		for _, scope := range reservation.Scopes {
+			if scope.Key == scopeKey {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
 func (m *AccessManager) quotaScopesLocked(user AccessUser, group AccessGroup, groupOK bool, chat AccessChat, day string) []quotaScope {
 	_ = day
 	scopes := []quotaScope{}
@@ -772,6 +910,9 @@ func (m *AccessManager) ensureMapsLocked() {
 	}
 	if m.state.Usage == nil {
 		m.state.Usage = map[string]DailyUsage{}
+	}
+	if m.state.Reservations == nil {
+		m.state.Reservations = map[string]AccessReservation{}
 	}
 	if m.state.KnownUsers == nil {
 		m.state.KnownUsers = map[string]KnownAccessUser{}

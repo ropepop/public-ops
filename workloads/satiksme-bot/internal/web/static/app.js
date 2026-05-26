@@ -203,6 +203,14 @@
     return String(initData || "").trim();
   }
 
+  function telegramMiniAppShell() {
+    return config.telegramMiniApp === true || String(config.telegramMiniApp || "").toLowerCase() === "true";
+  }
+
+  function telegramMiniAppAuthPending() {
+    return telegramMiniAppShell() && !!telegramMiniAppInitData() && !state.authenticated && state.authState !== "authenticated";
+  }
+
   function notifyTelegramMiniAppReady() {
     var webApp = telegramWebApp();
     if (!webApp || typeof webApp.ready !== "function") {
@@ -3068,6 +3076,9 @@
     if (state.authenticated) {
       return '<button class="action action-secondary action-compact" data-action="logout">Izrakstīties</button>';
     }
+    if (state.authInProgress && telegramMiniAppAuthPending()) {
+      return '<button class="action action-secondary action-compact" disabled>Savienojam Telegram sesiju…</button>';
+    }
     return '<button class="action action-primary action-compact" data-action="telegram-login">Pieslēgties ar Telegram</button>';
   }
 
@@ -3152,6 +3163,9 @@
   function readyStatusText() {
     var mode = String(config.mode || "public");
     if (state.authInProgress) {
+      if (telegramMiniAppAuthPending()) {
+        return "Savienojam Telegram sesiju…";
+      }
       return "Atveram Telegram pieslēgšanos…";
     }
     if (state.authFeedback && state.authFeedback.message) {
@@ -3395,6 +3409,15 @@
     }
   }
 
+  function prepareInitialAuthControls() {
+    if (telegramMiniAppAuthPending()) {
+      startAuthFeedback();
+      return;
+    }
+    renderAuthControls();
+    setStatus(readyStatusText());
+  }
+
   function boot() {
     if (!root.document || !document.getElementById) {
       return;
@@ -3424,8 +3447,7 @@
       syncIncidentLayoutState();
       bindActions();
       restoreAuthFeedbackFromURL();
-      renderAuthControls();
-      setStatus(readyStatusText());
+      prepareInitialAuthControls();
       syncLoadingIndicators();
       Promise.resolve()
         .then(function () {
@@ -3468,8 +3490,7 @@
     initMap();
     bindActions();
     restoreAuthFeedbackFromURL();
-    renderAuthControls();
-    setStatus(readyStatusText());
+    prepareInitialAuthControls();
     syncLoadingIndicators();
     Promise.resolve()
       .then(function () {

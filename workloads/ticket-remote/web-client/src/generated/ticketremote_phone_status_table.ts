@@ -10,9 +10,13 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export const params = {
+export default __t.row({
+  id: __t.string().primaryKey(),
   ticketId: __t.string(),
-  sessionId: __t.string(),
-  now: __t.string(),
-};
-export const returnType = __t.string()
+  backendId: __t.string(),
+  attachName: __t.string(),
+  desiredState: __t.string(),
+  streamState: __t.string(),
+  lastSeenAt: __t.string(),
+  updatedAt: __t.string(),
+});

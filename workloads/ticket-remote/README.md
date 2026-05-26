@@ -17,7 +17,7 @@ TICKET_REMOTE_AUTH_MODE=dev make run
 ## Runtime Model
 
 - General mode: linked users can view the ViVi ticket stream together.
-- Control-code requests: a linked user enters 2-8 digits in the webpage, `ticket_remote` queues the request, the phone automates ViVi, and only the requester receives the captured result until they close it, replace it, refresh/sign out, or the service loses in-memory state.
+- Control-code requests: a linked user enters 2-8 digits in the webpage, `ticket_remote` queues the request, the phone automates ViVi, and the requester browser freezes a stable stream-resolution live frame to capture the result locally. Pixel must not send ViVi result screenshot bytes to the browser.
 - A requester can submit at most two code requests per rolling minute. A second successful request replaces the visible result on that user's page.
 - Other viewers stay connected to the shared raw ticket stream. They may briefly see the real phone open and close ViVi's control-code UI, but they never receive direct control.
 - Browser users connect directly to SpacetimeDB for authenticated ticket state, while code-request actions go through `ticket_remote`.

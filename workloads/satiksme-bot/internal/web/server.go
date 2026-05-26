@@ -77,13 +77,14 @@ type Server struct {
 }
 
 type pageData struct {
-	AppCSSURL       string
-	AppJSURL        string
-	LeafletCSSURL   string
-	LeafletJSURL    string
-	LiveClientJSURL string
-	ConfigJS        template.JS
-	ScriptNonce     string
+	AppCSSURL           string
+	AppJSURL            string
+	LeafletCSSURL       string
+	LeafletJSURL        string
+	LiveClientJSURL     string
+	TelegramWebAppJSURL string
+	ConfigJS            template.JS
+	ScriptNonce         string
 }
 
 func NewServer(
@@ -138,6 +139,7 @@ func NewServer(
   <script data-cfasync="false" nonce="{{.ScriptNonce}}">window.SATIKSME_APP_CONFIG = {{.ConfigJS}};</script>
   {{if .LeafletJSURL}}<script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>{{end}}
   {{if .LiveClientJSURL}}<script data-cfasync="false" defer src="{{.LiveClientJSURL}}"></script>{{end}}
+  {{if .TelegramWebAppJSURL}}<script data-cfasync="false" src="{{.TelegramWebAppJSURL}}"></script>{{end}}
   <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
 </head>
 <body>
@@ -297,7 +299,7 @@ func (s *Server) AppURL() string {
 	if !s.cfg.SatiksmeWebEnabled {
 		return ""
 	}
-	return strings.TrimRight(s.cfg.SatiksmeWebPublicBaseURL, "/")
+	return strings.TrimRight(s.cfg.SatiksmeWebPublicBaseURL, "/") + "/app"
 }
 
 func (s *Server) PublicURL() string {
@@ -371,13 +373,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleSpacetimeJWKS(w, r)
 	case path == basePath || path == "":
-		s.serveShellPage(w, r, "public")
+		s.serveShellPage(w, r, "public", false)
 	case path == basePath+"/incidents":
-		s.serveShellPage(w, r, "public-incidents")
+		s.serveShellPage(w, r, "public-incidents", false)
 	case path == basePath+"/-incidents":
-		s.serveShellPage(w, r, "public-incidents")
+		s.serveShellPage(w, r, "public-incidents", false)
 	case path == basePath+"/app":
-		s.serveShellPage(w, r, "public")
+		s.serveShellPage(w, r, "public", true)
 	case path == basePath+"/bundles/active.json":
 		s.serveBundleActive(w, r)
 	case strings.HasPrefix(path, basePath+"/bundles/"):
@@ -420,7 +422,7 @@ func (s *Server) serveRobotsTxt(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("User-agent: *\nDisallow: /\n"))
 }
 
-func (s *Server) serveShell(w http.ResponseWriter, mode string) {
+func (s *Server) serveShell(w http.ResponseWriter, mode string, telegramMiniApp bool) {
 	s.setNoStoreHeaders(w)
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	s.setNoIndexHeaders(w)
@@ -429,7 +431,7 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 		writeError(w, http.StatusInternalServerError, "failed to prepare page")
 		return
 	}
-	s.setShellSecurityHeaders(w, scriptNonce)
+	s.setShellSecurityHeaders(w, scriptNonce, telegramMiniApp)
 	basePath := strings.TrimRight(s.pathPrefix, "/")
 	bundleActiveURL := basePath + "/bundles/active.json"
 	if s.bundleStore == nil {
@@ -457,6 +459,9 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 	if liveSnapshotLookupEnabled {
 		cfg["liveTransportSnapshotLookupEnabled"] = liveSnapshotLookupEnabled
 	}
+	if telegramMiniApp {
+		cfg["telegramMiniApp"] = true
+	}
 	if s.browserLiveViewerHeartbeatEnabled() {
 		cfg["liveTransportViewerHeartbeatEnabled"] = true
 		cfg["liveTransportViewerHeartbeatURL"] = basePath + "/api/v1/public/live-viewer"
@@ -472,23 +477,28 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string) {
 		leafletCSSURL = s.release.AssetURL(basePath, "leaflet/leaflet.css")
 		leafletJSURL = s.release.AssetURL(basePath, "leaflet/leaflet.js")
 	}
+	telegramWebAppJSURL := ""
+	if telegramMiniApp {
+		telegramWebAppJSURL = "https://telegram.org/js/telegram-web-app.js"
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = s.pageTemplate.Execute(w, pageData{
-		AppCSSURL:       s.release.AssetURL(basePath, "app.css"),
-		AppJSURL:        s.release.AssetURL(basePath, "app.js"),
-		LeafletCSSURL:   leafletCSSURL,
-		LeafletJSURL:    leafletJSURL,
-		LiveClientJSURL: liveClientURL,
-		ConfigJS:        template.JS(raw),
-		ScriptNonce:     scriptNonce,
+		AppCSSURL:           s.release.AssetURL(basePath, "app.css"),
+		AppJSURL:            s.release.AssetURL(basePath, "app.js"),
+		LeafletCSSURL:       leafletCSSURL,
+		LeafletJSURL:        leafletJSURL,
+		LiveClientJSURL:     liveClientURL,
+		TelegramWebAppJSURL: telegramWebAppJSURL,
+		ConfigJS:            template.JS(raw),
+		ScriptNonce:         scriptNonce,
 	})
 }
 
-func (s *Server) serveShellPage(w http.ResponseWriter, r *http.Request, mode string) {
+func (s *Server) serveShellPage(w http.ResponseWriter, r *http.Request, mode string, telegramMiniApp bool) {
 	if !allowMethods(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	s.serveShell(w, mode)
+	s.serveShell(w, mode, telegramMiniApp)
 }
 
 func (s *Server) browserSpacetimeConfigured() bool {
@@ -2096,15 +2106,15 @@ func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	h.Set("Permissions-Policy", "geolocation=(self), camera=(), microphone=(), payment=(), usb=(), fullscreen=(self)")
-	h.Set("Content-Security-Policy", s.contentSecurityPolicy(""))
+	h.Set("Content-Security-Policy", s.contentSecurityPolicy("", false))
 }
 
-func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string) {
+func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string, allowTelegramWebApp bool) {
 	s.setSecurityHeaders(w)
-	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce))
+	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce, allowTelegramWebApp))
 }
 
-func (s *Server) contentSecurityPolicy(scriptNonce string) string {
+func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramWebApp bool) string {
 	connectSources := []string{"'self'"}
 	if s.browserDirectDataEnabled() {
 		addCSPConnectSources(&connectSources, s.cfg.SatiksmeWebSpacetimeHost)
@@ -2114,6 +2124,9 @@ func (s *Server) contentSecurityPolicy(scriptNonce string) string {
 		scriptSources = append(scriptSources, "'nonce-"+strings.TrimSpace(scriptNonce)+"'")
 	}
 	scriptSources = append(scriptSources, "https://oauth.telegram.org")
+	if allowTelegramWebApp {
+		scriptSources = append(scriptSources, "https://telegram.org")
+	}
 	return strings.Join([]string{
 		"default-src 'self'",
 		"base-uri 'self'",

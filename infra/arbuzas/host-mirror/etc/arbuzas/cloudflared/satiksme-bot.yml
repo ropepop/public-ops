@@ -1,0 +1,6 @@
+tunnel: 323aab3e-6fa4-4a1c-9910-ef20bd414a52
+credentials-file: /etc/arbuzas/cloudflared/satiksme-bot.json
+ingress:
+  - hostname: satiksme-bot.jolkins.id.lv
+    service: http://127.0.0.1:9327
+  - service: http_status:404

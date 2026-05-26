@@ -1,0 +1,34 @@
+{
+  "identities": [
+    {
+      "createdEpochSeconds": 1772414759,
+      "dotLabel": "z48gj9gn4nki6v26b013",
+      "expiresEpochSeconds": null,
+      "id": "iphone-adj",
+      "token": "2873efbe2015ac05e3ef64a29940af55117a91172caa0b56"
+    },
+    {
+      "createdEpochSeconds": 1773257096,
+      "dotLabel": "bd5ulklt4lay3f8ulpcx",
+      "expiresEpochSeconds": null,
+      "id": "povilas",
+      "token": "AEs5UQUQaoTxbdwTaEXrW4SmZnhE1eTT99WeYbwJgNO"
+    },
+    {
+      "createdEpochSeconds": 1776203748,
+      "dotLabel": "f0f3t0ukotx4pmu0xhry",
+      "expiresEpochSeconds": null,
+      "id": "mbp-adj",
+      "token": "mAEfNogYCjvFXdn7Xw6WvQWLy-~.DvA5q2.VIJHy5U~ZtsHi"
+    },
+    {
+      "createdEpochSeconds": 1776209504,
+      "dotLabel": "ef5ayu3v7dkul3dzzxn0",
+      "expiresEpochSeconds": null,
+      "id": "pc-adj",
+      "token": "IbxIlU4ZubV3TW8O9rheFX5GSHJoefxIWnM8o4j.hKmVjve."
+    }
+  ],
+  "primaryIdentityId": "iphone-adj",
+  "schema": 1
+}

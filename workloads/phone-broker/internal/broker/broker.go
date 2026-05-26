@@ -48,7 +48,7 @@ const (
 	defaultTicketLeaseTTL     = 45 * time.Second
 	minTicketLeaseTTL         = 3 * time.Second
 	maxTicketLeaseTTL         = 3 * time.Minute
-	maxRecoverableJobAttempts = 3
+	maxRecoverableJobAttempts = 2
 
 	controlCodeHealthPollInterval   = 250 * time.Millisecond
 	controlCodeDisconnectResultWait = 12 * time.Second
@@ -823,7 +823,7 @@ func (b *Broker) selectRigasSatiksmeBatchLocked(now time.Time) []QRJob {
 
 func (b *Broker) runQRBatch(runCtx context.Context, jobs []QRJob, cancel context.CancelFunc) {
 	defer cancel()
-	ctx, timeoutCancel := context.WithTimeout(runCtx, b.cfg.JobTimeout)
+	ctx, timeoutCancel := context.WithTimeout(runCtx, b.qrBatchTimeout(len(jobs)))
 	defer timeoutCancel()
 
 	conn, err := b.openQRPhoneBatchControl(ctx, jobs)
@@ -960,6 +960,13 @@ func (b *Broker) runQRBatch(runCtx context.Context, jobs []QRJob, cancel context
 			readDone = startPhoneRead(readConn)
 		}
 	}
+}
+
+func (b *Broker) qrBatchTimeout(jobCount int) time.Duration {
+	if jobCount <= 1 {
+		return b.cfg.JobTimeout
+	}
+	return b.cfg.JobTimeout * time.Duration(jobCount)
 }
 
 func (b *Broker) currentRunningBatchID() string {

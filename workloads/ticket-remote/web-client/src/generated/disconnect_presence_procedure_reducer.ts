@@ -10,9 +10,8 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export default __t.row({
-  id: __t.string().primaryKey(),
+export default {
   ticketId: __t.string(),
-  stateJson: __t.string(),
-  updatedAt: __t.string(),
-});
+  sessionId: __t.string(),
+  now: __t.string(),
+};
