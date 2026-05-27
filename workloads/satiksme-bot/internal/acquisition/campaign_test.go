@@ -59,25 +59,40 @@ func TestSelectDailyBatchSkipsUsersAlreadyHandled(t *testing.T) {
 	}
 }
 
-func TestDraftFirstContactMatchesLanguageAndDoesNotRevealInternalAccounts(t *testing.T) {
-	candidate := Candidate{
-		UserID:   1,
-		Username: "target",
-		Language: "ru",
-		Source:   SourceRecentActive,
-	}
+func TestDraftFirstContactMentionsBotGroupAndMatchesLanguage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		language string
+		want     []string
+		forbid   []string
+	}{
+		{
+			name:     "latvian",
+			language: "lv",
+			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5 ciparu", "QR", "4"},
+			forbid:   []string{"Привет", "aldajo", "owner", "api", "session"},
+		},
+		{
+			name:     "russian",
+			language: "ru",
+			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5-знач", "QR", "4"},
+			forbid:   []string{"Čau", "aldajo", "owner", "api", "session"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			draft := DraftFirstContact(Candidate{UserID: 1, Username: "target", Language: tc.language, Source: SourceRecentActive}, DraftOptions{DailyRegistrations: 4, GroupName: "Rīgas Zaķi"})
 
-	draft := DraftFirstContact(candidate, DraftOptions{DailyRegistrations: 4, GroupName: "Rīgas Zaķi"})
-
-	for _, want := range []string{"Rīgas Zaķi", "4", "бесплат"} {
-		if !strings.Contains(strings.ToLower(draft.Text), strings.ToLower(want)) {
-			t.Fatalf("draft %q does not contain %q", draft.Text, want)
-		}
-	}
-	for _, forbidden := range []string{"aldajo", "owner", "api", "session"} {
-		if strings.Contains(strings.ToLower(draft.Text), forbidden) {
-			t.Fatalf("draft %q leaked forbidden term %q", draft.Text, forbidden)
-		}
+			for _, want := range tc.want {
+				if !strings.Contains(strings.ToLower(draft.Text), strings.ToLower(want)) {
+					t.Fatalf("draft %q does not contain %q", draft.Text, want)
+				}
+			}
+			for _, forbidden := range tc.forbid {
+				if strings.Contains(strings.ToLower(draft.Text), strings.ToLower(forbidden)) {
+					t.Fatalf("draft %q contains forbidden term %q", draft.Text, forbidden)
+				}
+			}
+		})
 	}
 }
 

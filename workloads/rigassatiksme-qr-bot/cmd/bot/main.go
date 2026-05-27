@@ -24,17 +24,7 @@ func main() {
 	defer cancel()
 
 	tg := telegram.NewClient(cfg.BotToken, cfg.HTTPTimeout)
-	if err := tg.SetMyCommands(ctx, []telegram.BotCommand{
-		{Command: "start", Description: "How to request a QR image"},
-		{Command: "help", Description: "Show QR bot help"},
-		{Command: "qr", Description: "Request QR image: /qr 12345"},
-		{Command: "status", Description: "Check your latest QR request"},
-		{Command: "cancel", Description: "Cancel your latest QR request"},
-		{Command: "access", Description: "Check ticket access and quota"},
-		{Command: "admin", Description: "Show admin access commands"},
-	}); err != nil {
-		log.Printf("set bot commands failed: %v", err)
-	}
+	registerBotCommands(ctx, tg)
 
 	access, err := buildAccessManager(cfg, telegramUsernameResolver{client: tg})
 	if err != nil {
@@ -47,6 +37,43 @@ func main() {
 	)
 	log.Printf("rigassatiksme QR bot started")
 	runLongPoll(ctx, tg, service, cfg.LongPollTimeout)
+}
+
+type botCommandSetter interface {
+	SetMyCommands(ctx context.Context, commands []telegram.BotCommand) error
+	SetMyCommandsForLanguage(ctx context.Context, commands []telegram.BotCommand, languageCode string) error
+}
+
+func registerBotCommands(ctx context.Context, tg botCommandSetter) {
+	if err := tg.SetMyCommands(ctx, localizedBotCommands("lv")); err != nil {
+		log.Printf("set Latvian bot commands failed: %v", err)
+	}
+	if err := tg.SetMyCommandsForLanguage(ctx, localizedBotCommands("ru"), "ru"); err != nil {
+		log.Printf("set Russian bot commands failed: %v", err)
+	}
+}
+
+func localizedBotCommands(language string) []telegram.BotCommand {
+	if strings.ToLower(strings.TrimSpace(language)) == "ru" {
+		return []telegram.BotCommand{
+			{Command: "start", Description: "Начать и показать помощь"},
+			{Command: "help", Description: "Показать помощь"},
+			{Command: "qr", Description: "Запросить QR изображение: /qr 12345"},
+			{Command: "status", Description: "Проверить последний QR-запрос"},
+			{Command: "cancel", Description: "Отменить последний QR-запрос"},
+			{Command: "access", Description: "Проверить доступ и лимит"},
+			{Command: "admin", Description: "Команды доступа для администратора"},
+		}
+	}
+	return []telegram.BotCommand{
+		{Command: "start", Description: "Sākt un parādīt palīdzību"},
+		{Command: "help", Description: "Parādīt palīdzību"},
+		{Command: "qr", Description: "Pieprasīt QR attēlu: /qr 12345"},
+		{Command: "status", Description: "Pārbaudīt pēdējo QR pieprasījumu"},
+		{Command: "cancel", Description: "Atcelt pēdējo QR pieprasījumu"},
+		{Command: "access", Description: "Pārbaudīt piekļuvi un limitu"},
+		{Command: "admin", Description: "Administratora piekļuves komandas"},
+	}
 }
 
 type config struct {
@@ -192,6 +219,15 @@ func runLongPoll(ctx context.Context, tg *telegram.Client, service *bot.Service,
 			if update.UpdateID >= offset {
 				offset = update.UpdateID + 1
 			}
+			if update.CallbackQuery != nil && update.CallbackQuery.From != nil {
+				if err := service.HandleCallback(ctx, botCallbackFromTelegram(update.CallbackQuery)); err != nil {
+					log.Printf("handle callback failed: %v", err)
+				}
+				if err := tg.AnswerCallbackQuery(ctx, update.CallbackQuery.ID); err != nil {
+					log.Printf("answer callback failed: %v", err)
+				}
+				continue
+			}
 			if update.Message == nil || update.Message.From == nil {
 				continue
 			}
@@ -218,6 +254,24 @@ func botMessageFromTelegram(message *telegram.Message) bot.Message {
 	}
 	msg.MentionedUsers = mentionedUsersFromTelegram(message.Entities)
 	return msg
+}
+
+func botCallbackFromTelegram(callback *telegram.CallbackQuery) bot.Callback {
+	if callback == nil {
+		return bot.Callback{}
+	}
+	out := bot.Callback{Data: callback.Data}
+	if callback.From != nil {
+		out.UserID = callback.From.ID
+		out.Username = callback.From.Username
+		out.ChatID = callback.From.ID
+		out.ChatType = "private"
+	}
+	if callback.Message != nil {
+		out.ChatID = callback.Message.Chat.ID
+		out.ChatType = callback.Message.Chat.Type
+	}
+	return out
 }
 
 func mentionedUsersFromTelegram(entities []telegram.MessageEntity) []bot.MentionedUser {

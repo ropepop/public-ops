@@ -193,12 +193,15 @@ services:
       RS_ACQUISITION_SENDER_SESSION_FILE: /srv/satiksme-bot/state/rs-acquisition/iamhdzs.session
       RS_ACQUISITION_SOURCE_SESSION_FILE: /srv/satiksme-bot/state/chat-analyzer.session
       RS_ACQUISITION_EXPECT_SENDER: iamhdzs
+      RS_ACQUISITION_ADMIN_MODE: ${RS_ACQUISITION_ADMIN_MODE:-mtproto}
+      RS_ACQUISITION_ADMIN_USERNAME: ${RS_ACQUISITION_ADMIN_USERNAME:-aldajo}
       RS_ACQUISITION_TIMEZONE: Europe/Riga
       RS_ACQUISITION_DAILY_LIMIT: "10"
       RS_ACQUISITION_DAILY_REGISTRATIONS: "4"
       RS_ACQUISITION_GROUP_NAME: Rīgas Zaķi
       RS_ACQUISITION_POLL_INTERVAL: 1m
       RS_ACQUISITION_INCLUDE_MEMBERS: ${RS_ACQUISITION_INCLUDE_MEMBERS:-false}
+      RS_ACQUISITION_GRANT_BOT_USERNAME: ${RS_ACQUISITION_GRANT_BOT_USERNAME:-rs_bilete_bot}
     command:
       - /bin/sh
       - -lc
@@ -211,12 +214,15 @@ services:
         export RS_ACQUISITION_SENDER_SESSION_FILE="$${RS_ACQUISITION_SENDER_SESSION_FILE:-/srv/satiksme-bot/state/rs-acquisition/iamhdzs.session}"
         export RS_ACQUISITION_SOURCE_SESSION_FILE="$${RS_ACQUISITION_SOURCE_SESSION_FILE:-/srv/satiksme-bot/state/chat-analyzer.session}"
         export RS_ACQUISITION_EXPECT_SENDER="$${RS_ACQUISITION_EXPECT_SENDER:-iamhdzs}"
+        export RS_ACQUISITION_ADMIN_MODE="$${RS_ACQUISITION_ADMIN_MODE:-mtproto}"
+        export RS_ACQUISITION_ADMIN_USERNAME="$${RS_ACQUISITION_ADMIN_USERNAME:-aldajo}"
         export RS_ACQUISITION_TIMEZONE="$${RS_ACQUISITION_TIMEZONE:-Europe/Riga}"
         export RS_ACQUISITION_DAILY_LIMIT="$${RS_ACQUISITION_DAILY_LIMIT:-10}"
         export RS_ACQUISITION_DAILY_REGISTRATIONS="$${RS_ACQUISITION_DAILY_REGISTRATIONS:-4}"
         export RS_ACQUISITION_GROUP_NAME="$${RS_ACQUISITION_GROUP_NAME:-Rīgas Zaķi}"
         export RS_ACQUISITION_POLL_INTERVAL="$${RS_ACQUISITION_POLL_INTERVAL:-1m}"
         export RS_ACQUISITION_INCLUDE_MEMBERS="$${RS_ACQUISITION_INCLUDE_MEMBERS:-false}"
+        export RS_ACQUISITION_GRANT_BOT_USERNAME="$${RS_ACQUISITION_GRANT_BOT_USERNAME:-rs_bilete_bot}"
         mkdir -p /srv/satiksme-bot/state/rs-acquisition
         if [ "$${RS_ACQUISITION_ENABLED}" != "true" ]; then
           echo "RS acquisition daemon disabled; set RS_ACQUISITION_ENABLED=true to run."

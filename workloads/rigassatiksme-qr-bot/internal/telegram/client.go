@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"rigassatiksmeqrbot/internal/bot"
 )
 
 type Client struct {
@@ -32,8 +34,9 @@ func NewClient(token string, timeout time.Duration) *Client {
 }
 
 type Update struct {
-	UpdateID int64    `json:"update_id"`
-	Message  *Message `json:"message,omitempty"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message,omitempty"`
+	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
 }
 
 type Message struct {
@@ -64,6 +67,13 @@ type Chat struct {
 	ID       int64  `json:"id"`
 	Type     string `json:"type"`
 	Username string `json:"username,omitempty"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    *User    `json:"from,omitempty"`
+	Message *Message `json:"message,omitempty"`
+	Data    string   `json:"data,omitempty"`
 }
 
 type BotCommand struct {
@@ -108,6 +118,30 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]U
 
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
 	return c.postJSON(ctx, "/sendMessage", map[string]any{"chat_id": chatID, "text": text})
+}
+
+func (c *Client) SendMessageWithButtons(ctx context.Context, chatID int64, text string, buttons [][]bot.InlineButton) error {
+	keyboard := make([][]map[string]string, 0, len(buttons))
+	for _, row := range buttons {
+		outRow := make([]map[string]string, 0, len(row))
+		for _, button := range row {
+			if strings.TrimSpace(button.Text) == "" || strings.TrimSpace(button.Data) == "" {
+				continue
+			}
+			outRow = append(outRow, map[string]string{
+				"text":          button.Text,
+				"callback_data": button.Data,
+			})
+		}
+		if len(outRow) > 0 {
+			keyboard = append(keyboard, outRow)
+		}
+	}
+	payload := map[string]any{"chat_id": chatID, "text": text}
+	if len(keyboard) > 0 {
+		payload["reply_markup"] = map[string]any{"inline_keyboard": keyboard}
+	}
+	return c.postJSON(ctx, "/sendMessage", payload)
 }
 
 func (c *Client) SendPhoto(ctx context.Context, chatID int64, image []byte, mime string, caption string) error {
@@ -162,7 +196,23 @@ func (c *Client) SendPhoto(ctx context.Context, chatID int64, image []byte, mime
 }
 
 func (c *Client) SetMyCommands(ctx context.Context, commands []BotCommand) error {
-	return c.postJSON(ctx, "/setMyCommands", map[string]any{"commands": commands})
+	return c.SetMyCommandsForLanguage(ctx, commands, "")
+}
+
+func (c *Client) SetMyCommandsForLanguage(ctx context.Context, commands []BotCommand, languageCode string) error {
+	payload := map[string]any{"commands": commands}
+	if strings.TrimSpace(languageCode) != "" {
+		payload["language_code"] = strings.TrimSpace(languageCode)
+	}
+	return c.postJSON(ctx, "/setMyCommands", payload)
+}
+
+func (c *Client) AnswerCallbackQuery(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	return c.postJSON(ctx, "/answerCallbackQuery", map[string]any{"callback_query_id": id})
 }
 
 func (c *Client) GetChat(ctx context.Context, chatID string) (Chat, error) {

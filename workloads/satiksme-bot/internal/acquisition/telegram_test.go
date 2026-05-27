@@ -40,6 +40,32 @@ func TestCandidatesFromHistoryKeepsRecentUserMetadata(t *testing.T) {
 	}
 }
 
+func TestCandidatesFromHistoryUsesMessageLanguageOverProfileLanguage(t *testing.T) {
+	messageTime := time.Date(2026, 5, 26, 7, 30, 0, 0, time.UTC)
+	result := &tg.MessagesMessages{
+		Messages: []tg.MessageClass{
+			&tg.Message{
+				ID:      10,
+				Date:    int(messageTime.Unix()),
+				FromID:  &tg.PeerUser{UserID: 42},
+				Message: "kur ir kontrole?",
+			},
+		},
+		Users: []tg.UserClass{
+			&tg.User{ID: 42, AccessHash: 777, Username: "target", FirstName: "Anna", LangCode: "ru"},
+		},
+	}
+
+	candidates := CandidatesFromHistory(result, SourceRecentActive)
+
+	if len(candidates) != 1 {
+		t.Fatalf("len(candidates) = %d, want 1", len(candidates))
+	}
+	if candidates[0].Language != "lv" {
+		t.Fatalf("candidate language = %q, want lv from message text", candidates[0].Language)
+	}
+}
+
 func TestCandidatesFromUsersSkipsBotsDeletedAndSelf(t *testing.T) {
 	now := time.Date(2026, 5, 26, 7, 30, 0, 0, time.UTC)
 	candidates := CandidatesFromUsers([]tg.UserClass{
@@ -54,5 +80,8 @@ func TestCandidatesFromUsersSkipsBotsDeletedAndSelf(t *testing.T) {
 	}
 	if candidates[0].UserID != 1 || candidates[0].Source != SourceMemberList {
 		t.Fatalf("candidate = %+v, want real member-list user", candidates[0])
+	}
+	if candidates[0].Language != "lv" {
+		t.Fatalf("member-list candidate language = %q, want lv default without message sample", candidates[0].Language)
 	}
 }

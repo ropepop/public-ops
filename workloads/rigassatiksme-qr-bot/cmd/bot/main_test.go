@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,34 @@ func TestBotMessageFromTelegramCapturesTextMentionUserIDs(t *testing.T) {
 	}
 }
 
+func TestRegisterBotCommandsSetsLatvianDefaultAndRussianVariant(t *testing.T) {
+	setter := &fakeCommandSetter{}
+
+	registerBotCommands(context.Background(), setter)
+
+	if len(setter.calls) != 2 {
+		t.Fatalf("command calls = %d, want 2", len(setter.calls))
+	}
+	if setter.calls[0].language != "" {
+		t.Fatalf("default command language = %q, want empty", setter.calls[0].language)
+	}
+	if !commandDescriptionsContain(setter.calls[0].commands, "palīdzību") {
+		t.Fatalf("default commands should be Latvian: %#v", setter.calls[0].commands)
+	}
+	if commandDescriptionsContain(setter.calls[0].commands, "How to request") {
+		t.Fatalf("default commands still contain English: %#v", setter.calls[0].commands)
+	}
+	if setter.calls[1].language != "ru" {
+		t.Fatalf("second command language = %q, want ru", setter.calls[1].language)
+	}
+	if !commandDescriptionsContain(setter.calls[1].commands, "помощь") {
+		t.Fatalf("russian commands should be Russian: %#v", setter.calls[1].commands)
+	}
+	if commandDescriptionsContain(setter.calls[1].commands, "Show QR") {
+		t.Fatalf("russian commands still contain English: %#v", setter.calls[1].commands)
+	}
+}
+
 type fakeChatGetter struct {
 	chatID string
 	chat   telegram.Chat
@@ -86,4 +115,33 @@ func (g *fakeChatGetter) GetChat(ctx context.Context, chatID string) (telegram.C
 		return telegram.Chat{}, g.err
 	}
 	return g.chat, nil
+}
+
+type commandCall struct {
+	language string
+	commands []telegram.BotCommand
+}
+
+type fakeCommandSetter struct {
+	calls []commandCall
+}
+
+func (s *fakeCommandSetter) SetMyCommands(ctx context.Context, commands []telegram.BotCommand) error {
+	s.calls = append(s.calls, commandCall{commands: append([]telegram.BotCommand(nil), commands...)})
+	return nil
+}
+
+func (s *fakeCommandSetter) SetMyCommandsForLanguage(ctx context.Context, commands []telegram.BotCommand, languageCode string) error {
+	s.calls = append(s.calls, commandCall{language: languageCode, commands: append([]telegram.BotCommand(nil), commands...)})
+	return nil
+}
+
+func commandDescriptionsContain(commands []telegram.BotCommand, value string) bool {
+	value = strings.ToLower(value)
+	for _, command := range commands {
+		if strings.Contains(strings.ToLower(command.Description), value) {
+			return true
+		}
+	}
+	return false
 }

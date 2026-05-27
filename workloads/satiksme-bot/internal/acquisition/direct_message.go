@@ -31,6 +31,11 @@ type DirectTestMessageResult struct {
 	Sent           bool   `json:"sent"`
 }
 
+type SenderInfo struct {
+	UserID   int64  `json:"userId"`
+	Username string `json:"username"`
+}
+
 type MTProtoOutreachConfig struct {
 	APIID       int
 	APIHash     string
@@ -46,16 +51,21 @@ func NewMTProtoOutreach(cfg MTProtoOutreachConfig) *MTProtoOutreach {
 }
 
 func (m *MTProtoOutreach) SenderUsername(ctx context.Context) (string, error) {
-	var username string
+	info, err := m.SenderInfo(ctx)
+	return info.Username, err
+}
+
+func (m *MTProtoOutreach) SenderInfo(ctx context.Context) (SenderInfo, error) {
+	var info SenderInfo
 	err := m.run(ctx, func(ctx context.Context, client *telegram.Client) error {
 		user, err := selfUser(ctx, client.API())
 		if err != nil {
 			return err
 		}
-		username = cleanUsername(user.Username)
+		info = SenderInfo{UserID: user.ID, Username: cleanUsername(user.Username)}
 		return nil
 	})
-	return username, err
+	return info, err
 }
 
 func (m *MTProtoOutreach) SendDirect(ctx context.Context, candidate Candidate, text string) error {
@@ -72,6 +82,58 @@ func (m *MTProtoOutreach) SendDirect(ctx context.Context, candidate Candidate, t
 	})
 }
 
+func (m *MTProtoOutreach) SendUsernameMessage(ctx context.Context, username string, text string) error {
+	username = cleanUsername(username)
+	if username == "" {
+		return fmt.Errorf("target username is required")
+	}
+	message := strings.TrimSpace(text)
+	if message == "" {
+		return fmt.Errorf("message is required")
+	}
+	return m.run(ctx, func(ctx context.Context, client *telegram.Client) error {
+		user, err := resolveUserByUsernameWithOptions(ctx, client.API(), username, resolveUserOptions{AllowBot: true})
+		if err != nil {
+			return err
+		}
+		return client.SendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:      &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash},
+			Message:   message,
+			NoWebpage: true,
+		})
+	})
+}
+
+type MTProtoGrantGatewayConfig struct {
+	APIID       int
+	APIHash     string
+	SessionFile string
+	BotUsername string
+}
+
+type MTProtoGrantGateway struct {
+	outreach    *MTProtoOutreach
+	botUsername string
+}
+
+func NewMTProtoGrantGateway(cfg MTProtoGrantGatewayConfig) (*MTProtoGrantGateway, error) {
+	botUsername := cleanUsername(cfg.BotUsername)
+	if botUsername == "" {
+		return nil, fmt.Errorf("grant bot username is required")
+	}
+	return &MTProtoGrantGateway{
+		outreach:    NewMTProtoOutreach(MTProtoOutreachConfig{APIID: cfg.APIID, APIHash: cfg.APIHash, SessionFile: cfg.SessionFile}),
+		botUsername: botUsername,
+	}, nil
+}
+
+func (g *MTProtoGrantGateway) SendGrantCommand(ctx context.Context, command string) error {
+	if g == nil || g.outreach == nil {
+		return fmt.Errorf("grant gateway is not configured")
+	}
+	return g.outreach.SendUsernameMessage(ctx, g.botUsername, command)
+}
+
 func (m *MTProtoOutreach) PollReplies(ctx context.Context, candidates []Candidate) ([]ContactReply, error) {
 	replies := []ContactReply{}
 	err := m.run(ctx, func(ctx context.Context, client *telegram.Client) error {
@@ -85,6 +147,9 @@ func (m *MTProtoOutreach) PollReplies(ctx context.Context, candidates []Candidat
 				Limit: 10,
 			})
 			if err != nil {
+				if nonFatalReplyPollError(err) {
+					continue
+				}
 				return err
 			}
 			for _, message := range messagesFromHistory(result) {
@@ -178,7 +243,7 @@ func SendDirectTestMessage(ctx context.Context, opts DirectTestMessageOptions) (
 		if senderUsername != expectedSender {
 			return fmt.Errorf("sender session is @%s, want @%s", senderUsername, expectedSender)
 		}
-		target, err := resolveUserByUsername(ctx, client.API(), targetUsername)
+		target, err := resolveUserByUsernameWithOptions(ctx, client.API(), targetUsername, resolveUserOptions{AllowBot: true})
 		if err != nil {
 			return err
 		}
@@ -223,18 +288,20 @@ func (m *MTProtoOutreach) run(ctx context.Context, fn func(context.Context, *tel
 }
 
 func inputPeerForCandidate(ctx context.Context, api *tg.Client, candidate Candidate) (tg.InputPeerClass, error) {
+	username := cleanUsername(candidate.Username)
+	if username != "" {
+		user, err := resolveUserByUsername(ctx, api, username)
+		if err == nil {
+			return &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash}, nil
+		}
+		if candidate.UserID <= 0 || candidate.AccessHash == 0 {
+			return nil, err
+		}
+	}
 	if candidate.UserID > 0 && candidate.AccessHash != 0 {
 		return &tg.InputPeerUser{UserID: candidate.UserID, AccessHash: candidate.AccessHash}, nil
 	}
-	username := cleanUsername(candidate.Username)
-	if username == "" {
-		return nil, fmt.Errorf("candidate %d has no username or access hash", candidate.UserID)
-	}
-	user, err := resolveUserByUsername(ctx, api, username)
-	if err != nil {
-		return nil, err
-	}
-	return &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash}, nil
+	return nil, fmt.Errorf("candidate %d has no username or access hash", candidate.UserID)
 }
 
 func timeFromTelegramDate(date int) time.Time {
@@ -258,19 +325,38 @@ func selfUser(ctx context.Context, api *tg.Client) (*tg.User, error) {
 }
 
 func resolveUserByUsername(ctx context.Context, api *tg.Client, username string) (*tg.User, error) {
+	return resolveUserByUsernameWithOptions(ctx, api, username, resolveUserOptions{})
+}
+
+type resolveUserOptions struct {
+	AllowBot bool
+}
+
+func resolveUserByUsernameWithOptions(ctx context.Context, api *tg.Client, username string, opts resolveUserOptions) (*tg.User, error) {
 	resolved, err := api.ContactsResolveUsername(ctx, cleanUsername(username))
 	if err != nil {
 		return nil, err
 	}
+	return selectResolvedUser(username, resolved, opts)
+}
+
+func selectResolvedUser(username string, resolved *tg.ContactsResolvedPeer, opts resolveUserOptions) (*tg.User, error) {
 	peer, ok := resolved.Peer.(*tg.PeerUser)
 	if !ok {
 		return nil, fmt.Errorf("@%s did not resolve to a Telegram user", cleanUsername(username))
 	}
 	for _, raw := range resolved.Users {
 		user, ok := raw.(*tg.User)
-		if ok && user.ID == peer.UserID && !skipTelegramUser(user) {
+		if ok && user.ID == peer.UserID && !skipResolvedUser(user, opts) {
 			return user, nil
 		}
 	}
 	return nil, fmt.Errorf("@%s resolved without usable user metadata", cleanUsername(username))
+}
+
+func skipResolvedUser(user *tg.User, opts resolveUserOptions) bool {
+	if user == nil || user.ID <= 0 || user.Deleted || user.Self || user.Fake || user.Scam {
+		return true
+	}
+	return user.Bot && !opts.AllowBot
 }

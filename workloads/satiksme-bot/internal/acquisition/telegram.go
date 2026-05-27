@@ -239,10 +239,7 @@ func CandidatesFromHistory(result tg.MessagesMessagesClass, source CandidateSour
 		messageAt := time.Unix(int64(message.Date), 0).UTC()
 		candidate := candidateFromUser(user, source, messageAt)
 		candidate.LastMessageID = int64(message.ID)
-		candidate.Language = normalizeLanguage(user.LangCode)
-		if candidate.Language == "lv" {
-			candidate.Language = InferLanguage(message.Message)
-		}
+		candidate.Language = InferLanguage(message.Message)
 		if existing, ok := outByID[candidate.UserID]; ok && !candidate.LastActiveAt.After(existing.LastActiveAt) {
 			continue
 		}
@@ -281,7 +278,7 @@ func candidateFromUser(user *tg.User, source CandidateSource, seenAt time.Time) 
 		AccessHash:   user.AccessHash,
 		Username:     cleanUsername(user.Username),
 		DisplayName:  displayName,
-		Language:     normalizeLanguage(user.LangCode),
+		Language:     "lv",
 		Source:       source,
 		LastActiveAt: seenAt.UTC(),
 	})

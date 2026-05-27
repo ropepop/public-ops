@@ -53,6 +53,7 @@ type AccessRequest struct {
 	ChatType       string
 	UserID         string
 	Username       string
+	Language       string
 	MentionedUsers []AccessMentionedUser
 	Now            time.Time
 }
@@ -90,6 +91,7 @@ type AccessState struct {
 	Reservations          map[string]AccessReservation      `json:"reservations,omitempty"`
 	KnownUsers            map[string]KnownAccessUser        `json:"knownUsers,omitempty"`
 	PendingUserGrants     map[string]PendingAccessUserGrant `json:"pendingUserGrants,omitempty"`
+	UserLanguages         map[string]string                 `json:"userLanguages,omitempty"`
 	UpdatedAt             string                            `json:"updatedAt,omitempty"`
 }
 
@@ -189,6 +191,7 @@ func NewAccessManager(cfg AccessConfig) (*AccessManager, error) {
 			Reservations:      map[string]AccessReservation{},
 			KnownUsers:        map[string]KnownAccessUser{},
 			PendingUserGrants: map[string]PendingAccessUserGrant{},
+			UserLanguages:     map[string]string{},
 		},
 	}
 	if manager.statePath != "" {
@@ -247,7 +250,7 @@ func (m *AccessManager) RecordUser(_ context.Context, req AccessRequest) (string
 			m.grantUserLocked(userID, username, grant.DailyLimit, grant.Group, now)
 			delete(m.state.PendingUserGrants, key)
 			changed = true
-			notices = append(notices, pendingGrantActivatedText(username, grant.DailyLimit, grant.Group))
+			notices = append(notices, pendingGrantActivatedTextForLanguage(username, grant.DailyLimit, grant.Group, m.responseLanguageLocked(req)))
 		}
 	}
 	for _, mentioned := range req.MentionedUsers {
@@ -262,7 +265,7 @@ func (m *AccessManager) RecordUser(_ context.Context, req AccessRequest) (string
 				m.grantUserLocked(mentionedUserID, mentionedUsername, grant.DailyLimit, grant.Group, now)
 				delete(m.state.PendingUserGrants, key)
 				changed = true
-				notices = append(notices, pendingGrantActivatedText(mentionedUsername, grant.DailyLimit, grant.Group))
+				notices = append(notices, pendingGrantActivatedTextForLanguage(mentionedUsername, grant.DailyLimit, grant.Group, m.responseLanguageLocked(req)))
 			}
 		}
 	}
@@ -428,10 +431,10 @@ func (m *AccessManager) HandleAdminCommand(ctx context.Context, req AccessReques
 	m.ensureMapsLocked()
 	actor := cleanID(req.UserID)
 	if !m.state.Admins[actor] {
-		return "Admin only.", true, nil
+		return botText(req.Language, "admin_only"), true, nil
 	}
 	if !isAdminCommand(cmd) {
-		return "Unknown admin command. Use /admin for help.", true, nil
+		return botText("en", "unknown_admin"), true, nil
 	}
 	now := m.requestTime(req)
 	message, err := m.applyAdminCommandLocked(ctx, cmd, args, now)
@@ -455,16 +458,17 @@ func (m *AccessManager) AccessStatus(_ context.Context, req AccessRequest) (stri
 	if m.state.Admins[userID] {
 		return fmt.Sprintf("Access: admin. Users: %d. Groups: %d. Allowed chats: %d.", len(m.state.Users), len(m.state.Groups), len(m.state.Chats)), nil
 	}
+	language := normalizePublicBotLanguage(req.Language)
 	user, ok := m.state.Users[userID]
 	if !ok || !user.Active {
 		if m.defaultOpen {
-			return "Access: allowed by default.", nil
+			return accessStatusText(language, "default_allowed"), nil
 		}
-		return "Access: not allowed. Ask an admin to add your Telegram user ID.", nil
+		return accessStatusText(language, "not_allowed"), nil
 	}
-	parts := []string{"Access: allowed"}
+	parts := []string{accessStatusText(language, "allowed")}
 	if user.Group != "" {
-		parts = append(parts, "group: "+user.Group)
+		parts = append(parts, fmt.Sprintf(accessStatusText(language, "group"), user.Group))
 	}
 	var group AccessGroup
 	groupOK := false
@@ -485,12 +489,48 @@ func (m *AccessManager) AccessStatus(_ context.Context, req AccessRequest) (stri
 		if usage.Date == day {
 			count = usage.Count
 		}
-		parts = append(parts, fmt.Sprintf("%s quota: %d/%d today", scope.label, count, scope.limit))
+		parts = append(parts, fmt.Sprintf(accessStatusText(language, "quota"), quotaLabel(language, scope.label), count, scope.limit))
 		if pending := m.reservedCountLocked(scope.key, day); pending > 0 {
-			parts = append(parts, fmt.Sprintf("%s pending: %d", scope.label, pending))
+			parts = append(parts, fmt.Sprintf(accessStatusText(language, "pending"), quotaLabel(language, scope.label), pending))
 		}
 	}
 	return strings.Join(parts, ". ") + ".", nil
+}
+
+func (m *AccessManager) responseLanguageLocked(req AccessRequest) string {
+	if m.state.Admins[cleanID(req.UserID)] {
+		return "en"
+	}
+	return normalizePublicBotLanguage(req.Language)
+}
+
+func (m *AccessManager) UserLanguage(_ context.Context, req AccessRequest) (string, error) {
+	userID := cleanID(req.UserID)
+	if userID == "" || userID == "0" {
+		return "", nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	return normalizePublicBotLanguage(m.state.UserLanguages[userID]), nil
+}
+
+func (m *AccessManager) SetUserLanguage(_ context.Context, req AccessRequest, language string) error {
+	userID := cleanID(req.UserID)
+	if userID == "" || userID == "0" {
+		return nil
+	}
+	language = normalizePublicBotLanguage(language)
+	now := m.requestTime(req)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	m.state.UserLanguages[userID] = language
+	if username := cleanUsername(req.Username); username != "" {
+		m.recordKnownUserLocked(userID, username, now)
+	}
+	m.touchLocked(now)
+	return m.saveLocked()
 }
 
 func (m *AccessManager) applyAdminCommandLocked(ctx context.Context, cmd string, args []string, now time.Time) (string, error) {
@@ -920,6 +960,9 @@ func (m *AccessManager) ensureMapsLocked() {
 	if m.state.PendingUserGrants == nil {
 		m.state.PendingUserGrants = map[string]PendingAccessUserGrant{}
 	}
+	if m.state.UserLanguages == nil {
+		m.state.UserLanguages = map[string]string{}
+	}
 }
 
 func (m *AccessManager) touchLocked(now time.Time) {
@@ -1090,7 +1133,18 @@ func accessRequestFromMessage(msg Message) AccessRequest {
 		ChatType:       strings.TrimSpace(msg.ChatType),
 		UserID:         strconv.FormatInt(msg.UserID, 10),
 		Username:       cleanUsername(msg.Username),
+		Language:       "",
 		MentionedUsers: accessMentionedUsersFromMessage(msg.MentionedUsers),
+	}
+}
+
+func accessRequestFromCallback(callback Callback) AccessRequest {
+	return AccessRequest{
+		ChatID:   strconv.FormatInt(callback.ChatID, 10),
+		ChatType: strings.TrimSpace(callback.ChatType),
+		UserID:   strconv.FormatInt(callback.UserID, 10),
+		Username: cleanUsername(callback.Username),
+		Language: "",
 	}
 }
 
@@ -1125,19 +1179,24 @@ func (m *AccessManager) currentDefaultUserDailyLimitLocked() int {
 }
 
 func accessDenialText(decision AccessDecision) string {
+	return accessDenialTextForLanguage(decision, "en")
+}
+
+func accessDenialTextForLanguage(decision AccessDecision, language string) string {
+	language = normalizeBotLanguage(language)
 	switch decision.Reason {
 	case "chat_not_allowed":
-		return "This chat is not allowed to request tickets. Ask an admin to run /admin allow_chat for this Telegram chat ID."
+		return localizedAccessDenial(language, "chat_not_allowed")
 	case "chat_daily_limit":
-		return "This chat daily limit is used up. Try again tomorrow or ask an admin for a higher chat quota."
+		return localizedAccessDenial(language, "chat_daily_limit")
 	case "user_daily_limit":
-		return "Your daily limit is used up. Try again tomorrow or ask an admin for a higher quota."
+		return localizedAccessDenial(language, "user_daily_limit")
 	case "group_daily_limit":
-		return "Your group daily limit is used up. Try again tomorrow or ask an admin for a higher group quota."
+		return localizedAccessDenial(language, "group_daily_limit")
 	case "group_not_allowed":
-		return "Your access group is not allowed. Ask an admin to update your ticket access."
+		return localizedAccessDenial(language, "group_not_allowed")
 	default:
-		return "You are not allowed to request tickets yet. Ask an admin to add your Telegram user ID."
+		return localizedAccessDenial(language, "not_allowed")
 	}
 }
 
@@ -1179,10 +1238,175 @@ func usernameKey(value string) string {
 }
 
 func pendingGrantActivatedText(username string, limit int, group string) string {
+	return pendingGrantActivatedTextForLanguage(username, limit, group, "en")
+}
+
+func pendingGrantActivatedTextForLanguage(username string, limit int, group string, language string) string {
+	language = normalizeBotLanguage(language)
+	limitValue := localizedLimitText(limit, language)
 	if group != "" {
-		return fmt.Sprintf("Access enabled for @%s with daily limit %s in group %s.", cleanUsername(username), limitText(limit), group)
+		switch language {
+		case "ru":
+			return fmt.Sprintf("Доступ для @%s включён с дневным лимитом %s в группе %s.", cleanUsername(username), limitValue, group)
+		case "lv":
+			return fmt.Sprintf("Piekļuve @%s ieslēgta ar dienas limitu %s grupā %s.", cleanUsername(username), limitValue, group)
+		default:
+			return fmt.Sprintf("Access enabled for @%s with daily limit %s in group %s.", cleanUsername(username), limitValue, group)
+		}
 	}
-	return fmt.Sprintf("Access enabled for @%s with daily limit %s.", cleanUsername(username), limitText(limit))
+	switch language {
+	case "ru":
+		return fmt.Sprintf("Доступ для @%s включён с дневным лимитом %s.", cleanUsername(username), limitValue)
+	case "lv":
+		return fmt.Sprintf("Piekļuve @%s ieslēgta ar dienas limitu %s.", cleanUsername(username), limitValue)
+	default:
+		return fmt.Sprintf("Access enabled for @%s with daily limit %s.", cleanUsername(username), limitValue)
+	}
+}
+
+func accessStatusText(language string, key string) string {
+	switch normalizeBotLanguage(language) {
+	case "ru":
+		switch key {
+		case "default_allowed":
+			return "Доступ: разрешён по умолчанию."
+		case "not_allowed":
+			return "Доступ: не выдан. Попроси администратора добавить твой Telegram user ID."
+		case "allowed":
+			return "Доступ: разрешён"
+		case "group":
+			return "группа: %s"
+		case "quota":
+			return "лимит %s: %d/%d сегодня"
+		case "pending":
+			return "%s ожидает: %d"
+		}
+	case "lv":
+		switch key {
+		case "default_allowed":
+			return "Piekļuve: atļauta pēc noklusējuma."
+		case "not_allowed":
+			return "Piekļuve: nav piešķirta. Palūdz administratoram pievienot tavu Telegram lietotāja ID."
+		case "allowed":
+			return "Piekļuve: atļauta"
+		case "group":
+			return "grupa: %s"
+		case "quota":
+			return "%s limits: %d/%d šodien"
+		case "pending":
+			return "%s gaida: %d"
+		}
+	}
+	switch key {
+	case "default_allowed":
+		return "Access: allowed by default."
+	case "not_allowed":
+		return "Access: not allowed. Ask an admin to add your Telegram user ID."
+	case "allowed":
+		return "Access: allowed"
+	case "group":
+		return "group: %s"
+	case "quota":
+		return "%s quota: %d/%d today"
+	case "pending":
+		return "%s pending: %d"
+	default:
+		return ""
+	}
+}
+
+func quotaLabel(language string, label string) string {
+	switch normalizeBotLanguage(language) {
+	case "ru":
+		switch label {
+		case "user":
+			return "пользователя"
+		case "group":
+			return "группы"
+		case "chat":
+			return "чата"
+		}
+	case "lv":
+		switch label {
+		case "user":
+			return "lietotāja"
+		case "group":
+			return "grupas"
+		case "chat":
+			return "čata"
+		}
+	}
+	return label
+}
+
+func localizedAccessDenial(language string, key string) string {
+	switch normalizeBotLanguage(language) {
+	case "ru":
+		switch key {
+		case "chat_not_allowed":
+			return "У этого чата ещё нет доступа для запросов билетов. Попроси администратора добавить этот Telegram чат."
+		case "chat_daily_limit":
+			return "Дневной лимит этого чата израсходован. Попробуй завтра или попроси администратора увеличить лимит чата."
+		case "user_daily_limit":
+			return "Твой дневной лимит израсходован. Попробуй завтра или попроси администратора увеличить лимит."
+		case "group_daily_limit":
+			return "Дневной лимит твоей группы израсходован. Попробуй завтра или попроси администратора увеличить лимит группы."
+		case "group_not_allowed":
+			return "У твоей группы доступа нет разрешения. Попроси администратора обновить доступ."
+		default:
+			return "Доступ ещё не выдан. Попроси администратора добавить твой Telegram user ID."
+		}
+	case "lv":
+		switch key {
+		case "chat_not_allowed":
+			return "Šim čatam vēl nav piekļuves biļešu pieprasījumiem. Palūdz administratoram pievienot šo Telegram čatu."
+		case "chat_daily_limit":
+			return "Šī čata dienas limits ir iztērēts. Mēģini rīt vai palūdz administratoram lielāku čata limitu."
+		case "user_daily_limit":
+			return "Tavs dienas limits ir iztērēts. Mēģini rīt vai palūdz administratoram lielāku limitu."
+		case "group_daily_limit":
+			return "Tavas grupas dienas limits ir iztērēts. Mēģini rīt vai palūdz administratoram lielāku grupas limitu."
+		case "group_not_allowed":
+			return "Tavai piekļuves grupai nav atļaujas. Palūdz administratoram atjaunināt piekļuvi."
+		default:
+			return "Piekļuve vēl nav piešķirta. Palūdz administratoram pievienot tavu Telegram lietotāja ID."
+		}
+	}
+	switch key {
+	case "chat_not_allowed":
+		return "This chat is not allowed to request tickets. Ask an admin to run /admin allow_chat for this Telegram chat ID."
+	case "chat_daily_limit":
+		return "This chat daily limit is used up. Try again tomorrow or ask an admin for a higher chat quota."
+	case "user_daily_limit":
+		return "Your daily limit is used up. Try again tomorrow or ask an admin for a higher quota."
+	case "group_daily_limit":
+		return "Your group daily limit is used up. Try again tomorrow or ask an admin for a higher group quota."
+	case "group_not_allowed":
+		return "Your access group is not allowed. Ask an admin to update your ticket access."
+	default:
+		return "You are not allowed to request tickets yet. Ask an admin to add your Telegram user ID."
+	}
+}
+
+func localizedLimitText(limit int, language string) string {
+	limit = normalizeLimit(limit)
+	if limit > 0 {
+		return strconv.Itoa(limit)
+	}
+	switch normalizeBotLanguage(language) {
+	case "ru":
+		if limit < 0 {
+			return "безлимитно"
+		}
+		return "наследуется/безлимитно"
+	case "lv":
+		if limit < 0 {
+			return "bez limita"
+		}
+		return "mantots/bez limita"
+	default:
+		return limitText(limit)
+	}
 }
 
 func cleanGroupName(value string) string {

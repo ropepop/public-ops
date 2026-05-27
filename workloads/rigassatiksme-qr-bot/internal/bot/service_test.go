@@ -37,7 +37,7 @@ func TestServiceQueuesValidCodeAndSendsCompletedQRImage(t *testing.T) {
 	if got := broker.createdCode; got != "12345" {
 		t.Fatalf("created code = %q, want 12345", got)
 	}
-	if !telegram.hasMessageContaining("waiting") {
+	if !telegram.hasMessageContaining("Pieprasījums gaida") {
 		t.Fatalf("queue message missing: %#v", telegram.messages)
 	}
 	photo := telegram.waitForPhoto(t)
@@ -95,6 +95,45 @@ func TestServiceQueuesCodeCommandForGroupPrivacyMode(t *testing.T) {
 	}
 }
 
+func TestServiceStartShowsLatvianHelpWithRussianButton(t *testing.T) {
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{ChatID: 1001, UserID: 42, Text: "/start"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !telegram.hasMessageContaining("rs biļete") || !telegram.hasMessageContaining("5 ciparu") {
+		t.Fatalf("latvian start help missing: %#v", telegram.messages)
+	}
+	if !telegram.hasButton("Русский", "lang:ru") {
+		t.Fatalf("russian language button missing: %#v", telegram.buttonMessages)
+	}
+}
+
+func TestServiceLanguageCallbackStoresPreferenceAndHelpUsesIt(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{DefaultOpen: true, Clock: fixedAccessClock(t)})
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleCallback(context.Background(), Callback{ChatID: 1001, UserID: 42, Username: "target", Data: "lang:ru"}); err != nil {
+		t.Fatal(err)
+	}
+	if !telegram.hasMessageContaining("rs biļete") || !telegram.hasMessageContaining("5-знач") {
+		t.Fatalf("russian help missing after callback: %#v", telegram.messages)
+	}
+	if !telegram.hasButton("Latviski", "lang:lv") {
+		t.Fatalf("latvian language button missing: %#v", telegram.buttonMessages)
+	}
+
+	if err := service.HandleMessage(context.Background(), Message{ChatID: 1001, UserID: 42, Text: "/help"}); err != nil {
+		t.Fatal(err)
+	}
+	if !telegram.hasMessageContaining("5-знач") {
+		t.Fatalf("saved russian preference not used for /help: %#v", telegram.messages)
+	}
+}
+
 func TestServiceRejectsInvalidCode(t *testing.T) {
 	broker := &fakeBroker{}
 	telegram := &fakeTelegram{}
@@ -106,8 +145,146 @@ func TestServiceRejectsInvalidCode(t *testing.T) {
 	if broker.createdCode != "" {
 		t.Fatalf("invalid code should not create a job")
 	}
-	if !telegram.hasMessageContaining("5 digits") {
+	if !telegram.hasMessageContaining("5 ciparus") {
 		t.Fatalf("invalid input guidance missing: %#v", telegram.messages)
+	}
+}
+
+func TestServiceLocalizesLatvianNonAdminReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  Message
+		want string
+	}{
+		{name: "invalid qr command", msg: Message{ChatID: 1001, UserID: 42, Text: "/qr 1234"}, want: "Lietojums"},
+		{name: "unknown command", msg: Message{ChatID: 1001, UserID: 42, Text: "/wat"}, want: "Nezināma komanda"},
+		{name: "invalid text", msg: Message{ChatID: 1001, UserID: 42, Text: "hello"}, want: "Nosūti tieši 5 ciparus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			telegram := &fakeTelegram{}
+			service := NewService(ServiceConfig{}, telegram, &fakeBroker{})
+
+			if err := service.HandleMessage(context.Background(), tc.msg); err != nil {
+				t.Fatal(err)
+			}
+			if !telegram.hasMessageContaining(tc.want) {
+				t.Fatalf("localized reply missing %q: %#v", tc.want, telegram.messages)
+			}
+			if telegram.hasMessageContaining("digits") || telegram.hasMessageContaining("unknown command") {
+				t.Fatalf("english user reply leaked: %#v", telegram.messages)
+			}
+		})
+	}
+}
+
+func TestServiceLocalizesRussianNonAdminReplies(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{DefaultOpen: true, Clock: fixedAccessClock(t)})
+	if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, "ru"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		msg  Message
+		want string
+	}{
+		{name: "invalid qr command", msg: Message{ChatID: 1001, UserID: 42, Text: "/qr 1234"}, want: "Используй"},
+		{name: "unknown command", msg: Message{ChatID: 1001, UserID: 42, Text: "/wat"}, want: "Неизвестная команда"},
+		{name: "invalid text", msg: Message{ChatID: 1001, UserID: 42, Text: "hello"}, want: "Отправь ровно 5 цифр"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			telegram := &fakeTelegram{}
+			service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+			if err := service.HandleMessage(context.Background(), tc.msg); err != nil {
+				t.Fatal(err)
+			}
+			if !telegram.hasMessageContaining(tc.want) {
+				t.Fatalf("localized reply missing %q: %#v", tc.want, telegram.messages)
+			}
+			if telegram.hasMessageContaining("digits") || telegram.hasMessageContaining("unknown command") {
+				t.Fatalf("english user reply leaked: %#v", telegram.messages)
+			}
+		})
+	}
+}
+
+func TestServiceDoesNotUseEnglishForNonAdminStoredLanguage(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{DefaultOpen: true, Clock: fixedAccessClock(t)})
+	if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, "en"); err != nil {
+		t.Fatal(err)
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{ChatID: 1001, UserID: 42, Text: "/status"}); err != nil {
+		t.Fatal(err)
+	}
+	if !telegram.hasMessageContaining("Nav rindā") {
+		t.Fatalf("latvian fallback missing: %#v", telegram.messages)
+	}
+	if telegram.hasMessageContaining("No QR request") {
+		t.Fatalf("english fallback leaked to non-admin user: %#v", telegram.messages)
+	}
+}
+
+func TestServiceLocalizesQrLifecycleReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		language  string
+		broker    *fakeBroker
+		message   Message
+		waitFor   string
+		forbidden string
+	}{
+		{
+			name:      "latvian queued",
+			language:  "lv",
+			broker:    &fakeBroker{createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "1001", Status: JobWaiting}, job: QRJob{ID: "job-1", UserID: "42", ChatID: "1001", Status: JobRunning}},
+			message:   Message{ChatID: 1001, UserID: 42, Text: "12345"},
+			waitFor:   "Pieprasījums gaida",
+			forbidden: "Your request",
+		},
+		{
+			name:      "russian failed",
+			language:  "ru",
+			broker:    &fakeBroker{createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "1001", Status: JobWaiting}, job: QRJob{ID: "job-1", UserID: "42", ChatID: "1001", Status: JobFailed, Reason: "rs_app_attention_required"}},
+			message:   Message{ChatID: 1001, UserID: 42, Text: "12345"},
+			waitFor:   "Приложению RS нужно внимание",
+			forbidden: "QR request failed",
+		},
+		{
+			name:      "latvian no status",
+			language:  "lv",
+			broker:    &fakeBroker{},
+			message:   Message{ChatID: 1001, UserID: 42, Text: "/status"},
+			waitFor:   "Nav rindā",
+			forbidden: "No QR request",
+		},
+		{
+			name:      "russian no cancel",
+			language:  "ru",
+			broker:    &fakeBroker{},
+			message:   Message{ChatID: 1001, UserID: 42, Text: "/cancel"},
+			waitFor:   "Нет QR-запроса",
+			forbidden: "No QR request",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			access := NewMemoryAccessManager(AccessConfig{DefaultOpen: true, Clock: fixedAccessClock(t)})
+			if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, tc.language); err != nil {
+				t.Fatal(err)
+			}
+			telegram := &fakeTelegram{}
+			service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: 20 * time.Millisecond, Access: access}, telegram, tc.broker)
+
+			if err := service.HandleMessage(context.Background(), tc.message); err != nil {
+				t.Fatal(err)
+			}
+			telegram.waitForMessageContaining(t, tc.waitFor)
+			if tc.forbidden != "" && telegram.hasMessageContaining(tc.forbidden) {
+				t.Fatalf("english user reply leaked: %#v", telegram.messages)
+			}
+		})
 	}
 }
 
@@ -140,7 +317,7 @@ func TestServiceCancelsLatestJob(t *testing.T) {
 	if broker.cancelUserID != "42" {
 		t.Fatalf("cancel user = %q, want 42", broker.cancelUserID)
 	}
-	if !telegram.hasMessageContaining("cancelled") {
+	if !telegram.hasMessageContaining("atcelts") {
 		t.Fatalf("cancel confirmation missing: %#v", telegram.messages)
 	}
 }
@@ -225,9 +402,16 @@ func (b *fakeBroker) JobImage(ctx context.Context, id string) ([]byte, string, e
 }
 
 type fakeTelegram struct {
-	mu       sync.Mutex
-	messages []string
-	photos   []sentPhoto
+	mu             sync.Mutex
+	messages       []string
+	buttonMessages []sentButtonMessage
+	photos         []sentPhoto
+}
+
+type sentButtonMessage struct {
+	chatID  int64
+	text    string
+	buttons [][]InlineButton
 }
 
 type sentPhoto struct {
@@ -244,6 +428,14 @@ func (t *fakeTelegram) SendMessage(ctx context.Context, chatID int64, text strin
 	return nil
 }
 
+func (t *fakeTelegram) SendMessageWithButtons(ctx context.Context, chatID int64, text string, buttons [][]InlineButton) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.messages = append(t.messages, text)
+	t.buttonMessages = append(t.buttonMessages, sentButtonMessage{chatID: chatID, text: text, buttons: buttons})
+	return nil
+}
+
 func (t *fakeTelegram) SendPhoto(ctx context.Context, chatID int64, image []byte, mime string, caption string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -257,6 +449,21 @@ func (t *fakeTelegram) hasMessageContaining(part string) bool {
 	for _, message := range t.messages {
 		if strings.Contains(strings.ToLower(message), strings.ToLower(part)) {
 			return true
+		}
+	}
+	return false
+}
+
+func (t *fakeTelegram) hasButton(text string, data string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, message := range t.buttonMessages {
+		for _, row := range message.buttons {
+			for _, button := range row {
+				if button.Text == text && button.Data == data {
+					return true
+				}
+			}
 		}
 	}
 	return false

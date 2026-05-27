@@ -37,7 +37,7 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 420,
-      "sha256": "4b605d3fd6c33c5c1cee1845b0d6817ea57d1c58ec428b33acd1f71a20c11679",
+      "sha256": "5584f1ea37c7d7a2ace91f85ab1a543f3cf978fee8bb6d830451d95cf4074623",
       "size": 1198
     },
     "etc/arbuzas/dns/arbuzas-dns.yaml": {
@@ -92,8 +92,8 @@
     },
     "etc/arbuzas/env/rigassatiksme-qr-bot.env": {
       "mode": 384,
-      "sha256": "a2edc47113a5a64eca73e24da8879b8836cad776c612704669afc05aa4a4eab5",
-      "size": 1160
+      "sha256": "3c7cc69f8a3655ae99e9cb9379b888178127a582117aa19f08d26f62a4bb776b",
+      "size": 1171
     },
     "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z": {
       "mode": 384,
@@ -102,8 +102,8 @@
     },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 384,
-      "sha256": "1fd1b71e5ef2989bc46b77a980e5a2728770617f8d1dcbe3e7f84dd23f8428c9",
-      "size": 3879
+      "sha256": "3ed4d4e2179591d10183dc2b08951924756f1eb5ee9c2afb6ddd55841596f382",
+      "size": 3998
     },
     "etc/arbuzas/env/satiksme-bot.env.bak-google-ai": {
       "mode": 384,
@@ -242,5 +242,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1779793656
+  "updatedEpochSeconds": 1779864033
 }

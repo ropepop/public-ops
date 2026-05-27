@@ -19,8 +19,42 @@ func TestServiceRequiresAllowedUserBeforeQueueing(t *testing.T) {
 	if broker.createCount != 0 || broker.createdCode != "" {
 		t.Fatalf("unauthorized user created job count=%d code=%q", broker.createCount, broker.createdCode)
 	}
-	if !telegram.hasMessageContaining("not allowed") {
+	if !telegram.hasMessageContaining("Piekļuve vēl nav piešķirta") {
 		t.Fatalf("access denial message missing: %#v", telegram.messages)
+	}
+}
+
+func TestServiceLocalizesAccessDenialsForNonAdmins(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		language string
+		want     string
+	}{
+		{name: "latvian", language: "lv", want: "Piekļuve vēl nav piešķirta"},
+		{name: "russian", language: "ru", want: "Доступ ещё не выдан"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			access := NewMemoryAccessManager(AccessConfig{DefaultOpen: false, Clock: fixedAccessClock(t)})
+			if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, tc.language); err != nil {
+				t.Fatal(err)
+			}
+			broker := &fakeBroker{createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "42", Status: JobWaiting}}
+			telegram := &fakeTelegram{}
+			service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: 20 * time.Millisecond, Access: access}, telegram, broker)
+
+			if err := service.HandleMessage(context.Background(), Message{ChatID: 42, ChatType: "private", UserID: 42, Text: "12345"}); err != nil {
+				t.Fatal(err)
+			}
+			if broker.createCount != 0 {
+				t.Fatalf("unauthorized user created job count=%d", broker.createCount)
+			}
+			if !telegram.hasMessageContaining(tc.want) {
+				t.Fatalf("localized access denial missing %q: %#v", tc.want, telegram.messages)
+			}
+			if telegram.hasMessageContaining("not allowed") {
+				t.Fatalf("english denial leaked: %#v", telegram.messages)
+			}
+		})
 	}
 }
 
@@ -61,7 +95,7 @@ func TestAdminCanAllowUserIntoQuotaGroupAndQuotaIsEnforced(t *testing.T) {
 	if broker.createCount != 1 {
 		t.Fatalf("quota-exceeded request created a broker job: count=%d", broker.createCount)
 	}
-	if !telegram.hasMessageContaining("daily limit") {
+	if !telegram.hasMessageContaining("grupas dienas limits") {
 		t.Fatalf("quota denial message missing: %#v", telegram.messages)
 	}
 }
@@ -83,7 +117,7 @@ func TestFailedQueuedJobDoesNotUseDailyQuota(t *testing.T) {
 	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
 		t.Fatal(err)
 	}
-	telegram.waitForMessageContaining(t, "failed")
+	telegram.waitForMessageContaining(t, "neizdevās")
 	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +144,7 @@ func TestCanceledQueuedJobDoesNotUseDailyQuota(t *testing.T) {
 	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
 		t.Fatal(err)
 	}
-	telegram.waitForMessageContaining(t, "cancelled")
+	telegram.waitForMessageContaining(t, "atcelts")
 	if err := service.HandleMessage(context.Background(), withText(user, "23456")); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +181,7 @@ func TestSuccessfulQueuedJobUsesDailyQuotaOnce(t *testing.T) {
 	if broker.createCount != 1 {
 		t.Fatalf("second request after successful job should be denied, create count=%d", broker.createCount)
 	}
-	if !telegram.hasMessageContaining("daily limit") {
+	if !telegram.hasMessageContaining("Tavs dienas limits") {
 		t.Fatalf("quota denial message missing after success: %#v", telegram.messages)
 	}
 }
@@ -176,7 +210,7 @@ func TestPendingReservationBlocksConcurrentOverLimitRequest(t *testing.T) {
 	if broker.createCount != 1 {
 		t.Fatalf("pending reservation should block second request, create count=%d", broker.createCount)
 	}
-	if !telegram.hasMessageContaining("daily limit") {
+	if !telegram.hasMessageContaining("Tavs dienas limits") {
 		t.Fatalf("pending reservation denial missing daily limit text: %#v", telegram.messages)
 	}
 }
@@ -204,6 +238,68 @@ func TestQueueErrorReleasesPendingReservation(t *testing.T) {
 
 	if broker.createCount != 2 {
 		t.Fatalf("queue error should release reservation for retry, create count=%d", broker.createCount)
+	}
+}
+
+func TestServiceLocalizesAccessStatusForNonAdmins(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	broker := &fakeBroker{
+		createJob: QRJob{ID: "job-1", UserID: "42", ChatID: "-1001", Status: JobWaiting},
+		job:       QRJob{ID: "job-1", UserID: "42", ChatID: "-1001", Status: JobRunning},
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: 5 * time.Millisecond, PollTimeout: 50 * time.Millisecond, Access: access}, telegram, broker)
+
+	admin := Message{ChatID: 7, ChatType: "private", UserID: 7}
+	for _, text := range []string{"/set_group riders 3", "/allow_user 42 5 riders", "/allow_chat -1001 2"} {
+		if err := service.HandleMessage(context.Background(), withText(admin, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, "ru"); err != nil {
+		t.Fatal(err)
+	}
+	user := Message{ChatID: -1001, ChatType: "supergroup", UserID: 42}
+	if err := service.HandleMessage(context.Background(), withText(user, "12345")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), withText(user, "/access")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"Доступ: разрешён", "группа: riders", "лимит пользователя: 0/5", "ожидает: 1"} {
+		if !telegram.hasMessageContaining(want) {
+			t.Fatalf("localized access status missing %q: %#v", want, telegram.messages)
+		}
+	}
+	if telegram.hasMessageContaining("Access:") || telegram.hasMessageContaining("quota") || telegram.hasMessageContaining("pending") {
+		t.Fatalf("english access status leaked: %#v", telegram.messages)
+	}
+}
+
+func TestServiceLocalizesNonAdminAdminDenialButKeepsAdminRepliesEnglish(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	if err := access.SetUserLanguage(context.Background(), AccessRequest{UserID: "42", Now: fixedAccessClock(t)()}, "ru"); err != nil {
+		t.Fatal(err)
+	}
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{PollInterval: time.Millisecond, PollTimeout: time.Second, Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{ChatID: 42, ChatType: "private", UserID: 42, Text: "/admin"}); err != nil {
+		t.Fatal(err)
+	}
+	if !telegram.hasMessageContaining("Только для администратора") {
+		t.Fatalf("localized non-admin admin denial missing: %#v", telegram.messages)
+	}
+	if telegram.hasMessageContaining("admin only") {
+		t.Fatalf("english non-admin admin denial leaked: %#v", telegram.messages)
+	}
+
+	if err := service.HandleMessage(context.Background(), Message{ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin add 42 4"}); err != nil {
+		t.Fatal(err)
+	}
+	if !telegram.hasMessageContaining("Allowed user 42 with daily limit 4") {
+		t.Fatalf("admin response should remain English: %#v", telegram.messages)
 	}
 }
 
@@ -469,7 +565,7 @@ func TestPendingUsernameGrantAppliesWhenUserStartsBot(t *testing.T) {
 	}
 
 	assertPendingUsernameGrantActivated(t, access, telegram, "darja_smm_prod", "42", 20)
-	if !telegram.hasMessageContaining("send one 5 digit code") {
+	if !telegram.hasMessageContaining("5 ciparu") {
 		t.Fatalf("start help should still be sent after activating grant: %#v", telegram.messages)
 	}
 }
@@ -539,7 +635,7 @@ func TestGroupChatMustBeAllowedAndUsesChatQuota(t *testing.T) {
 	if broker.createCount != 0 {
 		t.Fatalf("request in unallowed group created a broker job: count=%d", broker.createCount)
 	}
-	if !telegram.hasMessageContaining("chat is not allowed") {
+	if !telegram.hasMessageContaining("Šim čatam vēl nav") {
 		t.Fatalf("group denial message missing: %#v", telegram.messages)
 	}
 
@@ -556,7 +652,7 @@ func TestGroupChatMustBeAllowedAndUsesChatQuota(t *testing.T) {
 	if broker.createCount != 1 {
 		t.Fatalf("chat-quota-exceeded request created a broker job: count=%d", broker.createCount)
 	}
-	if !telegram.hasMessageContaining("chat daily limit") {
+	if !telegram.hasMessageContaining("čata dienas limits") {
 		t.Fatalf("chat quota denial message missing: %#v", telegram.messages)
 	}
 }
@@ -573,7 +669,7 @@ func TestNonAdminCannotRunAdminCommands(t *testing.T) {
 	if err := service.HandleMessage(context.Background(), Message{ChatID: 42, ChatType: "private", UserID: 42, Text: "/admin"}); err != nil {
 		t.Fatal(err)
 	}
-	if !telegram.hasMessageContaining("admin only") {
+	if !telegram.hasMessageContaining("Tikai administratoram") {
 		t.Fatalf("non-admin rejection missing: %#v", telegram.messages)
 	}
 	if telegram.hasMessageContaining("/allow_user") {
@@ -613,7 +709,7 @@ func TestAccessStatusIncludesUserGroupAndChatQuota(t *testing.T) {
 	if err := service.HandleMessage(context.Background(), withText(user, "/access")); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"group: riders", "user quota: 1/5", "group quota: 1/3", "chat quota: 1/2"} {
+	for _, want := range []string{"grupa: riders", "lietotāja limits: 1/5", "grupas limits: 1/3", "čata limits: 1/2"} {
 		if !telegram.hasMessageContaining(want) {
 			t.Fatalf("access status missing %q: %#v", want, telegram.messages)
 		}
@@ -641,7 +737,7 @@ func TestAccessStatusIncludesPendingReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{"user quota: 0/2", "user pending: 1"} {
+	for _, want := range []string{"lietotāja limits: 0/2", "lietotāja gaida: 1"} {
 		if !telegram.hasMessageContaining(want) {
 			t.Fatalf("access status missing %q: %#v", want, telegram.messages)
 		}
@@ -650,7 +746,7 @@ func TestAccessStatusIncludesPendingReservations(t *testing.T) {
 
 func assertPendingUsernameGrantActivated(t *testing.T, access *AccessManager, telegram *fakeTelegram, username string, userID string, dailyLimit int) {
 	t.Helper()
-	if !telegram.hasMessageContaining("access enabled for @" + username + " with daily limit " + strconv.Itoa(dailyLimit)) {
+	if !telegram.hasMessageContaining("Piekļuve @" + username + " ieslēgta ar dienas limitu " + strconv.Itoa(dailyLimit)) {
 		t.Fatalf("pending grant activation notice missing: %#v", telegram.messages)
 	}
 	access.mu.Lock()

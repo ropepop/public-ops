@@ -45,8 +45,14 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return planDay(ctx, args[1:], stdout)
 	case "mark-sent":
 		return markSent(ctx, args[1:], stdout)
+	case "invalidate-pending-drafts":
+		return invalidatePendingDrafts(ctx, args[1:], stdout)
+	case "approve-token":
+		return approveToken(ctx, args[1:], stdout)
 	case "record-reply":
 		return recordReply(ctx, args[1:], stdout)
+	case "sender-info":
+		return senderInfo(ctx, args[1:], stdout)
 	case "send-test":
 		return sendTest(ctx, args[1:], stdout)
 	case "daemon":
@@ -69,8 +75,11 @@ func runDaemon(ctx context.Context, args []string, stdout io.Writer) error {
 	senderSessionFile := fs.String("sender-session-file", envOr("RS_ACQUISITION_SENDER_SESSION_FILE", "./state/rs-acquisition/iamhdzs.session"), "MTProto outreach sender session file")
 	chatID := fs.String("chat", envOr("RS_ACQUISITION_CHAT_ID", os.Getenv("SATIKSME_CHAT_ANALYZER_CHAT_ID")), "Source Telegram chat descriptor")
 	expectSender := fs.String("expect-sender", envOr("RS_ACQUISITION_EXPECT_SENDER", "iamhdzs"), "Expected outreach sender username")
+	adminMode := fs.String("admin-mode", envOr("RS_ACQUISITION_ADMIN_MODE", "bot"), "Admin approval transport: bot or mtproto")
+	adminUsername := fs.String("admin-username", envOr("RS_ACQUISITION_ADMIN_USERNAME", ""), "Telegram username that receives MTProto admin approvals")
 	adminToken := fs.String("admin-bot-token", envOr("RS_ACQUISITION_ADMIN_BOT_TOKEN", os.Getenv("RS_ACQUISITION_ALERT_BOT_TOKEN")), "Telegram Bot API token for admin approvals")
 	adminChatID := fs.String("admin-chat-id", envOr("RS_ACQUISITION_ADMIN_CHAT_ID", os.Getenv("RS_ACQUISITION_ALERT_CHAT_ID")), "Telegram admin chat ID")
+	grantBotUsername := fs.String("grant-bot-username", envOr("RS_ACQUISITION_GRANT_BOT_USERNAME", "rs_bilete_bot"), "Telegram bot username that receives accepted-user grant commands")
 	timezone := fs.String("timezone", envOr("RS_ACQUISITION_TIMEZONE", envOr("TZ", "Europe/Riga")), "Campaign day timezone")
 	dailyLimit := fs.Int("daily-limit", envInt("RS_ACQUISITION_DAILY_LIMIT", 10), "Maximum approved first contacts per day")
 	dailyRegistrations := fs.Int("daily-registrations", envInt("RS_ACQUISITION_DAILY_REGISTRATIONS", 4), "Free daily registrations to offer")
@@ -95,9 +104,21 @@ func runDaemon(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	defer store.Close()
-	admin, err := acquisition.NewAdminBotGateway(acquisition.AdminBotConfig{Token: *adminToken, ChatID: *adminChatID})
+	admin, err := buildAdminGateway(*adminMode, *apiID, *apiHash, *senderSessionFile, *adminUsername, *adminToken, *adminChatID, store)
 	if err != nil {
 		return err
+	}
+	var grant acquisition.GrantGateway
+	if strings.TrimSpace(*grantBotUsername) != "" {
+		grant, err = acquisition.NewMTProtoGrantGateway(acquisition.MTProtoGrantGatewayConfig{
+			APIID:       *apiID,
+			APIHash:     *apiHash,
+			SessionFile: *senderSessionFile,
+			BotUsername: *grantBotUsername,
+		})
+		if err != nil {
+			return err
+		}
 	}
 	outreach := acquisition.NewMTProtoOutreach(acquisition.MTProtoOutreachConfig{
 		APIID:       *apiID,
@@ -132,6 +153,7 @@ func runDaemon(ctx context.Context, args []string, stdout io.Writer) error {
 		Admin:    admin,
 		Outreach: outreach,
 		Replies:  outreach,
+		Grant:    grant,
 	}
 	if *once {
 		result, err := daemon.RunOnce(ctx)
@@ -154,6 +176,22 @@ func runDaemon(ctx context.Context, args []string, stdout io.Writer) error {
 			return nil
 		case <-ticker.C:
 		}
+	}
+}
+
+func buildAdminGateway(mode string, apiID int, apiHash string, senderSessionFile string, adminUsername string, adminToken string, adminChatID string, store *acquisition.Store) (acquisition.AdminGateway, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "bot":
+		return acquisition.NewAdminBotGateway(acquisition.AdminBotConfig{Token: adminToken, ChatID: adminChatID})
+	case "mtproto":
+		return acquisition.NewMTProtoAdminGateway(acquisition.MTProtoAdminConfig{
+			APIID:       apiID,
+			APIHash:     apiHash,
+			SessionFile: senderSessionFile,
+			Username:    adminUsername,
+		}, store)
+	default:
+		return nil, fmt.Errorf("--admin-mode must be bot or mtproto")
 	}
 }
 
@@ -317,6 +355,95 @@ func markSent(ctx context.Context, args []string, stdout io.Writer) error {
 	})
 }
 
+func invalidatePendingDrafts(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("invalidate-pending-drafts", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	statePath := fs.String("state", envOr("RS_ACQUISITION_STATE_PATH", defaultStatePath), "Private SQLite state path")
+	reason := fs.String("reason", "copy_updated", "Reason stored in the audit log")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := acquisition.OpenStore(*statePath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	invalidated, err := store.InvalidatePendingDrafts(ctx, *reason, now)
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{
+		"invalidated": invalidated,
+		"reason":      strings.TrimSpace(*reason),
+		"state":       *statePath,
+		"updatedAt":   now,
+	})
+}
+
+func approveToken(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("approve-token", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	statePath := fs.String("state", envOr("RS_ACQUISITION_STATE_PATH", defaultStatePath), "Private SQLite state path")
+	token := fs.String("token", "", "Pending approval token to send")
+	apiID := fs.Int("api-id", envInt("RS_ACQUISITION_API_ID", envInt("SATIKSME_CHAT_ANALYZER_API_ID", 0)), "Telegram API ID")
+	apiHash := fs.String("api-hash", envOr("RS_ACQUISITION_API_HASH", os.Getenv("SATIKSME_CHAT_ANALYZER_API_HASH")), "Telegram API hash")
+	senderSessionFile := fs.String("sender-session-file", envOr("RS_ACQUISITION_SENDER_SESSION_FILE", "./state/rs-acquisition/iamhdzs.session"), "MTProto outreach sender session file")
+	expectSender := fs.String("expect-sender", envOr("RS_ACQUISITION_EXPECT_SENDER", "iamhdzs"), "Expected outreach sender username")
+	adminMode := fs.String("admin-mode", envOr("RS_ACQUISITION_ADMIN_MODE", "bot"), "Admin alert transport: bot or mtproto")
+	adminUsername := fs.String("admin-username", envOr("RS_ACQUISITION_ADMIN_USERNAME", ""), "Telegram username that receives MTProto admin alerts")
+	adminToken := fs.String("admin-bot-token", envOr("RS_ACQUISITION_ADMIN_BOT_TOKEN", os.Getenv("RS_ACQUISITION_ALERT_BOT_TOKEN")), "Telegram Bot API token for admin alerts")
+	adminChatID := fs.String("admin-chat-id", envOr("RS_ACQUISITION_ADMIN_CHAT_ID", os.Getenv("RS_ACQUISITION_ALERT_CHAT_ID")), "Telegram admin chat ID")
+	timezone := fs.String("timezone", envOr("RS_ACQUISITION_TIMEZONE", envOr("TZ", "Europe/Riga")), "Campaign day timezone")
+	dailyLimit := fs.Int("daily-limit", envInt("RS_ACQUISITION_DAILY_LIMIT", 10), "Maximum approved first contacts per day")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cleanToken := strings.TrimSpace(*token)
+	if cleanToken == "" {
+		return fmt.Errorf("--token is required")
+	}
+	loc, err := time.LoadLocation(*timezone)
+	if err != nil {
+		return err
+	}
+	store, err := acquisition.OpenStore(*statePath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	admin, err := buildAdminGateway(*adminMode, *apiID, *apiHash, *senderSessionFile, *adminUsername, *adminToken, *adminChatID, store)
+	if err != nil {
+		return err
+	}
+	outreach := acquisition.NewMTProtoOutreach(acquisition.MTProtoOutreachConfig{
+		APIID:       *apiID,
+		APIHash:     *apiHash,
+		SessionFile: *senderSessionFile,
+	})
+	now := time.Now().UTC()
+	daemon := acquisition.CampaignDaemon{
+		Store: store,
+		Config: acquisition.DaemonConfig{
+			Now:            func() time.Time { return now },
+			Location:       loc,
+			DailyLimit:     *dailyLimit,
+			ExpectedSender: *expectSender,
+		},
+		Admin:    admin,
+		Outreach: outreach,
+	}
+	result, err := daemon.ProcessDecision(ctx, acquisition.AdminDecision{Token: cleanToken, Action: acquisition.AdminApprove})
+	if err != nil {
+		return err
+	}
+	return writeJSON(stdout, map[string]any{
+		"state":       *statePath,
+		"processedAt": now,
+		"result":      result,
+	})
+}
+
 func recordReply(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("record-reply", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -398,6 +525,32 @@ func sendTest(ctx context.Context, args []string, stdout io.Writer) error {
 	return writeJSON(stdout, result)
 }
 
+func senderInfo(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("sender-info", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	apiID := fs.Int("api-id", envInt("RS_ACQUISITION_API_ID", envInt("SATIKSME_CHAT_ANALYZER_API_ID", 0)), "Telegram API ID")
+	apiHash := fs.String("api-hash", envOr("RS_ACQUISITION_API_HASH", os.Getenv("SATIKSME_CHAT_ANALYZER_API_HASH")), "Telegram API hash")
+	sessionFile := fs.String("sender-session-file", envOr("RS_ACQUISITION_SENDER_SESSION_FILE", "./state/rs-acquisition/iamhdzs.session"), "MTProto sender session file")
+	expectSender := fs.String("expect-sender", envOr("RS_ACQUISITION_EXPECT_SENDER", ""), "Expected sender username for the session")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	outreach := acquisition.NewMTProtoOutreach(acquisition.MTProtoOutreachConfig{
+		APIID:       *apiID,
+		APIHash:     *apiHash,
+		SessionFile: *sessionFile,
+	})
+	info, err := outreach.SenderInfo(ctx)
+	if err != nil {
+		return err
+	}
+	expected := cleanUsernameLocal(*expectSender)
+	if expected != "" && cleanUsernameLocal(info.Username) != expected {
+		return fmt.Errorf("sender session is @%s, want @%s", cleanUsernameLocal(info.Username), expected)
+	}
+	return writeJSON(stdout, info)
+}
+
 func readTextValue(text string, textFile string) (string, error) {
 	if strings.TrimSpace(textFile) != "" {
 		raw, err := os.ReadFile(textFile)
@@ -454,7 +607,11 @@ Commands:
   import-candidates   Import candidate JSON into private state
   plan-day            Print the human-review draft batch for today
   mark-sent           Mark one human-approved first contact as sent
+  invalidate-pending-drafts
+                      Reject every unsent approval draft so new copy is generated
+  approve-token       Send one pending approval token through the normal outreach path
   record-reply        Classify a user reply, stop/alert if unsafe, print grant command on consent
+  sender-info         Print the authorized outreach Telegram account id and username
   send-test           Send one explicitly confirmed test DM from the outreach account
   daemon              Run the production admin-approved campaign service loop`)
 }
@@ -496,4 +653,10 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return value
+}
+
+func cleanUsernameLocal(username string) string {
+	username = strings.TrimSpace(username)
+	username = strings.TrimPrefix(username, "@")
+	return strings.ToLower(username)
 }

@@ -239,8 +239,6 @@ func normalizeLanguage(language string) string {
 	switch strings.ToLower(strings.TrimSpace(language)) {
 	case "ru", "rus", "russian":
 		return "ru"
-	case "en", "eng", "english":
-		return "en"
 	default:
 		return "lv"
 	}
@@ -249,11 +247,9 @@ func normalizeLanguage(language string) string {
 func firstContactText(language string, group string, registrations int) string {
 	switch normalizeLanguage(language) {
 	case "ru":
-		return fmt.Sprintf("Привет! Пишу, потому что ты в группе %s. Приглашаю в приватную базу пользователей rs biļete: бесплатно %d регистрации транспорта в день. Если хочешь, ответь «да», и я добавлю доступ.", group, registrations)
-	case "en":
-		return fmt.Sprintf("Hi! I’m writing because you are in the %s group. You’re invited to a private rs biļete user base with %d free transport registrations per day. If you want in, reply “yes” and I’ll add access.", group, registrations)
+		return fmt.Sprintf("Привет! Пишу, потому что ты в группе %s. Приглашаю попробовать @rs_bilete_bot: отправляешь 5-значный код из приложения Rīgas satiksme, бот возвращает QR. Сейчас доступ бесплатно на %d регистрации транспорта в день. Если хочешь, ответь «да», и я добавлю доступ.", group, registrations)
 	default:
-		return fmt.Sprintf("Čau! Rakstu, jo esi %s grupā. Aicinu pievienoties privātai rs biļete lietotāju bāzei: bez maksas %d transporta reģistrācijas dienā. Ja gribi, atbildi “jā” un pievienošu piekļuvi.", group, registrations)
+		return fmt.Sprintf("Čau! Rakstu, jo esi %s grupā. Aicinu izmēģināt @rs_bilete_bot: nosūti 5 ciparu kodu no Rīgas satiksme lietotnes, un bots atsūta QR. Tagad piekļuve ir bez maksas ar %d transporta reģistrācijām dienā. Ja gribi, atbildi “jā” un pievienošu piekļuvi.", group, registrations)
 	}
 }
 

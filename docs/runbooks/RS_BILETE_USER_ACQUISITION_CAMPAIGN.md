@@ -103,8 +103,8 @@ Before enabling it on Arbuzas:
 
 ```bash
 RS_ACQUISITION_ENABLED=false
-RS_ACQUISITION_ADMIN_BOT_TOKEN=<telegram bot token for admin approvals>
-RS_ACQUISITION_ADMIN_CHAT_ID=<admin Telegram chat id>
+RS_ACQUISITION_ADMIN_MODE=mtproto
+RS_ACQUISITION_ADMIN_USERNAME=aldajo
 RS_ACQUISITION_INCLUDE_MEMBERS=false
 ```
 
@@ -158,7 +158,7 @@ docker compose --profile rs_acquisition \
   stop satiksme_rs_acquisition
 ```
 
-Admin approvals are Telegram messages:
+Admin approvals are Telegram messages sent from `@iamhdzs` to `@aldajo`:
 
 ```text
 /approve <token>
