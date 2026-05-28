@@ -244,9 +244,13 @@ func botMessageFromTelegram(message *telegram.Message) bot.Message {
 		return bot.Message{}
 	}
 	msg := bot.Message{
-		ChatID:   message.Chat.ID,
-		ChatType: message.Chat.Type,
-		Text:     message.Text,
+		MessageID: message.MessageID,
+		ChatID:    message.Chat.ID,
+		ChatType:  message.Chat.Type,
+		Text:      message.Text,
+	}
+	if message.ReplyToMessage != nil {
+		msg.ReplyToMessageID = message.ReplyToMessage.MessageID
 	}
 	if message.From != nil {
 		msg.UserID = message.From.ID

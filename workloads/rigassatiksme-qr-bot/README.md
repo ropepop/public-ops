@@ -29,6 +29,14 @@ Daily quota counts only successful QR jobs. Queued/running jobs reserve capacity
 - `/admin allow_chat <telegram_chat_id> [daily_limit]` — allow a Telegram group/supergroup chat and optionally cap that chat's daily usage.
 - `/admin deny_chat <telegram_chat_id>` — disable a group/supergroup chat.
 - `/admin list_access` (alias: `/admin list`) — summarize configured admins, users, groups, and chats.
+- `/admin announce` — start a text-only announcement draft in a private admin chat. Reply to the command with the announcement text, review the preview and recipient count, then press `Send` or `Cancel`. Announcements go only to active allowed users; disabled users, pending grants, groups, and group chats are skipped.
+
+Seasonal announcement copy:
+
+```text
+rs biļete bots ir atjaunināts un tagad darbojas labāk - lūdzu, pamēģini vēlreiz.
+Бот rs biļete обновлён и теперь работает лучше - попробуй ещё раз, пожалуйста.
+```
 
 ## State and SpacetimeDB
 

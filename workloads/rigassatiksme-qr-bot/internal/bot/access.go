@@ -20,6 +20,8 @@ const (
 
 type AccessController interface {
 	RecordUser(ctx context.Context, req AccessRequest) (string, error)
+	IsAdmin(ctx context.Context, req AccessRequest) (bool, error)
+	AnnouncementRecipients(ctx context.Context) ([]AnnouncementRecipient, error)
 	AuthorizeAndConsume(ctx context.Context, req AccessRequest) (AccessDecision, error)
 	AuthorizeAndReserve(ctx context.Context, req AccessRequest, reservationID string) (AccessDecision, error)
 	CommitReservation(ctx context.Context, reservationID string) error
@@ -59,6 +61,11 @@ type AccessRequest struct {
 }
 
 type AccessMentionedUser struct {
+	UserID   string
+	Username string
+}
+
+type AnnouncementRecipient struct {
 	UserID   string
 	Username string
 }
@@ -277,6 +284,35 @@ func (m *AccessManager) RecordUser(_ context.Context, req AccessRequest) (string
 		return "", err
 	}
 	return strings.Join(notices, "\n"), nil
+}
+
+func (m *AccessManager) IsAdmin(_ context.Context, req AccessRequest) (bool, error) {
+	userID := cleanID(req.UserID)
+	if userID == "" {
+		return false, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	return m.state.Admins[userID], nil
+}
+
+func (m *AccessManager) AnnouncementRecipients(_ context.Context) ([]AnnouncementRecipient, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	recipients := make([]AnnouncementRecipient, 0, len(m.state.Users))
+	for _, user := range m.state.Users {
+		userID := cleanID(user.UserID)
+		if userID == "" || !user.Active {
+			continue
+		}
+		recipients = append(recipients, AnnouncementRecipient{UserID: userID, Username: cleanUsername(user.Username)})
+	}
+	sort.Slice(recipients, func(i, j int) bool {
+		return recipients[i].UserID < recipients[j].UserID
+	})
+	return recipients, nil
 }
 
 func (m *AccessManager) AuthorizeAndConsume(_ context.Context, req AccessRequest) (AccessDecision, error) {
@@ -1124,6 +1160,7 @@ func (m *AccessManager) adminHelpTextLocked() string {
 		"/admin allow_chat <chat_id> [daily_limit]",
 		"/admin deny_chat <chat_id>",
 		"/admin list_access (alias: /admin list)",
+		"/admin announce",
 	}, "\n")
 }
 

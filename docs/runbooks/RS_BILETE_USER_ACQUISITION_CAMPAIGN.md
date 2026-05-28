@@ -166,3 +166,44 @@ Admin approvals are Telegram messages sent from `@iamhdzs` to `@aldajo`:
 ```
 
 Keep `RS_ACQUISITION_INCLUDE_MEMBERS=false` for the first production pilot. Set it to `true` only after recent active candidates are exhausted and the approval workflow has been verified.
+
+## Retrying Failed Outreach
+
+Failed first-contact sends are not retried blindly. `PEER_FLOOD` failures are retryable after their cooldown; invalid peers stay skipped unless better Telegram metadata is discovered.
+
+Always dry-run first:
+
+```bash
+docker exec arbuzas-satiksme_rs_acquisition-1 \
+  /usr/local/bin/rs-acquisition-campaign retry-failed \
+  --env-file /srv/satiksme-bot/.env \
+  --state /srv/satiksme-bot/state/rs-acquisition/campaign.db \
+  --all-due \
+  --limit 10
+```
+
+Retry one due token only after the dry-run selects exactly that token:
+
+```bash
+docker exec arbuzas-satiksme_rs_acquisition-1 \
+  /usr/local/bin/rs-acquisition-campaign retry-failed \
+  --env-file /srv/satiksme-bot/.env \
+  --state /srv/satiksme-bot/state/rs-acquisition/campaign.db \
+  --token "<failed-token>" \
+  --limit 1 \
+  --execute
+```
+
+Do not pass `--force` during normal live recovery. If Telegram returns `PEER_FLOOD`, the command records a new backoff and stops before trying another user.
+
+After each retry attempt, inspect daemon logs and failed-draft state:
+
+```bash
+docker logs --since 10m arbuzas-satiksme_rs_acquisition-1
+
+docker exec arbuzas-satiksme_rs_acquisition-1 \
+  sqlite3 /srv/satiksme-bot/state/rs-acquisition/campaign.db \
+  "SELECT d.token,d.status,d.failure_kind,d.retry_count,d.last_retry_at,d.next_retry_at,c.username,c.status,c.stop_reason FROM approval_drafts d JOIN candidates c ON c.user_id=d.user_id WHERE d.status='failed' ORDER BY d.updated_at;"
+```
+
+When deploying `satiksme_bot`, the deploy script also recreates `satiksme_rs_acquisition` if that profile service is already running, so it does not remain on the previous image.

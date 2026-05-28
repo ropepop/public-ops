@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,12 +26,14 @@ type MentionedUser struct {
 }
 
 type Message struct {
-	ChatID         int64
-	ChatType       string
-	UserID         int64
-	Username       string
-	Text           string
-	MentionedUsers []MentionedUser
+	MessageID        int64
+	ReplyToMessageID int64
+	ChatID           int64
+	ChatType         string
+	UserID           int64
+	Username         string
+	Text             string
+	MentionedUsers   []MentionedUser
 }
 
 type Callback struct {
@@ -60,9 +63,10 @@ type QRJob struct {
 }
 
 type ServiceConfig struct {
-	PollInterval time.Duration
-	PollTimeout  time.Duration
-	Access       AccessController
+	PollInterval          time.Duration
+	PollTimeout           time.Duration
+	Access                AccessController
+	AnnouncementSendDelay time.Duration
 }
 
 type Telegram interface {
@@ -88,10 +92,12 @@ type Broker interface {
 }
 
 type Service struct {
-	cfg      ServiceConfig
-	telegram Telegram
-	broker   Broker
-	access   AccessController
+	cfg                ServiceConfig
+	telegram           Telegram
+	broker             Broker
+	access             AccessController
+	announcementMu     sync.Mutex
+	announcementDrafts map[string]announcementDraft
 }
 
 func NewService(cfg ServiceConfig, telegram Telegram, broker Broker) *Service {
@@ -101,7 +107,10 @@ func NewService(cfg ServiceConfig, telegram Telegram, broker Broker) *Service {
 	if cfg.PollTimeout <= 0 {
 		cfg.PollTimeout = 10 * time.Minute
 	}
-	return &Service{cfg: cfg, telegram: telegram, broker: broker, access: cfg.Access}
+	if cfg.AnnouncementSendDelay <= 0 {
+		cfg.AnnouncementSendDelay = 250 * time.Millisecond
+	}
+	return &Service{cfg: cfg, telegram: telegram, broker: broker, access: cfg.Access, announcementDrafts: map[string]announcementDraft{}}
 }
 
 func (s *Service) HandleMessage(ctx context.Context, msg Message) error {
@@ -121,7 +130,13 @@ func (s *Service) HandleMessage(ctx context.Context, msg Message) error {
 			}
 		}
 	}
+	if handled, err := s.handleAnnouncementReply(ctx, msg, accessReq, text, language); handled {
+		return err
+	}
 	if command, args, ok := parseCommand(text); ok {
+		if isAnnouncementCommand(command, args) {
+			return s.handleAnnouncementStart(ctx, msg, accessReq, language)
+		}
 		if s.access != nil {
 			if response, handled, err := s.access.HandleAdminCommand(ctx, accessReq, command, args); handled {
 				if err != nil {
@@ -155,6 +170,9 @@ func (s *Service) HandleMessage(ctx context.Context, msg Message) error {
 }
 
 func (s *Service) HandleCallback(ctx context.Context, callback Callback) error {
+	if handled, err := s.handleAnnouncementCallback(ctx, callback); handled {
+		return err
+	}
 	language, ok := parseLanguageCallback(callback.Data)
 	if !ok {
 		return nil
@@ -166,6 +184,233 @@ func (s *Service) HandleCallback(ctx context.Context, callback Callback) error {
 		}
 	}
 	return s.sendHelp(ctx, callback.ChatID, language)
+}
+
+type announcementDraft struct {
+	ID               string
+	AdminUserID      int64
+	ChatID           int64
+	CommandMessageID int64
+	Text             string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+}
+
+const announcementDraftTTL = 30 * time.Minute
+
+func isAnnouncementCommand(command string, args []string) bool {
+	if cleanCommand(command) != "admin" || len(args) != 1 {
+		return false
+	}
+	return canonicalAdminCommand(args[0]) == "announce"
+}
+
+func (s *Service) handleAnnouncementStart(ctx context.Context, msg Message, accessReq AccessRequest, language string) error {
+	if s.access == nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, accessReq)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+	}
+	if !admin {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	if msg.ChatType != "" && msg.ChatType != "private" {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_private_only"))
+	}
+	if msg.MessageID == 0 {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_tracking_error"))
+	}
+	now := time.Now()
+	draft := announcementDraft{
+		ID:               announcementDraftID(msg.UserID, msg.ChatID, msg.MessageID),
+		AdminUserID:      msg.UserID,
+		ChatID:           msg.ChatID,
+		CommandMessageID: msg.MessageID,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(announcementDraftTTL),
+	}
+	s.announcementMu.Lock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	s.announcementDrafts[draft.ID] = draft
+	s.announcementMu.Unlock()
+	return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_reply_prompt"))
+}
+
+func (s *Service) handleAnnouncementReply(ctx context.Context, msg Message, accessReq AccessRequest, text string, language string) (bool, error) {
+	if msg.ReplyToMessageID == 0 {
+		return false, nil
+	}
+	draft, ok := s.announcementDraftForReply(msg)
+	if !ok {
+		return false, nil
+	}
+	if s.access == nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, accessReq)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+	}
+	if !admin {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_empty"))
+	}
+	recipients, err := s.access.AnnouncementRecipients(ctx)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_recipient_error"))
+	}
+	draft.Text = text
+	s.announcementMu.Lock()
+	s.announcementDrafts[draft.ID] = draft
+	s.announcementMu.Unlock()
+	return true, s.sendAnnouncementPreview(ctx, draft, len(recipients))
+}
+
+func (s *Service) handleAnnouncementCallback(ctx context.Context, callback Callback) (bool, error) {
+	action, draftID, ok := parseAnnouncementCallback(callback.Data)
+	if !ok {
+		return false, nil
+	}
+	req := accessRequestFromCallback(callback)
+	if s.access == nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("lv", "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, req)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "access_check_error"))
+	}
+	if !admin {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("lv", "admin_only"))
+	}
+	draft, ok := s.announcementDraftByID(draftID)
+	if !ok || draft.AdminUserID != callback.UserID || draft.ChatID != callback.ChatID {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_missing"))
+	}
+	if action == "cancel" {
+		s.deleteAnnouncementDraft(draftID)
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_cancelled"))
+	}
+	recipients, err := s.access.AnnouncementRecipients(ctx)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_recipient_error"))
+	}
+	if strings.TrimSpace(draft.Text) == "" {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_empty"))
+	}
+	s.deleteAnnouncementDraft(draftID)
+	if err := s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_started", len(recipients))); err != nil {
+		return true, err
+	}
+	go s.sendAnnouncement(context.Background(), draft.ChatID, draft.Text, recipients)
+	return true, nil
+}
+
+func (s *Service) announcementDraftForReply(msg Message) (announcementDraft, bool) {
+	now := time.Now()
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	draftID := announcementDraftID(msg.UserID, msg.ChatID, msg.ReplyToMessageID)
+	draft, ok := s.announcementDrafts[draftID]
+	if !ok {
+		return announcementDraft{}, false
+	}
+	if draft.ExpiresAt.Before(now) {
+		delete(s.announcementDrafts, draftID)
+		return announcementDraft{}, false
+	}
+	return draft, true
+}
+
+func (s *Service) announcementDraftByID(draftID string) (announcementDraft, bool) {
+	now := time.Now()
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	draft, ok := s.announcementDrafts[draftID]
+	if !ok || draft.ExpiresAt.Before(now) {
+		delete(s.announcementDrafts, draftID)
+		return announcementDraft{}, false
+	}
+	return draft, true
+}
+
+func (s *Service) deleteAnnouncementDraft(draftID string) {
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	delete(s.announcementDrafts, draftID)
+}
+
+func (s *Service) cleanupExpiredAnnouncementDraftsLocked(now time.Time) {
+	for id, draft := range s.announcementDrafts {
+		if !draft.ExpiresAt.IsZero() && draft.ExpiresAt.Before(now) {
+			delete(s.announcementDrafts, id)
+		}
+	}
+}
+
+func (s *Service) sendAnnouncementPreview(ctx context.Context, draft announcementDraft, recipientCount int) error {
+	text := fmt.Sprintf("Announcement preview\nRecipients: %d\n\n%s", recipientCount, draft.Text)
+	buttons := [][]InlineButton{{
+		{Text: "Send", Data: "announce:send:" + draft.ID},
+		{Text: "Cancel", Data: "announce:cancel:" + draft.ID},
+	}}
+	if sender, ok := s.telegram.(buttonTelegram); ok {
+		return sender.SendMessageWithButtons(ctx, draft.ChatID, text, buttons)
+	}
+	return s.telegram.SendMessage(ctx, draft.ChatID, text)
+}
+
+func (s *Service) sendAnnouncement(ctx context.Context, adminChatID int64, text string, recipients []AnnouncementRecipient) {
+	sent := 0
+	failed := 0
+	for i, recipient := range recipients {
+		if i > 0 && s.cfg.AnnouncementSendDelay > 0 {
+			timer := time.NewTimer(s.cfg.AnnouncementSendDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				_ = s.telegram.SendMessage(context.Background(), adminChatID, fmt.Sprintf("Announcement sent to %d users; failed for %d.", sent, failed+len(recipients)-i))
+				return
+			case <-timer.C:
+			}
+		}
+		chatID, err := strconv.ParseInt(strings.TrimSpace(recipient.UserID), 10, 64)
+		if err != nil || chatID == 0 {
+			failed++
+			continue
+		}
+		if err := s.telegram.SendMessage(ctx, chatID, text); err != nil {
+			failed++
+			continue
+		}
+		sent++
+	}
+	_ = s.telegram.SendMessage(context.Background(), adminChatID, fmt.Sprintf("Announcement sent to %d users; failed for %d.", sent, failed))
+}
+
+func announcementDraftID(adminUserID int64, chatID int64, commandMessageID int64) string {
+	return fmt.Sprintf("%d-%d-%d", adminUserID, chatID, commandMessageID)
+}
+
+func parseAnnouncementCallback(data string) (string, string, bool) {
+	data = strings.TrimSpace(data)
+	for _, action := range []string{"send", "cancel"} {
+		prefix := "announce:" + action + ":"
+		if strings.HasPrefix(data, prefix) {
+			draftID := strings.TrimSpace(strings.TrimPrefix(data, prefix))
+			if draftID == "" {
+				return "", "", false
+			}
+			return action, draftID, true
+		}
+	}
+	return "", "", false
 }
 
 func (s *Service) handleCode(ctx context.Context, msg Message, accessReq AccessRequest, userID string, code string, language string) error {
@@ -613,6 +858,22 @@ func botTextEN(key string) string {
 		return "Admin only."
 	case "unknown_admin":
 		return "Unknown admin command. Use /admin for help."
+	case "announce_private_only":
+		return "Announcement commands work only in private admin chats."
+	case "announce_tracking_error":
+		return "I could not track this announcement command. Send /admin announce again."
+	case "announce_reply_prompt":
+		return "Reply to this command with the announcement text. I will preview it before sending."
+	case "announce_empty":
+		return "Announcement text is empty. Reply with the text you want to send."
+	case "announce_recipient_error":
+		return "Could not list announcement recipients."
+	case "announce_missing":
+		return "Announcement draft not found or expired. Send /admin announce again."
+	case "announce_cancelled":
+		return "Announcement cancelled."
+	case "announce_started":
+		return "Announcement sending started for %d users."
 	}
 	return ""
 }

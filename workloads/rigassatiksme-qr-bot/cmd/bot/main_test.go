@@ -75,6 +75,28 @@ func TestBotMessageFromTelegramCapturesTextMentionUserIDs(t *testing.T) {
 	}
 }
 
+func TestBotMessageFromTelegramCapturesReplyMessageIDs(t *testing.T) {
+	msg := botMessageFromTelegram(&telegram.Message{
+		MessageID: 22,
+		Chat:      telegram.Chat{ID: 7, Type: "private"},
+		From:      &telegram.User{ID: 7, Username: "admin"},
+		Text:      "announcement text",
+		ReplyToMessage: &telegram.Message{
+			MessageID: 10,
+			Chat:      telegram.Chat{ID: 7, Type: "private"},
+			From:      &telegram.User{ID: 7, Username: "admin"},
+			Text:      "/admin announce",
+		},
+	})
+
+	if msg.MessageID != 22 {
+		t.Fatalf("MessageID = %d, want 22", msg.MessageID)
+	}
+	if msg.ReplyToMessageID != 10 {
+		t.Fatalf("ReplyToMessageID = %d, want 10", msg.ReplyToMessageID)
+	}
+}
+
 func TestRegisterBotCommandsSetsLatvianDefaultAndRussianVariant(t *testing.T) {
 	setter := &fakeCommandSetter{}
 

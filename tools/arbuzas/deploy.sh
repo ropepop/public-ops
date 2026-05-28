@@ -2161,8 +2161,12 @@ remote_compose_up() {
   local all_non_dns_service_args=""
   local tunnel_service_args=""
   local dns_release_prepare_needed="false"
+  local satiksme_rs_acquisition_followup="false"
   non_dns_service_args="$(compose_target_service_args_without_dns)"
   all_non_dns_service_args="$(compose_all_non_dns_service_args)"
+  if targeted_service_selected satiksme_bot; then
+    satiksme_rs_acquisition_followup="true"
+  fi
   if (( TARGETED_MODE == 1 )); then
     tunnel_service_args="$(compose_target_tunnel_service_args)"
   else
@@ -2196,6 +2200,9 @@ remote_compose_up() {
       if [[ -n '${tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
       fi
+      if ${satiksme_rs_acquisition_followup} && docker ps --format '{{.Names}}' | grep -qx 'arbuzas-satiksme_rs_acquisition-1'; then
+        docker compose --profile rs_acquisition --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps satiksme_rs_acquisition
+      fi
     "
     return
   fi
@@ -2213,6 +2220,9 @@ remote_compose_up() {
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}
     if [[ -n '${tunnel_service_args}' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+    fi
+    if ${satiksme_rs_acquisition_followup} && docker ps --format '{{.Names}}' | grep -qx 'arbuzas-satiksme_rs_acquisition-1'; then
+      docker compose --profile rs_acquisition --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps satiksme_rs_acquisition
     fi
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
   "

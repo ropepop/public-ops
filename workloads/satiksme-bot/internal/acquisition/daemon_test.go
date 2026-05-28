@@ -660,6 +660,195 @@ func TestDaemonCycleUnsafeReplyStopsAndAlerts(t *testing.T) {
 	}
 }
 
+func TestDaemonRetryFailedDraftSuccessMarksSentAndContacted(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC)
+	store := openTestStore(t)
+	if err := store.UpsertCandidates(ctx, []Candidate{{UserID: 42, Username: "target", Source: SourceRecentActive}}, now); err != nil {
+		t.Fatalf("UpsertCandidates: %v", err)
+	}
+	if _, err := store.CreatePendingDraft(ctx, Candidate{UserID: 42, Username: "target"}, Draft{UserID: 42, Username: "target", Text: "hello"}, "tok-1", now); err != nil {
+		t.Fatalf("CreatePendingDraft: %v", err)
+	}
+	if _, _, err := store.MarkDraftOutreachFailed(ctx, "tok-1", "PEER_FLOOD target=@target", now); err != nil {
+		t.Fatalf("MarkDraftOutreachFailed: %v", err)
+	}
+	admin := &fakeAdminGateway{}
+	outreach := &fakeOutreach{sender: "iamhdzs"}
+	daemon := CampaignDaemon{
+		Store: store,
+		Config: DaemonConfig{
+			Now:                 func() time.Time { return now.Add(13 * time.Hour) },
+			Location:            time.UTC,
+			DailyLimit:          10,
+			ExpectedSender:      "iamhdzs",
+			RetryFailedCooldown: 12 * time.Hour,
+			RetryFailedLimit:    1,
+		},
+		Admin:    admin,
+		Outreach: outreach,
+	}
+
+	result, err := daemon.RetryFailedDrafts(ctx, RetryFailedOptions{Force: true})
+	if err != nil {
+		t.Fatalf("RetryFailedDrafts: %v", err)
+	}
+
+	if result.Processed != 1 || result.MessagesSent != 1 || len(outreach.sent) != 1 || outreach.sent[0].UserID != 42 {
+		t.Fatalf("result=%+v sent=%+v, want one retry send to user 42", result, outreach.sent)
+	}
+	candidate, ok, err := store.Candidate(ctx, 42)
+	if err != nil {
+		t.Fatalf("Candidate: %v", err)
+	}
+	if !ok || candidate.Status != StatusContacted || candidate.StopReason != "" {
+		t.Fatalf("candidate=%+v found=%v, want contacted without stop reason", candidate, ok)
+	}
+	count, err := store.DailyFirstContactCount(ctx, "2026-05-26")
+	if err != nil {
+		t.Fatalf("DailyFirstContactCount: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("daily count=%d, want retry success counted", count)
+	}
+	if len(admin.alerts) != 1 || !strings.Contains(admin.alerts[0], "retry sent") {
+		t.Fatalf("alerts=%+v, want retry sent alert", admin.alerts)
+	}
+}
+
+func TestDaemonRetryFailedDraftFloodFailureStopsAndBacksOff(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC)
+	store := openTestStore(t)
+	if err := store.UpsertCandidates(ctx, []Candidate{
+		{UserID: 42, Username: "first", Source: SourceRecentActive},
+		{UserID: 43, Username: "second", Source: SourceRecentActive},
+	}, now); err != nil {
+		t.Fatalf("UpsertCandidates: %v", err)
+	}
+	for _, item := range []struct {
+		userID int64
+		token  string
+	}{
+		{42, "tok-first"},
+		{43, "tok-second"},
+	} {
+		if _, err := store.CreatePendingDraft(ctx, Candidate{UserID: item.userID}, Draft{UserID: item.userID, Text: "hello"}, item.token, now); err != nil {
+			t.Fatalf("CreatePendingDraft %s: %v", item.token, err)
+		}
+		if _, _, err := store.MarkDraftOutreachFailed(ctx, item.token, "PEER_FLOOD", now); err != nil {
+			t.Fatalf("MarkDraftOutreachFailed %s: %v", item.token, err)
+		}
+	}
+	admin := &fakeAdminGateway{}
+	outreach := &fakeOutreach{
+		sender:        "iamhdzs",
+		sendErrByUser: map[int64]error{42: errors.New("callback: rpcDoRequest: rpc error code 400: PEER_FLOOD")},
+	}
+	daemon := CampaignDaemon{
+		Store: store,
+		Config: DaemonConfig{
+			Now:                 func() time.Time { return now.Add(13 * time.Hour) },
+			Location:            time.UTC,
+			DailyLimit:          10,
+			ExpectedSender:      "iamhdzs",
+			RetryFailedCooldown: 12 * time.Hour,
+			RetryFailedLimit:    2,
+		},
+		Admin:    admin,
+		Outreach: outreach,
+	}
+
+	result, err := daemon.RetryFailedDrafts(ctx, RetryFailedOptions{Force: true, Limit: 2})
+	if err != nil {
+		t.Fatalf("RetryFailedDrafts: %v", err)
+	}
+
+	if result.Processed != 1 || result.MessagesSent != 0 || result.UnreachableTargets != 1 || !result.StoppedOnFlood {
+		t.Fatalf("result=%+v, want first failed retry to stop the batch on flood", result)
+	}
+	if len(outreach.sent) != 0 {
+		t.Fatalf("sent=%+v, want no successful sends", outreach.sent)
+	}
+	first, found, err := store.DraftByToken(ctx, "tok-first")
+	if err != nil || !found {
+		t.Fatalf("DraftByToken first found=%v err=%v", found, err)
+	}
+	if first.RetryCount != 1 || first.NextRetryAt.IsZero() || first.NextRetryAt.Before(now.Add(24*time.Hour)) {
+		t.Fatalf("first draft=%+v, want retry count and future backoff", first)
+	}
+	second, found, err := store.DraftByToken(ctx, "tok-second")
+	if err != nil || !found {
+		t.Fatalf("DraftByToken second found=%v err=%v", found, err)
+	}
+	if second.RetryCount != 0 {
+		t.Fatalf("second draft=%+v, want second job untouched after stop-on-flood", second)
+	}
+	if len(admin.alerts) != 1 || !strings.Contains(admin.alerts[0], "retry failed") || !strings.Contains(admin.alerts[0], "PEER_FLOOD") {
+		t.Fatalf("alerts=%+v, want retry failure flood alert", admin.alerts)
+	}
+}
+
+func TestDaemonCycleAutoRetryProcessesAtMostOneFailedDraftAndStillPollsReplies(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC)
+	store := openTestStore(t)
+	if err := store.UpsertCandidates(ctx, []Candidate{
+		{UserID: 42, Username: "first", Source: SourceRecentActive},
+		{UserID: 43, Username: "second", Source: SourceRecentActive},
+		{UserID: 44, Username: "replytarget", Source: SourceRecentActive},
+	}, now); err != nil {
+		t.Fatalf("UpsertCandidates: %v", err)
+	}
+	for _, item := range []struct {
+		userID int64
+		token  string
+	}{
+		{42, "tok-first"},
+		{43, "tok-second"},
+	} {
+		if _, err := store.CreatePendingDraft(ctx, Candidate{UserID: item.userID}, Draft{UserID: item.userID, Text: "hello"}, item.token, now); err != nil {
+			t.Fatalf("CreatePendingDraft %s: %v", item.token, err)
+		}
+		if _, _, err := store.MarkDraftOutreachFailed(ctx, item.token, "PEER_FLOOD", now); err != nil {
+			t.Fatalf("MarkDraftOutreachFailed %s: %v", item.token, err)
+		}
+	}
+	if err := store.RecordFirstContactForDay(ctx, 44, "sent", "2026-05-26", now); err != nil {
+		t.Fatalf("RecordFirstContactForDay: %v", err)
+	}
+	admin := &fakeAdminGateway{}
+	outreach := &fakeOutreach{sender: "iamhdzs"}
+	daemon := CampaignDaemon{
+		Store: store,
+		Config: DaemonConfig{
+			Now:                 func() time.Time { return now.Add(13 * time.Hour) },
+			Location:            time.UTC,
+			DailyLimit:          10,
+			ExpectedSender:      "iamhdzs",
+			RetryFailedEnabled:  true,
+			RetryFailedCooldown: 12 * time.Hour,
+			RetryFailedLimit:    1,
+		},
+		Collector: fakeCandidateCollector{},
+		Admin:     admin,
+		Outreach:  outreach,
+		Replies:   fakeReplySource{replies: []ContactReply{{UserID: 44, MessageID: 12, Text: "ok"}}},
+	}
+
+	result, err := daemon.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if result.FailedRetriesProcessed != 1 || result.FailedRetriesSent != 1 || result.MessagesSent != 1 || result.RepliesProcessed != 1 {
+		t.Fatalf("result=%+v, want one retry and reply polling to continue", result)
+	}
+	if len(outreach.sent) != 1 || outreach.sent[0].UserID != 42 {
+		t.Fatalf("sent=%+v, want only first failed draft retried", outreach.sent)
+	}
+}
+
 type fakeCandidateCollector struct {
 	candidates []Candidate
 }

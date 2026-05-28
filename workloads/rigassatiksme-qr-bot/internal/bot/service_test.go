@@ -134,6 +134,129 @@ func TestServiceLanguageCallbackStoresPreferenceAndHelpUsesIt(t *testing.T) {
 	}
 }
 
+func TestAnnouncementCommandRejectsNonAdmin(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 42, ChatType: "private", UserID: 42, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !telegram.hasMessageContaining("Tikai administratoram") {
+		t.Fatalf("non-admin announcement command should get admin-only response: %#v", telegram.messages)
+	}
+}
+
+func TestAnnouncementCommandPromptsAdminToReply(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !telegram.hasMessageContaining("Reply to this command") {
+		t.Fatalf("announcement reply prompt missing: %#v", telegram.messages)
+	}
+}
+
+func TestAnnouncementReplyCreatesPreviewWithoutSending(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	seedAnnouncementUser(access, "42", true)
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+	text := seasonalAnnouncementTestText()
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 11, ReplyToMessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: text}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !telegram.hasMessageContaining("Recipients: 1") || !telegram.hasMessageContaining("rs biļete bots ir atjaunināts") {
+		t.Fatalf("announcement preview missing count or text: %#v", telegram.messages)
+	}
+	if !telegram.hasButton("Send", "announce:send:7-7-10") || !telegram.hasButton("Cancel", "announce:cancel:7-7-10") {
+		t.Fatalf("announcement preview buttons missing: %#v", telegram.buttonMessages)
+	}
+	if telegram.hasTextMessageTo(42, text) {
+		t.Fatalf("announcement should not send before confirmation: %#v", telegram.textMessages)
+	}
+}
+
+func TestAnnouncementConfirmSendsOnlyActiveAllowedUsersAndReportsFailures(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	seedAnnouncementUser(access, "42", true)
+	seedAnnouncementUser(access, "43", true)
+	seedAnnouncementUser(access, "44", false)
+	seedPendingAnnouncementGrant(access, "pending_user")
+	telegram := &fakeTelegram{failSendFor: map[int64]error{43: errors.New("blocked")}}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+	text := seasonalAnnouncementTestText()
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 11, ReplyToMessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleCallback(context.Background(), Callback{ChatID: 7, ChatType: "private", UserID: 7, Data: "announce:send:7-7-10"}); err != nil {
+		t.Fatal(err)
+	}
+
+	telegram.waitForTextMessageTo(t, 42, text)
+	telegram.waitForMessageContaining(t, "Announcement sent to 1 users; failed for 1.")
+	if telegram.hasTextMessageTo(44, text) {
+		t.Fatalf("disabled user received announcement: %#v", telegram.textMessages)
+	}
+}
+
+func TestAnnouncementCancelDeletesDraftAndSendsNothing(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	seedAnnouncementUser(access, "42", true)
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+	text := seasonalAnnouncementTestText()
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 11, ReplyToMessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleCallback(context.Background(), Callback{ChatID: 7, ChatType: "private", UserID: 7, Data: "announce:cancel:7-7-10"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !telegram.hasMessageContaining("Announcement cancelled") {
+		t.Fatalf("cancel confirmation missing: %#v", telegram.messages)
+	}
+	if telegram.hasTextMessageTo(42, text) {
+		t.Fatalf("cancelled announcement was sent: %#v", telegram.textMessages)
+	}
+}
+
+func TestAnnouncementIgnoresWrongReply(t *testing.T) {
+	access := NewMemoryAccessManager(AccessConfig{AdminUserIDs: []string{"7"}, DefaultOpen: false, Clock: fixedAccessClock(t)})
+	seedAnnouncementUser(access, "42", true)
+	telegram := &fakeTelegram{}
+	service := NewService(ServiceConfig{Access: access}, telegram, &fakeBroker{})
+
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 10, ChatID: 7, ChatType: "private", UserID: 7, Text: "/admin announce"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.HandleMessage(context.Background(), Message{MessageID: 11, ReplyToMessageID: 999, ChatID: 7, ChatType: "private", UserID: 7, Text: seasonalAnnouncementTestText()}); err != nil {
+		t.Fatal(err)
+	}
+
+	if telegram.hasButton("Send", "announce:send:7-7-10") {
+		t.Fatalf("wrong reply should not create announcement preview: %#v", telegram.buttonMessages)
+	}
+}
+
 func TestServiceRejectsInvalidCode(t *testing.T) {
 	broker := &fakeBroker{}
 	telegram := &fakeTelegram{}
@@ -404,8 +527,15 @@ func (b *fakeBroker) JobImage(ctx context.Context, id string) ([]byte, string, e
 type fakeTelegram struct {
 	mu             sync.Mutex
 	messages       []string
+	textMessages   []sentTextMessage
 	buttonMessages []sentButtonMessage
 	photos         []sentPhoto
+	failSendFor    map[int64]error
+}
+
+type sentTextMessage struct {
+	chatID int64
+	text   string
 }
 
 type sentButtonMessage struct {
@@ -424,14 +554,22 @@ type sentPhoto struct {
 func (t *fakeTelegram) SendMessage(ctx context.Context, chatID int64, text string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := t.failSendFor[chatID]; err != nil {
+		return err
+	}
 	t.messages = append(t.messages, text)
+	t.textMessages = append(t.textMessages, sentTextMessage{chatID: chatID, text: text})
 	return nil
 }
 
 func (t *fakeTelegram) SendMessageWithButtons(ctx context.Context, chatID int64, text string, buttons [][]InlineButton) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := t.failSendFor[chatID]; err != nil {
+		return err
+	}
 	t.messages = append(t.messages, text)
+	t.textMessages = append(t.textMessages, sentTextMessage{chatID: chatID, text: text})
 	t.buttonMessages = append(t.buttonMessages, sentButtonMessage{chatID: chatID, text: text, buttons: buttons})
 	return nil
 }
@@ -454,6 +592,17 @@ func (t *fakeTelegram) hasMessageContaining(part string) bool {
 	return false
 }
 
+func (t *fakeTelegram) hasTextMessageTo(chatID int64, text string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, message := range t.textMessages {
+		if message.chatID == chatID && message.text == text {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *fakeTelegram) hasButton(text string, data string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -467,6 +616,21 @@ func (t *fakeTelegram) hasButton(text string, data string) bool {
 		}
 	}
 	return false
+}
+
+func (t *fakeTelegram) waitForTextMessageTo(tst *testing.T, chatID int64, text string) {
+	tst.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if t.hasTextMessageTo(chatID, text) {
+			return
+		}
+		select {
+		case <-deadline:
+			tst.Fatalf("timed out waiting for message to %d: %#v", chatID, t.textMessages)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 func (t *fakeTelegram) waitForPhoto(tst *testing.T) sentPhoto {
@@ -486,6 +650,28 @@ func (t *fakeTelegram) waitForPhoto(tst *testing.T) sentPhoto {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+func seedAnnouncementUser(access *AccessManager, userID string, active bool) {
+	access.mu.Lock()
+	defer access.mu.Unlock()
+	access.ensureMapsLocked()
+	access.state.Users[userID] = AccessUser{UserID: userID, Active: active, DailyLimit: 20, CreatedAt: nowText(fixedAnnouncementTestTime()), UpdatedAt: nowText(fixedAnnouncementTestTime())}
+}
+
+func seedPendingAnnouncementGrant(access *AccessManager, username string) {
+	access.mu.Lock()
+	defer access.mu.Unlock()
+	access.ensureMapsLocked()
+	access.state.PendingUserGrants[usernameKey(username)] = PendingAccessUserGrant{Username: username, DailyLimit: 20, CreatedAt: nowText(fixedAnnouncementTestTime()), UpdatedAt: nowText(fixedAnnouncementTestTime())}
+}
+
+func seasonalAnnouncementTestText() string {
+	return "rs biļete bots ir atjaunināts un tagad darbojas labāk - lūdzu, pamēģini vēlreiz.\nБот rs biļete обновлён и теперь работает лучше - попробуй ещё раз, пожалуйста."
+}
+
+func fixedAnnouncementTestTime() time.Time {
+	return time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
 }
 
 func (t *fakeTelegram) waitForMessageContaining(tst *testing.T, part string) string {

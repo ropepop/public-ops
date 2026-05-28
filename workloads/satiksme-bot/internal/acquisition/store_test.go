@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -226,6 +227,52 @@ func TestStoreMarksDraftOutreachFailed(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("daily count=%d, want failed outreach not counted", count)
+	}
+}
+
+func TestStoreListsOnlyDueRetryablePeerFloodFailedDrafts(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC)
+	store := openTestStore(t)
+	if err := store.UpsertCandidates(ctx, []Candidate{
+		{UserID: 42, Username: "flooded", Source: SourceRecentActive},
+		{UserID: 43, Username: "invalid", Source: SourceRecentActive},
+		{UserID: 44, Username: "future", Source: SourceRecentActive},
+	}, now); err != nil {
+		t.Fatalf("UpsertCandidates: %v", err)
+	}
+	for _, item := range []struct {
+		userID int64
+		token  string
+		reason string
+	}{
+		{42, "tok-flood", "PEER_FLOOD target=@flooded"},
+		{43, "tok-invalid", "PEER_ID_INVALID target=@invalid"},
+		{44, "tok-future", "PEER_FLOOD target=@future"},
+	} {
+		if _, err := store.CreatePendingDraft(ctx, Candidate{UserID: item.userID}, Draft{UserID: item.userID, Text: "hello"}, item.token, now); err != nil {
+			t.Fatalf("CreatePendingDraft %s: %v", item.token, err)
+		}
+		if _, _, err := store.MarkDraftOutreachFailed(ctx, item.token, item.reason, now); err != nil {
+			t.Fatalf("MarkDraftOutreachFailed %s: %v", item.token, err)
+		}
+	}
+	if err := store.RecordFailedDraftRetryFailure(ctx, "tok-future", "PEER_FLOOD target=@future", now.Add(24*time.Hour), now.Add(time.Hour)); err != nil {
+		t.Fatalf("RecordFailedDraftRetryFailure future: %v", err)
+	}
+
+	drafts, err := store.FailedDraftsForRetry(ctx, FailedDraftRetryQuery{
+		Now:   now.Add(13 * time.Hour),
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("FailedDraftsForRetry: %v", err)
+	}
+	if len(drafts) != 1 || drafts[0].Token != "tok-flood" {
+		t.Fatalf("drafts=%+v, want only due peer flood draft", drafts)
+	}
+	if drafts[0].FailureKind != FailureKindPeerFlood || !strings.Contains(drafts[0].FailureReason, "PEER_FLOOD") {
+		t.Fatalf("draft=%+v, want peer flood failure metadata", drafts[0])
 	}
 }
 

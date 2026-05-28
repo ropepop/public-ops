@@ -40,12 +40,13 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID int64           `json:"message_id"`
-	From      *User           `json:"from,omitempty"`
-	Chat      Chat            `json:"chat"`
-	Date      int64           `json:"date"`
-	Text      string          `json:"text,omitempty"`
-	Entities  []MessageEntity `json:"entities,omitempty"`
+	MessageID      int64           `json:"message_id"`
+	From           *User           `json:"from,omitempty"`
+	Chat           Chat            `json:"chat"`
+	Date           int64           `json:"date"`
+	Text           string          `json:"text,omitempty"`
+	Entities       []MessageEntity `json:"entities,omitempty"`
+	ReplyToMessage *Message        `json:"reply_to_message,omitempty"`
 }
 
 type User struct {
