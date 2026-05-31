@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -1247,11 +1248,11 @@ func TestRigasSatiksmeBatchTimeoutScalesWithBatchSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80*time.Millisecond)})
+	secondJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "58011", Now: now.Add(80 * time.Millisecond)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190*time.Millisecond)})
+	thirdJob, err := b.EnqueueQRJob(ctx, QRJobInput{ChatID: "1001", UserID: "42", Code: "27515", Now: now.Add(190 * time.Millisecond)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2082,6 +2083,94 @@ func TestHealthExposesUpstreamControlCodeRequestForCommandAcceptance(t *testing.
 	}
 	if _, ok := payload["state"].(map[string]any); !ok {
 		t.Fatalf("health response lost broker state: %s", body)
+	}
+	upstreamStatus, ok := payload["upstream"].(map[string]any)
+	if !ok {
+		t.Fatalf("health did not expose upstream status: %s", body)
+	}
+	if upstreamStatus["ok"] != true {
+		t.Fatalf("upstream status = %#v", upstreamStatus)
+	}
+}
+
+func TestHealthReportsUnavailableUpstreamWithoutFailingBrokerLiveness(t *testing.T) {
+	upstream := newFakePhone(t)
+	upstreamURL := upstream.URL
+	upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstreamURL,
+		PhoneSendTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readResponseBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d body = %s", resp.StatusCode, body)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("health ok = %#v body = %s", payload["ok"], body)
+	}
+	upstreamStatus, ok := payload["upstream"].(map[string]any)
+	if !ok {
+		t.Fatalf("health did not expose upstream status: %s", body)
+	}
+	if upstreamStatus["ok"] != false {
+		t.Fatalf("upstream status = %#v", upstreamStatus)
+	}
+	if strings.TrimSpace(fmt.Sprint(upstreamStatus["error"])) == "" {
+		t.Fatalf("upstream status did not include an error: %#v", upstreamStatus)
+	}
+}
+
+func TestStrictHealthFailsWhenUpstreamUnavailable(t *testing.T) {
+	upstream := newFakePhone(t)
+	upstreamURL := upstream.URL
+	upstream.Close()
+
+	b, err := New(Config{
+		UpstreamBaseURL:  upstreamURL,
+		PhoneSendTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/health?strict=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readResponseBody(t, resp)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("strict health status = %d body = %s", resp.StatusCode, body)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["ok"] != false {
+		t.Fatalf("strict health ok = %#v body = %s", payload["ok"], body)
+	}
+	upstreamStatus, ok := payload["upstream"].(map[string]any)
+	if !ok {
+		t.Fatalf("strict health did not expose upstream status: %s", body)
+	}
+	if upstreamStatus["ok"] != false {
+		t.Fatalf("strict upstream status = %#v", upstreamStatus)
 	}
 }
 

@@ -1413,22 +1413,33 @@ func (b *Broker) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ok":    true,
 		"state": b.Snapshot(time.Now()),
 	}
-	if health, ok := b.upstreamHealthSnapshot(r.Context()); ok {
+	status := http.StatusOK
+	strict := r.URL.Query().Get("strict") == "1" || r.URL.Query().Get("requireUpstream") == "1"
+	health, upstreamOK, upstreamErr := b.upstreamHealthSnapshot(r.Context())
+	upstreamStatus := map[string]any{"ok": upstreamOK}
+	if upstreamErr != nil {
+		upstreamStatus["error"] = upstreamErr.Error()
+	}
+	response["upstream"] = upstreamStatus
+	if upstreamOK {
 		if strings.TrimSpace(health.ControlCodeRequest.RequestID) != "" {
 			response["controlCodeRequest"] = health.ControlCodeRequest
 		}
 		if strings.TrimSpace(health.RigasSatiksmeBatch.BatchID) != "" {
 			response["rigasSatiksmeBatch"] = health.RigasSatiksmeBatch
 		}
+	} else if strict {
+		response["ok"] = false
+		status = http.StatusServiceUnavailable
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, status, response)
 }
 
-func (b *Broker) upstreamHealthSnapshot(ctx context.Context) (upstreamHealth, bool) {
+func (b *Broker) upstreamHealthSnapshot(ctx context.Context) (upstreamHealth, bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, healthUpstreamProbeTimeout)
 	defer cancel()
 	health, err := b.fetchUpstreamHealth(probeCtx)
-	return health, err == nil
+	return health, err == nil, err
 }
 
 func (b *Broker) handleState(w http.ResponseWriter, r *http.Request) {

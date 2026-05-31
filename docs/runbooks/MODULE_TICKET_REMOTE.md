@@ -30,6 +30,16 @@ The public endpoint sits behind Cloudflare Access for page and API use. A plain 
 
 To confirm the newest page is live, compare the page's embedded version with `/api/v1/health` `serverVersion`, then check that response headers are no-store/dynamic instead of a stale cached response.
 
+For phone-stream failures, validate the private phone path before debugging the public page:
+
+```bash
+ssh arbuzas 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T ticket_phone_bridge /usr/local/bin/ticket-phone-bridge-health'
+ssh arbuzas "docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:\${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\"'"
+ssh arbuzas 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml logs --since 10m ticket_phone_bridge phone_broker ticket_remote'
+```
+
+`ticket_phone_bridge` has its own healthcheck and watchdog. It verifies the Pixel is connected over ADB, the exact ADB forward exists, and the forwarded Pixel health endpoint answers. If that check fails while `socat` is still listening, the bridge loop stops the listener, removes the stale ADB forward, reconnects to the Pixel, and starts a fresh listener. `phone_broker` keeps normal liveness independent, but `/api/v1/health?strict=1` fails when the private phone upstream is not reachable, so deploy validation catches the same failure mode that previously hid behind a healthy container.
+
 ## Cloudflare Access
 
 Configure a self-hosted Access app for `ticket.jolkins.id.lv`.

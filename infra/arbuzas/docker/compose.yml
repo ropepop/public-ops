@@ -296,7 +296,19 @@ services:
       TICKET_PHONE_DEVICE_PORT: "9388"
       TICKET_PHONE_ADB_FORWARD_PORT: "19389"
       TICKET_PHONE_BRIDGE_PORT: "9388"
+      TICKET_PHONE_HEALTH_INTERVAL: "5"
+      TICKET_PHONE_HEALTH_TIMEOUT: "2"
     restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/usr/local/bin/ticket-phone-bridge-health >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     dns:
       - 1.1.1.1
       - 1.0.0.1

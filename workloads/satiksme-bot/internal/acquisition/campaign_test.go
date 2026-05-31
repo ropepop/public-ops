@@ -69,14 +69,14 @@ func TestDraftFirstContactMentionsBotGroupAndMatchesLanguage(t *testing.T) {
 		{
 			name:     "latvian",
 			language: "lv",
-			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5 ciparu", "QR", "4"},
-			forbid:   []string{"Привет", "aldajo", "owner", "api", "session"},
+			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5 ciparu transporta numuru", "QR", "4"},
+			forbid:   []string{"Привет", "no Rīgas satiksme lietotnes", "aldajo", "owner", "api", "session"},
 		},
 		{
 			name:     "russian",
 			language: "ru",
-			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5-знач", "QR", "4"},
-			forbid:   []string{"Čau", "aldajo", "owner", "api", "session"},
+			want:     []string{"Rīgas Zaķi", "@rs_bilete_bot", "5-значный номер транспорта", "QR", "4"},
+			forbid:   []string{"Čau", "из приложения Rīgas satiksme", "aldajo", "owner", "api", "session"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -37,7 +37,7 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 420,
-      "sha256": "16437dc11c38f2e9067ff4795c598cd84185eea63b4badbc470174a31fea4589",
+      "sha256": "424a9867f4f9cd10bd16a76bd326fa135049f09a9bf40e14a42bf1f23dd4a677",
       "size": 1198
     },
     "etc/arbuzas/dns/arbuzas-dns.yaml": {
@@ -242,5 +242,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1779957815
+  "updatedEpochSeconds": 1780034655
 }

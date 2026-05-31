@@ -6,6 +6,8 @@ SCRIPT_PATH="${REPO_ROOT}/tools/arbuzas/deploy.sh"
 COMPOSE_PATH="${REPO_ROOT}/infra/arbuzas/docker/compose.yml"
 TRAIN_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/train-bot.Dockerfile"
 SATIKSME_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/satiksme-bot.Dockerfile"
+TICKET_PHONE_BRIDGE_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket-phone-bridge.Dockerfile"
+TICKET_PHONE_BRIDGE_HEALTH_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket-phone-bridge-health.sh"
 TRAIN_LDFLAGS_PATH="${REPO_ROOT}/workloads/train-bot/scripts/ldflags.sh"
 SATIKSME_LDFLAGS_PATH="${REPO_ROOT}/workloads/satiksme-bot/scripts/ldflags.sh"
 NETDATA_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/netdata.conf"
@@ -34,6 +36,30 @@ for release_identity_file in \
   "${SATIKSME_LDFLAGS_PATH}"; do
   if [[ ! -f "${release_identity_file}" ]]; then
     echo "FAIL: missing release identity build file at ${release_identity_file}" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "${TICKET_PHONE_BRIDGE_HEALTH_PATH}" ]]; then
+  echo "FAIL: missing ticket phone bridge health script at ${TICKET_PHONE_BRIDGE_HEALTH_PATH}" >&2
+  exit 1
+fi
+
+for ticket_phone_bridge_image_snippet in \
+  "curl" \
+  "ticket-phone-bridge-health.sh" \
+  "ticket-phone-bridge-health"; do
+  if ! grep -F "${ticket_phone_bridge_image_snippet}" "${TICKET_PHONE_BRIDGE_DOCKERFILE_PATH}" >/dev/null; then
+    echo "FAIL: ticket phone bridge image must include health tooling: ${ticket_phone_bridge_image_snippet}" >&2
+    exit 1
+  fi
+done
+
+for ticket_phone_bridge_compose_snippet in \
+  "TICKET_PHONE_HEALTH_INTERVAL" \
+  "/usr/local/bin/ticket-phone-bridge-health >/dev/null"; do
+  if ! grep -F "${ticket_phone_bridge_compose_snippet}" "${COMPOSE_PATH}" >/dev/null; then
+    echo "FAIL: ticket_phone_bridge compose healthcheck is missing or incomplete: ${ticket_phone_bridge_compose_snippet}" >&2
     exit 1
   fi
 done
@@ -305,6 +331,9 @@ required_snippets = [
     "--out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'",
     "append_unique COMPOSE_TARGET_SERVICES train_tunnel",
     "ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel",
+    "ticket-phone-bridge local health",
+    "/usr/local/bin/ticket-phone-bridge-health",
+    "/api/v1/health?strict=1",
     "rigassatiksme_qr_bot",
     "ARBUZAS_PHONE_BROKER_PORT",
     "TICKET_REMOTE_PHONE_BROKER_URL",

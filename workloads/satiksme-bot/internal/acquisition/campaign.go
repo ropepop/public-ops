@@ -247,9 +247,9 @@ func normalizeLanguage(language string) string {
 func firstContactText(language string, group string, registrations int) string {
 	switch normalizeLanguage(language) {
 	case "ru":
-		return fmt.Sprintf("Привет! Пишу, потому что ты в группе %s. Приглашаю попробовать @rs_bilete_bot: отправляешь 5-значный код из приложения Rīgas satiksme, бот возвращает QR. Сейчас доступ бесплатно на %d регистрации транспорта в день. Если хочешь, ответь «да», и я добавлю доступ.", group, registrations)
+		return fmt.Sprintf("Привет! Пишу, потому что ты в группе %s. Приглашаю попробовать @rs_bilete_bot: отправляешь 5-значный номер транспорта, бот возвращает QR. Сейчас доступ бесплатно на %d регистрации транспорта в день. Если хочешь, ответь «да», и я добавлю доступ.", group, registrations)
 	default:
-		return fmt.Sprintf("Čau! Rakstu, jo esi %s grupā. Aicinu izmēģināt @rs_bilete_bot: nosūti 5 ciparu kodu no Rīgas satiksme lietotnes, un bots atsūta QR. Tagad piekļuve ir bez maksas ar %d transporta reģistrācijām dienā. Ja gribi, atbildi “jā” un pievienošu piekļuvi.", group, registrations)
+		return fmt.Sprintf("Čau! Rakstu, jo esi %s grupā. Aicinu izmēģināt @rs_bilete_bot: nosūti 5 ciparu transporta numuru, un bots atsūta QR. Tagad piekļuve ir bez maksas ar %d transporta reģistrācijām dienā. Ja gribi, atbildi “jā” un pievienošu piekļuvi.", group, registrations)
 	}
 }
 

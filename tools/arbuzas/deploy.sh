@@ -2831,7 +2831,7 @@ for attempt in range(3):
         raise SystemExit(f'legacy Telegram login response does not point to the replacement flow: {legacy_body[:200]}')
     for leaked in ['invalid Telegram login', 'too many login attempts', 'missing hash', 'initData']:
         if leaked in legacy_body:
-            raise SystemExit(f'legacy Telegram login reached old validation/rate-limit path: {legacy_body[:200]}')
+            raise SystemExit(f'legacy malformed Telegram login leaks validation detail {leaked}: {legacy_body[:200]}')
 
 for path in [
     '/api/v1/public/dashboard?limit=2001',
@@ -3633,6 +3633,9 @@ if status != 410:
     raise SystemExit(f'legacy Telegram login returned {status}, want 410: {legacy_complete_body[:200]}')
 if '/api/v1/auth/telegram/complete' not in legacy_complete_body:
     raise SystemExit(f'legacy Telegram login does not point at complete endpoint: {legacy_complete_body[:200]}')
+for leaked in ['invalid Telegram login', 'too many login attempts', 'missing hash', 'initData']:
+    if leaked in legacy_complete_body:
+        raise SystemExit(f'legacy malformed Telegram login leaks validation detail {leaked}: {legacy_complete_body[:200]}')
 
 for path in ['/api/v1/me', '/api/v1/incidents/stop%3A3033/votes']:
     status, auth_failure_headers, auth_failure_body = request(path, method='POST' if path.endswith('/votes') else 'GET', body='{}' if path.endswith('/votes') else None)
@@ -3649,7 +3652,8 @@ assert_no_store('/api/v1/me OPTIONS', me_options_headers)
 if 'missing session' in me_options_body:
     raise SystemExit(f'OPTIONS /api/v1/me reached auth before method handling: {me_options_body[:200]}')
 
-status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method='GET')
+method = 'GET'
+status, live_viewer_headers, live_viewer_body = request('/api/v1/public/live-viewer', method=method)
 assert_no_store('/api/v1/public/live-viewer GET', live_viewer_headers)
 if status == 404:
     if live_viewer_headers.get('x-robots-tag') != 'noindex, noarchive':
@@ -3671,7 +3675,7 @@ elif status == 405:
     if live_viewer_headers.get('allow') != 'POST':
         raise SystemExit(f'public live viewer heartbeat OPTIONS Allow header {live_viewer_headers.get(\"allow\")!r}, want POST')
 else:
-    raise SystemExit(f'public live viewer heartbeat route returned {status}, want disabled 404 or enabled 405: {live_viewer_body[:200]}')
+    raise SystemExit(f'public live viewer heartbeat route is enabled for {method}: returned {status}, want disabled 404 or enabled 405: {live_viewer_body[:200]}')
 
 status, oidc_headers, oidc_body = request('/oidc/.well-known/openid-configuration')
 if status != 200:
@@ -4328,8 +4332,11 @@ validate_remote_phone_broker_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker
+  validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
+    "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker
   validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
     ticket_phone_bridge phone_broker
 }
 
@@ -4337,8 +4344,11 @@ validate_remote_rigassatiksme_qr_bot_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker rigassatiksme_qr_bot
+  validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
+    "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker rigassatiksme_qr_bot
   validate_remote_probe "${remote_release_dir}" "rigassatiksme QR bot broker health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
     ticket_phone_bridge phone_broker rigassatiksme_qr_bot
 }
 
@@ -4346,8 +4356,11 @@ validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
+    "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
+    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
     ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
