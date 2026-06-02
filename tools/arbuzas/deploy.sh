@@ -2161,12 +2161,8 @@ remote_compose_up() {
   local all_non_dns_service_args=""
   local tunnel_service_args=""
   local dns_release_prepare_needed="false"
-  local satiksme_rs_acquisition_followup="false"
   non_dns_service_args="$(compose_target_service_args_without_dns)"
   all_non_dns_service_args="$(compose_all_non_dns_service_args)"
-  if targeted_service_selected satiksme_bot; then
-    satiksme_rs_acquisition_followup="true"
-  fi
   if (( TARGETED_MODE == 1 )); then
     tunnel_service_args="$(compose_target_tunnel_service_args)"
   else
@@ -2200,9 +2196,6 @@ remote_compose_up() {
       if [[ -n '${tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
       fi
-      if ${satiksme_rs_acquisition_followup} && docker ps --format '{{.Names}}' | grep -qx 'arbuzas-satiksme_rs_acquisition-1'; then
-        docker compose --profile rs_acquisition --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps satiksme_rs_acquisition
-      fi
     "
     return
   fi
@@ -2220,9 +2213,6 @@ remote_compose_up() {
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}
     if [[ -n '${tunnel_service_args}' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
-    fi
-    if ${satiksme_rs_acquisition_followup} && docker ps --format '{{.Names}}' | grep -qx 'arbuzas-satiksme_rs_acquisition-1'; then
-      docker compose --profile rs_acquisition --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps satiksme_rs_acquisition
     fi
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
   "
@@ -2544,7 +2534,14 @@ def served_asset_hash(path):
         body = response.read()
         if path == 'app.js':
             text = body.decode('utf-8', 'replace')
-            for needle in ['.local', 'localhost', '127.0.0.1', '0.0.0.0', 'cloudflared', 'trycloudflare', 'tunnel']:
+            private_hostname_patterns = [
+                r'(?i)(?:https?:)?//[^\\s<>]+\\.local(?:[:/?#]|$)',
+                r'(?i)\\b[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.local(?:[:/?#]|$)',
+            ]
+            for pattern in private_hostname_patterns:
+                if re.search(pattern, text):
+                    raise SystemExit(f'public asset {path} exposes private hostname marker: {pattern}')
+            for needle in ['localhost', '127.0.0.1', '0.0.0.0', 'cloudflared', 'trycloudflare', 'cfargotunnel', 'argotunnel']:
                 if needle in text:
                     raise SystemExit(f'public asset {path} exposes private hostname marker: {needle}')
         return hashlib.sha256(body).hexdigest()
@@ -2576,6 +2573,16 @@ def assert_no_preview_metadata(path, body):
     for needle in ['<meta property=\"og:', \"<meta property='og:\", '<meta name=\"twitter:', \"<meta name='twitter:\", '<meta name=\"description\"', \"<meta name='description'\"]:
         if needle in lower:
             raise SystemExit(f'public shell exposes preview metadata {needle}: {path}')
+
+def assert_cloudflare_script_order_guard(path, body):
+    for needle in [
+        '<script data-cfasync=\"false\" nonce=\"',
+        '<script data-cfasync=\"false\" defer src=\"/assets/vendor/leaflet.js',
+        '<script data-cfasync=\"false\" defer src=\"/assets/external-feed.js',
+        '<script data-cfasync=\"false\" defer src=\"/assets/app.js',
+    ]:
+        if needle not in body:
+            raise SystemExit(f'{path} shell missing Cloudflare script-order guard: {needle}')
 
 def assert_security_headers(path, headers):
     for header in [
@@ -2663,6 +2670,7 @@ def assert_shell_route(path, expected_mode, allow_telegram_webapp=False):
     if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in route_body:
         raise SystemExit(f'{path} shell missing robots noindex meta')
     assert_no_preview_metadata(path, route_body)
+    assert_cloudflare_script_order_guard(path, route_body)
     if 'sourceVersion' in route_body:
         raise SystemExit(f'{path} shell exposes public sourceVersion')
     if f'mode: \"{expected_mode}\"' not in route_body:
@@ -2712,6 +2720,7 @@ if '<script nonce=' + chr(34) not in body:
 if '<meta name=\"robots\" content=\"noindex, noarchive\">' not in body:
     raise SystemExit('root shell missing robots noindex meta')
 assert_no_preview_metadata('/', body)
+assert_cloudflare_script_order_guard('/', body)
 if 'sourceVersion' in body:
     raise SystemExit('root shell exposes public sourceVersion')
 for needle in ['telegram-login.js', 'telegram-web-app.js']:
@@ -2889,16 +2898,20 @@ for asset, stale_hashes in known_stale_query_assets.items():
 status, robots_headers, robots_body = request('/robots.txt')
 if status != 200:
     raise SystemExit(f'robots.txt returned {status}, want app-owned 200')
-assert_no_store('/robots.txt', robots_headers)
-assert_noindex('/robots.txt', robots_headers)
 robots_head_status, robots_head_headers, _ = request('/robots.txt', method='HEAD')
 if robots_head_status != 200:
     raise SystemExit(f'HEAD /robots.txt returned {robots_head_status}, want app-owned 200')
-assert_no_store('/robots.txt HEAD', robots_head_headers)
-assert_noindex('/robots.txt HEAD', robots_head_headers)
 lower_robots = robots_body.lower()
-if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
-    raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
+if 'begin cloudflare managed content' in lower_robots:
+    if 'user-agent:' not in lower_robots or 'content-signal:' not in lower_robots or 'ai-train=no' not in lower_robots:
+        raise SystemExit(f'Cloudflare-managed robots.txt is missing expected content signals: {robots_body[:200]}')
+else:
+    assert_no_store('/robots.txt', robots_headers)
+    assert_noindex('/robots.txt', robots_headers)
+    assert_no_store('/robots.txt HEAD', robots_head_headers)
+    assert_noindex('/robots.txt HEAD', robots_head_headers)
+    if 'user-agent:' not in lower_robots or 'disallow: /' not in lower_robots:
+        raise SystemExit(f'robots.txt does not deny indexing: {robots_body[:200]}')
 
 for path in [
     f'/assets/app.js?v={app_hash}&debug=1',

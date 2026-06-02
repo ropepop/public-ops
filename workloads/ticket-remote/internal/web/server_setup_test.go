@@ -950,21 +950,19 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			t.Fatalf("ticket viewer JS missing freshness contract snippet %q", snippet)
 		}
 	}
-	for _, snippet := range []string{
-		`body[data-stream-freshness="STALE"] #screen`,
-		`.stream-resume-spinner`,
-	} {
-		if !staticCSSContains(css, snippet) {
-			t.Fatalf("ticket viewer CSS missing stale video indicator %q", snippet)
-		}
+	if !staticCSSContains(css, `.stream-resume-spinner`) {
+		t.Fatalf("ticket viewer CSS missing stream recovery spinner")
 	}
 	for _, snippet := range []string{
+		`body[data-stream-freshness="STALE"] #screen`,
 		`body[data-stream-freshness="STALE"] .stage::after`,
 		`body[data-stream-live="false"] .stage::after`,
+		`filter:`,
+		`opacity:.62`,
 		`Straume atjaunojas`,
 	} {
 		if staticCSSContains(css, snippet) {
-			t.Fatalf("ticket viewer CSS must keep stale stream recovery quiet over the video, found %q", snippet)
+			t.Fatalf("ticket viewer CSS must not alter the stream picture during recovery, found %q", snippet)
 		}
 	}
 	for _, snippet := range []string{

@@ -145,7 +145,7 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
   <title>vivi kontrole bot</title>
   <link rel="stylesheet" href="{{.AppCSSURL}}">
   <link rel="stylesheet" href="{{.LeafletCSSURL}}">
-  <script nonce="{{.ScriptNonce}}">
+  <script data-cfasync="false" nonce="{{.ScriptNonce}}">
     window.TRAIN_APP_CONFIG = {
       basePath: {{.BasePath}},
       publicBaseURL: {{.PublicBaseURL}},
@@ -171,10 +171,10 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
       schedule: {{.ScheduleJSON}}
     };
   </script>
-  {{if .TelegramWebAppScript}}<script src="https://telegram.org/js/telegram-web-app.js"></script>{{end}}
-  <script defer src="{{.LeafletJSURL}}"></script>
-  <script defer src="{{.ExternalFeedJSURL}}"></script>
-  <script defer src="{{.AppJSURL}}"></script>
+  {{if .TelegramWebAppScript}}<script data-cfasync="false" src="https://telegram.org/js/telegram-web-app.js"></script>{{end}}
+  <script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>
+  <script data-cfasync="false" defer src="{{.ExternalFeedJSURL}}"></script>
+  <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
 </head>
 <body>
   <div id="app"></div>

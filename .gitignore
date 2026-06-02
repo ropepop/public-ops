@@ -40,6 +40,7 @@ workloads/*/bot
 orchestrator/android-orchestrator/.kotlin/
 orchestrator/android-orchestrator/runtime-tests/debug-helper.*.sh
 "$TMP"
+infra/arbuzas/docker/env/arbuzas.env
 
 # Stable local browser session exports and sensitive browser captures
 state/browser-use/

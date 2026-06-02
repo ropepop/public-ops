@@ -100,6 +100,29 @@ func TestServeHTTPPublicShellRoutes(t *testing.T) {
 	}
 }
 
+func TestServeHTTPPublicShellScriptsBypassCloudflareRocketLoader(t *testing.T) {
+	t.Parallel()
+
+	server := newPublicDataServer(t, "https://example.test")
+	req := httptest.NewRequest("GET", "/", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d body=%s", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	for _, want := range []string{
+		`<script data-cfasync="false" nonce="`,
+		`<script data-cfasync="false" defer src="/assets/vendor/leaflet.js`,
+		`<script data-cfasync="false" defer src="/assets/external-feed.js`,
+		`<script data-cfasync="false" defer src="/assets/app.js`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("shell missing Rocket Loader opt-out marker %q: %s", want, body)
+		}
+	}
+}
+
 func TestServeHTTPUnknownPublicTrainShellRoutesReturnNotFound(t *testing.T) {
 	t.Parallel()
 
