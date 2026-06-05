@@ -17,18 +17,29 @@ PORTAINER_LOCAL_ENDPOINT="unix:///var/run/docker.sock"
 PORTAINER_DB_TOOL_DIR="${SCRIPT_DIR}/portainerdb"
 PORTAINER_TOOLBOX_IMAGE="${PORTAINER_TOOLBOX_IMAGE:-busybox:1.36.1}"
 DOCKER_GC_SCRIPT="${SCRIPT_DIR}/docker_gc.py"
+MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"
 DOCKER_GC_REMOTE_STATE_DIR="/etc/arbuzas/docker-gc"
 DOCKER_GC_REMOTE_STATE_FILE="${DOCKER_GC_REMOTE_STATE_DIR}/state.json"
 DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-168h}"
 DOCKER_GC_RELEASE_KEEP_PER_FAMILY="${DOCKER_GC_RELEASE_KEEP_PER_FAMILY:-10}"
 ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS="${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS:-7}"
 ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE="${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE:-100M}"
+ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE="${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE:-true}"
 NETDATA_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/netdata"
 NETDATA_REMOTE_CONFIG_DIR="/etc/netdata"
 NETDATA_REMOTE_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/netdata.conf"
 NETDATA_REMOTE_DOCKER_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/go.d/docker.conf"
 NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/go.d/sd/docker.conf"
 NETDATA_KICKSTART_URL="${NETDATA_KICKSTART_URL:-https://get.netdata.cloud/kickstart.sh}"
+MEMORY_REPORT_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/memory-report"
+MEMORY_REPORT_REMOTE_SERVICE_FILE="/etc/systemd/system/arbuzas-memory-report.service"
+MEMORY_REPORT_REMOTE_TIMER_FILE="/etc/systemd/system/arbuzas-memory-report.timer"
+MEMORY_REPORT_REMOTE_DEFAULT_FILE="/etc/default/arbuzas-memory-report"
+MEMORY_REPORT_REMOTE_SCRIPT_FILE="/usr/local/libexec/arbuzas-memory-report.py"
+MEMORY_REPORT_REMOTE_OUTPUT_DIR="/var/lib/arbuzas/memory-report"
+MEMORY_REPORT_REMOTE_JSON_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.json"
+MEMORY_REPORT_REMOTE_TEXT_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.txt"
+MEMORY_REPORT_REMOTE_PROM_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.prom"
 THINKPAD_FAN_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/thinkpad-fan"
 THINKPAD_FAN_REMOTE_SERVICE_FILE="/etc/systemd/system/arbuzas-thinkpad-fan.service"
 THINKPAD_FAN_REMOTE_DEFAULT_FILE="/etc/default/arbuzas-thinkpad-fan"
@@ -50,7 +61,7 @@ if [[ -f "${DOCKER_DEFAULT_ENV_FILE}" ]]; then
   set +a
 fi
 
-ARBUZAS_HOST="${ARBUZAS_HOST:-arbuzas}"
+ARBUZAS_HOST="${ARBUZAS_HOST:-kitty-gration}"
 ARBUZAS_USER="${ARBUZAS_USER:-${USER}}"
 ARBUZAS_SSH_PORT="${ARBUZAS_SSH_PORT:-}"
 ARBUZAS_TZ="${ARBUZAS_TZ:-Europe/Riga}"
@@ -348,6 +359,17 @@ remote_run_docker_gc() {
   "
 }
 
+remote_run_memory_report() {
+  [[ -f "${MEMORY_REPORT_SCRIPT}" ]] || {
+    echo "missing memory reporter: ${MEMORY_REPORT_SCRIPT}" >&2
+    return 1
+  }
+
+  run_ssh "$(remote_target)" \
+    "python3 - --source-label '/proc/meminfo on ${ARBUZAS_HOST}'" \
+    < "${MEMORY_REPORT_SCRIPT}"
+}
+
 remote_run_host_cache_cleanup() {
   if [[ ! "${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS}" =~ ^[0-9]+$ ]]; then
     echo "ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS must be a non-negative integer" >&2
@@ -357,10 +379,26 @@ remote_run_host_cache_cleanup() {
     echo "ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE must be a systemd size such as 100M" >&2
     return 2
   fi
+  case "${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE}" in
+    true|false)
+      ;;
+    *)
+      echo "ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE must be true or false" >&2
+      return 2
+      ;;
+  esac
 
   remote_root_command "
     tmp_min_age_days='${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS}'
     journal_max_size='${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}'
+    drop_reclaimable_cache='${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE}'
+    report_memory() {
+      local label=\"\$1\"
+      if command -v free >/dev/null 2>&1; then
+        echo \"host memory \${label}:\"
+        free -m
+      fi
+    }
     if command -v apt-get >/dev/null 2>&1; then
       apt-get clean
     fi
@@ -377,6 +415,18 @@ remote_run_host_cache_cleanup() {
     fi
     if command -v journalctl >/dev/null 2>&1; then
       journalctl --vacuum-size=\"\${journal_max_size}\"
+    fi
+    if [[ \"\${drop_reclaimable_cache}\" == 'true' ]]; then
+      report_memory 'before reclaimable cache flush'
+      sync
+      if [[ ! -w /proc/sys/vm/drop_caches ]]; then
+        echo 'cannot flush reclaimable cache: /proc/sys/vm/drop_caches is not writable' >&2
+        exit 1
+      fi
+      printf '3\n' > /proc/sys/vm/drop_caches
+      report_memory 'after reclaimable cache flush'
+    else
+      echo 'reclaimable cache flush skipped because ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false'
     fi
   "
 }
@@ -475,6 +525,89 @@ install_remote_netdata() {
     done
 
     tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} 127.0.0.1:${ARBUZAS_NETDATA_PORT}
+  "
+}
+
+stage_memory_report_config_to_remote() {
+  local remote_tmp_dir="/tmp/arbuzas-memory-report.$$"
+  local memory_report_tree_base64=""
+  local memory_report_script_base64=""
+  local attempt=0
+
+  [[ -d "${MEMORY_REPORT_CONFIG_ROOT}" ]] || {
+    echo "missing memory report config root: ${MEMORY_REPORT_CONFIG_ROOT}" >&2
+    return 1
+  }
+  [[ -f "${MEMORY_REPORT_SCRIPT}" ]] || {
+    echo "missing memory reporter: ${MEMORY_REPORT_SCRIPT}" >&2
+    return 1
+  }
+
+  memory_report_tree_base64="$(COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "${MEMORY_REPORT_CONFIG_ROOT}" -cf - . | base64 | tr -d '\n')"
+  memory_report_script_base64="$(base64 < "${MEMORY_REPORT_SCRIPT}" | tr -d '\n')"
+
+  log "Staging memory report service config on ${ARBUZAS_HOST}:${remote_tmp_dir}"
+  for attempt in 1 2 3; do
+    if remote_inline_shell "
+      rm -rf '${remote_tmp_dir}'
+      install -d '${remote_tmp_dir}'
+      printf '%s' '${memory_report_tree_base64}' | base64 -d | tar -xf - -C '${remote_tmp_dir}'
+      install -d '${remote_tmp_dir}/usr/local/libexec'
+      printf '%s' '${memory_report_script_base64}' | base64 -d > '${remote_tmp_dir}/usr/local/libexec/arbuzas-memory-report.py'
+    "; then
+      printf '%s\n' "${remote_tmp_dir}"
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      log "Memory report service staging attempt ${attempt} failed; retrying"
+      sleep 2
+    fi
+  done
+
+  echo "failed to stage memory report service config on ${ARBUZAS_HOST}" >&2
+  return 1
+}
+
+install_remote_memory_report() {
+  local remote_stage_root="$1"
+
+  log "Maintenance: installing the corrected memory report service on ${ARBUZAS_HOST}"
+  remote_root_command "
+    command -v python3 >/dev/null 2>&1 || {
+      echo 'python3 is required for the Arbuzas memory report service' >&2
+      exit 1
+    }
+    [[ -r /proc/meminfo ]] || {
+      echo '/proc/meminfo is required for the Arbuzas memory report service' >&2
+      exit 1
+    }
+
+    trap 'rm -rf \"${remote_stage_root}\"' EXIT
+
+    tar -C '${remote_stage_root}' -cf - . | tar -C / -xf -
+    chmod 0644 '${MEMORY_REPORT_REMOTE_DEFAULT_FILE}' '${MEMORY_REPORT_REMOTE_SERVICE_FILE}' '${MEMORY_REPORT_REMOTE_TIMER_FILE}'
+    chmod 0755 '${MEMORY_REPORT_REMOTE_SCRIPT_FILE}'
+    install -d -m 0755 '${MEMORY_REPORT_REMOTE_OUTPUT_DIR}'
+
+    systemctl daemon-reload
+    systemctl enable arbuzas-memory-report.timer >/dev/null
+    systemctl restart arbuzas-memory-report.timer
+    systemctl start arbuzas-memory-report.service
+
+    deadline=\$((SECONDS + 30))
+    while true; do
+      if systemctl is-active --quiet arbuzas-memory-report.timer && \
+         [[ -s '${MEMORY_REPORT_REMOTE_JSON_FILE}' ]] && \
+         [[ -s '${MEMORY_REPORT_REMOTE_TEXT_FILE}' ]] && \
+         [[ -s '${MEMORY_REPORT_REMOTE_PROM_FILE}' ]]; then
+        break
+      fi
+      if (( SECONDS >= deadline )); then
+        echo 'Arbuzas memory report service did not publish a snapshot' >&2
+        exit 1
+      fi
+      sleep 2
+    done
   "
 }
 
@@ -651,20 +784,23 @@ usage() {
 Usage: deploy.sh ACTION [options]
 
 Actions:
-  deploy            Prepare a release bundle, copy it to Arbuzas, render tunnel configs, and run docker compose up -d --build
-  validate          Validate the active or requested release on Arbuzas
+  deploy            Prepare a release bundle, copy it to the live host, render tunnel configs, and run docker compose up -d --build
+  validate          Validate the active or requested release on the live host
   rollback          Point /etc/arbuzas/current at a previous release and redeploy it
   cleanup-docker    Run the Arbuzas Docker image, release, build-cache, and host-cache cleanup policy on the live host
+  memory-report     Report corrected host memory pressure and provider-like cached-inclusive memory from /proc/meminfo
+  install-memory-report   Install the corrected host memory report service and timer on the live host
+  validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot
   compact-dns-db    Run the Arbuzas DNS cleanup activation and compact maintenance flow on the live host
   repair-dns-admin  Clear stale private DNS admin forwards, re-assert the Tailscale TCP forward, refresh the bare private web URL, and print host listener diagnostics
   install-netdata   Install Netdata plus hardware monitoring packages on the live host and publish it privately over Tailscale
   validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected Arbuzas hardware charts
   install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host
-  validate-thinkpad-fan  Validate the live Arbuzas ThinkPad fan controller and current control mode
+  validate-thinkpad-fan  Validate the live ThinkPad fan controller and current control mode
   repair-portainer  Backup and repair Portainer state in place, disable Docker Swarm, and restart Portainer on the standalone Docker socket
-  mirror-pull       Pull Arbuzas deployment variables and secrets from the host into the local plaintext mirror
-  mirror-audit      Compare the local Arbuzas mirror with the host and report drift before deploy
-  mirror-push       Push local Arbuzas mirror changes to the host when the host has not drifted
+  mirror-pull       Pull deployment variables and secrets from the host into the local plaintext mirror
+  mirror-audit      Compare the local host mirror with the host and report drift before deploy
+  mirror-push       Push local host mirror changes to the host when the host has not drifted
   deploy-config     Push local mirror changes and restart/reload only affected services; no build or release upload
 
 Options:
@@ -1063,6 +1199,18 @@ is_private_ipv4() {
   esac
 }
 
+is_tailscale_ipv4() {
+  local ip="${1:-}"
+  local o1="" o2="" o3="" o4=""
+  is_valid_ipv4 "${ip}" || return 1
+  IFS=. read -r o1 o2 o3 o4 <<< "${ip}"
+  (( 10#${o1} == 100 && 10#${o2} >= 64 && 10#${o2} <= 127 ))
+}
+
+is_dns_admin_bind_ipv4() {
+  is_private_ipv4 "${1:-}" || is_tailscale_ipv4 "${1:-}"
+}
+
 dns_validation_requested() {
   if (( TARGETED_MODE == 0 || VALIDATE_DNS == 1 )); then
     return 0
@@ -1075,8 +1223,8 @@ require_dns_private_admin_env() {
     echo "ARBUZAS_DNS_ADMIN_LAN_IP is required for the private Arbuzas DNS admin surface" >&2
     exit 2
   fi
-  if ! is_private_ipv4 "${ARBUZAS_DNS_ADMIN_LAN_IP}"; then
-    echo "ARBUZAS_DNS_ADMIN_LAN_IP must be a private RFC1918 IPv4 address (got: ${ARBUZAS_DNS_ADMIN_LAN_IP})" >&2
+  if ! is_dns_admin_bind_ipv4 "${ARBUZAS_DNS_ADMIN_LAN_IP}"; then
+    echo "ARBUZAS_DNS_ADMIN_LAN_IP must be a private RFC1918 or Tailscale IPv4 address (got: ${ARBUZAS_DNS_ADMIN_LAN_IP})" >&2
     exit 2
   fi
 }
@@ -1214,6 +1362,16 @@ resolve_remote_public_ipv4() {
       if [[ -r '/srv/arbuzas/dns/state/ddns-last-ipv4' ]]; then
         ip=\$(tr -d '\r\n[:space:]' < '/srv/arbuzas/dns/state/ddns-last-ipv4')
         if [[ \"\${ip}\" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]]; then
+          printf '%s\n' \"\${ip}\"
+          exit 0
+        fi
+      fi
+      if command -v curl >/dev/null 2>&1; then
+        if ip=\$(curl -4 -fsS --max-time 10 'https://ifconfig.me/ip' 2>/dev/null); then
+          printf '%s\n' \"\${ip}\"
+          exit 0
+        fi
+        if ip=\$(curl -4 -fsS --max-time 10 'https://api.ipify.org' 2>/dev/null); then
           printf '%s\n' \"\${ip}\"
           exit 0
         fi
@@ -1479,7 +1637,7 @@ for port, local_field, line in listeners:
     offenders.append(('unexpected DNS admin listener on 8097', line))
 
 if offenders:
-    print('DNS host preflight failed on Arbuzas; fix the listener conflict before retrying.', file=sys.stderr)
+    print('DNS host preflight failed on the live host; fix the listener conflict before retrying.', file=sys.stderr)
     for label, line in offenders:
         print(f'- {label}: {line}', file=sys.stderr)
     if repairable:
@@ -1561,17 +1719,17 @@ validate_private_dns_admin_access() {
   local tailnet_ipv4=""
   local tailnet_dns_name=""
 
-  log "Validate: dns private admin login on Arbuzas loopback"
+  log "Validate: dns private admin login on live host loopback"
   if ! remote_shell "curl -fsS 'http://127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin login on Arbuzas loopback"
+    log "Validation failed: dns private admin login on live host loopback"
     collect_remote_dns_host_diagnostics
     collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
     return 1
   fi
 
-  log "Validate: dns private admin login on Arbuzas LAN address"
+  log "Validate: dns private admin login on live host LAN address"
   if ! remote_shell "curl -fsS 'http://${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin login on Arbuzas LAN address"
+    log "Validation failed: dns private admin login on live host LAN address"
     collect_remote_dns_host_diagnostics
     collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
     return 1
@@ -1595,9 +1753,9 @@ validate_private_dns_admin_access() {
     return 1
   fi
 
-  log "Validate: dns private admin root on Arbuzas nginx"
+  log "Validate: dns private admin root on live host nginx"
   if ! remote_shell "curl -fsS -H 'Host: ${tailnet_dns_name}' 'http://127.0.0.1/' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin root on Arbuzas nginx"
+    log "Validation failed: dns private admin root on live host nginx"
     collect_remote_dns_host_diagnostics
     collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
     return 1
@@ -1655,12 +1813,12 @@ validate_remote_netdata() {
     done
   "
 
-  log "Validate: Netdata stays unclaimed on Arbuzas"
+  log "Validate: Netdata stays unclaimed on the live host"
   remote_root_command "
     [[ ! -f /var/lib/netdata/cloud.d/claim.conf ]]
   "
 
-  log "Validate: Netdata keeps Docker polling disabled on Arbuzas"
+  log "Validate: Netdata keeps Docker polling disabled on the live host"
   remote_root_command "
     [[ -f '${NETDATA_REMOTE_DOCKER_CONFIG_FILE}' ]] || {
       echo 'missing Netdata Docker override: ${NETDATA_REMOTE_DOCKER_CONFIG_FILE}' >&2
@@ -1784,6 +1942,87 @@ PY
     echo "Netdata did not answer over Tailscale at http://${tailnet_ipv4}:${ARBUZAS_NETDATA_PORT}/api/v1/info" >&2
     exit 1
   fi
+}
+
+validate_remote_memory_report() {
+  log "Validate: corrected memory report service files are installed"
+  remote_root_command "
+    [[ -f '${MEMORY_REPORT_REMOTE_SERVICE_FILE}' ]] || {
+      echo 'missing memory report service file: ${MEMORY_REPORT_REMOTE_SERVICE_FILE}' >&2
+      exit 1
+    }
+    [[ -f '${MEMORY_REPORT_REMOTE_TIMER_FILE}' ]] || {
+      echo 'missing memory report timer file: ${MEMORY_REPORT_REMOTE_TIMER_FILE}' >&2
+      exit 1
+    }
+    [[ -f '${MEMORY_REPORT_REMOTE_DEFAULT_FILE}' ]] || {
+      echo 'missing memory report defaults file: ${MEMORY_REPORT_REMOTE_DEFAULT_FILE}' >&2
+      exit 1
+    }
+    [[ -x '${MEMORY_REPORT_REMOTE_SCRIPT_FILE}' ]] || {
+      echo 'missing executable memory report script: ${MEMORY_REPORT_REMOTE_SCRIPT_FILE}' >&2
+      exit 1
+    }
+  "
+
+  log "Validate: corrected memory report timer is active"
+  remote_root_command "
+    systemctl is-enabled --quiet arbuzas-memory-report.timer
+    systemctl is-active --quiet arbuzas-memory-report.timer
+  "
+
+  log "Validate: corrected memory report publishes real pressure and cache separately"
+  remote_root_command "
+    systemctl start arbuzas-memory-report.service
+    [[ -s '${MEMORY_REPORT_REMOTE_JSON_FILE}' ]] || {
+      echo 'missing memory report JSON output: ${MEMORY_REPORT_REMOTE_JSON_FILE}' >&2
+      exit 1
+    }
+    [[ -s '${MEMORY_REPORT_REMOTE_TEXT_FILE}' ]] || {
+      echo 'missing memory report text output: ${MEMORY_REPORT_REMOTE_TEXT_FILE}' >&2
+      exit 1
+    }
+    [[ -s '${MEMORY_REPORT_REMOTE_PROM_FILE}' ]] || {
+      echo 'missing memory report metrics output: ${MEMORY_REPORT_REMOTE_PROM_FILE}' >&2
+      exit 1
+    }
+    python3 - '${MEMORY_REPORT_REMOTE_JSON_FILE}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    report = json.load(handle)
+
+required = [
+    'real_pressure_pct',
+    'provider_like_pct',
+    'reclaimable_cache_pct',
+    'available_kb',
+    'total_kb',
+]
+missing = [key for key in required if key not in report]
+if missing:
+    raise SystemExit('memory report missing keys: ' + ', '.join(missing))
+
+real_pressure = float(report['real_pressure_pct'])
+provider_like = float(report['provider_like_pct'])
+reclaimable_cache = float(report['reclaimable_cache_pct'])
+if not 0.0 <= real_pressure <= 100.0:
+    raise SystemExit(f'real pressure out of range: {real_pressure}')
+if not 0.0 <= provider_like <= 100.0:
+    raise SystemExit(f'provider-like memory out of range: {provider_like}')
+if not 0.0 <= reclaimable_cache <= 100.0:
+    raise SystemExit(f'reclaimable cache out of range: {reclaimable_cache}')
+if provider_like < real_pressure:
+    raise SystemExit(f'provider-like value {provider_like} is lower than real pressure {real_pressure}')
+if report.get('formulas', {}).get('real_pressure') != '(MemTotal - MemAvailable) / MemTotal':
+    raise SystemExit('real pressure formula must use MemAvailable')
+if report.get('formulas', {}).get('provider_like') != '(MemTotal - MemFree - Buffers) / MemTotal':
+    raise SystemExit('provider-like formula changed')
+PY
+    grep -F 'Source of truth:' '${MEMORY_REPORT_REMOTE_TEXT_FILE}' >/dev/null
+    grep -F 'arbuzas_memory_real_pressure_percent' '${MEMORY_REPORT_REMOTE_PROM_FILE}' >/dev/null
+  "
 }
 
 validate_remote_thinkpad_fan() {
@@ -2297,7 +2536,7 @@ PY
 validate_remote_dns_querylog_flow() {
   local remote_release_dir="$1"
 
-  validate_remote_probe "${remote_release_dir}" "dns local encrypted queries and query logging on Arbuzas" \
+  validate_remote_probe "${remote_release_dir}" "dns local encrypted queries and query logging on the live host" \
     "wait_until_ok python3 - <<'PY'
 import base64
 import json
@@ -2371,7 +2610,7 @@ PY" \
 validate_remote_dns_native_api_probe() {
   local remote_release_dir="$1"
 
-  validate_remote_probe "${remote_release_dir}" "dns native stats and clients APIs on Arbuzas" \
+  validate_remote_probe "${remote_release_dir}" "dns native stats and clients APIs on the live host" \
     "wait_until_ok python3 - <<'PY'
 import json
 import urllib.error
@@ -4478,7 +4717,7 @@ validate_remote_dns_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" dns_controlplane
-  validate_remote_probe "${remote_release_dir}" "dns private admin login on Arbuzas" \
+  validate_remote_probe "${remote_release_dir}" "dns private admin login on the live host" \
     "wait_until_ok sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login >/dev/null 2>/dev/null'" \
     dns_controlplane
   validate_remote_dns_querylog_flow "${remote_release_dir}"
@@ -4914,7 +5153,7 @@ deploy_config_from_mirror() {
 
 while (( $# > 0 )); do
   case "$1" in
-    deploy|validate|rollback|cleanup-docker|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
+    deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
       if [[ -n "${action}" ]]; then
         echo "Only one action is allowed" >&2
         exit 2
@@ -5002,10 +5241,16 @@ fi
 resolve_requested_services
 
 require_cmd ssh
-require_cmd scp
 require_cmd python3
 case "${action}" in
-  mirror-pull|mirror-audit|mirror-push|deploy-config)
+  memory-report)
+    ;;
+  *)
+    require_cmd scp
+    ;;
+esac
+case "${action}" in
+  memory-report|install-memory-report|validate-memory-report|mirror-pull|mirror-audit|mirror-push|deploy-config)
     ;;
   *)
     require_cmd go
@@ -5100,13 +5345,37 @@ case "${action}" in
     remote_run_docker_gc
     remote_run_host_cache_cleanup
     ;;
+  memory-report)
+    if [[ -n "${requested_release_id}" ]]; then
+      echo "--release-id is not supported for memory-report" >&2
+      exit 2
+    fi
+    remote_run_memory_report
+    ;;
+  install-memory-report)
+    if [[ -n "${requested_release_id}" ]]; then
+      echo "--release-id is not supported for install-memory-report" >&2
+      exit 2
+    fi
+    require_cmd base64
+    remote_stage_root="$(stage_memory_report_config_to_remote)"
+    install_remote_memory_report "${remote_stage_root}"
+    validate_remote_memory_report
+    ;;
+  validate-memory-report)
+    if [[ -n "${requested_release_id}" ]]; then
+      echo "--release-id is not supported for validate-memory-report" >&2
+      exit 2
+    fi
+    validate_remote_memory_report
+    ;;
   compact-dns-db)
     if [[ -n "${requested_release_id}" ]]; then
       echo "--release-id is not supported for compact-dns-db" >&2
       exit 2
     fi
     require_dns_private_admin_env
-    log "Maintenance: activating cleanup and compacting the live Arbuzas DNS control-plane database"
+    log "Maintenance: activating cleanup and compacting the live DNS control-plane database"
     compact_remote_dns_db
     validate_remote_dns_workload_health "${REMOTE_CURRENT_LINK}"
     ;;

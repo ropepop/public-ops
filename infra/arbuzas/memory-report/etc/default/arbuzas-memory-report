@@ -1,0 +1,3 @@
+# Directory where the host memory reporter publishes the latest corrected
+# memory snapshot for operators and lightweight graphing.
+ARBUZAS_MEMORY_REPORT_DIR=/var/lib/arbuzas/memory-report

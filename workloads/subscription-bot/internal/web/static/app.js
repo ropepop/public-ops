@@ -3,57 +3,66 @@
   const appRoot = document.getElementById("app");
   const tg = telegramWebApp();
   const query = new URLSearchParams(window.location.search);
+  const arrow = window.ArrowJS && typeof window.ArrowJS.html === "function" && typeof window.ArrowJS.reactive === "function"
+    ? window.ArrowJS
+    : null;
+  let arrowShellMounted = false;
 
-  const state = {
-    loading: true,
-    syncing: false,
-    bootstrapped: false,
-    error: "",
-    notice: "",
-    bootstrap: null,
-    launchRequest: readLaunchParams(),
-    section: config.mode === "admin" ? "admin" : "plans",
-    defaultSection: config.mode === "admin" ? "admin" : "plans",
-    adminView: config.mode === "admin" ? "overview" : "",
-    defaultAdminView: config.mode === "admin" ? "overview" : "",
-    selectedPlanId: query.get("plan_id") || "",
-    selectedInvoiceId: query.get("invoice_id") || "",
-    selectedServiceCode: "",
-    joinInviteCode: query.get("invite_code") || "",
-    supportMessage: "",
-    generatedInvite: null,
-    generatedInviteLaunch: null,
-    planDataLoading: false,
-    planData: null,
-    invoiceActions: {},
-    mainButtonAction: "",
-    mainButtonValue: "",
-    admin: {
-      loading: false,
-      overview: null,
-      tickets: [],
-      issues: [],
-      recentPlans: [],
-      reimbursements: [],
-      alerts: [],
-      entries: [],
-    },
-    createForm: {
-      totalPrice: "",
-      seatLimit: "2",
-      renewalDate: defaultRenewalDate(),
-      accessMode: "",
-      sharingPolicyAck: true,
-    },
-    quote: {
-      asset: "",
-      network: "",
-    },
-    blockForm: {
-      telegramId: "",
-      reason: "",
-    },
-  };
+  const state = createInitialState();
+
+  function createInitialState() {
+    const initialState = {
+      loading: true,
+      syncing: false,
+      bootstrapped: false,
+      error: "",
+      notice: "",
+      bootstrap: null,
+      launchRequest: readLaunchParams(),
+      section: config.mode === "admin" ? "admin" : "plans",
+      defaultSection: config.mode === "admin" ? "admin" : "plans",
+      adminView: config.mode === "admin" ? "overview" : "",
+      defaultAdminView: config.mode === "admin" ? "overview" : "",
+      selectedPlanId: query.get("plan_id") || "",
+      selectedInvoiceId: query.get("invoice_id") || "",
+      selectedServiceCode: "",
+      joinInviteCode: query.get("invite_code") || "",
+      supportMessage: "",
+      generatedInvite: null,
+      generatedInviteLaunch: null,
+      planDataLoading: false,
+      planData: null,
+      invoiceActions: {},
+      mainButtonAction: "",
+      mainButtonValue: "",
+      admin: {
+        loading: false,
+        overview: null,
+        tickets: [],
+        issues: [],
+        recentPlans: [],
+        reimbursements: [],
+        alerts: [],
+        entries: [],
+      },
+      createForm: {
+        totalPrice: "",
+        seatLimit: "2",
+        renewalDate: defaultRenewalDate(),
+        accessMode: "",
+        sharingPolicyAck: true,
+      },
+      quote: {
+        asset: "",
+        network: "",
+      },
+      blockForm: {
+        telegramId: "",
+        reason: "",
+      },
+    };
+    return arrow ? arrow.reactive(initialState) : initialState;
+  }
 
   setupTelegram();
 
@@ -903,6 +912,14 @@
   }
 
   function render() {
+    if (mountArrowShell()) {
+      syncTelegramChrome();
+      return;
+    }
+    if (arrowShellMounted) {
+      syncTelegramChrome();
+      return;
+    }
     appRoot.innerHTML = `
       <main class="miniapp-shell">
         ${renderHeader()}
@@ -911,6 +928,19 @@
       </main>
     `;
     syncTelegramChrome();
+  }
+
+  function mountArrowShell() {
+    if (!arrow || arrowShellMounted) {
+      return false;
+    }
+    appRoot.innerHTML = "";
+    document.documentElement.dataset.subscriptionUi = "arrow";
+    arrow.html`<main class="miniapp-shell" .innerHTML="${function () {
+      return renderHeader() + renderNotice() + renderBody();
+    }}"></main>`(appRoot);
+    arrowShellMounted = true;
+    return true;
   }
 
   function syncTelegramChrome() {

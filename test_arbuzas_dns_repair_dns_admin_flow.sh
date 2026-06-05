@@ -80,9 +80,9 @@ fi
 
 if [[ "${script_content}" == *"DNS_SAFE_REPAIR_COMMAND"* ]]; then
   if [[ "${state}" == "broken" ]]; then
-    echo "DNS host preflight failed on Arbuzas; fix the listener conflict before retrying." >&2
+    echo "DNS host preflight failed on the live host; fix the listener conflict before retrying." >&2
     echo "- conflicting host listener on 443: LISTEN 0 128 100.64.0.10:443 0.0.0.0:* users:((\"tailscaled\",pid=99,fd=9))" >&2
-    echo "Safe repair: ARBUZAS_HOST='arbuzas' ARBUZAS_USER='${USER:-tester}' ARBUZAS_SSH_PORT='22' ARBUZAS_DNS_ADMIN_LAN_IP='192.168.32.22' bash tools/arbuzas/deploy.sh repair-dns-admin" >&2
+    echo "Safe repair: ARBUZAS_HOST='kitty-gration' ARBUZAS_USER='${USER:-tester}' ARBUZAS_SSH_PORT='22' ARBUZAS_DNS_ADMIN_LAN_IP='192.168.32.22' bash tools/arbuzas/deploy.sh repair-dns-admin" >&2
     exit 1
   fi
   exit 0

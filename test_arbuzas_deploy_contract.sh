@@ -10,6 +10,10 @@ TICKET_PHONE_BRIDGE_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ti
 TICKET_PHONE_BRIDGE_HEALTH_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket-phone-bridge-health.sh"
 TRAIN_LDFLAGS_PATH="${REPO_ROOT}/workloads/train-bot/scripts/ldflags.sh"
 SATIKSME_LDFLAGS_PATH="${REPO_ROOT}/workloads/satiksme-bot/scripts/ldflags.sh"
+MEMORY_REPORT_PATH="${REPO_ROOT}/tools/arbuzas/memory_report.py"
+MEMORY_REPORT_DEFAULT_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/default/arbuzas-memory-report"
+MEMORY_REPORT_SERVICE_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/systemd/system/arbuzas-memory-report.service"
+MEMORY_REPORT_TIMER_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/systemd/system/arbuzas-memory-report.timer"
 NETDATA_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/netdata.conf"
 NETDATA_DOCKER_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/docker.conf"
 NETDATA_DOCKER_SD_CONFIG_PATH="${REPO_ROOT}/infra/arbuzas/netdata/go.d/sd/docker.conf"
@@ -44,6 +48,21 @@ if [[ ! -f "${TICKET_PHONE_BRIDGE_HEALTH_PATH}" ]]; then
   echo "FAIL: missing ticket phone bridge health script at ${TICKET_PHONE_BRIDGE_HEALTH_PATH}" >&2
   exit 1
 fi
+
+if [[ ! -f "${MEMORY_REPORT_PATH}" ]]; then
+  echo "FAIL: missing Arbuzas memory reporter at ${MEMORY_REPORT_PATH}" >&2
+  exit 1
+fi
+
+for memory_report_file in \
+  "${MEMORY_REPORT_DEFAULT_PATH}" \
+  "${MEMORY_REPORT_SERVICE_PATH}" \
+  "${MEMORY_REPORT_TIMER_PATH}"; do
+  if [[ ! -f "${memory_report_file}" ]]; then
+    echo "FAIL: missing Arbuzas memory report service file at ${memory_report_file}" >&2
+    exit 1
+  fi
+done
 
 for ticket_phone_bridge_image_snippet in \
   "curl" \
@@ -221,18 +240,24 @@ script = Path(sys.argv[1]).read_text(encoding="utf-8")
 
 required_snippets = [
     "cleanup-docker    Run the Arbuzas Docker image, release, build-cache, and host-cache cleanup policy on the live host",
+    "memory-report     Report corrected host memory pressure and provider-like cached-inclusive memory from /proc/meminfo",
+    "install-memory-report   Install the corrected host memory report service and timer on the live host",
+    "validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot",
     "compact-dns-db    Run the Arbuzas DNS cleanup activation and compact maintenance flow on the live host",
     "repair-dns-admin  Clear stale private DNS admin forwards, re-assert the Tailscale TCP forward, refresh the bare private web URL, and print host listener diagnostics",
     "install-netdata   Install Netdata plus hardware monitoring packages on the live host and publish it privately over Tailscale",
     "validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected Arbuzas hardware charts",
     "install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host",
-    "validate-thinkpad-fan  Validate the live Arbuzas ThinkPad fan controller and current control mode",
-    "mirror-pull       Pull Arbuzas deployment variables and secrets from the host into the local plaintext mirror",
-    "mirror-audit      Compare the local Arbuzas mirror with the host and report drift before deploy",
-    "mirror-push       Push local Arbuzas mirror changes to the host when the host has not drifted",
+    "validate-thinkpad-fan  Validate the live ThinkPad fan controller and current control mode",
+    "mirror-pull       Pull deployment variables and secrets from the host into the local plaintext mirror",
+    "mirror-audit      Compare the local host mirror with the host and report drift before deploy",
+    "mirror-push       Push local host mirror changes to the host when the host has not drifted",
     "deploy-config     Push local mirror changes and restart/reload only affected services; no build or release upload",
-    "deploy|validate|rollback|cleanup-docker|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)",
+    "deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)",
     "--release-id is not supported for cleanup-docker",
+    "--release-id is not supported for memory-report",
+    "--release-id is not supported for install-memory-report",
+    "--release-id is not supported for validate-memory-report",
     "--release-id is not supported for compact-dns-db",
     "--release-id is not supported for repair-dns-admin",
     "--release-id is not supported for install-netdata",
@@ -243,6 +268,7 @@ required_snippets = [
     "--services is only supported for deploy, validate, and rollback",
     "--services requires at least one service name",
     "remote_run_docker_gc()",
+    "remote_run_memory_report()",
     "remote_run_host_cache_cleanup()",
     "resolve_local_docker_gc_script()",
     "compact_remote_dns_db()",
@@ -274,6 +300,9 @@ required_snippets = [
     "stage_netdata_config_to_remote()",
     "install_remote_netdata()",
     "validate_remote_netdata()",
+    "stage_memory_report_config_to_remote()",
+    "install_remote_memory_report()",
+    "validate_remote_memory_report()",
     "stage_thinkpad_fan_config_to_remote()",
     "install_remote_thinkpad_fan()",
     "validate_remote_thinkpad_fan()",
@@ -296,11 +325,31 @@ required_snippets = [
     '--exclude="${path}/web-client/src/generated"',
     'cp "${REPO_ROOT}/tools/arbuzas/render_cloudflared_config.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/render_cloudflared_config.py"',
     'cp "${REPO_ROOT}/tools/arbuzas/docker_gc.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/docker_gc.py"',
+    'MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"',
+    "python3 - --source-label '/proc/meminfo on ${ARBUZAS_HOST}'",
+    'MEMORY_REPORT_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/memory-report"',
+    'MEMORY_REPORT_REMOTE_SERVICE_FILE="/etc/systemd/system/arbuzas-memory-report.service"',
+    'MEMORY_REPORT_REMOTE_TIMER_FILE="/etc/systemd/system/arbuzas-memory-report.timer"',
+    'MEMORY_REPORT_REMOTE_DEFAULT_FILE="/etc/default/arbuzas-memory-report"',
+    'MEMORY_REPORT_REMOTE_SCRIPT_FILE="/usr/local/libexec/arbuzas-memory-report.py"',
+    'MEMORY_REPORT_REMOTE_JSON_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.json"',
+    'MEMORY_REPORT_REMOTE_TEXT_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.txt"',
+    'MEMORY_REPORT_REMOTE_PROM_FILE="${MEMORY_REPORT_REMOTE_OUTPUT_DIR}/latest.prom"',
+    "COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C \"${MEMORY_REPORT_CONFIG_ROOT}\" -cf - . | base64 | tr -d '\\n'",
+    "printf '%s' '${memory_report_tree_base64}' | base64 -d | tar -xf - -C '${remote_tmp_dir}'",
+    "printf '%s' '${memory_report_script_base64}' | base64 -d > '${remote_tmp_dir}/usr/local/libexec/arbuzas-memory-report.py'",
+    "systemctl enable arbuzas-memory-report.timer >/dev/null",
+    "systemctl restart arbuzas-memory-report.timer",
+    "systemctl start arbuzas-memory-report.service",
+    "Validate: corrected memory report publishes real pressure and cache separately",
+    "arbuzas_memory_real_pressure_percent",
     'gc_script="$(resolve_local_docker_gc_script)"',
     'DOCKER_GC_RELEASE_KEEP_PER_FAMILY="${DOCKER_GC_RELEASE_KEEP_PER_FAMILY:-10}"',
     "DOCKER_GC_RELEASE_KEEP_PER_FAMILY must be a non-negative integer",
     'ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS="${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS:-7}"',
     'ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE="${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE:-100M}"',
+    'ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE="${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE:-true}"',
+    "ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE must be true or false",
     "--release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'",
     "apt-get clean",
     "-name 'arbuzas-*'",
@@ -309,6 +358,11 @@ required_snippets = [
     "-name 'ticket-*'",
     "-name 'speedtest-install.*'",
     "journalctl --vacuum-size=\\\"\\${journal_max_size}\\\"",
+    "drop_reclaimable_cache='${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE}'",
+    "report_memory 'before reclaimable cache flush'",
+    "printf '3\\n' > /proc/sys/vm/drop_caches",
+    "report_memory 'after reclaimable cache flush'",
+    "reclaimable cache flush skipped because ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false",
     "missing Docker GC helper locally and on the current Arbuzas release bundle",
     "gc_script='${REMOTE_CURRENT_LINK}/tools/arbuzas/docker_gc.py'",
     "run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null",
@@ -500,12 +554,12 @@ required_snippets = [
     "private DNS admin root is available at http://${tailnet_dns_name}/",
     "ARBUZAS_DNS_CONTROLPLANE_PORT=${ARBUZAS_DNS_CONTROLPLANE_PORT}",
     "ARBUZAS_DNS_ADMIN_LAN_IP=${ARBUZAS_DNS_ADMIN_LAN_IP}",
-    "DNS host preflight failed on Arbuzas; fix the listener conflict before retrying.",
+    "DNS host preflight failed on the live host; fix the listener conflict before retrying.",
     "Safe repair: {repair_cmd}",
     "for path in / /login /dns/login /v1/health /livez /healthz; do",
-    "dns private admin login on Arbuzas loopback",
-    "dns private admin login on Arbuzas LAN address",
-    "dns private admin root on Arbuzas nginx",
+    "dns private admin login on live host loopback",
+    "dns private admin login on live host LAN address",
+    "dns private admin root on live host nginx",
     "dns private admin bare URL over Tailscale",
     "dns private admin login over Tailscale",
     "curl -fsS 'http://${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null",
@@ -579,7 +633,10 @@ def block_between(start: str, end: str) -> str:
 deploy_block = block_between('  deploy)\n', '  validate)\n')
 validate_block = block_between('  validate)\n', '  rollback)\n')
 rollback_block = block_between('  rollback)\n', '  cleanup-docker)\n')
-cleanup_block = block_between('  cleanup-docker)\n', '  compact-dns-db)\n')
+cleanup_block = block_between('  cleanup-docker)\n', '  memory-report)\n')
+memory_report_block = block_between('  memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  install-memory-report)\n')
+install_memory_report_block = block_between('  install-memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  validate-memory-report)\n')
+validate_memory_report_block = block_between('  validate-memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  compact-dns-db)\n')
 compact_block = block_between('  compact-dns-db)\n', '  repair-dns-admin)\n')
 repair_dns_admin_block = block_between('  repair-dns-admin)\n', '  install-netdata)\n')
 install_block = block_between('  install-netdata)\n', '  validate-netdata)\n')
@@ -674,9 +731,41 @@ automatic_cleanup_block = block_between('run_automatic_remote_docker_gc() {\n', 
 if automatic_cleanup_block.index("remote_run_docker_gc") > automatic_cleanup_block.index("remote_run_host_cache_cleanup"):
     raise SystemExit("automatic cleanup runs host cache cleanup before Docker/release cleanup")
 
+memory_report_function_block = block_between('remote_run_memory_report() {\n', 'remote_run_host_cache_cleanup() {\n')
+if "MEMORY_REPORT_SCRIPT" not in memory_report_function_block:
+    raise SystemExit("memory-report function does not use the repo memory reporter")
+if "python3 - --source-label" not in memory_report_function_block:
+    raise SystemExit("memory-report function does not stream the reporter to the host")
+
+host_cache_cleanup_block = block_between('remote_run_host_cache_cleanup() {\n', 'compact_remote_dns_db() {\n')
+if host_cache_cleanup_block.index("journalctl --vacuum-size=\\\"\\${journal_max_size}\\\"") > host_cache_cleanup_block.index("report_memory 'before reclaimable cache flush'"):
+    raise SystemExit("host cache cleanup flushes reclaimable memory before journal cleanup")
+if host_cache_cleanup_block.index("report_memory 'before reclaimable cache flush'") > host_cache_cleanup_block.index("printf '3\\n' > /proc/sys/vm/drop_caches"):
+    raise SystemExit("host cache cleanup drops reclaimable memory before logging the pre-flush state")
+if host_cache_cleanup_block.index("printf '3\\n' > /proc/sys/vm/drop_caches") > host_cache_cleanup_block.index("report_memory 'after reclaimable cache flush'"):
+    raise SystemExit("host cache cleanup logs the post-flush state before dropping reclaimable memory")
+
+if "remote_run_memory_report" not in memory_report_block:
+    raise SystemExit("memory-report action does not invoke remote_run_memory_report")
+for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "remote_compose_up", "run_automatic_remote_docker_gc", "remote_run_docker_gc", "remote_run_host_cache_cleanup", "validate_remote_release"):
+    if forbidden in memory_report_block:
+        raise SystemExit(f"memory-report block should stay read-only and isolated from deploy/cleanup flow: {forbidden}")
+
+if "stage_memory_report_config_to_remote" not in install_memory_report_block or "install_remote_memory_report" not in install_memory_report_block or "validate_remote_memory_report" not in install_memory_report_block:
+    raise SystemExit("install-memory-report block does not stage config, install the service, and validate it")
+for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "remote_compose_up", "run_automatic_remote_docker_gc", "remote_run_docker_gc", "remote_run_host_cache_cleanup", "validate_remote_release"):
+    if forbidden in install_memory_report_block:
+        raise SystemExit(f"install-memory-report block should stay isolated from app deploy/cleanup flow: {forbidden}")
+
+if "validate_remote_memory_report" not in validate_memory_report_block:
+    raise SystemExit("validate-memory-report block does not invoke validate_remote_memory_report")
+for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "remote_compose_up", "run_automatic_remote_docker_gc", "remote_run_docker_gc", "remote_run_host_cache_cleanup", "validate_remote_release"):
+    if forbidden in validate_memory_report_block:
+        raise SystemExit(f"validate-memory-report block should stay isolated from app deploy/cleanup flow: {forbidden}")
+
 if "compact_remote_dns_db" not in compact_block:
     raise SystemExit("compact-dns-db action does not invoke compact_remote_dns_db")
-if 'log "Maintenance: activating cleanup and compacting the live Arbuzas DNS control-plane database"' not in compact_block:
+if 'log "Maintenance: activating cleanup and compacting the live DNS control-plane database"' not in compact_block:
     raise SystemExit("compact-dns-db block does not announce the activation-and-compact action")
 if 'require_dns_private_admin_env' not in compact_block:
     raise SystemExit("compact-dns-db block does not require the DNS private admin environment")

@@ -410,8 +410,14 @@ func TestShellRoutesServeMiniAppAssetsWhenEnabled(t *testing.T) {
 		if !strings.Contains(body, "/pixel-stack/subscription/assets/app.css?v=") {
 			t.Fatalf("expected versioned app.css asset in %s body=%s", path, body)
 		}
+		if !strings.Contains(body, "/pixel-stack/subscription/assets/arrow-core.js?v=") {
+			t.Fatalf("expected versioned arrow-core.js asset in %s body=%s", path, body)
+		}
 		if !strings.Contains(body, "/pixel-stack/subscription/assets/app.js?v=") {
 			t.Fatalf("expected versioned app.js asset in %s body=%s", path, body)
+		}
+		if strings.Index(body, "/pixel-stack/subscription/assets/arrow-core.js?v=") > strings.Index(body, "/pixel-stack/subscription/assets/app.js?v=") {
+			t.Fatalf("expected arrow-core.js to load before app.js in %s body=%s", path, body)
 		}
 		if !strings.Contains(body, `data-mode="`+mode+`"`) {
 			t.Fatalf("expected shell route %s to render mode %s, got %s", path, mode, body)

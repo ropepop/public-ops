@@ -95,6 +95,7 @@ type pageData struct {
 	LeafletCSSURL           string
 	LeafletJSURL            string
 	ExternalFeedJSURL       string
+	ArrowJSURL              string
 	AppJSURL                string
 }
 
@@ -174,6 +175,7 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
   {{if .TelegramWebAppScript}}<script data-cfasync="false" src="https://telegram.org/js/telegram-web-app.js"></script>{{end}}
   <script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>
   <script data-cfasync="false" defer src="{{.ExternalFeedJSURL}}"></script>
+  <script data-cfasync="false" defer src="{{.ArrowJSURL}}"></script>
   <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
 </head>
 <body>
@@ -2437,6 +2439,7 @@ func (s *Server) newPageData(basePath string, mode string, trainID string) pageD
 		LeafletCSSURL:           s.release.AssetURL(basePath, "vendor/leaflet.css"),
 		LeafletJSURL:            s.release.AssetURL(basePath, "vendor/leaflet.js"),
 		ExternalFeedJSURL:       s.release.AssetURL(basePath, "external-feed.js"),
+		ArrowJSURL:              s.release.AssetURL(basePath, "arrow-core.js"),
 		AppJSURL:                s.release.AssetURL(basePath, "app.js"),
 	}
 }

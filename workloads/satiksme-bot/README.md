@@ -1,6 +1,6 @@
 # Kontrole
 
-Web-first Riga Satiksme control map and incident feed workload for the Arbuzas production stack.
+Web-first Riga Satiksme control map and incident feed workload for the kitty-gration production stack.
 
 For agent-specific context, tests, deploy checks, and live-map pitfalls, start with [AGENTS.md](./AGENTS.md).
 
@@ -18,11 +18,11 @@ go run ./cmd/bot
 
 ## Active Deployment
 
-The active production runtime is Docker on Arbuzas. Local workload commands stop at build and image preparation; deployment happens through the shared operator script:
+The active production runtime is Docker on kitty-gration. Local workload commands stop at build and image preparation; deployment happens through the shared operator script:
 
 ```bash
-../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
-../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 ## Important Runtime Paths
@@ -37,4 +37,6 @@ The active production runtime is Docker on Arbuzas. Local workload commands stop
 - Anonymous visitors can browse the map and incidents; Telegram login unlocks reporting, voting, and commenting.
 - The website uses Telegram's current Login library (`telegram-login.js?3`): the page fetches `/api/v1/auth/telegram/config`, receives an `id_token` from Telegram, and finishes the site session through `/api/v1/auth/telegram/complete`.
 - Browser pages no longer talk to Spacetime directly; the site uses its own JSON API while the backend keeps Spacetime as the live data store.
+- Interactive browser UI uses ArrowJS for changing map, incident list, detail, and status areas. Keep static or no-JS pages simple until they need browser-side interactivity.
+- For UI changes that touch the Arrow runtime, run `(cd web-client && npm run build:arrow)` before the normal tests.
 - The old Pixel deploy helpers are rollback-only legacy material.

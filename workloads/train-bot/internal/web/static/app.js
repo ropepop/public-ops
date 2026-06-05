@@ -145,6 +145,10 @@
 
   const appEl = document.getElementById("app");
   const state = createInitialState();
+  const arrow = window.ArrowJS || null;
+  const arrowHTML = arrow && typeof arrow.html === "function" ? arrow.html : null;
+  const arrowReactive = arrow && typeof arrow.reactive === "function" ? arrow.reactive : null;
+  const arrowPublicIncidentSlots = arrowReactive ? arrowReactive({ listHTML: "", detailHTML: "" }) : null;
   restoreSpacetimeSession();
   const mapController = createMapController();
   const MAP_MARKER_ANIMATION_DEFAULT_MS = 900;
@@ -9714,25 +9718,81 @@
       : `<div class="empty">${escapeHtml(t("app_public_incidents_empty"))}</div>`;
   }
 
+  function markArrowUIActive() {
+    if (document && document.documentElement) {
+      document.documentElement.dataset.trainUi = "arrow";
+    }
+  }
+
+  function mountArrowHTMLSlot(node, slots, property) {
+    if (!node || !arrowHTML || !slots || !property) {
+      return false;
+    }
+    if (!node.__trainArrowSlot) {
+      node.innerHTML = "";
+      arrowHTML`<div .innerHTML="${() => slots[property] || ""}"></div>`(node);
+      node.__trainArrowSlot = true;
+    }
+    markArrowUIActive();
+    return true;
+  }
+
+  function renderArrowPublicIncidentSlot(node, property, html) {
+    if (!arrowPublicIncidentSlots) {
+      return false;
+    }
+    arrowPublicIncidentSlots[property] = html;
+    return mountArrowHTMLSlot(node, arrowPublicIncidentSlots, property);
+  }
+
+  function patchPublicIncidentPanels(incidentListHTML, detailPanelHTML, detailVisible, detailPanelClasses) {
+    const statusBar = document.getElementById("public-incidents-status-bar");
+    const listSlot = document.getElementById("public-incidents-list-slot");
+    const detailPanel = document.getElementById("incident-detail-panel");
+    const detailSlot = document.getElementById("public-incidents-detail-slot");
+    const toastRoot = document.getElementById("public-incidents-toast-root");
+    if (!statusBar || !listSlot || !detailPanel || !detailSlot || !toastRoot) {
+      return false;
+    }
+    statusBar.innerHTML = renderPublicIncidentsStatusBar();
+    detailPanel.className = detailPanelClasses;
+    detailPanel.hidden = !detailVisible;
+    detailPanel.setAttribute("aria-hidden", detailVisible ? "false" : "true");
+    if (!renderArrowPublicIncidentSlot(listSlot, "listHTML", incidentListHTML)) {
+      listSlot.innerHTML = incidentListHTML;
+    }
+    if (!renderArrowPublicIncidentSlot(detailSlot, "detailHTML", detailPanelHTML)) {
+      detailSlot.innerHTML = detailPanelHTML;
+    }
+    toastRoot.innerHTML = renderToast();
+    bindPublicIncidentEvents(appEl);
+    return true;
+  }
+
   function renderPublicIncidents() {
     syncIncidentLayoutState();
     const incidentListHTML = renderIncidentListHTML();
+    const detailPanelHTML = renderIncidentDetailPanel();
     const detailVisible = isIncidentDetailVisible();
     const detailPanelClasses = `panel incident-detail-panel ${state.publicIncidentMobileLayout && state.publicIncidentDetailOpen ? "incident-detail-panel-open" : ""}`;
+    if (patchPublicIncidentPanels(incidentListHTML, detailPanelHTML, detailVisible, detailPanelClasses)) {
+      return;
+    }
     setAppHTML(`
       <div class="shell">
         ${renderHero(t("app_public_incidents_eyebrow"), t("app_public_incidents_title"), t("app_public_incidents_note"))}
-        <section class="status-bar">${renderPublicIncidentsStatusBar()}</section>
+        <section class="status-bar" id="public-incidents-status-bar">${renderPublicIncidentsStatusBar()}</section>
         <div class="split incident-layout">
           <section class="panel" id="incident-list-panel">
-            <div class="card-list">${incidentListHTML}</div>
+            <div class="card-list" id="public-incidents-list-slot">${arrowPublicIncidentSlots ? "" : incidentListHTML}</div>
           </section>
           <section class="${escapeAttr(detailPanelClasses)}" id="incident-detail-panel" ${detailVisible ? "" : "hidden"} aria-hidden="${detailVisible ? "false" : "true"}">
-            ${renderIncidentDetailPanel()}
+            <div id="public-incidents-detail-slot">${arrowPublicIncidentSlots ? "" : detailPanelHTML}</div>
           </section>
         </div>
       </div>
-      ${renderToast()}`);
+      ${renderToastRoot("public-incidents-toast-root")}`);
+    patchPublicIncidentPanels(incidentListHTML, detailPanelHTML, detailVisible, detailPanelClasses);
     bindPublicIncidentEvents(appEl);
   }
 
@@ -11324,10 +11384,18 @@
     }
   }
 
+  function bindEventOnce(node, key, eventName, handler) {
+    if (!node || !key || node[key]) {
+      return;
+    }
+    node[key] = true;
+    node.addEventListener(eventName, handler);
+  }
+
   function bindPublicIncidentEvents(root) {
     const scope = root || document;
     scope.querySelectorAll("[data-action='open-incident']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainOpenIncidentBound", "click", () => {
         runUserAction(async () => {
           const incidentId = el.getAttribute("data-incident-id");
           const selectedId = String(incidentId || "").trim();
@@ -11340,12 +11408,12 @@
       });
     });
     scope.querySelectorAll("[data-action='open-incident-map']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainOpenIncidentMapBound", "click", () => {
         navigateToIncidentMap(el.getAttribute("data-incident-id"));
       });
     });
     scope.querySelectorAll("[data-action='incident-vote']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainIncidentVoteBound", "click", () => {
         if (!state.authenticated) {
           void beginTelegramLogin();
           return;
@@ -11356,7 +11424,7 @@
       });
     });
     scope.querySelectorAll("[data-action='submit-incident-comment']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainIncidentCommentBound", "click", () => {
         if (!state.authenticated) {
           void beginTelegramLogin();
           return;
@@ -11370,7 +11438,7 @@
     });
     const commentInput = scope.querySelector("#incident-comment-body");
     if (commentInput) {
-      commentInput.addEventListener("input", (event) => {
+      bindEventOnce(commentInput, "__trainIncidentCommentInputBound", "input", (event) => {
         setIncidentCommentDraft(event.target.getAttribute("data-incident-id"), event.target.value);
       });
     }

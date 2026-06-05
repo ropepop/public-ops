@@ -1,6 +1,6 @@
-# Arbuzas Docker + Portainer
+# kitty-gration Docker + Portainer
 
-This is the detailed operator runbook for the active Arbuzas runtime.
+This is the detailed operator runbook for the active kitty-gration runtime.
 
 ## Files
 
@@ -14,12 +14,12 @@ This is the detailed operator runbook for the active Arbuzas runtime.
 
 1. Pull the current host variables/secrets into the local plaintext mirror:
    ```bash
-   ./tools/arbuzas/deploy.sh mirror-pull --ssh-host arbuzas --ssh-user ropepop
+   ./tools/arbuzas/deploy.sh mirror-pull --ssh-host kitty-gration --ssh-user ropepop
    ```
 2. Edit deployment variables and secrets under `infra/arbuzas/host-mirror/` first. Use `mirror-audit` before overwriting host drift, and use `deploy-config` for config-only updates that should avoid rebuilds and release uploads.
 3. Copy `infra/arbuzas/docker/env/arbuzas.example.env` to a private local env file if you need operator-only CLI overrides.
-4. Make sure Arbuzas has Docker with the Compose plugin, Python 3, and SSH access.
-5. Make sure Arbuzas has `nginx` installed and running for the bare private DNS admin URL.
+4. Make sure kitty-gration has Docker with the Compose plugin, Python 3, and SSH access.
+5. Make sure kitty-gration has `nginx` installed and running for the bare private DNS admin URL.
 6. Make sure these host files exist, preferably via the local mirror:
    - `/etc/arbuzas/env/train-bot.env`
    - `/etc/arbuzas/env/satiksme-bot.env`
@@ -31,22 +31,22 @@ This is the detailed operator runbook for the active Arbuzas runtime.
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
-7. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on Arbuzas.
-8. DNS on Arbuzas binds directly to host ports `443` and `853`.
+7. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
+8. DNS on kitty-gration binds directly to host ports `443` and `853`.
 
 ## Normal Release Flow
 
 Deploy the current repo state:
 
 ```bash
-./tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Deploy only one service or a few services:
 
 ```bash
-./tools/arbuzas/deploy.sh deploy --services dns_controlplane --ssh-host arbuzas --ssh-user "$USER"
-./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Notes for targeted updates:
@@ -54,62 +54,80 @@ Notes for targeted updates:
 - `--services` is available only for `deploy` and `validate`.
 - Service names use the Compose service names from `infra/arbuzas/docker/compose.yml`.
 - `train_bot`, `satiksme_bot`, and `subscription_bot` automatically bring along their matching tunnel service so the public route stays aligned.
-- `site-notifications` is kept in the repo for reference and testing, but it is not part of the active Arbuzas deploy set.
+- `site-notifications` is kept in the repo for reference and testing, but it is not part of the active kitty-gration deploy set.
 - Targeted validation checks the slice you touched instead of forcing a full-stack validation pass.
 
 Validate an existing release:
 
 ```bash
-./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
-./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Run the cleanup policy without deploying:
 
 ```bash
-./tools/arbuzas/deploy.sh cleanup-docker --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh cleanup-docker --ssh-host kitty-gration --ssh-user "$USER"
+```
+
+Report the corrected host memory pressure without deploying or flushing cache:
+
+```bash
+./tools/arbuzas/deploy.sh memory-report --ssh-host kitty-gration --ssh-user "$USER"
+```
+
+Install or refresh the host-native corrected memory report service:
+
+```bash
+./tools/arbuzas/deploy.sh install-memory-report --ssh-host kitty-gration --ssh-user "$USER"
+```
+
+Re-run the memory report service checks without reinstalling it:
+
+```bash
+./tools/arbuzas/deploy.sh validate-memory-report --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Run one live DNS observability database compaction pass without deploying:
 
 ```bash
-./tools/arbuzas/deploy.sh compact-dns-db --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh compact-dns-db --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Push only local mirror changes and restart/reload affected services without rebuilding or uploading a release bundle:
 
 ```bash
-./tools/arbuzas/deploy.sh deploy-config --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy-config --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Repair a stale or broken Portainer install on the active host:
 
 ```bash
-./tools/arbuzas/deploy.sh repair-portainer --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh repair-portainer --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Install or refresh the host-native Netdata setup:
 
 ```bash
-./tools/arbuzas/deploy.sh install-netdata --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh install-netdata --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Re-run the Netdata checks without reinstalling it:
 
 ```bash
-./tools/arbuzas/deploy.sh validate-netdata --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate-netdata --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Install or refresh the host-native ThinkPad fan controller:
 
 ```bash
-./tools/arbuzas/deploy.sh install-thinkpad-fan --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh install-thinkpad-fan --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Re-run the fan-controller checks without reinstalling it:
 
 ```bash
-./tools/arbuzas/deploy.sh validate-thinkpad-fan --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate-thinkpad-fan --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 ## What Deploy Does
@@ -124,22 +142,24 @@ Re-run the fan-controller checks without reinstalling it:
 - prunes old release bundles beyond the newest 10 per release family
 - prunes Docker build cache older than 7 days
 - runs gentle host cache cleanup for package caches, narrow old `/tmp` scratch, and journals
-- confirms native Arbuzas DNS on `443/853` both on the host itself and from the public endpoint
+- flushes reclaimable Linux memory cache after cleanup so provider memory graphs fall back quickly
+- confirms native kitty-gration DNS on `443/853` both on the host itself and from the public endpoint
 
 The normal Docker release flow does not install or update Netdata. Netdata is a separate host-maintenance action.
+The corrected memory report service is also a separate host-maintenance action.
 The ThinkPad fan controller is also a separate host-maintenance action.
 
 ## Rollback
 
 ```bash
-./tools/arbuzas/deploy.sh rollback --release-id "<previous-release-id>" --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh rollback --release-id "<previous-release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Rollback re-runs the same post-validation cleanup policy after the host is healthy again.
 
 ## Cleanup
 
-The active Arbuzas runtime now applies cleanup in three ways:
+The active kitty-gration runtime now applies cleanup in three ways:
 
 - automatically after a successful `deploy`
 - automatically after a successful `rollback`
@@ -159,8 +179,12 @@ What the cleanup removes:
 - older release bundles beyond the protected current, rollback, and newest 10 per family set
 - Docker build cache older than 7 days
 - package-manager cache through `apt-get clean`
-- old Arbuzas scratch files in `/tmp` that match narrow known patterns
+- old kitty-gration scratch files in `/tmp` that match narrow known patterns
 - systemd journals beyond the configured cap, default `100M`
+- reclaimable in-memory Linux page, directory, and inode cache through `drop_caches=3`
+
+Dropping reclaimable memory cache affects provider memory charts and warm file reads, not live application memory.
+The host may rebuild cache naturally after Docker builds, validation, or busy app traffic.
 
 What the cleanup does not touch:
 
@@ -177,13 +201,52 @@ Implementation notes for operators:
 - Release bundle retention defaults to `DOCKER_GC_RELEASE_KEEP_PER_FAMILY=10`.
 - Host scratch retention defaults to `ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS=7`.
 - Journal cleanup defaults to `ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE=100M`.
-- If the cleanup state file is missing or corrupted, Arbuzas recreates it and starts a fresh 7-day countdown instead of deleting newly eligible images immediately.
+- Reclaimable memory cache flushing defaults to enabled; set `ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false` to skip it for one run.
+- If the cleanup state file is missing or corrupted, kitty-gration recreates it and starts a fresh 7-day countdown instead of deleting newly eligible images immediately.
 - If automatic cleanup fails after a successful deploy or rollback, the release still stays successful and the cleanup failure is logged as a warning.
 - Manual `cleanup-docker` fails loudly if the cleanup itself cannot complete.
 
+## Memory Reporting
+
+The VPS provider's "Memory Utilization" graph is not the source of truth for real pressure on kitty-gration. The observed provider line matches this cached-inclusive calculation:
+
+```text
+(MemTotal - MemFree - Buffers) / MemTotal
+```
+
+That formula counts much of the Linux file/slab cache as used memory. Linux normally keeps RAM warm for recently read files and releases that cache when applications need memory, so the provider line can stay high even when the machine is not under pressure.
+
+Use this formula for real pressure:
+
+```text
+(MemTotal - MemAvailable) / MemTotal
+```
+
+Use this command for the canonical live number:
+
+```bash
+./tools/arbuzas/deploy.sh memory-report --ssh-host kitty-gration --ssh-user "$USER"
+```
+
+The report shows three separate values:
+
+- real pressure using `MemAvailable`
+- cached/reclaimable memory shown separately
+- the provider-style cached-inclusive percentage for comparison with the VPS panel
+
+The canonical host source is the `arbuzas-memory-report.timer` service. Install it with `install-memory-report`; it publishes the latest corrected snapshot every minute under `/var/lib/arbuzas/memory-report/`:
+
+- `latest.json`
+- `latest.txt`
+- `latest.prom`
+
+The provider memory panel is useful only as a cached-inclusive comparison line. Cleanup still flushes reclaimable cache as a cosmetic fallback for that provider panel, but the flush is not proof of application memory pressure.
+
+Do not disable `qemu-guest-agent` to change the provider graph. The agent does not expose the provider's memory-utilization formula, and disabling it can break provider-side guest operations such as shutdown/reboot handling or console metadata.
+
 ## DNS DB Compaction
 
-The active Arbuzas `dns_controlplane` service owns DNS state compaction.
+The active kitty-gration `dns_controlplane` service owns DNS state compaction.
 
 - Primary state store: `/srv/arbuzas/dns/state/controlplane.sqlite`
 - Compatibility observability store: `/srv/arbuzas/dns/state/identity-observability.sqlite`
@@ -192,7 +255,7 @@ The active Arbuzas `dns_controlplane` service owns DNS state compaction.
 Manual operator command:
 
 ```bash
-./tools/arbuzas/deploy.sh compact-dns-db --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh compact-dns-db --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Expected result:
@@ -204,11 +267,11 @@ Expected result:
 
 Post-run checks:
 
-- `./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host arbuzas --ssh-user "$USER"`
+- `./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"`
 - confirm `dns_controlplane` stays healthy
 - confirm public `https://dns.jolkins.id.lv/login` returns `404`
 - confirm the private admin UI still loads on `http://<arbuzas-tailnet-dns-name>/`
-- confirm the short MagicDNS host works too at `http://arbuzas/` when the operator machine has MagicDNS enabled
+- confirm the short MagicDNS host works too at `http://kitty-gration/` when the operator machine has MagicDNS enabled
 - confirm the raw private admin port still loads on `http://<arbuzas-tailnet-ip>:8097/login`
 - confirm the improved query log and usage pages still load normally through the private admin port
 
@@ -218,7 +281,7 @@ Use `repair-portainer` when Portainer is carrying stale Swarm-era state, such as
 
 What the repair does:
 
-- confirms the current Arbuzas Compose stack is healthy before changing Portainer
+- confirms the current kitty-gration Compose stack is healthy before changing Portainer
 - refuses to continue if any Docker Swarm services or stacks are still active
 - stops only the Portainer container
 - archives `/srv/arbuzas/portainer` into `/srv/arbuzas/portainer-backups/portainer-<timestamp>.tar.gz`
@@ -243,7 +306,7 @@ Portainer-only rollback:
 
 ## Netdata Host Observability
 
-The Arbuzas Netdata setup is intentionally host-native, not a Compose service.
+The kitty-gration Netdata setup is intentionally host-native, not a Compose service.
 
 What `install-netdata` does:
 
@@ -251,10 +314,10 @@ What `install-netdata` does:
 - runs the official Netdata installer in stable, native-package, non-interactive mode
 - keeps Netdata auto-updates and anonymous telemetry disabled
 - syncs the repo-managed config from `infra/arbuzas/netdata/`
-- keeps Netdata's Docker collector and Docker-backed service discovery disabled on Arbuzas so Docker itself is not polled during normal host monitoring
+- keeps Netdata's Docker collector and Docker-backed service discovery disabled on kitty-gration so Docker itself is not polled during normal host monitoring
 - restarts Netdata so it binds only to `localhost:19999`
 - publishes a private TCP forward on the host through `tailscale serve`
-- validates the local API, Tailscale access, and expected Arbuzas hardware charts
+- validates the local API, Tailscale access, and expected kitty-gration hardware charts
 
 Access pattern:
 
@@ -262,11 +325,11 @@ Access pattern:
 - operator access: `http://<arbuzas-tailnet-ip>:19999`
 - there is no Cloudflare route for Netdata
 - there is no Portainer plugin dependency
-- there is no Netdata Cloud claim in the Arbuzas baseline
+- there is no Netdata Cloud claim in the kitty-gration baseline
 
 ## ThinkPad Fan Control
 
-Arbuzas now keeps a small host-native ThinkPad fan policy outside the Docker Compose project.
+kitty-gration now keeps a small host-native ThinkPad fan policy outside the Docker Compose project.
 
 What `install-thinkpad-fan` does:
 
@@ -288,7 +351,7 @@ Validation checks:
 - Portainer connects directly to the local Docker socket.
 - Netdata lives on the host outside the `arbuzas` Compose project.
 - The active runtime is one Compose project named `arbuzas`.
-- Arbuzas keeps the native DNS controlplane directly on `443/853`.
-- The live Arbuzas host must stay out of Docker Swarm. Validation now fails if Swarm is still enabled or if Portainer state still references `tasks.agent`.
+- kitty-gration keeps the native DNS controlplane directly on `443/853`.
+- The live kitty-gration host must stay out of Docker Swarm. Validation now fails if Swarm is still enabled or if Portainer state still references `tasks.agent`.
 - Swarm and rooted Pixel deployment paths are rollback-only legacy material.
 - If the live host still carries old localhost-only web bind or port values from the Pixel era, remove those keys from `/etc/arbuzas/env/*.env` before the next deploy.

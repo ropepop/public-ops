@@ -1,7 +1,7 @@
-# Arbuzas CPU Lock
+# Archived CPU Lock
 
-This directory preserves the live Arbuzas CPU lock setup that was found on the
-host on April 15, 2026.
+This directory preserves the CPU lock setup that was found on kitty-gration on
+April 15, 2026.
 
 It consists of:
 
@@ -25,7 +25,7 @@ The script writes logs to:
 
 ## Rebuild The Helper Image
 
-Run this on the Arbuzas host:
+Run this on kitty-gration only if deliberately restoring the archived lock:
 
 ```sh
 docker build -t arbuzas/cpu-lock:latest /path/to/repo/infra/arbuzas/cpu-lock

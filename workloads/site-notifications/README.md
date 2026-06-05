@@ -51,8 +51,8 @@ python app.py healthcheck
 ## Active Deployment
 
 ```bash
-../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
-../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 The production service stores state under `/srv/arbuzas/site-notifications/state` and uses `/etc/arbuzas/env/site-notifications.env` as its managed env file.

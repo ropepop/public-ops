@@ -49,6 +49,7 @@ type pageData struct {
 	PublicBaseURLJS string
 	ModeJS          string
 	AppCSSURL       string
+	ArrowJSURL      string
 	AppJSURL        string
 }
 
@@ -152,6 +153,7 @@ func NewServer(cfg config.Config, app *service.App, loc *time.Location) (*Server
     };
   </script>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="{{.ArrowJSURL}}"></script>
   <script defer src="{{.AppJSURL}}"></script>
 </head>
 <body data-mode="{{.ModeName}}">
@@ -551,6 +553,7 @@ func (s *Server) serveShell(w http.ResponseWriter, title string, mode string, ro
 		PublicBaseURLJS: strings.TrimRight(s.cfg.WebPublicBaseURL, "/"),
 		ModeJS:          mode,
 		AppCSSURL:       s.release.AssetURL(basePath, "app.css"),
+		ArrowJSURL:      s.release.AssetURL(basePath, "arrow-core.js"),
 		AppJSURL:        s.release.AssetURL(basePath, "app.js"),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

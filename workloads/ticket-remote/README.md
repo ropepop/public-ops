@@ -11,6 +11,7 @@ The service validates SpacetimeAuth email identity, checks ticket membership in 
 ```bash
 make test
 make spacetime-build
+make web-client-build
 TICKET_REMOTE_AUTH_MODE=dev make run
 ```
 
@@ -25,6 +26,8 @@ TICKET_REMOTE_AUTH_MODE=dev make run
 - The production backend is the physical Pixel through the private `phone_broker`, backed by `ticket_phone_bridge`; the old in-container device path has been removed.
 - Public video is H.264 over the existing HTTPS WebSocket: the active phone backend emits one private root FFmpeg H.264 stream, and `ticket_remote` fans it out to authenticated browsers without public media ports.
 - Pixel capture quality is fixed by the phone service at the current readable profile: 900 px target width, 10 FPS, 5 Mbps, FFmpeg H.264 baseline/ultrafast, and the existing keyframe cadence. Compute-reduction work must keep that browser-visible output unchanged and remove only duplicate or orphan root capture helpers, FFmpeg encoders, and wrapper shells.
+- Interactive browser UI uses ArrowJS for changing presence, status, stream, and control areas. Keep static or no-JS pages simple until they need browser-side interactivity.
+- Edit browser UI in `web-client/`, rebuild with `make web-client-build`, and verify the deployed page mounts the Arrow-backed path.
 
 ## Required Production Configuration
 
@@ -34,9 +37,9 @@ TICKET_REMOTE_AUTH_MODE=dev make run
 - `TICKET_REMOTE_SESSION_SIGNING_KEY`
 - `TICKET_REMOTE_STATE_BACKEND=spacetime`
 - `TICKET_REMOTE_SPACETIME_DATABASE`
-- `TICKET_REMOTE_SPACETIME_OIDC_ISSUER=https://vilciens.kontrole.info/oidc` on Arbuzas, matching the public train OIDC issuer that publishes the runtime signing key.
+- `TICKET_REMOTE_SPACETIME_OIDC_ISSUER=https://vilciens.kontrole.info/oidc` on kitty-gration, matching the public train OIDC issuer that publishes the runtime signing key.
 - either `TICKET_REMOTE_SPACETIME_BEARER_TOKEN` or `TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE`
-- on Arbuzas, key-file mode should use `TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE=/run/secrets/ticket-remote/spacetime-jwt-private-key.pem`
+- on kitty-gration, key-file mode should use `TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE=/run/secrets/ticket-remote/spacetime-jwt-private-key.pem`
 - `TICKET_REMOTE_PHONE_BACKENDS`
 - `TICKET_REMOTE_PHONE_BROKER_URL`
 - `TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID`

@@ -1,6 +1,6 @@
 # Ops Context Guide
 
-Use this file to pick the smallest useful Markdown context for an Arbuzas ops task. Avoid broad recursive doc reads unless the task is specifically historical or investigative.
+Use this file to pick the smallest useful Markdown context for a kitty-gration ops task. Avoid broad recursive doc reads unless the task is specifically historical or investigative.
 
 ## Always-read spine
 
@@ -16,11 +16,14 @@ Use this file to pick the smallest useful Markdown context for an Arbuzas ops ta
 - `../workloads/train-bot/AGENTS.md`: train app verification and public-cache cautions.
 - `../workloads/ticket-remote/README.md`: public ViVi ticket viewer runtime model.
 - `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
-- `../workloads/subscription-bot/README.md`, `../workloads/site-notifications/README.md`, and `../workloads/rigassatiksme-qr-bot/README.md`: smaller workload entrypoints.
+- `../workloads/subscription-bot/README.md` and `../workloads/subscription-bot/AGENTS.md`: subscription bot and mini app overview plus web UI checks.
+- `../workloads/site-notifications/README.md` and `../workloads/rigassatiksme-qr-bot/README.md`: smaller workload entrypoints.
+- For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
 
 ## Durable docs
 
 - `architecture/`: stable system design, boundaries, endpoints, state ownership, and runtime paths.
+- `architecture/WEB_UI_GUIDANCE.md`: required ArrowJS policy for active interactive browser UI.
 - `runbooks/`: operator procedures that should remain valid across sessions.
 - `reference/` if present: exhaustive command/config/API detail.
 - `../infra/arbuzas/docker/README.md`: active Docker layout and Compose details.

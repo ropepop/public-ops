@@ -44,6 +44,10 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 	if err != nil {
 		return releaseInfo{}, err
 	}
+	arrowCoreHash, err := hashStaticAsset(static, "arrow-core.js")
+	if err != nil {
+		return releaseInfo{}, err
+	}
 	liveClientHash, err := hashOptionalStaticAsset(static, "live-client.js")
 	if err != nil {
 		return releaseInfo{}, err
@@ -65,6 +69,7 @@ func newReleaseInfo(static fs.FS) (releaseInfo, error) {
 		assetHash: map[string]string{
 			"app.js":              appJSHash,
 			"app.css":             appCSSHash,
+			"arrow-core.js":       arrowCoreHash,
 			"leaflet/leaflet.css": leafletCSSHash,
 			"leaflet/leaflet.js":  leafletJSHash,
 		},

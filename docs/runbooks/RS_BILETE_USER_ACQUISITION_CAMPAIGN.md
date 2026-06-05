@@ -2,14 +2,14 @@
 
 This outreach workflow is disabled.
 
-As of June 2, 2026, Arbuzas must not run the RS Biļete acquisition daemon, send first-contact messages, retry failed outreach, or grant access through this campaign path.
+As of June 2, 2026, kitty-gration must not run the RS Biļete acquisition daemon, send first-contact messages, retry failed outreach, or grant access through this campaign path.
 
 ## Disabled State
 
 - The production Compose service `satiksme_rs_acquisition` has been removed from the active repo layout.
 - The Satiksme host environment keeps `RS_ACQUISITION_ENABLED=false`.
 - Pending approval drafts were invalidated with reason `campaign_disabled`.
-- The `iamhdzs` sender session was moved away from the active session filename on Arbuzas.
+- The `iamhdzs` sender session was moved away from the active session filename on kitty-gration.
 - Future Satiksme production images should not ship `/usr/local/bin/rs-acquisition-campaign`.
 
 ## Operator Rule

@@ -1,3 +1,5 @@
+import { html, reactive } from '@arrow-js/core';
+
 (function () {
   const cfg = window.TICKET_REMOTE_CONFIG || {};
   const pageVersion = cfg.pageVersion || 'ticket-remote-dev';
@@ -136,6 +138,8 @@
   if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot || !controlCodeCloseHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
+  const presenceState = reactive({ viewers: [], visibleViewerCount: 0 });
+  let presenceMounted = false;
 
   let ws = null;
   let videoWs = null;
@@ -2947,31 +2951,31 @@
   function renderPresence(viewers, visibleViewerCount) {
     const active = activeViewers(viewers);
     const countValue = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : active.length;
+    presenceState.visibleViewerCount = countValue;
+    presenceState.viewers = active.map((viewer, index) => ({
+      key: `${viewer.publicId || viewer.label || 'viewer'}-${index}`,
+      label: viewer.label || `Skatītājs ${index + 1}`
+    }));
+    if (presenceMounted) return;
     presence.textContent = '';
-    const title = document.createElement('div');
-    title.className = 'presence-header';
-    const label = document.createElement('span');
-    label.textContent = 'Skatītāji';
-    const count = document.createElement('strong');
-    count.textContent = `${countValue} lapā`;
-    title.append(label, count);
-    presence.appendChild(title);
-    if (!active.length) return;
-    const list = document.createElement('div');
-    list.className = 'presence-list';
-    active.forEach((viewer, index) => {
-      const row = document.createElement('div');
-      row.className = 'presence-item';
-      const label = document.createElement('span');
-      label.className = 'presence-email';
-      label.textContent = viewer.label || `Skatītājs ${index + 1}`;
-      const mark = document.createElement('span');
-      mark.className = 'presence-mark';
-      mark.textContent = 'skatās';
-      row.append(label, mark);
-      list.appendChild(row);
-    });
-    presence.appendChild(list);
+    document.documentElement.dataset.ticketUi = "arrow";
+    html`
+      <div class="presence-header">
+        <span>Skatītāji</span>
+        <strong>${() => `${presenceState.visibleViewerCount} lapā`}</strong>
+      </div>
+      ${() => presenceState.viewers.length ? html`
+        <div class="presence-list">
+          ${() => presenceState.viewers.map((viewer) => html`
+            <div class="presence-item">
+              <span class="presence-email">${viewer.label}</span>
+              <span class="presence-mark">skatās</span>
+            </div>
+          `.key(viewer.key))}
+        </div>
+      ` : ''}
+    `(presence);
+    presenceMounted = true;
   }
 
   async function postJSON(path, body) {

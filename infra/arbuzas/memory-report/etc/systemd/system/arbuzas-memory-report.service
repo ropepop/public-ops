@@ -1,0 +1,9 @@
+[Unit]
+Description=Arbuzas corrected host memory report
+After=local-fs.target
+ConditionPathExists=/proc/meminfo
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/arbuzas-memory-report
+ExecStart=/bin/sh -lc 'exec /usr/local/libexec/arbuzas-memory-report.py --source-label "/proc/meminfo on $(hostname -f 2>/dev/null || hostname)" --write-dir "${ARBUZAS_MEMORY_REPORT_DIR:-/var/lib/arbuzas/memory-report}"'

@@ -13,12 +13,12 @@ When ticket viewers are present, the broker holds lower-priority QR work in the 
 ```bash
 ../../tools/arbuzas/deploy.sh deploy \
   --services ticket_phone_bridge,phone_broker,rigassatiksme_qr_bot,ticket_remote,ticket_remote_tunnel \
-  --ssh-host arbuzas \
+  --ssh-host kitty-gration \
   --ssh-user ropepop
 
 ../../tools/arbuzas/deploy.sh validate \
   --services phone_broker,rigassatiksme_qr_bot,ticket_remote \
-  --ssh-host arbuzas \
+  --ssh-host kitty-gration \
   --ssh-user ropepop
 ```
 

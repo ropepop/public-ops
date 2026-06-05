@@ -1,7 +1,7 @@
 # Train Module
 
 - Canonical operations: [ROOT_OPERATIONS](./ROOT_OPERATIONS.md)
-- Active runtime: Docker on Arbuzas
+- Active runtime: Docker on kitty-gration
 - Public host: `https://vilciens.kontrole.info`
 - Persistent state root: `/srv/arbuzas/train-bot`
 - Host env file: `/etc/arbuzas/env/train-bot.env`
@@ -12,6 +12,7 @@
 cd workloads/train-bot
 make test
 make scrape
+(cd web-client && npm run build:arrow)
 make build
 make docker-image-build
 ```
@@ -19,13 +20,13 @@ make docker-image-build
 ## Deploy
 
 ```bash
-./tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 ## Validate
 
 ```bash
-./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 ## Agent Test Login
@@ -85,5 +86,6 @@ Troubleshooting:
 ## Notes
 
 - The schedule directory now lives under `/srv/arbuzas/train-bot/data/schedules`.
-- `/etc/arbuzas/env/train-bot.env` should not define `TRAIN_WEB_BIND_ADDR`, `TRAIN_WEB_PORT`, or `TRAIN_WEB_PUBLIC_BASE_URL`; Arbuzas Docker sets those at runtime from the release hostname.
+- `/etc/arbuzas/env/train-bot.env` should not define `TRAIN_WEB_BIND_ADDR`, `TRAIN_WEB_PORT`, or `TRAIN_WEB_PUBLIC_BASE_URL`; kitty-gration Docker sets those at runtime from the release hostname.
+- Interactive browser UI must use ArrowJS for changing public incident, route, status, and mini app surfaces. After deploy, verify `document.documentElement.dataset.trainUi === "arrow"` on the served page and check for new browser console errors.
 - Rollback uses the repo-level deploy script, not workload-local Pixel helpers.

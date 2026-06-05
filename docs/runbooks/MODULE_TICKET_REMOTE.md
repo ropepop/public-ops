@@ -7,16 +7,20 @@
 ```bash
 ../../tools/arbuzas/deploy.sh deploy \
   --services ticket_phone_bridge,phone_broker,ticket_remote,ticket_remote_tunnel \
-  --ssh-host arbuzas \
+  --ssh-host kitty-gration \
   --ssh-user ropepop
 
 ../../tools/arbuzas/deploy.sh validate \
   --services ticket_phone_bridge,phone_broker,ticket_remote,ticket_remote_tunnel \
-  --ssh-host arbuzas \
+  --ssh-host kitty-gration \
   --ssh-user ropepop
 ```
 
 Use an explicit `--release-id` for traceable deploys when cutting a known user-facing change.
+
+## Browser UI Standard
+
+Interactive browser UI must use ArrowJS for changing presence, status, stream, and control areas. Edit browser UI in `workloads/ticket-remote/web-client/`, rebuild with `make web-client-build`, and after deploy verify the authenticated page mounts the Arrow-backed path (`document.documentElement.dataset.ticketUi === "arrow"`) with no new browser console errors.
 
 ## Health Checks
 
@@ -33,9 +37,9 @@ To confirm the newest page is live, compare the page's embedded version with `/a
 For phone-stream failures, validate the private phone path before debugging the public page:
 
 ```bash
-ssh arbuzas 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T ticket_phone_bridge /usr/local/bin/ticket-phone-bridge-health'
-ssh arbuzas "docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:\${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\"'"
-ssh arbuzas 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml logs --since 10m ticket_phone_bridge phone_broker ticket_remote'
+ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T ticket_phone_bridge /usr/local/bin/ticket-phone-bridge-health'
+ssh kitty-gration "docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:\${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\"'"
+ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml logs --since 10m ticket_phone_bridge phone_broker ticket_remote'
 ```
 
 `ticket_phone_bridge` has its own healthcheck and watchdog. It verifies the Pixel is connected over ADB, the exact ADB forward exists, and the forwarded Pixel health endpoint answers. If that check fails while `socat` is still listening, the bridge loop stops the listener, removes the stale ADB forward, reconnects to the Pixel, and starts a fresh listener. `phone_broker` keeps normal liveness independent, but `/api/v1/health?strict=1` fails when the private phone upstream is not reachable, so deploy validation catches the same failure mode that previously hid behind a healthy container.
@@ -52,7 +56,7 @@ Configure a self-hosted Access app for `ticket.jolkins.id.lv`.
 
 ## Pixel Backend
 
-The phone backend is private to Ops through `phone_broker`, which is the only Arbuzas service ticket_remote should use for phone sessions. The broker owns priority between ticket viewing and lower-priority phone automation, then talks privately to `ticket_phone_bridge`.
+The phone backend is private to Ops through `phone_broker`, which is the only private kitty-gration service ticket_remote should use for phone sessions. The broker owns priority between ticket viewing and lower-priority phone automation, then talks privately to `ticket_phone_bridge`.
 `ticket_phone_bridge` connects to the Pixel over ADB on Tailscale, forwards the Pixel's local ticket stream port inside Docker, and exposes it only inside the private Docker network.
 The bridge uses the ADB key files in `/etc/arbuzas/secrets/android-adb/`, mounted read-only into the bridge container. Keep those files scoped to the bridge; they are what let Ops reach the already-authorized Pixel without asking Android to approve a new container identity.
 

@@ -1275,6 +1275,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"msg.presenceFallback=true",
 		"loadSpacetimeClientScript()",
 		"document.head.appendChild(script)",
+		`document.documentElement.dataset.ticketUi="arrow"`,
 		"apiFetch('/api/v1/admin/members'",
 		"apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`",
 		"activeMembers(state)",

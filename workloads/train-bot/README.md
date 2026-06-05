@@ -1,12 +1,12 @@
 # Train App
 
-Train bot, public web app, and Telegram entrypoints for the Arbuzas production stack.
+Train bot, public web app, and Telegram entrypoints for the kitty-gration production stack.
 
 For agent-specific context, test-login rules, and public verification pitfalls, start with [AGENTS.md](./AGENTS.md).
 
 ## Runtime Shape
 
-The active production runtime is Docker on Arbuzas:
+The active production runtime is Docker on kitty-gration:
 
 1. A daily importer writes validated schedule snapshots.
 2. The Go runtime serves the web app and Telegram bot.
@@ -62,8 +62,8 @@ Full setup and troubleshooting steps live in [Agent test login](./docs/agent-tes
 1. Run `make test`.
 2. Run `make scrape`.
 3. Run `make build` or `make docker-image-build`.
-4. Deploy with `../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"`.
-5. Validate with `../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"`.
+4. Deploy with `../../tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"`.
+5. Validate with `../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"`.
 6. Confirm the public incidents homepage renders real content instead of the live-data outage screen.
 
 ## Runbooks
@@ -78,5 +78,7 @@ Full setup and troubleshooting steps live in [Agent test login](./docs/agent-tes
 
 - Public TrainBot URLs are served from `https://vilciens.kontrole.info`.
 - Browser sign-in uses Telegram's current Login library (`telegram-login.js?3`) and server-verified Telegram `id_token` values; Mini App sessions still use Telegram Web App init data.
+- Interactive browser UI uses ArrowJS for changing public incident, route, status, and mini app surfaces. Keep static or no-JS pages simple until they need browser-side interactivity.
+- For UI changes that touch the Arrow runtime, run `(cd web-client && npm run build:arrow)` before the normal tests.
 - The old rooted Pixel deploy flow is rollback-only legacy material now.
 - If train-bot loses outbound name resolution in Docker, fix the train-bot stack first before changing host-wide DNS.

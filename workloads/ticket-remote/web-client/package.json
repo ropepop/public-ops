@@ -8,6 +8,7 @@
     "build:ticket-app": "node ./build-ticket-app.mjs"
   },
   "dependencies": {
+    "@arrow-js/core": "1.0.6",
     "spacetimedb": "^2.1.0"
   },
   "devDependencies": {

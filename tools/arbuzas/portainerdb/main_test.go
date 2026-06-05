@@ -53,6 +53,28 @@ func TestRepairDBFixesStaleAgentEndpoint(t *testing.T) {
 	}
 }
 
+func TestInspectDBAcceptsFreshPortainerWithoutEndpoints(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "fresh.db")
+
+	if err := seedEmptyEndpointDB(dbPath); err != nil {
+		t.Fatalf("seed fresh db: %v", err)
+	}
+
+	report, err := inspectDB(dbPath)
+	if err != nil {
+		t.Fatalf("inspect fresh db: %v", err)
+	}
+	if !report.Healthy {
+		t.Fatalf("expected fresh db without endpoints to be healthy: %#v", report)
+	}
+	if report.EndpointCount != 0 {
+		t.Fatalf("expected no endpoints in fresh db: %#v", report.Endpoints)
+	}
+}
+
 func seedTestDB(dbPath string) error {
 	_ = os.Remove(dbPath)
 
@@ -103,5 +125,23 @@ func seedTestDB(dbPath string) error {
 			return err
 		}
 		return snapshots.Put(key, encodedSnapshot)
+	})
+}
+
+func seedEmptyEndpointDB(dbPath string) error {
+	_ = os.Remove(dbPath)
+
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	return db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte(endpointsBucket)); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists([]byte(snapshotsBucket))
+		return err
 	})
 }

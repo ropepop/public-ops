@@ -49,13 +49,13 @@ printf '%s\n---\n' "${script_content}" >> "${log_dir}/scripts.log"
 if [[ "${script_content}" == *"DNS_SAFE_REPAIR_COMMAND"* ]]; then
   case "${scenario}" in
     broken_443)
-      echo "DNS host preflight failed on Arbuzas; fix the listener conflict before retrying." >&2
+      echo "DNS host preflight failed on the live host; fix the listener conflict before retrying." >&2
       echo "- conflicting host listener on 443: LISTEN 0 128 100.64.0.10:443 0.0.0.0:* users:((\"tailscaled\",pid=99,fd=9))" >&2
-      echo "Safe repair: ARBUZAS_HOST='arbuzas' ARBUZAS_USER='${USER:-tester}' ARBUZAS_SSH_PORT='22' ARBUZAS_DNS_ADMIN_LAN_IP='192.168.32.22' bash tools/arbuzas/deploy.sh repair-dns-admin" >&2
+      echo "Safe repair: ARBUZAS_HOST='kitty-gration' ARBUZAS_USER='${USER:-tester}' ARBUZAS_SSH_PORT='22' ARBUZAS_DNS_ADMIN_LAN_IP='192.168.32.22' bash tools/arbuzas/deploy.sh repair-dns-admin" >&2
       exit 1
       ;;
     conflict_853)
-      echo "DNS host preflight failed on Arbuzas; fix the listener conflict before retrying." >&2
+      echo "DNS host preflight failed on the live host; fix the listener conflict before retrying." >&2
       echo "- conflicting Docker publisher: rogue-dns|0.0.0.0:853->853/tcp" >&2
       echo "Safe repair only applies to stale private DNS admin forwarding. If this is a different service, free the port manually and retry." >&2
       exit 1
@@ -74,7 +74,7 @@ if [[ "${script_content}" == *"--- tailscale serve status ---"* ]]; then
   echo "--- tailscale serve status ---" >&2
   case "${scenario}" in
     broken_443)
-      echo "https://arbuzas.tailnet.ts.net (TLS over TCP 443) proxying to 127.0.0.1:8097" >&2
+      echo "https://kitty-gration.tailnet.ts.net (TLS over TCP 443) proxying to 127.0.0.1:8097" >&2
       echo "--- dns host listeners ---" >&2
       echo "LISTEN 0 128 100.64.0.10:443 0.0.0.0:* users:((\"tailscaled\",pid=99,fd=9))" >&2
       ;;

@@ -1,6 +1,6 @@
-# Arbuzas Boost-Off Boot Hook
+# kitty-gration Boost-Off Boot Hook
 
-This directory stores the live Arbuzas host setup that keeps Intel turbo boost
+This directory stores the live kitty-gration host setup that keeps Intel turbo boost
 disabled across reboots without restoring the old `2 GHz` CPU lock.
 
 It consists of:
@@ -23,7 +23,7 @@ The script writes logs to:
 
 ## Rebuild The Helper Image
 
-Run this on the Arbuzas host:
+Run this on kitty-gration:
 
 ```sh
 docker build -t arbuzas/cpu-boost-off:latest /path/to/repo/infra/arbuzas/cpu-boost-off

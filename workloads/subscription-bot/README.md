@@ -15,6 +15,7 @@ This service keeps the first version intentionally self-contained:
 ```bash
 cp .env.example .env
 go test ./...
+(cd web-client && npm run build)
 go run ./cmd/bot
 make docker-image-build
 ```
@@ -23,6 +24,7 @@ By default the workload starts in Telegram-first mode:
 - Telegram is the main product surface
 - the HTTP listener stays on for health checks and payment callbacks
 - the Mini App shell stays on unless `SUBSCRIPTION_BOT_WEB_SHELL_ENABLED=false` is set for debugging
+- the Mini App browser UI uses ArrowJS for interactive launcher, billing, and operator/admin surfaces
 - payment simulation buttons only appear when the sandbox provider is active
 
 For a live deployment, the minimum env you need is:
@@ -36,11 +38,11 @@ For a live deployment, the minimum env you need is:
 
 ## Active Deployment
 
-The active production runtime is Docker on Arbuzas:
+The active production runtime is Docker on kitty-gration:
 
 ```bash
-../../tools/arbuzas/deploy.sh deploy --ssh-host arbuzas --ssh-user "$USER"
-../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host arbuzas --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
+../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 ## Core Commands
@@ -71,7 +73,8 @@ The guided path is now button-driven:
 
 ## Notes
 
-- The built-in payment adapter is a sandbox provider so the full billing loop can run inside this repo and on the Arbuzas runtime without external processor credentials.
+- The built-in payment adapter is a sandbox provider so the full billing loop can run inside this repo and on the kitty-gration runtime without external processor credentials.
 - The sandbox provider still uses the production payment abstraction (`CreateInvoiceQuote`, `GetInvoiceStatus`, `ListInvoiceTransactions`, `NormalizeProviderPayment`) so a live processor can replace it later.
 - The first hosted processor target is NOWPayments. The live callback endpoint is `POST /api/v1/payments/webhook/nowpayments` under the configured public base URL.
+- For mini app UI changes, rebuild `web-client/`, run `go test ./internal/web`, and verify the served page mounts the Arrow-backed path.
 - No third-party account passwords are stored or sent through Telegram.

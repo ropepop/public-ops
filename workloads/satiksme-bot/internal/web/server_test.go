@@ -1469,6 +1469,9 @@ func TestShellConfigEnablesBrowserLiveSnapshotLookup(t *testing.T) {
 	if strings.Contains(body, "telegram.org/js/telegram-login") || strings.Contains(body, "telegram-web-app.js") {
 		t.Fatalf("shell should not load Telegram scripts before login: %s", body)
 	}
+	if !strings.Contains(body, "/assets/arrow-core.js") {
+		t.Fatalf("shell should load Arrow runtime before app.js: %s", body)
+	}
 	if !strings.Contains(body, "/assets/app.js") {
 		t.Fatalf("shell should load app.js: %s", body)
 	}

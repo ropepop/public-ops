@@ -9,6 +9,9 @@
 
   var defaultCenter = { lat: 56.9496, lng: 24.1052, zoom: 13 };
   var config = (root.window && root.window.SATIKSME_APP_CONFIG) || root.SATIKSME_APP_CONFIG || {};
+  var arrow = (root.window && root.window.ArrowJS) || root.ArrowJS || null;
+  var arrowHTML = arrow && typeof arrow.html === "function" ? arrow.html : null;
+  var arrowReactive = arrow && typeof arrow.reactive === "function" ? arrow.reactive : null;
   var trainSiteURL = "https://vilciens.kontrole.info";
   var incidentMobileBreakpointPx = 980;
   var incidentOverlayHistoryKey = "__satiksmeIncidentOverlay";
@@ -180,6 +183,7 @@
   var mapUserPanTolerancePx = 8;
   var mapDetailOverlayClampPaddingPx = 12;
   var actionsBound = false;
+  var arrowIncidentSlots = arrowReactive ? arrowReactive({ listHTML: "", detailHTML: "" }) : null;
   function pathFor(path) {
     var base = String(config.basePath || "").replace(/\/$/, "");
     if (!base) {
@@ -6322,6 +6326,36 @@
     return '<article class="favorite-card"><h3>' + escapeHTML(publicIncidentActorName(item.nickname)) + '</h3><div class="meta"><span>' + escapeHTML(formatEventTime(item.createdAt)) + "</span></div><p>" + escapeHTML(item.body || "") + "</p></article>";
   }
 
+  function markArrowUIActive() {
+    if (!root.document || !root.document.documentElement) {
+      return;
+    }
+    root.document.documentElement.dataset.satiksmeUi = "arrow";
+  }
+
+  function mountArrowHTMLSlot(node, property) {
+    if (!node || !arrowHTML || !arrowIncidentSlots || !property) {
+      return false;
+    }
+    if (!node.__satiksmeArrowSlot) {
+      node.innerHTML = "";
+      arrowHTML`<div .innerHTML="${function () { return arrowIncidentSlots[property] || ""; }}"></div>`(node);
+      node.__satiksmeArrowSlot = true;
+    }
+    markArrowUIActive();
+    return true;
+  }
+
+  function incidentListHTML() {
+    if (publicIncidentListNeedsLoadingUI()) {
+      return loadingStateHTML("Ielādē notiekošo…");
+    }
+    if (!state.publicIncidents.length) {
+      return '<div class="empty">Pēdējo 24 stundu incidentu nav.</div>';
+    }
+    return state.publicIncidents.map(renderIncidentSummaryCard).join("");
+  }
+
   function renderIncidentDetailHTML(detail) {
     var voteValue = "";
     var draft = "";
@@ -6372,18 +6406,28 @@
 
   function renderIncidentList() {
     var node = document.getElementById("incident-list");
+    var html = "";
     if (!node) {
       return;
     }
-    if (publicIncidentListNeedsLoadingUI()) {
-      node.innerHTML = loadingStateHTML("Ielādē notiekošo…");
-      return;
+    html = incidentListHTML();
+    if (arrowIncidentSlots) {
+      arrowIncidentSlots.listHTML = html;
+      if (mountArrowHTMLSlot(node, "listHTML")) {
+        return;
+      }
     }
-    if (!state.publicIncidents.length) {
-      node.innerHTML = '<div class="empty">Pēdējo 24 stundu incidentu nav.</div>';
-      return;
+    node.innerHTML = html;
+  }
+
+  function renderIncidentDetailSlot(node, html) {
+    if (arrowIncidentSlots) {
+      arrowIncidentSlots.detailHTML = html;
+      if (mountArrowHTMLSlot(node, "detailHTML")) {
+        return;
+      }
     }
-    node.innerHTML = state.publicIncidents.map(renderIncidentSummaryCard).join("");
+    node.innerHTML = html;
   }
 
   function renderIncidentDetail() {
@@ -6405,7 +6449,7 @@
     if (!node) {
       return;
     }
-    node.innerHTML = renderIncidentDetailHTML(state.publicIncidentDetail);
+    renderIncidentDetailSlot(node, renderIncidentDetailHTML(state.publicIncidentDetail));
   }
 
   function renderIncidentFeed() {

@@ -161,7 +161,7 @@ func inspectDB(dbPath string) (inspectionReport, error) {
 	})
 
 	report.Healthy = len(report.StaleEndpointIDs) == 0 &&
-		len(report.LocalEndpointIDs) > 0 &&
+		(len(report.LocalEndpointIDs) > 0 || report.EndpointCount == 0) &&
 		!report.RawContainsAgentEndpoint
 
 	return report, nil

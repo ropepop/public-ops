@@ -115,6 +115,7 @@ func TestServeHTTPPublicShellScriptsBypassCloudflareRocketLoader(t *testing.T) {
 		`<script data-cfasync="false" nonce="`,
 		`<script data-cfasync="false" defer src="/assets/vendor/leaflet.js`,
 		`<script data-cfasync="false" defer src="/assets/external-feed.js`,
+		`<script data-cfasync="false" defer src="/assets/arrow-core.js`,
 		`<script data-cfasync="false" defer src="/assets/app.js`,
 	} {
 		if !strings.Contains(body, want) {

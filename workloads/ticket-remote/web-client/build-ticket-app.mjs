@@ -9,7 +9,7 @@ const generatedBanner = "/* Generated from web-client/ticket-app-source.js. Edit
 
 await build({
   entryPoints: [sourceFile],
-  bundle: false,
+  bundle: true,
   minifyWhitespace: true,
   banner: {
     js: generatedBanner,

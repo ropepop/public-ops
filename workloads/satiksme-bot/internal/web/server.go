@@ -79,6 +79,7 @@ type Server struct {
 type pageData struct {
 	AppCSSURL           string
 	AppJSURL            string
+	ArrowJSURL          string
 	LeafletCSSURL       string
 	LeafletJSURL        string
 	LiveClientJSURL     string
@@ -140,6 +141,7 @@ func NewServer(
   {{if .LeafletJSURL}}<script data-cfasync="false" defer src="{{.LeafletJSURL}}"></script>{{end}}
   {{if .LiveClientJSURL}}<script data-cfasync="false" defer src="{{.LiveClientJSURL}}"></script>{{end}}
   {{if .TelegramWebAppJSURL}}<script data-cfasync="false" src="{{.TelegramWebAppJSURL}}"></script>{{end}}
+  <script data-cfasync="false" defer src="{{.ArrowJSURL}}"></script>
   <script data-cfasync="false" defer src="{{.AppJSURL}}"></script>
 </head>
 <body>
@@ -485,6 +487,7 @@ func (s *Server) serveShell(w http.ResponseWriter, mode string, telegramMiniApp 
 	_ = s.pageTemplate.Execute(w, pageData{
 		AppCSSURL:           s.release.AssetURL(basePath, "app.css"),
 		AppJSURL:            s.release.AssetURL(basePath, "app.js"),
+		ArrowJSURL:          s.release.AssetURL(basePath, "arrow-core.js"),
 		LeafletCSSURL:       leafletCSSURL,
 		LeafletJSURL:        leafletJSURL,
 		LiveClientJSURL:     liveClientURL,
