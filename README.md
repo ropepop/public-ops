@@ -6,7 +6,7 @@ Ops is a public GitHub project prepared from a sanitized working copy.
 
 - Ops is a public GitHub project prepared from a sanitized working copy.
 - Organizes the main public surface around .github/, archive/, automation/, docs/, infra/.
-- Includes 815 public project file(s) in the sanitized copy.
+- Includes 814 public project file(s) in the sanitized copy.
 
 ## Highlights
 
