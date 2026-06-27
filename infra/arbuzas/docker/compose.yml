@@ -184,6 +184,11 @@ services:
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/subscription-bot.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     working_dir: /srv/subscription-bot
     environment:
       TZ: ${ARBUZAS_TZ}
@@ -230,6 +235,11 @@ services:
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/ticket-phone-bridge.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     environment:
       TZ: ${ARBUZAS_TZ}
       TICKET_PHONE_ADB_TARGET: ${ARBUZAS_TICKET_PHONE_ADB_TARGET}
@@ -263,15 +273,18 @@ services:
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/phone-broker.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     working_dir: /srv/phone-broker
     environment:
       TZ: ${ARBUZAS_TZ}
       PHONE_BROKER_BIND_ADDR: 0.0.0.0
       PHONE_BROKER_PORT: ${ARBUZAS_PHONE_BROKER_PORT}
       PHONE_BROKER_UPSTREAM_BASE_URL: http://ticket_phone_bridge:9388
-      PHONE_BROKER_STATE_PATH: /srv/phone-broker/state/jobs.json
       PHONE_BROKER_TICKET_GRACE: 10s
-      PHONE_BROKER_MAX_TICKET_QR_BLOCK: 15s
     command:
       - /bin/sh
       - -lc
@@ -279,10 +292,8 @@ services:
         export PHONE_BROKER_BIND_ADDR="0.0.0.0"
         export PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT}"
         export PHONE_BROKER_UPSTREAM_BASE_URL="$${PHONE_BROKER_UPSTREAM_BASE_URL:-http://ticket_phone_bridge:9388}"
-        export PHONE_BROKER_STATE_PATH="$${PHONE_BROKER_STATE_PATH:-/srv/phone-broker/state/jobs.json}"
         export PHONE_BROKER_TICKET_GRACE="$${PHONE_BROKER_TICKET_GRACE:-10s}"
-        export PHONE_BROKER_MAX_TICKET_QR_BLOCK="$${PHONE_BROKER_MAX_TICKET_QR_BLOCK:-15s}"
-        mkdir -p /srv/phone-broker/run /srv/phone-broker/state
+        mkdir -p /srv/phone-broker/run
         exec /usr/local/bin/phone-broker
     healthcheck:
       test:
@@ -304,57 +315,67 @@ services:
     volumes:
       - /srv/arbuzas/phone-broker:/srv/phone-broker
 
-  rigassatiksme_qr_bot:
-    image: arbuzas/rigassatiksme-qr-bot:${ARBUZAS_RELEASE_ID}
+  ticket_remote_spacetime_sidecar:
+    image: arbuzas/ticket-remote-spacetime-sidecar:${ARBUZAS_RELEASE_ID}
     build:
       context: ../../..
-      dockerfile: infra/arbuzas/docker/images/rigassatiksme-qr-bot.Dockerfile
-    working_dir: /srv/rigassatiksme-qr-bot
+      dockerfile: infra/arbuzas/docker/images/ticket-remote-spacetime-sidecar.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
+    working_dir: /srv/ticket-remote-spacetime-sidecar
     environment:
       TZ: ${ARBUZAS_TZ}
-      PHONE_BROKER_BASE_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
-      RIGASATIKSME_QR_ACCESS_STATE_PATH: /srv/rigassatiksme-qr-bot/state/access.json
-      RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN: "false"
-      RIGASATIKSME_QR_ADMIN_USER_IDS: ${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}
-      RIGASATIKSME_QR_SPACETIME_HOST: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}
-      RIGASATIKSME_QR_SPACETIME_DATABASE: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}
-      RIGASATIKSME_QR_SPACETIME_TOKEN: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}
+      TICKET_REMOTE_SPACETIME_SIDECAR_BIND_ADDR: 0.0.0.0:9346
+      TICKET_REMOTE_TICKET_ID: vivi-default
     command:
       - /bin/sh
       - -lc
       - |
         set -a
-        . /srv/rigassatiksme-qr-bot/.env
+        . /srv/ticket-remote/.env
         set +a
-        export PHONE_BROKER_BASE_URL="http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}"
-        export RIGASATIKSME_QR_ACCESS_STATE_PATH="$${RIGASATIKSME_QR_ACCESS_STATE_PATH:-/srv/rigassatiksme-qr-bot/state/access.json}"
-        export RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN="$${RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN:-false}"
-        export RIGASATIKSME_QR_ADMIN_USER_IDS="$${RIGASATIKSME_QR_ADMIN_USER_IDS:-${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}}"
-        export RIGASATIKSME_QR_SPACETIME_HOST="$${RIGASATIKSME_QR_SPACETIME_HOST:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}}"
-        export RIGASATIKSME_QR_SPACETIME_DATABASE="$${RIGASATIKSME_QR_SPACETIME_DATABASE:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}}"
-        export RIGASATIKSME_QR_SPACETIME_TOKEN="$${RIGASATIKSME_QR_SPACETIME_TOKEN:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}}"
-        export RIGASATIKSME_QR_JOB_POLL_INTERVAL="$${RIGASATIKSME_QR_JOB_POLL_INTERVAL:-250ms}"
-        export RIGASATIKSME_QR_JOB_POLL_TIMEOUT="$${RIGASATIKSME_QR_JOB_POLL_TIMEOUT:-10m}"
-        mkdir -p /srv/rigassatiksme-qr-bot/run /srv/rigassatiksme-qr-bot/state
-        exec /usr/local/bin/rigassatiksme-qr-bot
+        export TICKET_REMOTE_SPACETIME_SIDECAR_BIND_ADDR="$${TICKET_REMOTE_SPACETIME_SIDECAR_BIND_ADDR:-0.0.0.0:9346}"
+        export TICKET_REMOTE_TICKET_ID="$${TICKET_REMOTE_TICKET_ID:-vivi-default}"
+        exec /usr/local/bin/ticket-remote-spacetime-sidecar
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9346/healthz >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
     dns:
       - 1.1.1.1
       - 1.0.0.1
       - 8.8.8.8
-    depends_on:
-      - phone_broker
     volumes:
-      - /srv/arbuzas/rigassatiksme-qr-bot:/srv/rigassatiksme-qr-bot
-      - /etc/arbuzas/env/rigassatiksme-qr-bot.env:/srv/rigassatiksme-qr-bot/.env:ro
+      - /srv/arbuzas/ticket-remote:/srv/ticket-remote
+      - /etc/arbuzas/env/ticket-remote.env:/srv/ticket-remote/.env:ro
+      - /etc/arbuzas/secrets/ticket-remote:/run/secrets/ticket-remote:ro
 
   ticket_remote:
     image: arbuzas/ticket-remote:${ARBUZAS_RELEASE_ID}
     build:
       context: ../../..
       dockerfile: infra/arbuzas/docker/images/ticket-remote.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
     working_dir: /srv/ticket-remote
     environment:
+      ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+      ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+      ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+      ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
       TZ: ${ARBUZAS_TZ}
       TICKET_REMOTE_BIND_ADDR: 0.0.0.0
       TICKET_REMOTE_PORT: ${ARBUZAS_TICKET_REMOTE_PORT}
@@ -367,6 +388,7 @@ services:
       TICKET_REMOTE_SPACETIME_AUTH_ISSUER: ${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
       TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID: ${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID}
       TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL: https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback
+      TICKET_REMOTE_SPACETIME_CLIENT_URL: http://ticket_remote_spacetime_sidecar:9346
       TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL: ticket@jolkins.id.lv
       TICKET_REMOTE_COOKIE_TTL: 720h
       TICKET_REMOTE_PHONE_BACKENDS: pixel|Pixel|http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
@@ -394,6 +416,7 @@ services:
         export TICKET_REMOTE_SPACETIME_AUTH_ISSUER="$${TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}"
         export TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID="$${TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}"
         export TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL="$${TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL:-https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/auth/callback}"
+        export TICKET_REMOTE_SPACETIME_CLIENT_URL="$${TICKET_REMOTE_SPACETIME_CLIENT_URL:-http://ticket_remote_spacetime_sidecar:9346}"
         export TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL="$${TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL:-ticket@jolkins.id.lv}"
         export TICKET_REMOTE_COOKIE_TTL="$${TICKET_REMOTE_COOKIE_TTL:-720h}"
         export TICKET_REMOTE_PHONE_BACKENDS="$${TICKET_REMOTE_PHONE_BACKENDS:-pixel|Pixel|http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
@@ -422,6 +445,7 @@ services:
       - 8.8.8.8
     depends_on:
       - phone_broker
+      - ticket_remote_spacetime_sidecar
     volumes:
       - /srv/arbuzas/ticket-remote:/srv/ticket-remote
       - /etc/arbuzas/env/ticket-remote.env:/srv/ticket-remote/.env:ro
@@ -498,58 +522,3 @@ services:
     volumes:
       - ../../../generated/cloudflared/ticket-remote.yml:/etc/cloudflared/config.yml:ro
       - /etc/arbuzas/cloudflared/ticket-remote.json:/run/arbuzas/cloudflared/credentials.json:ro
-
-  dns_controlplane:
-    image: arbuzas/dns-controlplane:${ARBUZAS_RELEASE_ID}
-    build:
-      context: ../../..
-      dockerfile: infra/arbuzas/docker/images/dns-controlplane.Dockerfile
-    environment:
-      TZ: ${ARBUZAS_TZ}
-      ARBUZAS_DNS_RUNTIME_ENV_FILE: /etc/arbuzas/dns/runtime.env
-      ARBUZAS_DNS_SOURCE_CONFIG_FILE: /etc/arbuzas/dns/arbuzas-dns.yaml
-      ARBUZAS_DNS_BIND_HOST: 0.0.0.0
-      ARBUZAS_DNS_PORT: "53"
-      ARBUZAS_DNS_CONTROLPLANE_HOST: 0.0.0.0
-      ARBUZAS_DNS_CONTROLPLANE_PORT: "${ARBUZAS_DNS_CONTROLPLANE_PORT}"
-      ARBUZAS_DNS_RUN_DIR: /run/arbuzas/dns
-      ARBUZAS_DNS_STATE_DIR: /srv/arbuzas/dns/state
-      ARBUZAS_DNS_RUNTIME_DIR: /srv/arbuzas/dns/runtime
-      ARBUZAS_DNS_LOG_DIR: /srv/arbuzas/dns/logs
-      ARBUZAS_DNS_CONTROLPLANE_DB_FILE: /srv/arbuzas/dns/state/controlplane.sqlite
-      ARBUZAS_DNS_IDENTITIES_FILE: /etc/arbuzas/dns/doh-identities.json
-      ARBUZAS_DNS_QUERYLOG_VIEW_PREFERENCE_FILE: /srv/arbuzas/dns/state/querylog-view-preference.json
-      ARBUZAS_DNS_HOSTNAME: "${ARBUZAS_DNS_HOSTNAME}"
-      ARBUZAS_DNS_DOT_HOSTNAME: "${ARBUZAS_DNS_HOSTNAME}"
-      ARBUZAS_DNS_TLS_CERT_FILE: /etc/arbuzas/dns/tls/fullchain.pem
-      ARBUZAS_DNS_TLS_KEY_FILE: /etc/arbuzas/dns/tls/privkey.pem
-      ARBUZAS_DNS_HTTPS_PORT: "${ARBUZAS_DNS_HTTPS_PORT}"
-      ARBUZAS_DNS_DOT_PORT: "${ARBUZAS_DNS_DOT_PORT}"
-    ports:
-      - target: ${ARBUZAS_DNS_HTTPS_PORT}
-        published: ${ARBUZAS_DNS_HTTPS_PORT}
-        protocol: tcp
-        mode: host
-      - target: ${ARBUZAS_DNS_DOT_PORT}
-        published: ${ARBUZAS_DNS_DOT_PORT}
-        protocol: tcp
-        mode: host
-      - 127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}:${ARBUZAS_DNS_CONTROLPLANE_PORT}
-      - ${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}:${ARBUZAS_DNS_CONTROLPLANE_PORT}
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -fsS http://127.0.0.1:$${ARBUZAS_DNS_CONTROLPLANE_PORT:-8097}/dns/login >/dev/null && openssl s_client -brief -connect 127.0.0.1:$${ARBUZAS_DNS_DOT_PORT:-853} -servername $${ARBUZAS_DNS_HOSTNAME:-dns.jolkins.id.lv} </dev/null >/dev/null 2>&1",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
-    restart: unless-stopped
-    volumes:
-      - /etc/arbuzas/dns:/etc/arbuzas/dns
-      - /srv/arbuzas/dns/state:/srv/arbuzas/dns/state
-      - /srv/arbuzas/dns/runtime:/srv/arbuzas/dns/runtime
-      - /srv/arbuzas/dns/logs:/srv/arbuzas/dns/logs
-      - /srv/arbuzas/dns/run:/run/arbuzas/dns

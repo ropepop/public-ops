@@ -21,7 +21,6 @@ THINKPAD_FAN_DEFAULT_PATH="${REPO_ROOT}/infra/arbuzas/thinkpad-fan/etc/default/a
 THINKPAD_FAN_MODPROBE_PATH="${REPO_ROOT}/infra/arbuzas/thinkpad-fan/etc/modprobe.d/arbuzas-thinkpad-fan.conf"
 THINKPAD_FAN_SERVICE_PATH="${REPO_ROOT}/infra/arbuzas/thinkpad-fan/etc/systemd/system/arbuzas-thinkpad-fan.service"
 THINKPAD_FAN_SCRIPT_PATH="${REPO_ROOT}/infra/arbuzas/thinkpad-fan/usr/local/libexec/arbuzas-thinkpad-fan.py"
-DNS_ADMIN_NGINX_TEMPLATE_PATH="${REPO_ROOT}/infra/arbuzas/nginx/arbuzas-dns-admin.conf.template"
 
 if [[ ! -f "${SCRIPT_PATH}" ]]; then
   echo "FAIL: missing Arbuzas deploy script at ${SCRIPT_PATH}" >&2
@@ -210,27 +209,19 @@ if ! grep -F "options thinkpad_acpi fan_control=1" "${THINKPAD_FAN_MODPROBE_PATH
   exit 1
 fi
 
-if [[ ! -f "${DNS_ADMIN_NGINX_TEMPLATE_PATH}" ]]; then
-  echo "FAIL: missing Arbuzas DNS admin nginx template at ${DNS_ADMIN_NGINX_TEMPLATE_PATH}" >&2
+# DNS controlplane retired 2026-06-21 — confirm no DNS service or admin surface remains.
+if grep -F "dns_controlplane" "${COMPOSE_PATH}" >/dev/null; then
+  echo "FAIL: dns_controlplane is retired; compose.yml must not include it" >&2
   exit 1
 fi
-
-for dns_admin_snippet in \
-  "listen 127.0.0.1:80;" \
-  "listen [::1]:80;" \
-  "listen __DNS_ADMIN_LISTEN_IPV4__:80;" \
-  "listen [__DNS_ADMIN_LISTEN_IPV6__]:80;" \
-  "server_name __DNS_ADMIN_SERVER_NAMES__;" \
-  "allow 100.64.0.0/10;" \
-  "allow fd7a:115c:a1e0::/48;" \
-  "proxy_set_header X-Forwarded-Proto http;" \
-  "proxy_pass http://127.0.0.1:__DNS_ADMIN_CONTROLPLANE_PORT__;" \
-  "deny all;"; do
-  if ! grep -F "${dns_admin_snippet}" "${DNS_ADMIN_NGINX_TEMPLATE_PATH}" >/dev/null; then
-    echo "FAIL: Arbuzas DNS admin nginx template must contain: ${dns_admin_snippet}" >&2
-    exit 1
-  fi
-done
+if grep -F "arbuzas-dns-admin" "${SCRIPT_PATH}" >/dev/null; then
+  echo "FAIL: arbuzas-dns-admin nginx site is retired; deploy.sh must not reference it" >&2
+  exit 1
+fi
+if grep -F "DNS_ADMIN_NGINX" "${SCRIPT_PATH}" >/dev/null; then
+  echo "FAIL: DNS_ADMIN_NGINX_* constants are retired; deploy.sh must not define them" >&2
+  exit 1
+fi
 
 if ! python3 - "${SCRIPT_PATH}" <<'PY'
 import sys
@@ -243,8 +234,6 @@ required_snippets = [
     "memory-report     Report corrected host memory pressure and provider-like cached-inclusive memory from /proc/meminfo",
     "install-memory-report   Install the corrected host memory report service and timer on the live host",
     "validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot",
-    "compact-dns-db    Run the Arbuzas DNS cleanup activation and compact maintenance flow on the live host",
-    "repair-dns-admin  Clear stale private DNS admin forwards, re-assert the Tailscale TCP forward, refresh the bare private web URL, and print host listener diagnostics",
     "install-netdata   Install Netdata plus hardware monitoring packages on the live host and publish it privately over Tailscale",
     "validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected Arbuzas hardware charts",
     "install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host",
@@ -253,13 +242,11 @@ required_snippets = [
     "mirror-audit      Compare the local host mirror with the host and report drift before deploy",
     "mirror-push       Push local host mirror changes to the host when the host has not drifted",
     "deploy-config     Push local mirror changes and restart/reload only affected services; no build or release upload",
-    "deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)",
+    "deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)",
     "--release-id is not supported for cleanup-docker",
     "--release-id is not supported for memory-report",
     "--release-id is not supported for install-memory-report",
     "--release-id is not supported for validate-memory-report",
-    "--release-id is not supported for compact-dns-db",
-    "--release-id is not supported for repair-dns-admin",
     "--release-id is not supported for install-netdata",
     "--release-id is not supported for validate-netdata",
     "--release-id is not supported for install-thinkpad-fan",
@@ -271,11 +258,10 @@ required_snippets = [
     "remote_run_memory_report()",
     "remote_run_host_cache_cleanup()",
     "resolve_local_docker_gc_script()",
-    "compact_remote_dns_db()",
     "run_automatic_remote_docker_gc()",
-    "compose_target_service_args_without_dns()",
+    "compose_target_service_args_without_tunnels()",
     "compose_target_tunnel_service_args()",
-    "compose_all_non_dns_service_args()",
+    "compose_all_service_args()",
     "compose_all_tunnel_service_args()",
     "render_remote_cloudflared_configs()",
     "cleanup_remote_public_bundle_versions()",
@@ -293,10 +279,6 @@ required_snippets = [
     "missing active while version dirs exist",
     "empty active while version dirs exist",
     "active version directory is missing",
-    "collect_remote_dns_host_diagnostics()",
-    "ensure_remote_dns_host_preflight()",
-    "repair_remote_dns_admin()",
-    "append_csv_unique()",
     "stage_netdata_config_to_remote()",
     "install_remote_netdata()",
     "validate_remote_netdata()",
@@ -306,7 +288,6 @@ required_snippets = [
     "stage_thinkpad_fan_config_to_remote()",
     "install_remote_thinkpad_fan()",
     "validate_remote_thinkpad_fan()",
-    'copy_tree_into_release "tools/arbuzas-rs"',
     '--exclude="${path}/.env"',
     '--exclude="${path}/.env.*"',
     '--exclude="${path}/.DS_Store"',
@@ -365,13 +346,6 @@ required_snippets = [
     "reclaimable cache flush skipped because ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false",
     "missing Docker GC helper locally and on the current Arbuzas release bundle",
     "gc_script='${REMOTE_CURRENT_LINK}/tools/arbuzas/docker_gc.py'",
-    "run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null",
-    "run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null",
-    "up -d --build --force-recreate --no-deps dns_controlplane >/dev/null",
-    "up -d --force-recreate --no-deps dns_controlplane",
-    "up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}",
-    "up -d --build --force-recreate --no-deps${non_dns_service_args}",
-    "up -d --force-recreate --no-deps${tunnel_service_args}",
     "release_static = pathlib.Path('${remote_release_dir}') / 'workloads/train-bot/internal/web/static'",
     "release_static = pathlib.Path('${remote_release_dir}') / 'workloads/satiksme-bot/internal/web/static'",
     "def expected_asset_body(path):",
@@ -386,11 +360,13 @@ required_snippets = [
     "--out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'",
     "--out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'",
     "append_unique COMPOSE_TARGET_SERVICES train_tunnel",
-    "ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel",
+    "ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel",
+    "ticket-remote Spacetime sidecar health",
+    "ticket_remote_spacetime_sidecar",
     "ticket-phone-bridge local health",
     "/usr/local/bin/ticket-phone-bridge-health",
     "/api/v1/health?strict=1",
-    "rigassatiksme_qr_bot",
+    # RS bot retired earlier; see archive/rs-bot/. Kept out of DNS scope.
     "ARBUZAS_PHONE_BROKER_PORT",
     "TICKET_REMOTE_PHONE_BROKER_URL",
     "ticket-remote stale viewer code absent",
@@ -525,50 +501,10 @@ required_snippets = [
     "TLS 1.0 unexpectedly accepted",
     "TLS 1.1 unexpectedly accepted",
     "dig +short CAA kontrole.info",
-    'DNS_ADMIN_NGINX_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/nginx"',
-    'DNS_ADMIN_NGINX_TEMPLATE_FILE="${DNS_ADMIN_NGINX_TEMPLATE_FILE:-${DNS_ADMIN_NGINX_CONFIG_ROOT}/arbuzas-dns-admin.conf.template}"',
-    'DNS_ADMIN_NGINX_REMOTE_SITE_FILE="/etc/nginx/sites-available/arbuzas-dns-admin"',
-    'DNS_ADMIN_NGINX_REMOTE_SITE_LINK="/etc/nginx/sites-enabled/arbuzas-dns-admin"',
-    'ARBUZAS_DNS_CONTROLPLANE_PORT="${ARBUZAS_DNS_CONTROLPLANE_PORT:-8097}"',
-    'ARBUZAS_SSH_PORT="${ARBUZAS_SSH_PORT:-}"',
-    'ARBUZAS_DNS_ADMIN_LAN_IP="${ARBUZAS_DNS_ADMIN_LAN_IP:-}"',
     "run_ssh() {",
     "run_scp() {",
-    "dns_validation_requested()",
-    "require_dns_private_admin_env()",
-    "resolve_remote_tailscale_dns_name()",
-    "resolve_remote_tailscale_hostname()",
-    "resolve_remote_tailscale_ipv6()",
-    "render_dns_admin_nginx_config()",
-    "publish_remote_dns_admin_tailscale()",
-    "validate_private_dns_admin_access()",
     "is_valid_ipv6()",
-    "tailscale serve --bg --https=443 off >/dev/null 2>&1 || true",
-    "tailscale serve --bg --yes --tcp ${ARBUZAS_DNS_CONTROLPLANE_PORT} 127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}",
-    "command -v nginx >/dev/null 2>&1 || {",
-    "printf '%s' '${nginx_config_base64}' | base64 -d > '${DNS_ADMIN_NGINX_REMOTE_SITE_FILE}'",
-    "ln -sfn '${DNS_ADMIN_NGINX_REMOTE_SITE_FILE}' '${DNS_ADMIN_NGINX_REMOTE_SITE_LINK}'",
-    'rendered = rendered.replace("__DNS_ADMIN_LISTEN_IPV4__", tailnet_ipv4)',
-    'rendered = rendered.replace("__DNS_ADMIN_LISTEN_IPV6__", tailnet_ipv6)',
-    "curl -fsS -H 'Host: ${tailnet_dns_name}' 'http://127.0.0.1/' >/dev/null 2>/dev/null",
-    "private DNS admin root is available at http://${tailnet_dns_name}/",
-    "ARBUZAS_DNS_CONTROLPLANE_PORT=${ARBUZAS_DNS_CONTROLPLANE_PORT}",
-    "ARBUZAS_DNS_ADMIN_LAN_IP=${ARBUZAS_DNS_ADMIN_LAN_IP}",
-    "DNS host preflight failed on the live host; fix the listener conflict before retrying.",
-    "Safe repair: {repair_cmd}",
-    "for path in / /login /dns/login /v1/health /livez /healthz; do",
-    "dns private admin login on live host loopback",
-    "dns private admin login on live host LAN address",
-    "dns private admin root on live host nginx",
-    "dns private admin bare URL over Tailscale",
-    "dns private admin login over Tailscale",
-    "curl -fsS 'http://${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null",
-    "curl -fsS -H 'Host: ${tailnet_dns_name}' 'http://127.0.0.1/' >/dev/null 2>/dev/null",
-    "curl -fsS \"http://${tailnet_dns_name}/\" >/dev/null 2>&1",
-    "curl -fsS \"http://${tailnet_ipv4}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login\"",
-    "ss -H -ltnp | awk '\\$4 ~ /:80$|:443$|:853$|:8097$/ { print }' >&2 || true",
-    'validate_private_dns_admin_access "${REMOTE_CURRENT_LINK}"',
-    'NETDATA_REMOTE_CONFIG_DIR="/etc/netdata"',
+    "NETDATA_REMOTE_CONFIG_DIR=\"/etc/netdata\"",
     "NETDATA_REMOTE_DOCKER_CONFIG_FILE=\"${NETDATA_REMOTE_CONFIG_DIR}/go.d/docker.conf\"",
     "NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE=\"${NETDATA_REMOTE_CONFIG_DIR}/go.d/sd/docker.conf\"",
     "COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C \"${NETDATA_CONFIG_ROOT}\" -cf - . | base64 | tr -d '\\n'",
@@ -583,12 +519,6 @@ required_snippets = [
     "grep -F 'disabled: yes' '${NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE}' >/dev/null",
     "unexpected Docker charts still enabled:",
     "collector=docker|/images/json|/containers/json",
-    "compose stop dns_controlplane",
-    "compose run -T --rm --no-deps --build dns_controlplane /usr/local/bin/arbuzas-dns compact --json --include-legacy-observability </dev/null",
-    "validate_remote_dns_workload_health \"${REMOTE_CURRENT_LINK}\"",
-    "validate_remote_dns_querylog_flow()",
-    "validate_remote_dns_native_api_probe()",
-    "sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)",
     "tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} 127.0.0.1:${ARBUZAS_NETDATA_PORT}",
     "curl -fsS 'http://127.0.0.1:${ARBUZAS_NETDATA_PORT}/api/v1/info'",
     "curl -fsS \"http://${tailnet_ipv4}:${ARBUZAS_NETDATA_PORT}/api/v1/info\"",
@@ -620,6 +550,36 @@ for retired_snippet in [
     "sim" + "ulator",
     "av" + "d",
     "qe" + "mu",
+    # DNS controlplane retired 2026-06-21
+    "dns_controlplane",
+    "arbuzas-dns",
+    "compact-dns-db",
+    "repair-dns-admin",
+    "DNS_ADMIN_NGINX",
+    "ARBUZAS_DNS_HTTPS_PORT",
+    "ARBUZAS_DNS_DOT_PORT",
+    "ARBUZAS_DNS_CONTROLPLANE_PORT",
+    "ARBUZAS_DNS_ADMIN_LAN_IP",
+    "ARBUZAS_DNS_HOSTNAME",
+    "publish_remote_dns_admin_tailscale",
+    "render_dns_admin_nginx_config",
+    "validate_public_dns_access",
+    "validate_private_dns_admin_access",
+    "validate_remote_dns_querylog_flow",
+    "validate_remote_dns_native_api_probe",
+    "validate_remote_dns_workload_health",
+    "compact_remote_dns_db",
+    "requires_dns_release_prepare",
+    "dns_validation_requested",
+    "require_dns_private_admin_env",
+    "resolve_remote_tailscale_dns_name",
+    "ensure_remote_dns_host_preflight",
+    "repair_remote_dns_admin",
+    "collect_remote_dns_host_diagnostics",
+    "probe_doh_endpoint",
+    "probe_dot_endpoint",
+    "probe_public_https_status",
+    "ddns-last-ipv4",
 ]:
     if retired_snippet in script:
         raise SystemExit(f"retired deploy contract snippet still present: {retired_snippet}")
@@ -636,19 +596,15 @@ rollback_block = block_between('  rollback)\n', '  cleanup-docker)\n')
 cleanup_block = block_between('  cleanup-docker)\n', '  memory-report)\n')
 memory_report_block = block_between('  memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  install-memory-report)\n')
 install_memory_report_block = block_between('  install-memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  validate-memory-report)\n')
-validate_memory_report_block = block_between('  validate-memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  compact-dns-db)\n')
-compact_block = block_between('  compact-dns-db)\n', '  repair-dns-admin)\n')
-repair_dns_admin_block = block_between('  repair-dns-admin)\n', '  install-netdata)\n')
+validate_memory_report_block = block_between('  validate-memory-report)\n    if [[ -n "${requested_release_id}" ]]; then\n', '  install-netdata)\n')
 install_block = block_between('  install-netdata)\n', '  validate-netdata)\n')
 validate_netdata_block = block_between('  validate-netdata)\n', '  install-thinkpad-fan)\n')
 install_thinkpad_fan_block = block_between('  install-thinkpad-fan)\n', '  validate-thinkpad-fan)\n')
 validate_thinkpad_fan_block = block_between('  validate-thinkpad-fan)\n', '  repair-portainer)\n')
 repair_block = block_between('  repair-portainer)\n', 'esac\n')
 render_cloudflared_block = block_between('render_remote_cloudflared_configs() {\n', 'resolve_remote_current_release_id() {\n')
-target_non_dns_block = block_between('compose_target_service_args_without_dns() {\n', 'compose_target_tunnel_service_args() {\n')
-all_non_dns_block = block_between('compose_all_non_dns_service_args() {\n', 'compose_all_tunnel_service_args() {\n')
-remote_compose_up_block = block_between('remote_compose_up() {\n', 'validate_remote_dns_querylog_flow() {\n')
-compact_function_block = block_between('compact_remote_dns_db() {\n', 'stage_netdata_config_to_remote() {\n')
+target_non_dns_block = block_between('compose_target_service_args_without_tunnels() {\n', 'compose_target_tunnel_service_args() {\n')
+all_non_dns_block = block_between('compose_all_service_args() {\n', 'compose_all_tunnel_service_args() {\n')
 rollback_function_block = block_between('rollback_remote_release() {\n', 'while (( $# > 0 )); do\n')
 validate_probe_block = block_between('validate_remote_probe() {\n', 'validate_remote_host_probe() {\n')
 validate_host_probe_block = block_between('validate_remote_host_probe() {\n', 'wait_until_local_ok() {\n')
@@ -660,18 +616,10 @@ if deploy_block.index("cleanup_remote_public_bundle_versions") < deploy_block.in
     raise SystemExit("deploy cleans public bundles before validation")
 if deploy_block.index("cleanup_remote_public_bundle_versions") > deploy_block.index("run_automatic_remote_docker_gc"):
     raise SystemExit("deploy cleans public bundles after docker cleanup")
-if "if requires_dns_release_prepare; then\n      publish_remote_dns_admin_tailscale\n" not in deploy_block:
-    raise SystemExit("deploy block must only publish the private DNS admin surface when DNS is in scope")
 if deploy_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"') > deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"'):
     raise SystemExit("deploy validates the release before confirming the current symlink")
 if 'log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in deploy_block:
     raise SystemExit("deploy block does not announce targeted service deployments")
-if 'if dns_validation_requested || requires_dns_release_prepare; then' not in deploy_block:
-    raise SystemExit("deploy block does not gate DNS-only private admin requirements")
-if 'require_dns_private_admin_env' not in deploy_block:
-    raise SystemExit("deploy block does not require the DNS private admin environment when needed")
-if deploy_block.index("publish_remote_dns_admin_tailscale") > deploy_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"'):
-    raise SystemExit("deploy block publishes the private DNS admin path after validation starts")
 
 if 'log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in validate_block:
     raise SystemExit("validate block does not announce targeted service validation")
@@ -707,18 +655,13 @@ if rollback_block.index('validate_remote_release "${requested_release_id}"') > r
 if rollback_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"') > rollback_block.index('validate_remote_release "${requested_release_id}"'):
     raise SystemExit("rollback validates the release before confirming the current symlink")
 for rollback_snippet in (
-    'rollback_non_dns_service_args="$(compose_target_service_args_without_dns)"',
+    'rollback_service_args="$(compose_target_service_args_without_tunnels)"',
     'rollback_tunnel_service_args="$(compose_target_tunnel_service_args)"',
-    'ROLLBACK_DNS_IN_SCOPE',
-    'up -d --build --force-recreate --no-deps${rollback_non_dns_service_args}',
+    'up -d --build --force-recreate --no-deps${rollback_service_args}',
     'up -d --force-recreate --no-deps${rollback_tunnel_service_args}',
 ):
     if rollback_snippet not in rollback_function_block:
         raise SystemExit(f"rollback function does not preserve targeted deploy scope: {rollback_snippet}")
-if "if requires_dns_release_prepare; then\n      publish_remote_dns_admin_tailscale\n" not in rollback_block:
-    raise SystemExit("rollback block must only publish the private DNS admin surface when DNS is in scope")
-if rollback_block.index("publish_remote_dns_admin_tailscale") > rollback_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"'):
-    raise SystemExit("rollback block publishes the private DNS admin path after validation starts")
 
 if "remote_run_docker_gc" not in cleanup_block:
     raise SystemExit("cleanup-docker action does not invoke remote_run_docker_gc")
@@ -737,7 +680,7 @@ if "MEMORY_REPORT_SCRIPT" not in memory_report_function_block:
 if "python3 - --source-label" not in memory_report_function_block:
     raise SystemExit("memory-report function does not stream the reporter to the host")
 
-host_cache_cleanup_block = block_between('remote_run_host_cache_cleanup() {\n', 'compact_remote_dns_db() {\n')
+host_cache_cleanup_block = block_between('remote_run_host_cache_cleanup() {\n', 'compose_all_service_args() {\n')
 if host_cache_cleanup_block.index("journalctl --vacuum-size=\\\"\\${journal_max_size}\\\"") > host_cache_cleanup_block.index("report_memory 'before reclaimable cache flush'"):
     raise SystemExit("host cache cleanup flushes reclaimable memory before journal cleanup")
 if host_cache_cleanup_block.index("report_memory 'before reclaimable cache flush'") > host_cache_cleanup_block.index("printf '3\\n' > /proc/sys/vm/drop_caches"):
@@ -762,23 +705,6 @@ if "validate_remote_memory_report" not in validate_memory_report_block:
 for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "remote_compose_up", "run_automatic_remote_docker_gc", "remote_run_docker_gc", "remote_run_host_cache_cleanup", "validate_remote_release"):
     if forbidden in validate_memory_report_block:
         raise SystemExit(f"validate-memory-report block should stay isolated from app deploy/cleanup flow: {forbidden}")
-
-if "compact_remote_dns_db" not in compact_block:
-    raise SystemExit("compact-dns-db action does not invoke compact_remote_dns_db")
-if 'log "Maintenance: activating cleanup and compacting the live DNS control-plane database"' not in compact_block:
-    raise SystemExit("compact-dns-db block does not announce the activation-and-compact action")
-if 'require_dns_private_admin_env' not in compact_block:
-    raise SystemExit("compact-dns-db block does not require the DNS private admin environment")
-if 'validate_remote_dns_workload_health "${REMOTE_CURRENT_LINK}"' not in compact_block:
-    raise SystemExit("compact-dns-db block does not validate the DNS workload after restart")
-
-if "repair_remote_dns_admin" not in repair_dns_admin_block:
-    raise SystemExit("repair-dns-admin block does not invoke repair_remote_dns_admin")
-if 'require_dns_private_admin_env' not in repair_dns_admin_block:
-    raise SystemExit("repair-dns-admin block does not require the DNS private admin environment")
-for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "remote_compose_up", "run_automatic_remote_docker_gc", "validate_remote_release"):
-    if forbidden in repair_dns_admin_block:
-        raise SystemExit(f"repair-dns-admin block should stay isolated from the app deploy flow: {forbidden}")
 
 if "stage_netdata_config_to_remote" not in install_block or "install_remote_netdata" not in install_block or "validate_remote_netdata" not in install_block:
     raise SystemExit("install-netdata block does not stage config, install Netdata, and validate it")
@@ -806,13 +732,6 @@ for forbidden in ("prepare_local_release_bundle", "copy_release_to_remote", "rem
 
 if "run_automatic_remote_docker_gc" in repair_block or "remote_run_docker_gc" in repair_block:
     raise SystemExit("repair-portainer block should not trigger Docker GC")
-
-if remote_compose_up_block.index("ensure_remote_dns_host_preflight") > remote_compose_up_block.index('remote_shell "'):
-    raise SystemExit("remote_compose_up runs the DNS preflight after beginning the remote compose flow")
-if compact_function_block.index("ensure_remote_dns_host_preflight") > compact_function_block.index('remote_compose_shell "${remote_release_dir}"'):
-    raise SystemExit("compact_remote_dns_db runs the DNS preflight after beginning the compact flow")
-if rollback_function_block.index("ensure_remote_dns_host_preflight") > rollback_function_block.index('remote_shell "'):
-    raise SystemExit("rollback_remote_release runs the DNS preflight after beginning the rollback flow")
 PY
 then
   echo "FAIL: Arbuzas deploy script no longer matches the Arbuzas maintenance contract" >&2

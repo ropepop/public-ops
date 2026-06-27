@@ -17,7 +17,7 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `../workloads/ticket-remote/README.md`: public ViVi ticket viewer runtime model.
 - `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
 - `../workloads/subscription-bot/README.md` and `../workloads/subscription-bot/AGENTS.md`: subscription bot and mini app overview plus web UI checks.
-- `../workloads/site-notifications/README.md` and `../workloads/rigassatiksme-qr-bot/README.md`: smaller workload entrypoints.
+- `../workloads/site-notifications/README.md`: smaller workload entrypoint.
 - For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
 
 ## Durable docs

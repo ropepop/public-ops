@@ -72,6 +72,56 @@ func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
 	}
 }
 
+func TestSpacetimeClientFiltersExpiredViewerPresence(t *testing.T) {
+	body, err := staticFS.ReadFile("static/spacetime-client.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(body)
+	for _, snippet := range []string{
+		"function rowExpiresAfter(row, nowMs)",
+		"Date.parse(String(row && (row.expiresAt || row.expires_at) || \"\"))",
+		"row.connected !== false && rowExpiresAfter(row, nowMs)",
+		"viewerCount: viewers.length",
+	} {
+		if !staticContains(js, snippet) {
+			t.Fatalf("Spacetime client must hide expired viewer presence, missing %q", snippet)
+		}
+	}
+}
+
+func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	start := strings.Index(module, "pub fn identity_connected")
+	end := strings.Index(module, "pub fn ticketremote_register_service_identity")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("Spacetime connection hook block not found")
+	}
+	chunk := module[start:end]
+	for _, forbidden := range []string{
+		"upsertPresence(",
+		"disconnectPresence(",
+		"connectionSessionId(ctx)",
+	} {
+		if strings.Contains(chunk, forbidden) {
+			t.Fatalf("raw Spacetime connect/disconnect hooks must not change viewer presence, found %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"pub fn identity_connected(_ctx: &ReducerContext) {}",
+		"pub fn identity_disconnected(_ctx: &ReducerContext) {}",
+		"pub fn ticketremote_member_set_stream_focus(",
+	} {
+		source := chunk
+		if required == "pub fn ticketremote_member_set_stream_focus(" {
+			source = module
+		}
+		if !strings.Contains(source, required) {
+			t.Fatalf("connection hook block missing %q", required)
+		}
+	}
+}
+
 func TestRelayViewerCountPublishesPhoneBrokerPresence(t *testing.T) {
 	presenceUpdates := make(chan int, 4)
 	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -513,9 +563,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"ownedControlCodeRequestIDs.has(String(requestID))",
 		"control_code_message_ignored",
 		"function closeCurrentControlCode(openNext)",
-		"postJSON('/api/v1/control-code/request',{digits})",
-		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
-		"msg.type!=='control_code_request'",
+		"client.requestControlCode(digits)",
+		"client.closeControlCode(requestID,\"browser_closed\")",
+		"ownerPublicId:localPublicID",
 		"codeResultArea.addEventListener('click'",
 		"setStatus('Kontroles kodu pieprasi ar pogu zem biļetes.')",
 		"window.TicketSpacetime.create",
@@ -527,7 +577,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"window.addEventListener('unhandledrejection'",
 		"function requireElement(selector, label)",
 		"function showFatalPage(message)",
-		"control_message_failed",
+		"control_code_request_failed",
 		"video_message_failed",
 		"decoded_frame_render_failed",
 		"location.pathname==='/auth/callback'",
@@ -538,12 +588,12 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function requestScreenWakeLock(reason)",
 		"navigator.wakeLock.request('screen')",
 		"if(!screenWakeLock)return;const lock=screenWakeLock",
-		"openControlCodeDialog(){if(document.fullscreenElement&&typeof document.exitFullscreen==='function')",
+		"function openControlCodeDialog()",
+		"if(!streamReadyForControlCode())",
 		"document.exitFullscreen().catch",
 		"function layoutViewportRect()",
 		"function toolbarCollapseAnchorPx()",
 		"Math.min(96,Math.max(24,viewportHeight()*.12))",
-		"clientLog('toolbar_collapse_anchor'",
 		"function firstScreenAnchorTop()",
 		"streamLive=rootCapture.active||phoneHealth.streamVerdict==='live'||pipeline.streamVerdict==='live'",
 		"function activeViewers(viewers)",
@@ -585,7 +635,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"lastDecodedFrameAt=0",
 		"latestStreamStatus=null",
 		"function handleScreenEngagementEvent(event)",
-		"msg.type==='state'",
+		"relayReportToStreamStatus(state.relayCurrentReport)",
 		"function resetDecoderForRecovery(reason)",
 		"requestReason:reason",
 		"resetDecoderForRecovery(\"first_frame_decoder_reset\")",
@@ -593,9 +643,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function controlCodeKeepsVideoAliveWhileHidden()",
 		"control_code_capture_keepalive",
 		"control_code_wait_reconnect",
-		"msg.type==='stream_status'",
-		"send(heartbeatMessage('public_connected'))",
-		"send(heartbeatMessage('public_heartbeat'))",
+		"publishStreamFocus(true,'public_connected')",
+		"spacetimeClient.heartbeat(true)",
 		"window.visualViewport",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
@@ -644,8 +693,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"lastRenderedFrameSequence",
 		"minFrameSequence",
 		`captureCanvas.toDataURL("image/png")`,
-		"/api/v1/control-code/capture",
 		"confirmControlCodeBrowserCapture",
+		"client.confirmControlCodeBrowserCapture(",
 		"captureControlCodeResultScreenshot",
 	} {
 		if !strings.Contains(js, snippet) {
@@ -1007,11 +1056,10 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	}
 	resultCSS := css[resultCSSStart : resultCSSStart+resultCSSEnd]
 	for _, snippet := range []string{
-		"position: fixed",
-		"left: var(--ticket-viewport-left",
-		"top: var(--ticket-viewport-top",
-		"width: var(--ticket-viewport-width",
-		"height: var(--ticket-viewport-height",
+		"position: absolute",
+		"inset: 0",
+		"width: 100%",
+		"height: 100%",
 		"z-index: 7",
 		"place-items: center",
 		"padding: 0",
@@ -1038,17 +1086,17 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	for _, snippet := range []string{
 		"sanitizeControlDigits(codeDigits.value)",
 		"controlCodeStatusRank(request.status)",
-		"rememberOwnedControlCodeRequest(payload.request)",
+		"ownerPublicId:localPublicID",
 		"locallyClosedControlCodeRequestIDs.add(String(requestID))",
 		"return String(value || '').replace(/\\D/g, '')",
 		"digits.length < 2 || digits.length > 8",
-		"postJSON('/api/v1/control-code/request',{digits})",
-		"renderControlCodeRequest(payload.request)",
+		"client.requestControlCode(digits)",
+		"renderControlCodeRequest({requestId:`pending:${Date.now()}`",
 		"closeCurrentControlCode(false)",
 		"scheduleControlCodeTicker(current)",
 		"codeResultValue.hidden=true",
 		"codeResultTimer.hidden=false",
-		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
+		"client.closeControlCode(requestID,\"browser_closed\")",
 		"publicPresence=Array.isArray(state&&state.viewerPresence)",
 		"activeViewers(state&&state.viewers||[])",
 		"controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot)",
@@ -1101,15 +1149,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 }
 
 func TestTicketSpacetimeModuleDisablesOldControlMutations(t *testing.T) {
-	moduleBody, err := os.ReadFile("../../spacetimedb/src/index.ts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	module := string(moduleBody)
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"const CONTROL_MS = 90 * 1000",
-		"throw new SenderError('control_mode_removed')",
-		"throw new SenderError('extension_disabled')",
+		"pub fn ticketremote_member_claim_control(",
+		"Err(\"control_mode_removed\".into())",
+		"Err(\"extension_disabled\".into())",
 	} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("SpacetimeDB module missing %q", snippet)
@@ -1130,33 +1174,34 @@ func TestTicketSpacetimeModuleDisablesOldControlMutations(t *testing.T) {
 }
 
 func TestTicketSpacetimeMemberReducersUseServerClockAndConnectionID(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	module := string(body)
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, reducer := range []string{
-		"member_heartbeat_presence",
-		"member_disconnect_presence",
-		"member_claim_control",
-		"member_release_control",
-		"member_revoke_control",
-		"member_upsert_member",
-		"member_remove_member",
+		"ticketremote_member_set_stream_focus",
+		"ticketremote_member_request_control_code",
+		"ticketremote_member_confirm_control_code_browser_capture",
+		"ticketremote_member_close_control_code",
+		"ticketremote_member_claim_control",
+		"ticketremote_member_release_control",
+		"ticketremote_member_revoke_control",
+		"ticketremote_member_upsert_member",
+		"ticketremote_member_remove_member",
 	} {
-		start := strings.Index(module, `name: named('`+reducer+`')`)
+		start := strings.Index(module, "pub fn "+reducer+"(")
 		if start < 0 {
 			t.Fatalf("missing reducer %s", reducer)
 		}
-		chunk := module[start:min(len(module), start+700)]
-		if strings.Contains(chunk, "now: t.string()") {
+		end := strings.Index(module[start+1:], "\n#[spacetimedb::reducer]")
+		if end < 0 {
+			end = min(len(module)-start, 900)
+		} else {
+			end++
+		}
+		chunk := module[start : start+end]
+		if strings.Contains(chunk, "nowArg") {
 			t.Fatalf("%s must not accept browser-supplied now", reducer)
 		}
-		if strings.Contains(chunk, "sessionId: t.string()") {
-			t.Fatalf("%s must not accept browser-supplied sessionId", reducer)
-		}
 	}
-	for _, snippet := range []string{"ctx.timestamp", "ctx.connectionId", "serverNow(ctx)", "connectionSessionId(ctx)"} {
+	for _, snippet := range []string{"ctx.timestamp", "ctx.connection_id()", "fn now(ctx: &ReducerContext)", "fn connection_session_id(ctx: &ReducerContext)"} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("module missing %q", snippet)
 		}
@@ -1164,69 +1209,45 @@ func TestTicketSpacetimeMemberReducersUseServerClockAndConnectionID(t *testing.T
 }
 
 func TestTicketSpacetimePublicTablesAreRedacted(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	module := string(body)
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	if strings.Contains(module, "ticketremote_live_state") || strings.Contains(module, "stateJson") {
 		t.Fatalf("SpacetimeDB module must not publish the old public JSON snapshot")
 	}
-	start := strings.Index(module, "const ticketremote_viewer_public = table(")
-	if start < 0 {
-		t.Fatalf("SpacetimeDB module must define public viewer presence")
-	}
-	viewerEnd := strings.Index(module[start:], "const ticketremote_control_session = table(")
-	if viewerEnd < 0 {
-		t.Fatalf("SpacetimeDB module viewer table end not found")
-	}
-	viewerChunk := module[start : start+viewerEnd]
-	for _, forbidden := range []string{"email:", "displayName:", "page:", "sessionId:"} {
+	viewerChunk := rustItemChunk(t, module, "#[spacetimedb::table(accessor = ticketremote_viewer_public, public")
+	for _, forbidden := range []string{"pub email:", "pub displayName:", "pub page:", "pub sessionId:"} {
 		if strings.Contains(viewerChunk, forbidden) {
 			t.Fatalf("public viewer table must not expose %q in %s", forbidden, viewerChunk)
 		}
 	}
-	for _, required := range []string{"id: t.string().primaryKey()", "ticketId:", "publicId:", "label:", "expiresAt:"} {
+	for _, required := range []string{"pub id: String", "pub ticketId: String", "pub publicId: String", "pub label: String", "pub expiresAt: String"} {
 		if !strings.Contains(viewerChunk, required) {
 			t.Fatalf("public viewer table missing %q in %s", required, viewerChunk)
 		}
 	}
-	phoneStart := strings.Index(module, "const ticketremote_phone_status = table(")
-	if phoneStart < 0 {
-		t.Fatalf("SpacetimeDB module must define public phone status")
-	}
-	phoneEnd := strings.Index(module[phoneStart:], "const ticketremote_phone_status_history = table(")
-	if phoneEnd < 0 {
-		t.Fatalf("SpacetimeDB module phone table end not found")
-	}
-	phoneChunk := module[phoneStart : phoneStart+phoneEnd]
-	for _, forbidden := range []string{"baseUrl:", "healthJson:", "lastError:"} {
+	phoneChunk := rustItemChunk(t, module, "#[spacetimedb::table(accessor = ticketremote_phone_status, public")
+	for _, forbidden := range []string{"pub baseUrl:", "pub healthJson:", "pub lastError:"} {
 		if strings.Contains(phoneChunk, forbidden) {
 			t.Fatalf("public phone table must not expose %q in %s", forbidden, phoneChunk)
 		}
 	}
-	if !strings.Contains(module, "publicPresenceRowId(") {
+	if !strings.Contains(module, "public_presence_row_id(") {
 		t.Fatalf("public viewer rows must use opaque row ids")
 	}
 }
 
 func TestSpacetimeReducersUseEmailWideControlOwnership(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(body)
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"const actorEmail = cleanEmail(args.email);",
-		"if (actorEmail && active.email !== actorEmail) throw new SenderError('not_controller');",
+		"let actor = clean_email(&email);",
+		"if !actor.is_empty() && clean_email(&row.email) != actor",
 	} {
 		if !strings.Contains(source, snippet) {
 			t.Fatalf("SpacetimeDB reducer missing email-wide ownership snippet %q", snippet)
 		}
 	}
 	for _, snippet := range []string{
-		"active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email)",
-		"args.sessionId && (active.sessionId !== args.sessionId || active.email !== cleanEmail(args.email))",
+		"!actor.is_empty() && row.sessionId",
+		"row.sessionId != _sessionId",
 	} {
 		if strings.Contains(source, snippet) {
 			t.Fatalf("SpacetimeDB reducer should not require same browser session: %q", snippet)
@@ -1235,19 +1256,16 @@ func TestSpacetimeReducersUseEmailWideControlOwnership(t *testing.T) {
 }
 
 func TestSpacetimeAuthDirectClientContract(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join("..", "..", "spacetimedb", "src", "index.ts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(body)
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"{ name: named('ticket_summary'), public: true }",
-		"name: named('viewer_public'),",
-		"{ name: named('phone_status'), public: true }",
-		"clientEmailFromAuth(ctx, ticketId)",
-		"payload.email_verified !== true",
-		"export const memberHeartbeatPresence",
-		"upsertPresence(ctx, ticket.id, sessionId, email",
+		"#[spacetimedb::table(accessor = ticketremote_ticket_summary, public)]",
+		"#[spacetimedb::table(accessor = ticketremote_viewer_public, public",
+		"#[spacetimedb::table(accessor = ticketremote_phone_status, public)]",
+		"client_email_from_auth(ctx, &ticket.id)",
+		"payload.get(\"email_verified\").and_then(|v| v.as_bool()) != Some(true)",
+		"pub fn ticketremote_member_set_stream_focus",
+		"let session_id = non_empty(&sessionId, &connection_session_id(ctx));",
+		"upsert_presence(\n            ctx,\n            &ticket.id,\n            &session_id,\n            &email",
 	} {
 		if !strings.Contains(source, snippet) {
 			t.Fatalf("SpacetimeDB auth/direct-client contract missing %q", snippet)
@@ -1268,11 +1286,14 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"/api/v1/auth/start",
 		"clearLocalAuthState()",
 		"/api/v1/auth/session",
-		"postJSON('/api/v1/control-code/request',{digits})",
-		"postJSON('/api/v1/control-code/close', { requestId: requestID })",
+		"client.requestControlCode(digits)",
+		"client.closeControlCode(requestID,\"browser_closed\")",
 		"usesDirectSpacetimeAuth()",
-		"function heartbeatMessage(reason)",
-		"msg.presenceFallback=true",
+		"publishStreamFocus(true,'public_connected')",
+		"spacetimeClient.heartbeat(true)",
+		"let spacetimeClientConnectPromise=null",
+		"if(spacetimeClientConnectPromise)return spacetimeClientConnectPromise",
+		"spacetimeClientConnectPromise=(async()=>",
 		"loadSpacetimeClientScript()",
 		"document.head.appendChild(script)",
 		`document.documentElement.dataset.ticketUi="arrow"`,
@@ -1304,7 +1325,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	}
 	for _, snippet := range []string{
 		"DbConnection.builder()",
-		"memberHeartbeatPresence",
+		"memberSetStreamFocus",
 		"ticketremote_ticket_summary",
 		"ticketremote_viewer_public",
 		"ticketremote_phone_status",
@@ -1480,6 +1501,7 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	directStore := &spacetimeBackendCountingStore{Store: store}
 	server, err := NewServer(config.Config{
 		PublicBaseURL: "http://ticket.test",
 		TicketID:      "vivi-default",
@@ -1494,6 +1516,11 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 			AuthCookieName:    "ticket_remote_auth",
 			SessionSigningKey: "test-signing-key",
 		},
+		State: state.StoreConfig{
+			Backend:           "spacetime",
+			SpacetimeHost:     "https://maincloud.spacetimedb.com",
+			SpacetimeDatabase: "ticket-remote-prod-v2",
+		},
 		Phone: config.PhoneConfig{
 			BackendID:         "pixel",
 			AttachName:        "Pixel",
@@ -1501,13 +1528,16 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 			DefaultBackendID:  "pixel",
 			ActiveBackendFile: filepath.Join(t.TempDir(), "active-phone-backend.json"),
 		},
-	}, store, phone.NewRelay(phone.RelayConfig{
+	}, directStore, phone.NewRelay(phone.RelayConfig{
 		BackendID:  "pixel",
 		AttachName: "Pixel",
 		BaseURL:    "http://pixel.test",
 	}))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !server.usesDirectSpacetimePresence() {
+		t.Fatal("test server should use direct Spacetime presence")
 	}
 	token, _, err := server.auth.IssueServerSession(auth.Identity{
 		Email:         "ticket@jolkins.id.lv",
@@ -1531,6 +1561,9 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	spacetimePayload, _ := payload["spacetime"].(map[string]any)
 	if spacetimePayload["token"] != nil {
 		t.Fatalf("server session token must not be exposed as direct Spacetime token: %#v", spacetimePayload)
+	}
+	if spacetimePayload["authRequired"] != true {
+		t.Fatalf("missing direct Spacetime cookie should require a direct auth refresh: %#v", spacetimePayload)
 	}
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)

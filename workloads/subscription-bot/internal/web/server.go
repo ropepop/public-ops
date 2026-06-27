@@ -1452,6 +1452,8 @@ func (s *Server) setReleaseHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Subscription-Bot-Commit", s.release.Commit)
 	w.Header().Set("X-Subscription-Bot-Build-Time", s.release.BuildTime)
 	w.Header().Set("X-Subscription-Bot-Dirty", s.release.Dirty)
+	w.Header().Set("X-Subscription-Bot-Release-Id", s.release.ReleaseID)
+	w.Header().Set("X-Subscription-Bot-Source-Sha256", s.release.SourceSHA256)
 	w.Header().Set("X-Subscription-Bot-Instance", s.release.Instance)
 	w.Header().Set("X-Subscription-Bot-App-Js", s.release.AppJSHash)
 }

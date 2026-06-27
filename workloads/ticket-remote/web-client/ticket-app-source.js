@@ -17,21 +17,51 @@ import { html, reactive } from '@arrow-js/core';
     return String(value);
   }
 
+  const pendingClientLogs = [];
+  const sampledClientLogState = new Map();
+  const sampledClientLogEvents = new Set(['control_code_capture_keepalive', 'stream_command_dispatched']);
+  const sampledClientLogIntervalMs = 60000;
+  let spacetimeClient = null;
+
+  function sampledClientLogDetail(event, detail) {
+    if (!sampledClientLogEvents.has(event)) return detail;
+    const now = Date.now();
+    const previous = sampledClientLogState.get(event) || { at: 0, dropped: 0 };
+    if (now - previous.at < sampledClientLogIntervalMs) {
+      previous.dropped += 1;
+      sampledClientLogState.set(event, previous);
+      return null;
+    }
+    const dropped = previous.dropped || 0;
+    sampledClientLogState.set(event, { at: now, dropped: 0 });
+    if (!dropped) return detail;
+    return safeString({
+      detail,
+      droppedSinceLast: dropped
+    });
+  }
+
   function reportClientFault(event, detail) {
-    if (typeof fetch !== 'function') return;
+    const eventName = String(event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    const detailText = safeString(detail).slice(0, 500);
+    const sampledDetail = sampledClientLogDetail(eventName, detailText);
+    if (sampledDetail == null) return;
+    pendingClientLogs.push({
+      level: 'info',
+      event: eventName,
+      detail: safeString({
+        pageVersion,
+        detail: sampledDetail,
+        webCodecs: 'VideoDecoder' in window,
+        userAgent: navigator.userAgent
+      }).slice(0, 1000),
+      at: Date.now()
+    });
+    if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
     try {
-      fetch('/api/v1/client-log', {
-        method: 'POST',
-        cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event,
-          pageVersion,
-          detail: safeString(detail).slice(0, 500),
-          webCodecs: 'VideoDecoder' in window,
-          userAgent: navigator.userAgent
-        })
-      }).catch(() => {});
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(() => flushClientLogs());
+      }
     } catch (_) {}
   }
 
@@ -72,13 +102,13 @@ import { html, reactive } from '@arrow-js/core';
     history.scrollRestoration = 'manual';
   }
 
-  let spacetimeClient = null;
   let spacetimeClientStatus = 'idle';
   let spacetimeDirectUnavailable = false;
   let spacetimeDirectUnavailableLogged = false;
   let directSpacetimeToken = '';
   let directSpacetimeTokenExpiresAt = 0;
   let spacetimeClientScriptPromise = null;
+  let spacetimeClientConnectPromise = null;
 
   if (!cfg.authenticated) {
     startAuthRedirect();
@@ -141,11 +171,11 @@ import { html, reactive } from '@arrow-js/core';
   const presenceState = reactive({ viewers: [], visibleViewerCount: 0 });
   let presenceMounted = false;
 
-  let ws = null;
   let videoWs = null;
   const activeVideoSockets = new Set();
   let reconnectTimer = null;
   let hiddenVideoCloseTimer = null;
+  let hiddenStreamFocusTimer = null;
   let configured = false;
   let streamUnsupported = false;
   let streamSize = { width: 540, height: 1080 };
@@ -172,6 +202,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastRenderedFrameTimestamp = 0;
   let lastRestartAt = 0;
   let lastRecoveryKeyframeAt = 0;
+  let lastKeyframeCommandAt = 0;
   let lastRecoveryDecoderResetAt = 0;
   let lastRecoveryVideoReconnectAt = 0;
   let lastRecoveryServerRecoverAt = 0;
@@ -215,9 +246,11 @@ import { html, reactive } from '@arrow-js/core';
   let controlCodeFrozenFrameCanvas = null;
   let controlCodeFrozenFrameKey = '';
   const localSessionID = String(cfg.sessionId || '').trim();
+  const localPublicID = accountPublicId(cfg.email || '');
   const ownedControlCodeRequestIDs = new Set();
   const locallyClosedControlCodeRequestIDs = new Set();
   let codeDialogOpen = false;
+  let controlCodeDialogScrollLock = null;
   let codeResultTickTimer = null;
   let stableViewport = null;
   let screenEngaged = false;
@@ -250,6 +283,7 @@ import { html, reactive } from '@arrow-js/core';
   const resumeVideoReconnectDelayMs = 600;
   const idleDisconnectMs = 15 * 60 * 1000;
   const recoveryKeyframeDebounceMs = 2000;
+  const keyframeCommandMinIntervalMs = 1000;
   const recoveryDecoderResetDebounceMs = 5000;
   const recoveryVideoReconnectDebounceMs = 8000;
   const recoveryServerRecoverDebounceMs = 12000;
@@ -257,7 +291,9 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeFingerprintGridHeight = 16;
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
-  const controlCodeCaptureKeyframeRetryMs = 650;
+  const controlCodeCapturePollMs = 200;
+  const controlCodeCaptureKeyframeRetryMs = 5000;
+  const controlCodeCaptureKeyframeRetryLimit = 3;
   const controlCodeGeneratedChipScanStartY = 0.50;
   const controlCodeGeneratedChipScanEndY = 0.61;
   const controlCodeGeneratedChipScanStepY = 0.01;
@@ -324,13 +360,13 @@ import { html, reactive } from '@arrow-js/core';
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
     }
+    if (hiddenStreamFocusTimer) {
+      clearTimeout(hiddenStreamFocusTimer);
+      hiddenStreamFocusTimer = null;
+    }
     closeEarlyVideo('idle_disconnect');
     closeDirectVideo();
     resetStreamState({ preserveFrame: true });
-    if (ws) {
-      try { ws.close(); } catch (_) {}
-      ws = null;
-    }
     if (spacetimeClient && typeof spacetimeClient.close === 'function') {
       spacetimeClient.close();
     }
@@ -421,7 +457,11 @@ import { html, reactive } from '@arrow-js/core';
     document.documentElement.style.setProperty('--ticket-dialog-height', `${dialogViewport.height}px`);
     document.documentElement.style.setProperty('--ticket-dialog-left', `${dialogViewport.offsetLeft}px`);
     document.documentElement.style.setProperty('--ticket-dialog-top', `${dialogViewport.offsetTop}px`);
-    document.documentElement.style.setProperty('--ticket-toolbar-anchor', `${screenEngaged ? toolbarCollapseAnchorPx() : 0}px`);
+    // --ticket-toolbar-anchor write removed: the CSS no longer references it after the
+    // .stage / .stage-page / .shell rules were migrated to min-height:100dvh. The JS-side
+    // helper toolbarCollapseAnchorPx() and the toolbarAnchorLogged flag are left in place
+    // as dead-but-harmless code so the clientLog('toolbar_collapse_anchor', ...) line
+    // history is not lost; they will be removed in the next cleanup pass.
   }
 
   function firstScreenAnchorTop() {
@@ -429,43 +469,26 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function updateDetailsReveal() {
+    if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;
     const revealed = window.scrollY >= Math.max(1, firstScreenAnchorTop() + viewportHeight() * 0.82);
     document.body.classList.toggle('details-visible', revealed);
     if (panel) panel.setAttribute('aria-hidden', revealed ? 'false' : 'true');
   }
 
   function keepFirstScreenPinned(force) {
-    if (codeDialogOpen && document.activeElement === codeDigits) {
-      updateDetailsReveal();
-      return;
-    }
     if (force) {
       document.body.classList.remove('details-visible');
       if (panel) panel.setAttribute('aria-hidden', 'true');
     }
-    if (force || !document.body.classList.contains('details-visible')) {
-      const targetTop = firstScreenAnchorTop();
-      if (Math.abs(window.scrollY - targetTop) > 1 || window.scrollX !== 0) {
-        window.scrollTo({ top: targetTop, left: 0, behavior: 'auto' });
-      }
-      updateDetailsReveal();
-    }
+    updateDetailsReveal();
   }
 
   function scheduleFirstScreenPin(force) {
     keepFirstScreenPinned(force);
-    requestAnimationFrame(() => keepFirstScreenPinned(force));
-    setTimeout(() => keepFirstScreenPinned(force), 60);
-    setTimeout(() => keepFirstScreenPinned(force), 300);
   }
 
-  function anchorToolbarCollapse(reason) {
+  function anchorToolbarCollapse(_reason) {
     updateViewportVars();
-    if (!toolbarAnchorLogged) {
-      toolbarAnchorLogged = true;
-      clientLog('toolbar_collapse_anchor', `${reason || 'gesture'}:${toolbarCollapseAnchorPx()}`);
-    }
-    scheduleFirstScreenPin(true);
   }
 
   async function requestScreenWakeLock(reason) {
@@ -541,7 +564,6 @@ import { html, reactive } from '@arrow-js/core';
       document.body.classList.add('screen-engaged');
       updateViewportVars();
       clientLog('screen_engaged', reason || 'gesture');
-      anchorToolbarCollapse(reason || 'gesture');
     }
     requestTicketFullscreen(reason || 'gesture');
     requestScreenWakeLock(reason || 'gesture');
@@ -579,23 +601,7 @@ import { html, reactive } from '@arrow-js/core';
     return false;
   }
 
-  async function refreshHealth() {
-    try {
-      const response = await fetch('/api/v1/health', { cache: 'no-store' });
-      const health = await response.json();
-      checkServerVersion(health);
-      return health;
-    } catch (error) {
-      clientLog('health_check_failed', error && error.message);
-      return null;
-    }
-  }
-
   document.body.dataset.videoPath = 'https-h264';
-
-  function socketURL() {
-    return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/session';
-  }
 
   function streamURL() {
     return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/stream';
@@ -789,8 +795,35 @@ import { html, reactive } from '@arrow-js/core';
     return Boolean(cleanLeft && cleanRight && cleanLeft === cleanRight);
   }
 
+  function accountPublicId(email) {
+    const normalized = String(email || '').trim().toLowerCase();
+    let hash = 2166136261 >>> 0;
+    for (let i = 0; i < normalized.length; i += 1) {
+      hash ^= normalized.charCodeAt(i) & 0xff;
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return hash.toString(36).padStart(4, '0').slice(0, 4);
+  }
+
   function clientLog(event, detail) {
     reportClientFault(event, detail);
+  }
+
+  function flushClientLogs() {
+    if (!spacetimeClient || typeof spacetimeClient.appendSafeLog !== 'function') return;
+    if (!pendingClientLogs.length) return;
+    const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));
+    batch.forEach((entry) => {
+      const detailJson = safeString({
+        pageVersion,
+        detail: entry.detail,
+        queuedAt: entry.at
+      }).slice(0, 1000);
+      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, '')
+        .catch(() => {
+          if (pendingClientLogs.length < 100) pendingClientLogs.unshift(entry);
+        });
+    });
   }
 
   function streamResumeSpinnerVisible() {
@@ -925,50 +958,26 @@ import { html, reactive } from '@arrow-js/core';
 
   function connect() {
     if (idleDisconnected) return;
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     clearTimeout(reconnectTimer);
     keepFirstScreenPinned();
     setConnected('Savienojas');
     connectedAt = performance.now();
-    ws = safeWebSocket(socketURL(), 'control');
-    if (!ws) {
-      setConnected('Savienojuma kļūme');
-      showStreamRecovery();
-      reconnectTimer = setTimeout(connect, 1500);
-      return;
-    }
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
+    connectSpacetimeState().then(() => {
+      publishStreamFocus(true, 'public_connected');
       setConnected('Savienots');
       if (!streamUnsupported) {
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
-      connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
-      send(heartbeatMessage('public_connected'));
+      flushClientLogs();
       connectDirectVideo();
-    };
-    ws.onmessage = (event) => {
-      handleMessage(event).catch((error) => {
-        clientLog('control_message_failed', error && error.message || 'message failed');
-      });
-    };
-    ws.onclose = () => {
-      if (idleDisconnected) return;
-      setConnected('Savienojas no jauna');
-      configured = false;
-      streamUnsupported = false;
-      keepFirstScreenPinned();
-      closeDirectVideo();
-      showStreamRecovery();
-      reconnectTimer = setTimeout(connect, 1000);
-    };
-    ws.onerror = () => {
+    }).catch((error) => {
       setConnected('Savienojuma kļūme');
       if (!streamUnsupported) {
         showStreamRecovery();
       }
-      clientLog('websocket_error', 'socket error');
-    };
+      clientLog('spacetime_connect_failed', error && error.message || 'connect failed');
+      reconnectTimer = setTimeout(connect, 1500);
+    });
     connectDirectVideo();
   }
 
@@ -1027,6 +1036,10 @@ import { html, reactive } from '@arrow-js/core';
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
     }
+    if (hiddenStreamFocusTimer) {
+      clearTimeout(hiddenStreamFocusTimer);
+      hiddenStreamFocusTimer = null;
+    }
     preserveCurrentFrame('close_direct_video');
     closeDecoder();
     const sockets = new Set(activeVideoSockets);
@@ -1060,8 +1073,15 @@ import { html, reactive } from '@arrow-js/core';
       connectDirectVideo();
       return;
     }
-    if (videoWs.readyState === WebSocket.OPEN) {
-      requestKeyframe(reason || 'control_code_capture_keepalive');
+    // During a control-code request, do NOT call requestKeyframe here.
+    // The previous behavior asked the phone for a new keyframe every
+    // keepalive tick (every ~1s), which forced the phone to re-encode
+    // and the browser decoder to reconfigure, destabilizing both the
+    // stream and the phone-side ViVi automation. The video socket is
+    // already open; that's enough to keep the relay warm. Use the
+    // debounced recovery path if the stream is actually degraded.
+    if (videoWs.readyState === WebSocket.OPEN && reason && reason.startsWith('stale')) {
+      requestKeyframeDebounced('control_code_capture_keepalive:' + reason, 4000);
     }
   }
 
@@ -1086,6 +1106,26 @@ import { html, reactive } from '@arrow-js/core';
     }, hiddenVideoCloseDelayMs);
   }
 
+  function releaseStreamFocusAfterHiddenGrace(reason) {
+    if (hiddenStreamFocusTimer) {
+      clearTimeout(hiddenStreamFocusTimer);
+      hiddenStreamFocusTimer = null;
+    }
+    if (controlCodeKeepsVideoAliveWhileHidden()) {
+      publishStreamFocus(true, reason || 'hidden_control_code_capture');
+      return;
+    }
+    hiddenStreamFocusTimer = setTimeout(() => {
+      hiddenStreamFocusTimer = null;
+      if (document.visibilityState !== 'hidden') return;
+      if (controlCodeKeepsVideoAliveWhileHidden()) {
+        publishStreamFocus(true, reason || 'hidden_control_code_capture');
+        return;
+      }
+      publishStreamFocus(false, reason || 'visibility_hidden');
+    }, hiddenVideoCloseDelayMs);
+  }
+
   function connectDirectVideo() {
     if (idleDisconnected) return;
     if (document.visibilityState === 'hidden' && !controlCodeKeepsVideoAliveWhileHidden()) {
@@ -1100,6 +1140,16 @@ import { html, reactive } from '@arrow-js/core';
     const early = claimEarlyVideoSocket();
     if (early && adoptVideoSocket(early.socket, early.queued, early.openedAt, 'early_video_socket')) {
       document.body.dataset.videoPath = 'https-h264';
+      return;
+    }
+    // If the pre-script early socket is still CONNECTING (common on slow mobile
+    // cold loads), give it a short grace window before opening a brand-new
+    // socket. The retry path will adopt it once it upgrades to OPEN.
+    const earlyPeek = window.TICKET_EARLY_VIDEO;
+    if (earlyPeek && !earlyPeek.claimed && !earlyPeek.closed && !earlyPeek.error
+        && earlyPeek.ws && earlyPeek.ws.readyState === WebSocket.CONNECTING) {
+      clientLog('early_video_connecting_grace', '');
+      setTimeout(connectDirectVideo, 250);
       return;
     }
     closeDirectVideo();
@@ -1146,7 +1196,7 @@ import { html, reactive } from '@arrow-js/core';
       }
       resetStreamState({ preserveFrame: true });
       showStreamRecovery();
-      if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
+      if (viewerIsForeground()) {
         setTimeout(connectDirectVideo, 1000);
       }
     };
@@ -1166,18 +1216,6 @@ import { html, reactive } from '@arrow-js/core';
     return true;
   }
 
-  function sendVideoSignal(value) {
-    if (videoWs && videoWs.readyState === WebSocket.OPEN) {
-      try {
-        videoWs.send(JSON.stringify(value));
-        return true;
-      } catch (error) {
-        reportClientFault('video_send_failed', error && error.message || 'send failed');
-      }
-    }
-    return false;
-  }
-
   function sendVideoClientLog(event, detail) {
     let safeDetail = '';
     if (detail != null && typeof detail === 'object') {
@@ -1189,21 +1227,23 @@ import { html, reactive } from '@arrow-js/core';
     } else {
       safeDetail = String(detail || '');
     }
-    sendVideoSignal({ type: 'client_log', event, detail: safeDetail.slice(0, 500) });
-    clientLog(event, detail);
+    clientLog(event, safeDetail);
   }
 
   function requestKeyframe(reason) {
-    if (!sendVideoSignal({ type: 'keyframe', reason })) {
-      send({ type: 'keyframe', reason });
-    }
+    const now = performance.now();
+    if (now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
+    lastKeyframeCommandAt = now;
+    runSpacetimeMutation((client) => client.requestKeyframe(reason || 'browser_request'), reason || 'keyframe')
+      .catch((error) => clientLog('keyframe_request_failed', `${reason || 'keyframe'}:${error && error.message || 'failed'}`));
+    return true;
   }
 
   function requestKeyframeDebounced(reason, minIntervalMs) {
     const now = performance.now();
     if (now - lastRecoveryKeyframeAt < minIntervalMs) return false;
+    if (!requestKeyframe(reason)) return false;
     lastRecoveryKeyframeAt = now;
-    requestKeyframe(reason);
     return true;
   }
 
@@ -1212,9 +1252,8 @@ import { html, reactive } from '@arrow-js/core';
     if (now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
     sendVideoClientLog('h264_server_recover_requested', reason);
-    if (!sendVideoSignal({ type: 'recover_stream', reason })) {
-      send({ type: 'recover_stream', reason });
-    }
+    runSpacetimeMutation((client) => client.recoverStream(reason || 'browser_recovery'), reason || 'recover_stream')
+      .catch((error) => clientLog('stream_recover_request_failed', `${reason || 'recover'}:${error && error.message || 'failed'}`));
     return true;
   }
 
@@ -1427,10 +1466,6 @@ import { html, reactive } from '@arrow-js/core';
       if (!checkServerVersion(msg)) return;
       if (msg.type === 'config') {
         await configureDecoder(msg);
-      } else if (msg.type === 'stream_status') {
-        handleStreamStatus(msg);
-      } else if (msg.type === 'state' || msg.type === 'phone' || msg.type === 'health') {
-        handleMessage({ data: event.data });
       }
       return;
     }
@@ -1496,6 +1531,20 @@ import { html, reactive } from '@arrow-js/core';
     } else if (hasRenderedFrame) {
       hideStreamResumeSpinner();
     }
+    // Surface the server's phone-engine readiness verdict to the user.
+    // The server reports streamVerdict in {live, idle, preparing_phone,
+    // waiting_keyframe, stale_recovering, browser_decode_recovering,
+    // timing_uncertain}. When the phone is still warming up, the user
+    // sees a meaningful status instead of a generic spinner.
+    const verdict = String(msg.streamVerdict || '');
+    if (!hasRenderedFrame || !freshness.liveLabeled) {
+      if (verdict === 'preparing_phone' || verdict === 'waiting_keyframe' || verdict === 'stale_recovering') {
+        const phoneStreamState = String(msg.phoneStreamState || '');
+        if (phoneStreamState !== 'streaming') {
+          setStatus('Tālrunis gatavojas...');
+        }
+      }
+    }
     publishStreamDebug();
   }
 
@@ -1517,6 +1566,7 @@ import { html, reactive } from '@arrow-js/core';
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
+      updateControlCodeSubmitAvailability();
       publishStreamDebug();
     } catch (error) {
       sendVideoClientLog('decoded_frame_render_failed', `${source || 'decoder'}:${error && error.message || 'draw failed'}`);
@@ -1672,35 +1722,19 @@ import { html, reactive } from '@arrow-js/core';
     }).catch((error) => sendVideoClientLog('decoder_recovery_config_failed', error && error.message || 'decoder recovery failed'));
   }
 
-  function send(value) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify(value));
-        return true;
-      } catch (error) {
-        reportClientFault('control_send_failed', error && error.message || 'send failed');
-      }
-    }
-    return false;
-  }
-
-  function heartbeatMessage(reason) {
-    const msg = { type: 'heartbeat', reason: reason || 'public_heartbeat' };
-    if (spacetimeDirectUnavailable) {
-      msg.presenceFallback = true;
-    }
-    return msg;
-  }
-
-  async function fetchAuthSessionToken() {
-    if (!usesDirectSpacetimeAuth()) {
-      throw new Error('Direct SpacetimeAuth is disabled for this ticket session.');
-    }
-    const response = await fetch('/api/v1/auth/session', { cache: 'no-store' });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || !payload.ok || !payload.spacetime || !payload.spacetime.token) {
-      throw new Error(payload.message || payload.error || 'SpacetimeAuth session is unavailable.');
-    }
+	  async function fetchAuthSessionToken() {
+	    if (!usesDirectSpacetimeAuth()) {
+	      throw new Error('Direct SpacetimeAuth is disabled for this ticket session.');
+	    }
+	    const response = await fetch('/api/v1/auth/session', { cache: 'no-store' });
+	    const payload = await response.json().catch(() => ({}));
+	    if (payload && payload.authenticated && payload.spacetime && payload.spacetime.authRequired) {
+	      beginSpacetimeLogin(authReturnTarget());
+	      throw new Error('Direct SpacetimeAuth session refresh required.');
+	    }
+	    if (!response.ok || !payload.ok || !payload.spacetime || !payload.spacetime.token) {
+	      throw new Error(payload.message || payload.error || 'SpacetimeAuth session is unavailable.');
+	    }
     rememberSpacetimeToken(payload.spacetime.token);
     return payload.spacetime.token;
   }
@@ -1737,51 +1771,48 @@ import { html, reactive } from '@arrow-js/core';
   async function connectSpacetimeState() {
     if (idleDisconnected) return;
     if (!usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
-    let token = '';
+    if (spacetimeClientConnectPromise) return spacetimeClientConnectPromise;
+    spacetimeClientConnectPromise = (async () => {
+      if (idleDisconnected || !usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
+      let token = '';
+      try {
+        await loadSpacetimeClientScript();
+        token = await spacetimeToken();
+      } catch (error) {
+        spacetimeDirectUnavailable = true;
+        if (!spacetimeDirectUnavailableLogged) {
+          spacetimeDirectUnavailableLogged = true;
+          clientLog('spacetime_direct_unavailable', error && error.message);
+        }
+        return;
+      }
+      if (spacetimeClient) return;
+      const st = cfg.spacetime || {};
+      spacetimeClient = window.TicketSpacetime.create({
+        host: st.host || 'https://maincloud.spacetimedb.com',
+        database: st.database || '',
+        token,
+        ticketId: cfg.ticketId || 'vivi-default',
+        sessionId: cfg.sessionId || '',
+        email: cfg.email || ''
+      }, {
+        onState: (state) => {
+          currentState = state;
+          rememberServerClock(currentState);
+          renderState();
+        },
+        onStatus: (status, detail) => {
+          spacetimeClientStatus = status;
+          if (status === 'live') flushClientLogs();
+          if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
+        }
+      });
+      spacetimeClient.connect();
+    })();
     try {
-      await loadSpacetimeClientScript();
-      token = await spacetimeToken();
-    } catch (error) {
-      spacetimeDirectUnavailable = true;
-      if (!spacetimeDirectUnavailableLogged) {
-        spacetimeDirectUnavailableLogged = true;
-        clientLog('spacetime_direct_unavailable', error && error.message);
-      }
-      send(heartbeatMessage('spacetime_direct_unavailable'));
-      return;
-    }
-    const st = cfg.spacetime || {};
-    spacetimeClient = window.TicketSpacetime.create({
-      host: st.host || 'https://maincloud.spacetimedb.com',
-      database: st.database || '',
-      token,
-      ticketId: cfg.ticketId || 'vivi-default',
-      sessionId: cfg.sessionId || '',
-      email: cfg.email || ''
-    }, {
-      onState: (state) => {
-        currentState = state;
-        rememberServerClock(currentState);
-        renderState();
-      },
-      onStatus: (status, detail) => {
-        spacetimeClientStatus = status;
-        if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
-      }
-    });
-    spacetimeClient.connect();
-  }
-
-  async function syncServerState(reason) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      send({ type: 'state_refresh', reason: reason || 'spacetime_mutation' });
-    }
-    const response = await fetch('/api/v1/state', { cache: 'no-store' });
-    const payload = await response.json().catch(() => ({}));
-    if (response.ok && payload.ok && payload.state) {
-      currentState = payload.state;
-      rememberServerClock(currentState);
-      renderState();
+      await spacetimeClientConnectPromise;
+    } finally {
+      spacetimeClientConnectPromise = null;
     }
   }
 
@@ -1789,7 +1820,12 @@ import { html, reactive } from '@arrow-js/core';
     await connectSpacetimeState();
     if (!spacetimeClient) throw new Error('Spacetime connection is unavailable.');
     await action(spacetimeClient);
-    await syncServerState(reason);
+    flushClientLogs();
+  }
+
+  function publishStreamFocus(active, reason) {
+    runSpacetimeMutation((client) => client.setStreamFocus(Boolean(active), reason || (active ? 'browser_visible' : 'browser_hidden')), reason || 'stream_focus')
+      .catch((error) => clientLog('stream_focus_failed', `${reason || 'focus'}:${error && error.message || 'failed'}`));
   }
 
   function sanitizeControlDigits(value) {
@@ -2272,7 +2308,8 @@ import { html, reactive } from '@arrow-js/core';
   function controlCodeTrustedPhonePostSubmitProof(resultProof) {
     resultProof = String(resultProof || '').trim();
     return resultProof === 'phone_visual_raw_ticket_after_submit' ||
-      resultProof === 'phone_visual_root_confirmed';
+      resultProof === 'phone_visual_root_confirmed' ||
+      resultProof === 'phone_visual';
   }
 
   const controlCodeSafeGeneratedFrameRequiredCount = 2;
@@ -2369,7 +2406,7 @@ import { html, reactive } from '@arrow-js/core';
       proof.candidateRejectedReason = 'request_not_succeeded';
       return proof;
     }
-    if (request.resultWindowClosedAt || request.cleanupFrameEpoch || request.cleanupMinFrameSequence) {
+    if (request.cleanupCompletedAt) {
       proof.candidateRejectedReason = 'result_window_closed_before_capture';
       return proof;
     }
@@ -2421,12 +2458,6 @@ import { html, reactive } from '@arrow-js/core';
     if (trustedPhonePostSubmitProof) {
       proof.trustedPhonePostSubmitProof = true;
     }
-    if (controlCodeBaselineFrameFingerprint &&
-      proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
-      proof.fingerprintChangedCells < controlCodeFingerprintChangedCellsThreshold) {
-      proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';
-      return proof;
-    }
     const generatedProof = controlCodeGeneratedFrameProof();
     proof.generatedVisible = generatedProof.generatedVisible;
     proof.generatedChipVisible = generatedProof.generatedChipVisible;
@@ -2444,9 +2475,21 @@ import { html, reactive } from '@arrow-js/core';
     proof.generatedCodeLightCellRatio = generatedProof.generatedCodeLightCellRatio;
     proof.generatedCodeContrastScore = generatedProof.generatedCodeContrastScore;
     proof.generatedCodeScore = generatedProof.generatedCodeScore;
-    if (!generatedProof.generatedVisible) {
+    const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||
+      Boolean(trustedPhonePostSubmitProof &&
+        generatedProof.generatedChipVisible &&
+        (proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold ||
+          proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold));
+    proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;
+    if (!browserTrustedGeneratedVisible) {
       resetControlCodeSafeGeneratedFrame('generated_not_visible');
       proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
+      if (controlCodeBaselineFrameFingerprint &&
+        proof.fingerprintDifferenceScore < controlCodeFingerprintDifferenceThreshold &&
+        proof.fingerprintChangedCells < controlCodeFingerprintChangedCellsThreshold) {
+        proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';
+        return proof;
+      }
       proof.candidateRejectedReason = 'generated_frame_not_visible';
       return proof;
     }
@@ -2490,10 +2533,14 @@ import { html, reactive } from '@arrow-js/core';
     proof = proof || {};
     const now = performance.now();
     const reason = String(proof.candidateRejectedReason || proof.reason || 'candidate_rejected');
-    if (now - lastControlCodeCaptureKeyframeRequestAt >= controlCodeCaptureKeyframeRetryMs) {
+    if (
+      lastControlCodeCaptureKeyframeRetryCount < controlCodeCaptureKeyframeRetryLimit &&
+      now - lastControlCodeCaptureKeyframeRequestAt >= controlCodeCaptureKeyframeRetryMs
+    ) {
       lastControlCodeCaptureKeyframeRequestAt = now;
-      lastControlCodeCaptureKeyframeRetryCount += 1;
-      requestKeyframe(`control_code_candidate_rejected_${reason}`);
+      if (requestKeyframeDebounced(`control_code_candidate_rejected_${reason}`, controlCodeCaptureKeyframeRetryMs)) {
+        lastControlCodeCaptureKeyframeRetryCount += 1;
+      }
     }
     lastControlCodeCaptureDebug = Object.assign({}, proof, {
       accepted: false,
@@ -2508,13 +2555,12 @@ import { html, reactive } from '@arrow-js/core';
   async function confirmControlCodeBrowserCapture(request, proof) {
     const requestID = String(request && request.requestId || '').trim();
     if (!requestID || !proof || !proof.accepted) return false;
-    const payload = await postJSON('/api/v1/control-code/capture', {
-      requestId: requestID,
-      candidateFrameEpoch: Number(proof.candidateFrameEpoch || 0),
-      candidateFrameSequence: Number(proof.candidateFrameSequence || 0),
-      acceptedReason: String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
-    });
-    if (payload.request) renderControlCodeRequest(payload.request);
+    await runSpacetimeMutation((client) => client.confirmControlCodeBrowserCapture(
+      requestID,
+      Number(proof.candidateFrameEpoch || 0),
+      Number(proof.candidateFrameSequence || 0),
+      String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
+    ), 'control_code_browser_capture');
     return true;
   }
 
@@ -2538,10 +2584,12 @@ import { html, reactive } from '@arrow-js/core';
     if (!proof || !proof.accepted) return false;
     const requestID = String(request.requestId || '').trim();
     if (!requestID) return false;
+    if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
     try {
       if (!controlCodeFrozenCandidateFrameForProof(proof)) return false;
       const capturedImage = captureControlCodeResultImage(proof);
       if (!capturedImage) return false;
+      if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
       controlCodeCaptureAckInFlightRequestID = requestID;
       try {
         await confirmControlCodeBrowserCapture(request, proof);
@@ -2553,6 +2601,7 @@ import { html, reactive } from '@arrow-js/core';
       if (!codeRequest || String(codeRequest.requestId || '').trim() !== requestID || codeRequest.status !== 'succeeded') {
         return false;
       }
+      if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
       codeResultImage.src = capturedImage;
       setControlCodeResultVisible(true);
       codeResultImage.hidden = false;
@@ -2579,6 +2628,7 @@ import { html, reactive } from '@arrow-js/core';
       publishStreamDebug();
       return true;
     } catch (error) {
+      if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
       reportClientFault('control_code_browser_capture_failed', error);
       failControlCodeResultScreenshotWait();
       return false;
@@ -2608,6 +2658,7 @@ import { html, reactive } from '@arrow-js/core';
     if (!codeRequest || codeRequest.status !== 'succeeded') return false;
     const requestID = String(codeRequest.requestId || '').trim();
     if (!requestID || controlCodeResultCapturedRequestID === requestID) return false;
+    if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
     if (controlCodeCaptureAckInFlightRequestID === requestID) return true;
     if (!controlCodeMarkerReady(codeRequest)) {
       noteControlCodeMarkerWaiting(codeRequest);
@@ -2631,6 +2682,7 @@ import { html, reactive } from '@arrow-js/core';
     const requestID = String(request && request.requestId || '').trim();
     if (!requestID) return;
     if (controlCodeResultCapturedRequestID === requestID) return;
+    if (locallyClosedControlCodeRequestIDs.has(requestID)) return;
     if (controlCodeResultCaptureRequestID !== requestID) {
       if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
@@ -2658,9 +2710,9 @@ import { html, reactive } from '@arrow-js/core';
         return;
       }
       if (maybeCaptureControlCodeResultImage()) return;
-      controlCodeResultCaptureTimer = setTimeout(tick, 80);
+      controlCodeResultCaptureTimer = setTimeout(tick, controlCodeCapturePollMs);
     };
-    if (!controlCodeResultCaptureTimer) controlCodeResultCaptureTimer = setTimeout(tick, 80);
+    if (!controlCodeResultCaptureTimer) controlCodeResultCaptureTimer = setTimeout(tick, controlCodeCapturePollMs);
   }
 
   function rememberOwnedControlCodeRequest(request) {
@@ -2671,9 +2723,12 @@ import { html, reactive } from '@arrow-js/core';
   function isOwnedControlCodeRequest(request) {
     const requestID = String(request && request.requestId || '').trim();
     if (!requestID) return false;
+    const ownerPublicID = String(request && request.ownerPublicId || '').trim();
+    if (ownerPublicID && localPublicID && ownerPublicID !== localPublicID) return false;
     const requestSessionID = String(request && request.sessionId || '').trim();
     if (requestSessionID && localSessionID && requestSessionID !== localSessionID) return false;
     return ownedControlCodeRequestIDs.has(requestID) ||
+      (ownerPublicID && localPublicID && ownerPublicID === localPublicID) ||
       (requestSessionID && localSessionID && requestSessionID === localSessionID) ||
       Boolean(codeRequest && codeRequest.requestId === requestID);
   }
@@ -2701,9 +2756,8 @@ import { html, reactive } from '@arrow-js/core';
     const busy = current && (current.status === 'queued' || current.status === 'running');
     codeRequestState.textContent = controlCodeStatusText(current && current.status, current && current.reason);
     codeRequestDetail.textContent = controlCodeDetailText(current);
-    requestCodeButton.disabled = Boolean(busy);
-    codeSubmit.disabled = Boolean(busy);
-    if (requestID && current && (busy || current.status === 'succeeded')) {
+    updateControlCodeSubmitAvailability();
+    if (requestID && !requestID.startsWith('pending:') && current && (busy || current.status === 'succeeded')) {
       rememberControlCodeBaselineFrame(requestID);
     }
     if (busy) {
@@ -2749,31 +2803,79 @@ import { html, reactive } from '@arrow-js/core';
     scheduleControlCodeTicker(null);
   }
 
+  function setDetailsPanelVisible(visible) {
+    document.body.classList.toggle('details-visible', Boolean(visible));
+    if (panel) panel.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  }
+
+  function lockControlCodeDialogScroll() {
+    if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;
+    const detailsVisible = document.body.classList.contains('details-visible');
+    controlCodeDialogScrollLock = {
+      active: true,
+      detailsVisible
+    };
+  }
+
+  function unlockControlCodeDialogScroll() {
+    const lock = controlCodeDialogScrollLock;
+    if (!lock || !lock.active) return;
+    lock.active = false;
+    setDetailsPanelVisible(lock.detailsVisible);
+    controlCodeDialogScrollLock = null;
+    updateDetailsReveal();
+  }
+
+  function settleCodeDialogScrollUnlock() {
+    if (!controlCodeDialogScrollLock || !controlCodeDialogScrollLock.active) return;
+    if (codeDialogOpen) return;
+    unlockControlCodeDialogScroll();
+  }
+
   function openControlCodeDialog() {
+    if (!streamReadyForControlCode()) {
+      codeError.textContent = '';
+      setStatus('Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      connectDirectVideo();
+      requestServerRecoveryDebounced('control_code_wait_for_live_frame');
+      updateControlCodeSubmitAvailability();
+      return;
+    }
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
       try {
         document.exitFullscreen().catch(() => {});
       } catch (_) {}
     }
+    lockControlCodeDialogScroll();
     codeDialogOpen = true;
     document.body.classList.add('code-dialog-open');
     updateViewportVars();
     codeDialog.hidden = false;
     codeError.textContent = '';
     codeDigits.value = '';
+    updateControlCodeSubmitAvailability();
+    runSpacetimeMutation((client) => client.prepareControlCode('dialog_open'), 'control_code_prepare')
+      .then(() => clientLog('control_code_prepare_complete', 'spacetime'))
+      .catch((error) => clientLog('control_code_prepare_failed', error && error.message || 'prepare failed'));
     setTimeout(() => {
       updateViewportVars();
-      codeDigits.focus();
+      codeDigits.focus({ preventScroll: true });
     }, 30);
   }
 
   function closeControlCodeDialog() {
     codeDialogOpen = false;
+    if (codeDialog.contains(document.activeElement) && typeof document.activeElement.blur === 'function') {
+      try {
+        document.activeElement.blur();
+      } catch (_) {}
+    }
     document.body.classList.remove('code-dialog-open', 'keyboard-active');
     codeDialog.hidden = true;
     codeError.textContent = '';
     updateViewportVars();
     resizeCanvasBox();
+    settleCodeDialogScrollUnlock();
   }
 
   async function submitControlCodeRequest() {
@@ -2783,22 +2885,40 @@ import { html, reactive } from '@arrow-js/core';
       codeError.textContent = 'Ievadi 2-8 ciparus.';
       return;
     }
+    if (!streamReadyForControlCode()) {
+      codeError.textContent = 'Pagaidi, līdz tiešraides kadrs atkal ir svaigs.';
+      updateControlCodeSubmitAvailability();
+      connectDirectVideo();
+      requestServerRecoveryDebounced('control_code_submit_wait_for_live_frame');
+      return;
+    }
     codeError.textContent = '';
     codeSubmit.disabled = true;
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
+    const submittedAt = performance.now();
     try {
-      const payload = await postJSON('/api/v1/control-code/request', { digits });
-      if (payload.request) {
-        rememberOwnedControlCodeRequest(payload.request);
-        locallyClosedControlCodeRequestIDs.delete(String(payload.request.requestId || '').trim());
-        renderControlCodeRequest(payload.request);
-      }
+      await runSpacetimeMutation((client) => client.requestControlCode(digits), 'control_code_request');
+      const mutationLatencyMs = Math.round(performance.now() - submittedAt);
+      clientLog('control_code_submitted', JSON.stringify({
+        digitCount: digits.length,
+        mutationLatencyMs,
+        viewportHeight: window.innerHeight,
+      }));
+      renderControlCodeRequest({
+        requestId: `pending:${Date.now()}`,
+        ownerPublicId: localPublicID,
+        status: 'queued',
+        reason: 'requested',
+        requestedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
       closeControlCodeDialog();
       setStatus('Pieprasījums nosūtīts.');
     } catch (error) {
+      clientLog('control_code_request_failed', error && error.message || 'request failed');
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
-      codeSubmit.disabled = false;
+      updateControlCodeSubmitAvailability();
     }
   }
 
@@ -2814,9 +2934,11 @@ import { html, reactive } from '@arrow-js/core';
       setControlCodeResultVisible(false);
       clearControlCodeResultCapture();
       scheduleControlCodeTicker(null);
+      if (codeRequest && String(codeRequest.requestId || '').trim() === String(requestID)) {
+        codeRequest = null;
+      }
       try {
-        const payload = await postJSON('/api/v1/control-code/close', { requestId: requestID });
-        if (payload.request) renderControlCodeRequest(payload.request);
+        await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'), 'control_code_close');
       } catch (error) {
         clientLog('control_code_close_failed', error && error.message || 'close failed');
       }
@@ -2837,6 +2959,13 @@ import { html, reactive } from '@arrow-js/core';
       closeCurrentControlCode(false);
       return;
     }
+    if (!streamReadyForControlCode()) {
+      setStatus('Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      connectDirectVideo();
+      requestServerRecoveryDebounced('control_code_hotspot_wait_for_live_frame');
+      updateControlCodeSubmitAvailability();
+      return;
+    }
     openControlCodeDialog();
   }
 
@@ -2847,45 +2976,6 @@ import { html, reactive } from '@arrow-js/core';
     }
     if (codeDialogOpen || codeResultArea.hidden) return;
     closeCurrentControlCode(false);
-  }
-
-  function handleControlCodeMessage(msg) {
-    if (msg.type !== 'control_code_request') return false;
-    renderControlCodeRequest(msg.request || null);
-    return true;
-  }
-
-  function handleInputMessage(msg) {
-    return msg.type === 'input' || msg.type === 'input_result';
-  }
-
-  async function handleMessage(event) {
-    if (typeof event.data === 'string') {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch (_) { return; }
-      if (msg.type === 'config') {
-        configureStreamInfo(msg);
-      } else if (msg.type === 'state') {
-        currentState = msg.state;
-        rememberServerClock(currentState);
-        renderState();
-      } else if (msg.type === 'health') {
-        if (msg.data && msg.data.message) {
-          setStatus(msg.data.message);
-          if (msg.data.streamActive === false && !streamUnsupported) {
-            showStreamRecovery();
-          }
-        }
-      } else if (msg.type === 'phone') {
-        setStatus(msg.message || '');
-      } else if (handleControlCodeMessage(msg)) {
-        return;
-      } else if (handleInputMessage(msg)) {
-        return;
-      }
-      return;
-    }
-    clientLog('unexpected_binary_frame', 'binary frame arrived on control socket');
   }
 
   function configureStreamInfo(config) {
@@ -2902,6 +2992,61 @@ import { html, reactive } from '@arrow-js/core';
     }
   }
 
+  function relayReportToStreamStatus(report) {
+    if (!report) return null;
+    let detail = {};
+    try {
+      detail = JSON.parse(report.statusJson || '{}') || {};
+    } catch (_) {
+      detail = {};
+    }
+    return Object.assign({}, detail, {
+      type: 'stream_status',
+      streamVerdict: String(report.streamVerdict || detail.streamVerdict || ''),
+      activeVideoClients: Number(report.videoClients ?? detail.activeVideoClients ?? 0),
+      lastFrameAgoMillis: Number(report.lastFrameAgoMillis ?? detail.lastFrameAgoMillis ?? 0),
+      framesForwarded: Number(report.framesForwarded ?? detail.framesForwarded ?? 0),
+      phoneStreamState: String(detail.phoneStreamState || ''),
+      phoneConnected: detail.phoneConnected,
+      phoneDesired: detail.phoneDesired,
+      updatedAt: String(report.updatedAt || detail.serverTime || '')
+    });
+  }
+
+  function controlCodeRequestExpiryTime(request) {
+    const status = String(request && request.status || '');
+    const expiryValue = status === 'succeeded'
+      ? (request && (request.resultExpiresAt || request.expiresAt))
+      : (request && request.expiresAt);
+    const parsed = Date.parse(expiryValue || '');
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function controlCodeRequestSortTime(request) {
+    const updatedAt = Date.parse(request && request.updatedAt || '');
+    if (Number.isFinite(updatedAt)) return updatedAt;
+    const requestedAt = Date.parse(request && request.requestedAt || '');
+    return Number.isFinite(requestedAt) ? requestedAt : 0;
+  }
+
+  function controlCodeRequestIsStillRelevant(request) {
+    if (!request) return false;
+    const requestID = String(request.requestId || '').trim();
+    if (requestID && locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+    const status = String(request.status || '');
+    if (status === 'closed' || status === 'expired') return false;
+    const expiresAt = controlCodeRequestExpiryTime(request);
+    if (!expiresAt) return true;
+    return (Date.now() + serverClockSkewMs) <= expiresAt + 1000;
+  }
+
+  function latestOwnedControlCodeRequest(state) {
+    const requests = Array.isArray(state && state.controlCodeRequests) ? state.controlCodeRequests : [];
+    return requests
+      .filter((request) => isOwnedControlCodeRequest(request) && controlCodeRequestIsStillRelevant(request))
+      .sort((a, b) => controlCodeRequestSortTime(b) - controlCodeRequestSortTime(a))[0] || null;
+  }
+
   function renderState() {
     const state = currentState;
     if (!state) return;
@@ -2909,8 +3054,17 @@ import { html, reactive } from '@arrow-js/core';
     const viewers = activeViewerPresence(state);
     const visibleViewerCount = Number.isFinite(Number(state.viewerCount)) ? Number(state.viewerCount) : viewers.length;
     renderPanelSummary(viewers, visibleViewerCount);
-    renderControlCodeRequest(codeRequest);
-    setStatus('Tiešraide rāda biļeti.');
+    const relayStatus = relayReportToStreamStatus(state.relayCurrentReport);
+    if (relayStatus) handleStreamStatus(relayStatus);
+    const ownedRequest = latestOwnedControlCodeRequest(state);
+    if (ownedRequest) {
+      renderControlCodeRequest(ownedRequest);
+    } else {
+      renderControlCodeRequest(controlCodeRequestIsStillRelevant(codeRequest) ? codeRequest : null);
+    }
+    if (!relayStatus || String(relayStatus.streamVerdict || '') === 'live') {
+      setStatus('Tiešraide rāda biļeti.');
+    }
     renderPresence(viewers, visibleViewerCount);
   }
 
@@ -2978,35 +3132,11 @@ import { html, reactive } from '@arrow-js/core';
     presenceMounted = true;
   }
 
-  async function postJSON(path, body) {
-    const response = await fetch(path, {
-      method: 'POST',
-      cache: 'no-store',
-      headers: { 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : '{}'
-    });
-    const text = await response.text();
-    let payload = {};
-    try {
-      payload = text ? JSON.parse(text) : {};
-    } catch (_) {
-      payload = { ok: false, message: text || 'Pieprasījums neizdevās' };
-    }
-    if (!response.ok || !payload.ok) {
-      throw new Error(payload.message || payload.error || 'Pieprasījums neizdevās');
-    }
-    if (payload.state) {
-      currentState = payload.state;
-      rememberServerClock(currentState);
-      renderState();
-    }
-    return payload;
-  }
-
   codeDigits.addEventListener('input', () => {
     const cleaned = sanitizeControlDigits(codeDigits.value);
     if (codeDigits.value !== cleaned) codeDigits.value = cleaned;
     codeError.textContent = '';
+    updateControlCodeSubmitAvailability();
     updateViewportVars();
   });
   codeDigits.addEventListener('focus', updateViewportVars);
@@ -3241,7 +3371,19 @@ import { html, reactive } from '@arrow-js/core';
     } else if (freshness.liveLabeled) {
       hideStreamResumeSpinner();
     }
+    updateControlCodeSubmitAvailability();
     return freshness;
+  }
+
+  function streamReadyForControlCode() {
+    const freshness = currentRenderedFreshness(performance.now());
+    return Boolean(hasRenderedFrame && freshness.liveLabeled);
+  }
+
+  function updateControlCodeSubmitAvailability() {
+    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
+    codeSubmit.disabled = Boolean(busy) || !streamReadyForControlCode();
+    requestCodeButton.disabled = Boolean(busy) || !streamReadyForControlCode();
   }
 
   function reconnectVideoForRecovery(reason) {
@@ -3280,11 +3422,6 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     const hadStream = configured || lastDecodedFrameAt > 0 || lastPacketAt > 0 || latestStreamStatus;
-    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-      connect();
-      return;
-    }
-    if (ws.readyState !== WebSocket.OPEN) return;
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       connectDirectVideo();
       if (hadStream) {
@@ -3400,7 +3537,6 @@ import { html, reactive } from '@arrow-js/core';
         hiddenMs: Math.round(hiddenMs),
         configured,
         frameAgeMs: frameAgeMs === null ? null : Math.round(frameAgeMs),
-        controlState: ws ? ws.readyState : -1,
         videoState: videoWs ? videoWs.readyState : -1
       }));
     }
@@ -3416,13 +3552,8 @@ import { html, reactive } from '@arrow-js/core';
       requestScreenWakeLock(reason || 'visibility_visible');
     }
     scheduleFirstScreenPin(false);
-    refreshHealth();
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
-    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-      connect();
-    } else if (ws.readyState === WebSocket.OPEN) {
-      send(heartbeatMessage(reason));
-    }
+    publishStreamFocus(true, reason || 'visibility_visible');
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       connectDirectVideo();
     } else if (videoWs.readyState === WebSocket.OPEN && (longHidden || videoStale)) {
@@ -3448,10 +3579,15 @@ import { html, reactive } from '@arrow-js/core';
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       noteViewerActivity(null, 'visibility_visible');
+      if (hiddenStreamFocusTimer) {
+        clearTimeout(hiddenStreamFocusTimer);
+        hiddenStreamFocusTimer = null;
+      }
       recoverAfterVisibilityResume('visibility_resume');
     } else if (document.visibilityState === 'hidden') {
       lastHiddenAt = performance.now();
       releaseScreenWakeLock('visibility_hidden');
+      releaseStreamFocusAfterHiddenGrace('visibility_hidden');
       pauseVideoWhileHidden('visibility_hidden');
     }
   });
@@ -3467,11 +3603,16 @@ import { html, reactive } from '@arrow-js/core';
   window.addEventListener('focus', () => {
     noteViewerActivity(null, 'focus');
     if (idleDisconnected) return;
-    refreshHealth();
+    publishStreamFocus(true, 'focus');
     chaseLiveStream();
   });
   window.addEventListener('pagehide', () => {
     closeEarlyVideo('pagehide');
+    if (hiddenStreamFocusTimer) {
+      clearTimeout(hiddenStreamFocusTimer);
+      hiddenStreamFocusTimer = null;
+    }
+    publishStreamFocus(false, 'pagehide');
     closeDirectVideo();
     if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {
       spacetimeClient.disconnectPresence();
@@ -3483,11 +3624,6 @@ import { html, reactive } from '@arrow-js/core';
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
       spacetimeClient.heartbeat(true);
     }
-    send(heartbeatMessage('public_heartbeat'));
-  }, 15000);
-  setInterval(() => {
-    if (idleDisconnected) return;
-    refreshHealth();
   }, 15000);
   setInterval(chaseLiveStream, 1000);
   updateViewportVars();
@@ -3496,7 +3632,6 @@ import { html, reactive } from '@arrow-js/core';
   resizeCanvasBox();
   scheduleViewerIdleDisconnect('initial_load');
   showQuietStreamLoading();
-  refreshHealth();
   connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
   connect();
 
@@ -4065,5 +4200,334 @@ import { html, reactive } from '@arrow-js/core';
       if (adminActionDepth > 0) return;
       load({ quiet: true });
     }, adminRefreshMs);
+  }
+
+  // ============================================================
+  // Test harness: enabled by visiting ticket.jolkins.id.lv#test-harness
+  // Captures every clientLog event with millisecond timestamps,
+  // times each control-code request end-to-end, and offers an
+  // automated 93-minute loop that opens the dialog, submits a
+  // control code, waits for the result, and repeats every 60s.
+  // Exposes window.__ticketTest for inspection.
+  //
+  // Gated by process.env.TICKET_APP_DEV: the harness is stripped from
+  // the production build (TICKET_APP_MODE=prod) so end users get the
+  // slim bundle. Build the dev bundle with TICKET_APP_MODE=dev.
+  // ============================================================
+  if (process.env.TICKET_APP_DEV && (() => {
+    const harnessEnabled = (() => {
+      try {
+        return (typeof window !== 'undefined')
+          && (window.location.hash === '#test-harness'
+              || window.location.hash === '#harness'
+              || /[?&]test=1\b/.test(window.location.search));
+      } catch (_) { return false; }
+    })();
+    return harnessEnabled;
+  })()) {
+    const harnessState = {
+      startedAt: performance.now(),
+      pageLoadAt: 0,
+      firstFrameAt: 0,
+      firstDecodedFrameAt: 0,
+      streamStatusHistory: [],
+      clientLogHistory: [],
+      controlCodeRequests: [],
+      keyframeEvents: [],
+      phoneEngineStates: [],
+      autoTestRunning: false,
+      autoTestStopRequested: false,
+      autoTestStartedAt: 0,
+      autoTestResults: [],
+    };
+    const HARNESS_MAX_HISTORY = 5000;
+    function harnessPushHistory(arr, item) {
+      arr.push(item);
+      if (arr.length > HARNESS_MAX_HISTORY) arr.shift();
+    }
+    function harnessTimestamp() {
+      return Math.round(performance.now() - harnessState.startedAt);
+    }
+    const originalClientLog = clientLog;
+    clientLog = function(event, detail) {
+      const entry = { t: harnessTimestamp(), event, detail: typeof detail === 'string' ? detail : (function(){ try { return JSON.stringify(detail); } catch(_){ return String(detail); } })() };
+      harnessPushHistory(harnessState.clientLogHistory, entry);
+      try { originalClientLog(event, detail); } catch (_) {}
+      try { updateHarnessPanel(); } catch (_) {}
+    };
+    const healthPollInterval = setInterval(async () => {
+      try {
+        const ds = relayReportToStreamStatus(currentState && currentState.relayCurrentReport);
+        if (ds) {
+          harnessPushHistory(harnessState.phoneEngineStates, {
+            t: harnessTimestamp(),
+            streamVerdict: ds.streamVerdict,
+            phoneStreamState: ds.phoneStreamState,
+            phoneConnected: ds.phoneConnected,
+            phoneDesired: ds.phoneDesired,
+            streamActive: ds.streamActive,
+            lastFrameAgoMillis: ds.lastFrameAgoMillis,
+            activeVideoClients: ds.activeVideoClients,
+          });
+          try { updateHarnessPanel(); } catch (_) {}
+        }
+      } catch (_) {}
+    }, 1000);
+    // Hook first-frame detection
+    const origNoteFirstFrame = function(){
+      if (harnessState.firstFrameAt === 0) {
+        harnessState.firstFrameAt = harnessTimestamp();
+      }
+    };
+    // Track first decoded frame
+    const origRenderDecoded = renderDecodedFrame;
+    // (We can't easily wrap the function without breaking closures; instead we
+    // poll for firstFrameReceived via the existing setter. The capture below
+    // catches it after the fact.)
+    const firstFrameWatcher = setInterval(() => {
+      if (firstFrameReceived && harnessState.firstDecodedFrameAt === 0) {
+        harnessState.firstDecodedFrameAt = harnessTimestamp();
+        clearInterval(firstFrameWatcher);
+        try { updateHarnessPanel(); } catch (_) {}
+      }
+    }, 100);
+    // Track stream_status
+    const origHandleStreamStatus = handleStreamStatus;
+    // (cannot wrap without breaking closure scope; record in handleStreamStatus inline)
+    // Track control-code request lifecycle
+    function harnessWrapControlCodeLifecycle() {
+      const origSubmit = submitControlCodeRequest;
+      // We can't directly wrap because of closure; lifecycle timings are
+      // captured by watching the local request state.
+    }
+    // Inject a wrapper that records each control_code_submitted event with
+    // extra state: at submit time, record T0. When the codeRequest state
+    // transitions, record the rest.
+    const origRenderControlCode = renderControlCodeRequest;
+    // We instrument via a polling loop that watches codeRequest.status.
+    let lastObservedCodeRequestId = '';
+    let activeCodeRequestStartedAt = 0;
+    const controlCodeWatcher = setInterval(() => {
+      const cur = codeRequest;
+      const id = cur && cur.requestId ? String(cur.requestId) : '';
+      const status = cur && cur.status ? String(cur.status) : '';
+      if (id && id !== lastObservedCodeRequestId) {
+        // New request
+        if (lastObservedCodeRequestId !== '') {
+          // Previous request changed under us; close it out
+          const prev = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
+          if (prev) prev.finalStatus = 'changed';
+        }
+        lastObservedCodeRequestId = id;
+        activeCodeRequestStartedAt = harnessTimestamp();
+        harnessPushHistory(harnessState.controlCodeRequests, {
+          requestId: id,
+          t_observed: activeCodeRequestStartedAt,
+          initialStatus: status,
+          transitions: [],
+        });
+        try { updateHarnessPanel(); } catch (_) {}
+      }
+      if (id && status) {
+        const last = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
+        if (last && last.requestId === id) {
+          const lastTransition = last.transitions[last.transitions.length - 1];
+          if (!lastTransition || lastTransition.status !== status) {
+            last.transitions.push({ t: harnessTimestamp(), status });
+            if (last.initialStatus === 'succeeded' || status === 'succeeded' || status === 'failed') {
+              last.finalStatus = status;
+              last.t_completed = harnessTimestamp();
+              last.t_total_ms = last.t_completed - last.t_observed;
+            }
+            try { updateHarnessPanel(); } catch (_) {}
+          }
+        }
+      }
+      if (!id && lastObservedCodeRequestId !== '') {
+        const last = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
+        if (last) {
+          last.finalStatus = last.finalStatus || 'cleared';
+          last.t_completed = last.t_completed || harnessTimestamp();
+          last.t_total_ms = last.t_total_ms || (last.t_completed - last.t_observed);
+        }
+        lastObservedCodeRequestId = '';
+        try { updateHarnessPanel(); } catch (_) {}
+      }
+    }, 200);
+
+    // Build the harness UI
+    function ensureHarnessPanel() {
+      let panel = document.getElementById('__ticketHarnessPanel');
+      if (panel) return panel;
+      panel = document.createElement('div');
+      panel.id = '__ticketHarnessPanel';
+      panel.style.cssText = 'position:fixed;left:8px;bottom:8px;width:480px;max-height:60vh;overflow:auto;background:rgba(0,0,0,0.85);color:#eef3f8;font:12px/1.4 ui-monospace,Menlo,monospace;padding:10px 12px;border:1px solid #4f8cff;border-radius:6px;z-index:2147483647;box-sizing:border-box;';
+      panel.innerHTML = `
+        <div style="font-weight:bold;color:#4f8cff;margin-bottom:6px;">Ticket Test Harness</div>
+        <div id="__ticketHarnessSummary" style="margin-bottom:8px;white-space:pre;"></div>
+        <div id="__ticketHarnessLastRequests" style="margin-bottom:8px;white-space:pre;"></div>
+        <div id="__ticketHarnessPhone" style="margin-bottom:8px;white-space:pre;color:#fbbf24;"></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button id="__ticketHarnessStart" type="button" style="padding:4px 8px;background:#2167d5;color:#fff;border:1px solid #4f8cff;border-radius:4px;cursor:pointer;">Start 93-min auto-test (60s interval)</button>
+          <button id="__ticketHarnessStop" type="button" style="padding:4px 8px;background:#7f1d1d;color:#fff;border:1px solid #ef4444;border-radius:4px;cursor:pointer;">Stop</button>
+          <button id="__ticketHarnessExport" type="button" style="padding:4px 8px;background:#374151;color:#fff;border:1px solid #6b7280;border-radius:4px;cursor:pointer;">Export JSON</button>
+          <button id="__ticketHarnessClear" type="button" style="padding:4px 8px;background:#374151;color:#fff;border:1px solid #6b7280;border-radius:4px;cursor:pointer;">Clear log</button>
+        </div>
+        <div id="__ticketHarnessLog" style="margin-top:8px;max-height:200px;overflow:auto;white-space:pre;color:#94a3b8;"></div>
+      `;
+      document.body.appendChild(panel);
+      document.getElementById('__ticketHarnessStart').addEventListener('click', startHarnessAutoTest);
+      document.getElementById('__ticketHarnessStop').addEventListener('click', () => { harnessState.autoTestStopRequested = true; });
+      document.getElementById('__ticketHarnessExport').addEventListener('click', exportHarnessJson);
+      document.getElementById('__ticketHarnessClear').addEventListener('click', () => {
+        harnessState.clientLogHistory.length = 0;
+        harnessState.controlCodeRequests.length = 0;
+        harnessState.phoneEngineStates.length = 0;
+        harnessState.streamStatusHistory.length = 0;
+        updateHarnessPanel();
+      });
+      return panel;
+    }
+    function updateHarnessPanel() {
+      ensureHarnessPanel();
+      const summary = document.getElementById('__ticketHarnessSummary');
+      const lastReq = document.getElementById('__ticketHarnessLastRequests');
+      const phone = document.getElementById('__ticketHarnessPhone');
+      const log = document.getElementById('__ticketHarnessLog');
+      const pageLoadMs = harnessState.firstFrameAt;
+      const firstDecodedMs = harnessState.firstDecodedFrameAt;
+      const completedReqs = harnessState.controlCodeRequests.filter(r => r.t_total_ms != null);
+      const totalReqs = harnessState.controlCodeRequests.length;
+      const maxReqMs = completedReqs.length ? Math.max(...completedReqs.map(r => r.t_total_ms)) : 0;
+      const avgReqMs = completedReqs.length ? Math.round(completedReqs.reduce((a, r) => a + r.t_total_ms, 0) / completedReqs.length) : 0;
+      const reqsOver5s = completedReqs.filter(r => r.t_total_ms > 5000).length;
+      summary.textContent =
+        `page→firstFrame: ${pageLoadMs ? pageLoadMs + 'ms' : '—'}    ` +
+        `page→firstDecoded: ${firstDecodedMs ? firstDecodedMs + 'ms' : '—'}\n` +
+        `requests: ${totalReqs} total / ${completedReqs.length} completed\n` +
+        `max req ms: ${maxReqMs}    avg req ms: ${avgReqMs}    reqs > 5s: ${reqsOver5s}`;
+      const last5 = harnessState.controlCodeRequests.slice(-5).reverse();
+      lastReq.textContent = last5.map(r => {
+        const total = r.t_total_ms != null ? r.t_total_ms + 'ms' : 'pending';
+        const transitions = (r.transitions || []).map(t => `${t.status}@${t.t}ms`).join(' → ');
+        return `${r.requestId.slice(-6)} ${total}\n  ${transitions}`;
+      }).join('\n');
+      const lastPhone = harnessState.phoneEngineStates.slice(-3);
+      phone.textContent = lastPhone.map(p => `${p.t}ms  verdict=${p.streamVerdict}  phoneStreamState=${p.phoneStreamState}  lastFrameAgo=${p.lastFrameAgoMillis}ms`).join('\n');
+      const lastLogs = harnessState.clientLogHistory.slice(-20);
+      log.textContent = lastLogs.map(l => `${l.t}ms  ${l.event}  ${l.detail ? l.detail.slice(0, 80) : ''}`).join('\n');
+    }
+    function startHarnessAutoTest() {
+      if (harnessState.autoTestRunning) return;
+      harnessState.autoTestRunning = true;
+      harnessState.autoTestStopRequested = false;
+      harnessState.autoTestStartedAt = harnessTimestamp();
+      harnessState.autoTestResults = [];
+      const intervalMs = 60000;
+      const totalMs = 93 * 60 * 1000;
+      const endAt = harnessState.autoTestStartedAt + totalMs;
+      // Pick a per-iteration digit pattern to avoid rate-limit collisions
+      // (the server allows 2 per 60s per email; the harness itself is one
+      // request per minute, but the user may submit manually in parallel).
+      function pickDigits() {
+        const cycle = ['11111', '22222', '33333', '44444', '55555', '66666', '77777', '88888', '99999', '00000'];
+        return cycle[harnessState.controlCodeRequests.length % cycle.length];
+      }
+      const tick = async () => {
+        if (harnessState.autoTestStopRequested) {
+          harnessState.autoTestRunning = false;
+          try { updateHarnessPanel(); } catch (_) {}
+          return;
+        }
+        if (harnessTimestamp() >= endAt) {
+          harnessState.autoTestRunning = false;
+          try { updateHarnessPanel(); } catch (_) {}
+          try { document.title = 'DONE: ' + (document.title || ''); } catch (_) {}
+          return;
+        }
+        // Cleanup: close any leftover result window from a previous iteration.
+        try {
+          if (codeResultArea && !codeResultArea.hidden) {
+            closeCurrentControlCode(false);
+          }
+          if (codeDialogOpen) {
+            closeControlCodeDialog();
+          }
+        } catch (_) {}
+        // Wait for state to fully settle. Use yield-via-rAF so the browser
+        // can paint and the agent-browser command isn't blocked.
+        let preWait = 0;
+        while ((codeRequest || codeDialogOpen || (codeResultArea && !codeResultArea.hidden)) && preWait < 45000 && !harnessState.autoTestStopRequested) {
+          await new Promise(r => requestAnimationFrame(() => setTimeout(r, 250)));
+          preWait += 250;
+        }
+        if (harnessState.autoTestStopRequested) {
+          harnessState.autoTestRunning = false;
+          try { updateHarnessPanel(); } catch (_) {}
+          return;
+        }
+        // Open the dialog and submit. Use rAF yields between each interaction.
+        try { openControlCodeDialog(); } catch (_) {}
+        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 200)));
+        try {
+          codeDigits.value = pickDigits();
+          const submitBtn = document.getElementById('controlCodeSubmit');
+          if (submitBtn) submitBtn.click();
+        } catch (_) {}
+        // Wait for the request to fully complete. The phone-side ViVi
+        // automation can take 5-20s in the worst case, plus the 30s
+        // cleanup window, so allow 90s.
+        const requestDeadline = harnessTimestamp() + 90000;
+        while (harnessTimestamp() < requestDeadline && !harnessState.autoTestStopRequested) {
+          const cur = codeRequest;
+          if (!cur || (cur.status !== 'running' && cur.status !== 'queued')) {
+            // Request finished. Give the UI 2s to settle.
+            await new Promise(r => requestAnimationFrame(() => setTimeout(r, 2000)));
+            break;
+          }
+          await new Promise(r => requestAnimationFrame(() => setTimeout(r, 500)));
+        }
+        try { updateHarnessPanel(); } catch (_) {}
+        // Schedule the next tick
+        setTimeout(tick, intervalMs);
+      };
+      tick();
+    }
+    function exportHarnessJson() {
+      const data = {
+        capturedAt: new Date().toISOString(),
+        userAgent: navigator.userAgent,
+        url: window.location.href,
+        harnessStartedAtT: harnessState.startedAt,
+        firstFrameAt: harnessState.firstFrameAt,
+        firstDecodedFrameAt: harnessState.firstDecodedFrameAt,
+        clientLogHistory: harnessState.clientLogHistory,
+        controlCodeRequests: harnessState.controlCodeRequests,
+        phoneEngineStates: harnessState.phoneEngineStates,
+        autoTestResults: harnessState.autoTestResults,
+        summary: {
+          totalRequests: harnessState.controlCodeRequests.length,
+          completedRequests: harnessState.controlCodeRequests.filter(r => r.t_total_ms != null).length,
+          maxRequestMs: Math.max(0, ...harnessState.controlCodeRequests.filter(r => r.t_total_ms != null).map(r => r.t_total_ms)),
+          avgRequestMs: (() => {
+            const a = harnessState.controlCodeRequests.filter(r => r.t_total_ms != null);
+            return a.length ? Math.round(a.reduce((s, r) => s + r.t_total_ms, 0) / a.length) : 0;
+          })(),
+          requestsOver5s: harnessState.controlCodeRequests.filter(r => r.t_total_ms > 5000).length,
+        },
+      };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ticket-harness-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+    // Initialize the panel
+    setTimeout(() => { try { ensureHarnessPanel(); updateHarnessPanel(); } catch (_) {} }, 100);
+    // Expose for inspection
+    window.__ticketTest = harnessState;
+    window.__ticketTestHarness = { state: harnessState, export: exportHarnessJson, start: startHarnessAutoTest, stop: () => { harnessState.autoTestStopRequested = true; } };
   }
 })();

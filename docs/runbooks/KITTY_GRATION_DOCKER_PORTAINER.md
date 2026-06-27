@@ -7,7 +7,6 @@ This is the detailed operator runbook for the active kitty-gration runtime.
 - Active layout: `infra/arbuzas/docker/`
 - Host Netdata config: `infra/arbuzas/netdata/`
 - Active deploy entrypoint: `tools/arbuzas/deploy.sh`
-- Active DNS Rust workspace: `tools/arbuzas-rs/`
 - Tunnel config renderer: `tools/arbuzas/render_cloudflared_config.py`
 
 ## Initial Setup
@@ -19,20 +18,14 @@ This is the detailed operator runbook for the active kitty-gration runtime.
 2. Edit deployment variables and secrets under `infra/arbuzas/host-mirror/` first. Use `mirror-audit` before overwriting host drift, and use `deploy-config` for config-only updates that should avoid rebuilds and release uploads.
 3. Copy `infra/arbuzas/docker/env/arbuzas.example.env` to a private local env file if you need operator-only CLI overrides.
 4. Make sure kitty-gration has Docker with the Compose plugin, Python 3, and SSH access.
-5. Make sure kitty-gration has `nginx` installed and running for the bare private DNS admin URL.
-6. Make sure these host files exist, preferably via the local mirror:
+5. Make sure these host files exist, preferably via the local mirror:
    - `/etc/arbuzas/env/train-bot.env`
    - `/etc/arbuzas/env/satiksme-bot.env`
    - `/etc/arbuzas/env/subscription-bot.env`
-   - `/etc/arbuzas/dns/runtime.env`
-   - `/etc/arbuzas/dns/arbuzas-dns.yaml`
-   - `/etc/arbuzas/dns/tls/fullchain.pem`
-   - `/etc/arbuzas/dns/tls/privkey.pem`
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
-7. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
-8. DNS on kitty-gration binds directly to host ports `443` and `853`.
+6. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
 
 ## Normal Release Flow
 
@@ -45,7 +38,6 @@ Deploy the current repo state:
 Deploy only one service or a few services:
 
 ```bash
-./tools/arbuzas/deploy.sh deploy --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"
 ./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
@@ -61,7 +53,7 @@ Validate an existing release:
 
 ```bash
 ./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
-./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Run the cleanup policy without deploying:
@@ -86,12 +78,6 @@ Re-run the memory report service checks without reinstalling it:
 
 ```bash
 ./tools/arbuzas/deploy.sh validate-memory-report --ssh-host kitty-gration --ssh-user "$USER"
-```
-
-Run one live DNS observability database compaction pass without deploying:
-
-```bash
-./tools/arbuzas/deploy.sh compact-dns-db --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Push only local mirror changes and restart/reload affected services without rebuilding or uploading a release bundle:
@@ -137,13 +123,12 @@ Re-run the fan-controller checks without reinstalling it:
 - updates `/etc/arbuzas/current`
 - runs `docker compose -p arbuzas up -d --build`
 - when `--services` is set, rebuilds and restarts only the requested services instead of the full stack
-- validates Portainer, apps, tunnels, and DNS
+- validates Portainer, apps, and tunnels
 - prunes unused Docker images after they have stayed unprotected for 7 days
 - prunes old release bundles beyond the newest 10 per release family
 - prunes Docker build cache older than 7 days
 - runs gentle host cache cleanup for package caches, narrow old `/tmp` scratch, and journals
 - flushes reclaimable Linux memory cache after cleanup so provider memory graphs fall back quickly
-- confirms native kitty-gration DNS on `443/853` both on the host itself and from the public endpoint
 
 The normal Docker release flow does not install or update Netdata. Netdata is a separate host-maintenance action.
 The corrected memory report service is also a separate host-maintenance action.
@@ -191,7 +176,6 @@ What the cleanup does not touch:
 - containers
 - volumes
 - networks
-- DNS state
 - Portainer data or backups
 - application state under `/srv/arbuzas/*`
 
@@ -244,37 +228,6 @@ The provider memory panel is useful only as a cached-inclusive comparison line. 
 
 Do not disable `qemu-guest-agent` to change the provider graph. The agent does not expose the provider's memory-utilization formula, and disabling it can break provider-side guest operations such as shutdown/reboot handling or console metadata.
 
-## DNS DB Compaction
-
-The active kitty-gration `dns_controlplane` service owns DNS state compaction.
-
-- Primary state store: `/srv/arbuzas/dns/state/controlplane.sqlite`
-- Compatibility observability store: `/srv/arbuzas/dns/state/identity-observability.sqlite`
-- Public identity surface and policy sync now run inside the same native `dns_controlplane` service.
-
-Manual operator command:
-
-```bash
-./tools/arbuzas/deploy.sh compact-dns-db --ssh-host kitty-gration --ssh-user "$USER"
-```
-
-Expected result:
-
-- The command prints a JSON result from the live `dns_controlplane` container.
-- `controlplane.status` is normally `compacted`.
-- `legacyObservability.status` is normally `compacted` when the compatibility observability file exists.
-- The `beforeBytes`, `afterBytes`, and `reclaimedBytes` values show how much space was recovered.
-
-Post-run checks:
-
-- `./tools/arbuzas/deploy.sh validate --services dns_controlplane --ssh-host kitty-gration --ssh-user "$USER"`
-- confirm `dns_controlplane` stays healthy
-- confirm public `https://dns.jolkins.id.lv/login` returns `404`
-- confirm the private admin UI still loads on `http://<arbuzas-tailnet-dns-name>/`
-- confirm the short MagicDNS host works too at `http://kitty-gration/` when the operator machine has MagicDNS enabled
-- confirm the raw private admin port still loads on `http://<arbuzas-tailnet-ip>:8097/login`
-- confirm the improved query log and usage pages still load normally through the private admin port
-
 ## Portainer Repair
 
 Use `repair-portainer` when Portainer is carrying stale Swarm-era state, such as a saved `tasks.agent` endpoint from the old deployment path.
@@ -289,7 +242,7 @@ What the repair does:
 - compacts the Portainer database so the stale agent address is removed from saved state
 - runs `docker swarm leave --force` so the live host returns to standalone Docker
 - starts Portainer again through the active Compose project
-- re-runs validation for Portainer, apps, tunnels, DNS, and the standalone-host baseline
+- re-runs validation for Portainer, apps, tunnels, and the standalone-host baseline
 
 Important consequences:
 
@@ -329,29 +282,30 @@ Access pattern:
 
 ## ThinkPad Fan Control
 
-kitty-gration now keeps a small host-native ThinkPad fan policy outside the Docker Compose project.
+The ThinkPad fan controller script and the `install-thinkpad-fan` deploy action are preserved in the repo at `infra/arbuzas/thinkpad-fan/`.
 
-What `install-thinkpad-fan` does:
+This is **not active on the live kitty-gration host** and is not applicable to it. The live host is an Intel Xeon Gold 6142 server, not a ThinkPad. The `thinkpad_acpi` kernel module is not loaded, the `arbuzas-thinkpad-fan.service` systemd unit is not installed, and the controller will not run on this hardware. Running `install-thinkpad-fan` on the live host will fail.
 
-- installs a repo-managed `thinkpad_acpi` modprobe override that enables manual fan control after boot
-- installs a systemd service and Python controller under `/etc/systemd/system/` and `/usr/local/libexec/`
-- reloads the ThinkPad ACPI driver so the manual fan interface is available immediately
-- keeps the fan at manual level `1` under normal temperatures so it stays spinning at the lowest confirmed running speed
-- hands control back to the ThinkPad embedded controller at `89°C` and above, and does not force manual mode again until the CPU sensor cools back to `89°C`
-- re-arms the ThinkPad fan watchdog continuously so a controller crash falls back to a safe automatic mode
+The `install-thinkpad-fan` and `validate-thinkpad-fan` deploy actions are kept for a future ThinkPad-based host only.
 
-Validation checks:
+## Boost-Off Hook
 
-- the `arbuzas-thinkpad-fan.service` unit stays active
-- `thinkpad_acpi` reports manual fan control enabled
-- the current live fan mode matches the expected policy for the current CPU temperature
+The boost-off reboot hook script and the `install-netdata`-style helper are preserved in the repo at `infra/arbuzas/cpu-boost-off/`.
+
+This is **not active on the live kitty-gration host** either. The `crontab` binary is not installed on the host, no `@reboot` crontab entry exists for the `ropepop` user, no script is installed at `/home/ropepop/.local/bin/arbuzas-disable-boost.sh`, and no log file is written. The kernel does not expose `/sys/devices/system/cpu/intel_pstate` on this Xeon server, so even installing the script would not have an observable effect.
+
+Observed CPU clock stays at the 2.6 GHz base clock with no turbo visible, regardless of the script. The corrected memory report output confirms this.
+
+## Netdata Status
+
+Netdata is **not installed** on the live kitty-gration host. The `install-netdata` and `validate-netdata` deploy actions are preserved for when Netdata is wanted; today there is no `netdata` systemd unit on the host.
 
 ## Notes
 
 - Portainer connects directly to the local Docker socket.
 - Netdata lives on the host outside the `arbuzas` Compose project.
 - The active runtime is one Compose project named `arbuzas`.
-- kitty-gration keeps the native DNS controlplane directly on `443/853`.
+- kitty-gration does not run a public DNS service. The host ports `443` and `853` are free; the `dns_controlplane` service was retired on 2026-06-21 (see `archive/dns-controlplane/`).
 - The live kitty-gration host must stay out of Docker Swarm. Validation now fails if Swarm is still enabled or if Portainer state still references `tasks.agent`.
 - Swarm and rooted Pixel deployment paths are rollback-only legacy material.
 - If the live host still carries old localhost-only web bind or port values from the Pixel era, remove those keys from `/etc/arbuzas/env/*.env` before the next deploy.

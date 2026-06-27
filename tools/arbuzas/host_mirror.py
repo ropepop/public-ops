@@ -33,11 +33,6 @@ PROFILES: dict[str, list[Entry]] = {
         Entry("tree", "etc/arbuzas/env"),
         Entry("tree", "etc/arbuzas/secrets"),
         Entry("tree", "etc/arbuzas/cloudflared"),
-        Entry("file", "etc/arbuzas/dns/runtime.env"),
-        Entry("file", "etc/arbuzas/dns/arbuzas-dns.yaml"),
-        Entry("file", "etc/arbuzas/dns/doh-identities.json"),
-        Entry("tree", "etc/arbuzas/dns/tls"),
-        Entry("tree", "etc/arbuzas/dns/secrets"),
         Entry("file", "etc/arbuzas/current/release.env"),
     ],
     "pixel": [
@@ -62,10 +57,8 @@ SERVICE_ORDER = [
     "subscription_tunnel",
     "ticket_phone_bridge",
     "phone_broker",
-    "rigassatiksme_qr_bot",
     "ticket_remote",
     "ticket_remote_tunnel",
-    "dns_controlplane",
 ]
 
 
@@ -204,7 +197,10 @@ def scp_base_args(args: argparse.Namespace) -> list[str]:
 
 
 def remote_tar_command(profile: str) -> str:
-    tar_parts = ["tar", "-C", "/", "--ignore-failed-read"]
+    if os.environ.get("ARBUZAS_HOST_MIRROR_PRIVILEGED") == "1":
+        tar_parts = ["sudo", "-n", "tar", "-C", "/", "--ignore-failed-read"]
+    else:
+        tar_parts = ["tar", "-C", "/", "--ignore-failed-read"]
     for excluded in EXCLUDES[profile]:
         tar_parts.append(f"--exclude={excluded}")
     tar_parts += ["-cf", "-"]
@@ -440,8 +436,6 @@ def affected_services_for_path(rel: str) -> set[str]:
         add_service(services, "subscription_bot")
     elif rel == "etc/arbuzas/env/ticket-remote.env":
         add_service(services, "ticket_remote")
-    elif rel == "etc/arbuzas/env/rigassatiksme-qr-bot.env":
-        add_service(services, "rigassatiksme_qr_bot")
     elif rel.startswith("etc/arbuzas/secrets/ticket-remote/"):
         add_service(services, "ticket_remote")
     elif rel.startswith("etc/arbuzas/secrets/android-adb/"):
@@ -458,8 +452,6 @@ def affected_services_for_path(rel: str) -> set[str]:
         }
         if name in tunnel_map:
             add_service(services, tunnel_map[name])
-    elif rel.startswith("etc/arbuzas/dns/"):
-        add_service(services, "dns_controlplane")
     return services
 
 

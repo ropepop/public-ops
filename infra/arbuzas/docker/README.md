@@ -4,7 +4,7 @@ This directory is the active production deployment layout for the single-host ki
 
 ## What Lives Here
 
-- `compose.yml`: the one active Docker Compose project for Portainer, apps, tunnels, DNS, and the physical Pixel ticket bridge.
+- `compose.yml`: the one active Docker Compose project for Portainer, apps, tunnels, and the physical Pixel ticket bridge.
 - `env/arbuzas.example.env`: the operator template for hostnames, ports, and image pins.
 - `images/`: Dockerfiles and entrypoints for the kitty-gration workloads and DNS sidecars.
 
@@ -21,4 +21,3 @@ This directory is the active production deployment layout for the single-host ki
 
 Portainer runs directly against the local Docker socket on port `9443`. The live kitty-gration host must stay out of Docker Swarm, and the active repair flow now rewrites stale `tasks.agent` state in place before falling back to a clean first-run setup. The old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
 The ticket service talks only to the physical Pixel through `phone_broker`, which privately proxies to `ticket_phone_bridge`; there is no ticket device lab inside the production compose project.
-The native kitty-gration DNS controlplane publishes encrypted DNS directly on host ports `443` and `853`.

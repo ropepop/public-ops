@@ -71,6 +71,86 @@ func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing
 	}
 }
 
+func TestBrowserPublicOwnerIdMatchesRustSpacetimeModule(t *testing.T) {
+	source := ticketAppSource(t)
+	client := readTicketWebClientSource(t, "src/index.ts")
+
+	for _, fixture := range []struct {
+		name string
+		body string
+		end  string
+	}{
+		{name: "page", body: source, end: "function clientLog"},
+		{name: "client", body: client, end: "function tableRows"},
+	} {
+		accountPublicID := substringBetween(t, fixture.body,
+			"function accountPublicId(email",
+			fixture.end)
+		if !strings.Contains(accountPublicID, "hash.toString(36).padStart(4") ||
+			!strings.Contains(accountPublicID, ".slice(0, 4)") {
+			t.Fatalf("%s accountPublicId must match the Rust Spacetime account_public_id shape", fixture.name)
+		}
+		for _, forbidden := range []string{
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+			"36 * 36 * 36 * 36",
+			"hash %",
+		} {
+			if strings.Contains(accountPublicID, forbidden) {
+				t.Fatalf("%s accountPublicId must not use the old modulo/uppercase owner id shape, found %q", fixture.name, forbidden)
+			}
+		}
+	}
+}
+
+func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
+	source := ticketAppSource(t)
+	rejectedBody := substringBetween(t, source,
+		"function noteControlCodeCandidateRejected(proof) {",
+		"  async function confirmControlCodeBrowserCapture(request, proof) {")
+	waitForScreenshot := substringBetween(t, source,
+		"function waitForControlCodeResultScreenshot(request) {",
+		"  function rememberOwnedControlCodeRequest(request) {")
+	keyframeBody := substringBetween(t, source,
+		"function requestKeyframe(reason) {",
+		"  function requestKeyframeDebounced(reason, minIntervalMs) {")
+
+	for _, needle := range []string{
+		"const controlCodeCapturePollMs = 200;",
+		"const controlCodeCaptureKeyframeRetryMs = 5000;",
+		"const controlCodeCaptureKeyframeRetryLimit = 3;",
+		"const keyframeCommandMinIntervalMs = 1000;",
+		"let lastKeyframeCommandAt = 0;",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code capture throttling missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"lastControlCodeCaptureKeyframeRetryCount < controlCodeCaptureKeyframeRetryLimit",
+		"requestKeyframeDebounced(`control_code_candidate_rejected_${reason}`, controlCodeCaptureKeyframeRetryMs)",
+		"lastControlCodeCaptureKeyframeRetryCount += 1;",
+	} {
+		if !strings.Contains(rejectedBody, needle) {
+			t.Fatalf("candidate rejection must bound keyframe retry writes, missing %q", needle)
+		}
+	}
+	if !strings.Contains(waitForScreenshot, "setTimeout(tick, controlCodeCapturePollMs)") {
+		t.Fatalf("control-code capture polling must use the named bounded interval")
+	}
+	if strings.Contains(waitForScreenshot, "setTimeout(tick, 20)") {
+		t.Fatalf("control-code capture polling must not run every 20ms")
+	}
+	for _, needle := range []string{
+		"if (now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;",
+		"lastKeyframeCommandAt = now;",
+		"return true;",
+	} {
+		if !strings.Contains(keyframeBody, needle) {
+			t.Fatalf("keyframe command helper must globally throttle writes, missing %q", needle)
+		}
+	}
+}
+
 func TestControlCodePhoneImageResultDoesNotBypassBrowserFrameCapture(t *testing.T) {
 	source := ticketAppSource(t)
 	succeededBranch := substringBetween(t, source,
@@ -241,7 +321,8 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"const popupProof = controlCodePopupFrameProof();",
 		"if (popupProof.popupVisible)",
 		"const generatedProof = controlCodeGeneratedFrameProof();",
-		"if (!generatedProof.generatedVisible)",
+		"const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||",
+		"if (!browserTrustedGeneratedVisible)",
 		"candidateFrameEpoch: controlCodeRenderedFrameEpoch()",
 		"candidateFrameSequence: controlCodeRenderedFrameSequence()",
 		"const renderedEpoch = controlCodeRenderedFrameEpoch();",
@@ -264,9 +345,13 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		}
 	}
 	acceptIndex := strings.Index(candidateProof, "proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';")
-	generatedIndex := strings.Index(candidateProof, "if (!generatedProof.generatedVisible)")
+	generatedIndex := strings.Index(candidateProof, "if (!browserTrustedGeneratedVisible)")
 	if acceptIndex < 0 || generatedIndex < 0 || generatedIndex > acceptIndex {
 		t.Fatalf("browser-generated candidate frame must prove generated visuals before fallback acceptance")
+	}
+	baselineRejectIndex := strings.Index(candidateProof, "proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';")
+	if baselineRejectIndex < 0 || baselineRejectIndex < generatedIndex {
+		t.Fatalf("baseline sameness rejection must run only after generated-screen proof is evaluated")
 	}
 	for _, needle := range []string{
 		"const proof = controlCodeCandidateFrameProof(codeRequest);",
@@ -351,6 +436,32 @@ func TestControlCodeResultCaptureUsesStreamSizeFrozenFrame(t *testing.T) {
 	}
 }
 
+func TestControlCodeBrowserCaptureCanContinueAfterPhoneRawReturn(t *testing.T) {
+	source := ticketAppSource(t)
+	candidateProof := substringBetween(t, source,
+		"function controlCodeCandidateFrameProof(request) {",
+		"  function noteControlCodeCandidateRejected(proof) {")
+
+	for _, forbidden := range []string{
+		"request.resultWindowClosedAt ||",
+		"request.cleanupFrameEpoch ||",
+		"request.cleanupMinFrameSequence",
+	} {
+		if strings.Contains(candidateProof, forbidden) {
+			t.Fatalf("browser capture must not reject just because phone cleanup has begun, found %q", forbidden)
+		}
+	}
+	if !strings.Contains(candidateProof, "if (request.cleanupCompletedAt) {") ||
+		!strings.Contains(candidateProof, "proof.candidateRejectedReason = 'result_window_closed_before_capture';") {
+		t.Fatalf("browser capture must still reject after cleanup is fully completed")
+	}
+	cleanupCompletedIndex := strings.Index(candidateProof, "if (request.cleanupCompletedAt)")
+	generatedRejectIndex := strings.Index(candidateProof, "if (!browserTrustedGeneratedVisible)")
+	if cleanupCompletedIndex < 0 || generatedRejectIndex < 0 || cleanupCompletedIndex > generatedRejectIndex {
+		t.Fatalf("cleanup-completed rejection must happen before any generated-frame capture can be accepted")
+	}
+}
+
 func TestControlCodeCaptureRejectsPopupFadeAndRequiresStableFrames(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
@@ -414,9 +525,15 @@ func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 		"function controlCodeTrustedPhonePostSubmitProof(resultProof) {",
 		"resultProof === 'phone_visual_raw_ticket_after_submit'",
 		"resultProof === 'phone_visual_root_confirmed'",
+		"resultProof === 'phone_visual'",
 		"const trustedPhonePostSubmitProof = controlCodeTrustedPhonePostSubmitProof(proof.resultProof);",
 		"if (trustedPhonePostSubmitProof) {",
 		"proof.trustedPhonePostSubmitProof = true;",
+		"const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||",
+		"trustedPhonePostSubmitProof &&",
+		"generatedProof.generatedChipVisible &&",
+		"proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;",
+		"if (!browserTrustedGeneratedVisible)",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("post-submit phone proof diagnostic path missing %q", needle)
@@ -429,12 +546,130 @@ func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 
 	popupRejectIndex := strings.Index(candidateProof, "if (popupProof.popupVisible)")
 	trustedDiagnosticIndex := strings.Index(candidateProof, "if (trustedPhonePostSubmitProof) {")
-	generatedRejectIndex := strings.Index(candidateProof, "if (!generatedProof.generatedVisible)")
+	generatedRejectIndex := strings.Index(candidateProof, "if (!browserTrustedGeneratedVisible)")
 	if popupRejectIndex < 0 || trustedDiagnosticIndex < 0 || generatedRejectIndex < 0 {
 		t.Fatalf("candidate proof must keep popup rejection, phone proof diagnostics, and generated visual enforcement")
 	}
 	if popupRejectIndex > trustedDiagnosticIndex || trustedDiagnosticIndex > generatedRejectIndex {
 		t.Fatalf("phone proof diagnostics must happen after popup rejection and before generated visual enforcement")
+	}
+	if !strings.Contains(candidateProof, "proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold") ||
+		!strings.Contains(candidateProof, "proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold") {
+		t.Fatalf("phone post-submit proof may assist only when the browser frame changed from the pre-request baseline")
+	}
+	if strings.Contains(candidateProof, "browserTrustedGeneratedVisible = trustedPhonePostSubmitProof") {
+		t.Fatalf("phone post-submit proof must not be the sole generated-frame trust signal")
+	}
+}
+
+func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testing.T) {
+	source := ticketAppSource(t)
+	css := ticketAppCSS(t)
+	openDialog := substringBetween(t, source,
+		"function openControlCodeDialog() {",
+		"  function closeControlCodeDialog() {")
+	closeDialog := substringBetween(t, source,
+		"function closeControlCodeDialog() {",
+		"  async function submitControlCodeRequest() {")
+	updateReveal := substringBetween(t, source,
+		"function updateDetailsReveal() {",
+		"  function keepFirstScreenPinned(force) {")
+	submitRequest := substringBetween(t, source,
+		"async function submitControlCodeRequest() {",
+		"  async function closeCurrentControlCode(openNext) {")
+
+	for _, forbidden := range []string{
+		"function pinToFirstScreenAfterKeyboardCollapse(",
+		"keyboard_restore_complete",
+		"keyboardRestoreActive",
+		"KEYBOARD_RESTORE_FALLBACK_MS",
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("control-code submit jump fix must not use delayed scroll restore: found %q", forbidden)
+		}
+	}
+	for _, needle := range []string{
+		"let controlCodeDialogScrollLock = null;",
+		"function lockControlCodeDialogScroll() {",
+		"function unlockControlCodeDialogScroll() {",
+		"function settleCodeDialogScrollUnlock() {",
+		"setDetailsPanelVisible(lock.detailsVisible);",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code dialog scroll lock missing %q", needle)
+		}
+	}
+	if !strings.Contains(openDialog, "lockControlCodeDialogScroll();") {
+		t.Fatalf("control-code dialog must remember details visibility before focusing the input")
+	}
+	if !strings.Contains(closeDialog, "document.activeElement.blur();") ||
+		!strings.Contains(closeDialog, "settleCodeDialogScrollUnlock();") {
+		t.Fatalf("control-code dialog close must blur focused input and release dialog-owned state")
+	}
+	if !strings.Contains(updateReveal, "if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;") {
+		t.Fatalf("details reveal must ignore modal-owned scroll while dialog body lock is active")
+	}
+	if strings.Contains(submitRequest, "pinToFirstScreenAfterKeyboardCollapse(") ||
+		strings.Contains(submitRequest, "window.scrollTo(0, 0)") ||
+		strings.Contains(source, "control-code-dialog-scroll-locked") ||
+		strings.Contains(source, "--ticket-dialog-scroll-y") ||
+		strings.Contains(source, "window.scrollTo(") {
+		t.Fatalf("submit path must not scroll the page back after closing the dialog")
+	}
+	if strings.Contains(submitRequest, "digits,\n") ||
+		strings.Contains(submitRequest, `"digits"`) {
+		t.Fatalf("control-code submit log must not include the submitted digits")
+	}
+	if !strings.Contains(submitRequest, "digitCount: digits.length") {
+		t.Fatalf("control-code submit log should keep only the submitted digit count")
+	}
+	for _, needle := range []string{
+		"body.control-code-dialog-scroll-locked",
+		"top:var(--ticket-dialog-scroll-y,0)",
+	} {
+		if strings.Contains(css, needle) {
+			t.Fatalf("control-code dialog must not use body fixed scroll-lock CSS: found %q", needle)
+		}
+	}
+}
+
+func TestControlCodeStateIgnoresExpiredOwnedRequests(t *testing.T) {
+	source := ticketAppSource(t)
+	latestRequest := substringBetween(t, source,
+		"function latestOwnedControlCodeRequest(state) {",
+		"  function renderState() {")
+	renderState := substringBetween(t, source,
+		"function renderState() {",
+		"  function rememberServerClock(state) {")
+
+	for _, needle := range []string{
+		"function controlCodeRequestExpiryTime(request) {",
+		"function controlCodeRequestSortTime(request) {",
+		"function controlCodeRequestIsStillRelevant(request) {",
+		"return (Date.now() + serverClockSkewMs) <= expiresAt + 1000;",
+		".filter((request) => isOwnedControlCodeRequest(request) && controlCodeRequestIsStillRelevant(request))",
+		".sort((a, b) => controlCodeRequestSortTime(b) - controlCodeRequestSortTime(a))[0] || null;",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code request selection must ignore expired rows and prefer newest valid requests, missing %q", needle)
+		}
+	}
+	if strings.Contains(latestRequest, "requests.find((request) => isOwnedControlCodeRequest(request))") {
+		t.Fatalf("control-code request selection must not take the first owned Spacetime row without expiry sorting")
+	}
+	if !strings.Contains(renderState, "renderControlCodeRequest(controlCodeRequestIsStillRelevant(codeRequest) ? codeRequest : null);") {
+		t.Fatalf("render state must clear a locally retained request once it is no longer fresh")
+	}
+}
+
+func TestSpacetimeClientIncludesControlCodeRequestExpiry(t *testing.T) {
+	data, err := os.ReadFile("../../web-client/src/index.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	if !strings.Contains(source, `expiresAt: String(request.expiresAt || request.expires_at || ""),`) {
+		t.Fatalf("direct Spacetime browser state must expose control-code request expiry to the page")
 	}
 }
 
@@ -517,10 +752,10 @@ func TestControlCodeCloseHidesGeneratedResultBeforeNetworkRoundTrip(t *testing.T
 		"async function closeCurrentControlCode(openNext) {",
 		"  function requestControlCodeFromHotspot(event) {")
 
-	postIndex := strings.Index(closeBody, "await postJSON('/api/v1/control-code/close'")
+	postIndex := strings.Index(closeBody, "client.closeControlCode(requestID, 'browser_closed')")
 	closedIndex := strings.Index(closeBody, "locallyClosedControlCodeRequestIDs.add(String(requestID));")
 	if postIndex < 0 || closedIndex < 0 {
-		t.Fatalf("close path must mark the request closed locally and then sync with the server")
+		t.Fatalf("close path must mark the request closed locally and then sync through Spacetime")
 	}
 	localCloseBody := closeBody[closedIndex:postIndex]
 	hideIndex := strings.Index(localCloseBody, "setControlCodeResultVisible(false);")
@@ -530,6 +765,61 @@ func TestControlCodeCloseHidesGeneratedResultBeforeNetworkRoundTrip(t *testing.T
 	}
 	if hideIndex > clearIndex {
 		t.Fatalf("generated control-code result must disappear locally before capture state cleanup and the close POST")
+	}
+}
+
+func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
+	source := ticketAppSource(t)
+	closeBody := substringBetween(t, source,
+		"async function closeCurrentControlCode(openNext) {",
+		"  function requestControlCodeFromHotspot(event) {")
+	captureBody := substringBetween(t, source,
+		"async function captureControlCodeResultScreenshot(request",
+		"  function failControlCodeResultScreenshotWait() {")
+	maybeCaptureBody := substringBetween(t, source,
+		"function maybeCaptureControlCodeResultImage() {",
+		"  function waitForControlCodeResultScreenshot(request) {")
+	waitBody := substringBetween(t, source,
+		"function waitForControlCodeResultScreenshot(request) {",
+		"  function rememberOwnedControlCodeRequest(request) {")
+
+	postIndex := strings.Index(closeBody, "client.closeControlCode(requestID, 'browser_closed')")
+	closedIndex := strings.Index(closeBody, "locallyClosedControlCodeRequestIDs.add(String(requestID));")
+	codeRequestNilIndex := strings.Index(closeBody, "codeRequest = null;")
+	if postIndex < 0 || closedIndex < 0 || codeRequestNilIndex < 0 {
+		t.Fatalf("close path must mark a request locally closed and clear the retained request before syncing")
+	}
+	if closedIndex > codeRequestNilIndex || codeRequestNilIndex > postIndex {
+		t.Fatalf("close path must clear local request state before the asynchronous close can race with capture")
+	}
+	if strings.Count(captureBody, "locallyClosedControlCodeRequestIDs.has(requestID)") < 4 {
+		t.Fatalf("browser capture must check for locally closed requests before and after async capture work")
+	}
+	ackIndex := strings.Index(captureBody, "await confirmControlCodeBrowserCapture(request, proof);")
+	revealIndex := strings.Index(captureBody, "codeResultImage.src = capturedImage;")
+	if ackIndex < 0 || revealIndex < 0 || ackIndex > revealIndex {
+		t.Fatalf("capture path must ack before revealing the captured result")
+	}
+	if !strings.Contains(captureBody[ackIndex:revealIndex], "if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;") {
+		t.Fatalf("capture path must not reveal a result if the request was closed while the ack was in flight")
+	}
+	catchIndex := strings.Index(captureBody, "} catch (error) {")
+	failIndex := strings.Index(captureBody, "failControlCodeResultScreenshotWait();")
+	if catchIndex < 0 || failIndex < 0 || catchIndex > failIndex {
+		t.Fatalf("capture failure path no longer shows the waiting failure message")
+	}
+	if !strings.Contains(captureBody[catchIndex:failIndex], "if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;") {
+		t.Fatalf("capture failure path must not redisplay a failed result after local close")
+	}
+	maybeGuardIndex := strings.Index(maybeCaptureBody, "if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;")
+	maybeCaptureIndex := strings.Index(maybeCaptureBody, "captureControlCodeResultScreenshot(codeRequest, proof);")
+	if maybeGuardIndex < 0 || maybeCaptureIndex < 0 || maybeGuardIndex > maybeCaptureIndex {
+		t.Fatalf("maybe-capture path must ignore locally closed requests before starting screenshot capture")
+	}
+	waitGuardIndex := strings.Index(waitBody, "if (locallyClosedControlCodeRequestIDs.has(requestID)) return;")
+	waitStatusIndex := strings.Index(waitBody, "codeResultArea.dataset.status = 'waiting';")
+	if waitGuardIndex < 0 || waitStatusIndex < 0 || waitGuardIndex > waitStatusIndex {
+		t.Fatalf("wait path must not re-arm result UI for a locally closed request")
 	}
 }
 
@@ -566,8 +856,7 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 		"const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;",
 		"const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));",
 		"if (longHidden || videoStale) {\n      clientLog('visibility_resume_recovery'",
-		"if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {\n      connect();",
-		"} else if (ws.readyState === WebSocket.OPEN) {\n      send(heartbeatMessage(reason));",
+		"publishStreamFocus(true, reason || 'visibility_visible');",
 		"if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {\n      connectDirectVideo();",
 		"if (videoStale) {\n      setTimeout(() => {",
 	}
@@ -588,7 +877,7 @@ func TestTicketViewerDisconnectsAfterIdleTimeoutUntilReload(t *testing.T) {
 		"  function resetStreamState(options) {")
 	videoBody := substringBetween(t, source,
 		"function connectDirectVideo() {",
-		"  function sendVideoSignal(value) {")
+		"  function sendVideoClientLog(event, detail) {")
 	recoveryBody := substringBetween(t, source,
 		"function recoverAfterVisibilityResume(reason) {",
 		"  window.addEventListener('resize', resizeCanvasBox);")
@@ -617,10 +906,10 @@ func TestTicketViewerDisconnectsAfterIdleTimeoutUntilReload(t *testing.T) {
 	for _, needle := range []string{
 		"idleDisconnected = true;",
 		"clearTimeout(reconnectTimer);",
+		"clearTimeout(hiddenStreamFocusTimer);",
 		"closeEarlyVideo('idle_disconnect');",
 		"closeDirectVideo();",
 		"resetStreamState({ preserveFrame: true });",
-		"ws.close();",
 		"spacetimeClient.close();",
 		"releaseScreenWakeLock('idle_disconnect');",
 		"showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pārlādē lapu, lai turpinātu.', true);",
@@ -655,6 +944,24 @@ func TestTicketViewerDisconnectsAfterIdleTimeoutUntilReload(t *testing.T) {
 func ticketAppSource(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("../../web-client/ticket-app-source.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func readTicketWebClientSource(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile("../../web-client/" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func ticketAppCSS(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("static/app.css")
 	if err != nil {
 		t.Fatal(err)
 	}

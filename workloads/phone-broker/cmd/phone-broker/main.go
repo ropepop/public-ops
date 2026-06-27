@@ -52,37 +52,11 @@ func loadConfig() (broker.Config, error) {
 	if err != nil {
 		return broker.Config{}, err
 	}
-	maxTicketQRBlock, err := envDuration("PHONE_BROKER_MAX_TICKET_QR_BLOCK", 15*time.Second)
-	if err != nil {
-		return broker.Config{}, err
-	}
-	runnerInterval, err := envDuration("PHONE_BROKER_RUNNER_INTERVAL", 500*time.Millisecond)
-	if err != nil {
-		return broker.Config{}, err
-	}
-	phoneSendTimeout, err := envDuration("PHONE_BROKER_PHONE_SEND_TIMEOUT", 2*time.Second)
-	if err != nil {
-		return broker.Config{}, err
-	}
-	jobTimeout, err := envDuration("PHONE_BROKER_JOB_TIMEOUT", 75*time.Second)
-	if err != nil {
-		return broker.Config{}, err
-	}
-	imageTTL, err := envDuration("PHONE_BROKER_IMAGE_TTL", 2*time.Minute)
-	if err != nil {
-		return broker.Config{}, err
-	}
 	cfg := broker.Config{
-		BindAddr:         env("PHONE_BROKER_BIND_ADDR", "0.0.0.0"),
-		Port:             port,
-		UpstreamBaseURL:  strings.TrimRight(env("PHONE_BROKER_UPSTREAM_BASE_URL", "http://ticket_phone_bridge:9388"), "/"),
-		StatePath:        env("PHONE_BROKER_STATE_PATH", "/srv/phone-broker/state/jobs.json"),
-		TicketGrace:      ticketGrace,
-		MaxTicketQRBlock: maxTicketQRBlock,
-		RunnerInterval:   runnerInterval,
-		PhoneSendTimeout: phoneSendTimeout,
-		JobTimeout:       jobTimeout,
-		ImageTTL:         imageTTL,
+		BindAddr:        env("PHONE_BROKER_BIND_ADDR", "0.0.0.0"),
+		Port:            port,
+		UpstreamBaseURL: strings.TrimRight(env("PHONE_BROKER_UPSTREAM_BASE_URL", "http://ticket_phone_bridge:9388"), "/"),
+		TicketGrace:     ticketGrace,
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return broker.Config{}, fmt.Errorf("PHONE_BROKER_PORT out of range: %d", cfg.Port)

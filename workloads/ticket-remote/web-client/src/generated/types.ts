@@ -46,6 +46,43 @@ export const TicketremoteCleanupSchedule = __t.object("TicketremoteCleanupSchedu
 });
 export type TicketremoteCleanupSchedule = __Infer<typeof TicketremoteCleanupSchedule>;
 
+export const TicketremoteControlCodeOwner = __t.object("TicketremoteControlCodeOwner", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  sessionId: __t.string(),
+  email: __t.string(),
+  digits: __t.string(),
+  requestedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteControlCodeOwner = __Infer<typeof TicketremoteControlCodeOwner>;
+
+export const TicketremoteControlCodeRequest = __t.object("TicketremoteControlCodeRequest", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  ownerPublicId: __t.string(),
+  status: __t.string(),
+  reason: __t.string(),
+  message: __t.string(),
+  requestedAt: __t.string(),
+  updatedAt: __t.string(),
+  resultExpiresAt: __t.string(),
+  captureRequired: __t.bool(),
+  captureAcknowledged: __t.bool(),
+  cleanupPending: __t.bool(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  minFrameSequence: __t.string(),
+  resultFrameEpoch: __t.string(),
+  resultMinFrameSequence: __t.string(),
+  captureFrameEpoch: __t.string(),
+  captureFrameSequence: __t.string(),
+  expiresAt: __t.string(),
+  resultProof: __t.option(__t.string()),
+  resultProofAt: __t.option(__t.string()),
+});
+export type TicketremoteControlCodeRequest = __Infer<typeof TicketremoteControlCodeRequest>;
+
 export const TicketremoteControlSession = __t.object("TicketremoteControlSession", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -74,6 +111,19 @@ export const TicketremotePhoneBackend = __t.object("TicketremotePhoneBackend", {
 });
 export type TicketremotePhoneBackend = __Infer<typeof TicketremotePhoneBackend>;
 
+export const TicketremotePhoneCurrentReport = __t.object("TicketremotePhoneCurrentReport", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  streamState: __t.string(),
+  desiredActive: __t.bool(),
+  lastCommandId: __t.string(),
+  lastCommandRevision: __t.string(),
+  statusJson: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremotePhoneCurrentReport = __Infer<typeof TicketremotePhoneCurrentReport>;
+
 export const TicketremotePhoneStatus = __t.object("TicketremotePhoneStatus", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -98,6 +148,150 @@ export const TicketremotePhoneStatusHistory = __t.object("TicketremotePhoneStatu
   expiresAt: __t.string(),
 });
 export type TicketremotePhoneStatusHistory = __Infer<typeof TicketremotePhoneStatusHistory>;
+
+export const TicketremoteRelayCurrentReport = __t.object("TicketremoteRelayCurrentReport", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  videoClients: __t.u32(),
+  streamVerdict: __t.string(),
+  lastFrameAgoMillis: __t.u32(),
+  framesForwarded: __t.string(),
+  statusJson: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteRelayCurrentReport = __Infer<typeof TicketremoteRelayCurrentReport>;
+
+export const TicketremoteSafeOperationalLog = __t.object("TicketremoteSafeOperationalLog", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  source: __t.string(),
+  level: __t.string(),
+  event: __t.string(),
+  correlationId: __t.string(),
+  detailJson: __t.string(),
+  createdAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteSafeOperationalLog = __Infer<typeof TicketremoteSafeOperationalLog>;
+
+export const TicketremoteServiceControl = __t.object("TicketremoteServiceControl", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  sessionId: __t.string(),
+  email: __t.string(),
+  state: __t.string(),
+  claimedAt: __t.string(),
+  expiresAt: __t.string(),
+  extended: __t.bool(),
+});
+export type TicketremoteServiceControl = __Infer<typeof TicketremoteServiceControl>;
+
+export const TicketremoteServiceIdentity = __t.object("TicketremoteServiceIdentity", {
+  id: __t.string(),
+  identity: __t.identity(),
+  ticketId: __t.string(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteServiceIdentity = __Infer<typeof TicketremoteServiceIdentity>;
+
+export const TicketremoteServiceMember = __t.object("TicketremoteServiceMember", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  email: __t.string(),
+  publicId: __t.string(),
+  role: __t.string(),
+  active: __t.bool(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteServiceMember = __Infer<typeof TicketremoteServiceMember>;
+
+export const TicketremoteServicePhone = __t.object("TicketremoteServicePhone", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  attachName: __t.string(),
+  baseUrl: __t.string(),
+  desiredState: __t.string(),
+  streamState: __t.string(),
+  healthJson: __t.string(),
+  lastError: __t.string(),
+  lastSeenAt: __t.string(),
+});
+export type TicketremoteServicePhone = __Infer<typeof TicketremoteServicePhone>;
+
+export const TicketremoteServiceStreamCommand = __t.object("TicketremoteServiceStreamCommand", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  commandType: __t.string(),
+  status: __t.string(),
+  revision: __t.string(),
+  reason: __t.string(),
+  payloadJson: __t.string(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteServiceStreamCommand = __Infer<typeof TicketremoteServiceStreamCommand>;
+
+export const TicketremoteServiceTicket = __t.object("TicketremoteServiceTicket", {
+  id: __t.string(),
+  displayName: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteServiceTicket = __Infer<typeof TicketremoteServiceTicket>;
+
+export const TicketremoteServiceViewer = __t.object("TicketremoteServiceViewer", {
+  sessionId: __t.string(),
+  ticketId: __t.string(),
+  email: __t.string(),
+  displayName: __t.string(),
+  page: __t.string(),
+  connected: __t.bool(),
+  lastSeenAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteServiceViewer = __Infer<typeof TicketremoteServiceViewer>;
+
+export const TicketremoteStreamCommand = __t.object("TicketremoteStreamCommand", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  commandType: __t.string(),
+  status: __t.string(),
+  revision: __t.string(),
+  reason: __t.string(),
+  payloadJson: __t.string(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteStreamCommand = __Infer<typeof TicketremoteStreamCommand>;
+
+export const TicketremoteStreamCommandSignal = __t.object("TicketremoteStreamCommandSignal", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  revision: __t.string(),
+  pendingCount: __t.u32(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteStreamCommandSignal = __Infer<typeof TicketremoteStreamCommandSignal>;
+
+export const TicketremoteStreamDesiredState = __t.object("TicketremoteStreamDesiredState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  desiredActive: __t.bool(),
+  viewerCount: __t.u32(),
+  reason: __t.string(),
+  revision: __t.string(),
+  updatedBy: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteStreamDesiredState = __Infer<typeof TicketremoteStreamDesiredState>;
 
 export const TicketremoteTicket = __t.object("TicketremoteTicket", {
   id: __t.string(),

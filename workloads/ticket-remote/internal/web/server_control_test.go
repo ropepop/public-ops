@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,22 +76,6 @@ func TestLegacyControlReleaseDoesNotNotifyPhoneControlExit(t *testing.T) {
 	messages := make(chan string, 10)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				_, data, err := conn.Read(r.Context())
-				if err != nil {
-					return
-				}
-				messages <- string(data)
-			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -98,27 +83,18 @@ func TestLegacyControlReleaseDoesNotNotifyPhoneControlExit(t *testing.T) {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			_, _, _ = conn.Read(r.Context())
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session/start", "/api/v1/session", "/api/v1/session/stop":
+			t.Errorf("removed direct phone-control path was used: %s", r.URL.Path)
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, messages)
 
-	store := state.NewMemoryStore()
-	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
-		TicketID:        "vivi-default",
-		DisplayName:     "ViVi timed ticket",
-		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "pixel",
-		PhoneBaseURL:    phoneServer.URL,
-		PhoneAttachName: "Pixel",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
 		BackendID:         "pixel",
 		AttachName:        "Pixel",
@@ -144,7 +120,6 @@ func TestLegacyControlReleaseDoesNotNotifyPhoneControlExit(t *testing.T) {
 	}
 
 	relay.AddViewer()
-	waitForPhoneMessage(t, messages, `"type":"start"`)
 	removed := postControlFailure(t, server, nil, "/api/v1/control/release")
 	if removed.Error != "control_mode_removed" {
 		t.Fatalf("expected control_mode_removed, got %#v", removed)
@@ -162,22 +137,6 @@ func TestControlGateEndTransitionNotifiesPhoneControlExit(t *testing.T) {
 	messages := make(chan string, 10)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				_, data, err := conn.Read(r.Context())
-				if err != nil {
-					return
-				}
-				messages <- string(data)
-			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -185,17 +144,18 @@ func TestControlGateEndTransitionNotifiesPhoneControlExit(t *testing.T) {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			_, _, _ = conn.Read(r.Context())
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session/start", "/api/v1/session", "/api/v1/session/stop":
+			t.Errorf("removed direct phone-control path was used: %s", r.URL.Path)
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, messages)
 
-	store := state.NewMemoryStore()
+	store := newTicketMemoryStore(t, phoneServer.URL)
 	server, err := NewServer(config.Config{
 		PublicBaseURL: "http://ticket.test",
 		TicketID:      "vivi-default",
@@ -219,7 +179,6 @@ func TestControlGateEndTransitionNotifiesPhoneControlExit(t *testing.T) {
 	}
 	defer server.relay.Close()
 	server.relay.AddViewer()
-	waitForPhoneMessage(t, messages, `"type":"start"`)
 
 	now := time.Now()
 	server.rememberControlGate(state.Snapshot{ActiveControl: &state.ControlSession{
@@ -346,6 +305,86 @@ func waitForPhoneMessageText(t *testing.T, messages <-chan string, snippet strin
 	}
 }
 
+func waitForPhoneMessageTextTimeout(t *testing.T, messages <-chan string, snippet string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case message := <-messages:
+			if strings.Contains(message, snippet) {
+				return message
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for phone message containing %s", snippet)
+		}
+	}
+}
+
+var ticketStreamCommandSinkRegistry = struct {
+	sync.Mutex
+	sinks map[string]chan<- string
+}{sinks: map[string]chan<- string{}}
+
+type recordingTicketStore struct {
+	state.Store
+	commandSink chan<- string
+}
+
+func registerTicketStreamCommandSink(t *testing.T, phoneURL string, sink chan<- string) {
+	t.Helper()
+	cleanURL := strings.TrimRight(strings.TrimSpace(phoneURL), "/")
+	if cleanURL == "" {
+		return
+	}
+	ticketStreamCommandSinkRegistry.Lock()
+	ticketStreamCommandSinkRegistry.sinks[cleanURL] = sink
+	ticketStreamCommandSinkRegistry.Unlock()
+	t.Cleanup(func() {
+		ticketStreamCommandSinkRegistry.Lock()
+		delete(ticketStreamCommandSinkRegistry.sinks, cleanURL)
+		ticketStreamCommandSinkRegistry.Unlock()
+	})
+}
+
+func ticketStreamCommandSink(phoneURL string) chan<- string {
+	cleanURL := strings.TrimRight(strings.TrimSpace(phoneURL), "/")
+	ticketStreamCommandSinkRegistry.Lock()
+	defer ticketStreamCommandSinkRegistry.Unlock()
+	return ticketStreamCommandSinkRegistry.sinks[cleanURL]
+}
+
+func (s *recordingTicketStore) AppendStreamCommand(ctx context.Context, input state.StreamCommandInput) error {
+	if err := s.Store.AppendStreamCommand(ctx, input); err != nil {
+		return err
+	}
+	if s.commandSink != nil {
+		message := streamCommandInputTestMessage(input)
+		select {
+		case s.commandSink <- message:
+		default:
+		}
+	}
+	return nil
+}
+
+func streamCommandInputTestMessage(input state.StreamCommandInput) string {
+	payload := map[string]any{}
+	if strings.TrimSpace(input.PayloadJSON) != "" {
+		_ = json.Unmarshal([]byte(input.PayloadJSON), &payload)
+	}
+	if _, ok := payload["type"]; !ok {
+		payload["type"] = input.CommandType
+	}
+	if _, ok := payload["reason"]; !ok && input.Reason != "" {
+		payload["reason"] = input.Reason
+	}
+	payload["commandId"] = input.CommandID
+	payload["revision"] = input.Revision
+	payload["commandType"] = input.CommandType
+	body, _ := json.Marshal(payload)
+	return string(body)
+}
+
 func waitForBrowserMessage(t *testing.T, conn *websocket.Conn, snippet string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -402,7 +441,7 @@ func newTicketPhoneTestServer(t *testing.T, messages chan<- string) *httptest.Se
 	}))
 }
 
-func newTicketMemoryStore(t *testing.T, phoneURL string) *state.MemoryStore {
+func newTicketMemoryStore(t *testing.T, phoneURL string) state.Store {
 	t.Helper()
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -414,6 +453,9 @@ func newTicketMemoryStore(t *testing.T, phoneURL string) *state.MemoryStore {
 		PhoneAttachName: "Pixel",
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if sink := ticketStreamCommandSink(phoneURL); sink != nil {
+		return &recordingTicketStore{Store: store, commandSink: sink}
 	}
 	return store
 }

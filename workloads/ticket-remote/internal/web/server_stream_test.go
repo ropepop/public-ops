@@ -20,38 +20,10 @@ import (
 )
 
 func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
-	phoneActivity := make(chan string, 1)
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-				_, data, err := conn.Read(ctx)
-				cancel()
-				if err != nil {
-					return
-				}
-				if bytes.Contains(data, []byte(`"type":"start"`)) {
-					select {
-					case phoneStart <- struct{}{}:
-					default:
-					}
-				}
-				if bytes.Contains(data, []byte(`"type":"activity"`)) {
-					phoneActivity <- string(data)
-					return
-				}
-			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -61,15 +33,13 @@ func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()
-			_, _, _ = conn.Read(ctx)
 			<-ctx.Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -90,6 +60,10 @@ func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
 		ReconnectMaxDelay: time.Hour,
 		NoViewerStopDelay: time.Hour,
 	})
+	storeForServer := state.Store(store)
+	if sink := ticketStreamCommandSink(phoneServer.URL); sink != nil {
+		storeForServer = &recordingTicketStore{Store: store, commandSink: sink}
+	}
 	server, err := NewServer(config.Config{
 		PublicBaseURL: "http://ticket.test",
 		TicketID:      "vivi-default",
@@ -105,7 +79,7 @@ func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
 			BaseURL:    phoneServer.URL,
 			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
 		},
-	}, store, relay)
+	}, storeForServer, relay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,55 +97,26 @@ func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
 	}
 	defer videoConn.Close(websocket.StatusNormalClosure, "test complete")
 
-	select {
-	case <-phoneStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("phone backend did not receive relay start")
-	}
-
 	controlConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
 		t.Fatalf("dial browser control websocket: %v", err)
 	}
 	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
-	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat"}`)); err != nil {
-		t.Fatalf("send browser heartbeat: %v", err)
+	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"activity"}`)); err != nil {
+		t.Fatalf("send browser activity: %v", err)
 	}
 
-	select {
-	case got := <-phoneActivity:
-		if !strings.Contains(got, "public_heartbeat") {
-			t.Fatalf("phone activity message = %s", got)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("browser heartbeat was not forwarded to phone activity")
+	got := waitForPhoneMessageText(t, phoneCommands, `"type":"activity"`)
+	if !strings.Contains(got, `"reason":"browser_activity"`) {
+		t.Fatalf("stream activity command = %s", got)
 	}
 }
 
 func TestBrowserControlSocketAloneDoesNotStartPhoneBackend(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"start"`)) {
-				phoneStart <- struct{}{}
-			}
-			<-ctx.Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -181,15 +126,13 @@ func TestBrowserControlSocketAloneDoesNotStartPhoneBackend(t *testing.T) {
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 			defer cancel()
-			_, _, _ = conn.Read(ctx)
 			<-ctx.Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -247,43 +190,19 @@ func TestBrowserControlSocketAloneDoesNotStartPhoneBackend(t *testing.T) {
 		t.Fatalf("control socket should not count as a stream viewer, got %d", got)
 	}
 	select {
-	case <-phoneStart:
-		t.Fatal("control socket without video viewer started the phone stream")
+	case message := <-phoneCommands:
+		if strings.Contains(message, `"type":"start"`) {
+			t.Fatalf("control socket without video viewer started the phone stream: %s", message)
+		}
 	case <-time.After(250 * time.Millisecond):
 	}
 }
 
 func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
-	websocketStart := make(chan struct{}, 1)
-	keyframeRequests := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			select {
-			case phoneStart <- struct{}{}:
-			default:
-			}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				t.Errorf("read phone websocket start: %v", err)
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"start"`)) {
-				websocketStart <- struct{}{}
-			}
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -291,24 +210,13 @@ func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				t.Errorf("read phone stream keyframe: %v", err)
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"keyframe"`)) {
-				keyframeRequests <- struct{}{}
-			}
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -331,54 +239,14 @@ func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("prewarm status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	select {
-	case <-websocketStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("prewarm did not start the phone relay through websocket")
-	}
-	select {
-	case <-keyframeRequests:
-	case <-time.After(3 * time.Second):
-		t.Fatal("prewarm did not request a phone keyframe through websocket")
-	}
-	select {
-	case <-phoneStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("prewarm did not use immediate HTTP session start")
-	}
+	waitForPhoneSignalCounts(t, phoneCommands, map[string]int{"start": 1, "keyframe": 1}, "prewarm stream commands")
 }
 
 func TestAuthenticatedIndexPrewarmsPhoneRelayBeforeBrowserVideoSocket(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
-	websocketStart := make(chan struct{}, 1)
-	keyframeRequests := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			select {
-			case phoneStart <- struct{}{}:
-			default:
-			}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				t.Errorf("read phone websocket start: %v", err)
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"start"`)) {
-				websocketStart <- struct{}{}
-			}
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -386,24 +254,13 @@ func TestAuthenticatedIndexPrewarmsPhoneRelayBeforeBrowserVideoSocket(t *testing
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				t.Errorf("read phone stream keyframe: %v", err)
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"keyframe"`)) {
-				keyframeRequests <- struct{}{}
-			}
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -424,36 +281,16 @@ func TestAuthenticatedIndexPrewarmsPhoneRelayBeforeBrowserVideoSocket(t *testing
 	if rec.Code != http.StatusOK {
 		t.Fatalf("index status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	select {
-	case <-websocketStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("authenticated index did not start the phone relay through websocket")
-	}
-	select {
-	case <-keyframeRequests:
-	case <-time.After(3 * time.Second):
-		t.Fatal("authenticated index did not request a phone keyframe through websocket")
-	}
-	select {
-	case <-phoneStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("authenticated index prewarm did not use immediate HTTP session start")
-	}
+	waitForPhoneSignalCounts(t, phoneCommands, map[string]int{"start": 1, "keyframe": 1}, "authenticated index prewarm commands")
 }
 
 func TestStreamPrewarmStartsPhoneByHTTPWithoutWaitingForWebsocketRelay(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 	releaseWebsocket := make(chan struct{})
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			select {
-			case phoneStart <- struct{}{}:
-			default:
-			}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session", "/api/v1/stream":
+		case "/api/v1/stream":
 			select {
 			case <-releaseWebsocket:
 			case <-r.Context().Done():
@@ -465,14 +302,13 @@ func TestStreamPrewarmStartsPhoneByHTTPWithoutWaitingForWebsocketRelay(t *testin
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
 	defer close(releaseWebsocket)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -494,41 +330,27 @@ func TestStreamPrewarmStartsPhoneByHTTPWithoutWaitingForWebsocketRelay(t *testin
 		t.Fatalf("prewarm status = %d body = %s", rec.Code, rec.Body.String())
 	}
 
-	select {
-	case <-phoneStart:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("prewarm should issue HTTP start without waiting for phone websocket relay")
-	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 }
 
 func TestStreamPrewarmDoesNotDuplicateHTTPStartWhileStartIsInFlight(t *testing.T) {
-	phoneStart := make(chan struct{}, 2)
-	releaseStart := make(chan struct{})
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			phoneStart <- struct{}{}
-			select {
-			case <-releaseStart:
-				w.WriteHeader(http.StatusOK)
-			case <-r.Context().Done():
-			}
-		case "/api/v1/session", "/api/v1/stream":
+		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
-	defer close(releaseStart)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -543,47 +365,46 @@ func TestStreamPrewarmDoesNotDuplicateHTTPStartWhileStartIsInFlight(t *testing.T
 	server := newTicketWebServer(t, store, relay, phoneServer.URL)
 
 	server.prewarmStreamForSession("same-session", "index_page_prewarm")
-	select {
-	case <-phoneStart:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("first prewarm did not start the phone by HTTP")
-	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 	server.prewarmStreamForSession("same-session", "page_boot")
-	select {
-	case <-phoneStart:
-		t.Fatal("second prewarm duplicated the HTTP phone start while the first start was still in flight")
-	case <-time.After(200 * time.Millisecond):
+	deadline := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case message := <-phoneCommands:
+			if strings.Contains(message, `"type":"start"`) {
+				t.Fatalf("second prewarm duplicated the Spacetime phone start command: %s", message)
+			}
+		case <-deadline:
+			return
+		}
 	}
 }
 
 func TestStreamPrewarmHTTPStartAllowsSlowPixelWake(t *testing.T) {
-	phoneStartContextCanceled := make(chan struct{}, 1)
-	phoneStart := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
+	releaseWebsocket := make(chan struct{})
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			phoneStart <- struct{}{}
+		case "/api/v1/stream":
 			select {
-			case <-time.After(1800 * time.Millisecond):
-				w.WriteHeader(http.StatusOK)
+			case <-releaseWebsocket:
 			case <-r.Context().Done():
-				phoneStartContextCanceled <- struct{}{}
+				return
 			}
-		case "/api/v1/session", "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	defer close(releaseWebsocket)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -598,41 +419,14 @@ func TestStreamPrewarmHTTPStartAllowsSlowPixelWake(t *testing.T) {
 	server := newTicketWebServer(t, store, relay, phoneServer.URL)
 
 	server.prewarmStreamForSession("same-session", "index_page_prewarm")
-	select {
-	case <-phoneStart:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("prewarm did not start the phone by HTTP")
-	}
-	select {
-	case <-phoneStartContextCanceled:
-		t.Fatal("prewarm HTTP start timed out before a realistic Pixel wake completed")
-	case <-time.After(1700 * time.Millisecond):
-	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 }
 
 func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T) {
-	websocketStart := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				t.Errorf("read phone websocket start: %v", err)
-				return
-			}
-			if bytes.Contains(data, []byte(`"type":"start"`)) {
-				websocketStart <- struct{}{}
-			}
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -641,13 +435,12 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	blockingStore := &blockingSnapshotStore{
 		Store:           newTicketMemoryStore(t, phoneServer.URL),
@@ -679,11 +472,7 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("index request did not reach state lookup")
 	}
-	select {
-	case <-websocketStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("authenticated index did not start phone relay before state lookup completed")
-	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 	close(blockingStore.releaseSnapshot)
 	select {
 	case rec := <-done:
@@ -696,16 +485,10 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 }
 
 func TestAuthenticatedIndexSessionCookiePrewarmStartsPhone(t *testing.T) {
-	phoneStart := make(chan struct{}, 1)
+	phoneCommands := make(chan string, 8)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			select {
-			case phoneStart <- struct{}{}:
-			default:
-			}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session", "/api/v1/stream":
+		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				t.Errorf("accept phone websocket: %v", err)
@@ -713,13 +496,12 @@ func TestAuthenticatedIndexSessionCookiePrewarmStartsPhone(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -761,17 +543,13 @@ func TestAuthenticatedIndexSessionCookiePrewarmStartsPhone(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("index status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	select {
-	case <-phoneStart:
-	case <-time.After(3 * time.Second):
-		t.Fatal("authenticated index server-session prewarm did not start the phone")
-	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 }
 
 func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session", "/api/v1/stream":
+		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				t.Errorf("accept phone websocket: %v", err)
@@ -779,8 +557,6 @@ func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
@@ -831,14 +607,6 @@ func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -847,8 +615,6 @@ func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1110,17 +876,10 @@ func TestVideoClientLogsAreHandledBeforePresenceHeartbeatFinishes(t *testing.T) 
 	}
 	writeCancel()
 
-	deadline := time.After(350 * time.Millisecond)
-	for {
-		snapshot := server.direct.snapshot(time.Now(), phone.Health{})
-		if event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent); ok && event.Event == "stream_first_packet_ms" {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("video client log was not handled while presence heartbeat was blocked: %#v", snapshot["lastBrowserEvent"])
-		case <-time.After(25 * time.Millisecond):
-		}
+	time.Sleep(350 * time.Millisecond)
+	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
+	if event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent); ok && event.Event == "stream_first_packet_ms" {
+		t.Fatalf("video client log should not be accepted on the media socket: %#v", event)
 	}
 }
 
@@ -1288,7 +1047,7 @@ func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
 	}
 }
 
-func TestVideoStreamSendsStreamStatus(t *testing.T) {
+func TestVideoStreamDoesNotSendStreamStatus(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
@@ -1301,47 +1060,19 @@ func TestVideoStreamSendsStreamStatus(t *testing.T) {
 	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
 
-	msg := readNextTextMessageOfType(t, ctx, viewerConn, "stream_status")
-	if msg["framesForwarded"].(float64) < 1 {
-		t.Fatalf("stream_status framesForwarded = %#v", msg["framesForwarded"])
-	}
-	if msg["lastFrameAgoMillis"].(float64) < 0 {
-		t.Fatalf("stream_status lastFrameAgoMillis = %#v", msg["lastFrameAgoMillis"])
-	}
-	if _, ok := msg["phoneStreamState"].(string); !ok {
-		t.Fatalf("stream_status missing phoneStreamState: %#v", msg)
+	_ = readNextTextMessageOfType(t, ctx, viewerConn, "config")
+	readCtx, readCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer readCancel()
+	typ, data, err := viewerConn.Read(readCtx)
+	if err == nil && typ == websocket.MessageText && strings.Contains(string(data), `"stream_status"`) {
+		t.Fatalf("video stream must not send stream_status messages: %s", data)
 	}
 }
 
 func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) {
-	phoneStart := make(chan struct{}, 4)
-	phoneVideoKeyframe := make(chan struct{}, 4)
-	phoneControlKeyframe := make(chan struct{}, 4)
+	phoneSignals := make(chan string, 64)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-				_, data, err := conn.Read(ctx)
-				cancel()
-				if err != nil {
-					return
-				}
-				if bytes.Contains(data, []byte(`"type":"start"`)) {
-					phoneStart <- struct{}{}
-				}
-				if bytes.Contains(data, []byte(`"type":"keyframe"`)) {
-					phoneControlKeyframe <- struct{}{}
-				}
-			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -1349,24 +1080,13 @@ func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) 
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-				_, data, err := conn.Read(ctx)
-				cancel()
-				if err != nil {
-					return
-				}
-				if bytes.Contains(data, []byte(`"type":"keyframe"`)) {
-					phoneVideoKeyframe <- struct{}{}
-				}
-			}
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
+			readPhoneSignals(r.Context(), conn, phoneSignals)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -1402,7 +1122,7 @@ func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) 
 			BaseURL:    phoneServer.URL,
 			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
 		},
-	}, store, relay)
+	}, &recordingTicketStore{Store: store, commandSink: phoneSignals}, relay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1420,19 +1140,19 @@ func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) 
 	}
 	defer videoConn.Close(websocket.StatusNormalClosure, "test complete")
 
-	waitForSignal(t, phoneStart, "initial phone start")
-	waitForSignal(t, phoneVideoKeyframe, "initial phone video keyframe")
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "initial phone keyframe")
+	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 	server.direct.mu.Lock()
 	server.direct.lastVideoClientAt = time.Now().Add(-15 * time.Second)
 	server.direct.mu.Unlock()
 	if err := videoConn.Write(ctx, websocket.MessageText, []byte(`{"type":"recover_stream","reason":"test_stale"}`)); err != nil {
 		t.Fatalf("write recover_stream: %v", err)
 	}
-	waitForSignal(t, phoneControlKeyframe, "recovery phone keyframe")
-	select {
-	case <-phoneStart:
-		t.Fatal("connected recovery should not restart the phone stream")
-	case <-time.After(250 * time.Millisecond):
+	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
+		t.Fatalf("recover_stream text on media socket should be ignored; got=%d", got)
+	}
+	if got := countPhoneSignalsWithin(phoneSignals, "start", 250*time.Millisecond); got != 0 {
+		t.Fatalf("connected recovery should not restart the phone stream; starts=%d", got)
 	}
 }
 
@@ -1446,8 +1166,8 @@ func TestVideoRecoverDuringStartupGraceOnlyRequestsKeyframe(t *testing.T) {
 	}
 
 	got := countPhoneSignalTypesWithin(phoneSignals, 300*time.Millisecond)
-	if got["keyframe"] != 1 {
-		t.Fatalf("startup recovery keyframes forwarded = %d want 1; all signals=%v", got["keyframe"], got)
+	if got["recover_stream"] != 0 {
+		t.Fatalf("startup recovery text should be ignored on media socket; all signals=%v", got)
 	}
 	if got["start"] != 0 {
 		t.Fatalf("startup recovery should not restart phone stream; signals=%v", got)
@@ -1466,8 +1186,8 @@ func TestVideoKeyframeRequestsAreRateLimitedPerViewer(t *testing.T) {
 	}
 
 	got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond)
-	if got != 1 {
-		t.Fatalf("keyframe requests forwarded = %d want 1", got)
+	if got != 0 {
+		t.Fatalf("keyframe text on media socket should be ignored; got=%d", got)
 	}
 }
 
@@ -1479,38 +1199,32 @@ func TestVideoKeyframeRequestsDuringStartupBypassPerViewerCooldown(t *testing.T)
 	if err := videoConn.Write(ctx, websocket.MessageText, []byte(`{"type":"keyframe","reason":"startup_first"}`)); err != nil {
 		t.Fatal(err)
 	}
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "first startup keyframe")
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("startup keyframe text on media socket should be ignored; got=%d", got)
+	}
 
 	time.Sleep(keyframeRequestGlobalInterval + 100*time.Millisecond)
 	if err := videoConn.Write(ctx, websocket.MessageText, []byte(`{"type":"keyframe","reason":"startup_second"}`)); err != nil {
 		t.Fatal(err)
 	}
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "second startup keyframe")
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("second startup keyframe text on media socket should be ignored; got=%d", got)
+	}
 }
 
 func TestStartupKeyframeWaitsForConnectingRelay(t *testing.T) {
-	var controlDials atomic.Int32
 	var videoDials atomic.Int32
-	firstControlDialed := make(chan struct{}, 1)
+	firstVideoDialed := make(chan struct{}, 1)
 	releaseVideoAccept := make(chan struct{})
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session":
-			controlDials.Add(1)
-			select {
-			case firstControlDialed <- struct{}{}:
-			default:
-			}
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			videoDials.Add(1)
+			select {
+			case firstVideoDialed <- struct{}{}:
+			default:
+			}
 			select {
 			case <-releaseVideoAccept:
 			case <-r.Context().Done():
@@ -1523,8 +1237,6 @@ func TestStartupKeyframeWaitsForConnectingRelay(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			readPhoneSignals(r.Context(), conn, make(chan string, 4))
-		case "/api/v1/session/start", "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1537,7 +1249,7 @@ func TestStartupKeyframeWaitsForConnectingRelay(t *testing.T) {
 
 	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
 	select {
-	case <-firstControlDialed:
+	case <-firstVideoDialed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not begin phone connection")
 	}
@@ -1548,37 +1260,24 @@ func TestStartupKeyframeWaitsForConnectingRelay(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(releaseVideoAccept)
 
-	if got := controlDials.Load(); got != 1 {
-		t.Fatalf("startup keyframe restarted connecting relay: control dials = %d, want 1", got)
-	}
 	if got := videoDials.Load(); got != 1 {
 		t.Fatalf("startup keyframe restarted connecting relay: video dials = %d, want 1", got)
 	}
 }
 
 func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
-	var controlDials atomic.Int32
 	var videoDials atomic.Int32
-	firstControlDialed := make(chan struct{}, 1)
+	firstVideoDialed := make(chan struct{}, 1)
 	releaseVideoAccept := make(chan struct{})
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session":
-			controlDials.Add(1)
-			select {
-			case firstControlDialed <- struct{}{}:
-			default:
-			}
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			<-r.Context().Done()
 		case "/api/v1/stream":
 			videoDials.Add(1)
+			select {
+			case firstVideoDialed <- struct{}{}:
+			default:
+			}
 			select {
 			case <-releaseVideoAccept:
 			case <-r.Context().Done():
@@ -1591,8 +1290,6 @@ func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			readPhoneSignals(r.Context(), conn, make(chan string, 4))
-		case "/api/v1/session/start", "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1606,7 +1303,7 @@ func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
 	server.direct.addVideoClient()
 	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
 	select {
-	case <-firstControlDialed:
+	case <-firstVideoDialed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not begin phone connection")
 	}
@@ -1615,9 +1312,6 @@ func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(releaseVideoAccept)
 
-	if got := controlDials.Load(); got != 1 {
-		t.Fatalf("startup recovery restarted connecting relay: control dials = %d, want 1", got)
-	}
 	if got := videoDials.Load(); got != 1 {
 		t.Fatalf("startup recovery restarted connecting relay: video dials = %d, want 1", got)
 	}
@@ -1659,8 +1353,8 @@ func TestVideoRecoveryRequestsAreRateLimitedGlobally(t *testing.T) {
 	if got["start"] != 0 {
 		t.Fatalf("connected stream recovery should not restart phone stream; signals=%v", got)
 	}
-	if got["keyframe"] != 1 {
-		t.Fatalf("stream recovery keyframe requests forwarded = %d want 1", got["keyframe"])
+	if got["recover_stream"] != 0 {
+		t.Fatalf("stream recovery text should be ignored on media socket; signals=%v", got)
 	}
 }
 
@@ -1668,16 +1362,6 @@ func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T
 	phoneSignals := make(chan string, 64)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			readPhoneSignals(r.Context(), conn, phoneSignals)
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -1686,13 +1370,12 @@ func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			readPhoneSignals(r.Context(), conn, phoneSignals)
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(phoneServer.Close)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
 	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
 	t.Cleanup(ticketServer.Close)
@@ -1709,13 +1392,12 @@ func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T
 	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
 
 	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
-	waitForPhoneSignal(t, phoneSignals, "start", "initial phone start")
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 
 	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"recover_stream","reason":"control_video_gone"}`)); err != nil {
 		t.Fatalf("write recover_stream over control socket: %v", err)
 	}
-	waitForPhoneSignalCounts(t, phoneSignals, map[string]int{"keyframe": 1}, "control recovery keyframe")
+	waitForPhoneSignalCounts(t, phoneSignals, map[string]int{"recover_stream": 1}, "control recovery command")
 	if got := countPhoneSignalsWithin(phoneSignals, "start", 250*time.Millisecond); got != 0 {
 		t.Fatalf("connected control recovery should not restart phone stream; starts=%d", got)
 	}
@@ -1723,23 +1405,8 @@ func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T
 
 func TestStreamRecoveryAfterRelayReconnectDoesNotDuplicateStart(t *testing.T) {
 	phoneSignals := make(chan string, 64)
-	httpStart := make(chan struct{}, 4)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			select {
-			case httpStart <- struct{}{}:
-			default:
-			}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			readPhoneSignals(r.Context(), conn, phoneSignals)
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -1748,13 +1415,12 @@ func TestStreamRecoveryAfterRelayReconnectDoesNotDuplicateStart(t *testing.T) {
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			readPhoneSignals(r.Context(), conn, phoneSignals)
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(phoneServer.Close)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
 	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
 	t.Cleanup(ticketServer.Close)
@@ -1771,7 +1437,6 @@ func TestStreamRecoveryAfterRelayReconnectDoesNotDuplicateStart(t *testing.T) {
 	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
 
 	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
-	waitForPhoneSignal(t, phoneSignals, "start", "initial phone start")
 	relay.Reconnect("test_force_disconnected_relay")
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1781,17 +1446,15 @@ func TestStreamRecoveryAfterRelayReconnectDoesNotDuplicateStart(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
-	drainHTTPStarts(httpStart, 150*time.Millisecond)
 
 	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"recover_stream","reason":"relay_disconnected"}`)); err != nil {
 		t.Fatalf("write recover_stream over control socket: %v", err)
 	}
 
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "recovered relay keyframe")
+	waitForPhoneSignal(t, phoneSignals, "recover_stream", "recovered relay command")
 	if got := countPhoneSignalsWithin(phoneSignals, "start", 250*time.Millisecond); got != 0 {
 		t.Fatalf("recovered relay should use keyframes without duplicate starts; starts=%d", got)
 	}
-	_ = httpStart
 }
 
 func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *websocket.Conn) {
@@ -1799,16 +1462,6 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 	phoneSignals := make(chan string, 64)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			readPhoneSignals(r.Context(), conn, phoneSignals)
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -1817,13 +1470,12 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
 			readPhoneSignals(r.Context(), conn, phoneSignals)
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(phoneServer.Close)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -1860,7 +1512,7 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 			BaseURL:    phoneServer.URL,
 			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
 		},
-	}, store, relay)
+	}, &recordingTicketStore{Store: store, commandSink: phoneSignals}, relay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1878,7 +1530,7 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 	t.Cleanup(func() {
 		_ = videoConn.Close(websocket.StatusNormalClosure, "test complete")
 	})
-	waitForPhoneSignal(t, phoneSignals, "start", "initial phone start")
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "initial phone keyframe")
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 	return server, phoneSignals, videoConn
 }
@@ -1904,6 +1556,10 @@ func newTicketRecoveryTestServer(t *testing.T, phoneBaseURL string) (*Server, *h
 		ReconnectMaxDelay: time.Hour,
 		NoViewerStopDelay: time.Hour,
 	})
+	storeForServer := state.Store(store)
+	if sink := ticketStreamCommandSink(phoneBaseURL); sink != nil {
+		storeForServer = &recordingTicketStore{Store: store, commandSink: sink}
+	}
 	server, err := NewServer(config.Config{
 		PublicBaseURL: "http://ticket.test",
 		TicketID:      "vivi-default",
@@ -1919,7 +1575,7 @@ func newTicketRecoveryTestServer(t *testing.T, phoneBaseURL string) (*Server, *h
 			BaseURL:    phoneBaseURL,
 			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneBaseURL}},
 		},
-	}, store, relay)
+	}, storeForServer, relay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1946,6 +1602,28 @@ func readPhoneSignals(ctx context.Context, conn *websocket.Conn, phoneSignals ch
 			default:
 			}
 		}
+		if bytes.Contains(data, []byte(`"type":"recover_stream"`)) {
+			select {
+			case phoneSignals <- "recover_stream":
+			default:
+			}
+		}
+	}
+}
+
+func phoneSignalType(message string) string {
+	message = strings.TrimSpace(message)
+	switch {
+	case message == "start" || strings.Contains(message, `"type":"start"`):
+		return "start"
+	case message == "keyframe" || strings.Contains(message, `"type":"keyframe"`):
+		return "keyframe"
+	case message == "recover_stream" || strings.Contains(message, `"type":"recover_stream"`):
+		return "recover_stream"
+	case message == "activity" || strings.Contains(message, `"type":"activity"`):
+		return "activity"
+	default:
+		return message
 	}
 }
 
@@ -1955,7 +1633,7 @@ func waitForPhoneSignal(t *testing.T, phoneSignals <-chan string, signal string,
 	for {
 		select {
 		case got := <-phoneSignals:
-			if got == signal {
+			if phoneSignalType(got) == signal {
 				return
 			}
 		case <-deadline:
@@ -2000,7 +1678,7 @@ func waitForPhoneSignalCounts(t *testing.T, phoneSignals <-chan string, want map
 		}
 		select {
 		case signal := <-phoneSignals:
-			got[signal]++
+			got[phoneSignalType(signal)]++
 		case <-deadline:
 			t.Fatalf("timed out waiting for %s; got %v want %v", label, got, want)
 		}
@@ -2037,7 +1715,7 @@ func countPhoneSignalTypesWithin(phoneSignals <-chan string, duration time.Durat
 	for {
 		select {
 		case got := <-phoneSignals:
-			counts[got]++
+			counts[phoneSignalType(got)]++
 		case <-timer.C:
 			return counts
 		}

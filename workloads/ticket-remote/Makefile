@@ -1,4 +1,4 @@
-.PHONY: run test build tidy spacetime-install spacetime-build web-client-install web-client-build docker-image-build clean-local
+.PHONY: run test build tidy spacetime-install spacetime-build spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build docker-image-build clean-local
 
 SPACETIME ?= $(HOME)/.local/bin/spacetime
 
@@ -7,9 +7,16 @@ run:
 
 test:
 	go test ./...
+	cd ./spacetime-sidecar && cargo test
 
 build:
 	go build -o ./bin/ticket-remote ./cmd/ticket-remote
+
+spacetime-sidecar-build:
+	cd ./spacetime-sidecar && cargo build
+
+spacetime-sidecar-test:
+	cd ./spacetime-sidecar && cargo test
 
 tidy:
 	go mod tidy
@@ -30,4 +37,4 @@ docker-image-build:
 	docker build -f ../../infra/arbuzas/docker/images/ticket-remote.Dockerfile -t arbuzas/ticket-remote:dev ../../
 
 clean-local:
-	rm -rf ./bin ./spacetimedb/node_modules ./spacetimedb/dist ./web-client/node_modules ./web-client/src/generated
+	rm -rf ./bin ./spacetimedb/node_modules ./spacetimedb/dist ./web-client/node_modules ./web-client/src/generated ./spacetime-sidecar/target

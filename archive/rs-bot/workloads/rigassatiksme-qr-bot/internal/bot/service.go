@@ -1,0 +1,1076 @@
+package bot
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	JobWaiting   = "waiting"
+	JobRunning   = "running"
+	JobSucceeded = "succeeded"
+	JobFailed    = "failed"
+	JobCanceled  = "canceled"
+)
+
+var fiveDigitCodePattern = regexp.MustCompile(`^[0-9]{5}$`)
+
+type MentionedUser struct {
+	UserID   int64
+	Username string
+}
+
+type Message struct {
+	MessageID        int64
+	ReplyToMessageID int64
+	ChatID           int64
+	ChatType         string
+	UserID           int64
+	Username         string
+	Text             string
+	MentionedUsers   []MentionedUser
+}
+
+type Callback struct {
+	ChatID   int64
+	ChatType string
+	UserID   int64
+	Username string
+	Data     string
+}
+
+type InlineButton struct {
+	Text string
+	Data string
+}
+
+type QRJob struct {
+	ID          string `json:"id"`
+	ChatID      string `json:"chatId"`
+	UserID      string `json:"userId"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason,omitempty"`
+	Attempts    int    `json:"attempts"`
+	CreatedAt   string `json:"createdAt"`
+	UpdatedAt   string `json:"updatedAt"`
+	StartedAt   string `json:"startedAt,omitempty"`
+	CompletedAt string `json:"completedAt,omitempty"`
+}
+
+type RSLoginSnapshot struct {
+	State         string `json:"state"`
+	PhoneLast4    string `json:"phoneLast4,omitempty"`
+	StartedAt     string `json:"startedAt,omitempty"`
+	CompletedAt   string `json:"completedAt,omitempty"`
+	FailureReason string `json:"failureReason,omitempty"`
+	SMSAttempts   int    `json:"smsAttempts,omitempty"`
+}
+
+type ServiceConfig struct {
+	PollInterval          time.Duration
+	PollTimeout           time.Duration
+	Access                AccessController
+	AnnouncementSendDelay time.Duration
+}
+
+type Telegram interface {
+	SendMessage(ctx context.Context, chatID int64, text string) error
+	SendPhoto(ctx context.Context, chatID int64, image []byte, mime string, caption string) error
+}
+
+type buttonTelegram interface {
+	SendMessageWithButtons(ctx context.Context, chatID int64, text string, buttons [][]InlineButton) error
+}
+
+type LanguageStore interface {
+	UserLanguage(ctx context.Context, req AccessRequest) (string, error)
+	SetUserLanguage(ctx context.Context, req AccessRequest, language string) error
+}
+
+type Broker interface {
+	CreateQRJob(ctx context.Context, chatID string, userID string, code string) (QRJob, error)
+	Job(ctx context.Context, id string) (QRJob, error)
+	LatestJob(ctx context.Context, userID string) (QRJob, bool, error)
+	CancelLatestJob(ctx context.Context, userID string) (QRJob, bool, error)
+	JobImage(ctx context.Context, id string) ([]byte, string, error)
+	StartRSLogin(ctx context.Context, phone string) (RSLoginSnapshot, error)
+	SubmitRSLoginSMS(ctx context.Context, code string) (RSLoginSnapshot, error)
+	CancelRSLogin(ctx context.Context) (RSLoginSnapshot, error)
+	RSLoginStatus(ctx context.Context) (RSLoginSnapshot, error)
+}
+
+type Service struct {
+	cfg                ServiceConfig
+	telegram           Telegram
+	broker             Broker
+	access             AccessController
+	announcementMu     sync.Mutex
+	announcementDrafts map[string]announcementDraft
+	rsLoginMu          sync.Mutex
+	rsLoginByAdmin     map[string]rsLoginSession
+}
+
+type rsLoginSession struct {
+	StartedAt  time.Time
+	PhoneLast4 string
+}
+
+func NewService(cfg ServiceConfig, telegram Telegram, broker Broker) *Service {
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 250 * time.Millisecond
+	}
+	if cfg.PollTimeout <= 0 {
+		cfg.PollTimeout = 10 * time.Minute
+	}
+	if cfg.AnnouncementSendDelay <= 0 {
+		cfg.AnnouncementSendDelay = 250 * time.Millisecond
+	}
+	return &Service{cfg: cfg, telegram: telegram, broker: broker, access: cfg.Access, announcementDrafts: map[string]announcementDraft{}, rsLoginByAdmin: map[string]rsLoginSession{}}
+}
+
+func (s *Service) HandleMessage(ctx context.Context, msg Message) error {
+	text := strings.TrimSpace(msg.Text)
+	userID := strconv.FormatInt(msg.UserID, 10)
+	accessReq := accessRequestFromMessage(msg)
+	language := s.preferredLanguage(ctx, accessReq)
+	accessReq.Language = language
+	if s.access != nil {
+		notice, err := s.access.RecordUser(ctx, accessReq)
+		if err != nil {
+			return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "record_user_error"))
+		}
+		if notice != "" {
+			if err := s.telegram.SendMessage(ctx, msg.ChatID, notice); err != nil {
+				return err
+			}
+		}
+	}
+	if handled, err := s.handleAnnouncementReply(ctx, msg, accessReq, text, language); handled {
+		return err
+	}
+	if command, args, ok := parseCommand(text); ok {
+		if isAnnouncementCommand(command, args) {
+			return s.handleAnnouncementStart(ctx, msg, accessReq, language)
+		}
+		if isRSLoginAdminCommand(command, args) {
+			subCommand := cleanCommand(args[0])
+			subArgs := args[1:]
+			_, err := s.handleRSLoginAdminCommand(ctx, msg, accessReq, subCommand, subArgs, language)
+			return err
+		}
+		if s.access != nil {
+			if response, handled, err := s.access.HandleAdminCommand(ctx, accessReq, command, args); handled {
+				if err != nil {
+					return err
+				}
+				return s.telegram.SendMessage(ctx, msg.ChatID, response)
+			}
+		}
+		switch command {
+		case "start", "help":
+			return s.sendHelp(ctx, msg.ChatID, language)
+		case "status":
+			return s.handleStatus(ctx, msg.ChatID, userID, language)
+		case "cancel":
+			return s.handleCancel(ctx, msg.ChatID, userID, language)
+		case "access":
+			return s.handleAccessStatus(ctx, msg, accessReq, language)
+		case "qr", "ticket", "code":
+			if len(args) != 1 || !fiveDigitCodePattern.MatchString(args[0]) {
+				return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "invalid_qr"))
+			}
+			return s.handleCode(ctx, msg, accessReq, userID, args[0], language)
+		default:
+			return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "unknown_command"))
+		}
+	}
+	if fiveDigitCodePattern.MatchString(text) {
+		return s.handleCode(ctx, msg, accessReq, userID, text, language)
+	}
+	return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "invalid_text"))
+}
+
+func (s *Service) HandleCallback(ctx context.Context, callback Callback) error {
+	if handled, err := s.handleAnnouncementCallback(ctx, callback); handled {
+		return err
+	}
+	language, ok := parseLanguageCallback(callback.Data)
+	if !ok {
+		return nil
+	}
+	req := accessRequestFromCallback(callback)
+	if store, ok := s.access.(LanguageStore); ok {
+		if err := store.SetUserLanguage(ctx, req, language); err != nil {
+			return s.telegram.SendMessage(ctx, callback.ChatID, botText(language, "language_update_error"))
+		}
+	}
+	return s.sendHelp(ctx, callback.ChatID, language)
+}
+
+type announcementDraft struct {
+	ID               string
+	AdminUserID      int64
+	ChatID           int64
+	CommandMessageID int64
+	Text             string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+}
+
+const announcementDraftTTL = 30 * time.Minute
+
+func isAnnouncementCommand(command string, args []string) bool {
+	if cleanCommand(command) != "admin" || len(args) != 1 {
+		return false
+	}
+	return canonicalAdminCommand(args[0]) == "announce"
+}
+
+func (s *Service) handleAnnouncementStart(ctx context.Context, msg Message, accessReq AccessRequest, language string) error {
+	if s.access == nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, accessReq)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+	}
+	if !admin {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	if msg.ChatType != "" && msg.ChatType != "private" {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_private_only"))
+	}
+	if msg.MessageID == 0 {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_tracking_error"))
+	}
+	now := time.Now()
+	draft := announcementDraft{
+		ID:               announcementDraftID(msg.UserID, msg.ChatID, msg.MessageID),
+		AdminUserID:      msg.UserID,
+		ChatID:           msg.ChatID,
+		CommandMessageID: msg.MessageID,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(announcementDraftTTL),
+	}
+	s.announcementMu.Lock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	s.announcementDrafts[draft.ID] = draft
+	s.announcementMu.Unlock()
+	return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_reply_prompt"))
+}
+
+func (s *Service) handleAnnouncementReply(ctx context.Context, msg Message, accessReq AccessRequest, text string, language string) (bool, error) {
+	if msg.ReplyToMessageID == 0 {
+		return false, nil
+	}
+	draft, ok := s.announcementDraftForReply(msg)
+	if !ok {
+		return false, nil
+	}
+	if s.access == nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, accessReq)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+	}
+	if !admin {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_empty"))
+	}
+	recipients, err := s.access.AnnouncementRecipients(ctx)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_recipient_error"))
+	}
+	draft.Text = text
+	s.announcementMu.Lock()
+	s.announcementDrafts[draft.ID] = draft
+	s.announcementMu.Unlock()
+	return true, s.sendAnnouncementPreview(ctx, draft, len(recipients))
+}
+
+func (s *Service) handleAnnouncementCallback(ctx context.Context, callback Callback) (bool, error) {
+	action, draftID, ok := parseAnnouncementCallback(callback.Data)
+	if !ok {
+		return false, nil
+	}
+	req := accessRequestFromCallback(callback)
+	if s.access == nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("lv", "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, req)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "access_check_error"))
+	}
+	if !admin {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("lv", "admin_only"))
+	}
+	draft, ok := s.announcementDraftByID(draftID)
+	if !ok || draft.AdminUserID != callback.UserID || draft.ChatID != callback.ChatID {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_missing"))
+	}
+	if action == "cancel" {
+		s.deleteAnnouncementDraft(draftID)
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_cancelled"))
+	}
+	recipients, err := s.access.AnnouncementRecipients(ctx)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_recipient_error"))
+	}
+	if strings.TrimSpace(draft.Text) == "" {
+		return true, s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_empty"))
+	}
+	s.deleteAnnouncementDraft(draftID)
+	if err := s.telegram.SendMessage(ctx, callback.ChatID, botText("en", "announce_started", len(recipients))); err != nil {
+		return true, err
+	}
+	go s.sendAnnouncement(context.Background(), draft.ChatID, draft.Text, recipients)
+	return true, nil
+}
+
+func (s *Service) announcementDraftForReply(msg Message) (announcementDraft, bool) {
+	now := time.Now()
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	draftID := announcementDraftID(msg.UserID, msg.ChatID, msg.ReplyToMessageID)
+	draft, ok := s.announcementDrafts[draftID]
+	if !ok {
+		return announcementDraft{}, false
+	}
+	if draft.ExpiresAt.Before(now) {
+		delete(s.announcementDrafts, draftID)
+		return announcementDraft{}, false
+	}
+	return draft, true
+}
+
+func (s *Service) announcementDraftByID(draftID string) (announcementDraft, bool) {
+	now := time.Now()
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	s.cleanupExpiredAnnouncementDraftsLocked(now)
+	draft, ok := s.announcementDrafts[draftID]
+	if !ok || draft.ExpiresAt.Before(now) {
+		delete(s.announcementDrafts, draftID)
+		return announcementDraft{}, false
+	}
+	return draft, true
+}
+
+func (s *Service) deleteAnnouncementDraft(draftID string) {
+	s.announcementMu.Lock()
+	defer s.announcementMu.Unlock()
+	delete(s.announcementDrafts, draftID)
+}
+
+func (s *Service) cleanupExpiredAnnouncementDraftsLocked(now time.Time) {
+	for id, draft := range s.announcementDrafts {
+		if !draft.ExpiresAt.IsZero() && draft.ExpiresAt.Before(now) {
+			delete(s.announcementDrafts, id)
+		}
+	}
+}
+
+func (s *Service) sendAnnouncementPreview(ctx context.Context, draft announcementDraft, recipientCount int) error {
+	text := fmt.Sprintf("Announcement preview\nRecipients: %d\n\n%s", recipientCount, draft.Text)
+	buttons := [][]InlineButton{{
+		{Text: "Send", Data: "announce:send:" + draft.ID},
+		{Text: "Cancel", Data: "announce:cancel:" + draft.ID},
+	}}
+	if sender, ok := s.telegram.(buttonTelegram); ok {
+		return sender.SendMessageWithButtons(ctx, draft.ChatID, text, buttons)
+	}
+	return s.telegram.SendMessage(ctx, draft.ChatID, text)
+}
+
+func (s *Service) sendAnnouncement(ctx context.Context, adminChatID int64, text string, recipients []AnnouncementRecipient) {
+	sent := 0
+	failed := 0
+	for i, recipient := range recipients {
+		if i > 0 && s.cfg.AnnouncementSendDelay > 0 {
+			timer := time.NewTimer(s.cfg.AnnouncementSendDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				_ = s.telegram.SendMessage(context.Background(), adminChatID, fmt.Sprintf("Announcement sent to %d users; failed for %d.", sent, failed+len(recipients)-i))
+				return
+			case <-timer.C:
+			}
+		}
+		chatID, err := strconv.ParseInt(strings.TrimSpace(recipient.UserID), 10, 64)
+		if err != nil || chatID == 0 {
+			failed++
+			continue
+		}
+		if err := s.telegram.SendMessage(ctx, chatID, text); err != nil {
+			failed++
+			continue
+		}
+		sent++
+	}
+	_ = s.telegram.SendMessage(context.Background(), adminChatID, fmt.Sprintf("Announcement sent to %d users; failed for %d.", sent, failed))
+}
+
+func announcementDraftID(adminUserID int64, chatID int64, commandMessageID int64) string {
+	return fmt.Sprintf("%d-%d-%d", adminUserID, chatID, commandMessageID)
+}
+
+func parseAnnouncementCallback(data string) (string, string, bool) {
+	data = strings.TrimSpace(data)
+	for _, action := range []string{"send", "cancel"} {
+		prefix := "announce:" + action + ":"
+		if strings.HasPrefix(data, prefix) {
+			draftID := strings.TrimSpace(strings.TrimPrefix(data, prefix))
+			if draftID == "" {
+				return "", "", false
+			}
+			return action, draftID, true
+		}
+	}
+	return "", "", false
+}
+
+func (s *Service) handleCode(ctx context.Context, msg Message, accessReq AccessRequest, userID string, code string, language string) error {
+	reservationID := ""
+	if s.access != nil {
+		reservationID = quotaReservationID(msg, userID)
+		decision, err := s.access.AuthorizeAndReserve(ctx, accessReq, reservationID)
+		if err != nil {
+			return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+		}
+		if !decision.Allowed {
+			return s.telegram.SendMessage(ctx, msg.ChatID, accessDenialTextForLanguage(decision, language))
+		}
+	}
+	job, err := s.broker.CreateQRJob(ctx, strconv.FormatInt(msg.ChatID, 10), userID, code)
+	if err != nil {
+		if s.access != nil {
+			_ = s.access.ReleaseReservation(context.Background(), reservationID)
+		}
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "queue_error"))
+	}
+	if err := s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "queued")); err != nil {
+		return err
+	}
+	go s.waitAndDeliver(context.Background(), msg.ChatID, job.ID, reservationID, language)
+	return nil
+}
+
+func (s *Service) handleStatus(ctx context.Context, chatID int64, userID string, language string) error {
+	job, ok, err := s.broker.LatestJob(ctx, userID)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, chatID, botText(language, "latest_check_error"))
+	}
+	if !ok {
+		return s.telegram.SendMessage(ctx, chatID, botText(language, "no_request"))
+	}
+	return s.telegram.SendMessage(ctx, chatID, statusTextForLanguage(job, language))
+}
+
+func (s *Service) handleCancel(ctx context.Context, chatID int64, userID string, language string) error {
+	_, ok, err := s.broker.CancelLatestJob(ctx, userID)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, chatID, botText(language, "cancel_error"))
+	}
+	if !ok {
+		return s.telegram.SendMessage(ctx, chatID, botText(language, "no_request"))
+	}
+	return s.telegram.SendMessage(ctx, chatID, botText(language, "cancelled"))
+}
+
+func (s *Service) handleAccessStatus(ctx context.Context, msg Message, accessReq AccessRequest, language string) error {
+	if s.access == nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_not_configured"))
+	}
+	text, err := s.access.AccessStatus(ctx, accessReq)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_status_error"))
+	}
+	return s.telegram.SendMessage(ctx, msg.ChatID, text)
+}
+
+const (
+	rsLoginStateIdle          = "idle"
+	rsLoginStateWaitingForSMS = "waiting_for_sms"
+	rsLoginStateSucceeded     = "succeeded"
+	rsLoginStateFailed        = "failed"
+)
+
+var rsLoginAdminCommands = map[string]bool{
+	"login_rs":        true,
+	"login_rs_sms":    true,
+	"login_rs_status": true,
+	"login_rs_cancel": true,
+}
+
+func isRSLoginAdminCommand(command string, args []string) bool {
+	if cleanCommand(command) != "admin" {
+		return false
+	}
+	if len(args) == 0 {
+		return false
+	}
+	return rsLoginAdminCommands[cleanCommand(args[0])]
+}
+
+func (s *Service) handleRSLoginAdminCommand(ctx context.Context, msg Message, accessReq AccessRequest, command string, args []string, language string) (bool, error) {
+	if !rsLoginAdminCommands[command] {
+		return false, nil
+	}
+	if s.access == nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	admin, err := s.access.IsAdmin(ctx, accessReq)
+	if err != nil {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "access_check_error"))
+	}
+	if !admin {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText(language, "admin_only"))
+	}
+	if msg.ChatType != "" && msg.ChatType != "private" {
+		return true, s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "announce_private_only"))
+	}
+	switch command {
+	case "login_rs":
+		return true, s.handleAdminLoginRSStart(ctx, msg, accessReq, args, language)
+	case "login_rs_sms":
+		return true, s.handleAdminLoginRSSMS(ctx, msg, accessReq, args, language)
+	case "login_rs_status":
+		return true, s.handleAdminLoginRSStatus(ctx, msg, language)
+	case "login_rs_cancel":
+		return true, s.handleAdminLoginRSCancel(ctx, msg, language)
+	}
+	return false, nil
+}
+
+func (s *Service) handleAdminLoginRSStart(ctx context.Context, msg Message, accessReq AccessRequest, args []string, language string) error {
+	if len(args) == 0 {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_usage"))
+	}
+	phone := strings.TrimSpace(strings.Join(args, " "))
+	snapshot, err := s.broker.StartRSLogin(ctx, phone)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, fmt.Sprintf("RS login failed to start: %s", err.Error()))
+	}
+	s.rememberRSLogin(msg, snapshot)
+	return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_started", snapshot.PhoneLast4))
+}
+
+func (s *Service) handleAdminLoginRSSMS(ctx context.Context, msg Message, accessReq AccessRequest, args []string, language string) error {
+	if len(args) != 1 {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_code_required"))
+	}
+	if !s.hasActiveRSLogin(msg) {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_no_active"))
+	}
+	code := args[0]
+	s.clearRSLogin(msg)
+	_, err := s.broker.SubmitRSLoginSMS(ctx, code)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, fmt.Sprintf("RS login SMS dispatch failed: %s", err.Error()))
+	}
+	return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_sms_accepted"))
+}
+
+func (s *Service) handleAdminLoginRSStatus(ctx context.Context, msg Message, language string) error {
+	snapshot, err := s.broker.RSLoginStatus(ctx)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_status_error"))
+	}
+	return s.telegram.SendMessage(ctx, msg.ChatID, formatRSLoginStatusForLanguage(snapshot, language))
+}
+
+func (s *Service) handleAdminLoginRSCancel(ctx context.Context, msg Message, language string) error {
+	snapshot, err := s.broker.CancelRSLogin(ctx)
+	if err != nil {
+		return s.telegram.SendMessage(ctx, msg.ChatID, botText("en", "admin_login_rs_status_error"))
+	}
+	s.clearRSLogin(msg)
+	return s.telegram.SendMessage(ctx, msg.ChatID, formatRSLoginStatusForLanguage(snapshot, language))
+}
+
+func (s *Service) rememberRSLogin(msg Message, snapshot RSLoginSnapshot) {
+	s.rsLoginMu.Lock()
+	defer s.rsLoginMu.Unlock()
+	if s.rsLoginByAdmin == nil {
+		s.rsLoginByAdmin = map[string]rsLoginSession{}
+	}
+	s.rsLoginByAdmin[rsLoginAdminKey(msg)] = rsLoginSession{
+		StartedAt:  time.Now(),
+		PhoneLast4: snapshot.PhoneLast4,
+	}
+}
+
+func (s *Service) clearRSLogin(msg Message) {
+	s.rsLoginMu.Lock()
+	defer s.rsLoginMu.Unlock()
+	delete(s.rsLoginByAdmin, rsLoginAdminKey(msg))
+}
+
+func (s *Service) hasActiveRSLogin(msg Message) bool {
+	s.rsLoginMu.Lock()
+	defer s.rsLoginMu.Unlock()
+	_, ok := s.rsLoginByAdmin[rsLoginAdminKey(msg)]
+	return ok
+}
+
+func rsLoginAdminKey(msg Message) string {
+	return fmt.Sprintf("%d:%d", msg.UserID, msg.ChatID)
+}
+
+func formatRSLoginStatusForLanguage(snapshot RSLoginSnapshot, language string) string {
+	switch snapshot.State {
+	case rsLoginStateIdle:
+		return botText(language, "admin_login_rs_status_idle")
+	case rsLoginStateWaitingForSMS:
+		return botText(language, "admin_login_rs_status_waiting", snapshot.PhoneLast4)
+	case rsLoginStateSucceeded:
+		return botText(language, "admin_login_rs_status_succeeded", snapshot.PhoneLast4)
+	case rsLoginStateFailed:
+		return botText(language, "admin_login_rs_status_failed", snapshot.PhoneLast4, snapshot.FailureReason)
+	}
+	return fmt.Sprintf("RS login state: %s", snapshot.State)
+}
+
+func (s *Service) waitAndDeliver(ctx context.Context, chatID int64, jobID string, reservationID string, language string) {
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.PollTimeout)
+	defer cancel()
+	ticker := time.NewTicker(s.cfg.PollInterval)
+	defer ticker.Stop()
+	for {
+		job, err := s.broker.Job(ctx, jobID)
+		if err == nil {
+			switch job.Status {
+			case JobSucceeded:
+				if s.access != nil {
+					_ = s.access.CommitReservation(context.Background(), reservationID)
+				}
+				image, mime, imageErr := s.broker.JobImage(ctx, jobID)
+				if imageErr != nil {
+					_ = s.telegram.SendMessage(ctx, chatID, botText(language, "qr_image_expired"))
+					return
+				}
+				_ = s.telegram.SendPhoto(ctx, chatID, image, mime, "")
+				return
+			case JobFailed:
+				if s.access != nil {
+					_ = s.access.ReleaseReservation(context.Background(), reservationID)
+				}
+				_ = s.telegram.SendMessage(ctx, chatID, botText(language, "qr_failed", cleanReasonForLanguage(job.Reason, language)))
+				return
+			case JobCanceled:
+				if s.access != nil {
+					_ = s.access.ReleaseReservation(context.Background(), reservationID)
+				}
+				_ = s.telegram.SendMessage(ctx, chatID, botText(language, "job_cancelled"))
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			_ = s.telegram.SendMessage(context.Background(), chatID, botText(language, "still_waiting"))
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func quotaReservationID(msg Message, userID string) string {
+	return fmt.Sprintf("qr:%s:%d:%d", strings.TrimSpace(userID), msg.ChatID, time.Now().UnixNano())
+}
+
+func statusText(job QRJob) string {
+	return statusTextForLanguage(job, "en")
+}
+
+func statusTextForLanguage(job QRJob, language string) string {
+	switch job.Status {
+	case JobWaiting:
+		if job.Reason == "ticket_active" {
+			return botText(language, "status_ticket_active")
+		}
+		return botText(language, "status_waiting")
+	case JobRunning:
+		return botText(language, "status_running")
+	case JobSucceeded:
+		return botText(language, "status_ready")
+	case JobCanceled:
+		return botText(language, "status_cancelled")
+	case JobFailed:
+		return botText(language, "qr_failed", cleanReasonForLanguage(job.Reason, language))
+	default:
+		return botText(language, "status_unknown", job.Status)
+	}
+}
+
+func cleanReason(reason string) string {
+	return cleanReasonForLanguage(reason, "en")
+}
+
+func cleanReasonForLanguage(reason string, language string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return botText(language, "reason_unknown")
+	}
+	switch reason {
+	case "rs_app_attention_required", "rs_monthly_ticket_unknown_state":
+		return botText(language, "reason_rs_attention")
+	case "rs_monthly_ticket_stale_code":
+		return botText(language, "reason_stale_code")
+	case "rs_auth_blocked":
+		return botText(language, "reason_rs_auth_blocked")
+	}
+	return strings.ReplaceAll(reason, "_", " ")
+}
+
+func parseCommand(text string) (string, []string, bool) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") {
+		return "", nil, false
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return "", nil, false
+	}
+	command := cleanCommand(fields[0])
+	if command == "" {
+		return "", nil, false
+	}
+	return command, fields[1:], true
+}
+
+func (s *Service) preferredLanguage(ctx context.Context, req AccessRequest) string {
+	if store, ok := s.access.(LanguageStore); ok {
+		language, err := store.UserLanguage(ctx, req)
+		if err == nil && strings.TrimSpace(language) != "" {
+			return normalizePublicBotLanguage(language)
+		}
+	}
+	return "lv"
+}
+
+func (s *Service) sendHelp(ctx context.Context, chatID int64, language string) error {
+	language = normalizePublicBotLanguage(language)
+	text := startText(language)
+	buttons := languageButtons(language)
+	if sender, ok := s.telegram.(buttonTelegram); ok {
+		return sender.SendMessageWithButtons(ctx, chatID, text, buttons)
+	}
+	return s.telegram.SendMessage(ctx, chatID, text)
+}
+
+func parseLanguageCallback(data string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(data)) {
+	case "lang:ru":
+		return "ru", true
+	case "lang:lv":
+		return "lv", true
+	default:
+		return "", false
+	}
+}
+
+func normalizeBotLanguage(language string) string {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "ru", "rus", "russian":
+		return "ru"
+	case "en", "eng", "english":
+		return "en"
+	default:
+		return "lv"
+	}
+}
+
+func normalizePublicBotLanguage(language string) string {
+	if normalizeBotLanguage(language) == "ru" {
+		return "ru"
+	}
+	return "lv"
+}
+
+func languageButtons(language string) [][]InlineButton {
+	if normalizePublicBotLanguage(language) == "ru" {
+		return [][]InlineButton{{{Text: "Latviski", Data: "lang:lv"}}}
+	}
+	return [][]InlineButton{{{Text: "Русский", Data: "lang:ru"}}}
+}
+
+func startText(language string) string {
+	if normalizePublicBotLanguage(language) == "ru" {
+		return strings.Join([]string{
+			"rs biļete бот помогает получить QR для транспорта.",
+			"Отправь 5-значный код из приложения Rīgas satiksme. Я подожду, пока телефон освободится, и пришлю QR изображение.",
+			"В группах используй /qr 12345, чтобы Telegram privacy mode доставил запрос.",
+			"Команды: /qr 12345, /status, /cancel, /access, /help.",
+		}, "\n")
+	}
+	return strings.Join([]string{
+		"rs biļete bots palīdz saņemt transporta QR.",
+		"Nosūti 5 ciparu kodu no Rīgas satiksme lietotnes. Es pagaidīšu, līdz telefons būs brīvs, un atsūtīšu QR attēlu.",
+		"Grupās izmanto /qr 12345, lai Telegram privacy mode piegādātu pieprasījumu.",
+		"Komandas: /qr 12345, /status, /cancel, /access, /help.",
+	}, "\n")
+}
+
+func botText(language string, key string, args ...any) string {
+	language = normalizeBotLanguage(language)
+	var text string
+	switch language {
+	case "ru":
+		text = botTextRU(key)
+	case "en":
+		text = botTextEN(key)
+	default:
+		text = botTextLV(key)
+	}
+	if text == "" {
+		text = botTextLV(key)
+	}
+	if len(args) > 0 {
+		return fmt.Sprintf(text, args...)
+	}
+	return text
+}
+
+func botTextLV(key string) string {
+	switch key {
+	case "record_user_error":
+		return "Neizdevās atjaunināt piekļuvi. Lūdzu, mēģini vēlreiz."
+	case "invalid_qr":
+		return "Lietojums: /qr 12345"
+	case "unknown_command":
+		return "Nezināma komanda. Izmanto /help, /qr 12345, /status, /cancel vai nosūti tieši 5 ciparus."
+	case "invalid_text":
+		return "Nosūti tieši 5 ciparus vai izmanto /status un /cancel."
+	case "language_update_error":
+		return "Neizdevās nomainīt valodu. Lūdzu, mēģini vēlreiz."
+	case "access_check_error":
+		return "Neizdevās pārbaudīt piekļuvi. Lūdzu, mēģini vēlreiz."
+	case "queue_error":
+		return "Neizdevās pievienot kodu rindai. Lūdzu, mēģini vēlreiz."
+	case "queued":
+		return "Pieprasījums gaida. Atsūtīšu QR attēlu šeit, kad tas būs gatavs."
+	case "latest_check_error":
+		return "Neizdevās pārbaudīt pēdējo pieprasījumu."
+	case "no_request":
+		return "Nav rindā esoša QR pieprasījuma."
+	case "cancel_error":
+		return "Neizdevās atcelt pēdējo pieprasījumu."
+	case "cancelled":
+		return "Pēdējais QR pieprasījums atcelts."
+	case "access_not_configured":
+		return "Šim botam piekļuves kontrole nav ieslēgta."
+	case "access_status_error":
+		return "Neizdevās pārbaudīt piekļuves statusu."
+	case "qr_image_expired":
+		return "QR tika izveidots, bet attēls paspēja izbeigties, pirms varēju to atsūtīt."
+	case "qr_failed":
+		return "QR pieprasījums neizdevās: %s"
+	case "job_cancelled":
+		return "QR pieprasījums tika atcelts."
+	case "still_waiting":
+		return "QR pieprasījums joprojām gaida. Izmanto /status, lai pārbaudītu vēlāk."
+	case "status_ticket_active":
+		return "QR pieprasījums gaida, jo biļetes lapa pašlaik tiek izmantota."
+	case "status_waiting":
+		return "QR pieprasījums gaida."
+	case "status_running":
+		return "QR pieprasījums pašlaik tiek apstrādāts."
+	case "status_ready":
+		return "QR pieprasījums ir gatavs."
+	case "status_cancelled":
+		return "QR pieprasījums tika atcelts."
+	case "status_unknown":
+		return "QR pieprasījuma statuss: %s."
+	case "reason_unknown":
+		return "nezināms"
+	case "reason_rs_attention":
+		return "Rīgas satiksme lietotnei vajag uzmanību. Atver to vienreiz un mēģini vēlreiz."
+	case "reason_stale_code":
+		return "Rīgas satiksme joprojām rādīja iepriekšējo QR pēc jaunā koda ievades. Novecojušu attēlu nesūtīju."
+	case "reason_rs_auth_blocked":
+		return "Rīgas Satiksme lietotnei beigusies sesija telefonā. Lūdzu, mēģini vēlreiz pēc brīža — ja neatjaunojas, admins var atjaunot sesiju ar /admin login_rs."
+	case "admin_only":
+		return "Tikai administratoram."
+	case "unknown_admin":
+		return "Nezināma administratora komanda. Izmanto /admin palīdzībai."
+	}
+	return ""
+}
+
+func botTextRU(key string) string {
+	switch key {
+	case "record_user_error":
+		return "Не удалось обновить доступ. Попробуй ещё раз."
+	case "invalid_qr":
+		return "Используй: /qr 12345"
+	case "unknown_command":
+		return "Неизвестная команда. Используй /help, /qr 12345, /status, /cancel или отправь ровно 5 цифр."
+	case "invalid_text":
+		return "Отправь ровно 5 цифр или используй /status и /cancel."
+	case "language_update_error":
+		return "Не удалось изменить язык. Попробуй ещё раз."
+	case "access_check_error":
+		return "Не удалось проверить доступ. Попробуй ещё раз."
+	case "queue_error":
+		return "Не удалось поставить код в очередь. Попробуй ещё раз."
+	case "queued":
+		return "Запрос ожидает. Я пришлю QR изображение сюда, когда оно будет готово."
+	case "latest_check_error":
+		return "Не удалось проверить последний запрос."
+	case "no_request":
+		return "Нет QR-запроса в очереди."
+	case "cancel_error":
+		return "Не удалось отменить последний запрос."
+	case "cancelled":
+		return "Последний QR-запрос отменён."
+	case "access_not_configured":
+		return "Контроль доступа для этого бота не настроен."
+	case "access_status_error":
+		return "Не удалось проверить статус доступа."
+	case "qr_image_expired":
+		return "QR был создан, но изображение истекло до отправки."
+	case "qr_failed":
+		return "QR-запрос не удался: %s"
+	case "job_cancelled":
+		return "QR-запрос был отменён."
+	case "still_waiting":
+		return "QR-запрос всё ещё ожидает. Используй /status, чтобы проверить позже."
+	case "status_ticket_active":
+		return "QR-запрос ожидает, потому что страница билета сейчас занята."
+	case "status_waiting":
+		return "QR-запрос ожидает."
+	case "status_running":
+		return "QR-запрос сейчас выполняется."
+	case "status_ready":
+		return "QR-запрос готов."
+	case "status_cancelled":
+		return "QR-запрос был отменён."
+	case "status_unknown":
+		return "Статус QR-запроса: %s."
+	case "reason_unknown":
+		return "неизвестно"
+	case "reason_rs_attention":
+		return "Приложению RS нужно внимание. Открой его один раз и попробуй снова."
+	case "reason_stale_code":
+		return "Rīgas satiksme всё ещё показывала предыдущий QR после ввода нового кода. Устаревшее изображение не отправлялось."
+	case "reason_rs_auth_blocked":
+		return "Сессия приложения Rīgas Satiksme истекла на телефоне. Попробуй позже — если не получится, админ может восстановить сессию через /admin login_rs."
+	case "admin_only":
+		return "Только для администратора."
+	case "unknown_admin":
+		return "Неизвестная команда администратора. Используй /admin для помощи."
+	}
+	return ""
+}
+
+func botTextEN(key string) string {
+	switch key {
+	case "record_user_error":
+		return "I could not update ticket access. Please try again."
+	case "invalid_qr":
+		return "Usage: /qr 12345"
+	case "unknown_command":
+		return "Unknown command. Use /help, /qr 12345, /status, /cancel, or send exactly 5 digits."
+	case "invalid_text":
+		return "Send exactly 5 digits, or use /status and /cancel."
+	case "language_update_error":
+		return "I could not update language preference. Please try again."
+	case "access_check_error":
+		return "I could not check ticket access. Please try again."
+	case "queue_error":
+		return "I could not queue that code. Please try again."
+	case "queued":
+		return "Your request is waiting. I will send the QR image here when it is ready."
+	case "latest_check_error":
+		return "I could not check the latest request."
+	case "no_request":
+		return "No QR request is queued."
+	case "cancel_error":
+		return "I could not cancel the latest request."
+	case "cancelled":
+		return "Latest QR request cancelled."
+	case "access_not_configured":
+		return "Access control is not configured for this bot."
+	case "access_status_error":
+		return "I could not check access status."
+	case "qr_image_expired":
+		return "The QR was created, but the image expired before I could send it."
+	case "qr_failed":
+		return "The QR request failed: %s"
+	case "job_cancelled":
+		return "The QR request was cancelled."
+	case "still_waiting":
+		return "The QR request is still waiting. Use /status to check it later."
+	case "status_ticket_active":
+		return "Your QR request is waiting because the ticket page is in use."
+	case "status_waiting":
+		return "Your QR request is waiting."
+	case "status_running":
+		return "Your QR request is running now."
+	case "status_ready":
+		return "Your QR request is ready."
+	case "status_cancelled":
+		return "Your QR request was cancelled."
+	case "status_unknown":
+		return "Your QR request status is %s."
+	case "reason_unknown":
+		return "unknown"
+	case "reason_rs_attention":
+		return "RS app needs attention. Open it once and retry."
+	case "reason_stale_code":
+		return "RS kept showing the previous QR after the new code was submitted. I did not send a stale image."
+	case "reason_rs_auth_blocked":
+		return "Rīgas Satiksme app session expired on the phone. Please try again in a moment — if it does not recover, an admin can restore the session with /admin login_rs."
+	case "admin_only":
+		return "Admin only."
+	case "unknown_admin":
+		return "Unknown admin command. Use /admin for help."
+	case "announce_private_only":
+		return "Announcement commands work only in private admin chats."
+	case "announce_tracking_error":
+		return "I could not track this announcement command. Send /admin announce again."
+	case "announce_reply_prompt":
+		return "Reply to this command with the announcement text. I will preview it before sending."
+	case "announce_empty":
+		return "Announcement text is empty. Reply with the text you want to send."
+	case "announce_recipient_error":
+		return "Could not list announcement recipients."
+	case "announce_missing":
+		return "Announcement draft not found or expired. Send /admin announce again."
+	case "announce_cancelled":
+		return "Announcement cancelled."
+	case "announce_started":
+		return "Announcement sending started for %d users."
+	case "admin_login_rs_usage":
+		return "Usage: /admin login_rs <phone> (e.g. /admin login_rs +371 27079944). The phone is required each time; no number is stored on the bot. The Pixel will type the phone into the RS app and wait. Send /admin login_rs_sms <password> here with the account password. The bot will not log the password."
+	case "admin_login_rs_code_required":
+		return "Usage: /admin login_rs_sms <password>"
+	case "admin_login_rs_no_active":
+		return "No active RS login. Start one with /admin login_rs <phone>."
+	case "admin_login_rs_started":
+		return "RS login started. Phone ending in %s. Send /admin login_rs_sms <password> here with the account password. You have one attempt per login start; a wrong password means starting over."
+	case "admin_login_rs_sms_accepted":
+		return "Password accepted for dispatch. The Pixel is typing the password into the Rīgas Satiksme app. Use /admin login_rs_status to check progress."
+	case "admin_login_rs_status_idle":
+		return "RS login is idle. No active login in progress."
+	case "admin_login_rs_status_waiting":
+		return "RS login is in progress for phone ending in %s. Waiting for the password. Use /admin login_rs_sms <password> to type it, or /admin login_rs_cancel to abort."
+	case "admin_login_rs_status_succeeded":
+		return "RS login succeeded for phone ending in %s. The session is restored. Ask the original user to retry their 5-digit code."
+	case "admin_login_rs_status_failed":
+		return "RS login for phone ending in %s failed: %s. Start a fresh login with /admin login_rs <phone>."
+	case "admin_login_rs_status_error":
+		return "Could not read the RS login status from the broker."
+	}
+	return ""
+}

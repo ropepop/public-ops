@@ -73,7 +73,7 @@ Service groups to attribute:
 
 - Core host operations: Portainer, Netdata, Docker daemon, host OS.
 - Public app group: `train_bot`, `satiksme_bot`, `subscription_bot`.
-- Phone group: `ticket_phone_bridge`, `phone_broker`, `rigassatiksme_qr_bot`, `ticket_remote`.
+- Phone group: `ticket_phone_bridge`, `phone_broker`, `ticket_remote`.
 - Public tunnel group: `train_tunnel`, `satiksme_tunnel`, `subscription_tunnel`, `ticket_remote_tunnel`.
 - DNS group: `dns_controlplane`.
 - Persistent state: `/srv/arbuzas/*`.

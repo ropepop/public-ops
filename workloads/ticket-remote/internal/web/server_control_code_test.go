@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,7 +61,7 @@ func TestControlCodeRequestQueuesPhoneCommandAndRoutesResultPrivately(t *testing
 		t.Fatalf("phone command mismatch: %s", phoneCommand)
 	}
 
-	phoneResults <- `{"type":"ticket_state_event","ticketState":"generated_result","eventSeq":7,"requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","totalDurationMillis":321,"phases":{"phone_command_received":0,"popup_ready":184,"digits_typed":312,"ok_tapped":455,"result_first_visible":2988,"result_marker_requested":3015}}`
+	sendPhoneResult(t, server, `{"type":"ticket_state_event","ticketState":"generated_result","eventSeq":7,"requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","totalDurationMillis":321,"phases":{"phone_command_received":0,"popup_ready":184,"digits_typed":312,"ok_tapped":455,"result_first_visible":2988,"result_marker_requested":3015}}`)
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"type":"control_code_request"`) ||
 		!strings.Contains(privateResult, `"status":"succeeded"`) ||
@@ -130,7 +131,7 @@ func TestControlCodePhoneRootImageResultIsRejectedAndNeverExposesImageBytes(t *t
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-	phoneResults <- `{"type":"control_code_result","requestId":"` + response.Request.ID + `","ok":true,"reason":"generated","value":"12345","resultProof":"phone_root_image","imageMime":"image/png","imageBase64":"` + tinyPNGBase64 + `","totalDurationMillis":321,"phases":{"phone_command_received":0,"result_image_png_ready":318},"cleanupPending":true}`
+	sendPhoneResult(t, server, `{"type":"control_code_result","requestId":"`+response.Request.ID+`","ok":true,"reason":"generated","value":"12345","resultProof":"phone_root_image","imageMime":"image/png","imageBase64":"`+tinyPNGBase64+`","totalDurationMillis":321,"phases":{"phone_command_received":0,"result_image_png_ready":318},"cleanupPending":true}`)
 
 	privateResult := waitForBrowserMessage(t, requester, `"reason":"control_code_phone_image_disabled"`)
 	if !strings.Contains(privateResult, `"type":"control_code_request"`) ||
@@ -152,12 +153,10 @@ func TestControlCodePhoneRootImageResultIsRejectedAndNeverExposesImageBytes(t *t
 	assertNoBrowserMessageContaining(t, other, tinyPNGBase64, 250*time.Millisecond)
 }
 
-func TestControlCodeRequestRetriesWhenPhoneDoesNotAcceptDispatch(t *testing.T) {
+func TestControlCodeRequestDoesNotDuplicateCommandWithoutPhoneAck(t *testing.T) {
 	messages := make(chan string, 20)
 	phoneResults := make(chan string, 20)
-	phoneServer := newTicketPhoneControlCodeTestServerWithOptions(t, messages, phoneResults, ticketPhoneControlCodeTestOptions{
-		skipGenerateHealthAccepts: 1,
-	})
+	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
 	defer phoneServer.Close()
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
@@ -183,17 +182,13 @@ func TestControlCodeRequestRetriesWhenPhoneDoesNotAcceptDispatch(t *testing.T) {
 	if !strings.Contains(firstCommand, `"requestId":"`+response.Request.ID+`"`) {
 		t.Fatalf("first phone command mismatch: %s", firstCommand)
 	}
-	secondCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	if !strings.Contains(secondCommand, `"requestId":"`+response.Request.ID+`"`) ||
-		!strings.Contains(secondCommand, `"dispatchAttempt":2`) {
-		t.Fatalf("retry phone command mismatch: %s", secondCommand)
-	}
+	assertNoPhoneMessageContaining(t, messages, `"type":"generate_control_code"`, 250*time.Millisecond)
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit"}`)
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"requestId":"`+response.Request.ID+`"`) ||
 		!strings.Contains(privateResult, `"resultProof":"phone_visual_raw_ticket_after_submit"`) {
-		t.Fatalf("requester did not receive private result after retry: %s", privateResult)
+		t.Fatalf("requester did not receive private result after phone report: %s", privateResult)
 	}
 }
 
@@ -243,7 +238,7 @@ func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
 		}
 	}
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_root"}`
+	server.handlePhoneText([]byte(`{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_root"}`))
 	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", response.Request.ID, 42, 77)
 	if !capture.OK {
@@ -258,7 +253,7 @@ func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
 		}
 	case <-time.After(150 * time.Millisecond):
 	}
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"ticket_detail"}`
+	server.handlePhoneText([]byte(`{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"ticket_detail"}`))
 	release := expectBrokerLeaseEventWithLease(t, leaseEvents, "/api/v1/phone/leases/ticket/release", controlLeaseID)
 	if release.LeaseID != "control-code:"+response.Request.ID || release.RequestID != response.Request.ID {
 		t.Fatalf("control-code lease release = %#v", release)
@@ -300,9 +295,9 @@ func TestControlCodeAsyncFlowAcceptsDigitLengthsTwoThroughEight(t *testing.T) {
 
 		streamEpoch := int64(100 + length)
 		minFrameSequence := int64(200 + length)
-		phoneResults <- fmt.Sprintf(`{"type":"ticket_state_event","ticketState":"generated_result","eventSeq":%d,"requestId":"%s","value":"%s","streamEpoch":%d,"frameSequence":%d,"minFrameSequence":%d,"reason":"generated"}`,
+		sendPhoneResult(t, server, fmt.Sprintf(`{"type":"ticket_state_event","ticketState":"generated_result","eventSeq":%d,"requestId":"%s","value":"%s","streamEpoch":%d,"frameSequence":%d,"minFrameSequence":%d,"reason":"generated"}`,
 			length,
-			response.Request.ID, digits, streamEpoch, minFrameSequence, minFrameSequence)
+			response.Request.ID, digits, streamEpoch, minFrameSequence, minFrameSequence))
 		waitForControlCodeServerStatus(t, server, response.Request.ID, controlCodeSucceeded)
 		server.codeMu.Lock()
 		got := server.codeRequests[response.Request.ID]
@@ -316,7 +311,7 @@ func TestControlCodeAsyncFlowAcceptsDigitLengthsTwoThroughEight(t *testing.T) {
 		if !capture.OK {
 			t.Fatalf("length %d browser capture ack failed: %#v", length, capture)
 		}
-		phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"return_to_raw_complete"}`
+		sendPhoneResult(t, server, `{"type":"control_code_cleanup_complete","requestId":"`+response.Request.ID+`","ok":true,"reason":"return_to_raw_complete"}`)
 		waitForControlCodeServerIdle(t, server, response.Request.ID)
 	}
 }
@@ -347,7 +342,7 @@ func TestControlCodeFrameReadyRequiresBrowserCaptureBeforeCleanup(t *testing.T) 
 	}
 }
 
-func TestControlCodeRawReturnBeforeBrowserCaptureFailsResult(t *testing.T) {
+func TestControlCodeRawReturnBeforeBrowserCaptureKeepsRequestOpen(t *testing.T) {
 	messages := make(chan string, 20)
 	phoneResults := make(chan string, 20)
 	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
@@ -374,17 +369,67 @@ func TestControlCodeRawReturnBeforeBrowserCaptureFailsResult(t *testing.T) {
 	request := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + request.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
-	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
+	server.handlePhoneText([]byte(`{"type":"control_code_frame_ready","requestId":"` + request.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`))
+	waitForControlCodeServerStatus(t, server, request.Request.ID, controlCodeSucceeded)
 
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + request.Request.ID + `","ok":true,"reason":"return_to_raw_complete"}`
-	waitForBrowserMessage(t, requester, `"cleanupReason":"return_to_raw_complete"`)
+	// The phone sends a ticket_state_event with TicketState=raw_ticket to
+	// signal that it has returned to the raw ticket screen. This is the
+	// real-world flow: the phone emits cleanup events via ticket_state_event
+	// as it transitions back to the raw ticket.
+	server.handlePhoneText([]byte(`{"type":"ticket_state_event","requestId":"` + request.Request.ID + `","eventSeq":2,"ticketState":"raw_ticket","reason":"return_to_raw_complete","streamEpoch":42,"frameSequence":80,"minFrameSequence":80}`))
+	// The server processes the ticket_state_event in a goroutine; give it
+	// a moment to update the request state before we assert.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.codeMu.Lock()
+		got := server.codeRequests[request.Request.ID]
+		ready := got != nil && !got.ResultWindowClosedAt.IsZero()
+		server.codeMu.Unlock()
+		if ready || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	server.codeMu.Lock()
 	got := server.codeRequests[request.Request.ID]
 	server.codeMu.Unlock()
-	if got == nil || got.Status != controlCodeFailed || got.Reason != "result_window_closed_before_capture" {
-		t.Fatalf("raw return before browser capture must fail the result: %#v", got)
+	if got == nil {
+		t.Fatalf("request should remain in the map after raw return, got nil")
+	}
+	// The request must stay in succeeded state, not auto-fail, so the browser
+	// can still acknowledge the capture within the 30s cleanup window.
+	if got.Status != controlCodeSucceeded {
+		t.Fatalf("raw return before browser capture must keep request in succeeded state, got status=%q reason=%q", got.Status, got.Reason)
+	}
+	if got.ResultWindowClosedAt.IsZero() {
+		t.Fatalf("raw return before browser capture must set ResultWindowClosedAt, got %v", got.ResultWindowClosedAt)
+	}
+	if got.CleanupFrameEpoch != 42 {
+		t.Fatalf("raw return should record CleanupFrameEpoch, got %d", got.CleanupFrameEpoch)
+	}
+	if got.CleanupMinFrameSequence != 80 {
+		t.Fatalf("raw return should record CleanupMinFrameSequence, got %d", got.CleanupMinFrameSequence)
+	}
+	// CleanupCompletedAt is intentionally NOT set yet — the browser
+	// still has time to capture. It will be set after capture ack.
+	if !got.CleanupCompletedAt.IsZero() {
+		t.Fatalf("cleanup must not be marked completed before browser capture, got %v", got.CleanupCompletedAt)
+	}
+
+	// The browser should still be able to acknowledge the capture within the
+	// 30s cleanup window. Previously this returned 409 with
+	// "result_window_closed_before_capture"; now it should succeed.
+	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", request.Request.ID, 42, 80)
+	if !capture.OK {
+		t.Fatalf("browser capture after raw return must succeed, got error=%q message=%q", capture.Error, capture.Message)
+	}
+
+	server.codeMu.Lock()
+	got = server.codeRequests[request.Request.ID]
+	server.codeMu.Unlock()
+	if got.CaptureAcknowledgedAt.IsZero() {
+		t.Fatalf("capture must be acknowledged after raw return, got zero")
 	}
 }
 
@@ -415,7 +460,7 @@ func TestControlCodeRawReturnWhileRunningDoesNotExposeInternalCleanupReason(t *t
 	request := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + request.Request.ID + `","ok":true,"reason":"return_to_raw_complete"}`
+	sendPhoneResult(t, server, `{"type":"control_code_cleanup_complete","requestId":"`+request.Request.ID+`","ok":true,"reason":"return_to_raw_complete"}`)
 	result := waitForBrowserMessage(t, requester, `"status":"failed"`)
 	if strings.Contains(result, `"reason":"return_to_raw_complete"`) {
 		t.Fatalf("raw return cleanup marker must not leak as a failed request reason: %s", result)
@@ -467,29 +512,10 @@ func TestControlCodePrepareSendsPhonePrepareWithoutQueueingRequest(t *testing.T)
 	}
 }
 
-func TestControlCodeRequestWaitsForSocketAfterDirectPhoneStart(t *testing.T) {
+func TestControlCodeRequestPublishesCommandWithoutDirectPhoneStart(t *testing.T) {
 	messages := make(chan string, 20)
-	startRequests := make(chan struct{}, 5)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/session/start":
-			startRequests <- struct{}{}
-			w.WriteHeader(http.StatusOK)
-		case "/api/v1/session":
-			time.Sleep(controlCodeRelayConnectWait + 300*time.Millisecond)
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone control websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			for {
-				_, data, err := conn.Read(r.Context())
-				if err != nil {
-					return
-				}
-				messages <- string(data)
-			}
 		case "/api/v1/stream":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -497,15 +523,16 @@ func TestControlCodeRequestWaitsForSocketAfterDirectPhoneStart(t *testing.T) {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			_, _, _ = conn.Read(r.Context())
 			<-r.Context().Done()
-		case "/api/v1/session/stop":
-			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session/start", "/api/v1/session", "/api/v1/session/stop":
+			t.Errorf("removed direct phone-control path was used: %s", r.URL.Path)
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, messages)
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -523,14 +550,9 @@ func TestControlCodeRequestWaitsForSocketAfterDirectPhoneStart(t *testing.T) {
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 
-	select {
-	case <-startRequests:
-	case <-time.After(2 * time.Second):
-		t.Fatal("control-code relay prep did not call direct phone session start")
-	}
 	phoneCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	if !strings.Contains(phoneCommand, `"requestId":"`+response.Request.ID+`"`) || !strings.Contains(phoneCommand, `"digits":"12345"`) {
-		t.Fatalf("phone command mismatch after delayed socket readiness: %s", phoneCommand)
+		t.Fatalf("phone command mismatch after video relay readiness: %s", phoneCommand)
 	}
 }
 
@@ -563,7 +585,7 @@ func TestControlCodeResultRoutesOnlyToRequestingSession(t *testing.T) {
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","totalDurationMillis":321}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"frameSequence":77,"minFrameSequence":77,"reason":"generated","totalDurationMillis":321}`)
 
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"streamEpoch":42`) ||
@@ -603,7 +625,7 @@ func TestControlCodeFrameReadyMovesRequestToSucceededAndRoutesOnlyToRequester(t 
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual","resultProofAt":"2026-05-22T10:23:45.123Z","totalDurationMillis":432,"phases":{"popup_opened":50}}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual","resultProofAt":"2026-05-22T10:23:45.123Z","totalDurationMillis":432,"phases":{"popup_opened":50}}`)
 
 	result := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	for _, snippet := range []string{
@@ -653,7 +675,7 @@ func TestControlCodeFrameReadyPreservesPhonePostSubmitVisualProof(t *testing.T) 
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit","resultProofAt":"2026-05-22T10:23:45.123Z"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"frameSequence":76,"minFrameSequence":77,"reason":"generated","resultProof":"phone_visual_raw_ticket_after_submit","resultProofAt":"2026-05-22T10:23:45.123Z"}`)
 
 	result := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(result, `"resultProof":"phone_visual_raw_ticket_after_submit"`) {
@@ -687,7 +709,7 @@ func TestControlCodeFrameReadyRequiresBrowserPostBeforePhoneCleanup(t *testing.T
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`)
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"cleanupPending":true`) ||
 		!strings.Contains(privateResult, `"captureRequired":true`) ||
@@ -729,7 +751,7 @@ func TestControlCodeFrameReadyIsIdempotentForOwningSession(t *testing.T) {
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`)
 	first := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(first, `"value":"12345"`) {
 		t.Fatalf("first marker result mismatch: %s", first)
@@ -769,7 +791,7 @@ func TestControlCodePhoneImageResultDoesNotSucceed(t *testing.T) {
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_result","requestId":"` + response.Request.ID + `","ok":true,"reason":"generated","value":"12345","imageMime":"image/png","imageBase64":"legacy-phone-png"}`
+	sendPhoneResult(t, server, `{"type":"control_code_result","requestId":"`+response.Request.ID+`","ok":true,"reason":"generated","value":"12345","imageMime":"image/png","imageBase64":"legacy-phone-png"}`)
 
 	failed := waitForBrowserMessage(t, requester, `"reason":"control_code_stream_marker_required"`)
 	if !strings.Contains(failed, `"status":"failed"`) || strings.Contains(failed, `"imageBase64"`) || strings.Contains(failed, `"imageMime"`) {
@@ -805,7 +827,7 @@ func TestControlCodeFrameReadyDoesNotExposeMarkerToOtherSession(t *testing.T) {
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + response.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+response.Request.ID+`","value":"12345","streamEpoch":42,"minFrameSequence":77}`)
 	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	assertNoBrowserMessageContaining(t, otherSession, response.Request.ID, 250*time.Millisecond)
 }
@@ -837,7 +859,7 @@ func TestControlCodeMarkerResultKeepsQueueBlockedUntilPhoneCleanup(t *testing.T)
 	first := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	second := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "67890")
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + first.Request.ID + `","value":"12345","streamEpoch":42,"minFrameSequence":77}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+first.Request.ID+`","value":"12345","streamEpoch":42,"minFrameSequence":77}`)
 	result := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(result, `"cleanupPending":true`) {
 		t.Fatalf("marker result should stay cleanup-pending: %s", result)
@@ -845,7 +867,7 @@ func TestControlCodeMarkerResultKeepsQueueBlockedUntilPhoneCleanup(t *testing.T)
 	assertNoPhoneMessageContaining(t, messages, `"type":"control_code_browser_capture"`, 250*time.Millisecond)
 	assertNoPhoneMessageContaining(t, messages, `"requestId":"`+second.Request.ID+`"`, 250*time.Millisecond)
 
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + first.Request.ID + `","ok":true,"reason":"ticket_detail"}`
+	sendPhoneResult(t, server, `{"type":"control_code_cleanup_complete","requestId":"`+first.Request.ID+`","ok":true,"reason":"ticket_detail"}`)
 	secondCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	if !strings.Contains(secondCommand, `"requestId":"`+second.Request.ID+`"`) {
 		t.Fatalf("second request should start after failed capture cleanup: %s", secondCommand)
@@ -922,7 +944,7 @@ func TestControlCodeResultDeliveryKeepsQueueBlockedUntilPhoneCleanup(t *testing.
 	}
 	second := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "67890")
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + first.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+first.Request.ID+`","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`)
 	privateResult := waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	if !strings.Contains(privateResult, `"cleanupPending":true`) ||
 		!strings.Contains(privateResult, `"captureRequired":true`) ||
@@ -932,7 +954,7 @@ func TestControlCodeResultDeliveryKeepsQueueBlockedUntilPhoneCleanup(t *testing.
 	assertNoPhoneMessageContaining(t, messages, `"type":"control_code_browser_capture"`, 250*time.Millisecond)
 	assertNoPhoneMessageContaining(t, messages, `"requestId":"`+second.Request.ID+`"`, 250*time.Millisecond)
 
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + first.Request.ID + `","ok":true,"reason":"ticket_detail"}`
+	sendPhoneResult(t, server, `{"type":"control_code_cleanup_complete","requestId":"`+first.Request.ID+`","ok":true,"reason":"ticket_detail"}`)
 	secondCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	if !strings.Contains(secondCommand, `"requestId":"`+second.Request.ID+`"`) || !strings.Contains(secondCommand, `"digits":"67890"`) {
 		t.Fatalf("second phone command should start after cleanup: %s", secondCommand)
@@ -966,12 +988,12 @@ func TestControlCodeCleanupAttentionKeepsSuccessfulResultVisible(t *testing.T) {
 	request := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
 	waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 
-	phoneResults <- `{"type":"control_code_frame_ready","requestId":"` + request.Request.ID + `","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`
+	sendPhoneResult(t, server, `{"type":"control_code_frame_ready","requestId":"`+request.Request.ID+`","streamEpoch":42,"minFrameSequence":77,"reason":"generated"}`)
 	waitForBrowserMessage(t, requester, `"status":"succeeded"`)
 	postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", request.Request.ID, 42, 77)
 	waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
 
-	phoneResults <- `{"type":"control_code_cleanup_complete","requestId":"` + request.Request.ID + `","ok":false,"reason":"control_code_cleanup_attention_needed"}`
+	sendPhoneResult(t, server, `{"type":"control_code_cleanup_complete","requestId":"`+request.Request.ID+`","ok":false,"reason":"control_code_cleanup_attention_needed"}`)
 	update := waitForBrowserMessage(t, requester, `"cleanupReason":"control_code_cleanup_attention_needed"`)
 	if !strings.Contains(update, `"status":"succeeded"`) || strings.Contains(update, `"imageBase64"`) {
 		t.Fatalf("cleanup attention must keep generated result visible: %s", update)
@@ -1031,7 +1053,7 @@ func TestControlCodeCloseRunningRequestDoesNotReleasePhoneQueue(t *testing.T) {
 	}
 	assertNoPhoneMessageContaining(t, messages, `"requestId":"`+second.Request.ID+`"`, 250*time.Millisecond)
 
-	phoneResults <- `{"type":"control_code_result","requestId":"` + first.Request.ID + `","ok":false,"reason":"control_code_not_generated"}`
+	sendPhoneResult(t, server, `{"type":"control_code_result","requestId":"`+first.Request.ID+`","ok":false,"reason":"control_code_not_generated"}`)
 	waitForBrowserMessage(t, requester, `"status":"failed"`)
 }
 
@@ -1059,17 +1081,31 @@ func TestControlCodeRequestRateLimitsThirdAcceptedRequestInSixtySeconds(t *testi
 }
 
 func TestControlCodeRequestFailsFastWhenPhoneUnavailable(t *testing.T) {
-	store := newTicketMemoryStore(t, "http://127.0.0.1:1")
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept phone video websocket: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	store := &failingStreamCommandStore{Store: newTicketMemoryStore(t, phoneServer.URL)}
 	relay := phone.NewRelay(phone.RelayConfig{
 		BackendID:         "pixel",
 		AttachName:        "Pixel",
-		BaseURL:           "http://127.0.0.1:1",
+		BaseURL:           phoneServer.URL,
 		ReconnectMinDelay: time.Hour,
 		ReconnectMaxDelay: time.Hour,
 		NoViewerStopDelay: time.Hour,
 	})
 	defer relay.Close()
-	server := newTicketWebServer(t, store, relay, "http://127.0.0.1:1")
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
 	httpServer := httptest.NewServer(server)
 	defer httpServer.Close()
 
@@ -1092,6 +1128,14 @@ func TestControlCodeRequestFailsFastWhenPhoneUnavailable(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("request did not fail fast when phone unavailable")
+}
+
+type failingStreamCommandStore struct {
+	state.Store
+}
+
+func (s *failingStreamCommandStore) AppendStreamCommand(context.Context, state.StreamCommandInput) error {
+	return errors.New("stream command store unavailable")
 }
 
 func TestControlCodeRequestRejectsNonNumericOrWrongLengthCodes(t *testing.T) {
@@ -1270,6 +1314,59 @@ func TestControlCodePendingBrowserCaptureDoesNotExpireOrStartDisplayTTL(t *testi
 	}
 }
 
+func TestControlCodePendingBrowserCaptureFailsOnCleanupTimeout(t *testing.T) {
+	server := newTicketWebServer(t, newTicketMemoryStore(t, "http://127.0.0.1:1"), phone.NewRelay(phone.RelayConfig{BaseURL: "http://127.0.0.1:1"}), "http://127.0.0.1:1")
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	req := &controlCodeRequest{
+		ID:                     "req-capture-timeout",
+		SessionID:              "session",
+		Email:                  "ticket@jolkins.id.lv",
+		Digits:                 "1234",
+		Status:                 controlCodeSucceeded,
+		Value:                  "1234",
+		ResultFrameEpoch:       42,
+		ResultMinFrameSequence: 77,
+		RequestedAt:            time.Now().Add(-2 * time.Minute),
+		CompletedAt:            time.Now().Add(-35 * time.Second),
+		MarkerReceivedAt:       time.Now().Add(-35 * time.Second),
+		CaptureRequired:        true,
+		CaptureReason:          "waiting_for_browser_capture",
+		CleanupPending:         true,
+	}
+	server.codeMu.Lock()
+	server.codeRequests[req.ID] = req
+	server.codeRunning = req.ID
+	server.codeMu.Unlock()
+
+	server.completeControlCodeCleanup(req.ID, false, "control_code_cleanup_timeout")
+
+	server.codeMu.Lock()
+	got := server.codeRequests[req.ID]
+	running := server.codeRunning
+	server.codeMu.Unlock()
+	if got == nil {
+		t.Fatal("request should remain available for the browser failure update")
+	}
+	if got.Status != controlCodeFailed || got.Reason != "result_window_closed_before_capture" {
+		t.Fatalf("timeout should fail pending browser capture, got status=%q reason=%q", got.Status, got.Reason)
+	}
+	if got.Value != "" || got.CaptureRequired {
+		t.Fatalf("timeout should clear the generated value and capture requirement: %#v", got)
+	}
+	if got.CleanupCompletedAt.IsZero() || got.CompletedAt.IsZero() || got.CaptureRejectedAt.IsZero() {
+		t.Fatalf("timeout should stamp completion and rejection fields: %#v", got)
+	}
+	if running != "" {
+		t.Fatalf("codeRunning = %q, want cleared", running)
+	}
+
+	capture := postControlCodeCaptureRaw(t, httpServer.URL, "ticket@jolkins.id.lv", "session", req.ID, 42, 77)
+	if capture.OK || capture.Error != "request_not_ready" {
+		t.Fatalf("late browser capture should be rejected after timeout: %#v", capture)
+	}
+}
+
 func TestControlCodeSucceededRequestExpiresStoredValueWithoutBrowserView(t *testing.T) {
 	server := newTicketWebServer(t, newTicketMemoryStore(t, "http://127.0.0.1:1"), phone.NewRelay(phone.RelayConfig{BaseURL: "http://127.0.0.1:1"}), "http://127.0.0.1:1")
 	req := &controlCodeRequest{
@@ -1366,11 +1463,16 @@ func newTicketPhoneControlCodeTestServer(t *testing.T, messages chan<- string, r
 	return newTicketPhoneControlCodeTestServerWithOptions(t, messages, results, ticketPhoneControlCodeTestOptions{})
 }
 
+func sendPhoneResult(t *testing.T, server *Server, payload string) {
+	t.Helper()
+	server.handlePhoneText([]byte(payload))
+}
+
 func newTicketPhoneControlCodeTestServerWithOptions(t *testing.T, messages chan<- string, results <-chan string, options ticketPhoneControlCodeTestOptions) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	controlCodeRequest := map[string]any{}
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/session/start":
 			w.WriteHeader(http.StatusOK)
@@ -1424,7 +1526,11 @@ func newTicketPhoneControlCodeTestServerWithOptions(t *testing.T, messages chan<
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			_, _, _ = conn.Read(r.Context())
+			go func() {
+				for result := range results {
+					_ = conn.Write(context.Background(), websocket.MessageText, []byte(result))
+				}
+			}()
 			<-r.Context().Done()
 		case "/api/v1/session/stop":
 			w.WriteHeader(http.StatusOK)
@@ -1432,6 +1538,8 @@ func newTicketPhoneControlCodeTestServerWithOptions(t *testing.T, messages chan<
 			http.NotFound(w, r)
 		}
 	}))
+	registerTicketStreamCommandSink(t, server.URL, messages)
+	return server
 }
 
 func cloneMapForControlCodeTest(input map[string]any) map[string]any {

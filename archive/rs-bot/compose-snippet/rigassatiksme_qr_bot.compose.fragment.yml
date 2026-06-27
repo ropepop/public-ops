@@ -1,0 +1,48 @@
+  rigassatiksme_qr_bot:
+    image: arbuzas/rigassatiksme-qr-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/rigassatiksme-qr-bot.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
+    working_dir: /srv/rigassatiksme-qr-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      PHONE_BROKER_BASE_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
+      RIGASATIKSME_QR_ACCESS_STATE_PATH: /srv/rigassatiksme-qr-bot/state/access.json
+      RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN: "false"
+      RIGASATIKSME_QR_ADMIN_USER_IDS: ${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}
+      RIGASATIKSME_QR_SPACETIME_HOST: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}
+      RIGASATIKSME_QR_SPACETIME_DATABASE: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}
+      RIGASATIKSME_QR_SPACETIME_TOKEN: ${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/rigassatiksme-qr-bot/.env
+        set +a
+        export PHONE_BROKER_BASE_URL="http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}"
+        export RIGASATIKSME_QR_ACCESS_STATE_PATH="$${RIGASATIKSME_QR_ACCESS_STATE_PATH:-/srv/rigassatiksme-qr-bot/state/access.json}"
+        export RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN="$${RIGASATIKSME_QR_ACCESS_DEFAULT_OPEN:-false}"
+        export RIGASATIKSME_QR_ADMIN_USER_IDS="$${RIGASATIKSME_QR_ADMIN_USER_IDS:-${ARBUZAS_RIGASATIKSME_QR_ADMIN_USER_IDS:-}}"
+        export RIGASATIKSME_QR_SPACETIME_HOST="$${RIGASATIKSME_QR_SPACETIME_HOST:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_HOST:-}}"
+        export RIGASATIKSME_QR_SPACETIME_DATABASE="$${RIGASATIKSME_QR_SPACETIME_DATABASE:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_DATABASE:-}}"
+        export RIGASATIKSME_QR_SPACETIME_TOKEN="$${RIGASATIKSME_QR_SPACETIME_TOKEN:-${ARBUZAS_RIGASATIKSME_QR_SPACETIME_TOKEN:-}}"
+        export RIGASATIKSME_QR_JOB_POLL_INTERVAL="$${RIGASATIKSME_QR_JOB_POLL_INTERVAL:-250ms}"
+        export RIGASATIKSME_QR_JOB_POLL_TIMEOUT="$${RIGASATIKSME_QR_JOB_POLL_TIMEOUT:-10m}"
+        mkdir -p /srv/rigassatiksme-qr-bot/run /srv/rigassatiksme-qr-bot/state
+        exec /usr/local/bin/rigassatiksme-qr-bot
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    depends_on:
+      - phone_broker
+    volumes:
+      - /srv/arbuzas/rigassatiksme-qr-bot:/srv/rigassatiksme-qr-bot
+      - /etc/arbuzas/env/rigassatiksme-qr-bot.env:/srv/rigassatiksme-qr-bot/.env:ro

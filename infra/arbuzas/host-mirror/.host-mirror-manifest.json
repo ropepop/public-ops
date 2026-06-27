@@ -37,73 +37,23 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 420,
-      "sha256": "c4be3e9099b44b4c58866e666c38841b1b968285e7700aa29d3d40cc4de387f7",
-      "size": 1211
+      "sha256": "65b1992081d17c9c625af0c64ab7f7e6f4178ad8900b8619ece82d4dd6c34321",
+      "size": 1046
     },
-    "etc/arbuzas/dns/arbuzas-dns.yaml": {
-      "mode": 420,
-      "sha256": "27d76ceca61d2cb4981e8e692bbff3803a21e0bb4d9f2bd39b62df6c8268f4e7",
-      "size": 1040
-    },
-    "etc/arbuzas/dns/doh-identities.json": {
-      "mode": 420,
-      "sha256": "d364a9efdd1f2708a804bd475a89b957443df8c187ba7f99d59a431d47378482",
-      "size": 954
-    },
-    "etc/arbuzas/dns/runtime.env": {
-      "mode": 384,
-      "sha256": "db364f0ea9dc053b0c8787c22783049b3205290200cfa84df7f844a6e5036c52",
-      "size": 2477
-    },
-    "etc/arbuzas/dns/secrets/admin-password": {
-      "mode": 384,
-      "sha256": "e3b767c1023cf63936d6dd2692bfd42f03926550407c5f8db21f6418c2e6258a",
-      "size": 25
-    },
-    "etc/arbuzas/dns/secrets/cloudflare-token": {
-      "mode": 384,
-      "sha256": "6c0c1f1afbe0374b84d526efc5838a34c1159987c3cec57045f68eaf7b4606ac",
-      "size": 41
-    },
-    "etc/arbuzas/dns/secrets/github-policy-repo": {
-      "mode": 384,
-      "sha256": "28a16888797e60317886d182f3d8a9cf6c721cfebf94647b2d1805fb44df5b6a",
-      "size": 411
-    },
-    "etc/arbuzas/dns/secrets/github-policy-repo.pub": {
-      "mode": 420,
-      "sha256": "8dd22effe25e50264ef61e13b382ede4ba1446cbf9b0d10c6cf43db6bee8d7fa",
-      "size": 100
-    },
-    "etc/arbuzas/dns/secrets/ipinfo-lite-token": {
-      "mode": 384,
-      "sha256": "2d27a1c42aa4e4182e1e4278ad2d066365323f973b6f1606dd20e76634220e54",
-      "size": 91
-    },
-    "etc/arbuzas/dns/tls/fullchain.pem": {
-      "mode": 384,
-      "sha256": "99d8323f5eb18e4714f5177b9d7b4c91cf82b91a2fc192a4b235a4305b401e2d",
-      "size": 2884
-    },
-    "etc/arbuzas/dns/tls/privkey.pem": {
-      "mode": 384,
-      "sha256": "71be63e0c036d8061045cb6d53cc1cfb2f3609edd93b8a16cdc19b7ddfe5c641",
-      "size": 241
-    },
-    "etc/arbuzas/env/rigassatiksme-qr-bot.env": {
-      "mode": 384,
-      "sha256": "3c7cc69f8a3655ae99e9cb9379b888178127a582117aa19f08d26f62a4bb776b",
-      "size": 1171
-    },
-    "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z": {
+    "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z.retired-20260618T215944Z": {
       "mode": 384,
       "sha256": "9b322681333c809f914b355ee55a28a91532bd1b987770fe735b0935973659e4",
       "size": 1157
     },
-    "etc/arbuzas/env/satiksme-bot.env": {
+    "etc/arbuzas/env/rigassatiksme-qr-bot.env.retired-20260618T215944Z": {
       "mode": 384,
-      "sha256": "5e5ff0bcb12be762eba18ceb8d247484f2b07e282bebddf1673ad04d05ac167c",
-      "size": 3999
+      "sha256": "3c7cc69f8a3655ae99e9cb9379b888178127a582117aa19f08d26f62a4bb776b",
+      "size": 1171
+    },
+    "etc/arbuzas/env/satiksme-bot.env": {
+      "mode": 420,
+      "sha256": "4bccbac8742324b52c69be558b92f248731e9afb5d29fec6abdb7dfbf763f41d",
+      "size": 3778
     },
     "etc/arbuzas/env/satiksme-bot.env.bak-google-ai": {
       "mode": 384,
@@ -145,13 +95,18 @@
       "sha256": "4d1c1a6682f1ac87b78ba4e05dd7e07ca1d0fe9ccbc80629ceebc0113b819c36",
       "size": 3650
     },
-    "etc/arbuzas/env/subscription-bot.env": {
+    "etc/arbuzas/env/satiksme-bot.env.bak.20260618T221750Z": {
       "mode": 384,
+      "sha256": "5e5ff0bcb12be762eba18ceb8d247484f2b07e282bebddf1673ad04d05ac167c",
+      "size": 3999
+    },
+    "etc/arbuzas/env/subscription-bot.env": {
+      "mode": 420,
       "sha256": "6ed9bf7b6f7ee22777de42dbcc399540c57685ba428dc5d578759404d45ed18b",
       "size": 1697
     },
     "etc/arbuzas/env/ticket-remote.env": {
-      "mode": 384,
+      "mode": 420,
       "sha256": "acae2843941a693b91d130b826966c73103bda22716f9b294db267823a3709b5",
       "size": 1173
     },
@@ -176,7 +131,7 @@
       "size": 1216
     },
     "etc/arbuzas/env/train-bot.env": {
-      "mode": 384,
+      "mode": 420,
       "sha256": "0a0c0b3739111e5febd9b1759f39190de2abb3af24c01dfca8472f41b0764b78",
       "size": 2059
     },
@@ -242,5 +197,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1780613625
+  "updatedEpochSeconds": 1782532122
 }

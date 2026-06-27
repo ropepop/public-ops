@@ -6,8 +6,5 @@
 import { type Infer as __Infer } from "spacetimedb";
 
 // Import all procedure arg schemas
-import * as TicketremoteGetStateProcedure from "../ticketremote_get_state_procedure";
 
-export type TicketremoteGetStateArgs = __Infer<typeof TicketremoteGetStateProcedure.params>;
-export type TicketremoteGetStateResult = __Infer<typeof TicketremoteGetStateProcedure.returnType>;
 

@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -17,8 +15,7 @@ import (
 )
 
 const (
-	idleStopSettleDelay      = 200 * time.Millisecond
-	controlKeepaliveInterval = 5 * time.Second
+	idleStopSettleDelay = 200 * time.Millisecond
 
 	DefaultRequestTimeout    = 10 * time.Second
 	DefaultReconnectMinDelay = 500 * time.Millisecond
@@ -59,7 +56,6 @@ type Relay struct {
 	cfg RelayConfig
 
 	mu           sync.Mutex
-	writeMu      sync.Mutex
 	videoWriteMu sync.Mutex
 	viewers      int
 	desired      bool
@@ -67,7 +63,6 @@ type Relay struct {
 	lastError    string
 	lastConfig   string
 	lastSeenAt   time.Time
-	conn         *websocket.Conn
 	videoConn    *websocket.Conn
 	cancelLoop   context.CancelFunc
 	idleStop     *time.Timer
@@ -150,7 +145,6 @@ func (r *Relay) EnsureActive(reason string) bool {
 	if reason == "" {
 		reason = "ensure active"
 	}
-	var conn *websocket.Conn
 	var videoConn *websocket.Conn
 	var oldCancel context.CancelFunc
 	var ctx context.Context
@@ -163,7 +157,7 @@ func (r *Relay) EnsureActive(reason string) bool {
 		r.idleStop.Stop()
 		r.idleStop = nil
 	}
-	if r.desired && r.connected && r.conn != nil && r.videoConn != nil {
+	if r.desired && r.connected && r.videoConn != nil {
 		r.mu.Unlock()
 		return true
 	}
@@ -171,9 +165,7 @@ func (r *Relay) EnsureActive(reason string) bool {
 		oldCancel = r.cancelLoop
 		r.cancelLoop = nil
 	}
-	conn = r.conn
 	videoConn = r.videoConn
-	r.conn = nil
 	r.videoConn = nil
 	r.connected = false
 	r.desired = true
@@ -183,9 +175,6 @@ func (r *Relay) EnsureActive(reason string) bool {
 	r.cancelLoop = cancel
 	r.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.Close(websocket.StatusInternalError, reason)
-	}
 	if videoConn != nil {
 		_ = videoConn.Close(websocket.StatusInternalError, reason)
 	}
@@ -231,18 +220,10 @@ func (r *Relay) stopIfStillIdle() {
 	if r.cancelLoop != nil {
 		r.cancelLoop = nil
 	}
-	conn := r.conn
 	videoConn := r.videoConn
-	r.conn = nil
 	r.videoConn = nil
 	r.connected = false
 	r.mu.Unlock()
-	if conn != nil {
-		r.sendIdleStopOnControlConn(conn)
-	}
-	if conn != nil {
-		_ = conn.Close(websocket.StatusNormalClosure, "no viewers")
-	}
 	if videoConn != nil {
 		_ = videoConn.Close(websocket.StatusNormalClosure, "no viewers")
 	}
@@ -263,24 +244,6 @@ func (r *Relay) finishIdleStop(done chan struct{}) {
 	r.mu.Unlock()
 }
 
-func (r *Relay) sendIdleStopOnControlConn(conn *websocket.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	body, err := json.Marshal(map[string]any{
-		"type":     "stop",
-		"reason":   "relay_no_viewers",
-		"explicit": true,
-	})
-	if err != nil {
-		return
-	}
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
-		log.Printf("ticket phone relay: websocket idle stop failed: %v", err)
-	}
-}
-
 func (r *Relay) Close() {
 	r.mu.Lock()
 	if r.idleStop != nil {
@@ -291,35 +254,20 @@ func (r *Relay) Close() {
 		r.cancelLoop()
 		r.cancelLoop = nil
 	}
-	conn := r.conn
 	videoConn := r.videoConn
-	r.conn = nil
 	r.videoConn = nil
 	r.connected = false
 	r.desired = false
 	r.viewers = 0
 	r.mu.Unlock()
-	if conn != nil {
-		_ = conn.Close(websocket.StatusNormalClosure, "relay closed")
-	}
 	if videoConn != nil {
 		_ = videoConn.Close(websocket.StatusNormalClosure, "relay closed")
 	}
-	r.stopPhoneSession()
-}
-
-func (r *Relay) StartPhoneSession(ctx context.Context) error {
-	r.mu.Lock()
-	base := r.cfg.BaseURL
-	timeout := r.cfg.RequestTimeout
-	r.mu.Unlock()
-	return r.startPhoneSessionAt(ctx, base, timeout)
 }
 
 func (r *Relay) SwitchBackend(backend Backend) {
 	cleanBaseURL := strings.TrimRight(strings.TrimSpace(backend.BaseURL), "/")
 	r.mu.Lock()
-	oldBaseURL := r.cfg.BaseURL
 	same := r.cfg.BackendID == strings.TrimSpace(backend.ID) && r.cfg.BaseURL == cleanBaseURL
 	if same {
 		r.cfg.AttachName = strings.TrimSpace(backend.AttachName)
@@ -334,10 +282,8 @@ func (r *Relay) SwitchBackend(backend Backend) {
 		r.cancelLoop()
 		r.cancelLoop = nil
 	}
-	conn := r.conn
 	videoConn := r.videoConn
 	shouldReconnect := r.desired && r.viewers > 0
-	r.conn = nil
 	r.videoConn = nil
 	r.connected = false
 	r.lastError = ""
@@ -354,13 +300,9 @@ func (r *Relay) SwitchBackend(backend Backend) {
 	}
 	r.mu.Unlock()
 
-	if conn != nil {
-		_ = conn.Close(websocket.StatusNormalClosure, "phone backend switched")
-	}
 	if videoConn != nil {
 		_ = videoConn.Close(websocket.StatusNormalClosure, "phone backend switched")
 	}
-	r.stopPhoneSessionAt(oldBaseURL)
 	r.mu.Lock()
 	if r.cfg.BaseURL == cleanBaseURL {
 		r.lastError = ""
@@ -372,11 +314,7 @@ func (r *Relay) SwitchBackend(backend Backend) {
 }
 
 func (r *Relay) SendJSON(ctx context.Context, value any) error {
-	body, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	return r.SendText(ctx, body)
+	return fmt.Errorf("direct phone control websocket writes have been removed; publish Spacetime stream commands instead")
 }
 
 func (r *Relay) SendControlExit(ctx context.Context, reason string) error {
@@ -391,16 +329,7 @@ func (r *Relay) SendControlExit(ctx context.Context, reason string) error {
 }
 
 func (r *Relay) SendText(ctx context.Context, body []byte) error {
-	r.mu.Lock()
-	conn := r.conn
-	connected := r.connected
-	r.mu.Unlock()
-	if conn == nil || !connected {
-		return fmt.Errorf("phone stream is not connected")
-	}
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	return conn.Write(ctx, websocket.MessageText, body)
+	return fmt.Errorf("direct phone control websocket writes have been removed; publish Spacetime stream commands instead")
 }
 
 func (r *Relay) Snapshot() Health {
@@ -459,60 +388,32 @@ func (r *Relay) connectLoop(ctx context.Context) {
 }
 
 func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
-	controlURL, err := r.websocketURL("/api/v1/session")
-	if err != nil {
-		return err
-	}
 	videoURL, err := r.websocketURL("/api/v1/stream")
 	if err != nil {
 		return err
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, r.cfg.RequestTimeout)
 	defer cancel()
-	dialResults := make(chan relayDialResult, 2)
-	go r.dialPhoneWebsocket(dialCtx, "control", controlURL, dialResults)
+	dialResults := make(chan relayDialResult, 1)
 	go r.dialPhoneWebsocket(dialCtx, "video", videoURL, dialResults)
 
-	var controlConn *websocket.Conn
 	var videoConn *websocket.Conn
-	for i := 0; i < 2; i++ {
-		select {
-		case <-ctx.Done():
-			if controlConn != nil {
-				_ = controlConn.Close(websocket.StatusInternalError, "dial cancelled")
-			}
-			if videoConn != nil {
-				_ = videoConn.Close(websocket.StatusInternalError, "dial cancelled")
-			}
-			return ctx.Err()
-		case result := <-dialResults:
-			if result.err != nil {
-				if controlConn != nil {
-					_ = controlConn.Close(websocket.StatusInternalError, "peer dial failed")
-				}
-				if videoConn != nil {
-					_ = videoConn.Close(websocket.StatusInternalError, "peer dial failed")
-				}
-				return result.err
-			}
-			switch result.name {
-			case "control":
-				controlConn = result.conn
-			case "video":
-				videoConn = result.conn
-			}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-dialResults:
+		if result.err != nil {
+			return result.err
 		}
+		videoConn = result.conn
 	}
-	controlConn.SetReadLimit(r.cfg.ReadLimit)
 	videoConn.SetReadLimit(r.cfg.ReadLimit)
 	r.mu.Lock()
 	if !r.desired {
 		r.mu.Unlock()
-		_ = controlConn.Close(websocket.StatusNormalClosure, "relay no longer desired")
 		_ = videoConn.Close(websocket.StatusNormalClosure, "relay no longer desired")
 		return nil
 	}
-	r.conn = controlConn
 	r.videoConn = videoConn
 	r.connected = true
 	r.lastError = ""
@@ -520,10 +421,7 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
-		wasCurrent := r.conn == controlConn || r.videoConn == videoConn
-		if r.conn == controlConn {
-			r.conn = nil
-		}
+		wasCurrent := r.videoConn == videoConn
 		if r.videoConn == videoConn {
 			r.videoConn = nil
 		}
@@ -532,51 +430,18 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 		}
 		onDisconnect := r.onDisconnect
 		r.mu.Unlock()
-		_ = controlConn.Close(websocket.StatusNormalClosure, "phone relay reconnect")
 		_ = videoConn.Close(websocket.StatusNormalClosure, "phone relay reconnect")
 		if onDisconnect != nil {
 			onDisconnect(retErr)
 		}
 	}()
-	if err := r.SendJSON(ctx, map[string]any{"type": "start", "reason": "relay_websocket_start"}); err != nil {
-		return fmt.Errorf("start phone stream: %w", err)
-	}
-	if err := r.sendVideoJSON(ctx, map[string]any{"type": "keyframe", "reason": "relay_video_join"}); err != nil {
-		return fmt.Errorf("request phone keyframe: %w", err)
-	}
-	errCh := make(chan error, 2)
-	go r.controlKeepaliveLoop(ctx, controlConn)
-	go func() { errCh <- r.readLoop(ctx, controlConn) }()
+	errCh := make(chan error, 1)
 	go func() { errCh <- r.readLoop(ctx, videoConn) }()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
 		return err
-	}
-}
-
-func (r *Relay) controlKeepaliveLoop(ctx context.Context, conn *websocket.Conn) {
-	ticker := time.NewTicker(controlKeepaliveInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		body, err := json.Marshal(map[string]any{"type": "keepalive", "active": true})
-		if err != nil {
-			return
-		}
-		writeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-		r.writeMu.Lock()
-		err = conn.Write(writeCtx, websocket.MessageText, body)
-		r.writeMu.Unlock()
-		cancel()
-		if err != nil {
-			return
-		}
 	}
 }
 
@@ -646,7 +511,6 @@ func (r *Relay) Reconnect(reason string) {
 		reason = "recovery reconnect"
 	}
 	r.mu.Lock()
-	conn := r.conn
 	videoConn := r.videoConn
 	var oldCancel context.CancelFunc
 	var ctx context.Context
@@ -660,14 +524,10 @@ func (r *Relay) Reconnect(reason string) {
 		ctx, cancel = context.WithCancel(context.Background())
 		r.cancelLoop = cancel
 	}
-	r.conn = nil
 	r.videoConn = nil
 	r.connected = false
 	r.lastError = reason
 	r.mu.Unlock()
-	if conn != nil {
-		_ = conn.Close(websocket.StatusInternalError, reason)
-	}
 	if videoConn != nil {
 		_ = videoConn.Close(websocket.StatusInternalError, reason)
 	}
@@ -677,23 +537,6 @@ func (r *Relay) Reconnect(reason string) {
 	if shouldRestart {
 		go r.connectLoop(ctx)
 	}
-}
-
-func (r *Relay) sendVideoJSON(ctx context.Context, value any) error {
-	body, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	conn := r.videoConn
-	connected := r.connected
-	r.mu.Unlock()
-	if conn == nil || !connected {
-		return fmt.Errorf("phone video stream is not connected")
-	}
-	r.videoWriteMu.Lock()
-	defer r.videoWriteMu.Unlock()
-	return conn.Write(ctx, websocket.MessageText, body)
 }
 
 func (r *Relay) websocketURL(path string) (string, error) {
@@ -717,77 +560,4 @@ func (r *Relay) websocketURL(path string) (string, error) {
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
 	parsed.RawQuery = ""
 	return parsed.String(), nil
-}
-
-func (r *Relay) stopPhoneSession() {
-	r.mu.Lock()
-	base := r.cfg.BaseURL
-	r.mu.Unlock()
-	r.stopPhoneSessionAt(base)
-}
-
-func (r *Relay) startPhoneSessionAt(ctx context.Context, baseURL string, timeout time.Duration) error {
-	base := strings.TrimRight(baseURL, "/")
-	if base == "" {
-		return fmt.Errorf("phone base URL is empty")
-	}
-	if timeout <= 0 {
-		timeout = r.cfg.RequestTimeout
-	}
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	startCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(startCtx, http.MethodPost, base+"/api/v1/session/start", nil)
-	if err != nil {
-		return fmt.Errorf("start phone session: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("start phone session: %w", err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
-	}
-	return fmt.Errorf("start phone session status %d", resp.StatusCode)
-}
-
-func (r *Relay) stopPhoneSessionAt(baseURL string) {
-	base := strings.TrimRight(baseURL, "/")
-	if base == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.RequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/session/stop", nil)
-	if err != nil {
-		return
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		r.mu.Lock()
-		idle := !r.desired && r.viewers == 0
-		if idle {
-			r.lastError = ""
-		}
-		r.mu.Unlock()
-		if idle {
-			log.Printf("ticket phone relay: ignored idle stop error: %v", err)
-			return
-		}
-		r.recordError(fmt.Errorf("stop phone session: %w", err))
-		return
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		r.mu.Lock()
-		r.lastError = ""
-		r.mu.Unlock()
-		return
-	}
-	r.recordError(fmt.Errorf("stop phone session status %d", resp.StatusCode))
 }

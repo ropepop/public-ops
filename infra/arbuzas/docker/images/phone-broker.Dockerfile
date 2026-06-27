@@ -4,6 +4,10 @@ FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG ARBUZAS_RELEASE_ID=unknown
+ARG ARBUZAS_RELEASE_SOURCE_COMMIT=nogit
+ARG ARBUZAS_RELEASE_SOURCE_DIRTY=unknown
+ARG ARBUZAS_RELEASE_SOURCE_SHA256=unknown
 
 WORKDIR /src/workloads/phone-broker
 
@@ -15,8 +19,14 @@ COPY workloads/phone-broker ./
 
 RUN --mount=type=cache,target=/go/pkg/mod \
   --mount=type=cache,target=/root/.cache/go-build \
+  set -eux; \
+  export ARBUZAS_RELEASE_ID="${ARBUZAS_RELEASE_ID}"; \
+  export ARBUZAS_RELEASE_SOURCE_COMMIT="${ARBUZAS_RELEASE_SOURCE_COMMIT}"; \
+  export ARBUZAS_RELEASE_SOURCE_DIRTY="${ARBUZAS_RELEASE_SOURCE_DIRTY}"; \
+  export ARBUZAS_RELEASE_SOURCE_SHA256="${ARBUZAS_RELEASE_SOURCE_SHA256}"; \
+  ldflags="$(bash ./scripts/ldflags.sh)"; \
   CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" \
-    go build -o /out/phone-broker ./cmd/phone-broker
+    go build -ldflags "$ldflags" -o /out/phone-broker ./cmd/phone-broker
 
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 

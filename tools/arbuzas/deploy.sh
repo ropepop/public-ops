@@ -48,10 +48,6 @@ THINKPAD_FAN_REMOTE_SCRIPT_FILE="/usr/local/libexec/arbuzas-thinkpad-fan.py"
 THINKPAD_FAN_REMOTE_PROC_FILE="/proc/acpi/ibm/fan"
 THINKPAD_FAN_REMOTE_PARAM_FILE="/sys/module/thinkpad_acpi/parameters/fan_control"
 THINKPAD_FAN_REMOTE_TEMP_GLOB="/sys/devices/platform/thinkpad_hwmon/hwmon/hwmon*/temp1_input"
-DNS_ADMIN_NGINX_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/nginx"
-DNS_ADMIN_NGINX_TEMPLATE_FILE="${DNS_ADMIN_NGINX_TEMPLATE_FILE:-${DNS_ADMIN_NGINX_CONFIG_ROOT}/arbuzas-dns-admin.conf.template}"
-DNS_ADMIN_NGINX_REMOTE_SITE_FILE="/etc/nginx/sites-available/arbuzas-dns-admin"
-DNS_ADMIN_NGINX_REMOTE_SITE_LINK="/etc/nginx/sites-enabled/arbuzas-dns-admin"
 ROOT_FALLBACK_IMAGE="${ROOT_FALLBACK_IMAGE:-debian:13-slim}"
 
 if [[ -f "${DOCKER_DEFAULT_ENV_FILE}" ]]; then
@@ -74,10 +70,6 @@ ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
 ARBUZAS_PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT:-9398}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
-ARBUZAS_DNS_HTTPS_PORT="${ARBUZAS_DNS_HTTPS_PORT:-443}"
-ARBUZAS_DNS_DOT_PORT="${ARBUZAS_DNS_DOT_PORT:-853}"
-ARBUZAS_DNS_CONTROLPLANE_PORT="${ARBUZAS_DNS_CONTROLPLANE_PORT:-8097}"
-ARBUZAS_DNS_ADMIN_LAN_IP="${ARBUZAS_DNS_ADMIN_LAN_IP:-}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
 ARBUZAS_TAILSCALE_IPV4="${ARBUZAS_TAILSCALE_IPV4:-}"
 ARBUZAS_FAN_ENTER_AUTO_C="${ARBUZAS_FAN_ENTER_AUTO_C:-89}"
@@ -87,7 +79,6 @@ ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info
 ARBUZAS_SATIKSME_BOT_HOSTNAME="${ARBUZAS_SATIKSME_BOT_HOSTNAME:-kontrole.info}"
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME="${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME:-farel-subscription-bot.jolkins.id.lv}"
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
-ARBUZAS_DNS_HOSTNAME="${ARBUZAS_DNS_HOSTNAME:-dns.jolkins.id.lv}"
 ARBUZAS_PORTAINER_IMAGE="${ARBUZAS_PORTAINER_IMAGE:-portainer/portainer-ce:lts}"
 ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
 
@@ -99,9 +90,7 @@ VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
 VALIDATE_SUBSCRIPTION=0
 VALIDATE_PHONE_BROKER=0
-VALIDATE_RIGASATIKSME_QR=0
 VALIDATE_TICKET_REMOTE=0
-VALIDATE_DNS=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
@@ -113,17 +102,12 @@ ALL_SERVICES=(
   subscription_bot
   ticket_phone_bridge
   phone_broker
-  rigassatiksme_qr_bot
+  ticket_remote_spacetime_sidecar
   ticket_remote
   train_tunnel
   satiksme_tunnel
   subscription_tunnel
   ticket_remote_tunnel
-  dns_controlplane
-)
-
-DNS_SERVICES=(
-  dns_controlplane
 )
 
 log() {
@@ -428,22 +412,6 @@ remote_run_host_cache_cleanup() {
     else
       echo 'reclaimable cache flush skipped because ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false'
     fi
-  "
-}
-
-compact_remote_dns_db() {
-  local remote_release_dir="${REMOTE_CURRENT_LINK}"
-  ensure_remote_dns_host_preflight
-  remote_compose_shell "${remote_release_dir}" "
-    restart_dns_controlplane() {
-      compose up -d --build --force-recreate --no-deps dns_controlplane >/dev/null
-    }
-
-    trap 'restart_dns_controlplane || true' EXIT
-    compose stop dns_controlplane
-    compose run -T --rm --no-deps --build dns_controlplane /usr/local/bin/arbuzas-dns compact --json --include-legacy-observability </dev/null
-    restart_dns_controlplane
-    trap - EXIT
   "
 }
 
@@ -791,8 +759,6 @@ Actions:
   memory-report     Report corrected host memory pressure and provider-like cached-inclusive memory from /proc/meminfo
   install-memory-report   Install the corrected host memory report service and timer on the live host
   validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot
-  compact-dns-db    Run the Arbuzas DNS cleanup activation and compact maintenance flow on the live host
-  repair-dns-admin  Clear stale private DNS admin forwards, re-assert the Tailscale TCP forward, refresh the bare private web URL, and print host listener diagnostics
   install-netdata   Install Netdata plus hardware monitoring packages on the live host and publish it privately over Tailscale
   validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected Arbuzas hardware charts
   install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host
@@ -813,9 +779,8 @@ Options:
 
 Services:
   portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
-  subscription_bot, subscription_tunnel, ticket_phone_bridge, phone_broker, rigassatiksme_qr_bot,
-  ticket_remote, ticket_remote_tunnel,
-  dns_controlplane
+  subscription_bot, subscription_tunnel, ticket_phone_bridge, phone_broker,
+  ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel
 EOF
 }
 
@@ -886,22 +851,13 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
       append_unique DIAGNOSTIC_SERVICES phone_broker
       ;;
-    rigassatiksme_qr)
-      VALIDATE_RIGASATIKSME_QR=1
-      append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
-      append_unique DIAGNOSTIC_SERVICES phone_broker
-      append_unique DIAGNOSTIC_SERVICES rigassatiksme_qr_bot
-      ;;
     ticket_remote)
       VALIDATE_TICKET_REMOTE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
       append_unique DIAGNOSTIC_SERVICES phone_broker
+      append_unique DIAGNOSTIC_SERVICES ticket_remote_spacetime_sidecar
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
-      ;;
-    dns)
-      VALIDATE_DNS=1
-      append_unique DIAGNOSTIC_SERVICES dns_controlplane
       ;;
     *)
       echo "Unknown validation group: ${group_name}" >&2
@@ -958,31 +914,27 @@ resolve_requested_services() {
         append_unique COMPOSE_TARGET_SERVICES phone_broker
         mark_validation_group phone_broker
         ;;
-      phone_broker)
+    phone_broker)
+      append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
+      append_unique COMPOSE_TARGET_SERVICES phone_broker
+      mark_validation_group phone_broker
+      ;;
+    ticket_remote)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
         append_unique COMPOSE_TARGET_SERVICES phone_broker
-        mark_validation_group phone_broker
-        ;;
-      rigassatiksme_qr_bot)
-        append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-        append_unique COMPOSE_TARGET_SERVICES phone_broker
-        append_unique COMPOSE_TARGET_SERVICES rigassatiksme_qr_bot
-        mark_validation_group rigassatiksme_qr
-        ;;
-      ticket_remote)
-        append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-        append_unique COMPOSE_TARGET_SERVICES phone_broker
+        append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
         append_unique COMPOSE_TARGET_SERVICES ticket_remote
         append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
+        mark_validation_group ticket_remote
+        ;;
+      ticket_remote_spacetime_sidecar)
+        append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
+        append_unique COMPOSE_TARGET_SERVICES ticket_remote
         mark_validation_group ticket_remote
         ;;
       ticket_remote_tunnel)
         append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
         mark_validation_group ticket_remote
-        ;;
-      dns_controlplane)
-        append_unique COMPOSE_TARGET_SERVICES "${service_name}"
-        mark_validation_group dns
         ;;
       *)
         echo "Unknown service: ${service_name}" >&2
@@ -1010,12 +962,12 @@ compose_target_service_args() {
   printf '%s' "${service_args}"
 }
 
-compose_target_service_args_without_dns() {
+compose_target_service_args_without_tunnels() {
   local service_args=""
   local service_name
   for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
-      dns_controlplane|train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
         continue
         ;;
       *)
@@ -1039,20 +991,20 @@ compose_target_tunnel_service_args() {
   printf '%s' "${service_args}"
 }
 
-compose_all_non_dns_service_args() {
+compose_all_service_args() {
   local service_args=""
   local service_name
-  local non_dns_services=(
+  local all_services=(
     portainer
     train_bot
     satiksme_bot
     subscription_bot
     ticket_phone_bridge
     phone_broker
-    rigassatiksme_qr_bot
+    ticket_remote_spacetime_sidecar
     ticket_remote
   )
-  for service_name in "${non_dns_services[@]}"; do
+  for service_name in "${all_services[@]}"; do
     service_args+=" ${service_name}"
   done
   printf '%s' "${service_args}"
@@ -1074,24 +1026,6 @@ targeted_service_selected() {
     if [[ "${service_name}" == "${wanted}" ]]; then
       return 0
     fi
-  done
-
-  return 1
-}
-
-requires_dns_release_prepare() {
-  local service_name
-
-  if (( TARGETED_MODE == 0 )); then
-    return 0
-  fi
-
-  for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
-    case "${service_name}" in
-      dns_controlplane)
-        return 0
-        ;;
-    esac
   done
 
   return 1
@@ -1207,165 +1141,10 @@ is_tailscale_ipv4() {
   (( 10#${o1} == 100 && 10#${o2} >= 64 && 10#${o2} <= 127 ))
 }
 
-is_dns_admin_bind_ipv4() {
-  is_private_ipv4 "${1:-}" || is_tailscale_ipv4 "${1:-}"
-}
-
-dns_validation_requested() {
-  if (( TARGETED_MODE == 0 || VALIDATE_DNS == 1 )); then
-    return 0
-  fi
-  return 1
-}
-
-require_dns_private_admin_env() {
-  if [[ -z "${ARBUZAS_DNS_ADMIN_LAN_IP}" ]]; then
-    echo "ARBUZAS_DNS_ADMIN_LAN_IP is required for the private Arbuzas DNS admin surface" >&2
-    exit 2
-  fi
-  if ! is_dns_admin_bind_ipv4 "${ARBUZAS_DNS_ADMIN_LAN_IP}"; then
-    echo "ARBUZAS_DNS_ADMIN_LAN_IP must be a private RFC1918 or Tailscale IPv4 address (got: ${ARBUZAS_DNS_ADMIN_LAN_IP})" >&2
-    exit 2
-  fi
-}
-
-dns_https_url() {
-  local path="$1"
-  local base="https://${ARBUZAS_DNS_HOSTNAME}"
-  if [[ "${ARBUZAS_DNS_HTTPS_PORT}" != "443" ]]; then
-    base="${base}:${ARBUZAS_DNS_HTTPS_PORT}"
-  fi
-  printf '%s%s\n' "${base}" "${path}"
-}
-
-dns_probe_query_base64url() {
-  python3 - <<'PY'
-import base64
-import struct
-
-labels = "example.com".split(".")
-question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels) + b"\x00"
-question += struct.pack("!HH", 1, 1)
-query = struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0) + question
-print(base64.urlsafe_b64encode(query).rstrip(b"=").decode("ascii"))
-PY
-}
-
-probe_doh_endpoint() {
-  local connect_ip="${1:-}"
-  local doh_query=""
-
-  doh_query="$(dns_probe_query_base64url)" || return 1
-  python3 - "${connect_ip}" "${ARBUZAS_DNS_HOSTNAME}" "${ARBUZAS_DNS_HTTPS_PORT}" "${doh_query}" <<'PY'
-import http.client
-import ssl
-import sys
-
-connect_ip = sys.argv[1]
-hostname = sys.argv[2]
-port = int(sys.argv[3])
-doh_query = sys.argv[4]
-
-connect_host = connect_ip or hostname
-context = ssl._create_unverified_context()
-connection = http.client.HTTPSConnection(connect_host, port, context=context, timeout=10)
-try:
-    connection.request(
-        "GET",
-        f"/dns-query?dns={doh_query}",
-        headers={
-            "Host": hostname,
-            "Accept": "application/dns-message",
-        },
-    )
-    response = connection.getresponse()
-    content_type = response.getheader("Content-Type", "")
-    body = response.read()
-    if response.status != 200:
-        raise SystemExit(f"unexpected DoH status: {response.status}")
-    if not content_type.lower().startswith("application/dns-message"):
-        raise SystemExit(f"unexpected DoH content type: {content_type}")
-    if not body:
-        raise SystemExit("empty DoH response body")
-finally:
-    connection.close()
-PY
-}
-
-probe_public_https_status() {
-  local path="$1"
-  local expected_status="$2"
-  local connect_ip="${3:-}"
-  local url=""
-  local status=""
-
-  url="$(dns_https_url "${path}")"
-  if [[ -n "${connect_ip}" ]]; then
-    status="$(
-      curl --resolve "${ARBUZAS_DNS_HOSTNAME}:${ARBUZAS_DNS_HTTPS_PORT}:${connect_ip}" \
-        -sk \
-        -o /dev/null \
-        -w '%{http_code}' \
-        "${url}"
-    )" || return 1
-  else
-    status="$(curl -sk -o /dev/null -w '%{http_code}' "${url}")" || return 1
-  fi
-
-  [[ "${status}" == "${expected_status}" ]]
-}
-
-probe_dot_endpoint() {
-  local connect_host="${1:-${ARBUZAS_DNS_HOSTNAME}}"
-
-  python3 - "${connect_host}" "${ARBUZAS_DNS_HOSTNAME}" "${ARBUZAS_DNS_DOT_PORT}" <<'PY'
-import socket
-import ssl
-import struct
-import sys
-
-connect_host = sys.argv[1]
-server_name = sys.argv[2]
-port = int(sys.argv[3])
-
-labels = "example.com".split(".")
-question = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels) + b"\x00"
-question += struct.pack("!HH", 1, 1)
-query = struct.pack("!HHHHHH", 0x4343, 0x0100, 1, 0, 0, 0) + question
-
-context = ssl.create_default_context()
-with socket.create_connection((connect_host, port), timeout=10) as raw_stream:
-    with context.wrap_socket(raw_stream, server_hostname=server_name) as tls_stream:
-        tls_stream.sendall(struct.pack("!H", len(query)) + query)
-        prefix = tls_stream.recv(2)
-        if len(prefix) != 2:
-            raise SystemExit("missing DoT response length prefix")
-        response_len = struct.unpack("!H", prefix)[0]
-        payload = b""
-        while len(payload) < response_len:
-            chunk = tls_stream.recv(response_len - len(payload))
-            if not chunk:
-                raise SystemExit("truncated DoT response")
-            payload += chunk
-        if len(payload) < 4:
-            raise SystemExit("short DoT response")
-        flags = struct.unpack("!H", payload[2:4])[0]
-        if (flags & 0x8000) == 0:
-            raise SystemExit("DoT response did not set the QR bit")
-PY
-}
-
 resolve_remote_public_ipv4() {
   local ip=""
   ip="$(
     remote_shell "
-      if [[ -r '/srv/arbuzas/dns/state/ddns-last-ipv4' ]]; then
-        ip=\$(tr -d '\r\n[:space:]' < '/srv/arbuzas/dns/state/ddns-last-ipv4')
-        if [[ \"\${ip}\" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]]; then
-          printf '%s\n' \"\${ip}\"
-          exit 0
-        fi
-      fi
       if command -v curl >/dev/null 2>&1; then
         if ip=\$(curl -4 -fsS --max-time 10 'https://ifconfig.me/ip' 2>/dev/null); then
           printf '%s\n' \"\${ip}\"
@@ -1418,27 +1197,6 @@ resolve_remote_tailscale_ipv6() {
   printf '%s\n' "${ip}"
 }
 
-resolve_remote_tailscale_dns_name() {
-  local dns_name=""
-
-  dns_name="$(
-    remote_inline_shell "
-      python3 - <<'PY'
-import json
-import subprocess
-
-payload = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
-dns_name = payload.get('Self', {}).get('DNSName', '').rstrip('.')
-if not dns_name:
-    raise SystemExit('missing Arbuzas Tailscale DNS name')
-print(dns_name)
-PY
-    " 2>/dev/null | tail -n 1 | tr -d '\r\n[:space:]'
-  )" || return 1
-
-  [[ -n "${dns_name}" ]] || return 1
-  printf '%s\n' "${dns_name}"
-}
 
 resolve_remote_tailscale_hostname() {
   local hostname=""
@@ -1460,324 +1218,6 @@ PY
 
   [[ -n "${hostname}" ]] || return 1
   printf '%s\n' "${hostname}"
-}
-
-render_dns_admin_nginx_config() {
-  local tailnet_dns_name="$1"
-  local tailnet_hostname="$2"
-  local tailnet_ipv4="$3"
-  local tailnet_ipv6="$4"
-
-  [[ -f "${DNS_ADMIN_NGINX_TEMPLATE_FILE}" ]] || {
-    echo "missing DNS admin nginx template: ${DNS_ADMIN_NGINX_TEMPLATE_FILE}" >&2
-    return 1
-  }
-
-  python3 - "${DNS_ADMIN_NGINX_TEMPLATE_FILE}" "${tailnet_dns_name}" "${tailnet_hostname}" "${tailnet_ipv4}" "${tailnet_ipv6}" "${ARBUZAS_DNS_CONTROLPLANE_PORT}" <<'PY'
-from pathlib import Path
-import sys
-
-template_path = Path(sys.argv[1])
-tailnet_dns_name = sys.argv[2]
-tailnet_hostname = sys.argv[3]
-tailnet_ipv4 = sys.argv[4]
-tailnet_ipv6 = sys.argv[5]
-controlplane_port = sys.argv[6]
-server_names = []
-for candidate in (tailnet_hostname, tailnet_dns_name):
-    candidate = candidate.strip()
-    if candidate and candidate not in server_names:
-        server_names.append(candidate)
-
-rendered = template_path.read_text(encoding="utf-8")
-rendered = rendered.replace("__DNS_ADMIN_SERVER_NAMES__", " ".join(server_names))
-rendered = rendered.replace("__DNS_ADMIN_LISTEN_IPV4__", tailnet_ipv4)
-rendered = rendered.replace("__DNS_ADMIN_LISTEN_IPV6__", tailnet_ipv6)
-rendered = rendered.replace("__DNS_ADMIN_CONTROLPLANE_PORT__", controlplane_port)
-print(rendered, end="")
-PY
-}
-
-publish_remote_dns_admin_tailscale() {
-  local tailnet_dns_name=""
-  local tailnet_hostname=""
-  local tailnet_ipv4=""
-  local tailnet_ipv6=""
-  local nginx_config_base64=""
-
-  tailnet_dns_name="$(resolve_remote_tailscale_dns_name)" || {
-    echo "Could not determine the Arbuzas Tailscale DNS name for the bare DNS admin URL." >&2
-    exit 1
-  }
-  tailnet_hostname="$(resolve_remote_tailscale_hostname)" || {
-    echo "Could not determine the Arbuzas Tailscale short hostname for the bare DNS admin URL." >&2
-    exit 1
-  }
-  tailnet_ipv4="$(resolve_remote_tailscale_ipv4)" || {
-    echo "Could not determine the Arbuzas Tailscale IPv4 address for the bare DNS admin URL." >&2
-    exit 1
-  }
-  tailnet_ipv6="$(resolve_remote_tailscale_ipv6)" || {
-    echo "Could not determine the Arbuzas Tailscale IPv6 address for the bare DNS admin URL." >&2
-    exit 1
-  }
-  nginx_config_base64="$(
-    render_dns_admin_nginx_config "${tailnet_dns_name}" "${tailnet_hostname}" "${tailnet_ipv4}" "${tailnet_ipv6}" | base64 | tr -d '\n'
-  )" || exit 1
-
-  log "Maintenance: publishing the Arbuzas DNS admin surface privately over Tailscale"
-  remote_root_command "
-    command -v tailscale >/dev/null 2>&1 || {
-      echo 'tailscale is required for the Arbuzas DNS private admin forward' >&2
-      exit 1
-    }
-    command -v nginx >/dev/null 2>&1 || {
-      echo 'nginx is required for the bare Arbuzas DNS admin URL' >&2
-      exit 1
-    }
-    # DNS owns host port 443 directly; clear any stale Tailscale HTTPS proxy first.
-    tailscale serve --bg --https=443 off >/dev/null 2>&1 || true
-    tailscale serve --bg --yes --tcp ${ARBUZAS_DNS_CONTROLPLANE_PORT} 127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}
-    install -d '$(dirname "${DNS_ADMIN_NGINX_REMOTE_SITE_FILE}")' '$(dirname "${DNS_ADMIN_NGINX_REMOTE_SITE_LINK}")'
-    printf '%s' '${nginx_config_base64}' | base64 -d > '${DNS_ADMIN_NGINX_REMOTE_SITE_FILE}'
-    ln -sfn '${DNS_ADMIN_NGINX_REMOTE_SITE_FILE}' '${DNS_ADMIN_NGINX_REMOTE_SITE_LINK}'
-    nginx -t
-    if command -v systemctl >/dev/null 2>&1; then
-      if systemctl is-active --quiet nginx; then
-        systemctl reload nginx
-      else
-        systemctl start nginx
-      fi
-    else
-      nginx -s reload
-    fi
-    curl -fsS -H 'Host: ${tailnet_dns_name}' 'http://127.0.0.1/' >/dev/null 2>/dev/null
-  "
-  log "Maintenance: private DNS admin root is available at http://${tailnet_dns_name}/"
-}
-
-collect_remote_dns_host_diagnostics() {
-  remote_root_command "
-    echo '--- tailscale serve status ---' >&2
-    if command -v tailscale >/dev/null 2>&1; then
-      tailscale serve status >&2 || true
-    else
-      echo 'tailscale not installed' >&2
-    fi
-    echo '--- dns host listeners ---' >&2
-    ss -H -ltnp | awk '\$4 ~ /:80$|:443$|:853$|:8097$/ { print }' >&2 || true
-    echo '--- docker published dns ports ---' >&2
-    docker ps --format '{{.Names}}|{{.Ports}}' | grep -E '(:443->|:853->|:8097->)' >&2 || true
-  " || true
-}
-
-ensure_remote_dns_host_preflight() {
-  local repair_cmd=""
-
-  repair_cmd="ARBUZAS_HOST='${ARBUZAS_HOST}' ARBUZAS_USER='${ARBUZAS_USER}' ARBUZAS_SSH_PORT='${ARBUZAS_SSH_PORT}' ARBUZAS_DNS_ADMIN_LAN_IP='${ARBUZAS_DNS_ADMIN_LAN_IP}' bash tools/arbuzas/deploy.sh repair-dns-admin"
-  log "Preflight: checking Arbuzas DNS host listeners before cutover"
-  if remote_root_command "
-    DNS_ADMIN_LAN_IP='${ARBUZAS_DNS_ADMIN_LAN_IP}' \
-    DNS_SAFE_REPAIR_COMMAND='${repair_cmd}' \
-    python3 - <<'PY'
-import os
-import subprocess
-import sys
-
-dns_container = 'arbuzas-dns_controlplane-1'
-lan_ip = os.environ['DNS_ADMIN_LAN_IP']
-repair_cmd = os.environ['DNS_SAFE_REPAIR_COMMAND']
-interesting_ports = {'443', '853', '8097'}
-
-
-def load_output(command):
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    return result.stdout.splitlines()
-
-
-listeners = []
-for line in load_output(['ss', '-H', '-ltnp']):
-    parts = line.split()
-    if len(parts) < 5:
-        continue
-    local_field = parts[3]
-    if ':' not in local_field:
-        continue
-    port = local_field.rsplit(':', 1)[-1]
-    if port in interesting_ports:
-        listeners.append((port, local_field, line))
-
-docker_rows = load_output(['docker', 'ps', '--format', '{{.Names}}|{{.Ports}}'])
-offenders = []
-repairable = False
-
-for row in docker_rows:
-    name, _, ports = row.partition('|')
-    if not ports.strip():
-        continue
-    if any(marker in ports for marker in (':443->', ':853->', ':8097->')) and name.strip() != dns_container:
-        offenders.append(('conflicting Docker publisher', row))
-
-for port, local_field, line in listeners:
-    is_docker_proxy = 'docker-proxy' in line
-    is_tailscaled = 'tailscaled' in line
-    if port in {'443', '853'}:
-        if not is_docker_proxy:
-            offenders.append((f'conflicting host listener on {port}', line))
-            if is_tailscaled and port == '443':
-                repairable = True
-        continue
-
-    if port != '8097':
-        continue
-    if is_tailscaled:
-        continue
-    if is_docker_proxy and local_field in {f'127.0.0.1:{port}', f'{lan_ip}:{port}'}:
-        continue
-    offenders.append(('unexpected DNS admin listener on 8097', line))
-
-if offenders:
-    print('DNS host preflight failed on the live host; fix the listener conflict before retrying.', file=sys.stderr)
-    for label, line in offenders:
-        print(f'- {label}: {line}', file=sys.stderr)
-    if repairable:
-        print(f'Safe repair: {repair_cmd}', file=sys.stderr)
-    else:
-        print('Safe repair only applies to stale private DNS admin forwarding. If this is a different service, free the port manually and retry.', file=sys.stderr)
-    raise SystemExit(1)
-PY
-  "; then
-    return 0
-  fi
-
-  collect_remote_dns_host_diagnostics
-  return 1
-}
-
-repair_remote_dns_admin() {
-  log "Maintenance: repairing the Arbuzas DNS private admin forwarding"
-  publish_remote_dns_admin_tailscale
-  collect_remote_dns_host_diagnostics
-  validate_private_dns_admin_access "${REMOTE_CURRENT_LINK}"
-}
-
-validate_public_dns_access() {
-  local diagnostics_release_dir="$1"
-  local public_ip=""
-  local path=""
-
-  for path in / /login /dns/login /v1/health /livez /healthz; do
-    log "Validate: dns public HTTPS keeps ${path} closed"
-    if ! wait_until_local_ok probe_public_https_status "${path}" 404 >/dev/null 2>&1; then
-      if ! is_valid_ipv4 "${public_ip}"; then
-        public_ip="$(resolve_remote_public_ipv4 || true)"
-      fi
-      if is_valid_ipv4 "${public_ip}" && wait_until_local_ok probe_public_https_status "${path}" 404 "${public_ip}" >/dev/null 2>&1; then
-        log "Validate: dns public HTTPS keeps ${path} closed via fallback IP ${public_ip}"
-      else
-        log "Validation failed: dns public HTTPS keeps ${path} closed"
-        echo "Public DNS web access looks too open: ${path} on ${ARBUZAS_DNS_HOSTNAME}:${ARBUZAS_DNS_HTTPS_PORT} is not returning 404." >&2
-        collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-        return 1
-      fi
-    fi
-  done
-
-  log "Validate: dns public DoH query"
-  if ! wait_until_local_ok probe_doh_endpoint >/dev/null 2>&1; then
-    if ! is_valid_ipv4 "${public_ip}"; then
-      public_ip="$(resolve_remote_public_ipv4 || true)"
-    fi
-    if is_valid_ipv4 "${public_ip}" && wait_until_local_ok probe_doh_endpoint "${public_ip}" >/dev/null 2>&1; then
-      log "Validate: dns public DoH query via fallback IP ${public_ip}"
-    else
-      log "Validation failed: dns public DoH query"
-      echo "Public DNS-over-HTTPS looks broken: ${ARBUZAS_DNS_HOSTNAME}:${ARBUZAS_DNS_HTTPS_PORT} did not return a DNS message even though the Arbuzas-local HTTPS listener already passed." >&2
-      collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-      return 1
-    fi
-  fi
-
-  log "Validate: dns public DoT query"
-  if ! wait_until_local_ok probe_dot_endpoint >/dev/null 2>&1; then
-    if ! is_valid_ipv4 "${public_ip}"; then
-      public_ip="$(resolve_remote_public_ipv4 || true)"
-    fi
-    if is_valid_ipv4 "${public_ip}" && wait_until_local_ok probe_dot_endpoint "${public_ip}" >/dev/null 2>&1; then
-      log "Validate: dns public DoT query via fallback IP ${public_ip}"
-    else
-      log "Validation failed: dns public DoT query"
-      echo "Public DNS-over-TLS looks broken: ${ARBUZAS_DNS_HOSTNAME}:${ARBUZAS_DNS_DOT_PORT} did not return a DNS answer even though the Arbuzas-local DoT listener already passed." >&2
-      collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-      return 1
-    fi
-  fi
-}
-
-validate_private_dns_admin_access() {
-  local diagnostics_release_dir="$1"
-  local tailnet_ipv4=""
-  local tailnet_dns_name=""
-
-  log "Validate: dns private admin login on live host loopback"
-  if ! remote_shell "curl -fsS 'http://127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin login on live host loopback"
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  log "Validate: dns private admin login on live host LAN address"
-  if ! remote_shell "curl -fsS 'http://${ARBUZAS_DNS_ADMIN_LAN_IP}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin login on live host LAN address"
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  tailnet_ipv4="$(resolve_remote_tailscale_ipv4 || true)"
-  if ! is_valid_ipv4 "${tailnet_ipv4}"; then
-    log "Validation failed: dns private admin Tailscale address"
-    echo "Could not determine the Arbuzas Tailscale IPv4 address for the private DNS admin check." >&2
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  tailnet_dns_name="$(resolve_remote_tailscale_dns_name || true)"
-  if [[ -z "${tailnet_dns_name}" ]]; then
-    log "Validation failed: dns private admin Tailscale DNS name"
-    echo "Could not determine the Arbuzas Tailscale DNS name for the bare DNS admin URL check." >&2
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  log "Validate: dns private admin root on live host nginx"
-  if ! remote_shell "curl -fsS -H 'Host: ${tailnet_dns_name}' 'http://127.0.0.1/' >/dev/null 2>/dev/null"; then
-    log "Validation failed: dns private admin root on live host nginx"
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  log "Validate: dns private admin bare URL over Tailscale"
-  if ! wait_until_local_ok curl -fsS "http://${tailnet_dns_name}/" >/dev/null 2>&1; then
-    log "Validation failed: dns private admin bare URL over Tailscale"
-    echo "Private DNS admin bare URL over Tailscale looks broken: http://${tailnet_dns_name}/ did not answer." >&2
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
-
-  log "Validate: dns private admin login over Tailscale"
-  if ! wait_until_local_ok curl -fsS "http://${tailnet_ipv4}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login" >/dev/null 2>&1; then
-    log "Validation failed: dns private admin login over Tailscale"
-    echo "Private DNS admin access over Tailscale looks broken: http://${tailnet_ipv4}:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login did not answer." >&2
-    collect_remote_dns_host_diagnostics
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" dns_controlplane
-    return 1
-  fi
 }
 
 validate_remote_netdata() {
@@ -1884,7 +1324,6 @@ checks = {
     'containers': has(
         lambda descriptor: 'cgroup' in descriptor
         or 'app.arbuzas-' in descriptor
-        or 'app.adguardhome' in descriptor
         or 'app.cloudflared' in descriptor
     ),
     'temperature': has(lambda descriptor: 'temperature' in descriptor and ('thinkpad' in descriptor or 'coretemp' in descriptor or 'cpu' in descriptor)),
@@ -2141,7 +1580,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker workloads/rigassatiksme-qr-bot)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -2161,7 +1600,6 @@ included_roots = [
     pathlib.Path("workloads/train-bot"),
     pathlib.Path("workloads/satiksme-bot"),
     pathlib.Path("workloads/phone-broker"),
-    pathlib.Path("workloads/rigassatiksme-qr-bot"),
 ]
 entries = []
 for included in included_roots:
@@ -2204,13 +1642,11 @@ prepare_local_release_bundle() {
   mkdir -p "${ARBUZAS_RELEASE_DIR}/generated/cloudflared"
 
   copy_tree_into_release "infra/arbuzas/docker"
-  copy_tree_into_release "tools/arbuzas-rs"
   copy_tree_into_release "workloads/shared-go"
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
   copy_tree_into_release "workloads/subscription-bot"
   copy_tree_into_release "workloads/phone-broker"
-  copy_tree_into_release "workloads/rigassatiksme-qr-bot"
   copy_tree_into_release "workloads/ticket-remote"
 
   mkdir -p "${ARBUZAS_RELEASE_DIR}/tools/arbuzas"
@@ -2236,10 +1672,6 @@ ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
 ARBUZAS_PHONE_BROKER_PORT=${ARBUZAS_PHONE_BROKER_PORT}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
-ARBUZAS_DNS_HTTPS_PORT=${ARBUZAS_DNS_HTTPS_PORT}
-ARBUZAS_DNS_DOT_PORT=${ARBUZAS_DNS_DOT_PORT}
-ARBUZAS_DNS_CONTROLPLANE_PORT=${ARBUZAS_DNS_CONTROLPLANE_PORT}
-ARBUZAS_DNS_ADMIN_LAN_IP=${ARBUZAS_DNS_ADMIN_LAN_IP}
 ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
 ARBUZAS_SATIKSME_BOT_HOSTNAME=${ARBUZAS_SATIKSME_BOT_HOSTNAME}
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME=${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}
@@ -2249,7 +1681,6 @@ ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TE
 ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE:-}
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}
-ARBUZAS_DNS_HOSTNAME=${ARBUZAS_DNS_HOSTNAME}
 ARBUZAS_PORTAINER_IMAGE=${ARBUZAS_PORTAINER_IMAGE}
 ARBUZAS_CLOUDFLARED_IMAGE=${ARBUZAS_CLOUDFLARED_IMAGE}
 EOF
@@ -2304,25 +1735,19 @@ prepare_remote_host_layout() {
       '/srv/arbuzas/subscription-bot/state' \
       '/srv/arbuzas/ticket-remote/run' \
       '/srv/arbuzas/ticket-remote/state' \
-      '/srv/arbuzas/dns/state' \
-      '/srv/arbuzas/dns/runtime' \
-      '/srv/arbuzas/dns/run' \
-      '/srv/arbuzas/dns/logs' \
       '/etc/arbuzas/env' \
       '/etc/arbuzas/releases' \
       '/etc/arbuzas/docker-gc' \
-      '/etc/arbuzas/dns/tls' \
-      '/etc/arbuzas/dns/secrets' \
       '/etc/arbuzas/cloudflared' \
       '/etc/arbuzas/secrets'
     if [[ ! -f '${DOCKER_GC_REMOTE_STATE_FILE}' && -r '/srv/arbuzas/docker-gc/state.json' ]]; then
       cp '/srv/arbuzas/docker-gc/state.json' '${DOCKER_GC_REMOTE_STATE_FILE}'
     fi
-    touch \
+    sudo -n touch \
       '/etc/arbuzas/env/train-bot.env' \
       '/etc/arbuzas/env/satiksme-bot.env' \
       '/etc/arbuzas/env/subscription-bot.env' \
-      '/etc/arbuzas/env/ticket-remote.env'
+      '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
   "
 }
 
@@ -2346,38 +1771,38 @@ copy_release_to_remote() {
 
   remote_shell "
     rm -rf '${remote_tmp_dir}'
-    mkdir -p '${remote_tmp_dir}'
-    tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
-    rm -f '${remote_tarball}'
+    sudo -n mkdir -p '${remote_tmp_dir}'
+    sudo -n tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
+    sudo -n rm -f '${remote_tarball}'
   "
 
   remote_shell "
     [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete upload: missing release.env in ${remote_tmp_dir}' >&2; exit 1; }
-    rm -rf '${remote_release_dir}'
-    mv '${remote_tmp_dir}' '${remote_release_dir}'
+    sudo -n rm -rf '${remote_release_dir}'
+    sudo -n mv '${remote_tmp_dir}' '${remote_release_dir}'
   "
 }
 
 render_remote_cloudflared_configs() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
   remote_shell "
-    mkdir -p '${remote_release_dir}/generated/cloudflared'
-    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+    sudo -n mkdir -p '${remote_release_dir}/generated/cloudflared'
+    sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
       --credentials-file '/etc/arbuzas/cloudflared/train-bot.json' \
       --hostname '${ARBUZAS_TRAIN_BOT_HOSTNAME}' \
       --upstream 'http://train_bot:${ARBUZAS_TRAIN_BOT_PORT}' \
       --out '${remote_release_dir}/generated/cloudflared/train-bot.yml'
-    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+    sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
       --credentials-file '/etc/arbuzas/cloudflared/satiksme-bot.json' \
       --hostname '${ARBUZAS_SATIKSME_BOT_HOSTNAME}' \
       --upstream 'http://satiksme_bot:${ARBUZAS_SATIKSME_BOT_PORT}' \
       --out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'
-    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+    sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
       --credentials-file '/etc/arbuzas/cloudflared/subscription-bot.json' \
       --hostname '${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}' \
       --upstream 'http://subscription_bot:${ARBUZAS_SUBSCRIPTION_BOT_PORT}' \
       --out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'
-    python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
+    sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
       --credentials-file '/etc/arbuzas/cloudflared/ticket-remote.json' \
       --hostname '${ARBUZAS_TICKET_REMOTE_HOSTNAME}' \
       --upstream 'http://ticket_remote:${ARBUZAS_TICKET_REMOTE_PORT}' \
@@ -2396,41 +1821,24 @@ resolve_remote_current_release_id() {
 
 remote_compose_up() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
-  local non_dns_service_args=""
-  local all_non_dns_service_args=""
+  local non_tunnel_service_args=""
+  local all_service_args=""
   local tunnel_service_args=""
-  local dns_release_prepare_needed="false"
-  non_dns_service_args="$(compose_target_service_args_without_dns)"
-  all_non_dns_service_args="$(compose_all_non_dns_service_args)"
+  non_tunnel_service_args="$(compose_target_service_args_without_tunnels)"
+  all_service_args="$(compose_all_service_args)"
   if (( TARGETED_MODE == 1 )); then
     tunnel_service_args="$(compose_target_tunnel_service_args)"
   else
     tunnel_service_args="$(compose_all_tunnel_service_args)"
   fi
 
-  if requires_dns_release_prepare; then
-    dns_release_prepare_needed="true"
-    ensure_remote_dns_host_preflight
-  fi
-
   if (( TARGETED_MODE == 1 )); then
     remote_shell "
       cd '${remote_release_dir}'
-      if ${dns_release_prepare_needed}; then
-        docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' build dns_controlplane
-        docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null
-        docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
-        if [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]]; then
-          docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' stop dns_controlplane frontend adguardhome >/dev/null 2>&1 || true
-        fi
-      fi
-      ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+      sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
-      if ${dns_release_prepare_needed}; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
-      fi
-      if [[ -n '${non_dns_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_dns_service_args}
+      if [[ -n '${non_tunnel_service_args}' ]]; then
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_tunnel_service_args}
       fi
       if [[ -n '${tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
@@ -2441,19 +1849,12 @@ remote_compose_up() {
 
   remote_shell "
     cd '${remote_release_dir}'
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' build dns_controlplane
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null
-    docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
-    if [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]]; then
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' stop dns_controlplane frontend adguardhome >/dev/null 2>&1 || true
-    fi
-    ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+    sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_non_dns_service_args}
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_service_args}
     if [[ -n '${tunnel_service_args}' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
     fi
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
   "
 }
 
@@ -2531,106 +1932,6 @@ for name, active_root, versions_root in targets:
     print(f'public bundle cleanup target={name} active={active_version} removed={len(removed)}')
 PY
   "
-}
-
-validate_remote_dns_querylog_flow() {
-  local remote_release_dir="$1"
-
-  validate_remote_probe "${remote_release_dir}" "dns local encrypted queries and query logging on the live host" \
-    "wait_until_ok python3 - <<'PY'
-import base64
-import json
-import socket
-import sqlite3
-import ssl
-import struct
-import time
-import urllib.request
-
-db_path = '/srv/arbuzas/dns/state/controlplane.sqlite'
-hostname = '${ARBUZAS_DNS_HOSTNAME}'
-https_port = int('${ARBUZAS_DNS_HTTPS_PORT}')
-dot_port = int('${ARBUZAS_DNS_DOT_PORT}')
-
-def query_count():
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-    try:
-        return conn.execute('SELECT COUNT(*) FROM querylog_mirror_rows').fetchone()[0]
-    finally:
-        conn.close()
-
-labels = 'example.com'.split('.')
-question = b''.join(bytes([len(label)]) + label.encode('ascii') for label in labels) + b'\\x00'
-question += struct.pack('!HH', 1, 1)
-query = struct.pack('!HHHHHH', 0x5151, 0x0100, 1, 0, 0, 0) + question
-query_b64 = base64.urlsafe_b64encode(query).rstrip(b'=').decode('ascii')
-before = query_count()
-
-context = ssl._create_unverified_context()
-request = urllib.request.Request(
-    f'https://127.0.0.1:{https_port}/dns-query?dns={query_b64}',
-    headers={
-        'Host': hostname,
-        'Accept': 'application/dns-message',
-    },
-)
-with urllib.request.urlopen(request, context=context, timeout=5) as response:
-    if response.headers.get_content_type() != 'application/dns-message':
-        raise SystemExit('DoH probe returned the wrong content type')
-    if not response.read():
-        raise SystemExit('DoH probe returned an empty body')
-
-with socket.create_connection(('127.0.0.1', dot_port), timeout=5) as raw_stream:
-    with context.wrap_socket(raw_stream, server_hostname=hostname) as tls_stream:
-        tls_stream.sendall(struct.pack('!H', len(query)) + query)
-        prefix = tls_stream.recv(2)
-        if len(prefix) != 2:
-            raise SystemExit('DoT probe did not return a response prefix')
-        response_len = struct.unpack('!H', prefix)[0]
-        payload = b''
-        while len(payload) < response_len:
-            chunk = tls_stream.recv(response_len - len(payload))
-            if not chunk:
-                raise SystemExit('DoT probe returned a truncated response')
-            payload += chunk
-        if len(payload) < 4 or (struct.unpack('!H', payload[2:4])[0] & 0x8000) == 0:
-            raise SystemExit('DoT probe did not return a DNS answer')
-
-deadline = time.time() + 10
-while time.time() < deadline:
-    if query_count() > before:
-        break
-    time.sleep(0.5)
-else:
-    raise SystemExit('querylog row count did not increase after encrypted DNS traffic')
-PY" \
-    dns_controlplane
-}
-
-validate_remote_dns_native_api_probe() {
-  local remote_release_dir="$1"
-
-  validate_remote_probe "${remote_release_dir}" "dns native stats and clients APIs on the live host" \
-    "wait_until_ok python3 - <<'PY'
-import json
-import urllib.error
-import urllib.request
-
-base = 'http://127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}'
-
-for path in [
-    '/dns/api/stats?interval=24_hours',
-    '/dns/api/clients',
-]:
-    request = urllib.request.Request(f'{base}{path}')
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        if error.code != 401:
-            raise
-PY" \
-    dns_controlplane
 }
 
 validate_remote_running_services() {
@@ -4592,31 +3893,22 @@ validate_remote_phone_broker_workload_health() {
     ticket_phone_bridge phone_broker
 }
 
-validate_remote_rigassatiksme_qr_bot_workload_health() {
-  local remote_release_dir="$1"
-
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker rigassatiksme_qr_bot
-  validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
-    "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker rigassatiksme_qr_bot
-  validate_remote_probe "${remote_release_dir}" "rigassatiksme QR bot broker health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker rigassatiksme_qr_bot
-}
-
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
     "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
     "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote Spacetime sidecar health" \
+    "wait_until_ok compose exec -T ticket_remote_spacetime_sidecar sh -lc 'curl -fsS http://127.0.0.1:9346/healthz | grep -F \"\\\"status\\\":\\\"ok\\\"\" >/dev/null'" \
+    ticket_remote_spacetime_sidecar ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote production state backend" \
     "ticket_state_backend_ok() {
       file_backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
@@ -4637,10 +3929,10 @@ validate_remote_ticket_remote_workload_health() {
       compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PHONE_BACKEND_ID}\" = pixel && test \"\${TICKET_REMOTE_PHONE_BROKER_URL}\" = \"http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}\" && curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
     }
     wait_until_ok active_configured_backend_ok" \
-    ticket_phone_bridge phone_broker ticket_remote
+    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
-    ticket_phone_bridge phone_broker ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote public HTTP redirects to HTTPS" \
     "wait_until_ok sh -lc 'result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" http://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${result}\" in \"301 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*|\"308 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*) exit 0 ;; *) printf \"%s\\n\" \"\${result}\" >&2; exit 1 ;; esac'" \
     ticket_remote ticket_remote_tunnel
@@ -4670,6 +3962,9 @@ validate_remote_ticket_remote_workload_health() {
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e
       binary=/usr/local/bin/ticket-remote
+      app_js=\$(mktemp)
+      trap \"rm -f \\\"\${app_js}\\\"\" EXIT
+      curl -fsS \"http://127.0.0.1:\${TICKET_REMOTE_WEB_PORT:-9338}/static/app.js\" > \"\${app_js}\"
       grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"localStorage|sessionStorage|ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
@@ -4682,16 +3977,16 @@ validate_remote_ticket_remote_workload_health() {
       grep -aF \"revokeControl(\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"inputQueueLimit = 30\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"inputDrainDelayMs = 35\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"RTCPeerConnection\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"webrtc_ice_config\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"webrtcVideo\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"iceTransportPolicy\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"Savieno WebRTC video\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"TURN\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"legacy_frame_in_tsf2_stream\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"version: '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"configuredFrameEnvelope\" \"\${binary}\" >/dev/null && exit 1
-      grep -aF \"|| '\\''legacy'\\''\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"RTCPeerConnection\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"webrtc_ice_config\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"webrtcVideo\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"iceTransportPolicy\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"Savieno WebRTC video\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"TURN\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"legacy_frame_in_tsf2_stream\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"version: '\\''legacy'\\''\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"configuredFrameEnvelope\" \"\${app_js}\" >/dev/null && exit 1
+      grep -aF \"|| '\\''legacy'\\''\" \"\${app_js}\" >/dev/null && exit 1
       grep -aF \"/api/v1/control-code/request\" \"\${binary}\" >/dev/null
       grep -aF \"/api/v1/control-code/close\" \"\${binary}\" >/dev/null
       grep -aF \"control_code_request\" \"\${binary}\" >/dev/null
@@ -4713,23 +4008,6 @@ validate_remote_ticket_remote_workload_health() {
     ticket_remote
 }
 
-validate_remote_dns_workload_health() {
-  local remote_release_dir="$1"
-
-  validate_remote_running_services "${remote_release_dir}" "expected services running" dns_controlplane
-  validate_remote_probe "${remote_release_dir}" "dns private admin login on the live host" \
-    "wait_until_ok sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_DNS_CONTROLPLANE_PORT}/login >/dev/null 2>/dev/null'" \
-    dns_controlplane
-  validate_remote_dns_querylog_flow "${remote_release_dir}"
-  validate_remote_dns_native_api_probe "${remote_release_dir}"
-  validate_remote_probe "${remote_release_dir}" "dns controlplane healthcheck" \
-    "wait_until_ok compose exec -T dns_controlplane /usr/local/bin/arbuzas-dns health --json --strict >/dev/null 2>/dev/null" \
-    dns_controlplane
-  validate_remote_probe "${remote_release_dir}" "dns controlplane release validation" \
-    "wait_until_ok compose exec -T dns_controlplane /usr/local/bin/arbuzas-dns release validate --json >/dev/null 2>/dev/null" \
-    dns_controlplane
-}
-
 validate_remote_workload_health() {
   local remote_release_dir="$1"
 
@@ -4738,9 +4016,7 @@ validate_remote_workload_health() {
   validate_remote_satiksme_workload_health "${remote_release_dir}"
   validate_remote_subscription_workload_health "${remote_release_dir}"
   validate_remote_phone_broker_workload_health "${remote_release_dir}"
-  validate_remote_rigassatiksme_qr_bot_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
-  validate_remote_dns_workload_health "${remote_release_dir}"
 }
 
 validate_remote_selected_workload_health() {
@@ -4761,14 +4037,8 @@ validate_remote_selected_workload_health() {
   if (( VALIDATE_PHONE_BROKER == 1 )); then
     validate_remote_phone_broker_workload_health "${remote_release_dir}"
   fi
-  if (( VALIDATE_RIGASATIKSME_QR == 1 )); then
-    validate_remote_rigassatiksme_qr_bot_workload_health "${remote_release_dir}"
-  fi
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
-  fi
-  if (( VALIDATE_DNS == 1 )); then
-    validate_remote_dns_workload_health "${remote_release_dir}"
   fi
 }
 
@@ -4875,10 +4145,6 @@ validate_remote_release() {
 
   if (( TARGETED_MODE == 1 )); then
     validate_remote_selected_workload_health "${remote_release_dir}"
-    if (( VALIDATE_DNS == 1 )); then
-      validate_public_dns_access "${remote_release_dir}"
-      validate_private_dns_admin_access "${remote_release_dir}"
-    fi
     validate_remote_swarm_baseline "${remote_release_dir}"
     if (( VALIDATE_PORTAINER == 1 )); then
       validate_remote_portainer_state "${remote_release_dir}"
@@ -4888,8 +4154,6 @@ validate_remote_release() {
   fi
 
   validate_remote_workload_health "${remote_release_dir}"
-  validate_public_dns_access "${remote_release_dir}"
-  validate_private_dns_admin_access "${remote_release_dir}"
   validate_remote_host_baseline "${remote_release_dir}"
   return_remote_validation_status
 }
@@ -4907,7 +4171,7 @@ repair_remote_portainer() {
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker rigassatiksme_qr_bot ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
   validate_remote_workload_health "${remote_release_dir}"
 
   validate_remote_host_probe "${remote_release_dir}" \
@@ -4924,7 +4188,7 @@ repair_remote_portainer() {
         exit 1
       fi
     " \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker rigassatiksme_qr_bot ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel dns_controlplane
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
 
   backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_path="${REMOTE_PORTAINER_BACKUPS_DIR}/portainer-${backup_timestamp}.tar.gz"
@@ -4995,7 +4259,6 @@ repair_remote_portainer() {
   "
 
   rm -rf "${tmpdir}"
-  publish_remote_dns_admin_tailscale
   validate_remote_release
   log "Repair complete. Portainer backup saved at ${backup_path}"
   if (( has_portainer_db == 1 )); then
@@ -5012,48 +4275,28 @@ rollback_remote_release() {
   fi
   ARBUZAS_RELEASE_ID="${requested_release_id}"
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
-  local rollback_non_dns_service_args=""
+  local rollback_service_args=""
   local rollback_tunnel_service_args=""
-  local rollback_dns_in_scope=1
   if (( TARGETED_MODE == 1 )); then
-    rollback_non_dns_service_args="$(compose_target_service_args_without_dns)"
+    rollback_service_args="$(compose_target_service_args_without_tunnels)"
     rollback_tunnel_service_args="$(compose_target_tunnel_service_args)"
-    rollback_dns_in_scope=0
-    if targeted_service_selected dns_controlplane; then
-      rollback_dns_in_scope=1
-    fi
   else
-    rollback_non_dns_service_args="$(compose_all_non_dns_service_args)"
-  fi
-  if (( rollback_dns_in_scope == 1 )); then
-    ensure_remote_dns_host_preflight
+    rollback_service_args="$(compose_all_service_args)"
   fi
   remote_shell "
-    ROLLBACK_DNS_IN_SCOPE='${rollback_dns_in_scope}'
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing release bundle: ${remote_release_dir}' >&2; exit 1; }
     cd '${remote_release_dir}'
-    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' ]]; then
-      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' build dns_controlplane
-      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns migrate --json </dev/null
-      docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
-    fi
-    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' && -f '${REMOTE_CURRENT_LINK}/release.env' ]]; then
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' stop dns_controlplane frontend adguardhome >/dev/null 2>&1 || true
-    fi
     ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     if [[ '${TARGETED_MODE}' == '1' ]]; then
-      if [[ -n '${rollback_non_dns_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${rollback_non_dns_service_args}
+      if [[ -n '${rollback_service_args}' ]]; then
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${rollback_service_args}
       fi
       if [[ -n '${rollback_tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${rollback_tunnel_service_args}
       fi
     else
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${rollback_non_dns_service_args}
-    fi
-    if [[ \"\${ROLLBACK_DNS_IN_SCOPE}\" == '1' ]]; then
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${rollback_service_args}
     fi
   "
 }
@@ -5066,7 +4309,8 @@ run_host_mirror() {
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
   fi
-  python3 "${args[@]}" "$@"
+  ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
+    python3 "${args[@]}" "$@"
 }
 
 run_host_mirror_push() {
@@ -5076,12 +4320,14 @@ run_host_mirror_push() {
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
   fi
-  python3 "${args[@]}"
+  ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
+    python3 "${args[@]}"
 }
 
 host_mirror_affected_services() {
   local changed_paths_file="$1"
-  python3 "${HOST_MIRROR_SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths_file}"
+  ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
+    python3 "${HOST_MIRROR_SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths_file}"
 }
 
 csv_join_services() {
@@ -5101,10 +4347,8 @@ deploy_config_from_mirror() {
   local changed_paths_file
   local affected_output=""
   local -a affected_services=()
-  local -a non_dns_services=()
   local service_name=""
-  local non_dns_args=""
-  local has_dns=0
+  local service_args=""
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
   trap 'rm -f "${changed_paths_file}"' RETURN
 
@@ -5118,11 +4362,6 @@ deploy_config_from_mirror() {
   while IFS= read -r service_name; do
     [[ -n "${service_name}" ]] || continue
     affected_services+=("${service_name}")
-    if [[ "${service_name}" == "dns_controlplane" ]]; then
-      has_dns=1
-    else
-      non_dns_services+=("${service_name}")
-    fi
   done <<< "${affected_output}"
 
   log "Deploy config: affected services $(csv_join_services "${affected_services[@]}")"
@@ -5131,29 +4370,18 @@ deploy_config_from_mirror() {
     [[ -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing active compose file under ${REMOTE_CURRENT_LINK}' >&2; exit 1; }
   "
 
-  if (( ${#non_dns_services[@]} > 0 )); then
-    non_dns_args=""
-    for service_name in "${non_dns_services[@]}"; do
-      non_dns_args+=" ${service_name}"
-    done
-    remote_shell "
-      cd '${REMOTE_CURRENT_LINK}'
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${non_dns_args}
-    "
-  fi
-
-  if (( has_dns == 1 )); then
-    remote_shell "
-      cd '${REMOTE_CURRENT_LINK}'
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' run -T --rm --no-deps dns_controlplane /usr/local/bin/arbuzas-dns release sync-policy --json </dev/null
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps dns_controlplane
-    "
-  fi
+  for service_name in "${affected_services[@]}"; do
+    service_args+=" ${service_name}"
+  done
+  remote_shell "
+    cd '${REMOTE_CURRENT_LINK}'
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
+  "
 }
 
 while (( $# > 0 )); do
   case "$1" in
-    deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|compact-dns-db|repair-dns-admin|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
+    deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
       if [[ -n "${action}" ]]; then
         echo "Only one action is allowed" >&2
         exit 2
@@ -5279,9 +4507,6 @@ case "${action}" in
     ;;
   deploy)
     require_cmd tar
-    if dns_validation_requested || requires_dns_release_prepare; then
-      require_dns_private_admin_env
-    fi
     ARBUZAS_RELEASE_ID="${requested_release_id:-${ARBUZAS_RELEASE_ID}}"
     ARBUZAS_RELEASE_DIR="${LOCAL_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
     previous_release_id="$(resolve_remote_current_release_id || true)"
@@ -5296,9 +4521,6 @@ case "${action}" in
     copy_release_to_remote
     render_remote_cloudflared_configs
     remote_compose_up
-    if requires_dns_release_prepare; then
-      publish_remote_dns_admin_tailscale
-    fi
     if validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}" && validate_remote_release "${ARBUZAS_RELEASE_ID}"; then
       cleanup_remote_public_bundle_versions
       run_automatic_remote_docker_gc
@@ -5308,31 +4530,19 @@ case "${action}" in
       log "Deploy validation failed; rolling back to ${previous_release_id}"
       requested_release_id="${previous_release_id}"
       rollback_remote_release
-      if requires_dns_release_prepare; then
-        publish_remote_dns_admin_tailscale
-      fi
       validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
       validate_remote_release "${previous_release_id}"
     fi
     exit 1
     ;;
   validate)
-    if dns_validation_requested; then
-      require_dns_private_admin_env
-    fi
     if (( TARGETED_MODE == 1 )); then
       log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"
     fi
     validate_remote_release "${requested_release_id}"
     ;;
   rollback)
-    if dns_validation_requested || requires_dns_release_prepare; then
-      require_dns_private_admin_env
-    fi
     rollback_remote_release
-    if requires_dns_release_prepare; then
-      publish_remote_dns_admin_tailscale
-    fi
     validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
     validate_remote_release "${requested_release_id}"
     run_automatic_remote_docker_gc
@@ -5368,24 +4578,6 @@ case "${action}" in
       exit 2
     fi
     validate_remote_memory_report
-    ;;
-  compact-dns-db)
-    if [[ -n "${requested_release_id}" ]]; then
-      echo "--release-id is not supported for compact-dns-db" >&2
-      exit 2
-    fi
-    require_dns_private_admin_env
-    log "Maintenance: activating cleanup and compacting the live DNS control-plane database"
-    compact_remote_dns_db
-    validate_remote_dns_workload_health "${REMOTE_CURRENT_LINK}"
-    ;;
-  repair-dns-admin)
-    if [[ -n "${requested_release_id}" ]]; then
-      echo "--release-id is not supported for repair-dns-admin" >&2
-      exit 2
-    fi
-    require_dns_private_admin_env
-    repair_remote_dns_admin
     ;;
   install-netdata)
     if [[ -n "${requested_release_id}" ]]; then
@@ -5426,7 +4618,6 @@ case "${action}" in
       echo "--release-id is not supported for repair-portainer" >&2
       exit 2
     fi
-    require_dns_private_admin_env
     repair_remote_portainer
     ;;
 esac

@@ -116,6 +116,7 @@ func Load() (Config, error) {
 			TicketID:             getenv("TICKET_REMOTE_TICKET_ID", state.DefaultTicketID),
 			SpacetimeHost:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_HOST", "https://maincloud.spacetimedb.com"), "/"),
 			SpacetimeDatabase:    getenv("TICKET_REMOTE_SPACETIME_DATABASE", ""),
+			SpacetimeClientURL:   strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_CLIENT_URL", ""), "/"),
 			SpacetimeBearerToken: getenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", ""),
 			SpacetimeIssuer:      getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", state.DefaultSpacetimeIssuer),
 			SpacetimeAudience:    getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", state.DefaultSpacetimeAudience),
@@ -204,6 +205,9 @@ func validateProductionConfig(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.State.SpacetimeDatabase) == "" {
 		return fmt.Errorf("TICKET_REMOTE_SPACETIME_DATABASE is required in production")
+	}
+	if strings.TrimSpace(cfg.State.SpacetimeClientURL) == "" {
+		return fmt.Errorf("TICKET_REMOTE_SPACETIME_CLIENT_URL is required in production")
 	}
 	if strings.TrimSpace(cfg.State.SpacetimeBearerToken) == "" && strings.TrimSpace(cfg.State.SpacetimeKeyFile) == "" {
 		return fmt.Errorf("TICKET_REMOTE_SPACETIME_BEARER_TOKEN or TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE is required in production")

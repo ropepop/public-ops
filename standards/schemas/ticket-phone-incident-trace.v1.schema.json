@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kitty-gration.local/schemas/ticket-phone-incident-trace.v1.schema.json",
+  "title": "ticket-phone-incident-trace.v1",
+  "description": "User-impact incident trace for the ticket_phone_bridge / phone_broker / ticket_remote / public ticket.jolkins.id.lv surface. Required for any production ticket incident. No secrets, no raw user IDs, no raw broker job IDs, no RS monthly-ticket codes.",
+  "type": "object",
+  "required": [
+    "schema",
+    "traceId",
+    "generatedAt",
+    "userImpact",
+    "phases",
+    "outcome",
+    "safety"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "ticket-phone-incident-trace.v1"
+    },
+    "traceId": {
+      "type": "string",
+      "description": "Safe, non-secret trace identifier (e.g. ticket:<sequence>). No raw broker job ID."
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor": {
+      "type": "object",
+      "description": "Safe actor label. Either a SpacetimeAuth email login (preferred) or a stable user:<hex> hash. Never a raw numeric Telegram/Cloudflare user ID.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["spacetimeauth_email", "user_hash", "anonymous"]
+        },
+        "email": { "type": "string", "format": "email" },
+        "hash": { "type": "string" }
+      },
+      "required": ["kind"]
+    },
+    "userImpact": {
+      "type": "object",
+      "description": "What the affected user actually saw.",
+      "required": ["pageLoadSucceeded", "streamReachedLive", "controlCodeAccepted"],
+      "properties": {
+        "pageLoadSucceeded": { "type": "boolean" },
+        "pageLoadMillis": { "type": "number" },
+        "streamReachedLive": { "type": "boolean" },
+        "streamLiveAt": { "type": "string", "format": "date-time" },
+        "controlCodeRequested": { "type": "boolean" },
+        "controlCodeAccepted": { "type": "boolean" },
+        "controlCodeResultReason": { "type": "string" },
+        "leaseHeldMillis": { "type": "number" }
+      }
+    },
+    "phases": {
+      "type": "object",
+      "description": "Lifecycle phases with timestamps and durations in milliseconds.",
+      "properties": {
+        "auth": { "$ref": "#/$defs/phase" },
+        "sessionStart": { "$ref": "#/$defs/phase" },
+        "sessionConnect": { "$ref": "#/$defs/phase" },
+        "streamFirstFrame": { "$ref": "#/$defs/phase" },
+        "controlCodeSubmit": { "$ref": "#/$defs/phase" },
+        "controlCodeResult": { "$ref": "#/$defs/phase" },
+        "viviCleanup": { "$ref": "#/$defs/phase" },
+        "sessionStop": { "$ref": "#/$defs/phase" }
+      }
+    },
+    "broker": {
+      "type": "object",
+      "description": "Broker-side state at incident time. Never include raw job IDs unless required for local triage.",
+      "properties": {
+        "desiredOwner": { "type": "string" },
+        "desiredPriority": { "type": "array", "items": { "type": "string" } },
+        "ticketViewers": { "type": "integer" },
+        "ticketSockets": { "type": "integer" },
+        "activeLeaseId": { "type": "string" },
+        "leaseReason": { "type": "string" },
+        "leaseRequestId": { "type": "string" }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "description": "Upstream Pixel ticket_phone_bridge / Android TicketStreamService phase timings. No raw codes, no image bytes.",
+      "properties": {
+        "ticketState": { "type": "string" },
+        "viviState": { "type": "string" },
+        "streamVerdict": { "type": "string" },
+        "streamActive": { "type": "boolean" },
+        "controlCodeRequestId": { "type": "string" },
+        "phases": { "type": "object", "additionalProperties": { "type": "number" } }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "required": ["status", "rootCause", "tests", "deployEvidence", "liveVerificationEvidence"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["open", "mitigated", "fixed", "recovered", "failed", "monitoring"]
+        },
+        "rootCause": { "type": "string" },
+        "tests": { "type": "array", "items": { "type": "string" } },
+        "deployEvidence": { "type": "string" },
+        "liveVerificationEvidence": { "type": "string" }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "description": "Mandatory declaration that the trace contains no secrets, no raw user/chat IDs, and no ticket codes.",
+      "required": ["noSecrets", "noRawUserIDs", "noCodes"],
+      "properties": {
+        "noSecrets": { "type": "boolean", "const": true },
+        "noRawUserIDs": { "type": "boolean", "const": true },
+        "noCodes": { "type": "boolean", "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "durationMillis": { "type": "number" },
+        "ok": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

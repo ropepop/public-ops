@@ -170,6 +170,12 @@ func (h *directStreamHub) removeVideoClient() {
 	}
 }
 
+func (h *directStreamHub) activeVideoClientCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.activeVideoClients
+}
+
 func (h *directStreamHub) recordPhoneReconnect() {
 	h.mu.Lock()
 	h.phoneReconnects++
