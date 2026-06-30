@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,6 +132,37 @@ func TestValidatorAcceptsServerSessionToken(t *testing.T) {
 	}
 }
 
+func TestValidatorAcceptsNonExpiringServerSessionToken(t *testing.T) {
+	validator := NewValidator(AccessConfig{
+		Mode:              "spacetime",
+		AuthCookieName:    "ticket_remote_auth",
+		SessionSigningKey: "test-signing-key",
+	})
+	now := time.Now()
+	token, expiresAt, err := validator.IssueServerSession(Identity{
+		Email:         "member@example.com",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, -1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expiresAt.IsZero() {
+		t.Fatalf("expiresAt = %s, want zero for non-expiring session", expiresAt)
+	}
+	claims := decodeServerSessionClaimsForTest(t, token)
+	if claims.ExpiresAt != 0 {
+		t.Fatalf("encoded exp = %d, want omitted/zero", claims.ExpiresAt)
+	}
+	identity, err := validator.ValidateServerSession(token, now.AddDate(20, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Email != "member@example.com" || identity.Subject != "user_123" || !identity.EmailVerified {
+		t.Fatalf("identity = %#v", identity)
+	}
+}
+
 func TestValidatorRejectsExpiredServerSessionToken(t *testing.T) {
 	validator := NewValidator(AccessConfig{
 		Mode:              "spacetime",
@@ -144,6 +176,24 @@ func TestValidatorRejectsExpiredServerSessionToken(t *testing.T) {
 	if _, err := validator.ValidateServerSession(token, now); err == nil {
 		t.Fatal("expected expired server session to be rejected")
 	}
+}
+
+func decodeServerSessionClaimsForTest(t *testing.T, token string) serverSessionClaims {
+	t.Helper()
+	rest := strings.TrimPrefix(token, serverSessionTokenPrefix)
+	payload, _, ok := strings.Cut(rest, ".")
+	if !ok {
+		t.Fatalf("invalid token shape: %q", token)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims serverSessionClaims
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatal(err)
+	}
+	return claims
 }
 
 func TestValidatorAcceptsCloudflareAccessJWT(t *testing.T) {

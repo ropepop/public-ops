@@ -129,6 +129,23 @@ func TestSpacetimeAuthModeLoadsWithSessionSigningKey(t *testing.T) {
 	}
 }
 
+func TestLoadParsesNoExpirySessionAndSpacetimeTokenTTL(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_COOKIE_TTL", "never")
+	t.Setenv("TICKET_REMOTE_SPACETIME_TOKEN_TTL", "never")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CookieTTL != DurationNever {
+		t.Fatalf("cookie TTL = %s, want no-expiry sentinel", cfg.CookieTTL)
+	}
+	if cfg.State.TokenTTL != DurationNever {
+		t.Fatalf("Spacetime token TTL = %s, want no-expiry sentinel", cfg.State.TokenTTL)
+	}
+}
+
 func TestCloudflareAccessAuthModeLoads(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "cloudflare")
 	t.Setenv("TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN", "team.example.cloudflareaccess.com")

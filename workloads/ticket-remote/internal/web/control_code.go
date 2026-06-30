@@ -27,7 +27,7 @@ const (
 	controlCodeRateWindow       = 60 * time.Second
 	controlCodeResultTTL        = 60 * time.Second
 	controlCodePhoneSendTTL     = 2 * time.Second
-	controlCodePhoneResultWait  = 75 * time.Second
+	controlCodePhoneResultWait  = 105 * time.Second
 	controlCodePhoneCleanupWait = 30 * time.Second
 	controlCodePhoneAcceptWait  = 900 * time.Millisecond
 	controlCodePhoneAcceptPoll  = 50 * time.Millisecond
@@ -235,6 +235,10 @@ func (s *Server) preparePhoneRelayForControlCodeDetailed(reason string, timeout 
 		result.completedAt = completedAt
 	}()
 	s.appendStreamCommandAsync("prepare_control_code", reason, map[string]any{
+		"type":   "prepare_control_code",
+		"owner":  "ticket",
+		"app":    "vivi",
+		"flow":   "control_code",
 		"source": "ticket_remote",
 	}, streamCommandTTL)
 	s.relay.EnsureActive(reason)
@@ -454,6 +458,7 @@ func (s *Server) handleControlCodePhoneResult(msg map[string]any) bool {
 		minFrameSequence := controlCodeInt64FromMessage(msg["minFrameSequence"])
 		resultProof, _ := msg["resultProof"].(string)
 		resultProofAt, _ := msg["resultProofAt"].(string)
+		s.publishSpacetimeControlCodePhoneMarker(requestID, streamEpoch, frameSequence, minFrameSequence, resultProof, resultProofAt)
 		s.updateSpacetimeControlCodeRequestAsync(
 			requestID,
 			controlCodeSucceeded,
@@ -537,28 +542,60 @@ func (s *Server) updateSpacetimeControlCodeRequestAsync(requestID string, status
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
-		defer cancel()
-		err := s.store.UpdateControlCodeRequest(ctx, state.ControlCodeRequestUpdateInput{
-			TicketID:               s.cfg.TicketID,
-			RequestID:              requestID,
-			Status:                 strings.TrimSpace(status),
-			Reason:                 strings.TrimSpace(reason),
-			Message:                strings.TrimSpace(message),
-			StreamEpoch:            controlCodeFrameString(streamEpoch),
-			FrameSequence:          controlCodeFrameString(frameSequence),
-			MinFrameSequence:       controlCodeFrameString(minFrameSequence),
-			ResultFrameEpoch:       controlCodeFrameString(resultFrameEpoch),
-			ResultMinFrameSequence: controlCodeFrameString(resultMinFrameSequence),
-			ResultProof:            cleanControlCodeResultProof(resultProof),
-			ResultProofAt:          strings.TrimSpace(resultProofAt),
-			CleanupPending:         cleanupPending,
-			Now:                    time.Now(),
-		})
-		if err != nil {
+		if err := s.updateSpacetimeControlCodeRequest(requestID, status, reason, message, streamEpoch, frameSequence, minFrameSequence, resultFrameEpoch, resultMinFrameSequence, resultProof, resultProofAt, cleanupPending); err != nil {
 			log.Printf("ticket control-code Spacetime update failed request=%s status=%s: %v", requestID, status, err)
 		}
 	}()
+}
+
+func (s *Server) updateSpacetimeControlCodeRequest(requestID string, status string, reason string, message string, streamEpoch int64, frameSequence int64, minFrameSequence int64, resultFrameEpoch int64, resultMinFrameSequence int64, resultProof string, resultProofAt string, cleanupPending bool) error {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" || s.store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
+	defer cancel()
+	return s.store.UpdateControlCodeRequest(ctx, state.ControlCodeRequestUpdateInput{
+		TicketID:               s.cfg.TicketID,
+		RequestID:              requestID,
+		Status:                 strings.TrimSpace(status),
+		Reason:                 strings.TrimSpace(reason),
+		Message:                strings.TrimSpace(message),
+		StreamEpoch:            controlCodeFrameString(streamEpoch),
+		FrameSequence:          controlCodeFrameString(frameSequence),
+		MinFrameSequence:       controlCodeFrameString(minFrameSequence),
+		ResultFrameEpoch:       controlCodeFrameString(resultFrameEpoch),
+		ResultMinFrameSequence: controlCodeFrameString(resultMinFrameSequence),
+		ResultProof:            cleanControlCodeResultProof(resultProof),
+		ResultProofAt:          strings.TrimSpace(resultProofAt),
+		CleanupPending:         cleanupPending,
+		Now:                    time.Now(),
+	})
+}
+
+func (s *Server) publishSpacetimeControlCodePhoneMarker(requestID string, streamEpoch int64, frameSequence int64, minFrameSequence int64, resultProof string, resultProofAt string) {
+	if requestID = strings.TrimSpace(requestID); requestID == "" {
+		return
+	}
+	if strings.TrimSpace(resultProof) == "" {
+		resultProof = "phone_visual"
+	}
+	if err := s.updateSpacetimeControlCodeRequest(
+		requestID,
+		controlCodeRunning,
+		"phone_generated_marker",
+		"",
+		streamEpoch,
+		frameSequence,
+		minFrameSequence,
+		streamEpoch,
+		minFrameSequence,
+		resultProof,
+		resultProofAt,
+		false,
+	); err != nil {
+		log.Printf("ticket control-code Spacetime marker update failed request=%s: %v", requestID, err)
+	}
 }
 
 func controlCodePhasesFromMessage(raw any) map[string]int64 {

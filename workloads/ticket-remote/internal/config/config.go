@@ -16,6 +16,7 @@ import (
 
 const defaultOIDCIssuer = "https://auth.spacetimedb.com/oidc"
 const defaultNoViewerStopDelay = 8 * time.Second
+const DurationNever time.Duration = -1
 
 type Config struct {
 	BindAddr            string
@@ -30,6 +31,13 @@ type Config struct {
 	Access              auth.AccessConfig
 	State               state.StoreConfig
 	Phone               PhoneConfig
+	DevPerfMetrics      DevPerfMetricsConfig
+}
+
+type DevPerfMetricsConfig struct {
+	Enabled   bool
+	TTL       time.Duration
+	ExpiresAt time.Time
 }
 
 type PhoneConfig struct {
@@ -97,7 +105,7 @@ func Load() (Config, error) {
 		TicketDisplayName:   getenv("TICKET_REMOTE_TICKET_DISPLAY_NAME", state.DefaultTicketName),
 		BootstrapAdminEmail: normalizeEmail(getenv("TICKET_REMOTE_BOOTSTRAP_ADMIN_EMAIL", "ticket@jolkins.id.lv")),
 		CookieName:          getenv("TICKET_REMOTE_COOKIE_NAME", "ticket_remote_session"),
-		CookieTTL:           getenvDuration("TICKET_REMOTE_COOKIE_TTL", 30*24*time.Hour),
+		CookieTTL:           getenvDurationWithNever("TICKET_REMOTE_COOKIE_TTL", 30*24*time.Hour),
 		Access: auth.AccessConfig{
 			Mode:              getenv("TICKET_REMOTE_AUTH_MODE", "spacetime"),
 			DevEmail:          normalizeEmail(getenv("TICKET_REMOTE_DEV_EMAIL", "ticket@jolkins.id.lv")),
@@ -123,7 +131,7 @@ func Load() (Config, error) {
 			SpacetimeKeyFile:     getenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", ""),
 			ServiceSubject:       getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", state.DefaultSpacetimeServiceSubject),
 			ServiceRoles:         splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", state.DefaultSpacetimeServiceRole)),
-			TokenTTL:             getenvDuration("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
+			TokenTTL:             getenvDurationWithNever("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
 			HTTPTimeout:          getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", state.DefaultSpacetimeHTTPTimeout),
 			AuthIssuer:           strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
 			AuthAudience:         getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
@@ -140,6 +148,11 @@ func Load() (Config, error) {
 			ReconnectMinDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MIN_DELAY", phone.DefaultReconnectMinDelay),
 			ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", phone.DefaultReconnectMaxDelay),
 			NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", defaultNoViewerStopDelay),
+		},
+		DevPerfMetrics: DevPerfMetricsConfig{
+			Enabled:   getenvBool("TICKET_REMOTE_DEV_PERF_METRICS_ENABLED", false),
+			TTL:       getenvDuration("TICKET_REMOTE_DEV_PERF_METRICS_TTL", 24*time.Hour),
+			ExpiresAt: getenvTime("TICKET_REMOTE_DEV_PERF_METRICS_EXPIRES_AT"),
 		},
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
@@ -178,6 +191,13 @@ func Load() (Config, error) {
 	}
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")
+	}
+	if cfg.DevPerfMetrics.Enabled && cfg.DevPerfMetrics.ExpiresAt.IsZero() {
+		ttl := cfg.DevPerfMetrics.TTL
+		if ttl <= 0 {
+			ttl = 24 * time.Hour
+		}
+		cfg.DevPerfMetrics.ExpiresAt = time.Now().Add(ttl)
 	}
 	if cfg.Production {
 		if err := validateProductionConfig(cfg); err != nil {
@@ -339,6 +359,27 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return time.Duration(hours) * time.Hour
 	}
 	return fallback
+}
+
+func getenvDurationWithNever(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	switch strings.ToLower(value) {
+	case "never", "none", "no-expiry", "noexpiry", "forever", "infinite", "infinity":
+		return DurationNever
+	default:
+		return getenvDuration(key, fallback)
+	}
+}
+
+func getenvTime(key string) time.Time {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed
+	}
+	return time.Time{}
 }
 
 func splitCSV(value string) []string {

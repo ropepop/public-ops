@@ -70,6 +70,7 @@ class TicketSpacetimeClient {
   private connectionGeneration = 0;
   private manuallyDisconnected = false;
   private lastHeartbeatAt = 0;
+  private readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void; timer: number }> = [];
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
     this.cfg = cfg;
@@ -96,9 +97,8 @@ class TicketSpacetimeClient {
         this.connected = true;
         this.reconnectDelayMs = 1000;
         this.handlers.onStatus?.("live");
-        this.attachStateListeners(connection);
+        this.resolveReadyWaiters();
         this.subscribeState(connection);
-        this.heartbeat(true);
       })
       .onDisconnect(() => {
         if (generation !== this.connectionGeneration) return;
@@ -140,6 +140,7 @@ class TicketSpacetimeClient {
 
   close(): void {
     this.manuallyDisconnected = true;
+    this.rejectReadyWaiters(new Error("Spacetime connection closed"));
     this.disconnect(true);
   }
 
@@ -244,6 +245,18 @@ class TicketSpacetimeClient {
     });
   }
 
+  appendDevMetric(metricName: string, phase: string, flowId: string, valueMillis: number, ok: boolean, detailJson: string): Promise<void> {
+    return this.callReducer("memberAppendDevPerfMetric", {
+      ticketId: this.cfg.ticketId,
+      metricName,
+      phase,
+      flowId,
+      valueMillis: Math.max(0, Math.min(86400000, Math.round(Number(valueMillis) || 0))),
+      ok,
+      detailJson,
+    });
+  }
+
   upsertMember(email: string, role: string): Promise<void> {
     return this.callReducer("memberUpsertMember", {
       ticketId: this.cfg.ticketId,
@@ -287,8 +300,16 @@ class TicketSpacetimeClient {
   private subscribeState(connection: DbConnection): void {
     const ticket = sqlString(this.cfg.ticketId);
     const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
+    let applied = false;
     this.subscription = connection.subscriptionBuilder()
-      .onApplied(() => this.publishFocusedState())
+      .onApplied(() => {
+        if (!applied) {
+          applied = true;
+          this.attachStateListeners(connection);
+        }
+        this.publishFocusedState();
+        this.heartbeat(true);
+      })
       .subscribe([
         `SELECT * FROM ticketremote_ticket_summary WHERE ticketId = ${ticket}`,
         `SELECT * FROM ticketremote_viewer_public WHERE ticketId = ${ticket}`,
@@ -483,6 +504,7 @@ class TicketSpacetimeClient {
   }
 
   private async callReducer(name: string, args: Record<string, unknown>): Promise<void> {
+    await this.whenReady(5000);
     const reducer = this.reducer(name);
     await reducer(args);
   }
@@ -496,6 +518,33 @@ class TicketSpacetimeClient {
 
   private isReady(): boolean {
     return Boolean(this.conn && this.connected);
+  }
+
+  private whenReady(timeoutMs: number): Promise<void> {
+    if (this.isReady()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.readyWaiters = this.readyWaiters.filter((waiter) => waiter.resolve !== resolve);
+        reject(new Error("Spacetime connection is not ready"));
+      }, Math.max(1, timeoutMs));
+      this.readyWaiters.push({ resolve, reject, timer });
+    });
+  }
+
+  private resolveReadyWaiters(): void {
+    const waiters = this.readyWaiters.splice(0);
+    for (const waiter of waiters) {
+      window.clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+  }
+
+  private rejectReadyWaiters(error: Error): void {
+    const waiters = this.readyWaiters.splice(0);
+    for (const waiter of waiters) {
+      window.clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
   }
 }
 

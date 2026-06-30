@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -17,14 +18,25 @@ import (
 )
 
 const (
-	streamCommandBridgeFastPollInterval   = 500 * time.Millisecond
-	streamCommandBridgeActivePollInterval = time.Second
+	streamCommandBridgeFastPollInterval   = 100 * time.Millisecond
+	streamCommandBridgeActivePollInterval = 100 * time.Millisecond
 	streamCommandBridgeQuietPollInterval  = 2 * time.Second
-	streamCommandBridgeIdlePollInterval   = 10 * time.Second
+	streamCommandBridgeIdlePollInterval   = 1 * time.Second
 	streamCommandBridgeReadTimeout        = 4 * time.Second
 	streamCommandBridgeWriteTimeout       = 8 * time.Second
 	streamCommandBridgeLimit              = 20
 	streamCommandBridgeBackoffMax         = 5 * time.Second
+	streamCommandRecoverRestartDelay      = 250 * time.Millisecond
+	controlCodePhoneHealthPollInterval    = 100 * time.Millisecond
+	controlCodePhoneHealthRequestTimeout  = 1500 * time.Millisecond
+)
+
+type controlCodeBridgeObservation int
+
+const (
+	controlCodeBridgeIgnored controlCodeBridgeObservation = iota
+	controlCodeBridgeResultObserved
+	controlCodeBridgeCleanupObserved
 )
 
 type pendingStreamCommandReader interface {
@@ -222,9 +234,12 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 		s.direct.recordKeyframeRequested()
 		return s.sendPhoneSessionCommand(ctx, payload)
 	case "recover_stream":
-		_ = s.postPhoneSessionCommand(ctx, "/api/v1/session/start")
+		if err := s.restartPhoneSessionForRecovery(ctx); err != nil {
+			return err
+		}
 		s.relay.Reconnect("spacetime_command_recover_stream")
-		return s.sendPhoneSessionCommand(ctx, payload)
+		_ = s.sendPhoneSessionCommand(ctx, payload)
+		return nil
 	case "control_code_browser_capture", "control_code_result_ack":
 		err := s.sendPhoneSessionCommand(ctx, payload)
 		if requestID != "" {
@@ -243,6 +258,23 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 	default:
 		return s.sendPhoneSessionCommand(ctx, payload)
 	}
+}
+
+func (s *Server) restartPhoneSessionForRecovery(ctx context.Context) error {
+	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/stop"); err != nil {
+		return fmt.Errorf("stop stale phone session: %w", err)
+	}
+	timer := time.NewTimer(streamCommandRecoverRestartDelay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/start"); err != nil {
+		return fmt.Errorf("start recovered phone session: %w", err)
+	}
+	return nil
 }
 
 func streamCommandPhonePayload(command state.StreamCommand) (map[string]any, error) {
@@ -385,8 +417,8 @@ func (s *Server) sendPhoneSessionCommandAndReadControlCodeResult(ctx context.Con
 		return conn.Close(websocket.StatusNormalClosure, "command dispatched")
 	}
 	s.updateSpacetimeControlCodeRequestAsync(requestID, controlCodeRunning, "dispatched_by_ticket_remote_bridge", "", 0, 0, 0, 0, 0, "", "", false)
-	go s.readPhoneControlCodeResult(command.ID, requestID, conn)
-	return nil
+	readCtx, releaseReadCtx := context.WithTimeout(context.Background(), controlCodePhoneResultWait+controlCodePhoneCleanupWait+5*time.Second)
+	return s.readPhoneControlCodeResult(readCtx, releaseReadCtx, command.ID, requestID, conn)
 }
 
 func (s *Server) dialPhoneSessionCommand(ctx context.Context) (*websocket.Conn, error) {
@@ -409,52 +441,239 @@ func writePhoneSessionCommand(ctx context.Context, conn *websocket.Conn, payload
 	return conn.Write(ctx, websocket.MessageText, body)
 }
 
-func (s *Server) readPhoneControlCodeResult(commandID string, requestID string, conn *websocket.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), controlCodePhoneResultWait+5*time.Second)
-	defer cancel()
-	defer conn.Close(websocket.StatusNormalClosure, "control code result read complete")
-	for {
-		msgType, body, err := conn.Read(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				s.updateSpacetimeControlCodeRequestAsync(requestID, controlCodeFailed, "phone_timeout", "phone_timeout", 0, 0, 0, 0, 0, "", "", false)
-				s.appendStreamCommandBridgeLogAsync("warn", "control_code_result_timeout", state.StreamCommand{ID: commandID, CommandType: "generate_control_code", BackendID: s.activePhoneBackend().ID}, err)
+func (s *Server) readPhoneControlCodeResult(ctx context.Context, releaseReadCtx context.CancelFunc, commandID string, requestID string, conn *websocket.Conn) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var completeOnce sync.Once
+	completed := make(chan struct{})
+	var resultOnce sync.Once
+	resultObserved := make(chan struct{})
+	markCompleted := func() {
+		completeOnce.Do(func() {
+			close(completed)
+			cancel()
+			if releaseReadCtx != nil {
+				releaseReadCtx()
 			}
+			_ = conn.Close(websocket.StatusNormalClosure, "control code result observed")
+		})
+	}
+	markResultObserved := func() {
+		resultOnce.Do(func() {
+			close(resultObserved)
+			time.AfterFunc(controlCodePhoneCleanupWait, markCompleted)
+		})
+	}
+	observeBridgeMessage := func(observation controlCodeBridgeObservation) {
+		switch observation {
+		case controlCodeBridgeCleanupObserved:
+			markResultObserved()
+			markCompleted()
+		case controlCodeBridgeResultObserved:
+			markResultObserved()
+		}
+	}
+	readErr := make(chan error, 1)
+	go s.pollPhoneControlCodeHealthForResult(ctx, requestID, observeBridgeMessage)
+	go func() {
+		for {
+			msgType, body, err := conn.Read(ctx)
+			if err != nil {
+				if controlCodeBridgeCompleted(completed) || controlCodeBridgeCompleted(resultObserved) {
+					return
+				}
+				select {
+				case readErr <- err:
+				default:
+				}
+				return
+			}
+			if msgType != websocket.MessageText {
+				continue
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(body, &msg); err != nil {
+				continue
+			}
+			observeBridgeMessage(s.handlePhoneControlCodeBridgeMessage(requestID, msg))
+		}
+	}()
+	select {
+	case <-resultObserved:
+		return nil
+	case <-completed:
+		return nil
+	case err := <-readErr:
+		ctxErr := ctx.Err()
+		markCompleted()
+		if ctxErr != nil {
+			s.updateSpacetimeControlCodeRequestAsync(requestID, controlCodeFailed, "phone_timeout", "phone_timeout", 0, 0, 0, 0, 0, "", "", false)
+			s.appendStreamCommandBridgeLogAsync("warn", "control_code_result_timeout", state.StreamCommand{ID: commandID, CommandType: "generate_control_code", BackendID: s.activePhoneBackend().ID}, err)
+			return fmt.Errorf("read control code result: %w", ctxErr)
+		}
+		s.updateSpacetimeControlCodeRequestAsync(requestID, controlCodeFailed, "phone_command_socket_closed", "phone_command_socket_closed", 0, 0, 0, 0, 0, "", "", false)
+		s.appendStreamCommandBridgeLogAsync("warn", "control_code_result_socket_closed", state.StreamCommand{ID: commandID, CommandType: "generate_control_code", BackendID: s.activePhoneBackend().ID}, err)
+		return fmt.Errorf("read control code result: %w", err)
+	case <-ctx.Done():
+		if controlCodeBridgeCompleted(resultObserved) {
+			return nil
+		}
+		markCompleted()
+		s.updateSpacetimeControlCodeRequestAsync(requestID, controlCodeFailed, "phone_timeout", "phone_timeout", 0, 0, 0, 0, 0, "", "", false)
+		s.appendStreamCommandBridgeLogAsync("warn", "control_code_result_timeout", state.StreamCommand{ID: commandID, CommandType: "generate_control_code", BackendID: s.activePhoneBackend().ID}, ctx.Err())
+		return fmt.Errorf("read control code result: %w", ctx.Err())
+	}
+}
+
+func controlCodeBridgeCompleted(completed <-chan struct{}) bool {
+	select {
+	case <-completed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) pollPhoneControlCodeHealthForResult(ctx context.Context, requestID string, observe func(controlCodeBridgeObservation)) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	if observation := s.reconcilePhoneControlCodeHealth(ctx, requestID); observation != controlCodeBridgeIgnored {
+		observe(observation)
+		if observation == controlCodeBridgeCleanupObserved {
 			return
 		}
-		if msgType != websocket.MessageText {
-			continue
-		}
-		var msg map[string]any
-		if err := json.Unmarshal(body, &msg); err != nil {
-			continue
-		}
-		if s.handlePhoneControlCodeBridgeMessage(requestID, msg) {
+	}
+	ticker := time.NewTicker(controlCodePhoneHealthPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			observation := s.reconcilePhoneControlCodeHealth(ctx, requestID)
+			if observation != controlCodeBridgeIgnored {
+				observe(observation)
+			}
+			if observation == controlCodeBridgeCleanupObserved {
+				return
+			}
 		}
 	}
 }
 
-func (s *Server) handlePhoneControlCodeBridgeMessage(requestID string, msg map[string]any) bool {
+func (s *Server) reconcilePhoneControlCodeHealth(ctx context.Context, requestID string) controlCodeBridgeObservation {
+	data, err := s.fetchPhoneHealthData(ctx)
+	if err != nil || len(data) == 0 {
+		return controlCodeBridgeIgnored
+	}
+	controlCode, _ := data["controlCodeRequest"].(map[string]any)
+	if controlCodeRequestID(controlCode) != requestID {
+		controlCode = nil
+	}
+	for _, key := range []string{"pixelTicketStateEvent", "ticketStateEvent"} {
+		eventRaw, _ := data[key].(map[string]any)
+		if len(eventRaw) == 0 {
+			continue
+		}
+		eventMsg := clonePhoneHealthMap(eventRaw)
+		eventMsg["type"] = "ticket_state_event"
+		if strings.TrimSpace(fmt.Sprint(eventMsg["requestId"])) != requestID {
+			continue
+		}
+		if controlCode != nil {
+			if _, ok := eventMsg["totalDurationMillis"]; !ok {
+				eventMsg["totalDurationMillis"] = controlCode["totalDurationMillis"]
+			}
+			if _, ok := eventMsg["phases"]; !ok {
+				eventMsg["phases"] = controlCode["phases"]
+			}
+		}
+		observation := s.handlePhoneControlCodeBridgeMessage(requestID, eventMsg)
+		if observation != controlCodeBridgeIgnored {
+			return observation
+		}
+	}
+	return controlCodeBridgeIgnored
+}
+
+func controlCodeRequestID(controlCode map[string]any) string {
+	if len(controlCode) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(controlCode["requestId"]))
+}
+
+func clonePhoneHealthMap(input map[string]any) map[string]any {
+	output := make(map[string]any, len(input)+1)
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func (s *Server) fetchPhoneHealthData(ctx context.Context) (map[string]any, error) {
+	base := s.phoneCommandBaseURL()
+	if base == "" {
+		return nil, fmt.Errorf("phone command base URL is empty")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, controlCodePhoneHealthRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimRight(base, "/")+"/api/v1/health", nil)
+	if err != nil {
+		return nil, err
+	}
+	client := s.phoneBrokerHTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("phone health returned HTTP %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if data, ok := payload["data"].(map[string]any); ok {
+		return data, nil
+	}
+	return payload, nil
+}
+
+func (s *Server) handlePhoneControlCodeBridgeMessage(requestID string, msg map[string]any) controlCodeBridgeObservation {
 	if event, ok := pixelTicketEventFromMessage(msg); ok {
 		s.handlePixelTicketStateEvent(msg)
-		if event.RequestID == requestID && event.TicketState == "generated_result" {
-			return true
+		if event.RequestID != requestID {
+			return controlCodeBridgeIgnored
 		}
-		return false
+		switch event.TicketState {
+		case "generated_result":
+			return controlCodeBridgeResultObserved
+		case "raw_ticket":
+			return controlCodeBridgeCleanupObserved
+		}
+		return controlCodeBridgeIgnored
 	}
 	msgType, _ := msg["type"].(string)
 	msgRequestID, _ := msg["requestId"].(string)
 	if strings.TrimSpace(msgRequestID) != requestID {
-		return false
+		return controlCodeBridgeIgnored
 	}
 	if s.handleControlCodePhoneResult(msg) {
 		switch strings.TrimSpace(msgType) {
-		case "control_code_frame_ready", "control_code_result", "control_code_cleanup_complete":
-			return true
+		case "control_code_cleanup_complete":
+			return controlCodeBridgeCleanupObserved
+		case "control_code_frame_ready", "control_code_result":
+			return controlCodeBridgeResultObserved
 		}
 	}
-	return false
+	return controlCodeBridgeIgnored
 }
 
 func (s *Server) postPhoneSessionCommand(ctx context.Context, path string) error {

@@ -97,6 +97,30 @@ export const TicketremoteControlSession = __t.object("TicketremoteControlSession
 });
 export type TicketremoteControlSession = __Infer<typeof TicketremoteControlSession>;
 
+export const TicketremoteDevPerfMetric = __t.object("TicketremoteDevPerfMetric", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  source: __t.string(),
+  metricName: __t.string(),
+  phase: __t.string(),
+  flowId: __t.string(),
+  valueMillis: __t.u32(),
+  ok: __t.bool(),
+  detailJson: __t.string(),
+  createdAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteDevPerfMetric = __Infer<typeof TicketremoteDevPerfMetric>;
+
+export const TicketremoteDevPerfMetricsConfig = __t.object("TicketremoteDevPerfMetricsConfig", {
+  ticketId: __t.string(),
+  enabled: __t.bool(),
+  reason: __t.string(),
+  expiresAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteDevPerfMetricsConfig = __Infer<typeof TicketremoteDevPerfMetricsConfig>;
+
 export const TicketremotePhoneBackend = __t.object("TicketremotePhoneBackend", {
   id: __t.string(),
   ticketId: __t.string(),

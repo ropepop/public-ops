@@ -907,7 +907,7 @@ Expected: HTTP redirects to HTTPS; HTTPS headers are present; `/api/v1/livez` re
 
 - [ ] **Step 6: Verify authenticated browser behavior**
 
-Use the shared browser profile as required by this repo:
+Use the repo's Chrome-first browser verification policy. Prefer Codex `chrome:control-chrome` with the user's existing Chrome state. Treat the old shared browser-use profile command below as legacy fallback guidance only:
 
 ```bash
 browser-use --session default --profile "Your Chrome"

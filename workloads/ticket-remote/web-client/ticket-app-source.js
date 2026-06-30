@@ -3,6 +3,7 @@ import { html, reactive } from '@arrow-js/core';
 (function () {
   const cfg = window.TICKET_REMOTE_CONFIG || {};
   const pageVersion = cfg.pageVersion || 'ticket-remote-dev';
+  const assetVersion = String(cfg.assetVersion || pageVersion || '').trim();
 
   function safeString(value) {
     if (value == null) return '';
@@ -18,9 +19,13 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   const pendingClientLogs = [];
+  const pendingDevPerfMetrics = [];
   const sampledClientLogState = new Map();
   const sampledClientLogEvents = new Set(['control_code_capture_keepalive', 'stream_command_dispatched']);
   const sampledClientLogIntervalMs = 60000;
+  const controlCodeAutoPrepareMinIntervalMs = 45000;
+  const devMetricsConfig = cfg.devMetrics || {};
+  const devMetricsExpiresAtMs = Date.parse(devMetricsConfig.expiresAt || '');
   let spacetimeClient = null;
 
   function sampledClientLogDetail(event, detail) {
@@ -101,6 +106,7 @@ import { html, reactive } from '@arrow-js/core';
   if ('scrollRestoration' in history) {
     history.scrollRestoration = 'manual';
   }
+  normalizeAssetVersionURL();
 
   let spacetimeClientStatus = 'idle';
   let spacetimeDirectUnavailable = false;
@@ -183,6 +189,7 @@ import { html, reactive } from '@arrow-js/core';
   let serverClockSkewMs = 0;
   let pointerStart = null;
   let connectedAt = 0;
+  let videoSocketCreatedAt = 0;
   let videoConnectedAt = 0;
   let configuredAt = 0;
   let lastFrameAt = 0;
@@ -245,6 +252,10 @@ import { html, reactive } from '@arrow-js/core';
   let controlCodeSafeGeneratedFrameCount = 0;
   let controlCodeFrozenFrameCanvas = null;
   let controlCodeFrozenFrameKey = '';
+  let controlCodePreparedCaptureProof = null;
+  let controlCodePreparedCaptureDisplayedRequestID = '';
+  let controlCodeAutoPrepareInFlight = false;
+  let lastControlCodeAutoPrepareAt = 0;
   const localSessionID = String(cfg.sessionId || '').trim();
   const localPublicID = accountPublicId(cfg.email || '');
   const ownedControlCodeRequestIDs = new Set();
@@ -252,6 +263,11 @@ import { html, reactive } from '@arrow-js/core';
   let codeDialogOpen = false;
   let controlCodeDialogScrollLock = null;
   let codeResultTickTimer = null;
+  let activeStreamOpenMetric = null;
+  let activeControlCodeMetric = null;
+  let resumeRecoverySoftTimer = null;
+  let resumeRecoveryHardTimer = null;
+  let lastHiddenWallAt = 0;
   let stableViewport = null;
   let screenEngaged = false;
   let screenWakeLock = null;
@@ -280,7 +296,10 @@ import { html, reactive } from '@arrow-js/core';
   const streamDecoderStartupGraceMs = 3500;
   const hiddenVideoCloseDelayMs = 3000;
   const backgroundRecoveryHiddenMs = 30000;
+  const oldTabFreshResumeHiddenMs = 5000;
   const resumeVideoReconnectDelayMs = 600;
+  const resumeSoftReconnectMs = 1800;
+  const resumeHardRecoverMs = 3200;
   const idleDisconnectMs = 15 * 60 * 1000;
   const recoveryKeyframeDebounceMs = 2000;
   const keyframeCommandMinIntervalMs = 1000;
@@ -291,8 +310,8 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeFingerprintGridHeight = 16;
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
-  const controlCodeCapturePollMs = 200;
-  const controlCodeCaptureKeyframeRetryMs = 5000;
+  const controlCodeCapturePollMs = 100;
+  const controlCodeCaptureKeyframeRetryMs = 1500;
   const controlCodeCaptureKeyframeRetryLimit = 3;
   const controlCodeGeneratedChipScanStartY = 0.50;
   const controlCodeGeneratedChipScanEndY = 0.61;
@@ -340,13 +359,24 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function noteViewerActivity(event, reason) {
-    if (idleDisconnected) return;
     if (event && event.isTrusted === false) return;
+    if (idleDisconnected) {
+      resumeFromIdleDisconnect(reason || (event && event.type) || 'activity');
+      return;
+    }
     scheduleViewerIdleDisconnect(reason || (event && event.type) || 'activity');
   }
 
   function expireViewerIdle(reason) {
     if (idleDisconnected) return;
+    if (document.visibilityState === 'visible') {
+      scheduleViewerIdleDisconnect('visible_idle_keepalive');
+      clientLog('viewer_idle_visible_keepalive', reason || 'idle_timeout');
+      if (!streamHasFreshRenderedFrame()) {
+        recoverAfterVisibilityResume('visible_idle_keepalive');
+      }
+      return;
+    }
     idleDisconnected = true;
     if (idleDisconnectTimer) {
       clearTimeout(idleDisconnectTimer);
@@ -364,6 +394,7 @@ import { html, reactive } from '@arrow-js/core';
       clearTimeout(hiddenStreamFocusTimer);
       hiddenStreamFocusTimer = null;
     }
+    clearResumeWatchdogs();
     closeEarlyVideo('idle_disconnect');
     closeDirectVideo();
     resetStreamState({ preserveFrame: true });
@@ -374,10 +405,31 @@ import { html, reactive } from '@arrow-js/core';
     releaseScreenWakeLock('idle_disconnect');
     setConnected('Apturēts');
     setStatus('Straume apturēta pēc 15 minūtēm bez darbības.');
-    showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pārlādē lapu, lai turpinātu.', true);
+    showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pieskaries Sākt, lai turpinātu.', true);
     document.body.dataset.streamFreshness = 'IDLE_DISCONNECTED';
     publishStreamDebug();
     clientLog('viewer_idle_disconnected', reason || 'idle_timeout');
+  }
+
+  function resumeFromIdleDisconnect(reason) {
+    if (!idleDisconnected || streamUnsupported) return false;
+    if (document.visibilityState === 'hidden' && !controlCodeKeepsVideoAliveWhileHidden()) return false;
+    idleDisconnected = false;
+    document.body.dataset.streamFreshness = 'RECOVERING';
+    setConnected('Savienojas');
+    setStatus('Atjauno tiešraidi...');
+    showStreamRecovery();
+    scheduleViewerIdleDisconnect(reason || 'idle_resume');
+    beginStreamOpenMetric('old_tab_resume', reason || 'idle_resume', true);
+    connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
+    publishStreamFocus(true, reason || 'idle_resume');
+    connectDirectVideo();
+    requestKeyframeDebounced(`${reason || 'idle_resume'}_keyframe`, 0, true);
+    requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);
+    scheduleResumeWatchdogs(reason || 'idle_resume');
+    publishStreamDebug();
+    clientLog('viewer_idle_resumed', reason || 'idle_resume');
+    return true;
   }
 
   function layoutViewportRect() {
@@ -593,12 +645,29 @@ import { html, reactive } from '@arrow-js/core';
 
   function checkServerVersion(payload) {
     const serverVersion = payload && payload.serverVersion;
+    const serverAssetVersion = String(payload && payload.assetVersion || '').trim();
+    if (serverAssetVersion && assetVersion && serverAssetVersion !== assetVersion) {
+      const next = new URL(location.href);
+      next.searchParams.set('v', serverAssetVersion);
+      location.replace(next.toString());
+      return false;
+    }
     if (!serverVersion || serverVersion === pageVersion) return true;
     if (!String(serverVersion).startsWith('ticket-remote-')) return true;
     const next = new URL(location.href);
     next.searchParams.set('v', serverVersion);
     location.replace(next.toString());
     return false;
+  }
+
+  function normalizeAssetVersionURL() {
+    if (!assetVersion || !window.history || typeof history.replaceState !== 'function') return;
+    try {
+      const next = new URL(location.href);
+      if (next.searchParams.get('v') === assetVersion) return;
+      next.searchParams.set('v', assetVersion);
+      history.replaceState(history.state, document.title, next.toString());
+    } catch (_) {}
   }
 
   document.body.dataset.videoPath = 'https-h264';
@@ -826,6 +895,61 @@ import { html, reactive } from '@arrow-js/core';
     });
   }
 
+  function devPerfMetricsEnabled() {
+    if (!devMetricsConfig || devMetricsConfig.enabled !== true) return false;
+    if (!Number.isFinite(devMetricsExpiresAtMs)) return false;
+    return Date.now() < devMetricsExpiresAtMs;
+  }
+
+  function randomMetricFlowId(prefix) {
+    const cleanPrefix = String(prefix || 'flow').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 24) || 'flow';
+    return `${cleanPrefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function flushDevPerfMetrics() {
+    if (!devPerfMetricsEnabled()) {
+      pendingDevPerfMetrics.length = 0;
+      return;
+    }
+    if (!spacetimeClient || typeof spacetimeClient.appendDevMetric !== 'function') return;
+    if (!pendingDevPerfMetrics.length) return;
+    const batch = pendingDevPerfMetrics.splice(0, Math.min(20, pendingDevPerfMetrics.length));
+    batch.forEach((entry) => {
+      spacetimeClient.appendDevMetric(
+        entry.metricName,
+        entry.phase,
+        entry.flowId,
+        entry.valueMillis,
+        entry.ok,
+        entry.detailJson
+      ).catch(() => {
+        if (pendingDevPerfMetrics.length < 100) pendingDevPerfMetrics.unshift(entry);
+      });
+    });
+  }
+
+  function recordDevPerfMetric(metricName, phase, flowId, valueMillis, ok, detail) {
+    if (!devPerfMetricsEnabled()) return;
+    const entry = {
+      metricName: String(metricName || 'metric').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'metric',
+      phase: String(phase || 'event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'event',
+      flowId: String(flowId || randomMetricFlowId(metricName)).slice(0, 120),
+      valueMillis: Math.max(0, Math.min(86400000, Math.round(Number(valueMillis) || 0))),
+      ok: Boolean(ok),
+      detailJson: safeString(Object.assign({
+        pageVersion,
+        metricExpiresAt: devMetricsConfig.expiresAt || ''
+      }, detail || {})).slice(0, 1500)
+    };
+    pendingDevPerfMetrics.push(entry);
+    if (pendingDevPerfMetrics.length > 100) pendingDevPerfMetrics.splice(0, pendingDevPerfMetrics.length - 100);
+    try {
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(() => flushDevPerfMetrics());
+      }
+    } catch (_) {}
+  }
+
   function streamResumeSpinnerVisible() {
     return Boolean(streamResumeSpinner && !streamResumeSpinner.hidden);
   }
@@ -956,12 +1080,159 @@ import { html, reactive } from '@arrow-js/core';
     stage.style.setProperty('--stream-top', `${Math.max(0, Math.floor((maxHeight - displayHeight) / 2))}px`);
   }
 
+  function videoSocketState() {
+    return videoWs ? videoWs.readyState : -1;
+  }
+
+  function beginStreamOpenMetric(kind, reason, force) {
+    if (!devPerfMetricsEnabled()) return null;
+    if (activeStreamOpenMetric && !force) return activeStreamOpenMetric;
+    activeStreamOpenMetric = {
+      flowId: randomMetricFlowId(kind || 'stream_open'),
+      kind: kind || 'stream_open',
+      reason: reason || '',
+      startedAt: performance.now(),
+      socketState: videoSocketState(),
+      hadRenderedFrame: hasRenderedFrame,
+      hadFallbackFrame: fallbackFrameAvailable
+    };
+    return activeStreamOpenMetric;
+  }
+
+  function finishStreamOpenMetric(phase, ok, detail) {
+    if (!activeStreamOpenMetric) return;
+    const metric = activeStreamOpenMetric;
+    activeStreamOpenMetric = null;
+    clearResumeWatchdogs();
+    const elapsedMs = performance.now() - metric.startedAt;
+    recordDevPerfMetric('stream_open', metric.kind, metric.flowId, elapsedMs, ok && elapsedMs <= 5000, Object.assign({
+      phase: phase || '',
+      reason: metric.reason,
+      startedSocketState: metric.socketState,
+      completedSocketState: videoSocketState(),
+      hadRenderedFrame: metric.hadRenderedFrame,
+      hadFallbackFrame: metric.hadFallbackFrame,
+      targetMillis: 5000
+    }, detail || {}));
+  }
+
+  function clearResumeWatchdogs() {
+    if (resumeRecoverySoftTimer) {
+      clearTimeout(resumeRecoverySoftTimer);
+      resumeRecoverySoftTimer = null;
+    }
+    if (resumeRecoveryHardTimer) {
+      clearTimeout(resumeRecoveryHardTimer);
+      resumeRecoveryHardTimer = null;
+    }
+  }
+
+  function streamHasFreshRenderedFrame() {
+    return currentRenderedFreshness(performance.now()).liveLabeled;
+  }
+
+  function scheduleResumeWatchdogs(reason) {
+    clearResumeWatchdogs();
+    const metric = activeStreamOpenMetric;
+    const flowId = metric && metric.flowId;
+    resumeRecoverySoftTimer = setTimeout(() => {
+      resumeRecoverySoftTimer = null;
+      if (idleDisconnected || document.visibilityState !== 'visible') return;
+      if (streamHasFreshRenderedFrame()) return;
+      recordDevPerfMetric('stream_recovery_step', 'resume_soft_reconnect', flowId || randomMetricFlowId('resume'), resumeSoftReconnectMs, true, {
+        reason,
+        socketState: videoSocketState(),
+        hasRenderedFrame,
+        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
+      });
+      preserveCurrentFrame('resume_soft_reconnect');
+      closeDirectVideo();
+      resetStreamState({ preserveFrame: true });
+      connectDirectVideo();
+      requestKeyframeDebounced(`${reason || 'resume'}_soft_reconnect`, 500);
+    }, resumeSoftReconnectMs);
+    resumeRecoveryHardTimer = setTimeout(() => {
+      resumeRecoveryHardTimer = null;
+      if (idleDisconnected || document.visibilityState !== 'visible') return;
+      if (streamHasFreshRenderedFrame()) return;
+      recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true, {
+        reason,
+        socketState: videoSocketState(),
+        hasRenderedFrame,
+        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
+      });
+      requestKeyframeDebounced(`${reason || 'resume'}_hard_recover`, 500);
+      requestServerRecoveryDebounced(`${reason || 'resume'}_hard_recover`);
+      connectDirectVideo();
+    }, resumeHardRecoverMs);
+  }
+
+  function forceFreshVideoResume(reason, kind) {
+    if (idleDisconnected || streamUnsupported) return;
+    const now = performance.now();
+    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
+    clientLog('fresh_video_resume', JSON.stringify({
+      reason,
+      kind,
+      configured,
+      frameAgeMs: Math.round(frameAgeMs),
+      socketState: videoSocketState(),
+      hasRenderedFrame,
+      fallbackFrameAvailable
+    }));
+    closeEarlyVideo(reason || 'fresh_resume');
+    preserveCurrentFrame(`fresh_resume:${reason || 'unknown'}`);
+    closeDirectVideo();
+    resetStreamState({ preserveFrame: true });
+    showStreamRecovery();
+    beginStreamOpenMetric(kind || 'old_tab_resume', reason || 'resume', true);
+    connectDirectVideo();
+    requestKeyframeDebounced(`${reason || 'resume'}_fresh_socket`, 500);
+    scheduleResumeWatchdogs(reason || 'resume');
+  }
+
+  function restoreCachedVideoForFreshFrame(reason, kind) {
+    if (idleDisconnected || streamUnsupported) return;
+    const now = performance.now();
+    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
+    clientLog('cached_video_resume', JSON.stringify({
+      reason,
+      kind,
+      configured,
+        frameAgeMs: Math.round(frameAgeMs),
+        socketState: videoSocketState(),
+        hasRenderedFrame,
+        fallbackFrameAvailable
+      }));
+    closeEarlyVideo(reason || 'cached_resume');
+    if (hiddenVideoCloseTimer) {
+      clearTimeout(hiddenVideoCloseTimer);
+      hiddenVideoCloseTimer = null;
+    }
+    if (hiddenStreamFocusTimer) {
+      clearTimeout(hiddenStreamFocusTimer);
+      hiddenStreamFocusTimer = null;
+    }
+    preserveCurrentFrame(`cached_resume:${reason || 'unknown'}`);
+    closeDirectVideo();
+    resetStreamState({ preserveFrame: true });
+    showStreamRecovery();
+    beginStreamOpenMetric(kind || 'old_tab_resume', reason || 'resume', true);
+    connectDirectVideo();
+    requestKeyframeDebounced(`${reason || 'resume'}_cached_keyframe`, 0, true);
+    requestServerRecoveryDebounced(`${reason || 'resume'}_cached_recover`, true);
+    scheduleResumeWatchdogs(reason || 'resume');
+  }
+
   function connect() {
     if (idleDisconnected) return;
     clearTimeout(reconnectTimer);
     keepFirstScreenPinned();
     setConnected('Savienojas');
     connectedAt = performance.now();
+    if (!hasRenderedFrame) {
+      beginStreamOpenMetric('cold_open', 'connect', false);
+    }
     connectSpacetimeState().then(() => {
       publishStreamFocus(true, 'public_connected');
       setConnected('Savienots');
@@ -969,6 +1240,7 @@ import { html, reactive } from '@arrow-js/core';
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
       flushClientLogs();
+      flushDevPerfMetrics();
       connectDirectVideo();
     }).catch((error) => {
       setConnected('Savienojuma kļūme');
@@ -979,6 +1251,9 @@ import { html, reactive } from '@arrow-js/core';
       reconnectTimer = setTimeout(connect, 1500);
     });
     connectDirectVideo();
+    if (!hasRenderedFrame) {
+      scheduleResumeWatchdogs('cold_open');
+    }
   }
 
   function resetStreamState(options) {
@@ -988,6 +1263,7 @@ import { html, reactive } from '@arrow-js/core';
     }
     configured = false;
     configuredAt = 0;
+    videoSocketCreatedAt = 0;
     videoConnectedAt = 0;
     lastFrameAt = 0;
     lastDecodedFrameAt = 0;
@@ -1045,6 +1321,7 @@ import { html, reactive } from '@arrow-js/core';
     const sockets = new Set(activeVideoSockets);
     if (videoWs) sockets.add(videoWs);
     videoWs = null;
+    videoSocketCreatedAt = 0;
     sockets.forEach((socket) => {
       intentionallyClosedVideoSockets.add(socket);
       try { socket.close(1000, 'client_closed'); } catch (_) {}
@@ -1154,6 +1431,7 @@ import { html, reactive } from '@arrow-js/core';
     }
     closeDirectVideo();
     document.body.dataset.videoPath = 'https-h264';
+    videoSocketCreatedAt = performance.now();
     const socket = safeWebSocket(streamURL(), 'video');
     if (!socket) {
       showStreamRecovery();
@@ -1230,26 +1508,26 @@ import { html, reactive } from '@arrow-js/core';
     clientLog(event, safeDetail);
   }
 
-  function requestKeyframe(reason) {
+  function requestKeyframe(reason, force) {
     const now = performance.now();
-    if (now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
+    if (!force && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
     lastKeyframeCommandAt = now;
     runSpacetimeMutation((client) => client.requestKeyframe(reason || 'browser_request'), reason || 'keyframe')
       .catch((error) => clientLog('keyframe_request_failed', `${reason || 'keyframe'}:${error && error.message || 'failed'}`));
     return true;
   }
 
-  function requestKeyframeDebounced(reason, minIntervalMs) {
+  function requestKeyframeDebounced(reason, minIntervalMs, force) {
     const now = performance.now();
-    if (now - lastRecoveryKeyframeAt < minIntervalMs) return false;
-    if (!requestKeyframe(reason)) return false;
+    if (!force && now - lastRecoveryKeyframeAt < minIntervalMs) return false;
+    if (!requestKeyframe(reason, force)) return false;
     lastRecoveryKeyframeAt = now;
     return true;
   }
 
-  function requestServerRecoveryDebounced(reason) {
+  function requestServerRecoveryDebounced(reason, force) {
     const now = performance.now();
-    if (now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
+    if (!force && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
     sendVideoClientLog('h264_server_recover_requested', reason);
     runSpacetimeMutation((client) => client.recoverStream(reason || 'browser_recovery'), reason || 'recover_stream')
@@ -1563,6 +1841,18 @@ import { html, reactive } from '@arrow-js/core';
       lastRenderedFrameTimestamp = Number(frameMetadata.timestamp || 0);
       firstFrameReceived = true;
       hasRenderedFrame = true;
+      finishStreamOpenMetric('first_fresh_frame', true, {
+        visualAgeMillis: Math.round(lastRenderedFrameVisualAgeMillis),
+        frameEpoch: lastRenderedFrameEpoch,
+        frameSequence: lastRenderedFrameSequence,
+        browserReceiveToDecodeMillis: lastRenderedFrameQueuedAt > 0 && lastRenderedFrameReceivedAt > 0
+          ? Math.round(Math.max(0, lastRenderedFrameQueuedAt - lastRenderedFrameReceivedAt))
+          : -1,
+        decodeToRenderMillis: lastRenderedFrameQueuedAt > 0
+          ? Math.round(Math.max(0, lastRenderedFrameRenderedAt - lastRenderedFrameQueuedAt))
+          : -1
+      });
+      maybePrepareControlCodeResultFrame();
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
@@ -1803,7 +2093,11 @@ import { html, reactive } from '@arrow-js/core';
         },
         onStatus: (status, detail) => {
           spacetimeClientStatus = status;
-          if (status === 'live') flushClientLogs();
+          if (status === 'live') {
+            flushClientLogs();
+            flushDevPerfMetrics();
+          }
+          updateControlCodeSubmitAvailability();
           if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
         }
       });
@@ -1908,6 +2202,7 @@ import { html, reactive } from '@arrow-js/core';
   function setControlCodeResultVisible(visible) {
     codeResultArea.hidden = !visible;
     document.body.classList.toggle('control-code-result-visible', Boolean(visible));
+    updateControlCodeSubmitAvailability();
   }
 
   function clearControlCodeResultCapture() {
@@ -1926,6 +2221,7 @@ import { html, reactive } from '@arrow-js/core';
     lastControlCodeCaptureKeyframeRetryCount = 0;
     resetControlCodeSafeGeneratedFrame('clear_capture');
     clearControlCodeFrozenCandidateFrame();
+    clearControlCodePreparedCapture();
     codeResultImage.hidden = true;
     codeResultImage.removeAttribute('src');
     publishStreamDebug();
@@ -2050,9 +2346,21 @@ import { html, reactive } from '@arrow-js/core';
       width: 0.68,
       height: 0.22
     });
+    const dialogUpper = canvasRegionFingerprint({
+      x: 0.16,
+      y: 0.30,
+      width: 0.68,
+      height: 0.22
+    });
     const inputLine = canvasRegionFingerprint({
       x: 0.24,
       y: 0.52,
+      width: 0.52,
+      height: 0.045
+    });
+    const inputLineUpper = canvasRegionFingerprint({
+      x: 0.24,
+      y: 0.41,
       width: 0.52,
       height: 0.045
     });
@@ -2068,29 +2376,51 @@ import { html, reactive } from '@arrow-js/core';
       width: 0.18,
       height: 0.07
     });
+    const okButtonUpper = canvasRegionFingerprint({
+      x: 0.64,
+      y: 0.43,
+      width: 0.18,
+      height: 0.07
+    });
     const keyboardVisible = Boolean(keyboard &&
       keyboard.lightCellRatio >= 0.58 &&
       keyboard.mean >= 150 &&
       keyboard.contrastScore <= 95);
-    const dialogVisible = Boolean(dialog &&
+    const dialogLowerVisible = Boolean(dialog &&
       dialog.lightCellRatio >= 0.42 &&
       dialog.mean >= 118 &&
       dialog.darkCellRatio <= 0.30 &&
       dialog.contrastScore <= 98);
+    const dialogUpperVisible = Boolean(dialogUpper &&
+      dialogUpper.lightCellRatio >= 0.42 &&
+      dialogUpper.mean >= 118 &&
+      dialogUpper.darkCellRatio <= 0.30 &&
+      dialogUpper.contrastScore <= 98);
+    const dialogVisible = dialogLowerVisible || dialogUpperVisible;
+    const dialogProof = dialogUpperVisible ? dialogUpper : dialog;
     const inputLineVisible = Boolean(inputLine &&
       inputLine.darkCellRatio >= 0.08 &&
-      inputLine.contrastScore >= 18);
-    const okButtonOrangeRatio = regionOrangeCellRatio({
+      inputLine.contrastScore >= 18) || Boolean(inputLineUpper &&
+      inputLineUpper.darkCellRatio >= 0.08 &&
+      inputLineUpper.contrastScore >= 18);
+    const okButtonLowerOrangeRatio = regionOrangeCellRatio({
       x: 0.64,
       y: 0.51,
       width: 0.18,
       height: 0.07
     });
-    const dialogGhostVisible = Boolean(dialog &&
-      dialog.lightCellRatio >= 0.24 &&
-      dialog.mean >= 82 &&
-      dialog.darkCellRatio <= 0.30 &&
-      dialog.contrastScore <= 106 &&
+    const okButtonUpperOrangeRatio = regionOrangeCellRatio({
+      x: 0.64,
+      y: 0.43,
+      width: 0.18,
+      height: 0.07
+    });
+    const okButtonOrangeRatio = Math.max(okButtonLowerOrangeRatio, okButtonUpperOrangeRatio);
+    const dialogGhostVisible = Boolean(dialogProof &&
+      dialogProof.lightCellRatio >= 0.24 &&
+      dialogProof.mean >= 82 &&
+      dialogProof.darkCellRatio <= 0.30 &&
+      dialogProof.contrastScore <= 106 &&
       okButtonOrangeRatio >= 0.03);
     const dimOverlayVisible = Boolean(dimOverlay &&
       dimOverlay.mean >= 68 &&
@@ -2102,7 +2432,11 @@ import { html, reactive } from '@arrow-js/core';
       okButton.mean >= 105 &&
       okButton.mean <= 220 &&
       okButton.contrastScore <= 85 &&
-      okButton.lightCellRatio >= 0.18);
+      okButton.lightCellRatio >= 0.18) || Boolean(okButtonUpper &&
+      okButtonUpper.mean >= 105 &&
+      okButtonUpper.mean <= 220 &&
+      okButtonUpper.contrastScore <= 85 &&
+      okButtonUpper.lightCellRatio >= 0.18);
     const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);
     const popupKeyboardVisible = dialogVisible && keyboardVisible;
     return {
@@ -2114,9 +2448,9 @@ import { html, reactive } from '@arrow-js/core';
       keyboardLightCellRatio: keyboard ? Math.round(Number(keyboard.lightCellRatio || 0) * 100) / 100 : 0,
       keyboardMean: keyboard ? Math.round(Number(keyboard.mean || 0) * 10) / 10 : 0,
       keyboardContrastScore: keyboard ? Math.round(Number(keyboard.contrastScore || 0) * 10) / 10 : 0,
-      popupLightCellRatio: dialog ? Math.round(Number(dialog.lightCellRatio || 0) * 100) / 100 : 0,
-      popupDarkCellRatio: dialog ? Math.round(Number(dialog.darkCellRatio || 0) * 100) / 100 : 0,
-      popupContrastScore: dialog ? Math.round(Number(dialog.contrastScore || 0) * 10) / 10 : 0,
+      popupLightCellRatio: dialogProof ? Math.round(Number(dialogProof.lightCellRatio || 0) * 100) / 100 : 0,
+      popupDarkCellRatio: dialogProof ? Math.round(Number(dialogProof.darkCellRatio || 0) * 100) / 100 : 0,
+      popupContrastScore: dialogProof ? Math.round(Number(dialogProof.contrastScore || 0) * 10) / 10 : 0,
       dimOverlayMean: dimOverlay ? Math.round(Number(dimOverlay.mean || 0) * 10) / 10 : 0,
       dimOverlayContrastScore: dimOverlay ? Math.round(Number(dimOverlay.contrastScore || 0) * 10) / 10 : 0,
       popupInputLineDarkCellRatio: inputLine ? Math.round(Number(inputLine.darkCellRatio || 0) * 100) / 100 : 0,
@@ -2264,6 +2598,7 @@ import { html, reactive } from '@arrow-js/core';
     lastControlCodeCaptureKeyframeRetryCount = 0;
     resetControlCodeSafeGeneratedFrame('baseline');
     clearControlCodeFrozenCandidateFrame();
+    clearControlCodePreparedCapture();
     lastControlCodeCaptureDebug = {
       requestId: requestID,
       baselineCaptured: Boolean(controlCodeBaselineFrameFingerprint),
@@ -2307,12 +2642,84 @@ import { html, reactive } from '@arrow-js/core';
 
   function controlCodeTrustedPhonePostSubmitProof(resultProof) {
     resultProof = String(resultProof || '').trim();
-    return resultProof === 'phone_visual_raw_ticket_after_submit' ||
-      resultProof === 'phone_visual_root_confirmed' ||
+    return resultProof === 'phone_visual_root_confirmed' ||
       resultProof === 'phone_visual';
   }
 
-  const controlCodeSafeGeneratedFrameRequiredCount = 2;
+  const controlCodeSafeGeneratedFrameRequiredCount = 1;
+  const controlCodeTrustedProofSafeGeneratedFrameRequiredCount = 1;
+
+  function controlCodeMetricRequestKey(requestID) {
+    return requestID ? accountPublicId(String(requestID)) : '';
+  }
+
+  function beginControlCodeMetric(digitCount) {
+    if (!devPerfMetricsEnabled()) return null;
+    activeControlCodeMetric = {
+      flowId: randomMetricFlowId('control_code'),
+      startedAt: performance.now(),
+      digitCount: Number(digitCount || 0),
+      requestKey: '',
+      transitions: new Set(),
+      resultReadyRecorded: false,
+      finished: false
+    };
+    recordDevPerfMetric('control_code_phase', 'submit_started', activeControlCodeMetric.flowId, 0, true, {
+      digitCount: activeControlCodeMetric.digitCount,
+      targetMillis: 5000
+    });
+    return activeControlCodeMetric;
+  }
+
+  function noteControlCodeMetricPhase(phase, request, ok, detail) {
+    if (!activeControlCodeMetric || activeControlCodeMetric.finished) return;
+    const requestID = String(request && request.requestId || '').trim();
+    if (requestID && !requestID.startsWith('pending:')) {
+      activeControlCodeMetric.requestKey = controlCodeMetricRequestKey(requestID);
+    }
+    const elapsedMs = performance.now() - activeControlCodeMetric.startedAt;
+    recordDevPerfMetric('control_code_phase', phase, activeControlCodeMetric.flowId, elapsedMs, ok, Object.assign({
+      requestKey: activeControlCodeMetric.requestKey,
+      digitCount: activeControlCodeMetric.digitCount,
+      status: String(request && request.status || ''),
+      targetMillis: 5000
+    }, detail || {}));
+  }
+
+  function noteControlCodeRequestMetric(request) {
+    if (!request || !activeControlCodeMetric || activeControlCodeMetric.finished) return;
+    const status = String(request.status || '');
+    if (!status) return;
+    const transitionKey = `${String(request.requestId || '')}:${status}`;
+    if (activeControlCodeMetric.transitions.has(transitionKey)) return;
+    activeControlCodeMetric.transitions.add(transitionKey);
+    noteControlCodeMetricPhase(`status_${status}`, request, status !== 'failed', {
+      reason: String(request.reason || ''),
+      markerEpoch: Number(request.resultFrameEpoch || request.streamEpoch || 0),
+      markerSequence: Number(request.resultMinFrameSequence || request.minFrameSequence || 0)
+    });
+    if (status === 'succeeded' && !activeControlCodeMetric.resultReadyRecorded) {
+      activeControlCodeMetric.resultReadyRecorded = true;
+      noteControlCodeMetricPhase('phone_result_ready', request, true);
+    }
+    if (status === 'failed' || status === 'expired') {
+      finishControlCodeMetric(status, false, {
+        reason: String(request.reason || request.message || status)
+      });
+    }
+  }
+
+  function finishControlCodeMetric(outcome, ok, detail) {
+    if (!activeControlCodeMetric || activeControlCodeMetric.finished) return;
+    activeControlCodeMetric.finished = true;
+    const elapsedMs = performance.now() - activeControlCodeMetric.startedAt;
+    recordDevPerfMetric('control_code_total', outcome || 'finished', activeControlCodeMetric.flowId, elapsedMs, ok && elapsedMs <= 5000, Object.assign({
+      requestKey: activeControlCodeMetric.requestKey,
+      digitCount: activeControlCodeMetric.digitCount,
+      targetMillis: 5000
+    }, detail || {}));
+    activeControlCodeMetric = null;
+  }
 
   function controlCodeCandidateFrameKey(proof) {
     return [
@@ -2359,6 +2766,11 @@ import { html, reactive } from '@arrow-js/core';
     controlCodeFrozenFrameKey = '';
   }
 
+  function clearControlCodePreparedCapture() {
+    controlCodePreparedCaptureProof = null;
+    controlCodePreparedCaptureDisplayedRequestID = '';
+  }
+
   function freezeControlCodeCandidateFrame(proof) {
     if (!proof || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
     const frozen = document.createElement('canvas');
@@ -2382,6 +2794,8 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeCandidateFrameProof(request) {
+    const options = arguments.length > 1 ? arguments[1] : null;
+    const allowProvisional = Boolean(options && options.allowProvisional);
     const requestID = String(request && request.requestId || '').trim();
     const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
     const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
@@ -2402,8 +2816,12 @@ import { html, reactive } from '@arrow-js/core';
       frozenFrameKey: controlCodeFrozenFrameKey,
       keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
     };
-    if (!request || request.status !== 'succeeded') {
+    if (!request || (!allowProvisional && request.status !== 'succeeded')) {
       proof.candidateRejectedReason = 'request_not_succeeded';
+      return proof;
+    }
+    if (allowProvisional && request.status !== 'running' && request.status !== 'succeeded') {
+      proof.candidateRejectedReason = 'request_not_running';
       return proof;
     }
     if (request.cleanupCompletedAt) {
@@ -2414,13 +2832,17 @@ import { html, reactive } from '@arrow-js/core';
       proof.candidateRejectedReason = 'request_id_missing';
       return proof;
     }
-    if (!markerEpoch || !markerSequence || !hasRenderedFrame) {
+    if ((!markerEpoch || !markerSequence) && !allowProvisional) {
       proof.candidateRejectedReason = 'marker_waiting';
+      return proof;
+    }
+    if (!hasRenderedFrame) {
+      proof.candidateRejectedReason = 'frame_waiting';
       return proof;
     }
     const renderedEpoch = controlCodeRenderedFrameEpoch();
     const renderedSequence = controlCodeRenderedFrameSequence();
-    if (renderedEpoch !== markerEpoch || renderedSequence < markerSequence) {
+    if (markerEpoch && markerSequence && (renderedEpoch !== markerEpoch || renderedSequence < markerSequence)) {
       proof.candidateRejectedReason = 'frame_before_marker';
       return proof;
     }
@@ -2480,8 +2902,18 @@ import { html, reactive } from '@arrow-js/core';
         generatedProof.generatedChipVisible &&
         (proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold ||
           proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold));
+    const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof &&
+      markerEpoch &&
+      markerSequence &&
+      renderedEpoch === markerEpoch &&
+      renderedSequence >= markerSequence &&
+      (request.status === 'succeeded' || allowProvisional));
+    proof.trustedPhoneMarkerFrame = trustedPhoneMarkerFrame;
     proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;
-    if (!browserTrustedGeneratedVisible) {
+    if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame) {
+      proof.generatedMarkerOnlyRejected = true;
+    }
+    if (!proof.browserTrustedGeneratedVisible) {
       resetControlCodeSafeGeneratedFrame('generated_not_visible');
       proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
       if (controlCodeBaselineFrameFingerprint &&
@@ -2495,7 +2927,11 @@ import { html, reactive } from '@arrow-js/core';
     }
     const safeFrameCount = noteControlCodeSafeGeneratedFrame(proof);
     proof.safeGeneratedFrameCount = safeFrameCount;
-    if (safeFrameCount < controlCodeSafeGeneratedFrameRequiredCount) {
+    const requiredSafeFrameCount = trustedPhonePostSubmitProof ?
+      controlCodeTrustedProofSafeGeneratedFrameRequiredCount :
+      controlCodeSafeGeneratedFrameRequiredCount;
+    proof.requiredSafeGeneratedFrameCount = requiredSafeFrameCount;
+    if (safeFrameCount < requiredSafeFrameCount) {
       proof.candidateRejectedReason = 'generated_frame_not_stable';
       return proof;
     }
@@ -2506,8 +2942,109 @@ import { html, reactive } from '@arrow-js/core';
     proof.accepted = true;
     proof.candidateAccepted = true;
     proof.candidateRejectedReason = '';
-    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    proof.acceptedReason = markerEpoch && markerSequence
+      ? 'candidate_frame_at_or_after_phone_marker_and_generated_visual'
+      : 'browser_prepared_generated_frame_before_marker';
+    proof.provisional = allowProvisional && (!markerEpoch || !markerSequence || request.status !== 'succeeded');
     return proof;
+  }
+
+  function controlCodePreparedProofUsable(request, proof) {
+    if (!request || !proof || !proof.accepted) return false;
+    const requestID = String(request.requestId || '').trim();
+    if (!requestID || String(proof.requestId || '').trim() !== requestID) return false;
+    if (!controlCodeFrozenCandidateFrameForProof(proof)) return false;
+    if (request.status !== 'succeeded') return false;
+    const markerEpoch = Number(request.resultFrameEpoch || request.streamEpoch || 0);
+    const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
+    if (!markerEpoch || !markerSequence) return false;
+    if (Number(proof.candidateFrameEpoch || 0) !== markerEpoch) return false;
+    if (Number(proof.candidateFrameSequence || 0) < markerSequence) return false;
+    proof.markerEpoch = markerEpoch;
+    proof.markerSequence = markerSequence;
+    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    proof.provisional = false;
+    return true;
+  }
+
+  function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {
+    if (!requestID || !capturedImage) return false;
+    codeResultImage.src = capturedImage;
+    setControlCodeResultVisible(true);
+    codeResultImage.hidden = false;
+    codeResultStatus.textContent = '';
+    codeResultStatus.hidden = true;
+    codeResultValue.hidden = true;
+    codeResultValue.textContent = '';
+    codeResultValue.style.display = '';
+    codeResultTimer.hidden = true;
+    codeResultTimer.textContent = '';
+    codeResultArea.dataset.status = 'succeeded';
+    codeResultArea.style.background = '#000';
+    if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
+      controlCodePreparedCaptureDisplayedRequestID = requestID;
+      finishControlCodeMetric(outcome || 'browser_capture_displayed', true, {
+        candidateFrameEpoch: Number(proof.candidateFrameEpoch || 0),
+        candidateFrameSequence: Number(proof.candidateFrameSequence || 0),
+        safeGeneratedFrameCount: controlCodeSafeGeneratedFrameCount,
+        fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
+        fingerprintChangedCells: proof.fingerprintChangedCells,
+        provisional: Boolean(proof.provisional)
+      });
+    }
+    lastControlCodeCaptureDebug = Object.assign({}, proof, {
+      accepted: proof.accepted,
+      candidateAccepted: true,
+      fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
+      capturedNaturalWidth: canvas.width,
+      capturedNaturalHeight: canvas.height,
+      controlCodeSafeGeneratedFrameCount,
+      controlCodeFrozenFrameKey,
+      capturedAt: Date.now()
+    });
+    publishStreamDebug();
+    return true;
+  }
+
+  function controlCodeResultDisplayedForRequest(requestID) {
+    requestID = String(requestID || '').trim();
+    return Boolean(requestID &&
+      controlCodePreparedCaptureDisplayedRequestID === requestID &&
+      !codeResultArea.hidden &&
+      !codeResultImage.hidden &&
+      Boolean(codeResultImage.currentSrc || codeResultImage.src));
+  }
+
+  function maybePrepareControlCodeResultFrame() {
+    if (!codeRequest || codeRequest.status !== 'running') return false;
+    const requestID = String(codeRequest.requestId || '').trim();
+    if (!requestID || requestID.startsWith('pending:')) return false;
+    if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+    if (controlCodePreparedCaptureProof &&
+      String(controlCodePreparedCaptureProof.requestId || '').trim() === requestID &&
+      controlCodeFrozenCandidateFrameForProof(controlCodePreparedCaptureProof)) {
+      return true;
+    }
+    const proof = controlCodeCandidateFrameProof(codeRequest, { allowProvisional: true });
+    if (!proof.accepted) {
+      if (proof.candidateRejectedReason === 'generated_frame_not_visible' ||
+        proof.candidateRejectedReason === 'candidate_matches_pre_request_frame') {
+        lastControlCodeCaptureDebug = Object.assign({}, proof, {
+          accepted: false,
+          candidateAccepted: false,
+          preparedAt: Date.now()
+        });
+      }
+      return false;
+    }
+    controlCodePreparedCaptureProof = Object.assign({}, proof, {
+      preparedAt: Date.now()
+    });
+    const capturedImage = captureControlCodeResultImage(proof);
+    if (capturedImage) {
+      displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');
+    }
+    return true;
   }
 
   function noteControlCodeMarkerWaiting(request) {
@@ -2590,9 +3127,11 @@ import { html, reactive } from '@arrow-js/core';
       const capturedImage = captureControlCodeResultImage(proof);
       if (!capturedImage) return false;
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+      displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');
       controlCodeCaptureAckInFlightRequestID = requestID;
       try {
         await confirmControlCodeBrowserCapture(request, proof);
+        controlCodeResultCapturedRequestID = requestID;
       } finally {
         if (controlCodeCaptureAckInFlightRequestID === requestID) {
           controlCodeCaptureAckInFlightRequestID = '';
@@ -2602,35 +3141,16 @@ import { html, reactive } from '@arrow-js/core';
         return false;
       }
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
-      codeResultImage.src = capturedImage;
-      setControlCodeResultVisible(true);
-      codeResultImage.hidden = false;
-      controlCodeResultCapturedRequestID = requestID;
-      codeResultStatus.textContent = '';
-      codeResultStatus.hidden = true;
-      codeResultValue.hidden = true;
-      codeResultValue.textContent = '';
-      codeResultValue.style.display = '';
-      codeResultTimer.hidden = true;
-      codeResultTimer.textContent = '';
-      codeResultArea.dataset.status = 'succeeded';
-      codeResultArea.style.background = '#000';
-      lastControlCodeCaptureDebug = Object.assign({}, proof, {
-        accepted: proof.accepted,
-        candidateAccepted: true,
-        fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
-        capturedNaturalWidth: canvas.width,
-        capturedNaturalHeight: canvas.height,
-        controlCodeSafeGeneratedFrameCount,
-        controlCodeFrozenFrameKey,
-        capturedAt: Date.now()
-      });
-      publishStreamDebug();
       return true;
     } catch (error) {
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
       reportClientFault('control_code_browser_capture_failed', error);
-      failControlCodeResultScreenshotWait();
+      if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
+        finishControlCodeMetric('browser_capture_failed', false, {
+          error: error && error.message || 'capture failed'
+        });
+        failControlCodeResultScreenshotWait();
+      }
       return false;
     }
   }
@@ -2652,6 +3172,9 @@ import { html, reactive } from '@arrow-js/core';
     codeResultValue.textContent = '';
     codeResultValue.style.display = '';
     codeResultTimer.hidden = false;
+    finishControlCodeMetric('browser_capture_wait_failed', false, {
+      requestKey: codeRequest && codeRequest.requestId ? controlCodeMetricRequestKey(codeRequest.requestId) : ''
+    });
   }
 
   function maybeCaptureControlCodeResultImage() {
@@ -2663,6 +3186,15 @@ import { html, reactive } from '@arrow-js/core';
     if (!controlCodeMarkerReady(codeRequest)) {
       noteControlCodeMarkerWaiting(codeRequest);
       return false;
+    }
+    if (controlCodePreparedProofUsable(codeRequest, controlCodePreparedCaptureProof)) {
+      if (controlCodeResultCaptureTimer) {
+        clearTimeout(controlCodeResultCaptureTimer);
+        controlCodeResultCaptureTimer = null;
+      }
+      controlCodeResultCaptureRequestID = '';
+      captureControlCodeResultScreenshot(codeRequest, controlCodePreparedCaptureProof);
+      return true;
     }
     const proof = controlCodeCandidateFrameProof(codeRequest);
     if (!proof.accepted) {
@@ -2683,24 +3215,42 @@ import { html, reactive } from '@arrow-js/core';
     if (!requestID) return;
     if (controlCodeResultCapturedRequestID === requestID) return;
     if (locallyClosedControlCodeRequestIDs.has(requestID)) return;
+    const resultAlreadyDisplayed = controlCodePreparedCaptureDisplayedRequestID === requestID &&
+      !codeResultArea.hidden &&
+      !codeResultImage.hidden &&
+      Boolean(codeResultImage.currentSrc || codeResultImage.src);
     if (controlCodeResultCaptureRequestID !== requestID) {
       if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
       controlCodeResultCaptureRequestID = requestID;
-      codeResultImage.hidden = true;
-      codeResultImage.removeAttribute('src');
+      if (!resultAlreadyDisplayed) {
+        codeResultImage.hidden = true;
+        codeResultImage.removeAttribute('src');
+      }
     }
-    codeResultArea.dataset.status = 'waiting';
-    codeResultArea.style.background = '';
-    codeResultStatus.hidden = true;
-    codeResultStatus.textContent = '';
-    codeResultValue.hidden = true;
-    codeResultValue.textContent = '';
-    codeResultValue.style.display = '';
-    codeResultTimer.hidden = true;
-    codeResultTimer.textContent = '';
-    setControlCodeResultVisible(false);
+    if (resultAlreadyDisplayed) {
+      codeResultArea.dataset.status = 'succeeded';
+      codeResultArea.style.background = '#000';
+      codeResultStatus.hidden = true;
+      codeResultStatus.textContent = '';
+      codeResultValue.hidden = true;
+      codeResultValue.textContent = '';
+      codeResultValue.style.display = '';
+      codeResultTimer.hidden = true;
+    } else {
+      codeResultArea.dataset.status = 'waiting';
+      codeResultArea.style.background = '';
+      codeResultStatus.hidden = true;
+      codeResultStatus.textContent = '';
+      codeResultValue.hidden = true;
+      codeResultValue.textContent = '';
+      codeResultValue.style.display = '';
+      codeResultTimer.hidden = true;
+      codeResultTimer.textContent = '';
+      setControlCodeResultVisible(false);
+    }
     keepControlCodeVideoAlive('control_code_wait_reconnect');
+    requestKeyframeDebounced('control_code_result_wait_start', 0, true);
     if (maybeCaptureControlCodeResultImage()) return;
     const tick = () => {
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
@@ -2753,6 +3303,7 @@ import { html, reactive } from '@arrow-js/core';
     }
     codeRequest = request || codeRequest;
     const current = codeRequest;
+    const currentRequestID = String(current && current.requestId || '').trim();
     const busy = current && (current.status === 'queued' || current.status === 'running');
     codeRequestState.textContent = controlCodeStatusText(current && current.status, current && current.reason);
     codeRequestDetail.textContent = controlCodeDetailText(current);
@@ -2762,6 +3313,17 @@ import { html, reactive } from '@arrow-js/core';
     }
     if (busy) {
       keepControlCodeVideoAlive('control_code_request_active');
+      if (current.status === 'running') {
+        requestKeyframeDebounced('control_code_running', controlCodeCaptureKeyframeRetryMs);
+        maybePrepareControlCodeResultFrame();
+      }
+      if (controlCodeResultDisplayedForRequest(currentRequestID)) {
+        scheduleControlCodeTicker(current);
+        return;
+      }
+    }
+    if (current) {
+      noteControlCodeRequestMetric(current);
     }
     if (!current || current.status === 'closed' || current.status === 'expired') {
       setControlCodeResultVisible(false);
@@ -2784,6 +3346,9 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (current.status === 'failed') {
+      finishControlCodeMetric('request_failed', false, {
+        reason: String(current.reason || current.message || 'failed')
+      });
       setControlCodeResultVisible(true);
       clearControlCodeResultCapture();
       codeResultArea.dataset.status = 'failed';
@@ -2835,10 +3400,10 @@ import { html, reactive } from '@arrow-js/core';
   function openControlCodeDialog() {
     if (!streamReadyForControlCode()) {
       codeError.textContent = '';
-      setStatus('Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
-      connectDirectVideo();
-      requestServerRecoveryDebounced('control_code_wait_for_live_frame');
-      updateControlCodeSubmitAvailability();
+      setStatus(liveFrameReadyForControlCode()
+        ? 'Savienojas ar vadības kanālu pirms koda pieprasījuma.'
+        : 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      refreshControlCodeReadiness('control_code_wait_for_ready');
       return;
     }
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
@@ -2875,6 +3440,7 @@ import { html, reactive } from '@arrow-js/core';
     codeError.textContent = '';
     updateViewportVars();
     resizeCanvasBox();
+    updateControlCodeSubmitAvailability();
     settleCodeDialogScrollUnlock();
   }
 
@@ -2886,19 +3452,24 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (!streamReadyForControlCode()) {
-      codeError.textContent = 'Pagaidi, līdz tiešraides kadrs atkal ir svaigs.';
-      updateControlCodeSubmitAvailability();
-      connectDirectVideo();
-      requestServerRecoveryDebounced('control_code_submit_wait_for_live_frame');
+      codeError.textContent = liveFrameReadyForControlCode()
+        ? 'Pagaidi, līdz vadības savienojums ir gatavs.'
+        : 'Pagaidi, līdz tiešraides kadrs atkal ir svaigs.';
+      refreshControlCodeReadiness('control_code_submit_wait_for_ready');
       return;
     }
     codeError.textContent = '';
     codeSubmit.disabled = true;
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
+    beginControlCodeMetric(digits.length);
     const submittedAt = performance.now();
     try {
       await runSpacetimeMutation((client) => client.requestControlCode(digits), 'control_code_request');
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
+      noteControlCodeMetricPhase('request_mutation_complete', null, true, {
+        mutationLatencyMs
+      });
+      requestKeyframeDebounced('control_code_request_submitted', 0, true);
       clientLog('control_code_submitted', JSON.stringify({
         digitCount: digits.length,
         mutationLatencyMs,
@@ -2916,6 +3487,9 @@ import { html, reactive } from '@arrow-js/core';
       setStatus('Pieprasījums nosūtīts.');
     } catch (error) {
       clientLog('control_code_request_failed', error && error.message || 'request failed');
+      finishControlCodeMetric('request_submit_failed', false, {
+        error: error && error.message || 'request failed'
+      });
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
       updateControlCodeSubmitAvailability();
@@ -2937,6 +3511,9 @@ import { html, reactive } from '@arrow-js/core';
       if (codeRequest && String(codeRequest.requestId || '').trim() === String(requestID)) {
         codeRequest = null;
       }
+      finishControlCodeMetric('closed_by_browser', false, {
+        requestKey: controlCodeMetricRequestKey(String(requestID))
+      });
       try {
         await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'), 'control_code_close');
       } catch (error) {
@@ -2960,10 +3537,11 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (!streamReadyForControlCode()) {
-      setStatus('Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
-      connectDirectVideo();
-      requestServerRecoveryDebounced('control_code_hotspot_wait_for_live_frame');
-      updateControlCodeSubmitAvailability();
+      setStatus(liveFrameReadyForControlCode()
+        ? 'Savienojas ar vadības kanālu pirms koda pieprasījuma.'
+        : 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      if (!liveFrameReadyForControlCode()) reconnectVideoForRecovery('control_code_hotspot_wait_for_live_frame');
+      refreshControlCodeReadiness('control_code_hotspot_wait_for_ready');
       return;
     }
     openControlCodeDialog();
@@ -3179,7 +3757,7 @@ import { html, reactive } from '@arrow-js/core';
   });
   startStreamButton.addEventListener('click', () => {
     if (idleDisconnected) {
-      location.reload();
+      resumeFromIdleDisconnect('manual_start');
       return;
     }
     restartStream('manual_start');
@@ -3375,15 +3953,57 @@ import { html, reactive } from '@arrow-js/core';
     return freshness;
   }
 
-  function streamReadyForControlCode() {
+  function liveFrameReadyForControlCode() {
     const freshness = currentRenderedFreshness(performance.now());
     return Boolean(hasRenderedFrame && freshness.liveLabeled);
   }
 
+  function spacetimeReadyForControlCode() {
+    return Boolean(spacetimeClient && spacetimeClientStatus === 'live');
+  }
+
+  function streamReadyForControlCode() {
+    return liveFrameReadyForControlCode() && spacetimeReadyForControlCode();
+  }
+
+  function refreshControlCodeReadiness(reason) {
+    if (!liveFrameReadyForControlCode()) {
+      connectDirectVideo();
+      requestServerRecoveryDebounced(reason || 'control_code_wait_for_live_frame');
+    }
+    if (!spacetimeReadyForControlCode()) {
+      connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
+    }
+    updateControlCodeSubmitAvailability();
+  }
+
+  function maybeAutoPrepareControlCode(reason) {
+    if (document.visibilityState === 'hidden') return;
+    if (codeDialogOpen || !codeResultArea.hidden) return;
+    if (controlCodeAutoPrepareInFlight || !streamReadyForControlCode()) return;
+    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
+    if (busy) return;
+    const now = performance.now();
+    if (lastControlCodeAutoPrepareAt && now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs) return;
+    lastControlCodeAutoPrepareAt = now;
+    controlCodeAutoPrepareInFlight = true;
+    runSpacetimeMutation((client) => client.prepareControlCode(reason || 'page_ready_control_code'), 'control_code_auto_prepare')
+      .then(() => clientLog('control_code_auto_prepare_complete', reason || 'page_ready_control_code'))
+      .catch((error) => clientLog('control_code_auto_prepare_failed', error && error.message || 'prepare failed'))
+      .finally(() => {
+        controlCodeAutoPrepareInFlight = false;
+      });
+  }
+
   function updateControlCodeSubmitAvailability() {
     const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
-    codeSubmit.disabled = Boolean(busy) || !streamReadyForControlCode();
-    requestCodeButton.disabled = Boolean(busy) || !streamReadyForControlCode();
+    const unavailable = Boolean(busy) || !streamReadyForControlCode();
+    codeSubmit.disabled = unavailable || !codeDialogOpen;
+    requestCodeButton.disabled = unavailable;
+    const hotspotUnavailable = unavailable && codeResultArea.hidden;
+    controlCodeHotspot.disabled = hotspotUnavailable;
+    controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
+    if (!unavailable) maybeAutoPrepareControlCode('page_ready_control_code');
   }
 
   function reconnectVideoForRecovery(reason) {
@@ -3524,17 +4144,31 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function recoverAfterVisibilityResume(reason) {
-    if (idleDisconnected) return;
+    if (idleDisconnected) {
+      resumeFromIdleDisconnect(reason || 'visibility_resume');
+      return;
+    }
     const now = performance.now();
-    const hiddenMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
+    const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
+    const hiddenWallMs = lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0;
+    const hiddenMs = Math.max(hiddenPerfMs, hiddenWallMs);
     const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : null;
     const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;
+    const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;
     const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));
+    const cacheRestored = reason === 'pageshow_persisted' || (typeof document !== 'undefined' && document.wasDiscarded === true);
+    const connectingTooLong = videoWs && videoWs.readyState === WebSocket.CONNECTING && videoSocketCreatedAt > 0 && now - videoSocketCreatedAt > resumeSoftReconnectMs;
     lastHiddenAt = 0;
-    if (longHidden || videoStale) {
+    lastHiddenWallAt = 0;
+    if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {
       clientLog('visibility_resume_recovery', JSON.stringify({
         reason,
         hiddenMs: Math.round(hiddenMs),
+        hiddenPerfMs: Math.round(hiddenPerfMs),
+        hiddenWallMs: Math.round(hiddenWallMs),
+        oldHiddenTab,
+        cacheRestored,
+        connectingTooLong,
         configured,
         frameAgeMs: frameAgeMs === null ? null : Math.round(frameAgeMs),
         videoState: videoWs ? videoWs.readyState : -1
@@ -3554,8 +4188,14 @@ import { html, reactive } from '@arrow-js/core';
     scheduleFirstScreenPin(false);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     publishStreamFocus(true, reason || 'visibility_visible');
+    if (longHidden || oldHiddenTab || cacheRestored || connectingTooLong) {
+      restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');
+      return;
+    }
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
+      beginStreamOpenMetric('old_tab_resume', reason || 'visibility_visible', true);
       connectDirectVideo();
+      scheduleResumeWatchdogs(reason || 'visibility_visible');
     } else if (videoWs.readyState === WebSocket.OPEN && (longHidden || videoStale)) {
       requestKeyframe('visibility_resume');
     }
@@ -3586,6 +4226,8 @@ import { html, reactive } from '@arrow-js/core';
       recoverAfterVisibilityResume('visibility_resume');
     } else if (document.visibilityState === 'hidden') {
       lastHiddenAt = performance.now();
+      lastHiddenWallAt = Date.now();
+      clearResumeWatchdogs();
       releaseScreenWakeLock('visibility_hidden');
       releaseStreamFocusAfterHiddenGrace('visibility_hidden');
       pauseVideoWhileHidden('visibility_hidden');
@@ -3597,20 +4239,31 @@ import { html, reactive } from '@arrow-js/core';
       requestScreenWakeLock('pageshow');
     }
     scheduleFirstScreenPin(true);
-    if (event.persisted || lastHiddenAt > 0) recoverAfterVisibilityResume('pageshow');
+    if (event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true)) recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');
     chaseLiveStream();
   });
   window.addEventListener('focus', () => {
     noteViewerActivity(null, 'focus');
-    if (idleDisconnected) return;
+    if (idleDisconnected) {
+      resumeFromIdleDisconnect('focus');
+      return;
+    }
     publishStreamFocus(true, 'focus');
     chaseLiveStream();
   });
-  window.addEventListener('pagehide', () => {
+  window.addEventListener('pagehide', (event) => {
     closeEarlyVideo('pagehide');
+    clearResumeWatchdogs();
     if (hiddenStreamFocusTimer) {
       clearTimeout(hiddenStreamFocusTimer);
       hiddenStreamFocusTimer = null;
+    }
+    lastHiddenAt = performance.now();
+    lastHiddenWallAt = Date.now();
+    if (event && event.persisted) {
+      preserveCurrentFrame('pagehide_cached');
+      publishStreamFocus(false, 'pagehide_cached');
+      return;
     }
     publishStreamFocus(false, 'pagehide');
     closeDirectVideo();

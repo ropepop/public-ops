@@ -24,6 +24,7 @@ const CONTROL_CODE_PHONE_TTL_MS: i64 = 105_000;
 const SAFE_JSON_MAX_BYTES: usize = 4096;
 const SAFE_LOG_DETAIL_MAX_BYTES: usize = 2048;
 const SAFE_LOG_SAMPLE_INTERVAL_MS: i64 = 60_000;
+const DEV_PERF_DETAIL_MAX_BYTES: usize = 2048;
 
 #[spacetimedb::table(accessor = ticketremote_ticket)]
 #[derive(Clone)]
@@ -362,6 +363,47 @@ pub struct TicketremoteSafeOperationalLog {
     pub event: String,
     #[index(btree)]
     pub correlationId: String,
+    pub detailJson: String,
+    #[index(btree)]
+    pub createdAt: String,
+    #[index(btree)]
+    pub expiresAt: String,
+}
+
+#[spacetimedb::table(accessor = ticketremote_dev_perf_metrics_config)]
+#[derive(Clone)]
+pub struct TicketremoteDevPerfMetricsConfig {
+    #[primary_key]
+    pub ticketId: String,
+    pub enabled: bool,
+    pub reason: String,
+    #[index(btree)]
+    pub expiresAt: String,
+    #[index(btree)]
+    pub updatedAt: String,
+}
+
+#[spacetimedb::table(accessor = ticketremote_dev_perf_metric,
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt])),
+    index(accessor = ticketMetricCreatedAt, btree(columns = [ticketId, metricName, createdAt])),
+    index(accessor = flowCreatedAt, btree(columns = [flowId, createdAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteDevPerfMetric {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub source: String,
+    #[index(btree)]
+    pub metricName: String,
+    #[index(btree)]
+    pub phase: String,
+    #[index(btree)]
+    pub flowId: String,
+    pub valueMillis: u32,
+    pub ok: bool,
     pub detailJson: String,
     #[index(btree)]
     pub createdAt: String,
@@ -749,6 +791,16 @@ pub fn ticketremote_member_prepare_control_code(
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
+    let owner_public_id = account_public_id(&email);
+    let payload = serde_json::json!({
+        "type": "prepare_control_code",
+        "owner": "ticket",
+        "app": "vivi",
+        "flow": "control_code",
+        "source": "browser_spacetime",
+        "requester": owner_public_id
+    })
+    .to_string();
     insert_stream_command(
         ctx,
         &ticket.id,
@@ -761,7 +813,7 @@ pub fn ticketremote_member_prepare_control_code(
         "prepare_control_code",
         &now,
         &bounded_text(&non_empty(&reason, "dialog_open"), 120),
-        &json_object(&[("source", "browser"), ("actor", &account_public_id(&email))]),
+        &payload,
         CONTROL_CODE_COMMAND_TTL_MS,
         &now,
     );
@@ -1041,6 +1093,35 @@ pub fn ticketremote_member_append_safe_operational_log(
         &level,
         &event,
         &correlationId,
+        &detailJson,
+        &now,
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_append_dev_perf_metric(
+    ctx: &ReducerContext,
+    ticketId: String,
+    metricName: String,
+    phase: String,
+    flowId: String,
+    valueMillis: u32,
+    ok: bool,
+    detailJson: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    client_email_from_auth(ctx, &ticket.id)?;
+    insert_dev_perf_metric(
+        ctx,
+        &ticket.id,
+        "browser",
+        &metricName,
+        &phase,
+        &flowId,
+        valueMillis,
+        ok,
         &detailJson,
         &now,
     );
@@ -1865,6 +1946,76 @@ pub fn ticketremote_append_safe_operational_log(
         &level,
         &event,
         &correlationId,
+        &detailJson,
+        &now,
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_set_dev_perf_metrics(
+    ctx: &ReducerContext,
+    ticketId: String,
+    enabled: bool,
+    reason: String,
+    expiresAt: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let clean_expires_at = non_empty(&expiresAt, &history_expires_at(&now));
+    if ctx
+        .db
+        .ticketremote_dev_perf_metrics_config()
+        .ticketId()
+        .find(&ticket.id)
+        .is_some()
+    {
+        ctx.db
+            .ticketremote_dev_perf_metrics_config()
+            .ticketId()
+            .delete(&ticket.id);
+    }
+    if enabled && parse_time_ms(&clean_expires_at) > parse_time_ms(&now) {
+        ctx.db
+            .ticketremote_dev_perf_metrics_config()
+            .insert(TicketremoteDevPerfMetricsConfig {
+                ticketId: ticket.id,
+                enabled,
+                reason: bounded_text(&reason, 160),
+                expiresAt: clean_expires_at,
+                updatedAt: now,
+            });
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_append_dev_perf_metric(
+    ctx: &ReducerContext,
+    ticketId: String,
+    source: String,
+    metricName: String,
+    phase: String,
+    flowId: String,
+    valueMillis: u32,
+    ok: bool,
+    detailJson: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    insert_dev_perf_metric(
+        ctx,
+        &ticket.id,
+        &source,
+        &metricName,
+        &phase,
+        &flowId,
+        valueMillis,
+        ok,
         &detailJson,
         &now,
     );
@@ -3270,6 +3421,69 @@ fn insert_safe_operational_log(
         });
 }
 
+fn dev_perf_metrics_enabled(ctx: &ReducerContext, ticket_id: &str, now: &str) -> bool {
+    ctx.db
+        .ticketremote_dev_perf_metrics_config()
+        .ticketId()
+        .find(&clean_ticket_id(ticket_id))
+        .map(|row| row.enabled && parse_time_ms(&row.expiresAt) > parse_time_ms(now))
+        .unwrap_or(false)
+}
+
+fn insert_dev_perf_metric(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    source: &str,
+    metric_name: &str,
+    phase: &str,
+    flow_id: &str,
+    value_millis: u32,
+    ok: bool,
+    detail_json: &str,
+    now: &str,
+) {
+    let ticket = ensure_ticket(ctx, ticket_id, "", now);
+    if !dev_perf_metrics_enabled(ctx, &ticket.id, now) {
+        return;
+    }
+    let source = clean_token(source, "unknown").replace(
+        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+        "_",
+    );
+    let metric_name = clean_token(metric_name, "metric").replace(
+        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+        "_",
+    );
+    let phase = clean_token(phase, "event").replace(
+        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+        "_",
+    );
+    let flow_id = bounded_text(flow_id, 120);
+    let ordinal = next_audit_ordinal(ctx, &format!("{}:metric", ticket.id), now);
+    ctx.db
+        .ticketremote_dev_perf_metric()
+        .insert(TicketremoteDevPerfMetric {
+            id: format!(
+                "{}:{}:{}:{}:{}",
+                ticket.id,
+                stable_stamp(now),
+                ordinal,
+                source,
+                metric_name
+            ),
+            ticketId: ticket.id,
+            source,
+            metricName: metric_name,
+            phase,
+            flowId: flow_id,
+            valueMillis: value_millis,
+            ok,
+            detailJson: safe_json_string(detail_json, DEV_PERF_DETAIL_MAX_BYTES),
+            createdAt: now.into(),
+            expiresAt: history_expires_at(now),
+        });
+}
+
 fn active_public_viewer_rows(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -3621,6 +3835,37 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
                 .id()
                 .delete(&row.id);
             deleted += 1;
+        }
+    }
+    let metric_rows: Vec<_> = ctx
+        .db
+        .ticketremote_dev_perf_metric()
+        .ticketId()
+        .filter(&ticket.id)
+        .collect();
+    for row in metric_rows {
+        if deleted >= limit {
+            break;
+        }
+        if parse_time_ms(&row.expiresAt) <= now_ms {
+            ctx.db.ticketremote_dev_perf_metric().id().delete(&row.id);
+            deleted += 1;
+        }
+    }
+    if deleted < limit {
+        if let Some(config) = ctx
+            .db
+            .ticketremote_dev_perf_metrics_config()
+            .ticketId()
+            .find(&ticket.id)
+        {
+            if parse_time_ms(&config.expiresAt) <= now_ms {
+                ctx.db
+                    .ticketremote_dev_perf_metrics_config()
+                    .ticketId()
+                    .delete(&ticket.id);
+                deleted += 1;
+            }
         }
     }
     if deleted > 0 {

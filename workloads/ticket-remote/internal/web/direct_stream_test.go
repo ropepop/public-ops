@@ -366,6 +366,29 @@ func TestDirectStreamRefreshesPhoneClockCalibrationFromAcceptedFrames(t *testing
 	}
 }
 
+func TestDirectStreamRecalibratesFromTimestampedFrameAfterGap(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.addVideoClient()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	hub.mu.Lock()
+	hub.lastPhoneClockCalibrationAt = time.Now().Add(-(phoneClockCalibrationMaxAge + time.Second))
+	hub.lastFrameAt = time.Time{}
+	hub.lastFrameVisualAgeKnown = false
+	hub.mu.Unlock()
+
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 16500)) {
+		t.Fatal("timestamped frame after a quiet gap should refresh phone clock calibration")
+	}
+
+	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+	if snapshot["droppedUncalibratedFrames"] != uint64(0) || snapshot["framesForwarded"] != uint64(1) {
+		t.Fatalf("gap recovery frame should be accepted: %#v", snapshot)
+	}
+	if snapshot["phoneClockCalibrated"] != true || snapshot["streamVerdict"] != "live" {
+		t.Fatalf("gap recovery frame should restore live calibrated status: %#v", snapshot)
+	}
+}
+
 func TestDirectStreamAdjustsBoundedFutureClockSkewInsteadOfDroppingFreshFrames(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()

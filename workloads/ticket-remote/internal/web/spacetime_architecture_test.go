@@ -32,6 +32,8 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		"ticketremote_stream_command",
 		"ticketremote_phone_current_report",
 		"ticketremote_safe_operational_log",
+		"ticketremote_dev_perf_metrics_config",
+		"ticketremote_dev_perf_metric",
 		"ticketremote_cleanup_schedule",
 		"pub expiresAt: String",
 		"ticketBackendExpiresAt",
@@ -55,12 +57,15 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		"pub fn ticketremote_ack_stream_command(",
 		"pub fn ticketremote_update_phone_current_report(",
 		"pub fn ticketremote_append_safe_operational_log(",
+		"pub fn ticketremote_set_dev_perf_metrics(",
+		"pub fn ticketremote_member_append_dev_perf_metric(",
 		"pub fn ticketremote_purge_expired_stream_commands(",
 		"#[spacetimedb::view(accessor = ticketremote_service_stream_command, public, primary_key = id)]",
 		"service_ticket_id_for_viewer(",
 		"status == \"acknowledged\" || status == \"dispatched\"",
 		"ticketremote_stream_command()\n            .status()\n            .filter(status)",
 		"coalesced_safe_log_detail(",
+		"dev_perf_metrics_enabled(",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("SpacetimeDB module is missing clean-sheet architecture marker %q", required)
@@ -134,6 +139,9 @@ func TestSpacetimePendingCommandLookupUsesPendingIndex(t *testing.T) {
 
 func TestSpacetimeControlCodeBrowserCaptureCommandMatchesPixelEnvelope(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	prepareBody := sourceBetween(t, source,
+		"pub fn ticketremote_member_prepare_control_code(",
+		"pub fn ticketremote_member_request_control_code(")
 	confirmBody := sourceBetween(t, source,
 		"pub fn ticketremote_member_confirm_control_code_browser_capture(",
 		"pub fn ticketremote_member_close_control_code(")
@@ -141,6 +149,17 @@ func TestSpacetimeControlCodeBrowserCaptureCommandMatchesPixelEnvelope(t *testin
 		"pub fn ticketremote_member_close_control_code(",
 		"pub fn ticketremote_member_append_safe_operational_log(")
 
+	for _, required := range []string{
+		`"type": "prepare_control_code"`,
+		`"owner": "ticket"`,
+		`"app": "vivi"`,
+		`"flow": "control_code"`,
+		`"source": "browser_spacetime"`,
+	} {
+		if !strings.Contains(prepareBody, required) {
+			t.Fatalf("prepare command must match Pixel envelope, missing %q in %s", required, prepareBody)
+		}
+	}
 	for _, required := range []string{
 		`"owner": "ticket"`,
 		`"app": "vivi"`,
@@ -245,6 +264,7 @@ func TestSpacetimeCurrentStateAndHistoryRetentionBoundaries(t *testing.T) {
 	expiringTables := []string{
 		"#[spacetimedb::table(accessor = ticketremote_stream_command,",
 		"#[spacetimedb::table(accessor = ticketremote_safe_operational_log,",
+		"#[spacetimedb::table(accessor = ticketremote_dev_perf_metric,",
 		"#[spacetimedb::table(accessor = ticketremote_phone_status_history,",
 		"#[spacetimedb::table(accessor = ticketremote_audit_event,",
 	}
@@ -295,6 +315,8 @@ func TestSpacetimeBrowserClientSubscribesToTicketScopedFocusedTables(t *testing.
 		"SELECT * FROM ticketremote_phone_status WHERE ticketId =",
 		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 		"AND ownerPublicId =",
+		"appendDevMetric(",
+		"memberAppendDevPerfMetric",
 		"publishFocusedState(",
 	} {
 		if !strings.Contains(source, required) {
@@ -305,6 +327,8 @@ func TestSpacetimeBrowserClientSubscribesToTicketScopedFocusedTables(t *testing.
 		"ticketremoteLiveState",
 		"ticketremote_live_state",
 		"ticketremote_service_",
+		"SELECT * FROM ticketremote_dev_perf_metric",
+		"SELECT * FROM ticketremote_safe_operational_log",
 		"stateJson",
 		"asRowState(",
 	} {

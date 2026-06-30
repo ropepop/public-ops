@@ -35,6 +35,7 @@ import {
 
 // Import all reducer arg schemas
 import TicketremoteAckStreamCommandReducer from "./ticketremote_ack_stream_command_reducer";
+import TicketremoteAppendDevPerfMetricReducer from "./ticketremote_append_dev_perf_metric_reducer";
 import TicketremoteAppendSafeOperationalLogReducer from "./ticketremote_append_safe_operational_log_reducer";
 import TicketremoteAppendStreamCommandReducer from "./ticketremote_append_stream_command_reducer";
 import TicketremoteAuditReducer from "./ticketremote_audit_reducer";
@@ -43,6 +44,7 @@ import TicketremoteCleanupExpiredReducer from "./ticketremote_cleanup_expired_re
 import TicketremoteDisconnectPresenceReducer from "./ticketremote_disconnect_presence_reducer";
 import TicketremoteExtendControlReducer from "./ticketremote_extend_control_reducer";
 import TicketremoteHeartbeatPresenceReducer from "./ticketremote_heartbeat_presence_reducer";
+import TicketremoteMemberAppendDevPerfMetricReducer from "./ticketremote_member_append_dev_perf_metric_reducer";
 import TicketremoteMemberAppendSafeOperationalLogReducer from "./ticketremote_member_append_safe_operational_log_reducer";
 import TicketremoteMemberClaimControlReducer from "./ticketremote_member_claim_control_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
@@ -63,6 +65,7 @@ import TicketremoteReleaseControlReducer from "./ticketremote_release_control_re
 import TicketremoteRemoveMemberReducer from "./ticketremote_remove_member_reducer";
 import TicketremoteRevokeControlReducer from "./ticketremote_revoke_control_reducer";
 import TicketremoteServiceBootstrapReducer from "./ticketremote_service_bootstrap_reducer";
+import TicketremoteSetDevPerfMetricsReducer from "./ticketremote_set_dev_perf_metrics_reducer";
 import TicketremoteSetStreamDesiredStateReducer from "./ticketremote_set_stream_desired_state_reducer";
 import TicketremoteUpdateControlCodeRequestReducer from "./ticketremote_update_control_code_request_reducer";
 import TicketremoteUpdatePhoneReducer from "./ticketremote_update_phone_reducer";
@@ -348,6 +351,7 @@ const tablesSchema = __schema({
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("ticketremote_ack_stream_command", TicketremoteAckStreamCommandReducer),
+  __reducerSchema("ticketremote_append_dev_perf_metric", TicketremoteAppendDevPerfMetricReducer),
   __reducerSchema("ticketremote_append_safe_operational_log", TicketremoteAppendSafeOperationalLogReducer),
   __reducerSchema("ticketremote_append_stream_command", TicketremoteAppendStreamCommandReducer),
   __reducerSchema("ticketremote_audit", TicketremoteAuditReducer),
@@ -356,6 +360,7 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_disconnect_presence", TicketremoteDisconnectPresenceReducer),
   __reducerSchema("ticketremote_extend_control", TicketremoteExtendControlReducer),
   __reducerSchema("ticketremote_heartbeat_presence", TicketremoteHeartbeatPresenceReducer),
+  __reducerSchema("ticketremote_member_append_dev_perf_metric", TicketremoteMemberAppendDevPerfMetricReducer),
   __reducerSchema("ticketremote_member_append_safe_operational_log", TicketremoteMemberAppendSafeOperationalLogReducer),
   __reducerSchema("ticketremote_member_claim_control", TicketremoteMemberClaimControlReducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
@@ -376,6 +381,7 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_remove_member", TicketremoteRemoveMemberReducer),
   __reducerSchema("ticketremote_revoke_control", TicketremoteRevokeControlReducer),
   __reducerSchema("ticketremote_service_bootstrap", TicketremoteServiceBootstrapReducer),
+  __reducerSchema("ticketremote_set_dev_perf_metrics", TicketremoteSetDevPerfMetricsReducer),
   __reducerSchema("ticketremote_set_stream_desired_state", TicketremoteSetStreamDesiredStateReducer),
   __reducerSchema("ticketremote_update_control_code_request", TicketremoteUpdateControlCodeRequestReducer),
   __reducerSchema("ticketremote_update_phone", TicketremoteUpdatePhoneReducer),

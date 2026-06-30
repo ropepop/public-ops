@@ -420,10 +420,10 @@ func (h *directStreamHub) estimateFrameCaptureWallLocked(meta tsf2Metadata, now 
 	if h.lastPhoneUptimeMillis <= 0 || h.lastPhoneClockBridgeAt.IsZero() {
 		return time.Time{}, -1, "uncalibrated", false
 	}
-	if !h.phoneClockCalibratedLocked(now) && !h.recentAcceptedFrameLocked(now) {
-		return time.Time{}, -1, "uncalibrated", false
-	}
 	framePhoneUptimeMicros := int64(meta.timestamp)
+	if !h.phoneClockCalibratedLocked(now) && !h.recentAcceptedFrameLocked(now) {
+		h.recordPhoneClockLocked(framePhoneUptimeMicros/1000, now)
+	}
 	calibratedPhoneUptimeMicros := h.lastPhoneUptimeMillis * 1000
 	deltaMicros := framePhoneUptimeMicros - calibratedPhoneUptimeMicros
 	captureWall := h.lastPhoneClockBridgeAt.Add(time.Duration(deltaMicros) * time.Microsecond)

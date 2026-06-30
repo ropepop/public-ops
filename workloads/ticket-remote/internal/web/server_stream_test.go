@@ -929,7 +929,7 @@ func TestSpacetimePresenceFallbackWritesForExistingServerSession(t *testing.T) {
 		},
 		State: state.StoreConfig{
 			Backend:           "spacetime",
-			SpacetimeDatabase: "ticket-remote-prod-v2",
+			SpacetimeDatabase: "ticket-remote-prod-v3",
 		},
 		Phone: config.PhoneConfig{
 			BackendID:  "pixel",

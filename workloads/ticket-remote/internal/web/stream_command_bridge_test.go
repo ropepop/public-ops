@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,11 +200,103 @@ func TestStreamCommandBridgeBacksOffWhenIdle(t *testing.T) {
 	if got := server.nextStreamCommandBridgePollDelay(false, nil); got != streamCommandBridgeIdlePollInterval {
 		t.Fatalf("idle bridge poll delay = %v, want %v", got, streamCommandBridgeIdlePollInterval)
 	}
+	if streamCommandBridgeIdlePollInterval > time.Second {
+		t.Fatalf("idle command signal poll delay must stay <=1s so cold stream opens are not timer-bound")
+	}
 	if got := server.nextStreamCommandBridgePollDelay(true, nil); got != streamCommandBridgeFastPollInterval {
 		t.Fatalf("command bridge poll delay = %v, want %v", got, streamCommandBridgeFastPollInterval)
 	}
+	if streamCommandBridgeFastPollInterval > 100*time.Millisecond || streamCommandBridgeActivePollInterval > 100*time.Millisecond {
+		t.Fatalf("active command bridge poll delay must stay <=100ms for sub-5s control-code dispatch")
+	}
 	if got := server.nextStreamCommandBridgePollDelay(false, map[string]streamCommandBridgeAttempt{"cmd": {failures: 1}}); got != streamCommandBridgeFastPollInterval {
 		t.Fatalf("retry bridge poll delay = %v, want %v", got, streamCommandBridgeFastPollInterval)
+	}
+}
+
+func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T) {
+	messages := make(chan map[string]any, 4)
+	var stopRequests atomic.Int32
+	var startRequests atomic.Int32
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/stop":
+			stopRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session/start":
+			startRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone command websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			_, body, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode phone command: %v", err)
+				return
+			}
+			messages <- payload
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := &bridgeCommandStore{Store: state.NewMemoryStore()}
+	store.commands = []state.StreamCommand{{
+		ID:          "cmd-recover-1",
+		TicketID:    "vivi-default",
+		BackendID:   "pixel",
+		CommandType: "recover_stream",
+		Status:      "pending",
+		Revision:    "rev-1",
+		Reason:      "browser_stale_stream",
+		PayloadJSON: `{"reason":"browser_stale_stream"}`,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ExpiresAt:   time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}}
+	relay := phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "spacetime",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		State: configStateForBridgeTest(),
+		Phone: config.PhoneConfig{
+			BackendID:     "pixel",
+			AttachName:    "Pixel",
+			BaseURL:       phoneServer.URL,
+			BrokerBaseURL: phoneServer.URL,
+			Backends:      []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	payload := waitForBridgePhonePayload(t, messages)
+	if payload["type"] != "recover_stream" || payload["commandId"] != "cmd-recover-1" {
+		t.Fatalf("phone payload = %#v", payload)
+	}
+	waitForBridgeAck(t, store, "cmd-recover-1")
+	if got := stopRequests.Load(); got != 1 {
+		t.Fatalf("recover_stream stop requests = %d, want 1", got)
+	}
+	if got := startRequests.Load(); got != 1 {
+		t.Fatalf("recover_stream start requests = %d, want 1", got)
 	}
 }
 
@@ -310,10 +403,15 @@ func TestStreamCommandBridgeKeepsControlCodePayloadOutOfLogs(t *testing.T) {
 	if payload["digits"] != "12345" {
 		t.Fatalf("phone payload did not carry digits to Pixel: %#v", payload)
 	}
-	waitForBridgeAck(t, store, "request-1:generate_control_code")
+	time.Sleep(100 * time.Millisecond)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	for _, ack := range store.acks {
+		if ack.CommandID == "request-1:generate_control_code" && ack.Status == "acknowledged" {
+			t.Fatalf("bridge acknowledged generate_control_code before a phone result: %#v", ack)
+		}
+	}
 	for _, entry := range store.logs {
 		if strings.Contains(entry.DetailJSON, "12345") || strings.Contains(entry.DetailJSON, "digits") {
 			t.Fatalf("bridge log leaked control-code payload: %#v", entry)
@@ -429,6 +527,266 @@ func TestStreamCommandBridgeReadsControlCodeFrameReadyIntoSpacetime(t *testing.T
 	}
 }
 
+func TestStreamCommandBridgeKeepsResultSocketUntilRawTicketCleanup(t *testing.T) {
+	messages := make(chan map[string]any, 4)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone command websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			_, body, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode phone command: %v", err)
+				return
+			}
+			messages <- payload
+			requestID := strings.TrimSpace(stringFromAny(payload["requestId"]))
+			generated := map[string]any{
+				"type":             "ticket_state_event",
+				"eventSeq":         float64(1),
+				"ticketState":      "generated_result",
+				"reason":           "generated",
+				"requestId":        requestID,
+				"streamEpoch":      float64(88),
+				"frameSequence":    float64(300),
+				"minFrameSequence": float64(300),
+			}
+			raw, _ := json.Marshal(generated)
+			if err := conn.Write(r.Context(), websocket.MessageText, raw); err != nil {
+				t.Errorf("write generated ticket event: %v", err)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+			cleanup := map[string]any{
+				"type":             "ticket_state_event",
+				"eventSeq":         float64(2),
+				"ticketState":      "raw_ticket",
+				"reason":           "return_to_raw_complete",
+				"requestId":        requestID,
+				"streamEpoch":      float64(88),
+				"frameSequence":    float64(330),
+				"minFrameSequence": float64(330),
+			}
+			raw, _ = json.Marshal(cleanup)
+			if err := conn.Write(r.Context(), websocket.MessageText, raw); err != nil {
+				t.Errorf("write cleanup ticket event: %v", err)
+			}
+		case "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone video websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := &bridgeCommandStore{Store: state.NewMemoryStore()}
+	store.commands = []state.StreamCommand{{
+		ID:          "request-cleanup:generate_control_code",
+		TicketID:    "vivi-default",
+		BackendID:   "pixel",
+		CommandType: "generate_control_code",
+		Status:      "pending",
+		Revision:    "rev-1",
+		Reason:      "control_code_request",
+		PayloadJSON: `{"type":"generate_control_code","requestId":"request-cleanup","digits":"12345"}`,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ExpiresAt:   time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Millisecond,
+		ReconnectMaxDelay: time.Millisecond,
+	})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "spacetime",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		State: configStateForBridgeTest(),
+		Phone: config.PhoneConfig{
+			BackendID:     "pixel",
+			AttachName:    "Pixel",
+			BaseURL:       phoneServer.URL,
+			BrokerBaseURL: phoneServer.URL,
+			Backends:      []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	payload := waitForBridgePhonePayload(t, messages)
+	if payload["requestId"] != "request-cleanup" {
+		t.Fatalf("phone payload requestId = %#v", payload)
+	}
+	waitForBridgeAck(t, store, "request-cleanup:generate_control_code")
+	update := waitForBridgeControlCodeUpdate(t, store, "request-cleanup", controlCodeSucceeded)
+	if update.StreamEpoch != "88" || update.FrameSequence != "300" || update.MinFrameSequence != "300" || !update.CleanupPending {
+		t.Fatalf("unexpected succeeded update: %#v", update)
+	}
+	waitForBridgeStoredTicketState(t, store, "raw_ticket")
+}
+
+func TestStreamCommandBridgeReconcilesControlCodeResultFromPhoneHealth(t *testing.T) {
+	messages := make(chan map[string]any, 4)
+	var requestID atomic.Value
+	var healthReads atomic.Int64
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/health":
+			currentRequestID, _ := requestID.Load().(string)
+			w.Header().Set("Content-Type", "application/json")
+			if currentRequestID == "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+				return
+			}
+			ticketState := "generated_result"
+			reason := "generated"
+			eventSeq := float64(3)
+			frameSequence := float64(202)
+			minFrameSequence := float64(201)
+			if healthReads.Add(1) >= 2 {
+				ticketState = "raw_ticket"
+				reason = "return_to_raw_complete"
+				eventSeq = 4
+				frameSequence = 203
+				minFrameSequence = 203
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": true,
+				"controlCodeRequest": map[string]any{
+					"requestId":           currentRequestID,
+					"status":              "succeeded",
+					"reason":              "generated",
+					"totalDurationMillis": float64(1200),
+					"phases": map[string]any{
+						"result_marker_frame_ready": float64(1200),
+					},
+				},
+				"pixelTicketStateEvent": map[string]any{
+					"eventSeq":         eventSeq,
+					"ticketState":      ticketState,
+					"reason":           reason,
+					"requestId":        currentRequestID,
+					"streamEpoch":      float64(77),
+					"frameSequence":    frameSequence,
+					"minFrameSequence": minFrameSequence,
+				},
+			})
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone command websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			_, body, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode phone command: %v", err)
+				return
+			}
+			requestID.Store(strings.TrimSpace(stringFromAny(payload["requestId"])))
+			messages <- payload
+			<-r.Context().Done()
+		case "/api/v1/stream":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone video websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := &bridgeCommandStore{Store: state.NewMemoryStore()}
+	store.commands = []state.StreamCommand{{
+		ID:          "request-health:generate_control_code",
+		TicketID:    "vivi-default",
+		BackendID:   "pixel",
+		CommandType: "generate_control_code",
+		Status:      "pending",
+		Revision:    "rev-1",
+		Reason:      "control_code_request",
+		PayloadJSON: `{"type":"generate_control_code","requestId":"request-health","digits":"12345"}`,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ExpiresAt:   time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Millisecond,
+		ReconnectMaxDelay: time.Millisecond,
+	})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "spacetime",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		State: configStateForBridgeTest(),
+		Phone: config.PhoneConfig{
+			BackendID:     "pixel",
+			AttachName:    "Pixel",
+			BaseURL:       phoneServer.URL,
+			BrokerBaseURL: phoneServer.URL,
+			Backends:      []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	payload := waitForBridgePhonePayload(t, messages)
+	if payload["requestId"] != "request-health" {
+		t.Fatalf("phone payload requestId = %#v", payload)
+	}
+	waitForBridgeAck(t, store, "request-health:generate_control_code")
+	update := waitForBridgeControlCodeUpdate(t, store, "request-health", controlCodeSucceeded)
+	if update.StreamEpoch != "77" || update.FrameSequence != "202" || update.MinFrameSequence != "201" || !update.CleanupPending {
+		t.Fatalf("unexpected health-reconciled update: %#v", update)
+	}
+}
+
 func configStateForBridgeTest() state.StoreConfig {
 	return state.StoreConfig{
 		Backend:              "spacetime",
@@ -483,6 +841,25 @@ func waitForBridgePhoneReport(t *testing.T, store *bridgeCommandStore, commandID
 		select {
 		case <-deadline:
 			t.Fatalf("timed out waiting for bridge phone report %s", commandID)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func waitForBridgeStoredTicketState(t *testing.T, store state.Store, ticketState string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		snapshot, err := store.Snapshot(context.Background(), "vivi-default", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Phone != nil && strings.Contains(snapshot.Phone.HealthJSON, `"ticketState":"`+ticketState+`"`) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for stored ticket state %q: %#v", ticketState, snapshot.Phone)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}

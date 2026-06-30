@@ -502,6 +502,11 @@ func TestControlCodePrepareSendsPhonePrepareWithoutQueueingRequest(t *testing.T)
 	if !strings.Contains(phoneCommand, `"reason":"dialog_open"`) {
 		t.Fatalf("phone prepare command mismatch: %s", phoneCommand)
 	}
+	for _, required := range []string{`"owner":"ticket"`, `"app":"vivi"`, `"flow":"control_code"`} {
+		if !strings.Contains(phoneCommand, required) {
+			t.Fatalf("phone prepare command missing %s: %s", required, phoneCommand)
+		}
+	}
 
 	server.codeMu.Lock()
 	queued := len(server.codeQueue)

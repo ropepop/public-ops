@@ -20,7 +20,7 @@ DOCKER_GC_SCRIPT="${SCRIPT_DIR}/docker_gc.py"
 MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"
 DOCKER_GC_REMOTE_STATE_DIR="/etc/arbuzas/docker-gc"
 DOCKER_GC_REMOTE_STATE_FILE="${DOCKER_GC_REMOTE_STATE_DIR}/state.json"
-DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-168h}"
+DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-24h}"
 DOCKER_GC_RELEASE_KEEP_PER_FAMILY="${DOCKER_GC_RELEASE_KEEP_PER_FAMILY:-10}"
 ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS="${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS:-7}"
 ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE="${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE:-100M}"
@@ -323,7 +323,7 @@ remote_run_docker_gc() {
 
   if gc_script="$(resolve_local_docker_gc_script)"; then
     run_ssh "$(remote_target)" \
-      "python3 - --current-link '${REMOTE_CURRENT_LINK}' --releases-root '${REMOTE_RELEASES_ROOT}' --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' --build-cache-until '${DOCKER_GC_BUILD_CACHE_UNTIL}' --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'" \
+      "sudo -n python3 - --current-link '${REMOTE_CURRENT_LINK}' --releases-root '${REMOTE_RELEASES_ROOT}' --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' --build-cache-until '${DOCKER_GC_BUILD_CACHE_UNTIL}' --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'" \
       < "${gc_script}"
     return 0
   fi
@@ -334,7 +334,7 @@ remote_run_docker_gc() {
       echo 'missing Docker GC helper locally and on the current Arbuzas release bundle' >&2
       exit 1
     }
-    python3 \"\${gc_script}\" \
+    sudo -n python3 \"\${gc_script}\" \
       --current-link '${REMOTE_CURRENT_LINK}' \
       --releases-root '${REMOTE_RELEASES_ROOT}' \
       --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' \
@@ -1557,6 +1557,8 @@ copy_tree_into_release() {
       --exclude="${path}/data/public-bundles" \
       --exclude="${path}/data/schedules/*.json" \
       --exclude="${path}/spacetimedb/dist" \
+      --exclude="${path}/spacetimedb/target" \
+      --exclude="${path}/spacetime-sidecar/target" \
       --exclude="${path}/target" \
       --exclude="${path}/tmp" \
       --exclude="${path}/web-client/src/generated" \

@@ -383,7 +383,7 @@ func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
 		}
 	}
 	csp := rec.Header().Get("Content-Security-Policy")
-	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'unsafe-eval'", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self' https: wss:"} {
+	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'unsafe-eval'", "style-src 'self' 'nonce-", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self' https: wss:"} {
 		if !strings.Contains(csp, snippet) {
 			t.Fatalf("CSP missing %q: %s", snippet, csp)
 		}
@@ -653,10 +653,16 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function expireViewerIdle(reason)",
 		"closeEarlyVideo('idle_disconnect')",
 		"resetStreamState({preserveFrame:true})",
-		"showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pārlādē lapu, lai turpinātu.', true)",
+		"showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pieskaries Sākt, lai turpinātu.', true)",
 		"document.body.dataset.streamFreshness='IDLE_DISCONNECTED'",
 		"startStreamButton.addEventListener('click'",
-		"location.reload()",
+		"function resumeFromIdleDisconnect(reason)",
+		"resumeFromIdleDisconnect('manual_start')",
+		"normalizeAssetVersionURL()",
+		"function normalizeAssetVersionURL()",
+		"history.replaceState(history.state, document.title, next.toString())",
+		"serverAssetVersion && assetVersion",
+		"searchParams.set('v'",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer JS missing %q", snippet)
@@ -841,6 +847,18 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if !strings.Contains(indexHTML, `<script nonce="{{.Nonce}}" defer src="/static/app.js?v={{.AssetVersion}}"></script>`) {
 		t.Fatalf("ticket viewer must keep the app script versioned and cacheable")
 	}
+	for _, snippet := range []string{
+		`<style nonce="{{.Nonce}}">`,
+		`.control-code-hotspot`,
+		`opacity: 1;`,
+		`background: rgba(0, 0, 0, 0.001);`,
+		`color: transparent;`,
+		`font-size: 0;`,
+	} {
+		if !strings.Contains(indexHTML, snippet) {
+			t.Fatalf("ticket viewer HTML must keep hotspot hit testing alive, missing %q", snippet)
+		}
+	}
 	if !strings.Contains(serverGo, "assetVersionValue = serverVersion") {
 		t.Fatalf("ticket asset fallback version must follow the page version so public caches cannot keep an old app.js")
 	}
@@ -850,7 +868,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	for _, snippet := range []string{
 		"function usesDirectSpacetimeAuth()",
 		"function loadSpacetimeClientScript()",
-		"/static/spacetime-client.js?v=${assetVersion}",
+		"/static/spacetime-client.js?v=${",
 		"function connectSpacetimeState()",
 		"spacetimeToken()",
 	} {
@@ -1101,8 +1119,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"activeViewers(state&&state.viewers||[])",
 		"controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot)",
 		"controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot)",
+		"controlCodeHotspot.disabled=hotspotUnavailable",
+		"controlCodeHotspot.setAttribute('aria-disabled',hotspotUnavailable?'true':'false')",
 		"codeDialog.addEventListener('click'",
 		"event.key==='Escape'",
+		"requestKeyframeDebounced('control_code_request_submitted', 0, true)",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("control-code request flow missing %q", snippet)
@@ -1119,6 +1140,9 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	hotspotHandler := js[hotspotStart : hotspotStart+hotspotEnd]
 	if !strings.Contains(hotspotHandler, "closeCurrentControlCode(false)") {
 		t.Fatalf("top-left hotspot should close visible result without immediately opening a new request")
+	}
+	if !strings.Contains(hotspotHandler, "reconnectVideoForRecovery(\"control_code_hotspot_wait_for_live_frame\")") {
+		t.Fatalf("top-left hotspot should force local video recovery when the rendered frame is stale")
 	}
 	if strings.Contains(hotspotHandler, "closeCurrentControlCode(true)") {
 		t.Fatalf("top-left hotspot should not immediately reopen the request dialog after closing a visible result")
@@ -1329,8 +1353,9 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"ticketremote_ticket_summary",
 		"ticketremote_viewer_public",
 		"ticketremote_phone_status",
+		"onApplied(()=>{if(!applied){applied=true;this.attachStateListeners(connection);}this.publishFocusedState();this.heartbeat(true);})",
 	} {
-		if !strings.Contains(string(clientBody), snippet) {
+		if !staticContains(string(clientBody), snippet) {
 			t.Fatalf("ticket Spacetime browser bundle missing %q", snippet)
 		}
 	}
@@ -1519,7 +1544,7 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 		State: state.StoreConfig{
 			Backend:           "spacetime",
 			SpacetimeHost:     "https://maincloud.spacetimedb.com",
-			SpacetimeDatabase: "ticket-remote-prod-v2",
+			SpacetimeDatabase: "ticket-remote-prod-v3",
 		},
 		Phone: config.PhoneConfig{
 			BackendID:         "pixel",
@@ -1586,6 +1611,96 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	}
 	if len(indexRec.Result().Cookies()) == 0 {
 		t.Fatalf("authenticated index should establish a browser session cookie")
+	}
+}
+
+func TestNonExpiringServerSessionRefreshesAuthCookieOnCachedIndex(t *testing.T) {
+	store := state.NewMemoryStore()
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:        "vivi-default",
+		DisplayName:     "ViVi timed ticket",
+		AdminEmail:      "ticket@jolkins.id.lv",
+		PhoneBackendID:  "pixel",
+		PhoneBaseURL:    "http://pixel.test",
+		PhoneAttachName: "Pixel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     config.DurationNever,
+		Access: auth.AccessConfig{
+			Mode:              "spacetime",
+			OIDCIssuer:        "https://auth.spacetimedb.com/oidc",
+			OIDCClientID:      "client_test",
+			OIDCScope:         "openid profile email",
+			OIDCRedirect:      "http://ticket.test/auth/callback",
+			AuthCookieName:    "ticket_remote_auth",
+			SessionSigningKey: "test-signing-key",
+		},
+		Phone: config.PhoneConfig{
+			BackendID:         "pixel",
+			AttachName:        "Pixel",
+			BaseURL:           "http://pixel.test",
+			DefaultBackendID:  "pixel",
+			ActiveBackendFile: filepath.Join(t.TempDir(), "active-phone-backend.json"),
+		},
+	}, store, phone.NewRelay(phone.RelayConfig{
+		BackendID:  "pixel",
+		AttachName: "Pixel",
+		BaseURL:    "http://pixel.test",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, expiresAt, err := server.auth.IssueServerSession(auth.Identity{
+		Email:         "ticket@jolkins.id.lv",
+		Subject:       "user_123",
+		EmailVerified: true,
+	}, config.DurationNever, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expiresAt.IsZero() {
+		t.Fatalf("expiresAt = %s, want no expiry", expiresAt)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	first := httptest.NewRecorder()
+	server.ServeHTTP(first, req)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first index status = %d body = %s", first.Code, first.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	for _, cookie := range first.Result().Cookies() {
+		if cookie.Name == "ticket_remote_session" {
+			req.AddCookie(cookie)
+		}
+	}
+	second := httptest.NewRecorder()
+	server.ServeHTTP(second, req)
+	if second.Code != http.StatusOK {
+		t.Fatalf("cached index status = %d body = %s", second.Code, second.Body.String())
+	}
+	var refreshedAuth, refreshedSession bool
+	for _, cookie := range second.Result().Cookies() {
+		if cookie.Name == "ticket_remote_auth" && cookie.MaxAge == nonExpiringCookieMaxAge {
+			refreshedAuth = true
+		}
+		if cookie.Name == "ticket_remote_session" && cookie.MaxAge == nonExpiringCookieMaxAge {
+			refreshedSession = true
+		}
+	}
+	if !refreshedAuth {
+		t.Fatalf("cached index did not refresh non-expiring auth cookie: %#v", second.Result().Cookies())
+	}
+	if !refreshedSession {
+		t.Fatalf("cached index did not refresh non-expiring session cookie: %#v", second.Result().Cookies())
 	}
 }
 

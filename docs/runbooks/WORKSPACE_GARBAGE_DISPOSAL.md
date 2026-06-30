@@ -4,7 +4,7 @@
 
 - Generated output and Codex scratch are temporary local scratch.
 - Durable evidence belongs under `ops/evidence/`.
-- Reusable browser session bundles belong under `state/browser-use/`.
+- Reusable legacy browser session bundles belong under `state/browser-use/`.
 - Generated reports under `ops/reports/` are local report output unless promoted into a runbook or durable evidence bundle.
 - Release bundles must not include top-level workload runtime state, database, lock, or session-secret files.
 - Managed garbage roots are:
@@ -44,5 +44,5 @@ find . \
 
 - If a generated artifact needs to live beyond local troubleshooting, copy or promote it into `ops/evidence/`.
 - Do not keep durable files under `.codex-tmp/`; move anything worth keeping into a tracked location before cleanup runs.
-- Do not keep reusable Telegram or browser session bundles under `output/browser-use/`. Use `state/browser-use/` instead.
+- Do not keep reusable Telegram or legacy browser session bundles under `output/browser-use/`. Use `state/browser-use/` instead.
 - Archive ad hoc root `evidence/`, `security-audits/`, and `security-audit-evidence/` outside the repo before deleting them locally.
