@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "chatgpt.browser_control.integrity.v1",
+  "createdAt": "2026-06-30T17:52:53.247Z",
+  "target": {
+    "path": "reports/runs/2026-06-30T17-52-53-247Z-chatgpt-run-report.json",
+    "bytes": 1916,
+    "sha256": "f4c6fa582747bb6f7b10ea58b9e98dc8c2cefac5b3b9dc6e13d910f3117fe6ac"
+  },
+  "inputs": [],
+  "prompt": {
+    "normalized": true,
+    "bytes": 4653,
+    "sha256": "7755aec9dcc81178a62bf7f6d9c2c2703d9aa651182298d47ce8b2513cdb299f"
+  }
+}
