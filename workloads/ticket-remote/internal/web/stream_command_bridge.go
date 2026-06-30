@@ -204,9 +204,13 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 	requestID := streamCommandRequestID(payload)
 	switch commandType {
 	case "start":
+		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=start id=%s", command.ID))
 		s.relay.EnsureActive("spacetime_command_start")
 		startErr := s.postPhoneSessionCommand(ctx, "/api/v1/session/start")
 		sendErr := s.sendPhoneSessionCommand(ctx, payload)
+		if startErr == nil || sendErr == nil {
+			s.direct.recordStartupPhase("phone_start_dispatched", fmt.Sprintf("http_ok=%t socket_ok=%t", startErr == nil, sendErr == nil))
+		}
 		if startErr != nil && sendErr != nil {
 			return fmt.Errorf("start phone session: %w", startErr)
 		}
@@ -231,9 +235,11 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 		}
 		return s.sendPhoneSessionCommandAndReadControlCodeResult(ctx, command, payload, requestID)
 	case "keyframe":
+		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=keyframe id=%s", command.ID))
 		s.direct.recordKeyframeRequested()
 		return s.sendPhoneSessionCommand(ctx, payload)
 	case "recover_stream":
+		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=recover_stream id=%s", command.ID))
 		if err := s.restartPhoneSessionForRecovery(ctx); err != nil {
 			return err
 		}

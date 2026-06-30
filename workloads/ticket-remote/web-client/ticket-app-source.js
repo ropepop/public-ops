@@ -228,6 +228,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastAcceptedFrameSequence = 0;
   let lastAcceptedFrameTimestamp = 0;
   let firstFrameReceived = false;
+  let firstRenderedTraceSent = false;
   let hasRenderedFrame = false;
   let fallbackFrameCanvas = null;
   let fallbackFrameAvailable = false;
@@ -1276,6 +1277,7 @@ import { html, reactive } from '@arrow-js/core';
     lastPacketTimestamp = 0;
     lastAcceptedFrameSequence = 0;
     lastAcceptedFrameTimestamp = 0;
+    firstRenderedTraceSent = false;
     latestStreamStatus = null;
     lastStreamStatusAt = 0;
     decoderMode = 'annexb';
@@ -1506,6 +1508,17 @@ import { html, reactive } from '@arrow-js/core';
       safeDetail = String(detail || '');
     }
     clientLog(event, safeDetail);
+  }
+
+  function sendVideoSocketClientLog(event, detail) {
+    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return;
+    try {
+      videoWs.send(JSON.stringify({
+        type: 'client_log',
+        event: String(event || '').slice(0, 96),
+        detail: safeString(detail).slice(0, 500)
+      }));
+    } catch (_) {}
   }
 
   function requestKeyframe(reason, force) {
@@ -1841,7 +1854,7 @@ import { html, reactive } from '@arrow-js/core';
       lastRenderedFrameTimestamp = Number(frameMetadata.timestamp || 0);
       firstFrameReceived = true;
       hasRenderedFrame = true;
-      finishStreamOpenMetric('first_fresh_frame', true, {
+      const firstFrameDetail = {
         visualAgeMillis: Math.round(lastRenderedFrameVisualAgeMillis),
         frameEpoch: lastRenderedFrameEpoch,
         frameSequence: lastRenderedFrameSequence,
@@ -1851,7 +1864,12 @@ import { html, reactive } from '@arrow-js/core';
         decodeToRenderMillis: lastRenderedFrameQueuedAt > 0
           ? Math.round(Math.max(0, lastRenderedFrameRenderedAt - lastRenderedFrameQueuedAt))
           : -1
-      });
+      };
+      if (!firstRenderedTraceSent) {
+        firstRenderedTraceSent = true;
+        sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);
+      }
+      finishStreamOpenMetric('first_fresh_frame', true, firstFrameDetail);
       maybePrepareControlCodeResultFrame();
       maybeCaptureControlCodeResultImage();
       hideEmpty();

@@ -57,6 +57,8 @@ SERVICE_ORDER = [
     "subscription_tunnel",
     "ticket_phone_bridge",
     "phone_broker",
+    "chatgpt_broker",
+    "chatgpt_bot",
     "ticket_remote",
     "ticket_remote_tunnel",
 ]
@@ -376,7 +378,14 @@ with tempfile.TemporaryDirectory() as tmp:
         os.chmod(dest, stat.S_IMODE(member.mode))
 tar_path.unlink(missing_ok=True)
 '''
-        command = ssh_base_args(args) + ["python3 - " + shlex.quote(remote_tar)]
+        command = ssh_base_args(args) + [
+            "if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then "
+            "sudo -n python3 - "
+            + shlex.quote(remote_tar)
+            + "; else python3 - "
+            + shlex.quote(remote_tar)
+            + "; fi"
+        ]
         subprocess.run(command, input=remote_script, text=True, check=True)
 
 
@@ -436,8 +445,12 @@ def affected_services_for_path(rel: str) -> set[str]:
         add_service(services, "subscription_bot")
     elif rel == "etc/arbuzas/env/ticket-remote.env":
         add_service(services, "ticket_remote")
+    elif rel == "etc/arbuzas/env/chatgpt-broker.env":
+        add_service(services, "chatgpt_broker")
+        add_service(services, "chatgpt_bot")
     elif rel.startswith("etc/arbuzas/secrets/ticket-remote/"):
         add_service(services, "ticket_remote")
+        add_service(services, "chatgpt_broker")
     elif rel.startswith("etc/arbuzas/secrets/android-adb/"):
         add_service(services, "ticket_phone_bridge")
     elif rel.startswith("etc/arbuzas/secrets/"):

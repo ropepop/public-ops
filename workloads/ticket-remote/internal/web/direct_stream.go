@@ -114,6 +114,7 @@ type directStreamHub struct {
 	lastWarmKeyFrameSentAt  time.Time
 	lastWarmStartMissAt     time.Time
 	lastKeyframeRequestedAt time.Time
+	startupTrace            streamStartupTrace
 }
 
 type tsf2Metadata struct {
@@ -585,6 +586,7 @@ func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[
 	status["browserMediaError"] = h.lastBrowserMediaError
 	status["lastBrowserEvent"] = h.lastBrowserEvent
 	status["recentBrowserEvents"] = append([]clientTelemetryEvent(nil), h.recentBrowserEvents...)
+	status["startupTrace"] = h.startupTraceSnapshot(now)
 	return status
 }
 

@@ -662,8 +662,11 @@ func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 }
 
 func TestStreamPrewarmHoldIsOnlyAStartupBridge(t *testing.T) {
-	if streamPrewarmHold > 5*time.Second {
-		t.Fatalf("stream prewarm hold = %s, want <= 5s", streamPrewarmHold)
+	if streamPrewarmHold < 30*time.Second {
+		t.Fatalf("stream prewarm hold = %s, want enough warm time for reloads and short reconnects", streamPrewarmHold)
+	}
+	if streamPrewarmHold >= streamDesiredIdleReleaseGrace {
+		t.Fatalf("stream prewarm hold = %s, want below idle release grace %s", streamPrewarmHold, streamDesiredIdleReleaseGrace)
 	}
 }
 
@@ -878,8 +881,9 @@ func TestVideoClientLogsAreHandledBeforePresenceHeartbeatFinishes(t *testing.T) 
 
 	time.Sleep(350 * time.Millisecond)
 	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
-	if event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent); ok && event.Event == "stream_first_packet_ms" {
-		t.Fatalf("video client log should not be accepted on the media socket: %#v", event)
+	event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent)
+	if !ok || event.Event != "stream_first_packet_ms" {
+		t.Fatalf("video client log should be accepted on the media socket for startup diagnostics: %#v", snapshot["lastBrowserEvent"])
 	}
 }
 

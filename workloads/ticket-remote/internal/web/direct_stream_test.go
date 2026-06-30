@@ -64,6 +64,40 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	}
 }
 
+func TestDirectStreamStartupTraceRecordsAndCompletes(t *testing.T) {
+	hub := newDirectStreamHub()
+	traceID := hub.beginStartupTrace("session-a", "index_prewarm")
+	if traceID == "" {
+		t.Fatal("startup trace id should be set")
+	}
+	hub.recordStartupPhase("video_socket_accepted", "session=session-a")
+	hub.recordStartupPhaseOnce("first_forwarded_keyframe", "sequence=1")
+	hub.recordStartupPhaseOnce("first_forwarded_keyframe", "sequence=2")
+	hub.completeStartupTrace("browser_first_rendered_frame", `{"frameSequence":1}`)
+
+	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+	raw, ok := snapshot["startupTrace"].(map[string]any)
+	if !ok {
+		t.Fatalf("startup trace missing from snapshot: %#v", snapshot["startupTrace"])
+	}
+	if raw["id"] != traceID || raw["complete"] != true || raw["lastPhase"] != "browser_first_rendered_frame" {
+		t.Fatalf("unexpected startup trace: %#v", raw)
+	}
+	phases, ok := raw["phases"].([]streamStartupTracePhase)
+	if !ok {
+		t.Fatalf("startup trace phases missing: %#v", raw["phases"])
+	}
+	seenKeyframes := 0
+	for _, phase := range phases {
+		if phase.Name == "first_forwarded_keyframe" {
+			seenKeyframes++
+		}
+	}
+	if seenKeyframes != 1 {
+		t.Fatalf("first-only keyframe phase count = %d, want 1; phases=%#v", seenKeyframes, phases)
+	}
+}
+
 func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()

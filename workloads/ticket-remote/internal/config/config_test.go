@@ -90,11 +90,11 @@ func TestDefaultPhoneNoViewerStopDelayCoversBrowserReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Phone.NoViewerStopDelay < 5*time.Second {
+	if cfg.Phone.NoViewerStopDelay < 60*time.Second {
 		t.Fatalf("default no-viewer stop delay = %s, want enough grace for browser reloads", cfg.Phone.NoViewerStopDelay)
 	}
-	if cfg.Phone.NoViewerStopDelay > 10*time.Second {
-		t.Fatalf("default no-viewer stop delay = %s, want encoder to cool down shortly after viewers leave", cfg.Phone.NoViewerStopDelay)
+	if cfg.Phone.NoViewerStopDelay > 90*time.Second {
+		t.Fatalf("default no-viewer stop delay = %s, want encoder to cool down after the warm reconnect window", cfg.Phone.NoViewerStopDelay)
 	}
 }
 

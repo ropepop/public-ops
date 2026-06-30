@@ -216,6 +216,9 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 		TTL:         ttl,
 		Now:         now,
 	})
+	if err == nil && (commandType == "start" || commandType == "keyframe" || commandType == "recover_stream") {
+		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
+	}
 	return commandID, err
 }
 

@@ -68,6 +68,7 @@ ARBUZAS_TRAIN_BOT_PORT="${ARBUZAS_TRAIN_BOT_PORT:-9317}"
 ARBUZAS_SATIKSME_BOT_PORT="${ARBUZAS_SATIKSME_BOT_PORT:-9318}"
 ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
+ARBUZAS_CHATGPT_BROKER_PORT="${ARBUZAS_CHATGPT_BROKER_PORT:-9348}"
 ARBUZAS_PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT:-9398}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
@@ -90,6 +91,7 @@ VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
 VALIDATE_SUBSCRIPTION=0
 VALIDATE_PHONE_BROKER=0
+VALIDATE_CHATGPT=0
 VALIDATE_TICKET_REMOTE=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
@@ -102,6 +104,8 @@ ALL_SERVICES=(
   subscription_bot
   ticket_phone_bridge
   phone_broker
+  chatgpt_broker
+  chatgpt_bot
   ticket_remote_spacetime_sidecar
   ticket_remote
   train_tunnel
@@ -780,7 +784,8 @@ Options:
 Services:
   portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
   subscription_bot, subscription_tunnel, ticket_phone_bridge, phone_broker,
-  ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel
+  chatgpt_broker, chatgpt_bot, ticket_remote_spacetime_sidecar,
+  ticket_remote, ticket_remote_tunnel
 EOF
 }
 
@@ -851,6 +856,11 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
       append_unique DIAGNOSTIC_SERVICES phone_broker
       ;;
+    chatgpt)
+      VALIDATE_CHATGPT=1
+      append_unique DIAGNOSTIC_SERVICES chatgpt_broker
+      append_unique DIAGNOSTIC_SERVICES chatgpt_bot
+      ;;
     ticket_remote)
       VALIDATE_TICKET_REMOTE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
@@ -918,6 +928,16 @@ resolve_requested_services() {
       append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
       append_unique COMPOSE_TARGET_SERVICES phone_broker
       mark_validation_group phone_broker
+      ;;
+    chatgpt_broker)
+      append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
+      append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
+      mark_validation_group chatgpt
+      ;;
+    chatgpt_bot)
+      append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
+      append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
+      mark_validation_group chatgpt
       ;;
     ticket_remote)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
@@ -1001,6 +1021,8 @@ compose_all_service_args() {
     subscription_bot
     ticket_phone_bridge
     phone_broker
+    chatgpt_broker
+    chatgpt_bot
     ticket_remote_spacetime_sidecar
     ticket_remote
   )
@@ -1582,7 +1604,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker workloads/chatgpt-broker)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -1602,6 +1624,7 @@ included_roots = [
     pathlib.Path("workloads/train-bot"),
     pathlib.Path("workloads/satiksme-bot"),
     pathlib.Path("workloads/phone-broker"),
+    pathlib.Path("workloads/chatgpt-broker"),
 ]
 entries = []
 for included in included_roots:
@@ -1649,6 +1672,7 @@ prepare_local_release_bundle() {
   copy_tree_into_release "workloads/satiksme-bot"
   copy_tree_into_release "workloads/subscription-bot"
   copy_tree_into_release "workloads/phone-broker"
+  copy_tree_into_release "workloads/chatgpt-broker"
   copy_tree_into_release "workloads/ticket-remote"
 
   mkdir -p "${ARBUZAS_RELEASE_DIR}/tools/arbuzas"
@@ -1672,6 +1696,7 @@ ARBUZAS_TRAIN_BOT_PORT=${ARBUZAS_TRAIN_BOT_PORT}
 ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
 ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
+ARBUZAS_CHATGPT_BROKER_PORT=${ARBUZAS_CHATGPT_BROKER_PORT}
 ARBUZAS_PHONE_BROKER_PORT=${ARBUZAS_PHONE_BROKER_PORT}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
 ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
@@ -3895,6 +3920,15 @@ validate_remote_phone_broker_workload_health() {
     ticket_phone_bridge phone_broker
 }
 
+validate_remote_chatgpt_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" chatgpt_broker chatgpt_bot
+  validate_remote_probe "${remote_release_dir}" "chatgpt broker local health" \
+    "wait_until_ok compose exec -T chatgpt_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz\" >/dev/null 2>/dev/null'" \
+    chatgpt_broker chatgpt_bot
+}
+
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
@@ -4018,6 +4052,7 @@ validate_remote_workload_health() {
   validate_remote_satiksme_workload_health "${remote_release_dir}"
   validate_remote_subscription_workload_health "${remote_release_dir}"
   validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  validate_remote_chatgpt_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
 }
 
@@ -4038,6 +4073,9 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_PHONE_BROKER == 1 )); then
     validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_CHATGPT == 1 )); then
+    validate_remote_chatgpt_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
@@ -4173,7 +4211,7 @@ repair_remote_portainer() {
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
   validate_remote_workload_health "${remote_release_dir}"
 
   validate_remote_host_probe "${remote_release_dir}" \
@@ -4190,7 +4228,7 @@ repair_remote_portainer() {
         exit 1
       fi
     " \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
 
   backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_path="${REMOTE_PORTAINER_BACKUPS_DIR}/portainer-${backup_timestamp}.tar.gz"

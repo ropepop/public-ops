@@ -161,6 +161,29 @@ func TestTicketLeaseAcquireAndRelease(t *testing.T) {
 	}
 }
 
+func TestChatGPTRoutesAreNotExposed(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	defer upstream.Close()
+	b, err := New(Config{UpstreamBaseURL: upstream.URL, TicketGrace: 25 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	for _, path := range []string{
+		"/api/v1/phone/leases/chatgpt",
+		"/api/v1/phone/leases/chatgpt/release",
+		"/api/v1/chatgpt/run-text-job",
+	} {
+		resp := postJSON(t, server.URL+path, `{}`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestTicketLeaseRejectsTTLOutOfRange(t *testing.T) {
 	upstream := newFakeUpstream(t)
 	defer upstream.Close()

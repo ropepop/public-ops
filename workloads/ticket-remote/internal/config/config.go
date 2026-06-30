@@ -15,7 +15,7 @@ import (
 )
 
 const defaultOIDCIssuer = "https://auth.spacetimedb.com/oidc"
-const defaultNoViewerStopDelay = 8 * time.Second
+const defaultNoViewerStopDelay = 60 * time.Second
 const DurationNever time.Duration = -1
 
 type Config struct {

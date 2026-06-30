@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -387,12 +388,21 @@ func (b *Broker) endTicketSocket() {
 
 func (b *Broker) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	target := b.cfg.UpstreamBaseURL + r.URL.Path
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 32<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	req.Header = r.Header.Clone()
+	req.ContentLength = int64(len(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)

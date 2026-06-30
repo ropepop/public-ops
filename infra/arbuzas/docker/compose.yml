@@ -315,6 +315,88 @@ services:
     volumes:
       - /srv/arbuzas/phone-broker:/srv/phone-broker
 
+  chatgpt_broker:
+    image: arbuzas/chatgpt-broker:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/chatgpt-broker.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
+    working_dir: /srv/chatgpt-broker
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      CHATGPT_BROKER_BIND_ADDR: 0.0.0.0
+      CHATGPT_BROKER_PORT: ${ARBUZAS_CHATGPT_BROKER_PORT}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ -f /srv/chatgpt-broker/.env ]; then
+          set -a
+          . /srv/chatgpt-broker/.env
+          set +a
+        fi
+        export CHATGPT_BROKER_BIND_ADDR="0.0.0.0"
+        export CHATGPT_BROKER_PORT="${ARBUZAS_CHATGPT_BROKER_PORT}"
+        mkdir -p /srv/chatgpt-broker/run /srv/chatgpt-broker/state
+        exec /usr/local/bin/chatgpt-broker
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz >/dev/null",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    volumes:
+      - /srv/arbuzas/chatgpt-broker:/srv/chatgpt-broker
+      - /etc/arbuzas/env/chatgpt-broker.env:/srv/chatgpt-broker/.env:ro
+      - /etc/arbuzas/secrets/ticket-remote:/run/secrets/ticket-remote:ro
+
+  chatgpt_bot:
+    image: arbuzas/chatgpt-bot:${ARBUZAS_RELEASE_ID}
+    build:
+      context: ../../..
+      dockerfile: infra/arbuzas/docker/images/chatgpt-bot.Dockerfile
+      args:
+        ARBUZAS_RELEASE_ID: ${ARBUZAS_RELEASE_ID}
+        ARBUZAS_RELEASE_SOURCE_COMMIT: ${ARBUZAS_RELEASE_SOURCE_COMMIT}
+        ARBUZAS_RELEASE_SOURCE_DIRTY: ${ARBUZAS_RELEASE_SOURCE_DIRTY}
+        ARBUZAS_RELEASE_SOURCE_SHA256: ${ARBUZAS_RELEASE_SOURCE_SHA256}
+    working_dir: /srv/chatgpt-bot
+    environment:
+      TZ: ${ARBUZAS_TZ}
+      CHATGPT_BROKER_BASE_URL: http://chatgpt_broker:${ARBUZAS_CHATGPT_BROKER_PORT}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -a
+        . /srv/chatgpt-bot/.env
+        set +a
+        export CHATGPT_BROKER_BASE_URL="$${CHATGPT_BROKER_BASE_URL:-http://chatgpt_broker:${ARBUZAS_CHATGPT_BROKER_PORT}}"
+        exec /usr/local/bin/chatgpt-bot
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    depends_on:
+      - chatgpt_broker
+    volumes:
+      - /srv/arbuzas/chatgpt-bot:/srv/chatgpt-bot
+      - /etc/arbuzas/env/chatgpt-broker.env:/srv/chatgpt-bot/.env:ro
+
   ticket_remote_spacetime_sidecar:
     image: arbuzas/ticket-remote-spacetime-sidecar:${ARBUZAS_RELEASE_ID}
     build:
@@ -398,6 +480,7 @@ services:
       TICKET_REMOTE_PHONE_ATTACH_NAME: Pixel
       TICKET_REMOTE_PHONE_BASE_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
       TICKET_REMOTE_PHONE_BROKER_URL: http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}
+      TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY: 60s
     command:
       - /bin/sh
       - -lc
@@ -426,6 +509,7 @@ services:
         export TICKET_REMOTE_PHONE_ATTACH_NAME="$${TICKET_REMOTE_PHONE_ATTACH_NAME:-Pixel}"
         export TICKET_REMOTE_PHONE_BASE_URL="$${TICKET_REMOTE_PHONE_BASE_URL:-http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
         export TICKET_REMOTE_PHONE_BROKER_URL="$${TICKET_REMOTE_PHONE_BROKER_URL:-http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}}"
+        export TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY="$${TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY:-60s}"
         mkdir -p /srv/ticket-remote/run /srv/ticket-remote/state
         exec /usr/local/bin/ticket-remote
     healthcheck:

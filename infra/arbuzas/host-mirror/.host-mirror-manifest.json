@@ -37,8 +37,13 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 420,
-      "sha256": "304fff0327bfe351016f53fe9bafab0c2a0cf69f283c4e161603132d0f35f44e",
-      "size": 1046
+      "sha256": "4e71a8aedd2a43c7efd15cc5abc73491dba55b023e8073177ee6c9ab921052c7",
+      "size": 1079
+    },
+    "etc/arbuzas/env/chatgpt-broker.env": {
+      "mode": 420,
+      "sha256": "c36787e46dd06cb0998aa590fdd64a10527f3ad6eae0738a10776bd419815cd4",
+      "size": 822
     },
     "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z.retired-20260618T215944Z": {
       "mode": 384,
@@ -197,5 +202,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1782763659
+  "updatedEpochSeconds": 1782853484
 }
