@@ -19,13 +19,10 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   const pendingClientLogs = [];
-  const pendingDevPerfMetrics = [];
   const sampledClientLogState = new Map();
   const sampledClientLogEvents = new Set(['control_code_capture_keepalive', 'stream_command_dispatched']);
   const sampledClientLogIntervalMs = 60000;
   const controlCodeAutoPrepareMinIntervalMs = 45000;
-  const devMetricsConfig = cfg.devMetrics || {};
-  const devMetricsExpiresAtMs = Date.parse(devMetricsConfig.expiresAt || '');
   let spacetimeClient = null;
 
   function enqueueClientLog(entry) {
@@ -928,61 +925,6 @@ import { html, reactive } from '@arrow-js/core';
 	    });
 	  }
 
-  function devPerfMetricsEnabled() {
-    if (!devMetricsConfig || devMetricsConfig.enabled !== true) return false;
-    if (!Number.isFinite(devMetricsExpiresAtMs)) return false;
-    return Date.now() < devMetricsExpiresAtMs;
-  }
-
-  function randomMetricFlowId(prefix) {
-    const cleanPrefix = String(prefix || 'flow').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 24) || 'flow';
-    return `${cleanPrefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
-  }
-
-  function flushDevPerfMetrics() {
-    if (!devPerfMetricsEnabled()) {
-      pendingDevPerfMetrics.length = 0;
-      return;
-    }
-    if (!spacetimeClient || typeof spacetimeClient.appendDevMetric !== 'function') return;
-    if (!pendingDevPerfMetrics.length) return;
-    const batch = pendingDevPerfMetrics.splice(0, Math.min(20, pendingDevPerfMetrics.length));
-    batch.forEach((entry) => {
-      spacetimeClient.appendDevMetric(
-        entry.metricName,
-        entry.phase,
-        entry.flowId,
-        entry.valueMillis,
-        entry.ok,
-        entry.detailJson
-      ).catch(() => {
-        if (pendingDevPerfMetrics.length < 100) pendingDevPerfMetrics.unshift(entry);
-      });
-    });
-  }
-
-  function recordDevPerfMetric(metricName, phase, flowId, valueMillis, ok, detail) {
-    if (!devPerfMetricsEnabled()) return;
-    const entry = {
-      metricName: String(metricName || 'metric').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'metric',
-      phase: String(phase || 'event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'event',
-      flowId: String(flowId || randomMetricFlowId(metricName)).slice(0, 120),
-      valueMillis: Math.max(0, Math.min(86400000, Math.round(Number(valueMillis) || 0))),
-      ok: Boolean(ok),
-      detailJson: safeString(Object.assign({
-        pageVersion,
-        metricExpiresAt: devMetricsConfig.expiresAt || ''
-      }, detail || {})).slice(0, 1500)
-    };
-    pendingDevPerfMetrics.push(entry);
-    if (pendingDevPerfMetrics.length > 100) pendingDevPerfMetrics.splice(0, pendingDevPerfMetrics.length - 100);
-    try {
-      if (typeof queueMicrotask === 'function') {
-        queueMicrotask(() => flushDevPerfMetrics());
-      }
-    } catch (_) {}
-  }
-
   function streamResumeSpinnerVisible() {
     return Boolean(streamResumeSpinner && !streamResumeSpinner.hidden);
   }
@@ -1118,35 +1060,13 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function beginStreamOpenMetric(kind, reason, force) {
-    if (!devPerfMetricsEnabled()) return null;
-    if (activeStreamOpenMetric && !force) return activeStreamOpenMetric;
-    activeStreamOpenMetric = {
-      flowId: randomMetricFlowId(kind || 'stream_open'),
-      kind: kind || 'stream_open',
-      reason: reason || '',
-      startedAt: performance.now(),
-      socketState: videoSocketState(),
-      hadRenderedFrame: hasRenderedFrame,
-      hadFallbackFrame: fallbackFrameAvailable
-    };
-    return activeStreamOpenMetric;
+    activeStreamOpenMetric = null;
+    return null;
   }
 
   function finishStreamOpenMetric(phase, ok, detail) {
-    if (!activeStreamOpenMetric) return;
-    const metric = activeStreamOpenMetric;
     activeStreamOpenMetric = null;
     clearResumeWatchdogs();
-    const elapsedMs = performance.now() - metric.startedAt;
-    recordDevPerfMetric('stream_open', metric.kind, metric.flowId, elapsedMs, ok && elapsedMs <= 5000, Object.assign({
-      phase: phase || '',
-      reason: metric.reason,
-      startedSocketState: metric.socketState,
-      completedSocketState: videoSocketState(),
-      hadRenderedFrame: metric.hadRenderedFrame,
-      hadFallbackFrame: metric.hadFallbackFrame,
-      targetMillis: 5000
-    }, detail || {}));
   }
 
   function clearResumeWatchdogs() {
@@ -1427,18 +1347,10 @@ import { html, reactive } from '@arrow-js/core';
 
 	  function scheduleResumeWatchdogs(reason) {
     clearResumeWatchdogs();
-    const metric = activeStreamOpenMetric;
-    const flowId = metric && metric.flowId;
     resumeRecoverySoftTimer = setTimeout(() => {
       resumeRecoverySoftTimer = null;
       if (idleDisconnected || document.visibilityState !== 'visible') return;
       if (streamHasFreshRenderedFrame()) return;
-      recordDevPerfMetric('stream_recovery_step', 'resume_soft_reconnect', flowId || randomMetricFlowId('resume'), resumeSoftReconnectMs, true, {
-        reason,
-        socketState: videoSocketState(),
-        hasRenderedFrame,
-        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
-      });
       preserveCurrentFrame('resume_soft_reconnect');
       closeDirectVideo();
       resetStreamState({ preserveFrame: true });
@@ -1449,12 +1361,6 @@ import { html, reactive } from '@arrow-js/core';
       resumeRecoveryHardTimer = null;
 	      if (idleDisconnected || document.visibilityState !== 'visible') return;
 	      if (streamHasFreshRenderedFrame()) return;
-	      recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true, {
-	        reason,
-	        socketState: videoSocketState(),
-        hasRenderedFrame,
-	        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
-	      });
 	      recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover', {
 	        flow: activeResumeFlow,
 	        watchdogs: false,
@@ -1567,7 +1473,6 @@ import { html, reactive } from '@arrow-js/core';
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
       }
       flushClientLogs();
-      flushDevPerfMetrics();
       connectDirectVideo();
     }).catch((error) => {
       setConnected('Savienojuma kļūme');
@@ -2506,7 +2411,6 @@ import { html, reactive } from '@arrow-js/core';
           spacetimeClientStatus = status;
           if (status === 'live') {
             flushClientLogs();
-            flushDevPerfMetrics();
           }
           updateControlCodeSubmitAvailability();
           if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
@@ -3061,75 +2965,20 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeSafeGeneratedFrameRequiredCount = 1;
   const controlCodeTrustedProofSafeGeneratedFrameRequiredCount = 1;
 
-  function controlCodeMetricRequestKey(requestID) {
-    return requestID ? accountPublicId(String(requestID)) : '';
-  }
-
   function beginControlCodeMetric(digitCount) {
-    if (!devPerfMetricsEnabled()) return null;
-    activeControlCodeMetric = {
-      flowId: randomMetricFlowId('control_code'),
-      startedAt: performance.now(),
-      digitCount: Number(digitCount || 0),
-      requestKey: '',
-      transitions: new Set(),
-      resultReadyRecorded: false,
-      finished: false
-    };
-    recordDevPerfMetric('control_code_phase', 'submit_started', activeControlCodeMetric.flowId, 0, true, {
-      digitCount: activeControlCodeMetric.digitCount,
-      targetMillis: 5000
-    });
-    return activeControlCodeMetric;
+    activeControlCodeMetric = null;
+    return null;
   }
 
   function noteControlCodeMetricPhase(phase, request, ok, detail) {
-    if (!activeControlCodeMetric || activeControlCodeMetric.finished) return;
-    const requestID = String(request && request.requestId || '').trim();
-    if (requestID && !requestID.startsWith('pending:')) {
-      activeControlCodeMetric.requestKey = controlCodeMetricRequestKey(requestID);
-    }
-    const elapsedMs = performance.now() - activeControlCodeMetric.startedAt;
-    recordDevPerfMetric('control_code_phase', phase, activeControlCodeMetric.flowId, elapsedMs, ok, Object.assign({
-      requestKey: activeControlCodeMetric.requestKey,
-      digitCount: activeControlCodeMetric.digitCount,
-      status: String(request && request.status || ''),
-      targetMillis: 5000
-    }, detail || {}));
+    return;
   }
 
   function noteControlCodeRequestMetric(request) {
-    if (!request || !activeControlCodeMetric || activeControlCodeMetric.finished) return;
-    const status = String(request.status || '');
-    if (!status) return;
-    const transitionKey = `${String(request.requestId || '')}:${status}`;
-    if (activeControlCodeMetric.transitions.has(transitionKey)) return;
-    activeControlCodeMetric.transitions.add(transitionKey);
-    noteControlCodeMetricPhase(`status_${status}`, request, status !== 'failed', {
-      reason: String(request.reason || ''),
-      markerEpoch: Number(request.resultFrameEpoch || request.streamEpoch || 0),
-      markerSequence: Number(request.resultMinFrameSequence || request.minFrameSequence || 0)
-    });
-    if (status === 'succeeded' && !activeControlCodeMetric.resultReadyRecorded) {
-      activeControlCodeMetric.resultReadyRecorded = true;
-      noteControlCodeMetricPhase('phone_result_ready', request, true);
-    }
-    if (status === 'failed' || status === 'expired') {
-      finishControlCodeMetric(status, false, {
-        reason: String(request.reason || request.message || status)
-      });
-    }
+    return;
   }
 
   function finishControlCodeMetric(outcome, ok, detail) {
-    if (!activeControlCodeMetric || activeControlCodeMetric.finished) return;
-    activeControlCodeMetric.finished = true;
-    const elapsedMs = performance.now() - activeControlCodeMetric.startedAt;
-    recordDevPerfMetric('control_code_total', outcome || 'finished', activeControlCodeMetric.flowId, elapsedMs, ok && elapsedMs <= 5000, Object.assign({
-      requestKey: activeControlCodeMetric.requestKey,
-      digitCount: activeControlCodeMetric.digitCount,
-      targetMillis: 5000
-    }, detail || {}));
     activeControlCodeMetric = null;
   }
 
@@ -3585,7 +3434,7 @@ import { html, reactive } from '@arrow-js/core';
     codeResultValue.style.display = '';
     codeResultTimer.hidden = false;
     finishControlCodeMetric('browser_capture_wait_failed', false, {
-      requestKey: codeRequest && codeRequest.requestId ? controlCodeMetricRequestKey(codeRequest.requestId) : ''
+      requestKey: codeRequest && codeRequest.requestId ? accountPublicId(String(codeRequest.requestId)) : ''
     });
   }
 
@@ -3924,7 +3773,7 @@ import { html, reactive } from '@arrow-js/core';
         codeRequest = null;
       }
       finishControlCodeMetric('closed_by_browser', false, {
-        requestKey: controlCodeMetricRequestKey(String(requestID))
+        requestKey: accountPublicId(String(requestID))
       });
       try {
         await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'), 'control_code_close');
@@ -4771,9 +4620,6 @@ import { html, reactive } from '@arrow-js/core';
     const ticketResult = document.getElementById('adminTicketResult');
     const ticketResultDetail = document.getElementById('adminTicketResultDetail');
     const ticketReselect = document.getElementById('adminTicketReselect');
-    const eventsSummary = document.getElementById('adminEventsSummary');
-    const eventsFilter = document.getElementById('adminEventsFilter');
-    const eventsList = document.getElementById('adminEvents');
     const simSetup = document.querySelector('[data-simulator-setup="true"]');
     const simSetupSummary = document.getElementById('simSetupSummary');
     const simSetupPackages = document.getElementById('simSetupPackages');
@@ -4806,10 +4652,7 @@ import { html, reactive } from '@arrow-js/core';
       ticketDetail,
       ticketResult,
       ticketResultDetail,
-      ticketReselect,
-      eventsSummary,
-      eventsFilter,
-      eventsList
+      ticketReselect
     ];
     if (requiredAdminElements.some((element) => !element)) {
       reportClientFault('missing_admin_dom', 'admin shell incomplete');
@@ -4837,18 +4680,15 @@ import { html, reactive } from '@arrow-js/core';
         return;
       }
       adminLoadInFlight = (async () => {
-        const [stateResponse, backendResponse, eventsResponse] = await Promise.all([
+        const [stateResponse, backendResponse] = await Promise.all([
           fetch('/api/v1/admin/state', { cache: 'no-store' }),
-          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' }),
-          fetch(adminEventsURL(), { cache: 'no-store' })
+          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' })
         ]);
         const payload = await stateResponse.json();
         const backendsPayload = await backendResponse.json();
-        const eventsPayload = await eventsResponse.json();
         if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
         if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
-        if (!eventsResponse.ok || !eventsPayload.ok) throw new Error(eventsPayload.message || 'event load failed');
-        renderAdmin(payload.state, payload.phone, backendsPayload, eventsPayload);
+        renderAdmin(payload.state, payload.phone, backendsPayload);
         if (simSetup && simulatorSetupActive()) {
           loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
         }
@@ -4862,13 +4702,12 @@ import { html, reactive } from '@arrow-js/core';
       }
     }
 
-    function renderAdmin(state, phone, backendsPayload, eventsPayload) {
+    function renderAdmin(state, phone, backendsPayload) {
       const phoneRecord = state.phone || {};
       const phoneHealth = parsePhoneHealth(phoneRecord.statusJson || phoneRecord.healthJson);
       renderStatus(state, phone, phoneHealth);
       renderTicketSelection(phoneHealth);
       renderBackends(backendsPayload);
-      renderOperationalEvents(eventsPayload || {});
       membersEl.textContent = '';
       activeMembers(state).forEach((member) => {
         const row = document.createElement('div');
@@ -4904,10 +4743,6 @@ import { html, reactive } from '@arrow-js/core';
       });
       stateEl.textContent = JSON.stringify({ state, phone, phoneBackends: backendsPayload }, null, 2);
     }
-
-    eventsFilter.addEventListener('change', () => {
-      load().catch((error) => showNotice(error.message || 'Event load failed', true));
-    });
 
     memberForm.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -5094,51 +4929,6 @@ import { html, reactive } from '@arrow-js/core';
         backendList.appendChild(row);
       });
       renderSimulatorAvailability(active);
-    }
-
-    function adminEventsURL() {
-      const params = new URLSearchParams();
-      params.set('limit', '80');
-      const filter = eventsFilter.value || '';
-      if (filter === 'errors') {
-        params.set('level', 'warn');
-      } else if (filter) {
-        params.set('category', filter);
-      }
-      return `/api/v1/admin/operational-events?${params.toString()}`;
-    }
-
-    function renderOperationalEvents(payload) {
-      const events = payload.events || [];
-      eventsSummary.textContent = events.length
-        ? `${events.length} recent event${events.length === 1 ? '' : 's'}`
-        : 'No recent matching events';
-      eventsList.textContent = '';
-      if (!events.length) {
-        const empty = document.createElement('div');
-        empty.className = 'admin-event empty';
-        empty.textContent = 'No recent matching events';
-        eventsList.appendChild(empty);
-        return;
-      }
-      events.forEach((event) => {
-        const row = document.createElement('article');
-        row.className = `admin-event ${event.level === 'warn' ? 'warn' : ''}`;
-        const main = document.createElement('div');
-        main.className = 'admin-event-main';
-        const title = document.createElement('strong');
-        title.textContent = event.summary || `${humanState(event.category)} · ${humanState(event.action)}`;
-        const detail = document.createElement('span');
-        detail.className = 'admin-muted';
-        const ids = [event.requestId, event.commandId, event.backendId].filter(Boolean).slice(0, 2).join(' · ');
-        detail.textContent = `${relativeTime(event.createdAt)} · ${event.source || 'unknown'}${ids ? ` · ${ids}` : ''}`;
-        main.append(title, detail);
-        const badge = document.createElement('span');
-        badge.className = `admin-pill ${event.level === 'warn' ? 'admin' : ''}`;
-        badge.textContent = event.category || 'event';
-        row.append(main, badge);
-        eventsList.appendChild(row);
-      });
     }
 
     function simulatorSetupActive() {

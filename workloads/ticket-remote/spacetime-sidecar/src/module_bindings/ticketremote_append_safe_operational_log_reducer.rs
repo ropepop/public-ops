@@ -7,6 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub(super) struct TicketremoteAppendSafeOperationalLogArgs {
+    pub id: String,
     pub ticket_id: String,
     pub source: String,
     pub level: String,
@@ -19,6 +20,7 @@ pub(super) struct TicketremoteAppendSafeOperationalLogArgs {
 impl From<TicketremoteAppendSafeOperationalLogArgs> for super::Reducer {
     fn from(args: TicketremoteAppendSafeOperationalLogArgs) -> Self {
         Self::TicketremoteAppendSafeOperationalLog {
+            id: args.id,
             ticket_id: args.ticket_id,
             source: args.source,
             level: args.level,
@@ -47,6 +49,7 @@ pub trait ticketremote_append_safe_operational_log {
     /// /// Use [`ticketremote_append_safe_operational_log:ticketremote_append_safe_operational_log_then`] to run a callback after the reducer completes.
     fn ticketremote_append_safe_operational_log(
         &self,
+        id: String,
         ticket_id: String,
         source: String,
         level: String,
@@ -56,6 +59,7 @@ pub trait ticketremote_append_safe_operational_log {
         now_arg: String,
     ) -> __sdk::Result<()> {
         self.ticketremote_append_safe_operational_log_then(
+            id,
             ticket_id,
             source,
             level,
@@ -75,6 +79,7 @@ pub trait ticketremote_append_safe_operational_log {
     ///  and its status can be observed with the `callback`.
     fn ticketremote_append_safe_operational_log_then(
         &self,
+        id: String,
         ticket_id: String,
         source: String,
         level: String,
@@ -83,15 +88,18 @@ pub trait ticketremote_append_safe_operational_log {
         detail_json: String,
         now_arg: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()>;
 }
 
 impl ticketremote_append_safe_operational_log for super::RemoteReducers {
     fn ticketremote_append_safe_operational_log_then(
         &self,
+        id: String,
         ticket_id: String,
         source: String,
         level: String,
@@ -100,12 +108,15 @@ impl ticketremote_append_safe_operational_log for super::RemoteReducers {
         detail_json: String,
         now_arg: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             TicketremoteAppendSafeOperationalLogArgs {
+                id,
                 ticket_id,
                 source,
                 level,

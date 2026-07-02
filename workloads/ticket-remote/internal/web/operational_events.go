@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"ticketremote/internal/auth"
 	"ticketremote/internal/state"
 )
 
@@ -117,12 +116,13 @@ func (s *Server) recordProductEvent(input productEventInput) {
 	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 	defer cancel()
 	_ = s.store.AppendSafeOperationalLog(ctx, state.SafeOperationalLogInput{
+		ID:            state.NewSafeOperationalLogID(source, "product_"+category+"_"+action, correlationID, time.Now()),
 		TicketID:      s.cfg.TicketID,
 		Source:        source,
 		Level:         level,
 		Event:         "product_" + category + "_" + action,
 		CorrelationID: cleanRuntimeCorrelationID(correlationID),
-		DetailJSON:    string(body),
+		DetailJSON:    state.ClampSafeOperationalLogDetail(string(body)),
 		Now:           time.Now(),
 	})
 }
@@ -154,50 +154,6 @@ func (s *Server) handleServiceEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordProductEvent(input)
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
-}
-
-func (s *Server) handleAdminOperationalEvents(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if s.store == nil {
-		writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "state_unavailable", Message: "Ticket state is unavailable."})
-		return
-	}
-	limit := uint32FromString(r.URL.Query().Get("limit"), adminOperationalEventsDefaultLimit)
-	if limit == 0 || limit > adminOperationalEventsMaxLimit {
-		limit = adminOperationalEventsDefaultLimit
-	}
-	since := time.Now().Add(-2 * time.Hour)
-	if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
-		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
-			since = parsed
-		}
-	}
-	rows, err := s.store.ListSafeOperationalLogs(r.Context(), state.SafeOperationalLogQueryInput{
-		TicketID: s.cfg.TicketID,
-		Source:   cleanOptionalProductToken(r.URL.Query().Get("source")),
-		Level:    cleanOptionalProductToken(r.URL.Query().Get("level")),
-		Event:    cleanOptionalProductToken(r.URL.Query().Get("event")),
-		Since:    since,
-		Limit:    limit,
-	})
-	if err != nil {
-		s.recordRuntimeErrorAsync("admin_operational_events_failed", "", err, nil)
-		writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "events_unavailable", Message: "Operational events are unavailable."})
-		return
-	}
-	categoryFilter := cleanOptionalProductToken(r.URL.Query().Get("category"))
-	events := make([]adminOperationalEvent, 0, len(rows))
-	for _, row := range rows {
-		event := adminOperationalEventFromLog(row)
-		if categoryFilter != "" && event.Category != categoryFilter {
-			continue
-		}
-		events = append(events, event)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "events": events, "since": since.UTC().Format(time.RFC3339)})
 }
 
 func (s *Server) handlePixelTraceEvent(msg map[string]any) bool {

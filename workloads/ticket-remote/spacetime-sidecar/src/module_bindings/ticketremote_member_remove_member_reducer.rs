@@ -54,9 +54,11 @@ pub trait ticketremote_member_remove_member {
         ticket_id: String,
         email: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()>;
 }
 
@@ -66,9 +68,11 @@ impl ticketremote_member_remove_member for super::RemoteReducers {
         ticket_id: String,
         email: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             TicketremoteMemberRemoveMemberArgs { ticket_id, email },

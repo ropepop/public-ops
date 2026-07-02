@@ -10,24 +10,6 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export const TicketremoteAuditCounter = __t.object("TicketremoteAuditCounter", {
-  ticketId: __t.string(),
-  nextOrdinal: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremoteAuditCounter = __Infer<typeof TicketremoteAuditCounter>;
-
-export const TicketremoteAuditEvent = __t.object("TicketremoteAuditEvent", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  actorEmail: __t.string(),
-  event: __t.string(),
-  payloadJson: __t.string(),
-  createdAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteAuditEvent = __Infer<typeof TicketremoteAuditEvent>;
-
 export const TicketremoteAuthConfig = __t.object("TicketremoteAuthConfig", {
   ticketId: __t.string(),
   issuer: __t.string(),
@@ -83,44 +65,6 @@ export const TicketremoteControlCodeRequest = __t.object("TicketremoteControlCod
 });
 export type TicketremoteControlCodeRequest = __Infer<typeof TicketremoteControlCodeRequest>;
 
-export const TicketremoteControlSession = __t.object("TicketremoteControlSession", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  sessionId: __t.string(),
-  email: __t.string(),
-  state: __t.string(),
-  claimedAt: __t.string(),
-  expiresAt: __t.string(),
-  extended: __t.bool(),
-  endedAt: __t.string(),
-  endReason: __t.string(),
-});
-export type TicketremoteControlSession = __Infer<typeof TicketremoteControlSession>;
-
-export const TicketremoteDevPerfMetric = __t.object("TicketremoteDevPerfMetric", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  source: __t.string(),
-  metricName: __t.string(),
-  phase: __t.string(),
-  flowId: __t.string(),
-  valueMillis: __t.u32(),
-  ok: __t.bool(),
-  detailJson: __t.string(),
-  createdAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteDevPerfMetric = __Infer<typeof TicketremoteDevPerfMetric>;
-
-export const TicketremoteDevPerfMetricsConfig = __t.object("TicketremoteDevPerfMetricsConfig", {
-  ticketId: __t.string(),
-  enabled: __t.bool(),
-  reason: __t.string(),
-  expiresAt: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremoteDevPerfMetricsConfig = __Infer<typeof TicketremoteDevPerfMetricsConfig>;
-
 export const TicketremotePhoneBackend = __t.object("TicketremotePhoneBackend", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -148,31 +92,6 @@ export const TicketremotePhoneCurrentReport = __t.object("TicketremotePhoneCurre
 });
 export type TicketremotePhoneCurrentReport = __Infer<typeof TicketremotePhoneCurrentReport>;
 
-export const TicketremotePhoneStatus = __t.object("TicketremotePhoneStatus", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  attachName: __t.string(),
-  desiredState: __t.string(),
-  streamState: __t.string(),
-  lastSeenAt: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremotePhoneStatus = __Infer<typeof TicketremotePhoneStatus>;
-
-export const TicketremotePhoneStatusHistory = __t.object("TicketremotePhoneStatusHistory", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  attachName: __t.string(),
-  desiredState: __t.string(),
-  streamState: __t.string(),
-  lastError: __t.string(),
-  createdAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremotePhoneStatusHistory = __Infer<typeof TicketremotePhoneStatusHistory>;
-
 export const TicketremoteRelayCurrentReport = __t.object("TicketremoteRelayCurrentReport", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -198,18 +117,6 @@ export const TicketremoteSafeOperationalLog = __t.object("TicketremoteSafeOperat
   expiresAt: __t.string(),
 });
 export type TicketremoteSafeOperationalLog = __Infer<typeof TicketremoteSafeOperationalLog>;
-
-export const TicketremoteServiceControl = __t.object("TicketremoteServiceControl", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  sessionId: __t.string(),
-  email: __t.string(),
-  state: __t.string(),
-  claimedAt: __t.string(),
-  expiresAt: __t.string(),
-  extended: __t.bool(),
-});
-export type TicketremoteServiceControl = __Infer<typeof TicketremoteServiceControl>;
 
 export const TicketremoteServiceIdentity = __t.object("TicketremoteServiceIdentity", {
   id: __t.string(),
@@ -245,19 +152,6 @@ export const TicketremoteServicePhone = __t.object("TicketremoteServicePhone", {
 });
 export type TicketremoteServicePhone = __Infer<typeof TicketremoteServicePhone>;
 
-export const TicketremoteServiceSafeOperationalLog = __t.object("TicketremoteServiceSafeOperationalLog", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  source: __t.string(),
-  level: __t.string(),
-  event: __t.string(),
-  correlationId: __t.string(),
-  detailJson: __t.string(),
-  createdAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteServiceSafeOperationalLog = __Infer<typeof TicketremoteServiceSafeOperationalLog>;
-
 export const TicketremoteServiceStreamCommand = __t.object("TicketremoteServiceStreamCommand", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -279,18 +173,6 @@ export const TicketremoteServiceTicket = __t.object("TicketremoteServiceTicket",
   updatedAt: __t.string(),
 });
 export type TicketremoteServiceTicket = __Infer<typeof TicketremoteServiceTicket>;
-
-export const TicketremoteServiceViewer = __t.object("TicketremoteServiceViewer", {
-  sessionId: __t.string(),
-  ticketId: __t.string(),
-  email: __t.string(),
-  displayName: __t.string(),
-  page: __t.string(),
-  connected: __t.bool(),
-  lastSeenAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteServiceViewer = __Infer<typeof TicketremoteServiceViewer>;
 
 export const TicketremoteStreamCommand = __t.object("TicketremoteStreamCommand", {
   id: __t.string(),
@@ -348,42 +230,4 @@ export const TicketremoteTicketMember = __t.object("TicketremoteTicketMember", {
   updatedAt: __t.string(),
 });
 export type TicketremoteTicketMember = __Infer<typeof TicketremoteTicketMember>;
-
-export const TicketremoteTicketSummary = __t.object("TicketremoteTicketSummary", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  displayName: __t.string(),
-  viewerCount: __t.u32(),
-  phoneBackendId: __t.string(),
-  phoneAttachName: __t.string(),
-  phoneDesiredState: __t.string(),
-  phoneStreamState: __t.string(),
-  phoneLastSeenAt: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremoteTicketSummary = __Infer<typeof TicketremoteTicketSummary>;
-
-export const TicketremoteViewerPresence = __t.object("TicketremoteViewerPresence", {
-  sessionId: __t.string(),
-  ticketId: __t.string(),
-  email: __t.string(),
-  displayName: __t.string(),
-  page: __t.string(),
-  connected: __t.bool(),
-  createdAt: __t.string(),
-  lastSeenAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteViewerPresence = __Infer<typeof TicketremoteViewerPresence>;
-
-export const TicketremoteViewerPublic = __t.object("TicketremoteViewerPublic", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  publicId: __t.string(),
-  label: __t.string(),
-  connected: __t.bool(),
-  lastSeenAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteViewerPublic = __Infer<typeof TicketremoteViewerPublic>;
 

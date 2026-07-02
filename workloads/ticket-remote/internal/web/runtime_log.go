@@ -53,12 +53,13 @@ func (s *Server) recordRuntimeEventForSource(source, level, event, correlationID
 	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 	defer cancel()
 	_ = s.store.AppendSafeOperationalLog(ctx, state.SafeOperationalLogInput{
+		ID:            state.NewSafeOperationalLogID(source, event, correlationID, time.Now()),
 		TicketID:      s.cfg.TicketID,
 		Source:        cleanStreamControlText(source, "ticket_remote"),
 		Level:         cleanStreamControlText(level, "info"),
 		Event:         cleanStreamControlText(event, "runtime_event"),
 		CorrelationID: cleanRuntimeCorrelationID(correlationID),
-		DetailJSON:    body,
+		DetailJSON:    state.ClampSafeOperationalLogDetail(body),
 		Now:           time.Now(),
 	})
 }

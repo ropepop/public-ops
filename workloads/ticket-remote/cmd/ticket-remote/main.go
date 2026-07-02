@@ -43,9 +43,6 @@ func main() {
 	}); err != nil {
 		log.Fatalf("bootstrap state: %v", err)
 	}
-	if err := configureDevPerfMetrics(ctx, store, cfg); err != nil {
-		log.Fatalf("configure dev perf metrics: %v", err)
-	}
 
 	relay := phone.NewRelay(cfg.Phone.RelayConfig())
 	defer relay.Close()
@@ -78,27 +75,4 @@ func main() {
 			log.Fatalf("serve: %v", err)
 		}
 	}
-}
-
-func configureDevPerfMetrics(ctx context.Context, store state.Store, cfg config.Config) error {
-	now := time.Now()
-	expiresAt := cfg.DevPerfMetrics.ExpiresAt
-	if expiresAt.IsZero() && cfg.DevPerfMetrics.Enabled {
-		ttl := cfg.DevPerfMetrics.TTL
-		if ttl <= 0 {
-			ttl = 24 * time.Hour
-		}
-		expiresAt = now.Add(ttl)
-	}
-	enabled := cfg.DevPerfMetrics.Enabled && expiresAt.After(now)
-	if expiresAt.IsZero() {
-		expiresAt = now
-	}
-	return store.SetDevPerfMetrics(ctx, state.DevPerfMetricsConfigInput{
-		TicketID:  cfg.TicketID,
-		Enabled:   enabled,
-		Reason:    "ticket_remote_startup",
-		ExpiresAt: expiresAt,
-		Now:       now,
-	})
 }

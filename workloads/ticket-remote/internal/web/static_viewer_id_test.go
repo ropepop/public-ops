@@ -11,7 +11,7 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 		"function activeViewerPresence(state) {",
 		"  function renderPanelSummary(viewers, visibleViewerCount) {")
 	adminBody := substringBetween(t, source,
-		"function renderAdmin(state, phone, backendsPayload, eventsPayload) {",
+		"function renderAdmin(state, phone, backendsPayload) {",
 		"    memberForm.addEventListener('submit'")
 
 	if !strings.Contains(presenceBody, "viewer.publicId") {
@@ -28,7 +28,7 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 func TestAdminTicketSelectionReadsPhoneStatusJson(t *testing.T) {
 	source := ticketAppSource(t)
 	adminBody := substringBetween(t, source,
-		"function renderAdmin(state, phone, backendsPayload, eventsPayload) {",
+		"function renderAdmin(state, phone, backendsPayload) {",
 		"  function renderStatus(state, phone, phoneHealth) {")
 
 	if !strings.Contains(adminBody, "phoneRecord.statusJson || phoneRecord.healthJson") {

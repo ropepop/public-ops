@@ -23,15 +23,6 @@ function pickAccessor<T = any>(source: any, candidates: string[]): T {
   throw new Error(`missing accessor: ${candidates.join(", ")}`);
 }
 
-function maybeAccessor<T = any>(source: any, candidates: string[]): T | null {
-  for (const candidate of candidates) {
-    if (candidate && source && candidate in source) {
-      return source[candidate] as T;
-    }
-  }
-  return null;
-}
-
 function sqlString(value: string): string {
   return `'${String(value || "").replace(/'/g, "''")}'`;
 }
@@ -52,11 +43,6 @@ function tableRows(table: any): any[] {
 
 function rowTicketId(row: any): string {
   return String(row && (row.ticketId || row.ticket_id) || "");
-}
-
-function rowExpiresAfter(row: any, nowMs: number): boolean {
-  const expiresAt = Date.parse(String(row && (row.expiresAt || row.expires_at) || ""));
-  return Number.isFinite(expiresAt) && expiresAt > nowMs;
 }
 
 class TicketSpacetimeClient {
@@ -237,22 +223,11 @@ class TicketSpacetimeClient {
 
   appendSafeLog(level: string, event: string, detailJson: string, correlationId = ""): Promise<void> {
     return this.callReducer("memberAppendSafeOperationalLog", {
+      id: this.logRowId("browser", event, correlationId),
       ticketId: this.cfg.ticketId,
       level,
       event,
       correlationId,
-      detailJson,
-    });
-  }
-
-  appendDevMetric(metricName: string, phase: string, flowId: string, valueMillis: number, ok: boolean, detailJson: string): Promise<void> {
-    return this.callReducer("memberAppendDevPerfMetric", {
-      ticketId: this.cfg.ticketId,
-      metricName,
-      phase,
-      flowId,
-      valueMillis: Math.max(0, Math.min(86400000, Math.round(Number(valueMillis) || 0))),
-      ok,
       detailJson,
     });
   }
@@ -311,9 +286,6 @@ class TicketSpacetimeClient {
         this.heartbeat(true);
       })
       .subscribe([
-        `SELECT * FROM ticketremote_ticket_summary WHERE ticketId = ${ticket}`,
-        `SELECT * FROM ticketremote_viewer_public WHERE ticketId = ${ticket}`,
-        `SELECT * FROM ticketremote_phone_status WHERE ticketId = ${ticket}`,
         `SELECT * FROM ticketremote_stream_desired_state WHERE ticketId = ${ticket}`,
         `SELECT * FROM ticketremote_phone_current_report WHERE ticketId = ${ticket}`,
         `SELECT * FROM ticketremote_relay_current_report WHERE ticketId = ${ticket}`,
@@ -324,14 +296,6 @@ class TicketSpacetimeClient {
   private publishFocusedState(): void {
     if (!this.isReady()) return;
     const db = this.requireConnection().db;
-    const nowMs = Date.now();
-    const summary = tableRows(this.ticketSummaryTable(db))
-      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
-    const viewers = tableRows(this.viewerPublicTable(db))
-      .filter((row) => rowTicketId(row) === this.cfg.ticketId && row.connected !== false && rowExpiresAfter(row, nowMs))
-      .sort((a, b) => String(a.publicId || a.public_id || "").localeCompare(String(b.publicId || b.public_id || "")));
-    const phone = tableRows(this.phoneStatusTable(db))
-      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
     const desired = tableRows(this.streamDesiredStateTable(db))
       .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
     const phoneReport = tableRows(this.phoneCurrentReportTable(db))
@@ -343,31 +307,30 @@ class TicketSpacetimeClient {
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && String(row.ownerPublicId || row.owner_public_id || "") === ownerPublicId)
       .sort((a, b) => String(b.updatedAt || b.updated_at || "").localeCompare(String(a.updatedAt || a.updated_at || "")));
     const updatedAt = String(
-      summary && (summary.updatedAt || summary.updated_at) ||
       relayReport && (relayReport.updatedAt || relayReport.updated_at) ||
       phoneReport && (phoneReport.updatedAt || phoneReport.updated_at) ||
-      phone && (phone.updatedAt || phone.updated_at || phone.lastSeenAt || phone.last_seen_at) ||
       new Date().toISOString()
     );
-    const phoneBackendId = String(phone && (phone.backendId || phone.backend_id || phone.id) || summary && (summary.phoneBackendId || summary.phone_backend_id) || "");
-    const phoneAttachName = String(phone && (phone.attachName || phone.attach_name) || summary && (summary.phoneAttachName || summary.phone_attach_name) || phoneBackendId);
-    const phoneDesiredState = String(phone && (phone.desiredState || phone.desired_state) || summary && (summary.phoneDesiredState || summary.phone_desired_state) || "");
-    const phoneLastSeenAt = String(phone && (phone.lastSeenAt || phone.last_seen_at) || summary && (summary.phoneLastSeenAt || summary.phone_last_seen_at) || "");
+    const phoneBackendId = String(
+      phoneReport && (phoneReport.backendId || phoneReport.backend_id) ||
+      relayReport && (relayReport.backendId || relayReport.backend_id) ||
+      "pixel"
+    );
+    const phoneDesiredState = String(desired && (desired.desiredActive ?? desired.desired_active) ? "streaming" : "idle");
+    const phoneLastSeenAt = String(phoneReport && (phoneReport.updatedAt || phoneReport.updated_at) || "");
+    const viewerCount = Number(desired && (desired.viewerCount ?? desired.viewer_count) || relayReport && (relayReport.videoClients ?? relayReport.video_clients) || 0);
     this.handlers.onState?.({
       ticket: {
         id: this.cfg.ticketId,
-        displayName: String(summary && (summary.displayName || summary.display_name) || "ViVi timed ticket"),
+        displayName: "ViVi timed ticket",
         updatedAt,
       },
-      viewerCount: viewers.length,
-      viewerPresence: viewers.map((viewer) => ({
-        publicId: String(viewer.publicId || viewer.public_id || ""),
-        label: String(viewer.label || viewer.publicId || viewer.public_id || ""),
-      })),
+      viewerCount,
+      viewerPresence: [],
       activeControl: null,
       phone: phoneBackendId ? {
         id: phoneBackendId,
-        attachName: phoneAttachName,
+        attachName: phoneBackendId,
         desiredState: phoneDesiredState,
         lastSeenAt: phoneLastSeenAt,
       } : null,
@@ -427,38 +390,11 @@ class TicketSpacetimeClient {
 
   private focusedStateTables(source: any): any[] {
     return [
-      this.ticketSummaryTable(source),
-      this.viewerPublicTable(source),
-      this.phoneStatusTable(source),
       this.streamDesiredStateTable(source),
       this.phoneCurrentReportTable(source),
       this.relayCurrentReportTable(source),
       this.controlCodeRequestTable(source),
     ];
-  }
-
-  private ticketSummaryTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteTicketSummary",
-      "ticketRemoteTicketSummary",
-      "ticketremote_ticket_summary",
-    ]);
-  }
-
-  private viewerPublicTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteViewerPublic",
-      "ticketRemoteViewerPublic",
-      "ticketremote_viewer_public",
-    ]);
-  }
-
-  private phoneStatusTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremotePhoneStatus",
-      "ticketRemotePhoneStatus",
-      "ticketremote_phone_status",
-    ]);
   }
 
   private streamDesiredStateTable(source: any): any {
@@ -495,6 +431,16 @@ class TicketSpacetimeClient {
 
   private backendId(): string {
     return "pixel";
+  }
+
+  private logRowId(source: string, event: string, correlationId: string): string {
+    const clean = (value: string, fallback: string) => String(value || fallback)
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, "_")
+      .slice(0, 80) || fallback;
+    const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
+    const nonce = Math.random().toString(36).slice(2, 10);
+    return `${this.cfg.ticketId}:${stamp}:${clean(source, "browser")}:${clean(event, "event")}:${clean(correlationId, "none")}:${nonce}`;
   }
 
   private reducer(name: string): any {

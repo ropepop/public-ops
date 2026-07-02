@@ -73,9 +73,11 @@ pub trait ticketremote_member_close_control_code {
         request_id: String,
         reason: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()>;
 }
 
@@ -88,9 +90,11 @@ impl ticketremote_member_close_control_code for super::RemoteReducers {
         request_id: String,
         reason: String,
 
-        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
-            + Send
-            + 'static,
+        callback: impl FnOnce(
+            &super::ReducerEventContext,
+            Result<Result<(), String>, __sdk::InternalError>,
+        ) + Send
+        + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             TicketremoteMemberCloseControlCodeArgs {

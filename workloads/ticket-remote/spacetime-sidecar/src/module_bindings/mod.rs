@@ -7,178 +7,108 @@
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 pub mod ticketremote_ack_stream_command_reducer;
-pub mod ticketremote_append_dev_perf_metric_reducer;
 pub mod ticketremote_append_safe_operational_log_reducer;
 pub mod ticketremote_append_stream_command_reducer;
-pub mod ticketremote_audit_counter_type;
-pub mod ticketremote_audit_event_type;
-pub mod ticketremote_audit_reducer;
 pub mod ticketremote_auth_config_type;
-pub mod ticketremote_claim_control_reducer;
 pub mod ticketremote_cleanup_expired_reducer;
 pub mod ticketremote_cleanup_schedule_type;
 pub mod ticketremote_control_code_owner_type;
 pub mod ticketremote_control_code_request_table;
 pub mod ticketremote_control_code_request_type;
-pub mod ticketremote_control_session_type;
-pub mod ticketremote_dev_perf_metric_type;
-pub mod ticketremote_dev_perf_metrics_config_type;
-pub mod ticketremote_disconnect_presence_reducer;
-pub mod ticketremote_extend_control_reducer;
-pub mod ticketremote_heartbeat_presence_reducer;
-pub mod ticketremote_member_append_dev_perf_metric_reducer;
 pub mod ticketremote_member_append_safe_operational_log_reducer;
-pub mod ticketremote_member_claim_control_reducer;
 pub mod ticketremote_member_close_control_code_reducer;
 pub mod ticketremote_member_confirm_control_code_browser_capture_reducer;
-pub mod ticketremote_member_extend_control_reducer;
 pub mod ticketremote_member_prepare_control_code_reducer;
 pub mod ticketremote_member_recover_stream_reducer;
-pub mod ticketremote_member_release_control_reducer;
 pub mod ticketremote_member_remove_member_reducer;
 pub mod ticketremote_member_request_control_code_reducer;
 pub mod ticketremote_member_request_keyframe_reducer;
-pub mod ticketremote_member_revoke_control_reducer;
 pub mod ticketremote_member_set_stream_focus_reducer;
 pub mod ticketremote_member_upsert_member_reducer;
 pub mod ticketremote_phone_backend_type;
 pub mod ticketremote_phone_current_report_table;
 pub mod ticketremote_phone_current_report_type;
-pub mod ticketremote_phone_status_history_type;
-pub mod ticketremote_phone_status_table;
-pub mod ticketremote_phone_status_type;
 pub mod ticketremote_purge_expired_stream_commands_reducer;
 pub mod ticketremote_register_service_identity_reducer;
 pub mod ticketremote_relay_current_report_table;
 pub mod ticketremote_relay_current_report_type;
-pub mod ticketremote_release_control_reducer;
 pub mod ticketremote_remove_member_reducer;
-pub mod ticketremote_revoke_control_reducer;
 pub mod ticketremote_safe_operational_log_type;
 pub mod ticketremote_service_bootstrap_reducer;
-pub mod ticketremote_service_control_session_table;
-pub mod ticketremote_service_control_type;
 pub mod ticketremote_service_identity_type;
 pub mod ticketremote_service_member_type;
 pub mod ticketremote_service_phone_backend_table;
 pub mod ticketremote_service_phone_type;
-pub mod ticketremote_service_safe_operational_log_table;
-pub mod ticketremote_service_safe_operational_log_type;
 pub mod ticketremote_service_stream_command_table;
 pub mod ticketremote_service_stream_command_type;
 pub mod ticketremote_service_ticket_member_table;
 pub mod ticketremote_service_ticket_table;
 pub mod ticketremote_service_ticket_type;
-pub mod ticketremote_service_viewer_presence_table;
-pub mod ticketremote_service_viewer_type;
-pub mod ticketremote_set_dev_perf_metrics_reducer;
 pub mod ticketremote_set_stream_desired_state_reducer;
-pub mod ticketremote_snapshot_runtime_tables_to_logs_reducer;
 pub mod ticketremote_stream_command_signal_table;
 pub mod ticketremote_stream_command_signal_type;
 pub mod ticketremote_stream_command_type;
 pub mod ticketremote_stream_desired_state_table;
 pub mod ticketremote_stream_desired_state_type;
 pub mod ticketremote_ticket_member_type;
-pub mod ticketremote_ticket_summary_table;
-pub mod ticketremote_ticket_summary_type;
 pub mod ticketremote_ticket_type;
 pub mod ticketremote_update_control_code_request_reducer;
 pub mod ticketremote_update_phone_current_report_reducer;
 pub mod ticketremote_update_phone_reducer;
-pub mod ticketremote_update_phone_status_reducer;
 pub mod ticketremote_update_relay_current_report_reducer;
 pub mod ticketremote_upsert_member_reducer;
-pub mod ticketremote_viewer_presence_type;
-pub mod ticketremote_viewer_public_table;
-pub mod ticketremote_viewer_public_type;
 
 pub use ticketremote_ack_stream_command_reducer::ticketremote_ack_stream_command;
-pub use ticketremote_append_dev_perf_metric_reducer::ticketremote_append_dev_perf_metric;
 pub use ticketremote_append_safe_operational_log_reducer::ticketremote_append_safe_operational_log;
 pub use ticketremote_append_stream_command_reducer::ticketremote_append_stream_command;
-pub use ticketremote_audit_counter_type::TicketremoteAuditCounter;
-pub use ticketremote_audit_event_type::TicketremoteAuditEvent;
-pub use ticketremote_audit_reducer::ticketremote_audit;
 pub use ticketremote_auth_config_type::TicketremoteAuthConfig;
-pub use ticketremote_claim_control_reducer::ticketremote_claim_control;
 pub use ticketremote_cleanup_expired_reducer::ticketremote_cleanup_expired;
 pub use ticketremote_cleanup_schedule_type::TicketremoteCleanupSchedule;
 pub use ticketremote_control_code_owner_type::TicketremoteControlCodeOwner;
 pub use ticketremote_control_code_request_table::*;
 pub use ticketremote_control_code_request_type::TicketremoteControlCodeRequest;
-pub use ticketremote_control_session_type::TicketremoteControlSession;
-pub use ticketremote_dev_perf_metric_type::TicketremoteDevPerfMetric;
-pub use ticketremote_dev_perf_metrics_config_type::TicketremoteDevPerfMetricsConfig;
-pub use ticketremote_disconnect_presence_reducer::ticketremote_disconnect_presence;
-pub use ticketremote_extend_control_reducer::ticketremote_extend_control;
-pub use ticketremote_heartbeat_presence_reducer::ticketremote_heartbeat_presence;
-pub use ticketremote_member_append_dev_perf_metric_reducer::ticketremote_member_append_dev_perf_metric;
 pub use ticketremote_member_append_safe_operational_log_reducer::ticketremote_member_append_safe_operational_log;
-pub use ticketremote_member_claim_control_reducer::ticketremote_member_claim_control;
 pub use ticketremote_member_close_control_code_reducer::ticketremote_member_close_control_code;
 pub use ticketremote_member_confirm_control_code_browser_capture_reducer::ticketremote_member_confirm_control_code_browser_capture;
-pub use ticketremote_member_extend_control_reducer::ticketremote_member_extend_control;
 pub use ticketremote_member_prepare_control_code_reducer::ticketremote_member_prepare_control_code;
 pub use ticketremote_member_recover_stream_reducer::ticketremote_member_recover_stream;
-pub use ticketremote_member_release_control_reducer::ticketremote_member_release_control;
 pub use ticketremote_member_remove_member_reducer::ticketremote_member_remove_member;
 pub use ticketremote_member_request_control_code_reducer::ticketremote_member_request_control_code;
 pub use ticketremote_member_request_keyframe_reducer::ticketremote_member_request_keyframe;
-pub use ticketremote_member_revoke_control_reducer::ticketremote_member_revoke_control;
 pub use ticketremote_member_set_stream_focus_reducer::ticketremote_member_set_stream_focus;
 pub use ticketremote_member_upsert_member_reducer::ticketremote_member_upsert_member;
 pub use ticketremote_phone_backend_type::TicketremotePhoneBackend;
 pub use ticketremote_phone_current_report_table::*;
 pub use ticketremote_phone_current_report_type::TicketremotePhoneCurrentReport;
-pub use ticketremote_phone_status_history_type::TicketremotePhoneStatusHistory;
-pub use ticketremote_phone_status_table::*;
-pub use ticketremote_phone_status_type::TicketremotePhoneStatus;
 pub use ticketremote_purge_expired_stream_commands_reducer::ticketremote_purge_expired_stream_commands;
 pub use ticketremote_register_service_identity_reducer::ticketremote_register_service_identity;
 pub use ticketremote_relay_current_report_table::*;
 pub use ticketremote_relay_current_report_type::TicketremoteRelayCurrentReport;
-pub use ticketremote_release_control_reducer::ticketremote_release_control;
 pub use ticketremote_remove_member_reducer::ticketremote_remove_member;
-pub use ticketremote_revoke_control_reducer::ticketremote_revoke_control;
 pub use ticketremote_safe_operational_log_type::TicketremoteSafeOperationalLog;
 pub use ticketremote_service_bootstrap_reducer::ticketremote_service_bootstrap;
-pub use ticketremote_service_control_session_table::*;
-pub use ticketremote_service_control_type::TicketremoteServiceControl;
 pub use ticketremote_service_identity_type::TicketremoteServiceIdentity;
 pub use ticketremote_service_member_type::TicketremoteServiceMember;
 pub use ticketremote_service_phone_backend_table::*;
 pub use ticketremote_service_phone_type::TicketremoteServicePhone;
-pub use ticketremote_service_safe_operational_log_table::*;
-pub use ticketremote_service_safe_operational_log_type::TicketremoteServiceSafeOperationalLog;
 pub use ticketremote_service_stream_command_table::*;
 pub use ticketremote_service_stream_command_type::TicketremoteServiceStreamCommand;
 pub use ticketremote_service_ticket_member_table::*;
 pub use ticketremote_service_ticket_table::*;
 pub use ticketremote_service_ticket_type::TicketremoteServiceTicket;
-pub use ticketremote_service_viewer_presence_table::*;
-pub use ticketremote_service_viewer_type::TicketremoteServiceViewer;
-pub use ticketremote_set_dev_perf_metrics_reducer::ticketremote_set_dev_perf_metrics;
 pub use ticketremote_set_stream_desired_state_reducer::ticketremote_set_stream_desired_state;
-pub use ticketremote_snapshot_runtime_tables_to_logs_reducer::ticketremote_snapshot_runtime_tables_to_logs;
 pub use ticketremote_stream_command_signal_table::*;
 pub use ticketremote_stream_command_signal_type::TicketremoteStreamCommandSignal;
 pub use ticketremote_stream_command_type::TicketremoteStreamCommand;
 pub use ticketremote_stream_desired_state_table::*;
 pub use ticketremote_stream_desired_state_type::TicketremoteStreamDesiredState;
 pub use ticketremote_ticket_member_type::TicketremoteTicketMember;
-pub use ticketremote_ticket_summary_table::*;
-pub use ticketremote_ticket_summary_type::TicketremoteTicketSummary;
 pub use ticketremote_ticket_type::TicketremoteTicket;
 pub use ticketremote_update_control_code_request_reducer::ticketremote_update_control_code_request;
 pub use ticketremote_update_phone_current_report_reducer::ticketremote_update_phone_current_report;
 pub use ticketremote_update_phone_reducer::ticketremote_update_phone;
-pub use ticketremote_update_phone_status_reducer::ticketremote_update_phone_status;
 pub use ticketremote_update_relay_current_report_reducer::ticketremote_update_relay_current_report;
 pub use ticketremote_upsert_member_reducer::ticketremote_upsert_member;
-pub use ticketremote_viewer_presence_type::TicketremoteViewerPresence;
-pub use ticketremote_viewer_public_table::*;
-pub use ticketremote_viewer_public_type::TicketremoteViewerPublic;
 
 #[derive(Clone, PartialEq, Debug)]
 
@@ -194,18 +124,8 @@ pub enum Reducer {
         reason: String,
         now_arg: String,
     },
-    TicketremoteAppendDevPerfMetric {
-        ticket_id: String,
-        source: String,
-        metric_name: String,
-        phase: String,
-        flow_id: String,
-        value_millis: u32,
-        ok: bool,
-        detail_json: String,
-        now_arg: String,
-    },
     TicketremoteAppendSafeOperationalLog {
+        id: String,
         ticket_id: String,
         source: String,
         level: String,
@@ -225,62 +145,18 @@ pub enum Reducer {
         ttl_millis: u32,
         now_arg: String,
     },
-    TicketremoteAudit {
-        ticket_id: String,
-        actor_email: String,
-        event: String,
-        payload_json: String,
-        now_arg: String,
-    },
-    TicketremoteClaimControl {
-        ticket_id: String,
-        session_id: String,
-        email: String,
-        now_arg: String,
-    },
     TicketremoteCleanupExpired {
         ticket_id: String,
         now_arg: String,
         batch_size: u32,
     },
-    TicketremoteDisconnectPresence {
-        ticket_id: String,
-        session_id: String,
-        now_arg: String,
-    },
-    TicketremoteExtendControl {
-        ticket_id: String,
-        session_id: String,
-        email: String,
-        now_arg: String,
-    },
-    TicketremoteHeartbeatPresence {
-        ticket_id: String,
-        session_id: String,
-        email: String,
-        display_name: String,
-        page: String,
-        connected: bool,
-        now_arg: String,
-    },
-    TicketremoteMemberAppendDevPerfMetric {
-        ticket_id: String,
-        metric_name: String,
-        phase: String,
-        flow_id: String,
-        value_millis: u32,
-        ok: bool,
-        detail_json: String,
-    },
     TicketremoteMemberAppendSafeOperationalLog {
+        id: String,
         ticket_id: String,
         level: String,
         event: String,
         correlation_id: String,
         detail_json: String,
-    },
-    TicketremoteMemberClaimControl {
-        ticket_id: String,
     },
     TicketremoteMemberCloseControlCode {
         ticket_id: String,
@@ -298,9 +174,6 @@ pub enum Reducer {
         candidate_frame_sequence: String,
         accepted_reason: String,
     },
-    TicketremoteMemberExtendControl {
-        ticket_id: String,
-    },
     TicketremoteMemberPrepareControlCode {
         ticket_id: String,
         backend_id: String,
@@ -309,10 +182,6 @@ pub enum Reducer {
     TicketremoteMemberRecoverStream {
         ticket_id: String,
         backend_id: String,
-        reason: String,
-    },
-    TicketremoteMemberReleaseControl {
-        ticket_id: String,
         reason: String,
     },
     TicketremoteMemberRemoveMember {
@@ -328,10 +197,6 @@ pub enum Reducer {
     TicketremoteMemberRequestKeyframe {
         ticket_id: String,
         backend_id: String,
-        reason: String,
-    },
-    TicketremoteMemberRevokeControl {
-        ticket_id: String,
         reason: String,
     },
     TicketremoteMemberSetStreamFocus {
@@ -355,23 +220,10 @@ pub enum Reducer {
         ticket_id: String,
         now: String,
     },
-    TicketremoteReleaseControl {
-        ticket_id: String,
-        session_id: String,
-        email: String,
-        reason: String,
-        now_arg: String,
-    },
     TicketremoteRemoveMember {
         ticket_id: String,
         actor_email: String,
         email: String,
-        now_arg: String,
-    },
-    TicketremoteRevokeControl {
-        ticket_id: String,
-        actor_email: String,
-        reason: String,
         now_arg: String,
     },
     TicketremoteServiceBootstrap {
@@ -384,13 +236,6 @@ pub enum Reducer {
         auth_issuer: String,
         auth_audience: String,
     },
-    TicketremoteSetDevPerfMetrics {
-        ticket_id: String,
-        enabled: bool,
-        reason: String,
-        expires_at: String,
-        now_arg: String,
-    },
     TicketremoteSetStreamDesiredState {
         ticket_id: String,
         backend_id: String,
@@ -400,11 +245,6 @@ pub enum Reducer {
         revision: String,
         updated_by: String,
         now_arg: String,
-    },
-    TicketremoteSnapshotRuntimeTablesToLogs {
-        ticket_id: String,
-        now_arg: String,
-        batch_size: u32,
     },
     TicketremoteUpdateControlCodeRequest {
         ticket_id: String,
@@ -442,16 +282,6 @@ pub enum Reducer {
         status_json: String,
         now_arg: String,
     },
-    TicketremoteUpdatePhoneStatus {
-        ticket_id: String,
-        backend_id: String,
-        attach_name: String,
-        base_url: String,
-        desired_state: String,
-        health_json: String,
-        last_error: String,
-        now_arg: String,
-    },
     TicketremoteUpdateRelayCurrentReport {
         ticket_id: String,
         backend_id: String,
@@ -479,40 +309,24 @@ impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
             Reducer::TicketremoteAckStreamCommand { .. } => "ticketremote_ack_stream_command",
-            Reducer::TicketremoteAppendDevPerfMetric { .. } => {
-                "ticketremote_append_dev_perf_metric"
-            }
             Reducer::TicketremoteAppendSafeOperationalLog { .. } => {
                 "ticketremote_append_safe_operational_log"
             }
             Reducer::TicketremoteAppendStreamCommand { .. } => "ticketremote_append_stream_command",
-            Reducer::TicketremoteAudit { .. } => "ticketremote_audit",
-            Reducer::TicketremoteClaimControl { .. } => "ticketremote_claim_control",
             Reducer::TicketremoteCleanupExpired { .. } => "ticketremote_cleanup_expired",
-            Reducer::TicketremoteDisconnectPresence { .. } => "ticketremote_disconnect_presence",
-            Reducer::TicketremoteExtendControl { .. } => "ticketremote_extend_control",
-            Reducer::TicketremoteHeartbeatPresence { .. } => "ticketremote_heartbeat_presence",
-            Reducer::TicketremoteMemberAppendDevPerfMetric { .. } => {
-                "ticketremote_member_append_dev_perf_metric"
-            }
             Reducer::TicketremoteMemberAppendSafeOperationalLog { .. } => {
                 "ticketremote_member_append_safe_operational_log"
             }
-            Reducer::TicketremoteMemberClaimControl { .. } => "ticketremote_member_claim_control",
             Reducer::TicketremoteMemberCloseControlCode { .. } => {
                 "ticketremote_member_close_control_code"
             }
             Reducer::TicketremoteMemberConfirmControlCodeBrowserCapture { .. } => {
                 "ticketremote_member_confirm_control_code_browser_capture"
             }
-            Reducer::TicketremoteMemberExtendControl { .. } => "ticketremote_member_extend_control",
             Reducer::TicketremoteMemberPrepareControlCode { .. } => {
                 "ticketremote_member_prepare_control_code"
             }
             Reducer::TicketremoteMemberRecoverStream { .. } => "ticketremote_member_recover_stream",
-            Reducer::TicketremoteMemberReleaseControl { .. } => {
-                "ticketremote_member_release_control"
-            }
             Reducer::TicketremoteMemberRemoveMember { .. } => "ticketremote_member_remove_member",
             Reducer::TicketremoteMemberRequestControlCode { .. } => {
                 "ticketremote_member_request_control_code"
@@ -520,7 +334,6 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteMemberRequestKeyframe { .. } => {
                 "ticketremote_member_request_keyframe"
             }
-            Reducer::TicketremoteMemberRevokeControl { .. } => "ticketremote_member_revoke_control",
             Reducer::TicketremoteMemberSetStreamFocus { .. } => {
                 "ticketremote_member_set_stream_focus"
             }
@@ -531,16 +344,10 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteRegisterServiceIdentity { .. } => {
                 "ticketremote_register_service_identity"
             }
-            Reducer::TicketremoteReleaseControl { .. } => "ticketremote_release_control",
             Reducer::TicketremoteRemoveMember { .. } => "ticketremote_remove_member",
-            Reducer::TicketremoteRevokeControl { .. } => "ticketremote_revoke_control",
             Reducer::TicketremoteServiceBootstrap { .. } => "ticketremote_service_bootstrap",
-            Reducer::TicketremoteSetDevPerfMetrics { .. } => "ticketremote_set_dev_perf_metrics",
             Reducer::TicketremoteSetStreamDesiredState { .. } => {
                 "ticketremote_set_stream_desired_state"
-            }
-            Reducer::TicketremoteSnapshotRuntimeTablesToLogs { .. } => {
-                "ticketremote_snapshot_runtime_tables_to_logs"
             }
             Reducer::TicketremoteUpdateControlCodeRequest { .. } => {
                 "ticketremote_update_control_code_request"
@@ -549,7 +356,6 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteUpdatePhoneCurrentReport { .. } => {
                 "ticketremote_update_phone_current_report"
             }
-            Reducer::TicketremoteUpdatePhoneStatus { .. } => "ticketremote_update_phone_status",
             Reducer::TicketremoteUpdateRelayCurrentReport { .. } => {
                 "ticketremote_update_relay_current_report"
             }
@@ -571,28 +377,8 @@ impl __sdk::Reducer for Reducer {
                 reason: reason.clone(),
                 now_arg: now_arg.clone(),
 }),
-            Reducer::TicketremoteAppendDevPerfMetric{
-                ticket_id,
-                source,
-                metric_name,
-                phase,
-                flow_id,
-                value_millis,
-                ok,
-                detail_json,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_append_dev_perf_metric_reducer::TicketremoteAppendDevPerfMetricArgs {
-                ticket_id: ticket_id.clone(),
-                source: source.clone(),
-                metric_name: metric_name.clone(),
-                phase: phase.clone(),
-                flow_id: flow_id.clone(),
-                value_millis: value_millis.clone(),
-                ok: ok.clone(),
-                detail_json: detail_json.clone(),
-                now_arg: now_arg.clone(),
-}),
             Reducer::TicketremoteAppendSafeOperationalLog{
+                id,
                 ticket_id,
                 source,
                 level,
@@ -601,6 +387,7 @@ impl __sdk::Reducer for Reducer {
                 detail_json,
                 now_arg,
 }             => __sats::bsatn::to_vec(&ticketremote_append_safe_operational_log_reducer::TicketremoteAppendSafeOperationalLogArgs {
+                id: id.clone(),
                 ticket_id: ticket_id.clone(),
                 source: source.clone(),
                 level: level.clone(),
@@ -630,30 +417,6 @@ impl __sdk::Reducer for Reducer {
                 ttl_millis: ttl_millis.clone(),
                 now_arg: now_arg.clone(),
 }),
-            Reducer::TicketremoteAudit{
-                ticket_id,
-                actor_email,
-                event,
-                payload_json,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_audit_reducer::TicketremoteAuditArgs {
-                ticket_id: ticket_id.clone(),
-                actor_email: actor_email.clone(),
-                event: event.clone(),
-                payload_json: payload_json.clone(),
-                now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteClaimControl{
-                ticket_id,
-                session_id,
-                email,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_claim_control_reducer::TicketremoteClaimControlArgs {
-                ticket_id: ticket_id.clone(),
-                session_id: session_id.clone(),
-                email: email.clone(),
-                now_arg: now_arg.clone(),
-}),
             Reducer::TicketremoteCleanupExpired{
                 ticket_id,
                 now_arg,
@@ -663,77 +426,20 @@ impl __sdk::Reducer for Reducer {
                 now_arg: now_arg.clone(),
                 batch_size: batch_size.clone(),
 }),
-            Reducer::TicketremoteDisconnectPresence{
-                ticket_id,
-                session_id,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_disconnect_presence_reducer::TicketremoteDisconnectPresenceArgs {
-                ticket_id: ticket_id.clone(),
-                session_id: session_id.clone(),
-                now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteExtendControl{
-                ticket_id,
-                session_id,
-                email,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_extend_control_reducer::TicketremoteExtendControlArgs {
-                ticket_id: ticket_id.clone(),
-                session_id: session_id.clone(),
-                email: email.clone(),
-                now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteHeartbeatPresence{
-                ticket_id,
-                session_id,
-                email,
-                display_name,
-                page,
-                connected,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_heartbeat_presence_reducer::TicketremoteHeartbeatPresenceArgs {
-                ticket_id: ticket_id.clone(),
-                session_id: session_id.clone(),
-                email: email.clone(),
-                display_name: display_name.clone(),
-                page: page.clone(),
-                connected: connected.clone(),
-                now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteMemberAppendDevPerfMetric{
-                ticket_id,
-                metric_name,
-                phase,
-                flow_id,
-                value_millis,
-                ok,
-                detail_json,
-}             => __sats::bsatn::to_vec(&ticketremote_member_append_dev_perf_metric_reducer::TicketremoteMemberAppendDevPerfMetricArgs {
-                ticket_id: ticket_id.clone(),
-                metric_name: metric_name.clone(),
-                phase: phase.clone(),
-                flow_id: flow_id.clone(),
-                value_millis: value_millis.clone(),
-                ok: ok.clone(),
-                detail_json: detail_json.clone(),
-}),
             Reducer::TicketremoteMemberAppendSafeOperationalLog{
+                id,
                 ticket_id,
                 level,
                 event,
                 correlation_id,
                 detail_json,
 }             => __sats::bsatn::to_vec(&ticketremote_member_append_safe_operational_log_reducer::TicketremoteMemberAppendSafeOperationalLogArgs {
+                id: id.clone(),
                 ticket_id: ticket_id.clone(),
                 level: level.clone(),
                 event: event.clone(),
                 correlation_id: correlation_id.clone(),
                 detail_json: detail_json.clone(),
-}),
-            Reducer::TicketremoteMemberClaimControl{
-                ticket_id,
-}             => __sats::bsatn::to_vec(&ticketremote_member_claim_control_reducer::TicketremoteMemberClaimControlArgs {
-                ticket_id: ticket_id.clone(),
 }),
             Reducer::TicketremoteMemberCloseControlCode{
                 ticket_id,
@@ -765,11 +471,6 @@ impl __sdk::Reducer for Reducer {
                 candidate_frame_sequence: candidate_frame_sequence.clone(),
                 accepted_reason: accepted_reason.clone(),
 }),
-            Reducer::TicketremoteMemberExtendControl{
-                ticket_id,
-}             => __sats::bsatn::to_vec(&ticketremote_member_extend_control_reducer::TicketremoteMemberExtendControlArgs {
-                ticket_id: ticket_id.clone(),
-}),
             Reducer::TicketremoteMemberPrepareControlCode{
                 ticket_id,
                 backend_id,
@@ -786,13 +487,6 @@ impl __sdk::Reducer for Reducer {
 }             => __sats::bsatn::to_vec(&ticketremote_member_recover_stream_reducer::TicketremoteMemberRecoverStreamArgs {
                 ticket_id: ticket_id.clone(),
                 backend_id: backend_id.clone(),
-                reason: reason.clone(),
-}),
-            Reducer::TicketremoteMemberReleaseControl{
-                ticket_id,
-                reason,
-}             => __sats::bsatn::to_vec(&ticketremote_member_release_control_reducer::TicketremoteMemberReleaseControlArgs {
-                ticket_id: ticket_id.clone(),
                 reason: reason.clone(),
 }),
             Reducer::TicketremoteMemberRemoveMember{
@@ -820,13 +514,6 @@ impl __sdk::Reducer for Reducer {
 }             => __sats::bsatn::to_vec(&ticketremote_member_request_keyframe_reducer::TicketremoteMemberRequestKeyframeArgs {
                 ticket_id: ticket_id.clone(),
                 backend_id: backend_id.clone(),
-                reason: reason.clone(),
-}),
-            Reducer::TicketremoteMemberRevokeControl{
-                ticket_id,
-                reason,
-}             => __sats::bsatn::to_vec(&ticketremote_member_revoke_control_reducer::TicketremoteMemberRevokeControlArgs {
-                ticket_id: ticket_id.clone(),
                 reason: reason.clone(),
 }),
             Reducer::TicketremoteMemberSetStreamFocus{
@@ -867,19 +554,6 @@ impl __sdk::Reducer for Reducer {
                 ticket_id: ticket_id.clone(),
                 now: now.clone(),
 }),
-            Reducer::TicketremoteReleaseControl{
-                ticket_id,
-                session_id,
-                email,
-                reason,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_release_control_reducer::TicketremoteReleaseControlArgs {
-                ticket_id: ticket_id.clone(),
-                session_id: session_id.clone(),
-                email: email.clone(),
-                reason: reason.clone(),
-                now_arg: now_arg.clone(),
-}),
             Reducer::TicketremoteRemoveMember{
                 ticket_id,
                 actor_email,
@@ -889,17 +563,6 @@ impl __sdk::Reducer for Reducer {
                 ticket_id: ticket_id.clone(),
                 actor_email: actor_email.clone(),
                 email: email.clone(),
-                now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteRevokeControl{
-                ticket_id,
-                actor_email,
-                reason,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_revoke_control_reducer::TicketremoteRevokeControlArgs {
-                ticket_id: ticket_id.clone(),
-                actor_email: actor_email.clone(),
-                reason: reason.clone(),
                 now_arg: now_arg.clone(),
 }),
             Reducer::TicketremoteServiceBootstrap{
@@ -921,19 +584,6 @@ impl __sdk::Reducer for Reducer {
                 auth_issuer: auth_issuer.clone(),
                 auth_audience: auth_audience.clone(),
 }),
-            Reducer::TicketremoteSetDevPerfMetrics{
-                ticket_id,
-                enabled,
-                reason,
-                expires_at,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_set_dev_perf_metrics_reducer::TicketremoteSetDevPerfMetricsArgs {
-                ticket_id: ticket_id.clone(),
-                enabled: enabled.clone(),
-                reason: reason.clone(),
-                expires_at: expires_at.clone(),
-                now_arg: now_arg.clone(),
-}),
             Reducer::TicketremoteSetStreamDesiredState{
                 ticket_id,
                 backend_id,
@@ -952,15 +602,6 @@ impl __sdk::Reducer for Reducer {
                 revision: revision.clone(),
                 updated_by: updated_by.clone(),
                 now_arg: now_arg.clone(),
-}),
-            Reducer::TicketremoteSnapshotRuntimeTablesToLogs{
-                ticket_id,
-                now_arg,
-                batch_size,
-}             => __sats::bsatn::to_vec(&ticketremote_snapshot_runtime_tables_to_logs_reducer::TicketremoteSnapshotRuntimeTablesToLogsArgs {
-                ticket_id: ticket_id.clone(),
-                now_arg: now_arg.clone(),
-                batch_size: batch_size.clone(),
 }),
             Reducer::TicketremoteUpdateControlCodeRequest{
                 ticket_id,
@@ -1031,25 +672,6 @@ impl __sdk::Reducer for Reducer {
                 status_json: status_json.clone(),
                 now_arg: now_arg.clone(),
 }),
-            Reducer::TicketremoteUpdatePhoneStatus{
-                ticket_id,
-                backend_id,
-                attach_name,
-                base_url,
-                desired_state,
-                health_json,
-                last_error,
-                now_arg,
-}             => __sats::bsatn::to_vec(&ticketremote_update_phone_status_reducer::TicketremoteUpdatePhoneStatusArgs {
-                ticket_id: ticket_id.clone(),
-                backend_id: backend_id.clone(),
-                attach_name: attach_name.clone(),
-                base_url: base_url.clone(),
-                desired_state: desired_state.clone(),
-                health_json: health_json.clone(),
-                last_error: last_error.clone(),
-                now_arg: now_arg.clone(),
-}),
             Reducer::TicketremoteUpdateRelayCurrentReport{
                 ticket_id,
                 backend_id,
@@ -1093,20 +715,13 @@ impl __sdk::Reducer for Reducer {
 pub struct DbUpdate {
     ticketremote_control_code_request: __sdk::TableUpdate<TicketremoteControlCodeRequest>,
     ticketremote_phone_current_report: __sdk::TableUpdate<TicketremotePhoneCurrentReport>,
-    ticketremote_phone_status: __sdk::TableUpdate<TicketremotePhoneStatus>,
     ticketremote_relay_current_report: __sdk::TableUpdate<TicketremoteRelayCurrentReport>,
-    ticketremote_service_control_session: __sdk::TableUpdate<TicketremoteServiceControl>,
     ticketremote_service_phone_backend: __sdk::TableUpdate<TicketremoteServicePhone>,
-    ticketremote_service_safe_operational_log:
-        __sdk::TableUpdate<TicketremoteServiceSafeOperationalLog>,
     ticketremote_service_stream_command: __sdk::TableUpdate<TicketremoteServiceStreamCommand>,
     ticketremote_service_ticket: __sdk::TableUpdate<TicketremoteServiceTicket>,
     ticketremote_service_ticket_member: __sdk::TableUpdate<TicketremoteServiceMember>,
-    ticketremote_service_viewer_presence: __sdk::TableUpdate<TicketremoteServiceViewer>,
     ticketremote_stream_command_signal: __sdk::TableUpdate<TicketremoteStreamCommandSignal>,
     ticketremote_stream_desired_state: __sdk::TableUpdate<TicketremoteStreamDesiredState>,
-    ticketremote_ticket_summary: __sdk::TableUpdate<TicketremoteTicketSummary>,
-    ticketremote_viewer_public: __sdk::TableUpdate<TicketremoteViewerPublic>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -1125,31 +740,14 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                         ticketremote_phone_current_report_table::parse_table_update(table_update)?,
                     )
                 }
-                "ticketremote_phone_status" => db_update.ticketremote_phone_status.append(
-                    ticketremote_phone_status_table::parse_table_update(table_update)?,
-                ),
                 "ticketremote_relay_current_report" => {
                     db_update.ticketremote_relay_current_report.append(
                         ticketremote_relay_current_report_table::parse_table_update(table_update)?,
                     )
                 }
-                "ticketremote_service_control_session" => {
-                    db_update.ticketremote_service_control_session.append(
-                        ticketremote_service_control_session_table::parse_table_update(
-                            table_update,
-                        )?,
-                    )
-                }
                 "ticketremote_service_phone_backend" => {
                     db_update.ticketremote_service_phone_backend.append(
                         ticketremote_service_phone_backend_table::parse_table_update(table_update)?,
-                    )
-                }
-                "ticketremote_service_safe_operational_log" => {
-                    db_update.ticketremote_service_safe_operational_log.append(
-                        ticketremote_service_safe_operational_log_table::parse_table_update(
-                            table_update,
-                        )?,
                     )
                 }
                 "ticketremote_service_stream_command" => {
@@ -1167,13 +765,6 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                         ticketremote_service_ticket_member_table::parse_table_update(table_update)?,
                     )
                 }
-                "ticketremote_service_viewer_presence" => {
-                    db_update.ticketremote_service_viewer_presence.append(
-                        ticketremote_service_viewer_presence_table::parse_table_update(
-                            table_update,
-                        )?,
-                    )
-                }
                 "ticketremote_stream_command_signal" => {
                     db_update.ticketremote_stream_command_signal.append(
                         ticketremote_stream_command_signal_table::parse_table_update(table_update)?,
@@ -1184,12 +775,6 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                         ticketremote_stream_desired_state_table::parse_table_update(table_update)?,
                     )
                 }
-                "ticketremote_ticket_summary" => db_update.ticketremote_ticket_summary.append(
-                    ticketremote_ticket_summary_table::parse_table_update(table_update)?,
-                ),
-                "ticketremote_viewer_public" => db_update.ticketremote_viewer_public.append(
-                    ticketremote_viewer_public_table::parse_table_update(table_update)?,
-                ),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -1228,12 +813,6 @@ impl __sdk::DbUpdate for DbUpdate {
                 &self.ticketremote_phone_current_report,
             )
             .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_phone_status = cache
-            .apply_diff_to_table::<TicketremotePhoneStatus>(
-                "ticketremote_phone_status",
-                &self.ticketremote_phone_status,
-            )
-            .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_relay_current_report = cache
             .apply_diff_to_table::<TicketremoteRelayCurrentReport>(
                 "ticketremote_relay_current_report",
@@ -1252,34 +831,10 @@ impl __sdk::DbUpdate for DbUpdate {
                 &self.ticketremote_stream_desired_state,
             )
             .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_ticket_summary = cache
-            .apply_diff_to_table::<TicketremoteTicketSummary>(
-                "ticketremote_ticket_summary",
-                &self.ticketremote_ticket_summary,
-            )
-            .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_viewer_public = cache
-            .apply_diff_to_table::<TicketremoteViewerPublic>(
-                "ticketremote_viewer_public",
-                &self.ticketremote_viewer_public,
-            )
-            .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_service_control_session = cache
-            .apply_diff_to_table::<TicketremoteServiceControl>(
-                "ticketremote_service_control_session",
-                &self.ticketremote_service_control_session,
-            )
-            .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_service_phone_backend = cache
             .apply_diff_to_table::<TicketremoteServicePhone>(
                 "ticketremote_service_phone_backend",
                 &self.ticketremote_service_phone_backend,
-            )
-            .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_service_safe_operational_log = cache
-            .apply_diff_to_table::<TicketremoteServiceSafeOperationalLog>(
-                "ticketremote_service_safe_operational_log",
-                &self.ticketremote_service_safe_operational_log,
             )
             .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_service_stream_command = cache
@@ -1300,12 +855,6 @@ impl __sdk::DbUpdate for DbUpdate {
                 &self.ticketremote_service_ticket_member,
             )
             .with_updates_by_pk(|row| &row.id);
-        diff.ticketremote_service_viewer_presence = cache
-            .apply_diff_to_table::<TicketremoteServiceViewer>(
-                "ticketremote_service_viewer_presence",
-                &self.ticketremote_service_viewer_presence,
-            )
-            .with_updates_by_pk(|row| &row.session_id);
 
         diff
     }
@@ -1319,20 +868,11 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_phone_current_report" => db_update
                     .ticketremote_phone_current_report
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_phone_status" => db_update
-                    .ticketremote_phone_status
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_relay_current_report" => db_update
                     .ticketremote_relay_current_report
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_service_control_session" => db_update
-                    .ticketremote_service_control_session
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_service_phone_backend" => db_update
                     .ticketremote_service_phone_backend
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_service_safe_operational_log" => db_update
-                    .ticketremote_service_safe_operational_log
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_service_stream_command" => db_update
                     .ticketremote_service_stream_command
@@ -1343,20 +883,11 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_service_ticket_member" => db_update
                     .ticketremote_service_ticket_member
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_service_viewer_presence" => db_update
-                    .ticketremote_service_viewer_presence
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_stream_command_signal" => db_update
                     .ticketremote_stream_command_signal
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_stream_desired_state" => db_update
                     .ticketremote_stream_desired_state
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_ticket_summary" => db_update
-                    .ticketremote_ticket_summary
-                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "ticketremote_viewer_public" => db_update
-                    .ticketremote_viewer_public
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -1377,20 +908,11 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_phone_current_report" => db_update
                     .ticketremote_phone_current_report
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_phone_status" => db_update
-                    .ticketremote_phone_status
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_relay_current_report" => db_update
                     .ticketremote_relay_current_report
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_service_control_session" => db_update
-                    .ticketremote_service_control_session
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_service_phone_backend" => db_update
                     .ticketremote_service_phone_backend
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_service_safe_operational_log" => db_update
-                    .ticketremote_service_safe_operational_log
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_service_stream_command" => db_update
                     .ticketremote_service_stream_command
@@ -1401,20 +923,11 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_service_ticket_member" => db_update
                     .ticketremote_service_ticket_member
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_service_viewer_presence" => db_update
-                    .ticketremote_service_viewer_presence
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_stream_command_signal" => db_update
                     .ticketremote_stream_command_signal
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_stream_desired_state" => db_update
                     .ticketremote_stream_desired_state
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_ticket_summary" => db_update
-                    .ticketremote_ticket_summary
-                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "ticketremote_viewer_public" => db_update
-                    .ticketremote_viewer_public
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -1433,22 +946,15 @@ impl __sdk::DbUpdate for DbUpdate {
 pub struct AppliedDiff<'r> {
     ticketremote_control_code_request: __sdk::TableAppliedDiff<'r, TicketremoteControlCodeRequest>,
     ticketremote_phone_current_report: __sdk::TableAppliedDiff<'r, TicketremotePhoneCurrentReport>,
-    ticketremote_phone_status: __sdk::TableAppliedDiff<'r, TicketremotePhoneStatus>,
     ticketremote_relay_current_report: __sdk::TableAppliedDiff<'r, TicketremoteRelayCurrentReport>,
-    ticketremote_service_control_session: __sdk::TableAppliedDiff<'r, TicketremoteServiceControl>,
     ticketremote_service_phone_backend: __sdk::TableAppliedDiff<'r, TicketremoteServicePhone>,
-    ticketremote_service_safe_operational_log:
-        __sdk::TableAppliedDiff<'r, TicketremoteServiceSafeOperationalLog>,
     ticketremote_service_stream_command:
         __sdk::TableAppliedDiff<'r, TicketremoteServiceStreamCommand>,
     ticketremote_service_ticket: __sdk::TableAppliedDiff<'r, TicketremoteServiceTicket>,
     ticketremote_service_ticket_member: __sdk::TableAppliedDiff<'r, TicketremoteServiceMember>,
-    ticketremote_service_viewer_presence: __sdk::TableAppliedDiff<'r, TicketremoteServiceViewer>,
     ticketremote_stream_command_signal:
         __sdk::TableAppliedDiff<'r, TicketremoteStreamCommandSignal>,
     ticketremote_stream_desired_state: __sdk::TableAppliedDiff<'r, TicketremoteStreamDesiredState>,
-    ticketremote_ticket_summary: __sdk::TableAppliedDiff<'r, TicketremoteTicketSummary>,
-    ticketremote_viewer_public: __sdk::TableAppliedDiff<'r, TicketremoteViewerPublic>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -1472,29 +978,14 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             &self.ticketremote_phone_current_report,
             event,
         );
-        callbacks.invoke_table_row_callbacks::<TicketremotePhoneStatus>(
-            "ticketremote_phone_status",
-            &self.ticketremote_phone_status,
-            event,
-        );
         callbacks.invoke_table_row_callbacks::<TicketremoteRelayCurrentReport>(
             "ticketremote_relay_current_report",
             &self.ticketremote_relay_current_report,
             event,
         );
-        callbacks.invoke_table_row_callbacks::<TicketremoteServiceControl>(
-            "ticketremote_service_control_session",
-            &self.ticketremote_service_control_session,
-            event,
-        );
         callbacks.invoke_table_row_callbacks::<TicketremoteServicePhone>(
             "ticketremote_service_phone_backend",
             &self.ticketremote_service_phone_backend,
-            event,
-        );
-        callbacks.invoke_table_row_callbacks::<TicketremoteServiceSafeOperationalLog>(
-            "ticketremote_service_safe_operational_log",
-            &self.ticketremote_service_safe_operational_log,
             event,
         );
         callbacks.invoke_table_row_callbacks::<TicketremoteServiceStreamCommand>(
@@ -1512,11 +1003,6 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             &self.ticketremote_service_ticket_member,
             event,
         );
-        callbacks.invoke_table_row_callbacks::<TicketremoteServiceViewer>(
-            "ticketremote_service_viewer_presence",
-            &self.ticketremote_service_viewer_presence,
-            event,
-        );
         callbacks.invoke_table_row_callbacks::<TicketremoteStreamCommandSignal>(
             "ticketremote_stream_command_signal",
             &self.ticketremote_stream_command_signal,
@@ -1525,16 +1011,6 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<TicketremoteStreamDesiredState>(
             "ticketremote_stream_desired_state",
             &self.ticketremote_stream_desired_state,
-            event,
-        );
-        callbacks.invoke_table_row_callbacks::<TicketremoteTicketSummary>(
-            "ticketremote_ticket_summary",
-            &self.ticketremote_ticket_summary,
-            event,
-        );
-        callbacks.invoke_table_row_callbacks::<TicketremoteViewerPublic>(
-            "ticketremote_viewer_public",
-            &self.ticketremote_viewer_public,
             event,
         );
     }
@@ -1792,19 +1268,19 @@ impl __sdk::SubscriptionHandle for SubscriptionHandle {
 /// either a [`DbConnection`] or an [`EventContext`] and operate on either.
 pub trait RemoteDbContext:
     __sdk::DbContext<
-    DbView = RemoteTables,
-    Reducers = RemoteReducers,
-    SubscriptionBuilder = __sdk::SubscriptionBuilder<RemoteModule>,
->
+        DbView = RemoteTables,
+        Reducers = RemoteReducers,
+        SubscriptionBuilder = __sdk::SubscriptionBuilder<RemoteModule>,
+    >
 {
 }
 impl<
-        Ctx: __sdk::DbContext<
+    Ctx: __sdk::DbContext<
             DbView = RemoteTables,
             Reducers = RemoteReducers,
             SubscriptionBuilder = __sdk::SubscriptionBuilder<RemoteModule>,
         >,
-    > RemoteDbContext for Ctx
+> RemoteDbContext for Ctx
 {
 }
 
@@ -2199,35 +1675,23 @@ impl __sdk::SpacetimeModule for RemoteModule {
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         ticketremote_control_code_request_table::register_table(client_cache);
         ticketremote_phone_current_report_table::register_table(client_cache);
-        ticketremote_phone_status_table::register_table(client_cache);
         ticketremote_relay_current_report_table::register_table(client_cache);
-        ticketremote_service_control_session_table::register_table(client_cache);
         ticketremote_service_phone_backend_table::register_table(client_cache);
-        ticketremote_service_safe_operational_log_table::register_table(client_cache);
         ticketremote_service_stream_command_table::register_table(client_cache);
         ticketremote_service_ticket_table::register_table(client_cache);
         ticketremote_service_ticket_member_table::register_table(client_cache);
-        ticketremote_service_viewer_presence_table::register_table(client_cache);
         ticketremote_stream_command_signal_table::register_table(client_cache);
         ticketremote_stream_desired_state_table::register_table(client_cache);
-        ticketremote_ticket_summary_table::register_table(client_cache);
-        ticketremote_viewer_public_table::register_table(client_cache);
     }
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
         "ticketremote_control_code_request",
         "ticketremote_phone_current_report",
-        "ticketremote_phone_status",
         "ticketremote_relay_current_report",
-        "ticketremote_service_control_session",
         "ticketremote_service_phone_backend",
-        "ticketremote_service_safe_operational_log",
         "ticketremote_service_stream_command",
         "ticketremote_service_ticket",
         "ticketremote_service_ticket_member",
-        "ticketremote_service_viewer_presence",
         "ticketremote_stream_command_signal",
         "ticketremote_stream_desired_state",
-        "ticketremote_ticket_summary",
-        "ticketremote_viewer_public",
     ];
 }

@@ -31,14 +31,7 @@ type Config struct {
 	Access              auth.AccessConfig
 	State               state.StoreConfig
 	Phone               PhoneConfig
-	DevPerfMetrics      DevPerfMetricsConfig
 	ServiceEvents       ServiceEventsConfig
-}
-
-type DevPerfMetricsConfig struct {
-	Enabled   bool
-	TTL       time.Duration
-	ExpiresAt time.Time
 }
 
 type ServiceEventsConfig struct {
@@ -154,11 +147,6 @@ func Load() (Config, error) {
 			ReconnectMaxDelay: getenvDuration("TICKET_REMOTE_PHONE_RECONNECT_MAX_DELAY", phone.DefaultReconnectMaxDelay),
 			NoViewerStopDelay: getenvDuration("TICKET_REMOTE_PHONE_NO_VIEWER_STOP_DELAY", defaultNoViewerStopDelay),
 		},
-		DevPerfMetrics: DevPerfMetricsConfig{
-			Enabled:   getenvBool("TICKET_REMOTE_DEV_PERF_METRICS_ENABLED", false),
-			TTL:       getenvDuration("TICKET_REMOTE_DEV_PERF_METRICS_TTL", 24*time.Hour),
-			ExpiresAt: getenvTime("TICKET_REMOTE_DEV_PERF_METRICS_EXPIRES_AT"),
-		},
 		ServiceEvents: ServiceEventsConfig{
 			Token: getenv("TICKET_REMOTE_SERVICE_EVENT_TOKEN", ""),
 		},
@@ -199,13 +187,6 @@ func Load() (Config, error) {
 	}
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")
-	}
-	if cfg.DevPerfMetrics.Enabled && cfg.DevPerfMetrics.ExpiresAt.IsZero() {
-		ttl := cfg.DevPerfMetrics.TTL
-		if ttl <= 0 {
-			ttl = 24 * time.Hour
-		}
-		cfg.DevPerfMetrics.ExpiresAt = time.Now().Add(ttl)
 	}
 	if cfg.Production {
 		if err := validateProductionConfig(cfg); err != nil {

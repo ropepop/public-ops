@@ -72,20 +72,33 @@ func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
 	}
 }
 
-func TestSpacetimeClientFiltersExpiredViewerPresence(t *testing.T) {
+func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 	body, err := staticFS.ReadFile("static/spacetime-client.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	js := string(body)
 	for _, snippet := range []string{
-		"function rowExpiresAfter(row, nowMs)",
-		"Date.parse(String(row && (row.expiresAt || row.expires_at) || \"\"))",
-		"row.connected !== false && rowExpiresAfter(row, nowMs)",
-		"viewerCount: viewers.length",
+		"ticketremote_stream_desired_state",
+		"ticketremote_phone_current_report",
+		"ticketremote_relay_current_report",
+		"ticketremote_control_code_request",
+		"memberAppendSafeOperationalLog",
+		"logRowId(\"browser\",event,correlationId)",
 	} {
 		if !staticContains(js, snippet) {
-			t.Fatalf("Spacetime client must hide expired viewer presence, missing %q", snippet)
+			t.Fatalf("Spacetime client must use current product table marker %q", snippet)
+		}
+	}
+	for _, forbidden := range []string{
+		"ticketremote_ticket_summary",
+		"ticketremote_viewer_public",
+		"ticketremote_phone_status",
+		"ticketremote_service_safe_operational_log",
+		"memberAppendDevPerfMetric",
+	} {
+		if staticContains(js, forbidden) {
+			t.Fatalf("Spacetime client still contains removed marker %q", forbidden)
 		}
 	}
 }
@@ -1178,18 +1191,22 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	}
 }
 
-func TestTicketSpacetimeModuleDisablesOldControlMutations(t *testing.T) {
+func TestTicketSpacetimeModuleRemovesOldControlMutations(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"pub fn ticketremote_member_claim_control(",
-		"Err(\"control_mode_removed\".into())",
-		"Err(\"extension_disabled\".into())",
+		"pub fn ticketremote_member_request_control_code(",
+		"pub fn ticketremote_member_prepare_control_code(",
+		"pub fn ticketremote_member_close_control_code(",
 	} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("SpacetimeDB module missing %q", snippet)
 		}
 	}
 	for _, snippet := range []string{
+		"pub fn ticketremote_member_claim_control(",
+		"pub fn ticketremote_member_release_control(",
+		"pub fn ticketremote_member_revoke_control(",
+		"ticketremote_control_session",
 		"control_claimed",
 		"CONTROL_EXTENDED_MS",
 		"control_extended",
@@ -1210,9 +1227,6 @@ func TestTicketSpacetimeMemberReducersUseServerClockAndConnectionID(t *testing.T
 		"ticketremote_member_request_control_code",
 		"ticketremote_member_confirm_control_code_browser_capture",
 		"ticketremote_member_close_control_code",
-		"ticketremote_member_claim_control",
-		"ticketremote_member_release_control",
-		"ticketremote_member_revoke_control",
 		"ticketremote_member_upsert_member",
 		"ticketremote_member_remove_member",
 	} {
@@ -1243,44 +1257,48 @@ func TestTicketSpacetimePublicTablesAreRedacted(t *testing.T) {
 	if strings.Contains(module, "ticketremote_live_state") || strings.Contains(module, "stateJson") {
 		t.Fatalf("SpacetimeDB module must not publish the old public JSON snapshot")
 	}
-	viewerChunk := rustItemChunk(t, module, "#[spacetimedb::table(accessor = ticketremote_viewer_public, public")
-	for _, forbidden := range []string{"pub email:", "pub displayName:", "pub page:", "pub sessionId:"} {
-		if strings.Contains(viewerChunk, forbidden) {
-			t.Fatalf("public viewer table must not expose %q in %s", forbidden, viewerChunk)
+	for _, forbidden := range []string{
+		"ticketremote_viewer_public",
+		"ticketremote_phone_status",
+		"ticketremote_phone_status_history",
+		"ticketremote_ticket_summary",
+	} {
+		if strings.Contains(module, forbidden) {
+			t.Fatalf("SpacetimeDB module still publishes removed public table %q", forbidden)
 		}
 	}
-	for _, required := range []string{"pub id: String", "pub ticketId: String", "pub publicId: String", "pub label: String", "pub expiresAt: String"} {
-		if !strings.Contains(viewerChunk, required) {
-			t.Fatalf("public viewer table missing %q in %s", required, viewerChunk)
+	for _, required := range []string{
+		"#[spacetimedb::table(accessor = ticketremote_stream_desired_state, public",
+		"#[spacetimedb::table(accessor = ticketremote_phone_current_report, public",
+		"#[spacetimedb::table(accessor = ticketremote_relay_current_report, public",
+		"#[spacetimedb::table(accessor = ticketremote_control_code_request, public",
+	} {
+		if !strings.Contains(module, required) {
+			t.Fatalf("SpacetimeDB module missing current public table %q", required)
 		}
-	}
-	phoneChunk := rustItemChunk(t, module, "#[spacetimedb::table(accessor = ticketremote_phone_status, public")
-	for _, forbidden := range []string{"pub baseUrl:", "pub healthJson:", "pub lastError:"} {
-		if strings.Contains(phoneChunk, forbidden) {
-			t.Fatalf("public phone table must not expose %q in %s", forbidden, phoneChunk)
-		}
-	}
-	if !strings.Contains(module, "public_presence_row_id(") {
-		t.Fatalf("public viewer rows must use opaque row ids")
 	}
 }
 
-func TestSpacetimeReducersUseEmailWideControlOwnership(t *testing.T) {
+func TestSpacetimeControlCodeOwnershipIsRequesterScoped(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"let actor = clean_email(&email);",
-		"if !actor.is_empty() && clean_email(&row.email) != actor",
+		"ticketremote_control_code_owner",
+		"ownerPublicId",
+		"client_email_from_auth(ctx, &ticket.id)",
+		"if owner.ticketId != ticket.id || clean_email(&owner.email) != email",
 	} {
 		if !strings.Contains(source, snippet) {
-			t.Fatalf("SpacetimeDB reducer missing email-wide ownership snippet %q", snippet)
+			t.Fatalf("SpacetimeDB control-code ownership missing snippet %q", snippet)
 		}
 	}
 	for _, snippet := range []string{
-		"!actor.is_empty() && row.sessionId",
-		"row.sessionId != _sessionId",
+		"ticketremote_control_session",
+		"member_claim_control",
+		"member_release_control",
+		"member_revoke_control",
 	} {
 		if strings.Contains(source, snippet) {
-			t.Fatalf("SpacetimeDB reducer should not require same browser session: %q", snippet)
+			t.Fatalf("SpacetimeDB module still contains old control session marker %q", snippet)
 		}
 	}
 }
@@ -1288,14 +1306,15 @@ func TestSpacetimeReducersUseEmailWideControlOwnership(t *testing.T) {
 func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"#[spacetimedb::table(accessor = ticketremote_ticket_summary, public)]",
-		"#[spacetimedb::table(accessor = ticketremote_viewer_public, public",
-		"#[spacetimedb::table(accessor = ticketremote_phone_status, public)]",
+		"#[spacetimedb::table(accessor = ticketremote_stream_desired_state, public",
+		"#[spacetimedb::table(accessor = ticketremote_phone_current_report, public",
+		"#[spacetimedb::table(accessor = ticketremote_relay_current_report, public",
+		"#[spacetimedb::table(accessor = ticketremote_control_code_request, public",
 		"client_email_from_auth(ctx, &ticket.id)",
 		"payload.get(\"email_verified\").and_then(|v| v.as_bool()) != Some(true)",
 		"pub fn ticketremote_member_set_stream_focus",
 		"let session_id = non_empty(&sessionId, &connection_session_id(ctx));",
-		"upsert_presence(\n            ctx,\n            &ticket.id,\n            &session_id,\n            &email",
+		"upsert_stream_desired_state(",
 	} {
 		if !strings.Contains(source, snippet) {
 			t.Fatalf("SpacetimeDB auth/direct-client contract missing %q", snippet)
@@ -1356,9 +1375,10 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 	for _, snippet := range []string{
 		"DbConnection.builder()",
 		"memberSetStreamFocus",
-		"ticketremote_ticket_summary",
-		"ticketremote_viewer_public",
-		"ticketremote_phone_status",
+		"ticketremote_stream_desired_state",
+		"ticketremote_phone_current_report",
+		"ticketremote_relay_current_report",
+		"ticketremote_control_code_request",
 		"onApplied(()=>{if(!applied){applied=true;this.attachStateListeners(connection);}this.publishFocusedState();this.heartbeat(true);})",
 	} {
 		if !staticContains(string(clientBody), snippet) {
@@ -1370,9 +1390,13 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"releaseControl(",
 		"revokeControl(",
 		"memberClaimControl",
+		"ticketremote_ticket_summary",
+		"ticketremote_viewer_public",
+		"ticketremote_phone_status",
+		"memberAppendDevPerfMetric",
 	} {
 		if strings.Contains(string(clientBody), forbidden) {
-			t.Fatalf("ticket Spacetime browser bundle should not expose old control wrapper %q", forbidden)
+			t.Fatalf("ticket Spacetime browser bundle should not expose removed wrapper/table %q", forbidden)
 		}
 	}
 	if strings.Contains(indexHTML, "Cloudflare Access") || strings.Contains(string(jsBody), "Cloudflare Access") {

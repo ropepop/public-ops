@@ -31,11 +31,6 @@ type bridgeCommandStore struct {
 	logs         []state.SafeOperationalLogInput
 }
 
-func startLegacyStreamCommandBridgeForTest(t *testing.T, server *Server) {
-	t.Helper()
-	server.startStreamCommandBridge()
-}
-
 func (s *bridgeCommandStore) Backend() string {
 	return "spacetime"
 }
@@ -209,7 +204,6 @@ func TestStreamCommandBridgeDispatchesPendingCommandAndAcks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -315,7 +309,6 @@ func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -395,7 +388,6 @@ func TestStreamCommandBridgeForceTicketReselectStartsPhoneAndForwardsCommand(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -560,7 +552,6 @@ func TestStreamCommandBridgeKeepsControlCodePayloadOutOfLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -677,7 +668,6 @@ func TestStreamCommandBridgeReadsControlCodeFrameReadyIntoSpacetime(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -802,7 +792,6 @@ func TestStreamCommandBridgeKeepsResultSocketUntilRawTicketCleanup(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -940,7 +929,6 @@ func TestStreamCommandBridgeReconcilesControlCodeResultFromPhoneHealth(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)

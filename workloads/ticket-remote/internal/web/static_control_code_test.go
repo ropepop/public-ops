@@ -1175,12 +1175,19 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		}
 	}
 	for _, needle := range []string{
-		"recordDevPerfMetric('stream_recovery_step', 'resume_soft_reconnect', flowId || randomMetricFlowId('resume'), resumeSoftReconnectMs, true",
-		"recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true",
 		"recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover'",
 	} {
 		if !strings.Contains(resumeWatchdogsBody, needle) {
-			t.Fatalf("stream recovery action metrics must not be reported as failed end-to-end timings, missing %q", needle)
+			t.Fatalf("stream recovery watchdog must still perform hard recovery, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"recordDevPerfMetric(",
+		"randomMetricFlowId(",
+		"memberAppendDevPerfMetric",
+	} {
+		if strings.Contains(resumeWatchdogsBody, needle) {
+			t.Fatalf("stream recovery watchdog must not emit removed dev-performance metrics %q", needle)
 		}
 	}
 	for _, needle := range []string{

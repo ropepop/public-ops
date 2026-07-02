@@ -58,13 +58,7 @@ impl __sdk::__query_builder::HasCols for TicketremoteSafeOperationalLog {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct TicketremoteSafeOperationalLogIxCols {
-    pub correlation_id: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
-    pub created_at: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
-    pub event: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
-    pub expires_at: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
     pub id: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
-    pub level: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
-    pub source: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
     pub ticket_id: __sdk::__query_builder::IxCol<TicketremoteSafeOperationalLog, String>,
 }
 
@@ -72,13 +66,7 @@ impl __sdk::__query_builder::HasIxCols for TicketremoteSafeOperationalLog {
     type IxCols = TicketremoteSafeOperationalLogIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TicketremoteSafeOperationalLogIxCols {
-            correlation_id: __sdk::__query_builder::IxCol::new(table_name, "correlation_id"),
-            created_at: __sdk::__query_builder::IxCol::new(table_name, "created_at"),
-            event: __sdk::__query_builder::IxCol::new(table_name, "event"),
-            expires_at: __sdk::__query_builder::IxCol::new(table_name, "expires_at"),
             id: __sdk::__query_builder::IxCol::new(table_name, "id"),
-            level: __sdk::__query_builder::IxCol::new(table_name, "level"),
-            source: __sdk::__query_builder::IxCol::new(table_name, "source"),
             ticket_id: __sdk::__query_builder::IxCol::new(table_name, "ticket_id"),
         }
     }

@@ -11,6 +11,7 @@ import {
 } from "spacetimedb";
 
 export default {
+  id: __t.string(),
   ticketId: __t.string(),
   source: __t.string(),
   level: __t.string(),
