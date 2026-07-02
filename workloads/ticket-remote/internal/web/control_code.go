@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -241,35 +240,9 @@ func (s *Server) preparePhoneRelayForControlCodeDetailed(reason string, timeout 
 		"flow":   "control_code",
 		"source": "ticket_remote",
 	}, streamCommandTTL)
-	s.relay.EnsureActive(reason)
-	if s.relay.Snapshot().Connected {
-		result.OK = true
-		result.Result = "already_connected"
-		return result
-	}
-
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if s.relay.Snapshot().Connected {
-				result.OK = true
-				result.Result = "socket_connected"
-				return result
-			}
-		case <-deadline.C:
-			result.OK = s.relay.Snapshot().Connected
-			if result.OK {
-				result.Result = "connected_before_deadline"
-			} else {
-				result.Result = "timeout"
-			}
-			return result
-		}
-	}
+	result.OK = true
+	result.Result = "queued_spacetime_direct"
+	return result
 }
 
 func (s *Server) rememberControlCodeRelayPreparation(result controlCodeRelayPreparationHealth) {
@@ -543,7 +516,11 @@ func (s *Server) updateSpacetimeControlCodeRequestAsync(requestID string, status
 	}
 	go func() {
 		if err := s.updateSpacetimeControlCodeRequest(requestID, status, reason, message, streamEpoch, frameSequence, minFrameSequence, resultFrameEpoch, resultMinFrameSequence, resultProof, resultProofAt, cleanupPending); err != nil {
-			log.Printf("ticket control-code Spacetime update failed request=%s status=%s: %v", requestID, status, err)
+			s.recordRuntimeErrorAsync("control_code_spacetime_update_failed", requestID, err, map[string]any{
+				"requestId": requestID,
+				"status":    status,
+				"reason":    reason,
+			})
 		}
 	}()
 }
@@ -594,7 +571,7 @@ func (s *Server) publishSpacetimeControlCodePhoneMarker(requestID string, stream
 		resultProofAt,
 		false,
 	); err != nil {
-		log.Printf("ticket control-code Spacetime marker update failed request=%s: %v", requestID, err)
+		s.recordRuntimeErrorAsync("control_code_marker_update_failed", requestID, err, map[string]any{"requestId": requestID})
 	}
 }
 
@@ -1044,7 +1021,10 @@ func (s *Server) sendControlCodeBrowserCaptureAck(requestID string, ok bool, rea
 		"sentAt":                 time.Now().UTC().Format(time.RFC3339Nano),
 	}, streamCommandTTL)
 	if err != nil {
-		log.Printf("ticket control-code browser capture ack failed for %s: %v", requestID, err)
+		s.recordRuntimeErrorAsync("control_code_browser_capture_ack_failed", requestID, err, map[string]any{
+			"requestId": requestID,
+			"reason":    reason,
+		})
 	}
 	return err
 }
@@ -1097,7 +1077,10 @@ func (s *Server) sendControlCodeResultAck(requestID string, ok bool, reason stri
 		"sentAt":    time.Now().UTC().Format(time.RFC3339Nano),
 	}, streamCommandTTL)
 	if err != nil {
-		log.Printf("ticket control-code result ack failed for %s: %v", requestID, err)
+		s.recordRuntimeErrorAsync("control_code_result_ack_failed", requestID, err, map[string]any{
+			"requestId": requestID,
+			"reason":    reason,
+		})
 	}
 	return err
 }
@@ -1322,7 +1305,7 @@ func (s *Server) handleControlCodeRequestHTTP(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if err := s.store.Audit(r.Context(), s.cfg.TicketID, id.Email, "control_code_requested", map[string]any{"requestId": view.ID}, time.Now()); err != nil {
-		log.Printf("ticket control code audit failed for %s: %v", id.Email, err)
+		s.recordRuntimeErrorAsync("control_code_audit_failed", view.ID, err, map[string]any{"requestId": view.ID})
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "request": view})
 }

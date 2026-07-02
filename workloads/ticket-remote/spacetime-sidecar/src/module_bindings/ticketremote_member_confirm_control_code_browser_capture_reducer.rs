@@ -83,11 +83,9 @@ pub trait ticketremote_member_confirm_control_code_browser_capture {
         candidate_frame_sequence: String,
         accepted_reason: String,
 
-        callback: impl FnOnce(
-            &super::ReducerEventContext,
-            Result<Result<(), String>, __sdk::InternalError>,
-        ) + Send
-        + 'static,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
     ) -> __sdk::Result<()>;
 }
 
@@ -102,11 +100,9 @@ impl ticketremote_member_confirm_control_code_browser_capture for super::RemoteR
         candidate_frame_sequence: String,
         accepted_reason: String,
 
-        callback: impl FnOnce(
-            &super::ReducerEventContext,
-            Result<Result<(), String>, __sdk::InternalError>,
-        ) + Send
-        + 'static,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             TicketremoteMemberConfirmControlCodeBrowserCaptureArgs {

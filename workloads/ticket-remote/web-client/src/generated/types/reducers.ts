@@ -39,6 +39,7 @@ import TicketremoteRevokeControlReducer from "../ticketremote_revoke_control_red
 import TicketremoteServiceBootstrapReducer from "../ticketremote_service_bootstrap_reducer";
 import TicketremoteSetDevPerfMetricsReducer from "../ticketremote_set_dev_perf_metrics_reducer";
 import TicketremoteSetStreamDesiredStateReducer from "../ticketremote_set_stream_desired_state_reducer";
+import TicketremoteSnapshotRuntimeTablesToLogsReducer from "../ticketremote_snapshot_runtime_tables_to_logs_reducer";
 import TicketremoteUpdateControlCodeRequestReducer from "../ticketremote_update_control_code_request_reducer";
 import TicketremoteUpdatePhoneReducer from "../ticketremote_update_phone_reducer";
 import TicketremoteUpdatePhoneCurrentReportReducer from "../ticketremote_update_phone_current_report_reducer";
@@ -79,6 +80,7 @@ export type TicketremoteRevokeControlParams = __Infer<typeof TicketremoteRevokeC
 export type TicketremoteServiceBootstrapParams = __Infer<typeof TicketremoteServiceBootstrapReducer>;
 export type TicketremoteSetDevPerfMetricsParams = __Infer<typeof TicketremoteSetDevPerfMetricsReducer>;
 export type TicketremoteSetStreamDesiredStateParams = __Infer<typeof TicketremoteSetStreamDesiredStateReducer>;
+export type TicketremoteSnapshotRuntimeTablesToLogsParams = __Infer<typeof TicketremoteSnapshotRuntimeTablesToLogsReducer>;
 export type TicketremoteUpdateControlCodeRequestParams = __Infer<typeof TicketremoteUpdateControlCodeRequestReducer>;
 export type TicketremoteUpdatePhoneParams = __Infer<typeof TicketremoteUpdatePhoneReducer>;
 export type TicketremoteUpdatePhoneCurrentReportParams = __Infer<typeof TicketremoteUpdatePhoneCurrentReportReducer>;

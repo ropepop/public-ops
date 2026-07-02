@@ -50,9 +50,37 @@ func TestServerSubmitGetCancel(t *testing.T) {
 	}
 }
 
+func TestServerRecordsEvents(t *testing.T) {
+	queue := &fakeQueue{jobs: map[string]spacetime.Job{}}
+	server := httptest.NewServer(NewServer(queue, "Pixel Broker", 24*time.Hour).Handler())
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/api/v1/events", "application/json", bytes.NewBufferString(`{
+		"component": "bot",
+		"level": "warn",
+		"kind": "telegram_get_updates_failed",
+		"publicText": "Telegram polling failed",
+		"safeDetailsJson": "{\"error\":\"timeout\"}"
+	}`))
+	if err != nil {
+		t.Fatalf("post event: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if len(queue.events) != 1 {
+		t.Fatalf("events recorded = %d, want 1", len(queue.events))
+	}
+	if queue.events[0].Kind != "telegram_get_updates_failed" || queue.events[0].Component != "bot" {
+		t.Fatalf("unexpected event: %#v", queue.events[0])
+	}
+}
+
 type fakeQueue struct {
-	mu   sync.Mutex
-	jobs map[string]spacetime.Job
+	mu     sync.Mutex
+	jobs   map[string]spacetime.Job
+	events []spacetime.EventInput
 }
 
 func (f *fakeQueue) SubmitJob(_ context.Context, id, _, _, _, _, project, _ string, _ time.Duration) (spacetime.Job, error) {
@@ -103,5 +131,12 @@ func (f *fakeQueue) Notifications(_ context.Context) ([]spacetime.Notification, 
 }
 
 func (f *fakeQueue) MarkNotified(_ context.Context, _ string) error {
+	return nil
+}
+
+func (f *fakeQueue) RecordEvent(_ context.Context, input spacetime.EventInput) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, input)
 	return nil
 }

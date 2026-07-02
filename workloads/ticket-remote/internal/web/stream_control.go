@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -22,7 +21,11 @@ func (s *Server) publishStreamDesiredStateAsync(active bool, viewerCount int, re
 		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 		defer cancel()
 		if err := s.publishStreamDesiredState(ctx, active, viewerCount, reason, source); err != nil {
-			log.Printf("ticket stream desired-state publish failed: %v", err)
+			s.recordRuntimeErrorAsync("stream_desired_state_publish_failed", source, err, map[string]any{
+				"reason":      reason,
+				"active":      active,
+				"viewerCount": viewerCount,
+			})
 		}
 	}()
 }
@@ -36,16 +39,28 @@ func (s *Server) publishStreamDesiredState(ctx context.Context, active bool, vie
 	}
 	backend := s.activePhoneBackend()
 	now := time.Now()
-	return s.store.SetStreamDesiredState(ctx, state.StreamDesiredStateInput{
+	revision := streamControlRevision(now)
+	err := s.store.SetStreamDesiredState(ctx, state.StreamDesiredStateInput{
 		TicketID:      s.cfg.TicketID,
 		BackendID:     backend.ID,
 		DesiredActive: active,
 		ViewerCount:   uint32(viewerCount),
 		Reason:        cleanStreamControlText(reason, "stream_state"),
-		Revision:      streamControlRevision(now),
+		Revision:      revision,
 		UpdatedBy:     cleanStreamControlText(source, "ticket_remote"),
 		Now:           now,
 	})
+	if err != nil {
+		return err
+	}
+	s.recordRuntimeEventForSourceAsync(cleanStreamControlText(source, "ticket_remote"), "info", "stream_desired_state_publish_ok", revision, map[string]any{
+		"desiredActive": active,
+		"viewerCount":   viewerCount,
+		"backendId":     backend.ID,
+		"reason":        reason,
+		"revision":      revision,
+	})
+	return nil
 }
 
 func (s *Server) publishRelayCurrentReportAsync(reason string) {
@@ -53,7 +68,7 @@ func (s *Server) publishRelayCurrentReportAsync(reason string) {
 		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 		defer cancel()
 		if err := s.publishRelayCurrentReport(ctx, time.Now(), reason); err != nil {
-			log.Printf("ticket relay report publish failed: %v", err)
+			s.recordRuntimeErrorAsync("relay_report_publish_failed", reason, err, map[string]any{"reason": reason})
 		}
 	}()
 }
@@ -68,10 +83,14 @@ func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, r
 	backend := s.activePhoneBackend()
 	status := s.direct.streamStatus(now, s.relay.Snapshot())
 	status["reportReason"] = cleanStreamControlText(reason, "relay_report")
+	for key, value := range s.streamAutoRecoveryStatus(now) {
+		status[key] = value
+	}
 	statusJSON, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
+	s.noteRelayProductState(status, now, reason)
 	return s.store.UpdateRelayCurrentReport(ctx, state.RelayCurrentReportInput{
 		TicketID:           s.cfg.TicketID,
 		BackendID:          backend.ID,
@@ -82,6 +101,60 @@ func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, r
 		StatusJSON:         string(statusJSON),
 		Now:                now,
 	})
+}
+
+func (s *Server) noteRelayProductState(status map[string]any, now time.Time, reason string) {
+	verdict := cleanStreamControlText(stringFromAny(status["streamVerdict"]), "unknown")
+	dropReasons, _ := status["dropReasons"].(map[string]uint64)
+	var dropTotal uint64
+	for _, value := range dropReasons {
+		dropTotal += value
+	}
+	s.relayProductMu.Lock()
+	lastVerdict := s.lastRelayStreamVerdict
+	lastDropTotal := s.lastRelayDropTotal
+	if verdict != "" {
+		s.lastRelayStreamVerdict = verdict
+	}
+	if dropTotal > s.lastRelayDropTotal {
+		s.lastRelayDropTotal = dropTotal
+	}
+	s.relayProductMu.Unlock()
+	backend := s.activePhoneBackend()
+	if lastVerdict != "" && verdict != lastVerdict {
+		s.recordProductEventAsync(productEventInput{
+			Source:    "ticket_remote_relay",
+			Category:  "stream",
+			Action:    "verdict_changed",
+			Status:    verdict,
+			Reason:    reason,
+			BackendID: backend.ID,
+			SafeState: map[string]any{
+				"previousVerdict":    lastVerdict,
+				"videoClients":       uint32FromAny(status["activeVideoClients"]),
+				"lastFrameAgoMillis": uint32FromAny(status["lastFrameAgoMillis"]),
+				"framesForwarded":    stringFromAny(status["framesForwarded"]),
+				"reportedAt":         now.UTC().Format(time.RFC3339),
+			},
+		})
+	}
+	if dropTotal > lastDropTotal && (lastDropTotal == 0 || dropTotal-lastDropTotal >= 20) {
+		s.recordProductEventAsync(productEventInput{
+			Source:    "ticket_remote_relay",
+			Category:  "stream",
+			Action:    "frame_drop_threshold",
+			Status:    "warn",
+			Reason:    reason,
+			BackendID: backend.ID,
+			Count:     int64(dropTotal - lastDropTotal),
+			SafeState: map[string]any{
+				"dropTotal":          dropTotal,
+				"dropReasons":        fmt.Sprint(dropReasons),
+				"lastFrameAgoMillis": uint32FromAny(status["lastFrameAgoMillis"]),
+				"framesForwarded":    stringFromAny(status["framesForwarded"]),
+			},
+		})
+	}
 }
 
 func (s *Server) publishPhoneCurrentReport(ctx context.Context, now time.Time, reason string) error {
@@ -100,6 +173,9 @@ func (s *Server) publishPhoneCurrentReport(ctx context.Context, now time.Time, r
 		"relayDesired":     health.Desired,
 		"relayViewers":     health.Viewers,
 		"relayStreamState": health.StreamState,
+	}
+	for key, value := range s.streamAutoRecoveryStatus(now) {
+		status[key] = value
 	}
 	statusJSON, err := json.Marshal(status)
 	if err != nil {
@@ -164,14 +240,17 @@ func (s *Server) releaseStreamDesiredIfNoVideoClients(reason string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 	defer cancel()
 	if err := s.publishStreamDesiredState(ctx, false, 0, reason, "ticket_remote_relay"); err != nil {
-		log.Printf("ticket stream desired-state idle release failed: %v", err)
+		s.recordRuntimeErrorAsync("stream_desired_state_idle_release_failed", reason, err, map[string]any{"reason": reason})
 		return false
 	}
+	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_desired_state_idle_released", reason, map[string]any{
+		"reason": reason,
+	})
 	if err := s.publishRelayCurrentReport(ctx, time.Now(), reason); err != nil {
-		log.Printf("ticket relay report idle release publish failed: %v", err)
+		s.recordRuntimeErrorAsync("relay_report_idle_release_failed", reason, err, map[string]any{"reason": reason})
 	}
 	if err := s.publishPhoneCurrentReport(ctx, time.Now(), reason); err != nil {
-		log.Printf("ticket phone current report idle release publish failed: %v", err)
+		s.recordRuntimeErrorAsync("phone_current_report_idle_release_failed", reason, err, map[string]any{"reason": reason})
 	}
 	return true
 }
@@ -181,8 +260,26 @@ func (s *Server) appendStreamCommandAsync(commandType string, reason string, pay
 		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 		defer cancel()
 		if _, err := s.appendStreamCommand(ctx, commandType, reason, payload, ttl); err != nil {
-			log.Printf("ticket stream command publish failed type=%s: %v", commandType, err)
+			s.recordRuntimeErrorAsync("stream_command_publish_failed", commandType, err, map[string]any{
+				"commandType": cleanStreamControlText(commandType, "command"),
+				"reason":      cleanStreamControlText(reason, "stream_command"),
+			})
 		}
+	}()
+}
+
+func (s *Server) appendStreamRecoveryCommandAsync(reason string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
+		defer cancel()
+		commandID, err := s.appendStreamCommand(ctx, "recover_stream", reason, map[string]any{
+			"source": "ticket_remote",
+		}, streamCommandTTL)
+		if err != nil {
+			s.noteStreamAutoRecoveryResult("failed", reason, commandID, err)
+			return
+		}
+		s.recordRuntimeEventAsync("info", "stream_auto_recovery_started", commandID, map[string]any{"reason": reason})
 	}()
 }
 
@@ -216,10 +313,129 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 		TTL:         ttl,
 		Now:         now,
 	})
+	if err == nil {
+		s.recordProductEventAsync(productEventInput{
+			Source:        "ticket_remote_service",
+			Category:      "command",
+			Action:        "queued",
+			Status:        "ok",
+			Reason:        cleanStreamControlText(reason, "stream_command"),
+			CommandID:     commandID,
+			BackendID:     backend.ID,
+			CorrelationID: commandID,
+			SafeState: map[string]any{
+				"commandType": cleanStreamControlText(commandType, "command"),
+				"ttlMillis":   ttl.Milliseconds(),
+				"revision":    revision,
+			},
+		})
+	} else {
+		s.recordProductEventAsync(productEventInput{
+			Source:        "ticket_remote_service",
+			Category:      "command",
+			Action:        "queue_failed",
+			Status:        "failed",
+			Reason:        safeRuntimeLogError(err),
+			CommandID:     commandID,
+			BackendID:     backend.ID,
+			CorrelationID: commandID,
+			SafeState: map[string]any{
+				"commandType": cleanStreamControlText(commandType, "command"),
+			},
+		})
+	}
 	if err == nil && (commandType == "start" || commandType == "keyframe" || commandType == "recover_stream") {
 		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
+		s.recordRuntimeEventForSourceAsync("ticket_remote_service", "info", "stream_command_append_ok", commandID, map[string]any{
+			"commandType": cleanStreamControlText(commandType, "command"),
+			"reason":      cleanStreamControlText(reason, "stream_command"),
+			"backendId":   backend.ID,
+			"ttlMillis":   ttl.Milliseconds(),
+		})
 	}
 	return commandID, err
+}
+
+func (s *Server) beginStreamAutoRecovery(reason string, now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reason = cleanStreamControlText(reason, "browser_stream_recovery")
+	s.streamRecoveryMu.Lock()
+	defer s.streamRecoveryMu.Unlock()
+	if !s.lastStreamRecoveryAt.IsZero() && now.Sub(s.lastStreamRecoveryAt) < streamRecoveryCommandCooldown {
+		return false
+	}
+	s.lastStreamRecoveryAt = now
+	s.lastStreamRecoveryStage = "queued"
+	s.lastStreamRecoveryAction = "recover_stream_command"
+	s.lastStreamRecoveryResult = "started"
+	s.lastStreamRecoveryReason = reason
+	s.lastStreamRecoveryFailure = ""
+	s.lastStreamRecoveryCommandID = ""
+	return true
+}
+
+func (s *Server) noteStreamAutoRecoveryResult(result string, reason string, commandID string, err error) {
+	now := time.Now()
+	reason = cleanStreamControlText(reason, "browser_stream_recovery")
+	result = cleanStreamControlText(result, "unknown")
+	failure := ""
+	if err != nil {
+		failure = safeRuntimeLogError(err)
+	}
+	s.streamRecoveryMu.Lock()
+	s.lastStreamRecoveryAt = now
+	s.lastStreamRecoveryStage = result
+	s.lastStreamRecoveryResult = result
+	if reason != "" {
+		s.lastStreamRecoveryReason = reason
+	}
+	s.lastStreamRecoveryFailure = failure
+	if commandID != "" {
+		s.lastStreamRecoveryCommandID = cleanRuntimeCorrelationID(commandID)
+	}
+	s.streamRecoveryMu.Unlock()
+	event := "stream_auto_recovery_" + result
+	if result == "succeeded" {
+		s.recordRuntimeEventAsync("info", event, commandID, map[string]any{"reason": reason})
+	} else if err != nil {
+		s.recordRuntimeErrorAsync(event, commandID, err, map[string]any{"reason": reason})
+	}
+}
+
+func (s *Server) streamAutoRecoveryStatus(now time.Time) map[string]any {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.streamRecoveryMu.Lock()
+	defer s.streamRecoveryMu.Unlock()
+	stage := s.lastStreamRecoveryStage
+	if stage == "" {
+		stage = "idle"
+	}
+	result := s.lastStreamRecoveryResult
+	if result == "" {
+		result = "none"
+	}
+	action := s.lastStreamRecoveryAction
+	if action == "" {
+		action = "none"
+	}
+	var ageMillis any
+	if !s.lastStreamRecoveryAt.IsZero() {
+		ageMillis = uint32(now.Sub(s.lastStreamRecoveryAt) / time.Millisecond)
+	}
+	return map[string]any{
+		"currentRecoveryStage":       stage,
+		"lastWatchdogAction":         action,
+		"lastRecoveryResult":         result,
+		"lastRecoveryReason":         s.lastStreamRecoveryReason,
+		"lastRecoveryAgeMillis":      ageMillis,
+		"lastRecoveryFailureReason":  s.lastStreamRecoveryFailure,
+		"lastRecoveryCommandId":      s.lastStreamRecoveryCommandID,
+		"recoveryCommandCooldownSec": uint32(streamRecoveryCommandCooldown / time.Second),
+	}
 }
 
 func stringFromAny(value any) string {

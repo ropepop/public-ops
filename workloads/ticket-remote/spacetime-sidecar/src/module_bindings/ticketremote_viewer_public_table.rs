@@ -153,7 +153,7 @@ pub trait ticketremote_viewer_publicQueryTableAccess {
     #[allow(non_snake_case)]
     /// Get a query builder for the table `TicketremoteViewerPublic`.
     fn ticketremote_viewer_public(&self)
-    -> __sdk::__query_builder::Table<TicketremoteViewerPublic>;
+        -> __sdk::__query_builder::Table<TicketremoteViewerPublic>;
 }
 
 impl ticketremote_viewer_publicQueryTableAccess for __sdk::QueryTableAccessor {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,11 +21,12 @@ const (
 	streamCommandBridgeActivePollInterval = 100 * time.Millisecond
 	streamCommandBridgeQuietPollInterval  = 2 * time.Second
 	streamCommandBridgeIdlePollInterval   = 1 * time.Second
+	streamCommandBridgePurgeInterval      = 30 * time.Second
 	streamCommandBridgeReadTimeout        = 4 * time.Second
 	streamCommandBridgeWriteTimeout       = 8 * time.Second
+	streamCommandBridgePhoneStartTimeout  = 75 * time.Second
 	streamCommandBridgeLimit              = 20
 	streamCommandBridgeBackoffMax         = 5 * time.Second
-	streamCommandRecoverRestartDelay      = 250 * time.Millisecond
 	controlCodePhoneHealthPollInterval    = 100 * time.Millisecond
 	controlCodePhoneHealthRequestTimeout  = 1500 * time.Millisecond
 )
@@ -45,6 +45,10 @@ type pendingStreamCommandReader interface {
 
 type streamCommandSignalReader interface {
 	StreamCommandSignal(ctx context.Context, ticketID string, backendID string) (state.StreamCommandSignal, bool, error)
+}
+
+type expiredStreamCommandPurger interface {
+	PurgeExpiredStreamCommands(ctx context.Context, ticketID string, now time.Time, batchSize uint32) error
 }
 
 type streamCommandBridgeAttempt struct {
@@ -67,6 +71,7 @@ func (s *Server) startStreamCommandBridge() {
 func (s *Server) streamCommandBridgeLoop(reader pendingStreamCommandReader, stop <-chan struct{}) {
 	attempts := map[string]streamCommandBridgeAttempt{}
 	lastSignals := map[string]string{}
+	lastExpiredPurge := time.Time{}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -75,20 +80,21 @@ func (s *Server) streamCommandBridgeLoop(reader pendingStreamCommandReader, stop
 			return
 		case <-timer.C:
 		}
-		hadCommands := s.pollPendingStreamCommands(reader, attempts, lastSignals)
+		hadCommands := s.pollPendingStreamCommands(reader, attempts, lastSignals, &lastExpiredPurge)
 		timer.Reset(s.nextStreamCommandBridgePollDelay(hadCommands, attempts))
 	}
 }
 
-func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, attempts map[string]streamCommandBridgeAttempt, lastSignals map[string]string) bool {
+func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, attempts map[string]streamCommandBridgeAttempt, lastSignals map[string]string, lastExpiredPurge *time.Time) bool {
 	now := time.Now()
 	backend := s.activePhoneBackend()
+	s.purgeExpiredStreamCommandsIfDue(reader, now, lastExpiredPurge)
 	if signalReader, ok := reader.(streamCommandSignalReader); ok && len(attempts) == 0 {
 		signalCtx, signalCancel := context.WithTimeout(context.Background(), streamCommandBridgeReadTimeout)
 		signal, found, err := signalReader.StreamCommandSignal(signalCtx, s.cfg.TicketID, backend.ID)
 		signalCancel()
 		if err != nil {
-			log.Printf("ticket stream command bridge signal read failed: %v", err)
+			s.recordRuntimeErrorAsync("stream_command_signal_read_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
 			return false
 		}
 		key := backend.ID
@@ -102,7 +108,7 @@ func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, at
 	commands, err := reader.PendingStreamCommands(ctx, s.cfg.TicketID, backend.ID, streamCommandBridgeLimit, now)
 	cancel()
 	if err != nil {
-		log.Printf("ticket stream command bridge read failed: %v", err)
+		s.recordRuntimeErrorAsync("stream_command_read_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
 		return false
 	}
 	hadCommands := len(commands) > 0
@@ -115,21 +121,53 @@ func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, at
 			delete(attempts, command.ID)
 			continue
 		}
+		requestID := streamCommandRequestIDFromJSON(command.PayloadJSON)
 		attempt := attempts[command.ID]
 		if !attempt.next.IsZero() && now.Before(attempt.next) {
 			continue
 		}
 		if !attempt.dispatched {
-			ctx, cancel := context.WithTimeout(context.Background(), streamCommandBridgeWriteTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), streamCommandDispatchTimeout(command))
 			err := s.dispatchStreamCommandToPhone(ctx, command)
 			cancel()
 			if err != nil {
+				if cleanStreamControlText(command.CommandType, "command") == "recover_stream" {
+					s.noteStreamAutoRecoveryResult("failed", command.Reason, command.ID, err)
+				}
+				s.recordProductEventAsync(productEventInput{
+					Source:        "ticket_remote_bridge",
+					Category:      "command",
+					Action:        "dispatch_failed",
+					Status:        "failed",
+					Reason:        safeStreamCommandBridgeError(err),
+					CommandID:     command.ID,
+					RequestID:     requestID,
+					BackendID:     command.BackendID,
+					CorrelationID: command.ID,
+					SafeState: map[string]any{
+						"commandType": cleanStreamControlText(command.CommandType, "command"),
+					},
+				})
 				attempt.failures++
 				attempt.next = now.Add(streamCommandBridgeBackoff(attempt.failures))
 				attempts[command.ID] = attempt
 				s.appendStreamCommandBridgeLogAsync("warn", "stream_command_dispatch_failed", command, err)
 				continue
 			}
+			s.recordProductEventAsync(productEventInput{
+				Source:        "ticket_remote_bridge",
+				Category:      "command",
+				Action:        "dispatched",
+				Status:        "ok",
+				Reason:        command.Reason,
+				CommandID:     command.ID,
+				RequestID:     requestID,
+				BackendID:     command.BackendID,
+				CorrelationID: command.ID,
+				SafeState: map[string]any{
+					"commandType": cleanStreamControlText(command.CommandType, "command"),
+				},
+			})
 			attempt.dispatched = true
 			attempt.failures = 0
 			attempt.next = time.Time{}
@@ -139,13 +177,77 @@ func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, at
 			attempt.failures++
 			attempt.next = now.Add(streamCommandBridgeBackoff(attempt.failures))
 			attempts[command.ID] = attempt
-			log.Printf("ticket stream command bridge ack failed command=%s type=%s: %v", command.ID, command.CommandType, err)
+			s.recordProductEventAsync(productEventInput{
+				Source:        "ticket_remote_bridge",
+				Category:      "command",
+				Action:        "ack_failed",
+				Status:        "failed",
+				Reason:        safeRuntimeLogError(err),
+				CommandID:     command.ID,
+				RequestID:     requestID,
+				BackendID:     command.BackendID,
+				CorrelationID: command.ID,
+				SafeState: map[string]any{
+					"commandType": cleanStreamControlText(command.CommandType, "command"),
+				},
+			})
+			s.recordRuntimeErrorAsync("stream_command_ack_failed", command.ID, err, map[string]any{
+				"commandId":   command.ID,
+				"commandType": cleanStreamControlText(command.CommandType, "command"),
+			})
 			continue
+		}
+		s.recordProductEventAsync(productEventInput{
+			Source:        "ticket_remote_bridge",
+			Category:      "command",
+			Action:        "acknowledged",
+			Status:        "ok",
+			Reason:        "dispatched_by_ticket_remote_bridge",
+			CommandID:     command.ID,
+			RequestID:     requestID,
+			BackendID:     command.BackendID,
+			CorrelationID: command.ID,
+			SafeState: map[string]any{
+				"commandType": cleanStreamControlText(command.CommandType, "command"),
+			},
+		})
+		if cleanStreamControlText(command.CommandType, "command") == "recover_stream" {
+			s.noteStreamAutoRecoveryResult("succeeded", command.Reason, command.ID, nil)
 		}
 		delete(attempts, command.ID)
 	}
 	pruneStreamCommandBridgeAttempts(attempts, now)
 	return hadCommands
+}
+
+func (s *Server) purgeExpiredStreamCommandsIfDue(reader pendingStreamCommandReader, now time.Time, lastExpiredPurge *time.Time) {
+	if lastExpiredPurge == nil {
+		return
+	}
+	if !lastExpiredPurge.IsZero() && now.Sub(*lastExpiredPurge) < streamCommandBridgePurgeInterval {
+		return
+	}
+	purger, ok := reader.(expiredStreamCommandPurger)
+	if !ok {
+		return
+	}
+	*lastExpiredPurge = now
+	ctx, cancel := context.WithTimeout(context.Background(), streamCommandBridgeReadTimeout)
+	err := purger.PurgeExpiredStreamCommands(ctx, s.cfg.TicketID, now, streamCommandBridgeLimit)
+	cancel()
+	if err != nil {
+		s.recordRuntimeErrorAsync("stream_command_expired_purge_failed", s.cfg.TicketID, err, map[string]any{"ticketId": s.cfg.TicketID})
+		return
+	}
+}
+
+func streamCommandDispatchTimeout(command state.StreamCommand) time.Duration {
+	switch cleanStreamControlText(command.CommandType, "command") {
+	case "start", "prepare_control_code", "recover_stream", "force_ticket_reselect":
+		return streamCommandBridgePhoneStartTimeout
+	default:
+		return streamCommandBridgeWriteTimeout
+	}
 }
 
 func (s *Server) nextStreamCommandBridgePollDelay(hadCommands bool, attempts map[string]streamCommandBridgeAttempt) time.Duration {
@@ -223,6 +325,15 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 			return fmt.Errorf("prepare control code phone session: %w", startErr)
 		}
 		return nil
+	case "force_ticket_reselect":
+		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=force_ticket_reselect id=%s", command.ID))
+		s.relay.EnsureActive("spacetime_force_ticket_reselect")
+		startErr := s.postPhoneSessionCommand(ctx, "/api/v1/session/start")
+		sendErr := s.sendPhoneSessionCommand(ctx, payload)
+		if startErr != nil && sendErr != nil {
+			return fmt.Errorf("force ticket reselect phone session: %w", startErr)
+		}
+		return nil
 	case "generate_control_code":
 		if requestID != "" {
 			s.retainControlCodeRelay(requestID)
@@ -267,18 +378,8 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 }
 
 func (s *Server) restartPhoneSessionForRecovery(ctx context.Context) error {
-	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/stop"); err != nil {
-		return fmt.Errorf("stop stale phone session: %w", err)
-	}
-	timer := time.NewTimer(streamCommandRecoverRestartDelay)
-	select {
-	case <-ctx.Done():
-		timer.Stop()
-		return ctx.Err()
-	case <-timer.C:
-	}
-	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/start"); err != nil {
-		return fmt.Errorf("start recovered phone session: %w", err)
+	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/recover"); err != nil {
+		return fmt.Errorf("recover phone session: %w", err)
 	}
 	return nil
 }
@@ -313,6 +414,14 @@ func streamCommandRequestID(payload map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func streamCommandRequestIDFromJSON(payloadJSON string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		return ""
+	}
+	return streamCommandRequestID(payload)
 }
 
 func (s *Server) ackDispatchedStreamCommand(command state.StreamCommand) error {
@@ -362,6 +471,27 @@ func (s *Server) appendStreamCommandBridgeLogAsync(level string, event string, c
 	if s.store == nil {
 		return
 	}
+	category := "command"
+	if strings.Contains(event, "control_code") || cleanStreamControlText(command.CommandType, "command") == "generate_control_code" {
+		category = "control_code"
+	}
+	status := "ok"
+	if cleanStreamControlText(level, "info") == "warn" || err != nil || strings.Contains(event, "timeout") || strings.Contains(event, "failed") {
+		status = "failed"
+	}
+	s.recordProductEventAsync(productEventInput{
+		Source:        "ticket_remote_bridge",
+		Category:      category,
+		Action:        cleanStreamControlText(event, "bridge_event"),
+		Status:        status,
+		Reason:        safeStreamCommandBridgeError(err),
+		CommandID:     command.ID,
+		BackendID:     command.BackendID,
+		CorrelationID: command.ID,
+		SafeState: map[string]any{
+			"commandType": cleanStreamControlText(command.CommandType, "command"),
+		},
+	})
 	go func() {
 		detail := map[string]any{
 			"commandId":   command.ID,
@@ -653,6 +783,9 @@ func (s *Server) fetchPhoneHealthData(ctx context.Context) (map[string]any, erro
 }
 
 func (s *Server) handlePhoneControlCodeBridgeMessage(requestID string, msg map[string]any) controlCodeBridgeObservation {
+	if s.handlePixelTraceEvent(msg) {
+		return controlCodeBridgeIgnored
+	}
 	if event, ok := pixelTicketEventFromMessage(msg); ok {
 		s.handlePixelTicketStateEvent(msg)
 		if event.RequestID != requestID {

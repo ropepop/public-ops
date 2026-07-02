@@ -28,6 +28,16 @@ import { html, reactive } from '@arrow-js/core';
   const devMetricsExpiresAtMs = Date.parse(devMetricsConfig.expiresAt || '');
   let spacetimeClient = null;
 
+  function enqueueClientLog(entry) {
+    pendingClientLogs.push(entry);
+    if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
+    try {
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(() => flushClientLogs());
+      }
+    } catch (_) {}
+  }
+
   function sampledClientLogDetail(event, detail) {
     if (!sampledClientLogEvents.has(event)) return detail;
     const now = Date.now();
@@ -51,23 +61,20 @@ import { html, reactive } from '@arrow-js/core';
     const detailText = safeString(detail).slice(0, 500);
     const sampledDetail = sampledClientLogDetail(eventName, detailText);
     if (sampledDetail == null) return;
-    pendingClientLogs.push({
+    enqueueClientLog({
       level: 'info',
       event: eventName,
       detail: safeString({
         pageVersion,
+        assetVersion,
         detail: sampledDetail,
+        visibility: document.visibilityState,
         webCodecs: 'VideoDecoder' in window,
         userAgent: navigator.userAgent
       }).slice(0, 1000),
+      correlationId: typeof browserTraceId === 'string' ? browserTraceId : '',
       at: Date.now()
     });
-    if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
-    try {
-      if (typeof queueMicrotask === 'function') {
-        queueMicrotask(() => flushClientLogs());
-      }
-    } catch (_) {}
   }
 
   function escapeHTML(value) {
@@ -213,6 +220,8 @@ import { html, reactive } from '@arrow-js/core';
   let lastRecoveryDecoderResetAt = 0;
   let lastRecoveryVideoReconnectAt = 0;
   let lastRecoveryServerRecoverAt = 0;
+  let firstFrameServerRecoveryAttempts = 0;
+  let firstFrameServerRecoveryExhausted = false;
   let decoder = null;
   let decoderConfigured = false;
   let decoderMode = 'annexb';
@@ -259,6 +268,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastControlCodeAutoPrepareAt = 0;
   const localSessionID = String(cfg.sessionId || '').trim();
   const localPublicID = accountPublicId(cfg.email || '');
+  const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);
   const ownedControlCodeRequestIDs = new Set();
   const locallyClosedControlCodeRequestIDs = new Set();
   let codeDialogOpen = false;
@@ -268,6 +278,9 @@ import { html, reactive } from '@arrow-js/core';
   let activeControlCodeMetric = null;
   let resumeRecoverySoftTimer = null;
   let resumeRecoveryHardTimer = null;
+  let activeResumeFlow = null;
+  let pendingResumeFreshFrameFlow = null;
+  let activationReconnectBurstTimer = null;
   let lastHiddenWallAt = 0;
   let stableViewport = null;
   let screenEngaged = false;
@@ -301,9 +314,14 @@ import { html, reactive } from '@arrow-js/core';
   const resumeVideoReconnectDelayMs = 600;
   const resumeSoftReconnectMs = 1800;
   const resumeHardRecoverMs = 3200;
+  const activationReconnectBurstMs = 10000;
+  const activationReconnectTickMs = 1000;
+  const activationReconnectMaxTicks = 10;
+  const activationResumeLogLimit = 32;
+  const firstFrameServerRecoveryMaxAttempts = 2;
   const idleDisconnectMs = 15 * 60 * 1000;
   const recoveryKeyframeDebounceMs = 2000;
-  const keyframeCommandMinIntervalMs = 1000;
+  const keyframeCommandMinIntervalMs = 2500;
   const recoveryDecoderResetDebounceMs = 5000;
   const recoveryVideoReconnectDebounceMs = 8000;
   const recoveryServerRecoverDebounceMs = 12000;
@@ -312,8 +330,8 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
   const controlCodeCapturePollMs = 100;
-  const controlCodeCaptureKeyframeRetryMs = 1500;
-  const controlCodeCaptureKeyframeRetryLimit = 3;
+  const controlCodeCaptureKeyframeRetryMs = 5000;
+  const controlCodeCaptureKeyframeRetryLimit = 2;
   const controlCodeGeneratedChipScanStartY = 0.50;
   const controlCodeGeneratedChipScanEndY = 0.61;
   const controlCodeGeneratedChipScanStepY = 0.01;
@@ -391,12 +409,13 @@ import { html, reactive } from '@arrow-js/core';
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
     }
-    if (hiddenStreamFocusTimer) {
-      clearTimeout(hiddenStreamFocusTimer);
-      hiddenStreamFocusTimer = null;
-    }
-    clearResumeWatchdogs();
-    closeEarlyVideo('idle_disconnect');
+	    if (hiddenStreamFocusTimer) {
+	      clearTimeout(hiddenStreamFocusTimer);
+	      hiddenStreamFocusTimer = null;
+	    }
+	    clearResumeWatchdogs();
+	    clearActivationReconnectBurst();
+	    closeEarlyVideo('idle_disconnect');
     closeDirectVideo();
     resetStreamState({ preserveFrame: true });
     if (spacetimeClient && typeof spacetimeClient.close === 'function') {
@@ -427,11 +446,12 @@ import { html, reactive } from '@arrow-js/core';
     connectDirectVideo();
     requestKeyframeDebounced(`${reason || 'idle_resume'}_keyframe`, 0, true);
     requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);
-    scheduleResumeWatchdogs(reason || 'idle_resume');
-    publishStreamDebug();
-    clientLog('viewer_idle_resumed', reason || 'idle_resume');
-    return true;
-  }
+	    scheduleResumeWatchdogs(reason || 'idle_resume');
+	    publishStreamDebug();
+	    clientLog('viewer_idle_resumed', reason || 'idle_resume');
+	    startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
+	    return true;
+	  }
 
   function layoutViewportRect() {
     const fallbackWidth = Math.max(1, Math.round(window.innerWidth || document.documentElement.clientWidth || 1));
@@ -456,15 +476,16 @@ import { html, reactive } from '@arrow-js/core';
     return visualViewportRect();
   }
 
-  function keyboardLikelyOpen(layout, visual) {
-    const active = document.activeElement;
-    const inputFocused = active && (active === codeDigits || codeDialog.contains(active));
-    return Boolean(
-      codeDialogOpen &&
-      inputFocused &&
-      visual.height > 0 &&
-      layout.height - visual.height >= Math.max(120, layout.height * 0.18)
-    );
+	  function keyboardLikelyOpen(layout, visual) {
+	    const active = document.activeElement;
+	    const inputFocused = active && (active === codeDigits || codeDialog.contains(active));
+	    const dialogVisible = codeDialogOpen && !codeDialog.hidden;
+	    return Boolean(
+	      codeDialogOpen &&
+	      (inputFocused || dialogVisible) &&
+	      visual.height > 0 &&
+	      layout.height - visual.height >= Math.max(120, layout.height * 0.18)
+	    );
   }
 
   function stableStageViewportRect() {
@@ -725,6 +746,10 @@ import { html, reactive } from '@arrow-js/core';
     ['control_code_request_previous_result_cleanup_failed', 'Iepriekšējais kods vēl aizveras. Mēģini vēlreiz.'],
     ['control_code_cleanup_attention_needed', 'Tālrunim vajag mirkli, lai atgrieztos pie biļetes'],
     ['control_code_stream_marker_required', 'Tālrunis nepaguva apstiprināt ģenerēto kodu'],
+    ['waiting_for_ticket_reselect', 'Tālrunis vēl izvēlas biļeti. Uzgaidi mirkli.'],
+    ['waiting_for_stream_recovery', 'Tiešraide atjaunojas pirms koda pieprasījuma.'],
+    ['control_code_recovery_queue_timeout', 'Tālrunis nepaguva atjaunot biļeti. Mēģini vēlreiz.'],
+    ['control_code_stream_unstable', 'Tiešraide nav pietiekami stabila koda pieprasījumam.'],
     ['extension_disabled', 'Pagarināšana ir izslēgta']
   ]);
 
@@ -879,22 +904,29 @@ import { html, reactive } from '@arrow-js/core';
     reportClientFault(event, detail);
   }
 
-  function flushClientLogs() {
-    if (!spacetimeClient || typeof spacetimeClient.appendSafeLog !== 'function') return;
-    if (!pendingClientLogs.length) return;
-    const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));
-    batch.forEach((entry) => {
-      const detailJson = safeString({
-        pageVersion,
-        detail: entry.detail,
-        queuedAt: entry.at
-      }).slice(0, 1000);
-      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, '')
-        .catch(() => {
-          if (pendingClientLogs.length < 100) pendingClientLogs.unshift(entry);
-        });
-    });
-  }
+  clientLog('page_boot', JSON.stringify({
+    pageVersion,
+    assetVersion,
+    visibility: document.visibilityState,
+    webCodecs: 'VideoDecoder' in window
+  }));
+
+	  function flushClientLogs() {
+	    if (!spacetimeClient || typeof spacetimeClient.appendSafeLog !== 'function') return;
+	    if (!pendingClientLogs.length) return;
+	    const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));
+	    batch.forEach((entry) => {
+	      const detailJson = entry.detailJson || safeString({
+	        pageVersion,
+	        detail: entry.detail,
+	        queuedAt: entry.at
+	      }).slice(0, 1000);
+	      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '')
+	        .catch(() => {
+	          if (pendingClientLogs.length < 100) pendingClientLogs.unshift(entry);
+	        });
+	    });
+	  }
 
   function devPerfMetricsEnabled() {
     if (!devMetricsConfig || devMetricsConfig.enabled !== true) return false;
@@ -1128,11 +1160,272 @@ import { html, reactive } from '@arrow-js/core';
     }
   }
 
-  function streamHasFreshRenderedFrame() {
-    return currentRenderedFreshness(performance.now()).liveLabeled;
-  }
+	  function streamHasFreshRenderedFrame() {
+	    return currentRenderedFreshness(performance.now()).liveLabeled;
+	  }
 
-  function scheduleResumeWatchdogs(reason) {
+	  function safeResumeLabel(value, fallback) {
+	    const label = String(value || fallback || 'unknown')
+	      .toLowerCase()
+	      .replace(/[0-9]/g, '')
+	      .replace(/[^a-z_-]+/g, '_')
+	      .replace(/_+/g, '_')
+	      .replace(/^_+|_+$/g, '')
+	      .slice(0, 48);
+	    return label || fallback || 'unknown';
+	  }
+
+	  function resumeBooleanLabel(value) {
+	    return value ? 'yes' : 'no';
+	  }
+
+	  function randomResumeLetters(length) {
+	    const alphabet = 'abcdefghijklmnopqrstuvwxyz';
+	    const size = Math.max(1, Math.min(24, length || 10));
+	    let out = '';
+	    try {
+	      if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+	        const bytes = new Uint8Array(size);
+	        window.crypto.getRandomValues(bytes);
+	        for (let i = 0; i < bytes.length; i += 1) out += alphabet[bytes[i] % alphabet.length];
+	        return out;
+	      }
+	    } catch (_) {}
+	    for (let i = 0; i < size; i += 1) out += alphabet[Math.floor(Math.random() * alphabet.length) % alphabet.length];
+	    return out;
+	  }
+
+	  function randomResumeFlowId() {
+	    return `resume_${randomResumeLetters(12)}`;
+	  }
+
+	  function socketStateLabel(state) {
+	    switch (state) {
+	      case WebSocket.CONNECTING:
+	        return 'connecting';
+	      case WebSocket.OPEN:
+	        return 'open';
+	      case WebSocket.CLOSING:
+	        return 'closing';
+	      case WebSocket.CLOSED:
+	        return 'closed';
+	      case -1:
+	        return 'none';
+	      default:
+	        return 'unknown';
+	    }
+	  }
+
+	  function hiddenDurationBucket(hiddenMs) {
+	    if (!Number.isFinite(hiddenMs) || hiddenMs <= 0) return 'none';
+	    if (hiddenMs >= backgroundRecoveryHiddenMs) return 'long';
+	    if (hiddenMs >= oldTabFreshResumeHiddenMs) return 'old';
+	    return 'short';
+	  }
+
+	  function renderedFreshnessLabel() {
+	    const freshness = currentRenderedFreshness(performance.now());
+	    if (!freshness.hasFrame) return 'no_frame';
+	    return safeResumeLabel(freshness.streamFreshnessState, 'stale');
+	  }
+
+	  function decoderStateLabel() {
+	    if (decoderConfigured) return 'configured';
+	    return configured ? 'pending' : 'unconfigured';
+	  }
+
+	  function resumeDiagnosticSnapshot(detail) {
+	    return Object.assign({
+	      visibility: safeResumeLabel(document.visibilityState, 'unknown'),
+	      focus: typeof document.hasFocus === 'function' ? (document.hasFocus() ? 'focused' : 'blurred') : 'unknown',
+	      socket: socketStateLabel(videoSocketState()),
+	      frame: renderedFreshnessLabel(),
+	      configured: resumeBooleanLabel(configured),
+	      decoder: decoderStateLabel(),
+	      rendered: resumeBooleanLabel(hasRenderedFrame),
+	      fallback: resumeBooleanLabel(fallbackFrameAvailable),
+	      stream: streamUnsupported ? 'unsupported' : 'supported'
+	    }, detail || {});
+	  }
+
+	  function mediaSessionStuckOnPreservedFrame() {
+	    const socketState = videoSocketState();
+	    if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;
+	    if (!hasRenderedFrame && !fallbackFrameAvailable) return false;
+	    const freshness = currentRenderedFreshness(performance.now());
+	    if (freshness.liveLabeled) return false;
+	    if (freshness.streamFreshnessState !== 'STALE') return false;
+	    return !configured || !decoderConfigured;
+	  }
+
+	  function enqueueResumeSafeLog(flow, event, detail) {
+	    if (!flow || flow.done) return;
+	    if (flow.logCount >= activationResumeLogLimit) {
+	      if (!flow.limitLogged) {
+	        flow.limitLogged = true;
+	        enqueueClientLog({
+	          level: 'info',
+	          event: 'activation_resume_log_limit',
+	          detailJson: safeString({ state: 'limited' }).slice(0, 600),
+	          correlationId: flow.id
+	        });
+	      }
+	      return;
+	    }
+	    flow.logCount += 1;
+	    enqueueClientLog({
+	      level: 'info',
+	      event: safeResumeLabel(event, 'activation_resume_checkpoint'),
+	      detailJson: safeString(detail || {}).slice(0, 600),
+	      correlationId: flow.id
+	    });
+	  }
+
+	  function enqueueCompletedResumeSafeLog(flow, event, detail) {
+	    if (!flow || flow.freshLogged) return;
+	    flow.freshLogged = true;
+	    enqueueClientLog({
+	      level: 'info',
+	      event: safeResumeLabel(event, 'activation_resume_checkpoint'),
+	      detailJson: safeString(detail || {}).slice(0, 600),
+	      correlationId: flow.id
+	    });
+	  }
+
+	  function logResumeCheckpoint(event, detail, flow) {
+	    const targetFlow = flow || activeResumeFlow;
+	    if (!targetFlow) return;
+	    enqueueResumeSafeLog(targetFlow, event, resumeDiagnosticSnapshot(detail));
+	  }
+
+	  function clearActivationReconnectBurst() {
+	    if (activationReconnectBurstTimer) {
+	      clearTimeout(activationReconnectBurstTimer);
+	      activationReconnectBurstTimer = null;
+	    }
+	  }
+
+	  function finishActivationResumeFlow(reason, flow) {
+	    const targetFlow = flow || activeResumeFlow;
+	    if (!targetFlow || targetFlow.done) return;
+	    enqueueResumeSafeLog(targetFlow, 'activation_resume_finish', resumeDiagnosticSnapshot({
+	      result: safeResumeLabel(reason, 'complete'),
+	      phase: targetFlow.phase || 'unknown'
+	    }));
+	    if (reason === 'fresh_frame') {
+	      pendingResumeFreshFrameFlow = null;
+	    } else {
+	      pendingResumeFreshFrameFlow = {
+	        id: targetFlow.id,
+	        reason: targetFlow.reason,
+	        trigger: targetFlow.trigger,
+	        phase: safeResumeLabel(reason, 'complete'),
+	        freshLogged: false
+	      };
+	    }
+	    targetFlow.done = true;
+	    if (targetFlow === activeResumeFlow) {
+	      clearActivationReconnectBurst();
+	      activeResumeFlow = null;
+	    }
+	  }
+
+	  function startActivationResumeFlow(reason, trigger, options) {
+	    if (streamUnsupported) return null;
+	    const pauseBurst = Boolean(options && options.pauseBurst);
+	    let flow = activeResumeFlow;
+	    if (flow && !flow.done) {
+	      flow.reason = safeResumeLabel(reason, flow.reason);
+	      flow.trigger = safeResumeLabel(trigger, flow.trigger);
+	      logResumeCheckpoint('activation_resume_merged', {
+	        reason: flow.reason,
+	        trigger: flow.trigger,
+	        phase: pauseBurst ? 'paused' : 'active'
+	      }, flow);
+	    } else {
+	      pendingResumeFreshFrameFlow = null;
+	      flow = {
+	        id: randomResumeFlowId(),
+	        reason: safeResumeLabel(reason, 'activation'),
+	        trigger: safeResumeLabel(trigger, 'activation'),
+	        startedAt: performance.now(),
+	        deadlineAt: performance.now() + activationReconnectBurstMs,
+	        attempts: 0,
+	        logCount: 0,
+	        limitLogged: false,
+	        done: false,
+	        phase: pauseBurst ? 'paused' : 'starting'
+	      };
+	      activeResumeFlow = flow;
+	      logResumeCheckpoint('activation_resume_start', {
+	        reason: flow.reason,
+	        trigger: flow.trigger,
+	        phase: flow.phase
+	      }, flow);
+	    }
+	    if (pauseBurst) return flow;
+	    runActivationReconnectBurst(reason || 'activation', flow);
+	    return flow;
+	  }
+
+	  function activationRetryPhase(attempt) {
+	    if (attempt <= 0) return 'initial';
+	    if (attempt < 4) return 'early';
+	    if (attempt < 8) return 'middle';
+	    return 'late';
+	  }
+
+	  function runActivationReconnectBurst(reason, flow) {
+	    if (!flow || activeResumeFlow !== flow || flow.done) return;
+	    clearActivationReconnectBurst();
+	    if (streamHasFreshRenderedFrame()) {
+	      flow.phase = 'fresh';
+	      logResumeCheckpoint('activation_resume_fresh_frame', { result: 'fresh' }, flow);
+	      finishActivationResumeFlow('fresh_frame', flow);
+	      return;
+	    }
+	    if (idleDisconnected) {
+	      finishActivationResumeFlow('idle_disconnected', flow);
+	      return;
+	    }
+	    if (document.visibilityState !== 'visible') {
+	      flow.phase = 'paused';
+	      logResumeCheckpoint('activation_resume_paused', { reason: 'hidden' }, flow);
+	      return;
+	    }
+	    const now = performance.now();
+	    if (flow.attempts >= activationReconnectMaxTicks || now >= flow.deadlineAt) {
+	      flow.phase = 'exhausted';
+	      logResumeCheckpoint('activation_resume_exhausted', { result: 'exhausted' }, flow);
+	      finishActivationResumeFlow('exhausted', flow);
+	      return;
+	    }
+	    const attempt = flow.attempts;
+	    const phase = activationRetryPhase(attempt);
+	    flow.phase = phase;
+	    logResumeCheckpoint('activation_resume_retry', {
+	      phase,
+	      action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover' : (attempt === 0 ? 'keyframe' : 'socket_reconnect')
+	    }, flow);
+	    connectSpacetimeState().catch(() => clientLog('spacetime_reconnect_failed', 'activation_resume'));
+	    publishStreamFocus(true, safeResumeLabel(reason, 'activation'));
+	    if (attempt === 0 && !mediaSessionStuckOnPreservedFrame()) {
+	      connectDirectVideo();
+	      requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);
+	    } else {
+	      recoverFreshMediaSession(reason || 'activation', 'activation_resume', {
+	        flow,
+	        watchdogs: false,
+	        keyframeReason: `${reason || 'activation'}_activation_keyframe`,
+	        serverRecoveryReason: `${reason || 'activation'}_activation_recover`,
+	        forceServerRecovery: mediaSessionStuckOnPreservedFrame() || attempt >= 2
+	      });
+	    }
+	    flow.attempts += 1;
+	    activationReconnectBurstTimer = setTimeout(() => runActivationReconnectBurst(reason, flow), activationReconnectTickMs);
+	  }
+
+	  function scheduleResumeWatchdogs(reason) {
     clearResumeWatchdogs();
     const metric = activeStreamOpenMetric;
     const flowId = metric && metric.flowId;
@@ -1154,43 +1447,89 @@ import { html, reactive } from '@arrow-js/core';
     }, resumeSoftReconnectMs);
     resumeRecoveryHardTimer = setTimeout(() => {
       resumeRecoveryHardTimer = null;
-      if (idleDisconnected || document.visibilityState !== 'visible') return;
-      if (streamHasFreshRenderedFrame()) return;
-      recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true, {
-        reason,
-        socketState: videoSocketState(),
+	      if (idleDisconnected || document.visibilityState !== 'visible') return;
+	      if (streamHasFreshRenderedFrame()) return;
+	      recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true, {
+	        reason,
+	        socketState: videoSocketState(),
         hasRenderedFrame,
-        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
-      });
-      requestKeyframeDebounced(`${reason || 'resume'}_hard_recover`, 500);
-      requestServerRecoveryDebounced(`${reason || 'resume'}_hard_recover`);
-      connectDirectVideo();
-    }, resumeHardRecoverMs);
-  }
+	        lastFrameAgeMillis: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : -1
+	      });
+	      recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover', {
+	        flow: activeResumeFlow,
+	        watchdogs: false,
+	        keyframeReason: `${reason || 'resume'}_hard_recover`,
+	        keyframeMinIntervalMs: 500,
+	        serverRecoveryReason: `${reason || 'resume'}_hard_recover`,
+	        forceServerRecovery: true
+	      });
+	    }, resumeHardRecoverMs);
+	  }
 
-  function forceFreshVideoResume(reason, kind) {
-    if (idleDisconnected || streamUnsupported) return;
-    const now = performance.now();
-    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
+	  function recoverFreshMediaSession(reason, kind, options) {
+	    if (idleDisconnected || streamUnsupported) return false;
+	    options = options || {};
+	    const recoveryReason = safeResumeLabel(reason, 'media_session_recovery');
+	    const recoveryKind = safeResumeLabel(kind, 'media_session_recovery');
+	    const flow = options.flow || activeResumeFlow;
+	    const stuck = mediaSessionStuckOnPreservedFrame();
+	    if (flow) {
+	      if (stuck) {
+	        logResumeCheckpoint('activation_resume_media_stuck', {
+	          reason: recoveryReason,
+	          kind: recoveryKind,
+	          action: 'deep_recover'
+	        }, flow);
+	      }
+	      logResumeCheckpoint('activation_resume_deep_recover', {
+	        reason: recoveryReason,
+	        kind: recoveryKind,
+	        action: 'deep_recover'
+	      }, flow);
+	    }
+	    closeEarlyVideo(reason || 'media_session_recovery');
+	    if (hiddenVideoCloseTimer) {
+	      clearTimeout(hiddenVideoCloseTimer);
+	      hiddenVideoCloseTimer = null;
+	    }
+	    if (hiddenStreamFocusTimer) {
+	      clearTimeout(hiddenStreamFocusTimer);
+	      hiddenStreamFocusTimer = null;
+	    }
+	    preserveCurrentFrame(`fresh_media_session:${reason || 'unknown'}`);
+	    closeDirectVideo();
+	    resetStreamState({ preserveFrame: true });
+	    showStreamRecovery();
+	    beginStreamOpenMetric(kind || 'media_session_recovery', reason || 'resume', true);
+	    connectDirectVideo();
+	    requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);
+	    if (options.forceServerRecovery) {
+	      requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);
+	    }
+	    if (options.watchdogs !== false) {
+	      scheduleResumeWatchdogs(reason || 'resume');
+	    }
+	    return true;
+	  }
+
+	  function forceFreshVideoResume(reason, kind) {
+	    if (idleDisconnected || streamUnsupported) return;
+	    const now = performance.now();
+	    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
     clientLog('fresh_video_resume', JSON.stringify({
       reason,
       kind,
       configured,
       frameAgeMs: Math.round(frameAgeMs),
       socketState: videoSocketState(),
-      hasRenderedFrame,
-      fallbackFrameAvailable
-    }));
-    closeEarlyVideo(reason || 'fresh_resume');
-    preserveCurrentFrame(`fresh_resume:${reason || 'unknown'}`);
-    closeDirectVideo();
-    resetStreamState({ preserveFrame: true });
-    showStreamRecovery();
-    beginStreamOpenMetric(kind || 'old_tab_resume', reason || 'resume', true);
-    connectDirectVideo();
-    requestKeyframeDebounced(`${reason || 'resume'}_fresh_socket`, 500);
-    scheduleResumeWatchdogs(reason || 'resume');
-  }
+	      hasRenderedFrame,
+	      fallbackFrameAvailable
+	    }));
+	    recoverFreshMediaSession(reason || 'fresh_resume', kind || 'old_tab_resume', {
+	      keyframeReason: `${reason || 'resume'}_fresh_socket`,
+	      keyframeMinIntervalMs: 500
+	    });
+	  }
 
   function restoreCachedVideoForFreshFrame(reason, kind) {
     if (idleDisconnected || streamUnsupported) return;
@@ -1205,25 +1544,12 @@ import { html, reactive } from '@arrow-js/core';
         hasRenderedFrame,
         fallbackFrameAvailable
       }));
-    closeEarlyVideo(reason || 'cached_resume');
-    if (hiddenVideoCloseTimer) {
-      clearTimeout(hiddenVideoCloseTimer);
-      hiddenVideoCloseTimer = null;
-    }
-    if (hiddenStreamFocusTimer) {
-      clearTimeout(hiddenStreamFocusTimer);
-      hiddenStreamFocusTimer = null;
-    }
-    preserveCurrentFrame(`cached_resume:${reason || 'unknown'}`);
-    closeDirectVideo();
-    resetStreamState({ preserveFrame: true });
-    showStreamRecovery();
-    beginStreamOpenMetric(kind || 'old_tab_resume', reason || 'resume', true);
-    connectDirectVideo();
-    requestKeyframeDebounced(`${reason || 'resume'}_cached_keyframe`, 0, true);
-    requestServerRecoveryDebounced(`${reason || 'resume'}_cached_recover`, true);
-    scheduleResumeWatchdogs(reason || 'resume');
-  }
+	    recoverFreshMediaSession(reason || 'cached_resume', kind || 'old_tab_resume', {
+	      keyframeReason: `${reason || 'resume'}_cached_keyframe`,
+	      serverRecoveryReason: `${reason || 'resume'}_cached_recover`,
+	      forceServerRecovery: true
+	    });
+	  }
 
   function connect() {
     if (idleDisconnected) return;
@@ -1278,6 +1604,7 @@ import { html, reactive } from '@arrow-js/core';
     lastAcceptedFrameSequence = 0;
     lastAcceptedFrameTimestamp = 0;
     firstRenderedTraceSent = false;
+    resetFirstFrameServerRecovery();
     latestStreamStatus = null;
     lastStreamStatusAt = 0;
     decoderMode = 'annexb';
@@ -1431,14 +1758,21 @@ import { html, reactive } from '@arrow-js/core';
       setTimeout(connectDirectVideo, 250);
       return;
     }
-    closeDirectVideo();
-    document.body.dataset.videoPath = 'https-h264';
-    videoSocketCreatedAt = performance.now();
-    const socket = safeWebSocket(streamURL(), 'video');
-    if (!socket) {
-      showStreamRecovery();
-      setTimeout(connectDirectVideo, 1500);
-      return;
+	    closeDirectVideo();
+	    document.body.dataset.videoPath = 'https-h264';
+	    videoSocketCreatedAt = performance.now();
+    clientLog('video_socket_connect_attempt', JSON.stringify({
+      path: 'https-h264',
+      configured,
+      visibility: document.visibilityState,
+      frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
+    }));
+	    const socket = safeWebSocket(streamURL(), 'video');
+	    if (!socket) {
+      clientLog('video_socket_create_failed', 'safe_websocket_unavailable');
+	      showStreamRecovery();
+	      setTimeout(connectDirectVideo, 1500);
+	      return;
     }
     adoptVideoSocket(socket, [], 0, 'video_socket_open');
   }
@@ -1449,9 +1783,16 @@ import { html, reactive } from '@arrow-js/core';
       try { socket.close(1000, 'stale_video_socket'); } catch (_) {}
       return;
     }
-    if (videoConnectedAt <= 0) videoConnectedAt = performance.now();
-    showStreamWaiting('Saņem video konfigurāciju...');
-    requestKeyframe(reason || 'video_socket_open');
+	    if (videoConnectedAt <= 0) videoConnectedAt = performance.now();
+    clientLog('video_socket_opened', JSON.stringify({
+      reason: reason || 'video_socket_open',
+      openWaitMs: videoSocketCreatedAt > 0 ? Math.round(performance.now() - videoSocketCreatedAt) : null,
+      readyState: socket.readyState,
+      visibility: document.visibilityState
+    }));
+	    resetFirstFrameServerRecovery();
+	    showStreamWaiting('Saņem video konfigurāciju...');
+	    requestKeyframe(reason || 'video_socket_open');
   }
 
   function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {
@@ -1467,13 +1808,24 @@ import { html, reactive } from '@arrow-js/core';
         requestKeyframe('video_message_failed');
       });
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       activeVideoSockets.delete(socket);
       if (videoWs === socket) videoWs = null;
       if (intentionallyClosedVideoSockets.has(socket)) {
+        clientLog('video_socket_closed_intentional', JSON.stringify({
+          code: event && event.code,
+          wasClean: event && event.wasClean
+        }));
         intentionallyClosedVideoSockets.delete(socket);
         return;
       }
+      clientLog('video_socket_closed', JSON.stringify({
+        code: event && event.code,
+        wasClean: event && event.wasClean,
+        configured,
+        frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null,
+        visibility: document.visibilityState
+      }));
       resetStreamState({ preserveFrame: true });
       showStreamRecovery();
       if (viewerIsForeground()) {
@@ -1482,7 +1834,11 @@ import { html, reactive } from '@arrow-js/core';
     };
     socket.onerror = () => {
       if (intentionallyClosedVideoSockets.has(socket)) return;
-      clientLog('direct_video_websocket_error', 'socket error');
+      clientLog('direct_video_websocket_error', JSON.stringify({
+        readyState: socket.readyState,
+        configured,
+        frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
+      }));
     };
     if (socket.readyState === WebSocket.OPEN) {
       if (openedAt > 0) videoConnectedAt = openedAt;
@@ -1511,20 +1867,20 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function sendVideoSocketClientLog(event, detail) {
-    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return;
-    try {
-      videoWs.send(JSON.stringify({
-        type: 'client_log',
-        event: String(event || '').slice(0, 96),
-        detail: safeString(detail).slice(0, 500)
-      }));
-    } catch (_) {}
+    clientLog(event, safeString(detail).slice(0, 500));
   }
 
   function requestKeyframe(reason, force) {
     const now = performance.now();
     if (!force && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
     lastKeyframeCommandAt = now;
+    clientLog('keyframe_request', JSON.stringify({
+      reason: reason || 'browser_request',
+      force: Boolean(force),
+      configured,
+      videoState: videoWs ? videoWs.readyState : -1,
+      frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
+    }));
     runSpacetimeMutation((client) => client.requestKeyframe(reason || 'browser_request'), reason || 'keyframe')
       .catch((error) => clientLog('keyframe_request_failed', `${reason || 'keyframe'}:${error && error.message || 'failed'}`));
     return true;
@@ -1543,8 +1899,44 @@ import { html, reactive } from '@arrow-js/core';
     if (!force && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
     sendVideoClientLog('h264_server_recover_requested', reason);
+    clientLog('stream_recovery_request', JSON.stringify({
+      reason: reason || 'browser_recovery',
+      force: Boolean(force),
+      configured,
+      videoState: videoWs ? videoWs.readyState : -1,
+      frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
+    }));
     runSpacetimeMutation((client) => client.recoverStream(reason || 'browser_recovery'), reason || 'recover_stream')
       .catch((error) => clientLog('stream_recover_request_failed', `${reason || 'recover'}:${error && error.message || 'failed'}`));
+    return true;
+  }
+
+  function resetFirstFrameServerRecovery() {
+    firstFrameServerRecoveryAttempts = 0;
+    firstFrameServerRecoveryExhausted = false;
+  }
+
+  function logFirstFrameServerRecoveryExhausted(phase) {
+    enqueueClientLog({
+      level: 'info',
+      event: 'h264_first_frame_recovery_exhausted',
+      detailJson: safeString({
+        phase: safeResumeLabel(phase, 'first_frame_pending'),
+        result: 'exhausted'
+      }).slice(0, 600),
+      correlationId: activeResumeFlow ? activeResumeFlow.id : ''
+    });
+  }
+
+  function requestFirstFrameServerRecovery(reason, phase) {
+    if (firstFrameServerRecoveryExhausted) return false;
+    if (firstFrameServerRecoveryAttempts >= firstFrameServerRecoveryMaxAttempts) {
+      firstFrameServerRecoveryExhausted = true;
+      logFirstFrameServerRecoveryExhausted(phase);
+      return false;
+    }
+    if (!requestServerRecoveryDebounced(reason, false)) return false;
+    firstFrameServerRecoveryAttempts += 1;
     return true;
   }
 
@@ -1854,6 +2246,7 @@ import { html, reactive } from '@arrow-js/core';
       lastRenderedFrameTimestamp = Number(frameMetadata.timestamp || 0);
       firstFrameReceived = true;
       hasRenderedFrame = true;
+      resetFirstFrameServerRecovery();
       const firstFrameDetail = {
         visualAgeMillis: Math.round(lastRenderedFrameVisualAgeMillis),
         frameEpoch: lastRenderedFrameEpoch,
@@ -2147,7 +2540,7 @@ import { html, reactive } from '@arrow-js/core';
   function controlCodeStatusText(status, reason) {
     switch (status) {
     case 'queued':
-      return 'Gaida rindā';
+      return localizePublicMessage(reason || 'waiting_for_stream_recovery');
     case 'running':
       return 'Tālrunis veido kodu';
     case 'succeeded':
@@ -2174,7 +2567,8 @@ import { html, reactive } from '@arrow-js/core';
     if (!request) return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
     if (request.status === 'queued') {
       const position = Number(request.queuePosition || 0);
-      return position > 1 ? `Rindā: ${position}. vieta` : 'Pieprasījums rindā';
+      if (position > 1) return `Rindā: ${position}. vieta`;
+      return localizePublicMessage(request.reason || request.message || 'waiting_for_stream_recovery');
     }
     if (request.status === 'running') return 'Tālrunis īsi atver koda logu un atgriezīsies pie biļetes.';
     if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
@@ -3268,7 +3662,7 @@ import { html, reactive } from '@arrow-js/core';
       setControlCodeResultVisible(false);
     }
     keepControlCodeVideoAlive('control_code_wait_reconnect');
-    requestKeyframeDebounced('control_code_result_wait_start', 0, true);
+    requestKeyframeDebounced('control_code_result_wait_start', controlCodeCaptureKeyframeRetryMs);
     if (maybeCaptureControlCodeResultImage()) return;
     const tick = () => {
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
@@ -3962,11 +4356,25 @@ import { html, reactive } from '@arrow-js/core';
     const freshness = currentRenderedFreshness(performance.now());
     document.body.dataset.streamFreshness = freshness.streamFreshnessState;
     document.body.dataset.streamLive = freshness.liveLabeled ? 'true' : 'false';
-    if (!freshness.liveLabeled && (reason || hasRenderedFrame)) {
-      showStreamResumeSpinner();
-    } else if (freshness.liveLabeled) {
-      hideStreamResumeSpinner();
-    }
+	    if (!freshness.liveLabeled && (reason || hasRenderedFrame)) {
+	      showStreamResumeSpinner();
+	    } else if (freshness.liveLabeled) {
+	      hideStreamResumeSpinner();
+	      if (activeResumeFlow && !activeResumeFlow.done) {
+	        logResumeCheckpoint('activation_resume_fresh_frame', {
+	          reason: safeResumeLabel(reason, 'frame_rendered'),
+	          result: 'fresh'
+	        });
+	        finishActivationResumeFlow('fresh_frame');
+	      } else if (pendingResumeFreshFrameFlow && !pendingResumeFreshFrameFlow.freshLogged) {
+	        enqueueCompletedResumeSafeLog(pendingResumeFreshFrameFlow, 'activation_resume_fresh_frame', resumeDiagnosticSnapshot({
+	          reason: safeResumeLabel(reason, 'frame_rendered'),
+	          result: 'late_fresh',
+	          phase: pendingResumeFreshFrameFlow.phase || 'complete'
+	        }));
+	        pendingResumeFreshFrameFlow = null;
+	      }
+	    }
     updateControlCodeSubmitAvailability();
     return freshness;
   }
@@ -4082,8 +4490,18 @@ import { html, reactive } from '@arrow-js/core';
           clientLog('loading_over_2s', 'h264_first_frame_pending');
         }
       }
+      if (pendingAge > streamStaleDecoderResetMs && mediaSessionStuckOnPreservedFrame()) {
+        recoverFreshMediaSession('h264_first_frame_pending', 'first_frame_pending', {
+          flow: activeResumeFlow,
+          watchdogs: false,
+          keyframeReason: 'h264_first_frame_pending_keyframe',
+          serverRecoveryReason: 'h264_first_frame_pending_recover',
+          forceServerRecovery: true
+        });
+        return;
+      }
       if (pendingAge > streamStaleServerRecoverMs || backendInactive) {
-        requestServerRecoveryDebounced('h264_start_pending');
+        requestFirstFrameServerRecovery('h264_start_pending', 'unconfigured');
       }
       return;
     }
@@ -4103,7 +4521,7 @@ import { html, reactive } from '@arrow-js/core';
         reconnectVideoForRecovery('first_frame_video_reconnect');
       }
       if (firstFrameAge > streamStaleServerRecoverMs || backendInactive) {
-        requestServerRecoveryDebounced('first_frame_server_recover');
+        requestFirstFrameServerRecovery('first_frame_server_recover', 'configured');
       }
       return;
     }
@@ -4161,23 +4579,32 @@ import { html, reactive } from '@arrow-js/core';
     }
   }
 
-  function recoverAfterVisibilityResume(reason) {
-    if (idleDisconnected) {
-      resumeFromIdleDisconnect(reason || 'visibility_resume');
-      return;
-    }
-    const now = performance.now();
-    const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
-    const hiddenWallMs = lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0;
-    const hiddenMs = Math.max(hiddenPerfMs, hiddenWallMs);
-    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : null;
-    const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;
-    const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;
-    const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));
-    const cacheRestored = reason === 'pageshow_persisted' || (typeof document !== 'undefined' && document.wasDiscarded === true);
-    const connectingTooLong = videoWs && videoWs.readyState === WebSocket.CONNECTING && videoSocketCreatedAt > 0 && now - videoSocketCreatedAt > resumeSoftReconnectMs;
-    lastHiddenAt = 0;
-    lastHiddenWallAt = 0;
+	  function recoverAfterVisibilityResume(reason) {
+	    if (idleDisconnected) {
+	      resumeFromIdleDisconnect(reason || 'visibility_resume');
+	      return;
+	    }
+	    const now = performance.now();
+	    const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
+	    const hiddenWallMs = lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0;
+	    const hiddenMs = Math.max(hiddenPerfMs, hiddenWallMs);
+	    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : null;
+	    const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;
+	    const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;
+	    const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));
+	    const cacheRestored = reason === 'pageshow_persisted' || (typeof document !== 'undefined' && document.wasDiscarded === true);
+	    const connectingTooLong = videoWs && videoWs.readyState === WebSocket.CONNECTING && videoSocketCreatedAt > 0 && now - videoSocketCreatedAt > resumeSoftReconnectMs;
+	    const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });
+	    logResumeCheckpoint('activation_resume_recovery_decision', {
+	      reason: safeResumeLabel(reason, 'visibility_resume'),
+	      hidden: hiddenDurationBucket(hiddenMs),
+	      cache: resumeBooleanLabel(cacheRestored),
+	      stale: resumeBooleanLabel(videoStale),
+	      connecting: resumeBooleanLabel(connectingTooLong),
+	      action: longHidden || oldHiddenTab || cacheRestored || connectingTooLong ? 'cached_restore' : 'watch'
+	    }, resumeFlow);
+	    lastHiddenAt = 0;
+	    lastHiddenWallAt = 0;
     if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {
       clientLog('visibility_resume_recovery', JSON.stringify({
         reason,
@@ -4206,10 +4633,11 @@ import { html, reactive } from '@arrow-js/core';
     scheduleFirstScreenPin(false);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     publishStreamFocus(true, reason || 'visibility_visible');
-    if (longHidden || oldHiddenTab || cacheRestored || connectingTooLong) {
-      restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');
-      return;
-    }
+	    if (longHidden || oldHiddenTab || cacheRestored || connectingTooLong) {
+	      restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');
+	      runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);
+	      return;
+	    }
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       beginStreamOpenMetric('old_tab_resume', reason || 'visibility_visible', true);
       connectDirectVideo();
@@ -4224,9 +4652,10 @@ import { html, reactive } from '@arrow-js/core';
           reconnectVideoForRecovery('visibility_resume_stale');
         }
       }, resumeVideoReconnectDelayMs);
-    }
-    chaseLiveStream();
-  }
+	    }
+	    chaseLiveStream();
+	    runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);
+	  }
 
   window.addEventListener('resize', resizeCanvasBox);
   window.addEventListener('scroll', updateDetailsReveal, { passive: true });
@@ -4242,20 +4671,24 @@ import { html, reactive } from '@arrow-js/core';
         hiddenStreamFocusTimer = null;
       }
       recoverAfterVisibilityResume('visibility_resume');
-    } else if (document.visibilityState === 'hidden') {
-      lastHiddenAt = performance.now();
-      lastHiddenWallAt = Date.now();
-      clearResumeWatchdogs();
-      releaseScreenWakeLock('visibility_hidden');
-      releaseStreamFocusAfterHiddenGrace('visibility_hidden');
-      pauseVideoWhileHidden('visibility_hidden');
-    }
-  });
-  window.addEventListener('pageshow', (event) => {
-    noteViewerActivity(event, 'pageshow');
-    if (screenEngaged) {
-      requestScreenWakeLock('pageshow');
-    }
+	    } else if (document.visibilityState === 'hidden') {
+	      const flow = startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });
+	      logResumeCheckpoint('activation_visibility_hidden', { reason: 'hidden' }, flow);
+	      lastHiddenAt = performance.now();
+	      lastHiddenWallAt = Date.now();
+	      clearResumeWatchdogs();
+	      clearActivationReconnectBurst();
+	      releaseScreenWakeLock('visibility_hidden');
+	      releaseStreamFocusAfterHiddenGrace('visibility_hidden');
+	      pauseVideoWhileHidden('visibility_hidden');
+	    }
+	  });
+	  window.addEventListener('pageshow', (event) => {
+	    noteViewerActivity(event, 'pageshow');
+	    startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');
+	    if (screenEngaged) {
+	      requestScreenWakeLock('pageshow');
+	    }
     scheduleFirstScreenPin(true);
     if (event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true)) recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');
     chaseLiveStream();
@@ -4265,13 +4698,19 @@ import { html, reactive } from '@arrow-js/core';
     if (idleDisconnected) {
       resumeFromIdleDisconnect('focus');
       return;
-    }
-    publishStreamFocus(true, 'focus');
-    chaseLiveStream();
-  });
-  window.addEventListener('pagehide', (event) => {
-    closeEarlyVideo('pagehide');
-    clearResumeWatchdogs();
+	    }
+	    publishStreamFocus(true, 'focus');
+	    chaseLiveStream();
+	    startActivationResumeFlow('focus', 'focus');
+	  });
+	  window.addEventListener('pagehide', (event) => {
+	    const flow = startActivationResumeFlow(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide', { pauseBurst: true });
+	    logResumeCheckpoint('activation_pagehide', {
+	      cache: resumeBooleanLabel(Boolean(event && event.persisted))
+	    }, flow);
+	    closeEarlyVideo('pagehide');
+	    clearResumeWatchdogs();
+	    clearActivationReconnectBurst();
     if (hiddenStreamFocusTimer) {
       clearTimeout(hiddenStreamFocusTimer);
       hiddenStreamFocusTimer = null;
@@ -4302,11 +4741,12 @@ import { html, reactive } from '@arrow-js/core';
   updateDetailsReveal();
   resizeCanvasBox();
   scheduleViewerIdleDisconnect('initial_load');
-  showQuietStreamLoading();
-  connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
-  connect();
+	  showQuietStreamLoading();
+	  connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
+	  connect();
+	  startActivationResumeFlow('initial_load', 'initial_load');
 
-  async function startAdmin() {
+	  async function startAdmin() {
     const memberForm = document.getElementById('memberForm');
     const memberEmail = document.getElementById('memberEmail');
     const memberRole = document.getElementById('memberRole');
@@ -4325,6 +4765,15 @@ import { html, reactive } from '@arrow-js/core';
     const safetyDetail = document.getElementById('adminSafetyDetail');
     const backendSummary = document.getElementById('adminBackendSummary');
     const backendList = document.getElementById('adminBackendList');
+    const ticketSummary = document.getElementById('adminTicketSummary');
+    const ticketState = document.getElementById('adminTicketState');
+    const ticketDetail = document.getElementById('adminTicketDetail');
+    const ticketResult = document.getElementById('adminTicketResult');
+    const ticketResultDetail = document.getElementById('adminTicketResultDetail');
+    const ticketReselect = document.getElementById('adminTicketReselect');
+    const eventsSummary = document.getElementById('adminEventsSummary');
+    const eventsFilter = document.getElementById('adminEventsFilter');
+    const eventsList = document.getElementById('adminEvents');
     const simSetup = document.querySelector('[data-simulator-setup="true"]');
     const simSetupSummary = document.getElementById('simSetupSummary');
     const simSetupPackages = document.getElementById('simSetupPackages');
@@ -4351,7 +4800,16 @@ import { html, reactive } from '@arrow-js/core';
       safetyState,
       safetyDetail,
       backendSummary,
-      backendList
+      backendList,
+      ticketSummary,
+      ticketState,
+      ticketDetail,
+      ticketResult,
+      ticketResultDetail,
+      ticketReselect,
+      eventsSummary,
+      eventsFilter,
+      eventsList
     ];
     if (requiredAdminElements.some((element) => !element)) {
       reportClientFault('missing_admin_dom', 'admin shell incomplete');
@@ -4379,15 +4837,18 @@ import { html, reactive } from '@arrow-js/core';
         return;
       }
       adminLoadInFlight = (async () => {
-        const [stateResponse, backendResponse] = await Promise.all([
+        const [stateResponse, backendResponse, eventsResponse] = await Promise.all([
           fetch('/api/v1/admin/state', { cache: 'no-store' }),
-          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' })
+          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' }),
+          fetch(adminEventsURL(), { cache: 'no-store' })
         ]);
         const payload = await stateResponse.json();
         const backendsPayload = await backendResponse.json();
+        const eventsPayload = await eventsResponse.json();
         if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
         if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
-        renderAdmin(payload.state, payload.phone, backendsPayload);
+        if (!eventsResponse.ok || !eventsPayload.ok) throw new Error(eventsPayload.message || 'event load failed');
+        renderAdmin(payload.state, payload.phone, backendsPayload, eventsPayload);
         if (simSetup && simulatorSetupActive()) {
           loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
         }
@@ -4401,10 +4862,13 @@ import { html, reactive } from '@arrow-js/core';
       }
     }
 
-    function renderAdmin(state, phone, backendsPayload) {
-      const phoneHealth = parsePhoneHealth(state.phone && state.phone.healthJson);
+    function renderAdmin(state, phone, backendsPayload, eventsPayload) {
+      const phoneRecord = state.phone || {};
+      const phoneHealth = parsePhoneHealth(phoneRecord.statusJson || phoneRecord.healthJson);
       renderStatus(state, phone, phoneHealth);
+      renderTicketSelection(phoneHealth);
       renderBackends(backendsPayload);
+      renderOperationalEvents(eventsPayload || {});
       membersEl.textContent = '';
       activeMembers(state).forEach((member) => {
         const row = document.createElement('div');
@@ -4441,6 +4905,10 @@ import { html, reactive } from '@arrow-js/core';
       stateEl.textContent = JSON.stringify({ state, phone, phoneBackends: backendsPayload }, null, 2);
     }
 
+    eventsFilter.addEventListener('change', () => {
+      load().catch((error) => showNotice(error.message || 'Event load failed', true));
+    });
+
     memberForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       await runAdminAction(memberForm.querySelector('button[type="submit"]'), 'Adding member...', async () => {
@@ -4452,6 +4920,21 @@ import { html, reactive } from '@arrow-js/core';
         });
         memberEmail.value = '';
         showNotice('Member saved');
+        await load();
+      });
+    });
+
+    ticketReselect.addEventListener('click', async () => {
+      await runAdminAction(ticketReselect, 'Requesting...', async () => {
+        const response = await apiFetch('/api/v1/admin/ticket/reselect-latest', {
+          method: 'POST',
+          cache: 'no-store'
+        });
+        let payload = {};
+        try {
+          payload = await response.json();
+        } catch (_) {}
+        showNotice(payload.commandId ? `Latest ticket reselect request sent · ${payload.commandId}` : 'Latest ticket reselect request sent');
         await load();
       });
     });
@@ -4485,6 +4968,77 @@ import { html, reactive } from '@arrow-js/core';
         ? `Input gate: ${inputGate.reason}`
         : (lockdown.reason || 'Tap-only controls');
 
+    }
+
+    function renderTicketSelection(phoneHealth) {
+      const vivi = phoneHealth.viviState || {};
+      const reselect = phoneHealth.latestTicketReselect || {};
+      const stateName = vivi.state || 'UNKNOWN_VIVI';
+      const ticketId = vivi.ticketId || '';
+      const observed = durationAgo(vivi.observedAgoMillis);
+      const source = vivi.source || 'unknown';
+      const reason = vivi.reason || 'unknown';
+      const selected = stateName === 'TICKET_DETAIL';
+      ticketSummary.textContent = selected
+        ? `Selected: ${ticketId || 'ticket detail'}`
+        : `ViVi state: ${humanState(stateName)}`;
+      ticketState.textContent = ticketId || humanState(stateName);
+      ticketDetail.textContent = `${selected ? 'Ticket detail' : humanState(stateName)} · ${observed ? `seen ${observed}` : 'not observed'} · ${source} · ${reason}`;
+
+      const reselectStatus = String(reselect.status || '').toLowerCase();
+      const reselectActive = Boolean(reselect.active);
+      ticketReselect.disabled = reselectActive;
+      if (reselectStatus && reselectStatus !== 'idle') {
+        const started = durationAgo(reselect.startedAgoMillis);
+        const completed = durationAgo(reselect.completedAgoMillis);
+        const fresh = durationAgo(reselect.freshFrameAgoMillis);
+        if (reselectStatus === 'pending') {
+          ticketResult.textContent = reselectActive ? 'Pending' : 'Failed';
+          ticketResultDetail.textContent = reselectActive
+            ? `Phone is selecting the latest ticket${started ? ` · started ${started}` : ''}`
+            : `Phone did not finish ticket selection${started ? ` · started ${started}` : ''}`;
+          return;
+        }
+        if (reselectStatus === 'succeeded') {
+          ticketResult.textContent = fresh ? 'Ready' : 'Pending';
+          ticketResultDetail.textContent = fresh
+            ? `Fresh ticket stream confirmed ${fresh}`
+            : `Ticket selected${completed ? ` ${completed}` : ''}; waiting for fresh stream frame`;
+          return;
+        }
+        if (reselectStatus === 'failed') {
+          ticketResult.textContent = 'Failed';
+          ticketResultDetail.textContent = `${reselect.reason || 'Ticket reselect failed'}${completed ? ` · ${completed}` : ''}`;
+          return;
+        }
+      }
+
+      const latest = latestTicketReselectEvent(phoneHealth.recentEvents || []);
+      if (!latest) {
+        ticketResult.textContent = 'No request yet';
+        ticketResultDetail.textContent = 'Use this only when the phone should forget the remembered ticket and pick again.';
+        return;
+      }
+      const event = latest.event || '';
+      const ok = event.indexOf('succeeded') >= 0 || event.indexOf('requested') >= 0;
+      const failed = event.indexOf('failed') >= 0 || event.indexOf('blocked') >= 0;
+      ticketResult.textContent = failed ? 'Failed' : (ok ? 'Accepted' : humanState(event));
+      ticketResultDetail.textContent = `${humanState(event)} · ${durationAgo(latest.atAgoMillis) || 'just now'}${latest.detail ? ` · ${latest.detail}` : ''}`;
+    }
+
+    function latestTicketReselectEvent(events) {
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const item = events[index] || {};
+        if (String(item.event || '').indexOf('latest_ticket_reselect') === 0) return item;
+      }
+      return null;
+    }
+
+    function humanState(value) {
+      return String(value || 'unknown')
+        .replace(/_/g, ' ')
+        .toLowerCase()
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
     }
 
     function activeMembers(state) {
@@ -4540,6 +5094,51 @@ import { html, reactive } from '@arrow-js/core';
         backendList.appendChild(row);
       });
       renderSimulatorAvailability(active);
+    }
+
+    function adminEventsURL() {
+      const params = new URLSearchParams();
+      params.set('limit', '80');
+      const filter = eventsFilter.value || '';
+      if (filter === 'errors') {
+        params.set('level', 'warn');
+      } else if (filter) {
+        params.set('category', filter);
+      }
+      return `/api/v1/admin/operational-events?${params.toString()}`;
+    }
+
+    function renderOperationalEvents(payload) {
+      const events = payload.events || [];
+      eventsSummary.textContent = events.length
+        ? `${events.length} recent event${events.length === 1 ? '' : 's'}`
+        : 'No recent matching events';
+      eventsList.textContent = '';
+      if (!events.length) {
+        const empty = document.createElement('div');
+        empty.className = 'admin-event empty';
+        empty.textContent = 'No recent matching events';
+        eventsList.appendChild(empty);
+        return;
+      }
+      events.forEach((event) => {
+        const row = document.createElement('article');
+        row.className = `admin-event ${event.level === 'warn' ? 'warn' : ''}`;
+        const main = document.createElement('div');
+        main.className = 'admin-event-main';
+        const title = document.createElement('strong');
+        title.textContent = event.summary || `${humanState(event.category)} · ${humanState(event.action)}`;
+        const detail = document.createElement('span');
+        detail.className = 'admin-muted';
+        const ids = [event.requestId, event.commandId, event.backendId].filter(Boolean).slice(0, 2).join(' · ');
+        detail.textContent = `${relativeTime(event.createdAt)} · ${event.source || 'unknown'}${ids ? ` · ${ids}` : ''}`;
+        main.append(title, detail);
+        const badge = document.createElement('span');
+        badge.className = `admin-pill ${event.level === 'warn' ? 'admin' : ''}`;
+        badge.textContent = event.category || 'event';
+        row.append(main, badge);
+        eventsList.appendChild(row);
+      });
     }
 
     function simulatorSetupActive() {
@@ -4799,13 +5398,89 @@ import { html, reactive } from '@arrow-js/core';
       }, 3500);
     }
 
+    function extractJsonObjectField(raw, field) {
+      const text = String(raw || '');
+      const key = `"${field}"`;
+      const keyIndex = text.indexOf(key);
+      if (keyIndex < 0) return null;
+      const colonIndex = text.indexOf(':', keyIndex + key.length);
+      if (colonIndex < 0) return null;
+      let start = colonIndex + 1;
+      while (start < text.length && /\s/.test(text[start])) start += 1;
+      if (text[start] !== '{') return null;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = start; index < text.length; index += 1) {
+        const char = text[index];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (char === '\\') {
+            escaped = true;
+          } else if (char === '"') {
+            inString = false;
+          }
+          continue;
+        }
+        if (char === '"') {
+          inString = true;
+        } else if (char === '{') {
+          depth += 1;
+        } else if (char === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            try {
+              return JSON.parse(text.slice(start, index + 1));
+            } catch (_) {
+              return null;
+            }
+          }
+        }
+      }
+      return null;
+    }
+
+    function extractJsonStringField(raw, field) {
+      const pattern = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
+      const match = String(raw || '').match(pattern);
+      if (!match) return '';
+      try {
+        return JSON.parse(`"${match[1]}"`);
+      } catch (_) {
+        return match[1];
+      }
+    }
+
+    function extractJsonBooleanField(raw, field) {
+      const pattern = new RegExp(`"${field}"\\s*:\\s*(true|false)`);
+      const match = String(raw || '').match(pattern);
+      if (!match) return null;
+      return match[1] === 'true';
+    }
+
+    function parsePartialPhoneHealth(raw) {
+      const partial = {};
+      ['latestTicketReselect', 'controlCodeRequest', 'inputGate', 'viviState', 'rootCapture', 'streamPipeline', 'notificationLockdown'].forEach((field) => {
+        const value = extractJsonObjectField(raw, field);
+        if (value) partial[field] = value;
+      });
+      const streamActive = extractJsonBooleanField(raw, 'streamActive');
+      if (streamActive !== null) partial.streamActive = streamActive;
+      const streamVerdict = extractJsonStringField(raw, 'streamVerdict');
+      if (streamVerdict) partial.streamVerdict = streamVerdict;
+      const sessionState = extractJsonStringField(raw, 'sessionState');
+      if (sessionState) partial.sessionState = sessionState;
+      return partial;
+    }
+
     function parsePhoneHealth(raw) {
       if (!raw) return {};
       try {
         const parsed = JSON.parse(raw);
         return parsed && parsed.data ? parsed.data : parsed;
       } catch (_) {
-        return {};
+        return parsePartialPhoneHealth(raw);
       }
     }
 
@@ -4823,6 +5498,22 @@ import { html, reactive } from '@arrow-js/core';
       const days = Math.round(hours / 24);
       return `${days}d ago`;
     }
+
+    function durationAgo(value) {
+      if (value === null || value === undefined || value === '') return '';
+      const millis = Number(value);
+      if (!Number.isFinite(millis)) return '';
+      const seconds = Math.max(0, Math.round(millis / 1000));
+      if (seconds < 5) return 'just now';
+      if (seconds < 60) return `${seconds}s ago`;
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes}m ago`;
+      const hours = Math.round(minutes / 60);
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.round(hours / 24);
+      return `${days}d ago`;
+    }
+
 
     function showNotice(message, error = false) {
       notice.textContent = message;

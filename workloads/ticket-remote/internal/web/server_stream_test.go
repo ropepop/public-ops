@@ -808,7 +808,7 @@ func TestVideoWarmConfigIsSentBeforePresenceHeartbeatFinishes(t *testing.T) {
 	}
 }
 
-func TestVideoClientLogsAreHandledBeforePresenceHeartbeatFinishes(t *testing.T) {
+func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
@@ -882,8 +882,8 @@ func TestVideoClientLogsAreHandledBeforePresenceHeartbeatFinishes(t *testing.T) 
 	time.Sleep(350 * time.Millisecond)
 	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
 	event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent)
-	if !ok || event.Event != "stream_first_packet_ms" {
-		t.Fatalf("video client log should be accepted on the media socket for startup diagnostics: %#v", snapshot["lastBrowserEvent"])
+	if ok && event.Event == "stream_first_packet_ms" {
+		t.Fatalf("video client log must not be accepted on the media socket after Spacetime safe-log cutover: %#v", snapshot["lastBrowserEvent"])
 	}
 }
 
@@ -896,7 +896,7 @@ func TestPresenceUpdatesUseBackgroundTimeoutLongerThanPageLookup(t *testing.T) {
 	}
 }
 
-func TestSpacetimePresenceFallbackWritesForExistingServerSession(t *testing.T) {
+func TestDirectSpacetimePresenceRejectsControlSocket(t *testing.T) {
 	memoryStore := state.NewMemoryStore()
 	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
@@ -964,27 +964,20 @@ func TestSpacetimePresenceFallbackWritesForExistingServerSession(t *testing.T) {
 	defer cancel()
 	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
 	header := http.Header{"Cookie": []string{"ticket_remote_auth=" + token}}
-	conn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser control websocket: %v", err)
+	conn, response, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
+	if err == nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "test complete")
+		t.Fatal("direct Spacetime mode must reject the removed control socket")
 	}
-	_ = readNextTextMessageOfType(t, ctx, conn, "state")
-
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat","reason":"direct_presence_active"}`)); err != nil {
-		t.Fatalf("write direct heartbeat: %v", err)
+	if response == nil {
+		t.Fatalf("control socket response missing, want %d", http.StatusGone)
 	}
-	time.Sleep(100 * time.Millisecond)
+	if response.StatusCode != http.StatusGone {
+		t.Fatalf("control socket response status = %d, want %d", response.StatusCode, http.StatusGone)
+	}
 	if got := store.heartbeats.Load(); got != 0 {
-		t.Fatalf("direct Spacetime heartbeat should not write through server, got %d writes", got)
+		t.Fatalf("direct Spacetime presence should not write through server control socket, got %d writes", got)
 	}
-
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"heartbeat","reason":"spacetime_direct_unavailable","presenceFallback":true}`)); err != nil {
-		t.Fatalf("write fallback heartbeat: %v", err)
-	}
-	waitForAtomicCount(t, &store.heartbeats, 1, time.Second, "fallback heartbeat")
-
-	_ = conn.Close(websocket.StatusNormalClosure, "test complete")
-	waitForAtomicCount(t, &store.disconnects, 1, time.Second, "fallback disconnect")
 }
 
 func TestLiveFramesAreSharedDuringControlSession(t *testing.T) {
@@ -1359,6 +1352,28 @@ func TestVideoRecoveryRequestsAreRateLimitedGlobally(t *testing.T) {
 	}
 	if got["recover_stream"] != 0 {
 		t.Fatalf("stream recovery text should be ignored on media socket; signals=%v", got)
+	}
+}
+
+func TestPhoneRecoveryCommandQueueIsServerRateLimited(t *testing.T) {
+	phoneSignals := make(chan string, 64)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(phoneServer.Close)
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
+
+	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
+	t.Cleanup(ticketServer.Close)
+	t.Cleanup(relay.Close)
+
+	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
+	server.requestPhoneRecovery("stale_frame")
+	server.requestPhoneRecovery("stale_frame_repeat")
+
+	waitForPhoneSignalCounts(t, phoneSignals, map[string]int{"recover_stream": 1}, "first recovery command")
+	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
+		t.Fatalf("server recovery cooldown allowed duplicate recover_stream commands: %d", got)
 	}
 }
 

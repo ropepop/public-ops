@@ -152,9 +152,9 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 
 	for _, needle := range []string{
 		"const controlCodeCapturePollMs = 100;",
-		"const controlCodeCaptureKeyframeRetryMs = 1500;",
-		"const controlCodeCaptureKeyframeRetryLimit = 3;",
-		"const keyframeCommandMinIntervalMs = 1000;",
+		"const controlCodeCaptureKeyframeRetryMs = 5000;",
+		"const controlCodeCaptureKeyframeRetryLimit = 2;",
+		"const keyframeCommandMinIntervalMs = 2500;",
 		"let lastKeyframeCommandAt = 0;",
 	} {
 		if !strings.Contains(source, needle) {
@@ -173,8 +173,8 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	if !strings.Contains(waitForScreenshot, "setTimeout(tick, controlCodeCapturePollMs)") {
 		t.Fatalf("control-code capture polling must use the named bounded interval")
 	}
-	if !strings.Contains(waitForScreenshot, "requestKeyframeDebounced('control_code_result_wait_start', 0, true)") {
-		t.Fatalf("control-code result wait must force one fresh proof frame immediately")
+	if !strings.Contains(waitForScreenshot, "requestKeyframeDebounced('control_code_result_wait_start', controlCodeCaptureKeyframeRetryMs)") {
+		t.Fatalf("control-code result wait must use the bounded retry interval")
 	}
 	if strings.Contains(waitForScreenshot, "setTimeout(tick, 20)") {
 		t.Fatalf("control-code capture polling must not run every 20ms")
@@ -570,6 +570,22 @@ func TestControlCodeCaptureRejectsPopupFadeAndRequiresVerifiedGeneratedFrame(t *
 	}
 }
 
+func TestControlCodeRecoveryQueueReasonsArePublicAndVisible(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, needle := range []string{
+		"['waiting_for_ticket_reselect', 'Tālrunis vēl izvēlas biļeti. Uzgaidi mirkli.']",
+		"['waiting_for_stream_recovery', 'Tiešraide atjaunojas pirms koda pieprasījuma.']",
+		"['control_code_recovery_queue_timeout', 'Tālrunis nepaguva atjaunot biļeti. Mēģini vēlreiz.']",
+		"['control_code_stream_unstable', 'Tiešraide nav pietiekami stabila koda pieprasījumam.']",
+		"return localizePublicMessage(reason || 'waiting_for_stream_recovery');",
+		"return localizePublicMessage(request.reason || request.message || 'waiting_for_stream_recovery');",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code recovery queue source missing %q", needle)
+		}
+	}
+}
+
 func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
@@ -681,6 +697,10 @@ func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testin
 	if !strings.Contains(updateReveal, "if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;") {
 		t.Fatalf("details reveal must ignore modal-owned scroll while dialog body lock is active")
 	}
+	if !strings.Contains(source, "const dialogVisible = codeDialogOpen && !codeDialog.hidden;") ||
+		!strings.Contains(source, "(inputFocused || dialogVisible)") {
+		t.Fatalf("keyboard detection must keep the stage stable even when iOS changes focus timing")
+	}
 	if strings.Contains(submitRequest, "pinToFirstScreenAfterKeyboardCollapse(") ||
 		strings.Contains(submitRequest, "window.scrollTo(0, 0)") ||
 		strings.Contains(source, "control-code-dialog-scroll-locked") ||
@@ -701,6 +721,24 @@ func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testin
 	} {
 		if strings.Contains(css, needle) {
 			t.Fatalf("control-code dialog must not use body fixed scroll-lock CSS: found %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		".shell{width:100%;min-height:100dvh",
+		".stage-page{width:100%;min-height:100dvh",
+		".stage{position:relative;z-index:1;width:100%;min-height:100dvh",
+	} {
+		if strings.Contains(css, needle) {
+			t.Fatalf("ticket stream shell must not follow keyboard-sensitive 100dvh sizing: found %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		".shell{width:100%;min-height:var(--ticket-stage-height)",
+		".stage-page{width:100%;min-height:var(--ticket-stage-height)",
+		".stage{position:relative;z-index:1;width:100%;min-height:var(--ticket-stage-height)",
+	} {
+		if !strings.Contains(css, needle) {
+			t.Fatalf("ticket stream shell must use stable stage sizing, missing %q", needle)
 		}
 	}
 }
@@ -803,6 +841,25 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 		if !strings.Contains(chunk.body, "liveFrameReadyForControlCode()") ||
 			!strings.Contains(chunk.body, "refreshControlCodeReadiness(") {
 			t.Fatalf("%s must distinguish live-frame readiness from Spacetime readiness", chunk.name)
+		}
+	}
+}
+
+func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, needle := range []string{
+		"const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);",
+		"correlationId: typeof browserTraceId === 'string' ? browserTraceId : ''",
+		"clientLog('page_boot'",
+		"clientLog('video_socket_connect_attempt'",
+		"clientLog('video_socket_opened'",
+		"clientLog('video_socket_closed'",
+		"clientLog('keyframe_request'",
+		"clientLog('stream_recovery_request'",
+		"clientLog('visibility_resume_recovery'",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("browser stream trace breadcrumb missing %q", needle)
 		}
 	}
 }
@@ -1020,7 +1077,7 @@ func TestControlCodeProvisionalResultStaysVisibleWhileRunning(t *testing.T) {
 	}
 }
 
-func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing.T) {
+func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 	source := ticketAppSource(t)
 	visibilityBody := substringBetween(t, source,
 		"document.addEventListener('visibilitychange', () => {",
@@ -1036,16 +1093,48 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 		"  function connect() {")
 	resumeWatchdogsBody := substringBetween(t, source,
 		"function scheduleResumeWatchdogs(reason) {",
+		"  function recoverFreshMediaSession(reason, kind, options) {")
+	recoverMediaBody := substringBetween(t, source,
+		"function recoverFreshMediaSession(reason, kind, options) {",
 		"  function forceFreshVideoResume(reason, kind) {")
+	activationBody := substringBetween(t, source,
+		"function startActivationResumeFlow(reason, trigger, options) {",
+		"  function activationRetryPhase(attempt) {")
+	burstBody := substringBetween(t, source,
+		"function runActivationReconnectBurst(reason, flow) {",
+		"  function scheduleResumeWatchdogs(reason) {")
+	chaseBody := substringBetween(t, source,
+		"function chaseLiveStream() {",
+		"  function recoverAfterVisibilityResume(reason) {")
 
 	for _, needle := range []string{
 		"let lastHiddenAt = 0;",
 		"let lastHiddenWallAt = 0;",
+		"let activeResumeFlow = null;",
+		"let activationReconnectBurstTimer = null;",
 		"const backgroundRecoveryHiddenMs = 30000;",
 		"const oldTabFreshResumeHiddenMs = 5000;",
 		"const resumeVideoReconnectDelayMs = 600;",
 		"const resumeSoftReconnectMs = 1800;",
 		"const resumeHardRecoverMs = 3200;",
+		"const activationReconnectBurstMs = 10000;",
+		"const activationReconnectTickMs = 1000;",
+		"const activationReconnectMaxTicks = 10;",
+		"const activationResumeLogLimit = 32;",
+		"let pendingResumeFreshFrameFlow = null;",
+		"function resumeDiagnosticSnapshot(detail) {",
+		"decoder: decoderStateLabel(),",
+		"function mediaSessionStuckOnPreservedFrame() {",
+		"if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;",
+		"if (!hasRenderedFrame && !fallbackFrameAvailable) return false;",
+		"return !configured || !decoderConfigured;",
+		"function recoverFreshMediaSession(reason, kind, options) {",
+		"function enqueueCompletedResumeSafeLog(flow, event, detail) {",
+		"function logResumeCheckpoint(event, detail, flow) {",
+		"function finishActivationResumeFlow(reason, flow) {",
+		"pendingResumeFreshFrameFlow = {",
+		"result: 'late_fresh'",
+		"spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '')",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("missing visibility resume state/cadence %q", needle)
@@ -1053,11 +1142,15 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 	}
 	if !strings.Contains(visibilityBody, "lastHiddenAt = performance.now();") ||
 		!strings.Contains(visibilityBody, "lastHiddenWallAt = Date.now();") ||
-		!strings.Contains(visibilityBody, "recoverAfterVisibilityResume('visibility_resume');") {
+		!strings.Contains(visibilityBody, "recoverAfterVisibilityResume('visibility_resume');") ||
+		!strings.Contains(visibilityBody, "startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });") ||
+		!strings.Contains(visibilityBody, "logResumeCheckpoint('activation_visibility_hidden'") {
 		t.Fatalf("visibility changes must record hidden time and resume through the bounded recovery path")
 	}
-	if !strings.Contains(pageshowBody, "if (event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true)) recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');") {
-		t.Fatalf("pageshow must recover only for BFCache/previously-hidden pages, not every initial show")
+	if !strings.Contains(pageshowBody, "startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');") ||
+		!strings.Contains(source, "startActivationResumeFlow('focus', 'focus');") ||
+		!strings.Contains(source, "startActivationResumeFlow('initial_load', 'initial_load');") {
+		t.Fatalf("initial load, pageshow, and focus must all start the bounded activation watcher")
 	}
 	requiredRecoverySnippets := []string{
 		"const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;",
@@ -1067,9 +1160,12 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 		"const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;",
 		"const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));",
 		"const cacheRestored = reason === 'pageshow_persisted'",
+		"const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });",
+		"logResumeCheckpoint('activation_resume_recovery_decision'",
 		"if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {\n      clientLog('visibility_resume_recovery'",
 		"publishStreamFocus(true, reason || 'visibility_visible');",
 		"restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');",
+		"runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);",
 		"scheduleResumeWatchdogs(reason || 'visibility_visible');",
 		"if (videoStale) {\n      setTimeout(() => {",
 	}
@@ -1081,22 +1177,85 @@ func TestVisibilityResumeRecoversOnlyAfterRealBackgroundOrStaleStream(t *testing
 	for _, needle := range []string{
 		"recordDevPerfMetric('stream_recovery_step', 'resume_soft_reconnect', flowId || randomMetricFlowId('resume'), resumeSoftReconnectMs, true",
 		"recordDevPerfMetric('stream_recovery_step', 'resume_hard_recover', flowId || randomMetricFlowId('resume'), resumeHardRecoverMs, true",
+		"recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover'",
 	} {
 		if !strings.Contains(resumeWatchdogsBody, needle) {
 			t.Fatalf("stream recovery action metrics must not be reported as failed end-to-end timings, missing %q", needle)
 		}
 	}
 	for _, needle := range []string{
-		"closeEarlyVideo(reason || 'cached_resume');",
+		"deadlineAt: performance.now() + activationReconnectBurstMs",
+		"logResumeCheckpoint('activation_resume_start'",
+		"logResumeCheckpoint('activation_resume_merged'",
+		"runActivationReconnectBurst(reason || 'activation', flow);",
+	} {
+		if !strings.Contains(activationBody, needle) {
+			t.Fatalf("activation flow missing bounded start/merge behavior %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"if (streamHasFreshRenderedFrame())",
+		"logResumeCheckpoint('activation_resume_fresh_frame'",
+		"if (flow.attempts >= activationReconnectMaxTicks || now >= flow.deadlineAt)",
+		"logResumeCheckpoint('activation_resume_exhausted'",
+		"action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover'",
+		"requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);",
+		"recoverFreshMediaSession(reason || 'activation', 'activation_resume'",
+		"forceServerRecovery: mediaSessionStuckOnPreservedFrame() || attempt >= 2",
+		"activationReconnectBurstTimer = setTimeout(() => runActivationReconnectBurst(reason, flow), activationReconnectTickMs);",
+	} {
+		if !strings.Contains(burstBody, needle) {
+			t.Fatalf("activation reconnect burst missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"logResumeCheckpoint('activation_resume_media_stuck'",
+		"logResumeCheckpoint('activation_resume_deep_recover'",
+		"closeEarlyVideo(reason || 'media_session_recovery');",
+		"preserveCurrentFrame(`fresh_media_session:${reason || 'unknown'}`);",
 		"closeDirectVideo();",
 		"resetStreamState({ preserveFrame: true });",
-		"beginStreamOpenMetric(kind || 'old_tab_resume', reason || 'resume', true);",
-		"requestKeyframeDebounced(`${reason || 'resume'}_cached_keyframe`, 0, true);",
-		"requestServerRecoveryDebounced(`${reason || 'resume'}_cached_recover`, true);",
-		"scheduleResumeWatchdogs(reason || 'resume');",
+		"showStreamRecovery();",
+		"beginStreamOpenMetric(kind || 'media_session_recovery', reason || 'resume', true);",
+		"connectDirectVideo();",
+		"requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);",
+		"requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);",
+	} {
+		if !strings.Contains(recoverMediaBody, needle) {
+			t.Fatalf("fresh media-session recovery helper missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"recoverFreshMediaSession(reason || 'cached_resume', kind || 'old_tab_resume'",
+		"keyframeReason: `${reason || 'resume'}_cached_keyframe`,",
+		"serverRecoveryReason: `${reason || 'resume'}_cached_recover`,",
+		"forceServerRecovery: true",
 	} {
 		if !strings.Contains(restoreBody, needle) {
 			t.Fatalf("cached-tab restore must aggressively request a fresh frame, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"if (pendingAge > streamStaleDecoderResetMs && mediaSessionStuckOnPreservedFrame())",
+		"recoverFreshMediaSession('h264_first_frame_pending', 'first_frame_pending'",
+		"keyframeReason: 'h264_first_frame_pending_keyframe'",
+		"serverRecoveryReason: 'h264_first_frame_pending_recover'",
+		"forceServerRecovery: true",
+	} {
+		if !strings.Contains(chaseBody, needle) {
+			t.Fatalf("first-frame-pending recovery must escalate before long loading stalls, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"const firstFrameServerRecoveryMaxAttempts = 2;",
+		"function requestFirstFrameServerRecovery(reason, phase) {",
+		"event: 'h264_first_frame_recovery_exhausted'",
+		"requestFirstFrameServerRecovery('h264_start_pending', 'unconfigured');",
+		"requestFirstFrameServerRecovery('first_frame_server_recover', 'configured');",
+		"resetFirstFrameServerRecovery();",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("first-frame-pending server recovery must stay capped, missing %q", needle)
 		}
 	}
 }

@@ -24,10 +24,16 @@ type bridgeCommandStore struct {
 	mu           sync.Mutex
 	commands     []state.StreamCommand
 	pendingReads int
+	purges       int
 	acks         []state.StreamCommandAckInput
 	phoneReports []state.PhoneCurrentReportInput
 	codeUpdates  []state.ControlCodeRequestUpdateInput
 	logs         []state.SafeOperationalLogInput
+}
+
+func startLegacyStreamCommandBridgeForTest(t *testing.T, server *Server) {
+	t.Helper()
+	server.startStreamCommandBridge()
 }
 
 func (s *bridgeCommandStore) Backend() string {
@@ -95,6 +101,27 @@ func (s *bridgeCommandStore) AckStreamCommand(_ context.Context, input state.Str
 			s.commands[index].UpdatedAt = input.Now.UTC().Format(time.RFC3339)
 		}
 	}
+	return nil
+}
+
+func (s *bridgeCommandStore) PurgeExpiredStreamCommands(_ context.Context, ticketID string, now time.Time, batchSize uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purges++
+	if batchSize == 0 {
+		batchSize = 20
+	}
+	var kept []state.StreamCommand
+	var deleted uint32
+	for _, command := range s.commands {
+		expiresAt, _ := time.Parse(time.RFC3339, command.ExpiresAt)
+		if command.TicketID == ticketID && !expiresAt.IsZero() && !now.Before(expiresAt) && deleted < batchSize {
+			deleted++
+			continue
+		}
+		kept = append(kept, command)
+	}
+	s.commands = kept
 	return nil
 }
 
@@ -182,6 +209,7 @@ func TestStreamCommandBridgeDispatchesPendingCommandAndAcks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -216,16 +244,18 @@ func TestStreamCommandBridgeBacksOffWhenIdle(t *testing.T) {
 
 func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T) {
 	messages := make(chan map[string]any, 4)
-	var stopRequests atomic.Int32
-	var startRequests atomic.Int32
+	var recoverRequests atomic.Int32
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/session/stop":
-			stopRequests.Add(1)
+			t.Errorf("recover_stream must not stop a live viewer session")
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/api/v1/session/recover":
+			recoverRequests.Add(1)
 			w.WriteHeader(http.StatusOK)
 		case "/api/v1/session/start":
-			startRequests.Add(1)
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("recover_stream should use the phone recovery endpoint, not start after stop")
+			w.WriteHeader(http.StatusInternalServerError)
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
@@ -285,6 +315,7 @@ func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -292,11 +323,88 @@ func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T)
 		t.Fatalf("phone payload = %#v", payload)
 	}
 	waitForBridgeAck(t, store, "cmd-recover-1")
-	if got := stopRequests.Load(); got != 1 {
-		t.Fatalf("recover_stream stop requests = %d, want 1", got)
+	if got := recoverRequests.Load(); got != 1 {
+		t.Fatalf("recover_stream recover requests = %d, want 1", got)
 	}
+}
+
+func TestStreamCommandBridgeForceTicketReselectStartsPhoneAndForwardsCommand(t *testing.T) {
+	messages := make(chan map[string]any, 4)
+	var startRequests atomic.Int32
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session/start":
+			startRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/session":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept phone command websocket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
+			_, body, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode phone command: %v", err)
+				return
+			}
+			messages <- payload
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer phoneServer.Close()
+
+	store := &bridgeCommandStore{Store: state.NewMemoryStore()}
+	store.commands = []state.StreamCommand{{
+		ID:          "cmd-reselect-1",
+		TicketID:    "vivi-default",
+		BackendID:   "pixel",
+		CommandType: "force_ticket_reselect",
+		Status:      "pending",
+		Revision:    "rev-1",
+		Reason:      "admin_force_latest_ticket_reselect",
+		PayloadJSON: `{"type":"force_ticket_reselect","reason":"admin_force_latest_ticket_reselect"}`,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		ExpiresAt:   time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}}
+	relay := phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "spacetime",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+		State: configStateForBridgeTest(),
+		Phone: config.PhoneConfig{
+			BackendID:     "pixel",
+			AttachName:    "Pixel",
+			BaseURL:       phoneServer.URL,
+			BrokerBaseURL: phoneServer.URL,
+			Backends:      []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startLegacyStreamCommandBridgeForTest(t, server)
+	defer server.Close()
+
+	payload := waitForBridgePhonePayload(t, messages)
+	if payload["type"] != "force_ticket_reselect" || payload["commandId"] != "cmd-reselect-1" {
+		t.Fatalf("phone payload = %#v", payload)
+	}
+	waitForBridgeAck(t, store, "cmd-reselect-1")
 	if got := startRequests.Load(); got != 1 {
-		t.Fatalf("recover_stream start requests = %d, want 1", got)
+		t.Fatalf("force reselect start requests = %d, want 1", got)
 	}
 }
 
@@ -307,7 +415,8 @@ func TestStreamCommandBridgeSkipsPrivateReadWhenSignalIsIdle(t *testing.T) {
 		direct: newDirectStreamHub(),
 		relay:  phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://127.0.0.1:1"}),
 	}
-	hadCommands := server.pollPendingStreamCommands(store, map[string]streamCommandBridgeAttempt{}, map[string]string{})
+	lastPurge := time.Now()
+	hadCommands := server.pollPendingStreamCommands(store, map[string]streamCommandBridgeAttempt{}, map[string]string{}, &lastPurge)
 	if hadCommands {
 		t.Fatal("idle signal should not report commands")
 	}
@@ -315,6 +424,60 @@ func TestStreamCommandBridgeSkipsPrivateReadWhenSignalIsIdle(t *testing.T) {
 	defer store.mu.Unlock()
 	if store.pendingReads != 0 {
 		t.Fatalf("idle signal triggered private pending-command read: %d", store.pendingReads)
+	}
+}
+
+func TestStreamCommandBridgePurgesExpiredCommandsBeforeSignalGate(t *testing.T) {
+	now := time.Now().UTC()
+	store := &bridgeCommandStore{
+		Store: state.NewMemoryStore(),
+		commands: []state.StreamCommand{{
+			ID:          "cmd-expired",
+			TicketID:    "vivi-default",
+			BackendID:   "pixel",
+			CommandType: "recover_stream",
+			Status:      "pending",
+			Revision:    "rev-expired",
+			Reason:      "stale_test",
+			PayloadJSON: "{}",
+			CreatedAt:   now.Add(-time.Minute).Format(time.RFC3339),
+			UpdatedAt:   now.Add(-time.Minute).Format(time.RFC3339),
+			ExpiresAt:   now.Add(-time.Second).Format(time.RFC3339),
+		}},
+	}
+	server := &Server{
+		cfg:    config.Config{TicketID: "vivi-default"},
+		direct: newDirectStreamHub(),
+		relay:  phone.NewRelay(phone.RelayConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: "http://127.0.0.1:1"}),
+	}
+	lastPurge := time.Time{}
+	hadCommands := server.pollPendingStreamCommands(store, map[string]streamCommandBridgeAttempt{}, map[string]string{}, &lastPurge)
+	if hadCommands {
+		t.Fatal("expired command should not be dispatched as pending work")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.purges != 1 {
+		t.Fatalf("expired command purge count = %d, want 1", store.purges)
+	}
+	if len(store.commands) != 0 {
+		t.Fatalf("expired commands were not purged: %#v", store.commands)
+	}
+	if store.pendingReads != 0 {
+		t.Fatalf("purged idle signal should not trigger pending-command read: %d", store.pendingReads)
+	}
+}
+
+func TestStreamCommandBridgeUsesLongTimeoutForPhoneStartRecovery(t *testing.T) {
+	longCommands := []string{"start", "prepare_control_code", "recover_stream", "force_ticket_reselect"}
+	for _, commandType := range longCommands {
+		got := streamCommandDispatchTimeout(state.StreamCommand{CommandType: commandType})
+		if got != streamCommandBridgePhoneStartTimeout {
+			t.Fatalf("%s timeout = %s, want %s", commandType, got, streamCommandBridgePhoneStartTimeout)
+		}
+	}
+	if got := streamCommandDispatchTimeout(state.StreamCommand{CommandType: "keyframe"}); got != streamCommandBridgeWriteTimeout {
+		t.Fatalf("keyframe timeout = %s, want %s", got, streamCommandBridgeWriteTimeout)
 	}
 }
 
@@ -397,6 +560,7 @@ func TestStreamCommandBridgeKeepsControlCodePayloadOutOfLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -513,6 +677,7 @@ func TestStreamCommandBridgeReadsControlCodeFrameReadyIntoSpacetime(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -637,6 +802,7 @@ func TestStreamCommandBridgeKeepsResultSocketUntilRawTicketCleanup(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)
@@ -774,6 +940,7 @@ func TestStreamCommandBridgeReconcilesControlCodeResultFromPhoneHealth(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	startLegacyStreamCommandBridgeForTest(t, server)
 	defer server.Close()
 
 	payload := waitForBridgePhonePayload(t, messages)

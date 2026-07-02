@@ -17,6 +17,8 @@ pub(super) struct TicketremoteUpdateControlCodeRequestArgs {
     pub min_frame_sequence: String,
     pub result_frame_epoch: String,
     pub result_min_frame_sequence: String,
+    pub result_proof: String,
+    pub result_proof_at: String,
     pub cleanup_pending: bool,
     pub now_arg: String,
 }
@@ -34,6 +36,8 @@ impl From<TicketremoteUpdateControlCodeRequestArgs> for super::Reducer {
             min_frame_sequence: args.min_frame_sequence,
             result_frame_epoch: args.result_frame_epoch,
             result_min_frame_sequence: args.result_min_frame_sequence,
+            result_proof: args.result_proof,
+            result_proof_at: args.result_proof_at,
             cleanup_pending: args.cleanup_pending,
             now_arg: args.now_arg,
         }
@@ -67,6 +71,8 @@ pub trait ticketremote_update_control_code_request {
         min_frame_sequence: String,
         result_frame_epoch: String,
         result_min_frame_sequence: String,
+        result_proof: String,
+        result_proof_at: String,
         cleanup_pending: bool,
         now_arg: String,
     ) -> __sdk::Result<()> {
@@ -81,6 +87,8 @@ pub trait ticketremote_update_control_code_request {
             min_frame_sequence,
             result_frame_epoch,
             result_min_frame_sequence,
+            result_proof,
+            result_proof_at,
             cleanup_pending,
             now_arg,
             |_, _| {},
@@ -105,14 +113,14 @@ pub trait ticketremote_update_control_code_request {
         min_frame_sequence: String,
         result_frame_epoch: String,
         result_min_frame_sequence: String,
+        result_proof: String,
+        result_proof_at: String,
         cleanup_pending: bool,
         now_arg: String,
 
-        callback: impl FnOnce(
-            &super::ReducerEventContext,
-            Result<Result<(), String>, __sdk::InternalError>,
-        ) + Send
-        + 'static,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
     ) -> __sdk::Result<()>;
 }
 
@@ -129,14 +137,14 @@ impl ticketremote_update_control_code_request for super::RemoteReducers {
         min_frame_sequence: String,
         result_frame_epoch: String,
         result_min_frame_sequence: String,
+        result_proof: String,
+        result_proof_at: String,
         cleanup_pending: bool,
         now_arg: String,
 
-        callback: impl FnOnce(
-            &super::ReducerEventContext,
-            Result<Result<(), String>, __sdk::InternalError>,
-        ) + Send
-        + 'static,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
             TicketremoteUpdateControlCodeRequestArgs {
@@ -150,6 +158,8 @@ impl ticketremote_update_control_code_request for super::RemoteReducers {
                 min_frame_sequence,
                 result_frame_epoch,
                 result_min_frame_sequence,
+                result_proof,
+                result_proof_at,
                 cleanup_pending,
                 now_arg,
             },

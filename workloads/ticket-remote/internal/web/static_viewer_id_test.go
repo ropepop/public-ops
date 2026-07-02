@@ -11,7 +11,7 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 		"function activeViewerPresence(state) {",
 		"  function renderPanelSummary(viewers, visibleViewerCount) {")
 	adminBody := substringBetween(t, source,
-		"function renderAdmin(state, phone, backendsPayload) {",
+		"function renderAdmin(state, phone, backendsPayload, eventsPayload) {",
 		"    memberForm.addEventListener('submit'")
 
 	if !strings.Contains(presenceBody, "viewer.publicId") {
@@ -22,5 +22,39 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 	}
 	if !strings.Contains(adminBody, "admin-member-public-id") {
 		t.Fatalf("admin member public IDs should have a dedicated class for stable UI styling")
+	}
+}
+
+func TestAdminTicketSelectionReadsPhoneStatusJson(t *testing.T) {
+	source := ticketAppSource(t)
+	adminBody := substringBetween(t, source,
+		"function renderAdmin(state, phone, backendsPayload, eventsPayload) {",
+		"  function renderStatus(state, phone, phoneHealth) {")
+
+	if !strings.Contains(adminBody, "phoneRecord.statusJson || phoneRecord.healthJson") {
+		t.Fatalf("admin ticket selection must read current phone statusJson before legacy healthJson")
+	}
+	if !strings.Contains(adminBody, "renderTicketSelection(phoneHealth);") {
+		t.Fatalf("admin render must pass parsed phone health into the ticket selection panel")
+	}
+}
+
+func TestAdminPhoneHealthParserRecoversClippedTicketState(t *testing.T) {
+	source := ticketAppSource(t)
+	parserBody := substringBetween(t, source,
+		"function extractJsonObjectField(raw, field) {",
+		"    function relativeTime(value) {")
+
+	for _, required := range []string{
+		"function parsePartialPhoneHealth(raw) {",
+		"'latestTicketReselect'",
+		"'viviState'",
+		"'controlCodeRequest'",
+		"extractJsonBooleanField(raw, 'streamActive')",
+		"return parsePartialPhoneHealth(raw);",
+	} {
+		if !strings.Contains(parserBody, required) {
+			t.Fatalf("admin parser must recover safe fields from clipped phone health, missing %q", required)
+		}
 	}
 }

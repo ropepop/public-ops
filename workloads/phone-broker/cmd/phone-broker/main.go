@@ -57,6 +57,10 @@ func loadConfig() (broker.Config, error) {
 		Port:            port,
 		UpstreamBaseURL: strings.TrimRight(env("PHONE_BROKER_UPSTREAM_BASE_URL", "http://ticket_phone_bridge:9388"), "/"),
 		TicketGrace:     ticketGrace,
+		EventSink: broker.EventSinkConfig{
+			URL:   env("PHONE_BROKER_EVENT_SINK_URL", ""),
+			Token: env("PHONE_BROKER_EVENT_SINK_TOKEN", ""),
+		},
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return broker.Config{}, fmt.Errorf("PHONE_BROKER_PORT out of range: %d", cfg.Port)

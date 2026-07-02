@@ -22,6 +22,7 @@ type Queue interface {
 	RequestCancel(ctx context.Context, id string) (spacetime.Job, error)
 	Notifications(ctx context.Context) ([]spacetime.Notification, error)
 	MarkNotified(ctx context.Context, jobID string) error
+	RecordEvent(ctx context.Context, input spacetime.EventInput) error
 }
 
 type Server struct {
@@ -46,6 +47,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/api/v1/jobs", s.handleJobs)
 	mux.HandleFunc("/api/v1/jobs/", s.handleJobAction)
+	mux.HandleFunc("/api/v1/events", s.handleEvents)
 	mux.HandleFunc("/api/v1/notifications", s.handleNotifications)
 	return mux
 }
@@ -158,6 +160,51 @@ func (s *Server) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.queue == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "spacetime_not_configured"})
+		return
+	}
+	var req struct {
+		Component       string `json:"component"`
+		Level           string `json:"level"`
+		Kind            string `json:"kind"`
+		JobID           string `json:"jobId"`
+		AttemptID       string `json:"attemptId"`
+		PublicText      string `json:"publicText"`
+		SafeDetailsJSON string `json:"safeDetailsJson"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad_request"})
+		return
+	}
+	if strings.TrimSpace(req.Kind) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "event_kind_required"})
+		return
+	}
+	if strings.TrimSpace(req.SafeDetailsJSON) == "" {
+		req.SafeDetailsJSON = "{}"
+	}
+	if err := s.queue.RecordEvent(r.Context(), spacetime.EventInput{
+		Component:       req.Component,
+		Level:           req.Level,
+		Kind:            req.Kind,
+		JobID:           req.JobID,
+		AttemptID:       req.AttemptID,
+		PublicText:      req.PublicText,
+		SafeDetailsJSON: req.SafeDetailsJSON,
+		Retention:       s.retention,
+	}); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": safeError(err)})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {

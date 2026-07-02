@@ -143,6 +143,107 @@ func TestAdminPhoneBackendsListsHealth(t *testing.T) {
 	}
 }
 
+func TestAdminTicketReselectLatestQueuesForceCommand(t *testing.T) {
+	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
+	memory := state.NewMemoryStore()
+	store := &capturingStreamCommandStore{Store: memory}
+	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/ticket/reselect-latest", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("reselect status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.commands) != 1 {
+		t.Fatalf("commands = %#v, want one", store.commands)
+	}
+	command := store.commands[0]
+	if command.CommandType != "force_ticket_reselect" || command.BackendID != "lab-pixel" {
+		t.Fatalf("command = %#v", command)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(command.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["type"] != "force_ticket_reselect" || payload["source"] != "ticket_remote_admin" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	var response struct {
+		OK        bool   `json:"ok"`
+		CommandID string `json:"commandId"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || response.CommandID == "" || response.CommandID != command.CommandID {
+		t.Fatalf("response = %#v command = %#v", response, command)
+	}
+}
+
+func TestAdminTicketReselectLatestRequiresAdmin(t *testing.T) {
+	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
+	memory := state.NewMemoryStore()
+	store := &capturingStreamCommandStore{Store: memory}
+	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
+	if _, err := memory.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", "member@example.com", state.RoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/ticket/reselect-latest", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "member@example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin reselect status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.commands) != 0 {
+		t.Fatalf("non-admin queued commands = %#v", store.commands)
+	}
+}
+
+func TestAdminTicketReselectLatestRequiresActiveBackend(t *testing.T) {
+	store := &capturingStreamCommandStore{Store: state.NewMemoryStore()}
+	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
+		TicketID:     "vivi-default",
+		DisplayName:  "ViVi timed ticket",
+		AdminEmail:   "ticket@jolkins.id.lv",
+		AuthIssuer:   "https://issuer.test",
+		AuthAudience: "ticket-remote",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{})
+	handler, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:     "dev",
+			DevEmail: "ticket@jolkins.id.lv",
+		},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/ticket/reselect-latest", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing backend status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "phone_backend_unavailable") {
+		t.Fatalf("missing backend body = %s", rec.Body.String())
+	}
+	if len(store.commands) != 0 {
+		t.Fatalf("missing backend queued commands = %#v", store.commands)
+	}
+}
+
 func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
@@ -198,6 +299,16 @@ func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
 	if payload.State.Phone == nil || payload.State.Phone.ID != "lab-pixel" {
 		t.Fatalf("state phone = %#v", payload.State.Phone)
 	}
+}
+
+type capturingStreamCommandStore struct {
+	state.Store
+	commands []state.StreamCommandInput
+}
+
+func (s *capturingStreamCommandStore) AppendStreamCommand(ctx context.Context, input state.StreamCommandInput) error {
+	s.commands = append(s.commands, input)
+	return s.Store.AppendStreamCommand(ctx, input)
 }
 
 func newBackendSwitchServer(t *testing.T, store state.Store, activeFile string, simURL string, pixelURL string) (http.Handler, *phone.Relay) {

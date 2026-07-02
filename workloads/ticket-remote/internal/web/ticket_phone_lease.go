@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -46,7 +45,11 @@ func (s *Server) acquireTicketPhoneLeaseAsync(leaseID string, requestID string, 
 		ctx, cancel := context.WithTimeout(context.Background(), phoneBrokerPresenceTimeout)
 		defer cancel()
 		if err := s.postTicketPhoneLease(ctx, "/api/v1/phone/leases/ticket", request); err != nil {
-			log.Printf("ticket phone lease acquire failed: %v", err)
+			s.recordRuntimeErrorAsync("ticket_phone_lease_acquire_failed", request.LeaseID, err, map[string]any{
+				"leaseId":   request.LeaseID,
+				"requestId": request.RequestID,
+				"reason":    request.Reason,
+			})
 		}
 	}()
 }
@@ -64,7 +67,10 @@ func (s *Server) releaseTicketPhoneLeaseAsync(leaseID string, requestID string) 
 		ctx, cancel := context.WithTimeout(context.Background(), phoneBrokerPresenceTimeout)
 		defer cancel()
 		if err := s.postTicketPhoneLease(ctx, "/api/v1/phone/leases/ticket/release", request); err != nil {
-			log.Printf("ticket phone lease release failed: %v", err)
+			s.recordRuntimeErrorAsync("ticket_phone_lease_release_failed", request.LeaseID, err, map[string]any{
+				"leaseId":   request.LeaseID,
+				"requestId": request.RequestID,
+			})
 		}
 	}()
 }

@@ -32,12 +32,17 @@ type Config struct {
 	State               state.StoreConfig
 	Phone               PhoneConfig
 	DevPerfMetrics      DevPerfMetricsConfig
+	ServiceEvents       ServiceEventsConfig
 }
 
 type DevPerfMetricsConfig struct {
 	Enabled   bool
 	TTL       time.Duration
 	ExpiresAt time.Time
+}
+
+type ServiceEventsConfig struct {
+	Token string
 }
 
 type PhoneConfig struct {
@@ -153,6 +158,9 @@ func Load() (Config, error) {
 			Enabled:   getenvBool("TICKET_REMOTE_DEV_PERF_METRICS_ENABLED", false),
 			TTL:       getenvDuration("TICKET_REMOTE_DEV_PERF_METRICS_TTL", 24*time.Hour),
 			ExpiresAt: getenvTime("TICKET_REMOTE_DEV_PERF_METRICS_EXPIRES_AT"),
+		},
+		ServiceEvents: ServiceEventsConfig{
+			Token: getenv("TICKET_REMOTE_SERVICE_EVENT_TOKEN", ""),
 		},
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {

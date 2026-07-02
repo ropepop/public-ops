@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -20,18 +20,41 @@ import (
 )
 
 type update struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
-		MessageID int64 `json:"message_id"`
-		From      *struct {
-			ID       int64  `json:"id"`
-			Username string `json:"username"`
-		} `json:"from"`
-		Chat struct {
-			ID int64 `json:"id"`
-		} `json:"chat"`
-		Text string `json:"text"`
-	} `json:"message"`
+	UpdateID int64            `json:"update_id"`
+	Message  *telegramMessage `json:"message"`
+}
+
+type telegramMessage struct {
+	MessageID int64             `json:"message_id"`
+	From      *telegramUser     `json:"from"`
+	Chat      telegramChat      `json:"chat"`
+	Text      string            `json:"text"`
+	Caption   string            `json:"caption"`
+	Document  *telegramDocument `json:"document"`
+	Photo     []telegramPhoto   `json:"photo"`
+}
+
+type telegramUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+type telegramChat struct {
+	ID int64 `json:"id"`
+}
+
+type telegramDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type telegramPhoto struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
 }
 
 type telegramResponse[T any] struct {
@@ -43,27 +66,29 @@ type telegramResponse[T any] struct {
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		os.Exit(1)
 	}
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	if strings.TrimSpace(cfg.BotToken) == "" {
-		log.Fatal("BOT_TOKEN is required for chatgpt-bot")
+		reportBotEvent(context.Background(), client, cfg.BrokerBaseURL, "error", "bot_token_missing", "Bot token is not configured", nil)
+		os.Exit(1)
 	}
 	if len(cfg.AllowedTelegramIDs) == 0 {
-		log.Fatal("CHATGPT_ALLOWED_TELEGRAM_IDS must be set; bot defaults closed")
+		reportBotEvent(context.Background(), client, cfg.BrokerBaseURL, "error", "telegram_allowlist_missing", "Telegram allowlist is not configured", nil)
+		os.Exit(1)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	baseURL := "https://api.telegram.org/bot" + cfg.BotToken
 	var offset int64
-	log.Print("chatgpt bot polling Telegram")
+	reportBotEvent(ctx, client, cfg.BrokerBaseURL, "info", "bot_polling_started", "Bot polling Telegram", nil)
 	for ctx.Err() == nil {
 		if err := deliverNotifications(ctx, client, baseURL, cfg.BrokerBaseURL, cfg.AllowedTelegramIDs); err != nil {
-			log.Printf("deliver notifications: %v", err)
+			reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "deliver_notifications_failed", "Could not deliver notifications", map[string]string{"error": err.Error()})
 		}
 		updates, err := getUpdates(ctx, client, baseURL, offset, cfg.LongPollTimeout)
 		if err != nil {
-			log.Printf("telegram getUpdates: %v", sanitizeTelegramError(err, cfg.BotToken))
+			reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "telegram_get_updates_failed", "Telegram polling failed", map[string]string{"error": sanitizeTelegramError(err, cfg.BotToken)})
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -77,15 +102,27 @@ func main() {
 				continue
 			}
 			text := strings.TrimSpace(item.Message.Text)
+			if text == "" {
+				text = strings.TrimSpace(item.Message.Caption)
+			}
+			fileCount := telegramFileCount(item.Message)
+			if fileCount > 0 {
+				if fileCount > 10 || telegramLargestFileSize(item.Message) > 50*1024*1024 {
+					_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "File limit is 10 files, up to 50 MB each.")
+					continue
+				}
+				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "File upload is not ready on the Pixel runner yet. Send text-only prompts for now.")
+				continue
+			}
 			switch {
 			case text == "/start" || text == "/help":
-				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Send me a prompt and I will queue it for the Pixel ChatGPT broker. Commands: /status, /privacy.")
+				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Send me a prompt and I will run it through the Pixel ChatGPT app. Commands: /status, /cancel, /health, /privacy.")
 			case text == "/privacy":
 				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Prompts are sent to the owner-controlled ChatGPT Android app on the Pixel. Do not send secrets or regulated data.")
 			case text == "/status":
 				status, err := fetchStatus(ctx, client, cfg.BrokerBaseURL, item.Message.From.ID)
 				if err != nil {
-					log.Printf("fetch status: %v", err)
+					reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "fetch_status_failed", "Could not fetch status", map[string]string{"error": err.Error()})
 					_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Could not read broker status.")
 					continue
 				}
@@ -93,7 +130,7 @@ func main() {
 			case text == "/health":
 				health, err := fetchHealth(ctx, client, cfg.BrokerBaseURL)
 				if err != nil {
-					log.Printf("fetch health: %v", err)
+					reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "fetch_health_failed", "Could not fetch health", map[string]string{"error": err.Error()})
 					_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Broker health is not available.")
 					continue
 				}
@@ -105,7 +142,7 @@ func main() {
 					continue
 				}
 				if err := cancelJob(ctx, client, cfg.BrokerBaseURL, jobID); err != nil {
-					log.Printf("cancel job: %v", err)
+					reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "cancel_job_failed", "Could not cancel job", map[string]string{"jobId": jobID, "error": err.Error()})
 					_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Could not cancel that job.")
 					continue
 				}
@@ -113,16 +150,49 @@ func main() {
 			case strings.HasPrefix(text, "/"):
 				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Unknown command.")
 			case text != "":
-				jobID, err := submitJob(ctx, client, cfg.BrokerBaseURL, item.Message.Chat.ID, item.Message.From.ID, text, cfg.DefaultProjectName)
+				_, err := submitJob(ctx, client, cfg.BrokerBaseURL, item.Message.Chat.ID, item.Message.From.ID, brokerPrompt(text), cfg.DefaultProjectName)
 				if err != nil {
-					log.Printf("submit job: %v", err)
+					reportBotEvent(ctx, client, cfg.BrokerBaseURL, "warn", "submit_job_failed", "Could not submit job", map[string]string{"error": err.Error()})
 					_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Could not queue that request.")
 					continue
 				}
-				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Queued "+jobID)
+				_ = sendMessage(ctx, client, baseURL, item.Message.Chat.ID, "Working on Pixel...")
 			}
 		}
 	}
+}
+
+func brokerPrompt(prompt string) string {
+	return "CHATGPT_BROKER_CONTROL new=1;files=0\n" + strings.TrimSpace(prompt)
+}
+
+func telegramFileCount(message *telegramMessage) int {
+	if message == nil {
+		return 0
+	}
+	if message.Document != nil {
+		return 1
+	}
+	if len(message.Photo) > 0 {
+		return 1
+	}
+	return 0
+}
+
+func telegramLargestFileSize(message *telegramMessage) int64 {
+	if message == nil {
+		return 0
+	}
+	var largest int64
+	if message.Document != nil {
+		largest = message.Document.FileSize
+	}
+	for _, photo := range message.Photo {
+		if photo.FileSize > largest {
+			largest = photo.FileSize
+		}
+	}
+	return largest
 }
 
 func getUpdates(ctx context.Context, client *http.Client, baseURL string, offset int64, timeout int) ([]update, error) {
@@ -168,6 +238,38 @@ func sendMessage(ctx context.Context, client *http.Client, baseURL string, chatI
 		}
 	}
 	return nil
+}
+
+func reportBotEvent(ctx context.Context, client *http.Client, brokerURL, level, kind, publicText string, details map[string]string) {
+	brokerURL = strings.TrimRight(strings.TrimSpace(brokerURL), "/")
+	if brokerURL == "" {
+		return
+	}
+	detailJSON := "{}"
+	if len(details) > 0 {
+		body, err := json.Marshal(details)
+		if err == nil {
+			detailJSON = string(body)
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"component":       "bot",
+		"level":           level,
+		"kind":            kind,
+		"publicText":      publicText,
+		"safeDetailsJson": detailJSON,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, brokerURL+"/api/v1/events", bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 func submitJob(ctx context.Context, client *http.Client, brokerURL string, chatID, userID int64, prompt, project string) (string, error) {
@@ -325,9 +427,6 @@ func notificationText(item brokerNotification) string {
 	if text == "" {
 		text = "Job " + item.ID + " finished with status " + item.Status
 	}
-	if strings.TrimSpace(item.FailureCode) != "" {
-		text += " (" + strings.TrimSpace(item.FailureCode) + ")"
-	}
 	return text
 }
 
@@ -373,9 +472,9 @@ func cancelJob(ctx context.Context, client *http.Client, brokerURL, jobID string
 	return nil
 }
 
-func sanitizeTelegramError(err error, token string) error {
+func sanitizeTelegramError(err error, token string) string {
 	if err == nil {
-		return nil
+		return ""
 	}
-	return errors.New(strings.ReplaceAll(err.Error(), token, "<redacted>"))
+	return strings.ReplaceAll(err.Error(), token, "<redacted>")
 }

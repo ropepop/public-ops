@@ -18,9 +18,6 @@ type Config struct {
 	BrokerBaseURL      string
 	DefaultProjectName string
 	JobRetention       time.Duration
-	OCREnabled         bool
-	OCRPollInterval    time.Duration
-	TesseractPath      string
 	SpacetimeHost      string
 	SpacetimeDatabase  string
 	SpacetimeToken     string
@@ -41,11 +38,8 @@ func Load() (Config, error) {
 		HTTPTimeout:        envDuration("HTTP_TIMEOUT", 180*time.Second),
 		AllowedTelegramIDs: parseInt64Set(env("CHATGPT_ALLOWED_TELEGRAM_IDS", "")),
 		BrokerBaseURL:      strings.TrimRight(env("CHATGPT_BROKER_BASE_URL", "http://127.0.0.1:9348"), "/"),
-		DefaultProjectName: strings.TrimSpace(env("CHATGPT_PROJECT_NAME", "")),
+		DefaultProjectName: strings.TrimSpace(env("CHATGPT_PROJECT_NAME", "Pixel")),
 		JobRetention:       envDuration("CHATGPT_JOB_RETENTION", 24*time.Hour),
-		OCREnabled:         envBool("CHATGPT_OCR_ENABLED", true),
-		OCRPollInterval:    envDuration("CHATGPT_OCR_POLL_INTERVAL", 3*time.Second),
-		TesseractPath:      strings.TrimSpace(env("CHATGPT_TESSERACT_PATH", "tesseract")),
 		SpacetimeHost:      strings.TrimRight(env("CHATGPT_SPACETIME_HOST", "https://maincloud.spacetimedb.com"), "/"),
 		SpacetimeDatabase:  strings.TrimSpace(env("CHATGPT_SPACETIME_DATABASE", "")),
 		SpacetimeToken:     strings.TrimSpace(os.Getenv("CHATGPT_SPACETIME_BEARER_TOKEN")),
@@ -64,9 +58,6 @@ func Load() (Config, error) {
 	}
 	if cfg.JobRetention <= 0 {
 		return Config{}, fmt.Errorf("CHATGPT_JOB_RETENTION must be positive")
-	}
-	if cfg.OCRPollInterval <= 0 {
-		return Config{}, fmt.Errorf("CHATGPT_OCR_POLL_INTERVAL must be positive")
 	}
 	return cfg, nil
 }
@@ -116,21 +107,6 @@ func envDurationSpecial(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
-}
-
-func envBool(key string, fallback bool) bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if value == "" {
-		return fallback
-	}
-	switch value {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
 }
 
 func parseInt64Set(raw string) map[int64]struct{} {

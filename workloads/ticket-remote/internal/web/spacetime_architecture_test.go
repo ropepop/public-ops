@@ -21,9 +21,10 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 
 	for _, required := range []string{
-		"const HISTORY_TTL_MS: i64 = 24 * 60 * 60 * 1000;",
+		"const HISTORY_TTL_MS: i64 = 6 * 60 * 60 * 1000;",
 		"const CLEANUP_INTERVAL_SECS: u64 = 30 * 60;",
-		"const CLEANUP_BATCH_SIZE: u32 = 5000;",
+		"const CLEANUP_BATCH_SIZE: u32 = 0;",
+		"const SAFE_LOG_DETAIL_MAX_BYTES: usize = 8192;",
 		"ticketremote_ticket_summary",
 		"ticketremote_viewer_public",
 		"ticketremote_phone_status",
@@ -39,6 +40,9 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		"ticketBackendExpiresAt",
 		"ticketBackendStatusExpiresAt",
 		"ticketExpiresAt",
+		"ticketCreatedAt",
+		"eventCreatedAt",
+		"correlationCreatedAt",
 		"sourceCreatedAt",
 		"next_audit_ordinal(",
 		"cleanup_expired(",
@@ -57,15 +61,24 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		"pub fn ticketremote_ack_stream_command(",
 		"pub fn ticketremote_update_phone_current_report(",
 		"pub fn ticketremote_append_safe_operational_log(",
+		"pub fn ticketremote_snapshot_runtime_tables_to_logs(",
 		"pub fn ticketremote_set_dev_perf_metrics(",
 		"pub fn ticketremote_member_append_dev_perf_metric(",
 		"pub fn ticketremote_purge_expired_stream_commands(",
 		"#[spacetimedb::view(accessor = ticketremote_service_stream_command, public, primary_key = id)]",
+		"#[spacetimedb::view(accessor = ticketremote_service_safe_operational_log, public, primary_key = id)]",
 		"service_ticket_id_for_viewer(",
 		"status == \"acknowledged\" || status == \"dispatched\"",
 		"ticketremote_stream_command()\n            .status()\n            .filter(status)",
 		"coalesced_safe_log_detail(",
+		"stream_desired_state_set",
+		"stream_command_appended",
+		"stream_command_acknowledged",
 		"dev_perf_metrics_enabled(",
+		"insert_table_event_log(",
+		"cleanup_limit_reached(",
+		"cleanup_expired_completed",
+		"runtime_table_snapshot_completed",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("SpacetimeDB module is missing clean-sheet architecture marker %q", required)
@@ -76,9 +89,12 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		"stateJson",
 		"rowsFrom(tx.db.ticketremote_audit_event.ticketId.filter(ticketId)).length",
 		"writeLiveState(",
+		"const HISTORY_TTL_MS: i64 = 24 * 60 * 60 * 1000;",
 		"const HISTORY_TTL_MS: i64 = 72 * 60 * 60 * 1000;",
 		"const CLEANUP_INTERVAL_SECS: u64 = 5 * 60;",
+		"const CLEANUP_BATCH_SIZE: u32 = 5000;",
 		"const CLEANUP_BATCH_SIZE: u32 = 200;",
+		"const SAFE_LOG_DETAIL_MAX_BYTES: usize = 2048;",
 		"#[spacetimedb::table(accessor = ticketremote_service_stream_command, public",
 	} {
 		if strings.Contains(source, forbidden) {
@@ -98,6 +114,45 @@ func TestSpacetimeModuleUsesFocusedPublicTablesAndRetentionPolicy(t *testing.T) 
 		if strings.Contains(signalChunk, forbidden) {
 			t.Fatalf("stream command signal table must not expose command details, found %q in %s", forbidden, signalChunk)
 		}
+	}
+}
+
+func TestSpacetimeScheduledCleanupIsUnbounded(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	scheduledBody := sourceBetween(t, source,
+		"pub fn ticketremote_scheduled_cleanup_expired(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_upsert_member(")
+	ensureBody := sourceBetween(t, source,
+		"fn ensure_cleanup_schedule(",
+		"fn clear_phone_backends(")
+	cleanupBody := sourceBetween(t, source,
+		"fn history_expired(created_at: &str, expires_at: &str, now_ms: i64) -> bool",
+		"fn purge_expired_stream_commands_for_ticket(")
+	purgeBody := sourceBetween(t, source,
+		"fn purge_expired_stream_commands_for_ticket(",
+		"fn refresh_touched_signals(")
+
+	for _, required := range []string{
+		"cleanup_expired(ctx, &arg.ticketId, &now, 0);",
+		"batchSize: CLEANUP_BATCH_SIZE",
+		"let limit = batch_size;",
+		"cleanup_limit_reached(deleted, limit)",
+		"cleanup_remaining(limit, deleted)",
+		"fn history_expired(created_at: &str, expires_at: &str, now_ms: i64) -> bool",
+		"parse_time_ms(created_at).saturating_add(HISTORY_TTL_MS) <= now_ms",
+		"history_expired(&row.createdAt, &row.expiresAt, now_ms)",
+		`"limit": if limit == 0 { serde_json::Value::String("unbounded".into()) }`,
+		`"deletedCounts"`,
+		"cleanup_expired_completed",
+	} {
+		body := scheduledBody + ensureBody + cleanupBody
+		if !strings.Contains(body, required) {
+			t.Fatalf("unbounded cleanup marker missing %q", required)
+		}
+	}
+	if !strings.Contains(purgeBody, "let limit = batch_size;") ||
+		!strings.Contains(purgeBody, "cleanup_limit_reached(deleted, limit)") {
+		t.Fatalf("stream command purge must use the same unbounded zero semantics: %s", purgeBody)
 	}
 }
 
@@ -133,6 +188,76 @@ func TestSpacetimePendingCommandLookupUsesPendingIndex(t *testing.T) {
 		}
 		if !strings.Contains(sourceToSearch, marker) {
 			t.Fatalf("pending command reducer marker missing %q", marker)
+		}
+	}
+}
+
+func TestSpacetimeSidecarSnapshotUsesCurrentPhoneReportHealth(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetime-sidecar", "src", "main.rs")
+	body := sourceBetween(t, source,
+		"fn build_snapshot(app: &Arc<AppState>, ticket_id: &str) -> Result<SnapshotResponse, HttpError> {",
+		"    Ok(SnapshotResponse {")
+
+	for _, required := range []string{
+		"ticketremote_phone_current_report()",
+		"report.status_json.clone()",
+		"unwrap_or(row.health_json)",
+		"report.updated_at.clone()",
+		"unwrap_or(row.last_seen_at)",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("sidecar snapshot must merge current phone report health, missing %q in %s", required, body)
+		}
+	}
+}
+
+func TestSpacetimeSidecarReadsOperationalLogsThroughServiceView(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetime-sidecar", "src", "main.rs")
+	for _, required := range []string{
+		"SELECT * FROM ticketremote_service_safe_operational_log",
+		".ticketremote_service_safe_operational_log()",
+		"fn safe_operational_log_json(row: TicketremoteServiceSafeOperationalLog)",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("sidecar operational log service-view marker missing %q", required)
+		}
+	}
+	if strings.Contains(source, "SELECT * FROM ticketremote_safe_operational_log") ||
+		strings.Contains(source, ".ticketremote_safe_operational_log()") {
+		t.Fatalf("sidecar must not subscribe to the private operational log table directly")
+	}
+}
+
+func TestSpacetimePreservesCapturedControlCodeSuccessDuringCleanup(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	closeBody := sourceBetween(t, source,
+		"pub fn ticketremote_member_close_control_code(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_append_safe_operational_log(")
+	updateBody := sourceBetween(t, source,
+		"pub fn ticketremote_update_control_code_request(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_append_safe_operational_log(")
+	for _, required := range []string{
+		"let capture_acknowledged = current_request",
+		"if capture_acknowledged {",
+		"captureRequired: Some(false)",
+		"cleanupPending: Some(false)",
+		"expiresAt: Some(control_code_result_expires_at(&now))",
+	} {
+		if !strings.Contains(closeBody, required) {
+			t.Fatalf("captured close must preserve successful result, missing %q in %s", required, closeBody)
+		}
+	}
+	for _, required := range []string{
+		"let preserve_captured_success = existing.status == \"succeeded\"",
+		"&& existing.captureAcknowledged",
+		"&& control_code_cleanup_reason(&incoming_reason)",
+		"clean_status = existing.status.clone();",
+		"existing.reason.clone()",
+		"fn control_code_cleanup_reason(reason: &str) -> bool",
+		"\"ticket_detail\"",
+	} {
+		if !strings.Contains(updateBody, required) && !strings.Contains(source, required) {
+			t.Fatalf("cleanup updates must not downgrade captured success, missing %q", required)
 		}
 	}
 }
@@ -191,6 +316,88 @@ func TestSpacetimeControlCodeBrowserCaptureCommandMatchesPixelEnvelope(t *testin
 	} {
 		if strings.Contains(confirmBody, forbidden) {
 			t.Fatalf("browser-capture command must send numeric candidate frame metadata, found %q in %s", forbidden, confirmBody)
+		}
+	}
+}
+
+func TestSpacetimePrivateTableEventLogsCaptureRawControlCodeData(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	requestBody := sourceBetween(t, source,
+		"pub fn ticketremote_member_request_control_code(",
+		"pub fn ticketremote_member_confirm_control_code_browser_capture(")
+	ownerChunk := rustItemChunk(t, source, "#[spacetimedb::table(accessor = ticketremote_control_code_owner,")
+	publicRequestChunk := rustItemChunk(t, source, "#[spacetimedb::table(accessor = ticketremote_control_code_request, public")
+	signalChunk := rustItemChunk(t, source, "#[spacetimedb::table(accessor = ticketremote_stream_command_signal, public")
+
+	for _, required := range []string{
+		"digits: clean_digits.clone()",
+		`"digits": clean_digits`,
+		`"digits": &row.digits`,
+		`"ticketremote_control_code_owner"`,
+		"control_code_owner_log_row(&owner)",
+		"insert_table_event_log(",
+		"true,",
+	} {
+		if !strings.Contains(requestBody+source, required) {
+			t.Fatalf("private raw control-code log marker missing %q", required)
+		}
+	}
+	if !strings.Contains(ownerChunk, "pub digits: String") {
+		t.Fatalf("private owner table must retain raw digits until expiry: %s", ownerChunk)
+	}
+	for _, forbidden := range []string{"digits", "payloadJson", "email"} {
+		if strings.Contains(publicRequestChunk, forbidden) {
+			t.Fatalf("public control-code request table must not expose raw/private field %q: %s", forbidden, publicRequestChunk)
+		}
+		if strings.Contains(signalChunk, forbidden) {
+			t.Fatalf("public command signal table must not expose raw/private field %q: %s", forbidden, signalChunk)
+		}
+	}
+}
+
+func TestSpacetimeTableEventLogsActionTransitions(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	insertCommandBody := sourceBetween(t, source,
+		"fn insert_stream_command(",
+		"fn update_stream_command_status(")
+	updateCommandBody := sourceBetween(t, source,
+		"fn update_stream_command_status(",
+		"fn upsert_phone_current_report(")
+	updateControlBody := sourceBetween(t, source,
+		"fn update_control_code_public_request(",
+		"fn table_event_token(")
+	deleteControlBody := sourceBetween(t, source,
+		"fn delete_control_code_request(",
+		"fn active_control_code_owner_rows(")
+	auditBody := sourceBetween(t, source,
+		"fn audit(",
+		"fn ensure_cleanup_schedule(")
+	phoneHistoryBody := sourceBetween(t, source,
+		"fn append_phone_history(",
+		"fn apply_phone_update(")
+	snapshotBody := sourceBetween(t, source,
+		"pub fn ticketremote_snapshot_runtime_tables_to_logs(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_audit(")
+
+	checks := []struct {
+		label   string
+		body    string
+		markers []string
+	}{
+		{"stream command insert", insertCommandBody, []string{"ticketremote_stream_command", "insert", "stream_command_log_row(&row)"}},
+		{"stream command ack delete", updateCommandBody, []string{"acknowledged_delete", "dispatched_delete", `"previous"`, `"nextStatus"`}},
+		{"control code request update", updateControlBody, []string{"ticketremote_control_code_request", "update", "control_code_request_log_row(&row)"}},
+		{"control code request delete", deleteControlBody, []string{"ticketremote_control_code_request", "delete", "control_code_request_log_row(&row)"}},
+		{"control code owner delete", deleteControlBody, []string{"ticketremote_control_code_owner", "delete", "control_code_owner_log_row(&row)"}},
+		{"audit event insert", auditBody, []string{"ticketremote_audit_event", "insert", "audit_event_log_row(&row)"}},
+		{"phone history insert", phoneHistoryBody, []string{"ticketremote_phone_status_history", "insert", "phone_history_log_row(&row)"}},
+		{"snapshot reducer", snapshotBody, []string{"runtime_table_snapshot_completed", "snapshot", `"loggedCounts"`}},
+	}
+	for _, check := range checks {
+		for _, marker := range check.markers {
+			if !strings.Contains(check.body, marker) {
+				t.Fatalf("%s missing marker %q in %s", check.label, marker, check.body)
+			}
 		}
 	}
 }
@@ -272,6 +479,19 @@ func TestSpacetimeCurrentStateAndHistoryRetentionBoundaries(t *testing.T) {
 		chunk := rustItemChunk(t, source, marker)
 		if !strings.Contains(chunk, "pub expiresAt: String") {
 			t.Fatalf("history/log table %q must have indexed expiry: %s", marker, chunk)
+		}
+	}
+
+	safeLogChunk := rustItemChunk(t, source, "#[spacetimedb::table(accessor = ticketremote_safe_operational_log,")
+	for _, marker := range []string{
+		"index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))",
+		"index(accessor = ticketCreatedAt, btree(columns = [ticketId, createdAt]))",
+		"index(accessor = eventCreatedAt, btree(columns = [event, createdAt]))",
+		"index(accessor = correlationCreatedAt, btree(columns = [correlationId, createdAt]))",
+		"index(accessor = sourceCreatedAt, btree(columns = [source, createdAt]))",
+	} {
+		if !strings.Contains(safeLogChunk, marker) {
+			t.Fatalf("safe operational log table missing trace lookup index %q in %s", marker, safeLogChunk)
 		}
 	}
 }

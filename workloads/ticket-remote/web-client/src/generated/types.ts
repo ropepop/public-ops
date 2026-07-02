@@ -245,6 +245,19 @@ export const TicketremoteServicePhone = __t.object("TicketremoteServicePhone", {
 });
 export type TicketremoteServicePhone = __Infer<typeof TicketremoteServicePhone>;
 
+export const TicketremoteServiceSafeOperationalLog = __t.object("TicketremoteServiceSafeOperationalLog", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  source: __t.string(),
+  level: __t.string(),
+  event: __t.string(),
+  correlationId: __t.string(),
+  detailJson: __t.string(),
+  createdAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteServiceSafeOperationalLog = __Infer<typeof TicketremoteServiceSafeOperationalLog>;
+
 export const TicketremoteServiceStreamCommand = __t.object("TicketremoteServiceStreamCommand", {
   id: __t.string(),
   ticketId: __t.string(),

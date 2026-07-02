@@ -77,11 +77,15 @@ type Notification struct {
 	FailureCode    string `json:"failureCode,omitempty"`
 }
 
-type OCRWork struct {
-	ID                  string `json:"id"`
-	JobID               string `json:"jobId"`
-	AttemptID           string `json:"attemptId"`
-	ScreenshotPNGBase64 string `json:"screenshotPngBase64"`
+type EventInput struct {
+	Component       string
+	Level           string
+	Kind            string
+	JobID           string
+	AttemptID       string
+	PublicText      string
+	SafeDetailsJSON string
+	Retention       time.Duration
 }
 
 func New(cfg Config) (*Client, error) {
@@ -196,6 +200,24 @@ func (c *Client) MarkNotified(ctx context.Context, jobID string) error {
 	return err
 }
 
+func (c *Client) RecordEvent(ctx context.Context, input EventInput) error {
+	retentionMillis := input.Retention.Milliseconds()
+	if retentionMillis <= 0 {
+		retentionMillis = int64((24 * time.Hour) / time.Millisecond)
+	}
+	_, err := c.Call(ctx, "chatgptbroker_record_event", []any{
+		input.Component,
+		input.Level,
+		input.Kind,
+		input.JobID,
+		input.AttemptID,
+		input.PublicText,
+		input.SafeDetailsJSON,
+		uint64(retentionMillis),
+	})
+	return err
+}
+
 func (c *Client) ListJobs(ctx context.Context) ([]Job, error) {
 	rows, err := c.Query(ctx, "SELECT * FROM chatgptbroker_job")
 	if err != nil {
@@ -237,23 +259,6 @@ func (c *Client) Notifications(ctx context.Context) ([]Notification, error) {
 			PublicStatus:   stringValue(row["publicStatus"]),
 			ResultText:     stringValue(row["resultText"]),
 			FailureCode:    stringValue(row["failureCode"]),
-		})
-	}
-	return out, nil
-}
-
-func (c *Client) OCRWork(ctx context.Context) ([]OCRWork, error) {
-	rows, err := c.Query(ctx, "SELECT * FROM chatgptbroker_ocr_work")
-	if err != nil {
-		return nil, err
-	}
-	out := make([]OCRWork, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, OCRWork{
-			ID:                  stringValue(row["id"]),
-			JobID:               stringValue(row["jobId"]),
-			AttemptID:           stringValue(row["attemptId"]),
-			ScreenshotPNGBase64: stringValue(row["screenshotPngBase64"]),
 		})
 	}
 	return out, nil

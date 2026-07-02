@@ -34,6 +34,7 @@ type Config struct {
 	Port            int
 	UpstreamBaseURL string
 	TicketGrace     time.Duration
+	EventSink       EventSinkConfig
 }
 
 type Broker struct {
@@ -46,6 +47,8 @@ type Broker struct {
 	ticketLeases         map[string]ticketLease
 	lastPreemptionReason string
 	lastPreemptionAt     time.Time
+	lastUpstreamOK       *bool
+	eventSink            *eventSink
 }
 
 type TicketPresenceInput struct {
@@ -111,10 +114,24 @@ func New(cfg Config) (*Broker, error) {
 	return &Broker{
 		cfg:          cfg,
 		ticketLeases: map[string]ticketLease{},
+		eventSink:    newEventSink(cfg.EventSink),
 	}, nil
 }
 
 func (b *Broker) Run(ctx context.Context) {
+	if b.eventSink != nil {
+		b.eventSink.emit(productEvent{
+			Source:   "phone_broker",
+			Category: "broker",
+			Action:   "started",
+			Status:   "ok",
+			SafeState: map[string]any{
+				"upstreamConfigured": b.cfg.UpstreamBaseURL != "",
+			},
+		})
+		b.eventSink.run(ctx)
+		return
+	}
 	<-ctx.Done()
 }
 
@@ -151,7 +168,9 @@ func (b *Broker) UpdateTicketPresence(_ context.Context, input TicketPresenceInp
 	} else if b.ticketSockets == 0 {
 		b.ticketGraceUntil = now.Add(b.cfg.TicketGrace)
 	}
+	viewers := b.ticketViewers
 	b.mu.Unlock()
+	b.emitEvent("broker", "presence_updated", "ok", "", "", map[string]any{"viewers": viewers})
 	return nil
 }
 
@@ -188,6 +207,10 @@ func (b *Broker) AcquireTicketLease(_ context.Context, input TicketLeaseInput) (
 	b.ticketLeases[leaseID] = lease
 	snapshot := ticketLeaseSnapshot(lease, now, b.lastPreemptionReason, b.lastPreemptionAt)
 	b.mu.Unlock()
+	b.emitEvent("broker", "lease_acquired", "ok", lease.Reason, lease.RequestID, map[string]any{
+		"leaseId":         lease.ID,
+		"remainingMillis": snapshot.RemainingMillis,
+	})
 	return snapshot, nil
 }
 
@@ -210,6 +233,7 @@ func (b *Broker) ReleaseTicketLease(_ context.Context, input TicketLeaseInput) e
 		}
 	}
 	b.mu.Unlock()
+	b.emitEvent("broker", "lease_released", "ok", "", requestID, map[string]any{"leaseId": leaseID})
 	return nil
 }
 
@@ -247,6 +271,43 @@ func (b *Broker) Snapshot(now time.Time) StateSnapshot {
 	}
 }
 
+func (b *Broker) emitEvent(category string, action string, status string, reason string, requestID string, safeState map[string]any) {
+	if b == nil || b.eventSink == nil {
+		return
+	}
+	b.eventSink.emit(productEvent{
+		Source:    "phone_broker",
+		Category:  category,
+		Action:    action,
+		Status:    status,
+		Reason:    reason,
+		RequestID: requestID,
+		BackendID: "pixel",
+		SafeState: safeState,
+	})
+}
+
+func (b *Broker) noteUpstreamHealth(ok bool, err error) {
+	b.mu.Lock()
+	previous := b.lastUpstreamOK
+	if previous != nil && *previous == ok {
+		b.mu.Unlock()
+		return
+	}
+	value := ok
+	b.lastUpstreamOK = &value
+	b.mu.Unlock()
+	status := "ok"
+	reason := ""
+	if !ok {
+		status = "failed"
+		if err != nil {
+			reason = err.Error()
+		}
+	}
+	b.emitEvent("broker", "upstream_health_changed", status, reason, "", nil)
+}
+
 func (b *Broker) upstreamHealthSnapshot(ctx context.Context) (upstreamHealth, bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, healthUpstreamProbeTimeout)
 	defer cancel()
@@ -267,6 +328,7 @@ func (b *Broker) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	strict := r.URL.Query().Get("strict") == "1" || r.URL.Query().Get("requireUpstream") == "1"
 	health, upstreamOK, upstreamErr := b.upstreamHealthSnapshot(r.Context())
+	b.noteUpstreamHealth(upstreamOK, upstreamErr)
 	upstreamStatus := map[string]any{"ok": upstreamOK}
 	if upstreamErr != nil {
 		upstreamStatus["error"] = upstreamErr.Error()
@@ -370,8 +432,10 @@ func (b *Broker) handleTicketLeaseRelease(w http.ResponseWriter, r *http.Request
 func (b *Broker) beginTicketSocket() {
 	b.mu.Lock()
 	b.ticketSockets++
+	sockets := b.ticketSockets
 	b.ticketGraceUntil = time.Time{}
 	b.mu.Unlock()
+	b.emitEvent("broker", "ticket_socket_opened", "ok", "", "", map[string]any{"sockets": sockets})
 }
 
 func (b *Broker) endTicketSocket() {
@@ -383,7 +447,9 @@ func (b *Broker) endTicketSocket() {
 	if b.ticketSockets == 0 && b.ticketViewers == 0 {
 		b.ticketGraceUntil = now.Add(b.cfg.TicketGrace)
 	}
+	sockets := b.ticketSockets
 	b.mu.Unlock()
+	b.emitEvent("broker", "ticket_socket_closed", "ok", "", "", map[string]any{"sockets": sockets})
 }
 
 func (b *Broker) proxyHTTP(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +471,7 @@ func (b *Broker) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	req.ContentLength = int64(len(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		b.emitEvent("broker", "upstream_http_failed", "failed", err.Error(), "", map[string]any{"path": r.URL.Path})
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -427,14 +494,17 @@ func (b *Broker) proxyWebsocket(w http.ResponseWriter, r *http.Request, targetPa
 
 	target, err := b.websocketURL(targetPath)
 	if err != nil {
+		b.emitEvent("broker", "upstream_proxy_failed", "failed", "invalid_target", "", map[string]any{"path": targetPath})
 		_ = clientConn.Close(websocket.StatusInternalError, err.Error())
 		return
 	}
 	upstreamConn, _, err := websocket.Dial(r.Context(), target, &websocket.DialOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
+		b.emitEvent("broker", "upstream_proxy_failed", "failed", err.Error(), "", map[string]any{"path": targetPath})
 		_ = clientConn.Close(websocket.StatusInternalError, "upstream unavailable")
 		return
 	}
+	b.emitEvent("broker", "upstream_proxy_opened", "ok", "", "", map[string]any{"path": targetPath})
 	upstreamConn.SetReadLimit(websocketProxyReadLimitBytes)
 	defer upstreamConn.Close(websocket.StatusNormalClosure, "broker proxy closed")
 
@@ -445,6 +515,7 @@ func (b *Broker) proxyWebsocket(w http.ResponseWriter, r *http.Request, targetPa
 	case <-r.Context().Done():
 	case <-errCh:
 	}
+	b.emitEvent("broker", "upstream_proxy_closed", "ok", "", "", map[string]any{"path": targetPath})
 }
 
 func proxyMessages(ctx context.Context, dst *websocket.Conn, src *websocket.Conn) error {
@@ -527,10 +598,15 @@ func (b *Broker) pruneExpiredTicketLeasesLocked(now time.Time) {
 	if b.ticketLeases == nil {
 		return
 	}
+	expired := 0
 	for id, lease := range b.ticketLeases {
 		if !lease.ExpiresAt.IsZero() && !now.Before(lease.ExpiresAt) {
 			delete(b.ticketLeases, id)
+			expired++
 		}
+	}
+	if expired > 0 {
+		b.emitEvent("broker", "lease_expired", "ok", "", "", map[string]any{"count": expired})
 	}
 }
 

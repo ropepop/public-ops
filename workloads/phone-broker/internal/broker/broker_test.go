@@ -161,6 +161,89 @@ func TestTicketLeaseAcquireAndRelease(t *testing.T) {
 	}
 }
 
+func TestTicketLeaseAcquireEmitsServiceEvent(t *testing.T) {
+	events := make(chan map[string]any, 4)
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		events <- payload
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer sink.Close()
+
+	upstream := newFakeUpstream(t)
+	defer upstream.Close()
+	b, err := New(Config{
+		UpstreamBaseURL: upstream.URL,
+		TicketGrace:     25 * time.Millisecond,
+		EventSink:       EventSinkConfig{URL: sink.URL, Token: "secret"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	if _, err := b.AcquireTicketLease(context.Background(), TicketLeaseInput{
+		LeaseID:   "lease-test",
+		RequestID: "req-test",
+		Reason:    "control_code",
+		TTL:       10 * time.Second,
+	}); err != nil {
+		t.Fatalf("AcquireTicketLease: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event["action"] != "lease_acquired" {
+				continue
+			}
+			if event["source"] != "phone_broker" || event["category"] != "broker" || event["requestId"] != "req-test" {
+				t.Fatalf("event = %#v", event)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for lease_acquired event")
+		}
+	}
+}
+
+func TestUnavailableEventSinkDoesNotBlockTicketLease(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	defer upstream.Close()
+	b, err := New(Config{
+		UpstreamBaseURL: upstream.URL,
+		TicketGrace:     25 * time.Millisecond,
+		EventSink:       EventSinkConfig{URL: "http://127.0.0.1:1", Token: "secret"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	started := time.Now()
+	if _, err := b.AcquireTicketLease(context.Background(), TicketLeaseInput{
+		LeaseID: "lease-fast",
+		Reason:  "control_code",
+		TTL:     10 * time.Second,
+	}); err != nil {
+		t.Fatalf("AcquireTicketLease: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("AcquireTicketLease blocked on unavailable sink for %s", elapsed)
+	}
+}
+
 func TestChatGPTRoutesAreNotExposed(t *testing.T) {
 	upstream := newFakeUpstream(t)
 	defer upstream.Close()

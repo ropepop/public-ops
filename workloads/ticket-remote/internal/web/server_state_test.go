@@ -157,6 +157,8 @@ func TestAdminPageRendersDashboardShell(t *testing.T) {
 		`class="admin-status-grid"`,
 		`id="adminPhoneState"`,
 		`id="adminSafetyState"`,
+		`id="adminTicketSummary"`,
+		`id="adminTicketReselect"`,
 		`id="adminBackendList"`,
 		`id="adminNotice"`,
 		`<details class="admin-section admin-raw">`,

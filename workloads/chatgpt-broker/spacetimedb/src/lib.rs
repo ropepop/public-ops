@@ -86,24 +86,9 @@ pub struct ChatgptbrokerAttempt {
     pub failureCode: String,
     pub createdAt: Timestamp,
     pub updatedAt: Timestamp,
-}
-
-#[spacetimedb::table(accessor = chatgptbroker_ocr_input,
-    index(accessor = statusUpdatedAt, btree(columns = [status, updatedAt]))
-)]
-#[derive(Clone)]
-pub struct ChatgptbrokerOcrInput {
-    #[primary_key]
-    pub id: String,
     #[index(btree)]
-    pub jobId: String,
-    pub attemptId: String,
-    pub workerId: String,
-    #[index(btree)]
-    pub status: String,
-    pub screenshotPngBase64: String,
-    pub createdAt: Timestamp,
-    pub updatedAt: Timestamp,
+    #[default(Timestamp::UNIX_EPOCH)]
+    pub retentionDeleteAfter: Timestamp,
 }
 
 #[spacetimedb::table(accessor = chatgptbroker_phone_status, public)]
@@ -133,6 +118,9 @@ pub struct ChatgptbrokerEvent {
     pub publicText: String,
     pub safeDetailsJson: String,
     pub createdAt: Timestamp,
+    #[index(btree)]
+    #[default(Timestamp::UNIX_EPOCH)]
+    pub retentionDeleteAfter: Timestamp,
 }
 
 #[derive(Clone, SpacetimeType)]
@@ -144,16 +132,6 @@ pub struct ChatgptbrokerPhoneWorkRow {
     pub activeAttemptId: String,
     pub claimedBy: String,
     pub cancelRequested: bool,
-    pub createdAt: Timestamp,
-    pub updatedAt: Timestamp,
-}
-
-#[derive(Clone, SpacetimeType)]
-pub struct ChatgptbrokerOcrWorkRow {
-    pub id: String,
-    pub jobId: String,
-    pub attemptId: String,
-    pub screenshotPngBase64: String,
     pub createdAt: Timestamp,
     pub updatedAt: Timestamp,
 }
@@ -290,7 +268,7 @@ pub fn chatgptbroker_request_cancel(ctx: &ReducerContext, jobId: String) -> Resu
     };
     let next_status = match existing.status.as_str() {
         "queued" | "waiting_phone" | "failed_retryable" => "cancelled",
-        "running" | "ocr_pending" => "cancel_requested",
+        "running" => "cancel_requested",
         "succeeded" | "failed_final" | "cancelled" => return Err("job already finished".into()),
         _ => "cancel_requested",
     };
@@ -341,6 +319,33 @@ pub fn chatgptbroker_phone_heartbeat(
 }
 
 #[spacetimedb::reducer]
+pub fn chatgptbroker_record_event(
+    ctx: &ReducerContext,
+    component: String,
+    level: String,
+    kind: String,
+    jobId: String,
+    attemptId: String,
+    publicText: String,
+    safeDetailsJson: String,
+    retentionMillis: u64,
+) -> Result<(), String> {
+    require_any_service(ctx)?;
+    insert_event_with_retention(
+        ctx,
+        &jobId,
+        &attemptId,
+        &bounded(&component, 80),
+        &bounded(&kind, 80),
+        &bounded(&publicText, 300),
+        &safe_event_details(&level, &safeDetailsJson),
+        ctx.timestamp,
+        ctx.timestamp + retention_duration(retentionMillis),
+    );
+    Ok(())
+}
+
+#[spacetimedb::reducer]
 pub fn chatgptbroker_claim_next_job(
     ctx: &ReducerContext,
     workerId: String,
@@ -386,6 +391,7 @@ pub fn chatgptbroker_claim_next_job(
         failureCode: String::new(),
         createdAt: now,
         updatedAt: now,
+        retentionDeleteAfter: job.retentionDeleteAfter,
     });
     set_job_status(
         ctx,
@@ -430,56 +436,6 @@ pub fn chatgptbroker_mark_waiting_phone(ctx: &ReducerContext, jobId: String) -> 
 }
 
 #[spacetimedb::reducer]
-pub fn chatgptbroker_mark_screenshot_ready(
-    ctx: &ReducerContext,
-    jobId: String,
-    attemptId: String,
-    screenshotPngBase64: String,
-) -> Result<(), String> {
-    require_service(ctx, "phone")?;
-    let clean_job_id = required(&jobId, "job id required")?;
-    let clean_attempt_id = required(&attemptId, "attempt id required")?;
-    let Some(job) = ctx.db.chatgptbroker_job().id().find(&clean_job_id) else {
-        return Err("job not found".into());
-    };
-    if job.status != "running" && job.status != "cancel_requested" {
-        return Err("job is not running".into());
-    }
-    if job.activeAttemptId != clean_attempt_id {
-        return Err("attempt mismatch".into());
-    }
-    let now = ctx.timestamp;
-    let ocr_id = format!("ocr:{}", clean_attempt_id);
-    let row = ChatgptbrokerOcrInput {
-        id: ocr_id.clone(),
-        jobId: clean_job_id.clone(),
-        attemptId: clean_attempt_id.clone(),
-        workerId: job.claimedBy.clone(),
-        status: "queued".into(),
-        screenshotPngBase64: bounded(&screenshotPngBase64, 16_000_000),
-        createdAt: now,
-        updatedAt: now,
-    };
-    if ctx.db.chatgptbroker_ocr_input().id().find(&ocr_id).is_some() {
-        ctx.db.chatgptbroker_ocr_input().id().update(row);
-    } else {
-        ctx.db.chatgptbroker_ocr_input().insert(row);
-    }
-    set_job_status(
-        ctx,
-        &clean_job_id,
-        "ocr_pending",
-        "Reading result",
-        &clean_attempt_id,
-        "",
-        "",
-        job.claimedBy,
-        job.backendId,
-        job.cancelRequested,
-    )
-}
-
-#[spacetimedb::reducer]
 pub fn chatgptbroker_mark_succeeded(
     ctx: &ReducerContext,
     jobId: String,
@@ -490,22 +446,6 @@ pub fn chatgptbroker_mark_succeeded(
     let clean_job_id = required(&jobId, "job id required")?;
     let clean_attempt_id = required(&attemptId, "attempt id required")?;
     update_attempt_status(ctx, &clean_attempt_id, "succeeded", "")?;
-    if let Some(ocr) = ctx
-        .db
-        .chatgptbroker_ocr_input()
-        .id()
-        .find(&format!("ocr:{}", clean_attempt_id))
-    {
-        ctx.db
-            .chatgptbroker_ocr_input()
-            .id()
-            .update(ChatgptbrokerOcrInput {
-                status: "consumed".into(),
-                screenshotPngBase64: String::new(),
-                updatedAt: ctx.timestamp,
-                ..ocr
-            });
-    }
     let Some(job) = ctx.db.chatgptbroker_job().id().find(&clean_job_id) else {
         return Err("job not found".into());
     };
@@ -649,9 +589,14 @@ pub fn chatgptbroker_cleanup_expired(ctx: &ReducerContext) -> Result<(), String>
             ctx.db.chatgptbroker_job_secret().id().delete(&secret.id);
         }
     }
-    for ocr in ctx.db.chatgptbroker_ocr_input().iter() {
-        if ocr.updatedAt <= now && ocr.status == "consumed" {
-            ctx.db.chatgptbroker_ocr_input().id().delete(&ocr.id);
+    for attempt in ctx.db.chatgptbroker_attempt().iter() {
+        if attempt.retentionDeleteAfter <= now {
+            ctx.db.chatgptbroker_attempt().id().delete(&attempt.id);
+        }
+    }
+    for event in ctx.db.chatgptbroker_event().iter() {
+        if event.retentionDeleteAfter <= now {
+            ctx.db.chatgptbroker_event().id().delete(&event.id);
         }
     }
     Ok(())
@@ -669,28 +614,6 @@ pub fn chatgptbroker_phone_work(ctx: &ViewContext) -> Vec<ChatgptbrokerPhoneWork
     collect_phone_work_status(ctx, "failed_retryable", &mut out);
     collect_claimed_phone_work_status(ctx, &worker_id, "running", &mut out);
     collect_claimed_phone_work_status(ctx, &worker_id, "cancel_requested", &mut out);
-    out
-}
-
-#[spacetimedb::view(accessor = chatgptbroker_ocr_work, public, primary_key = id)]
-pub fn chatgptbroker_ocr_work(ctx: &ViewContext) -> Vec<ChatgptbrokerOcrWorkRow> {
-    if !view_has_role(ctx, "broker") {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for ocr in ctx.db.chatgptbroker_ocr_input().status().filter("queued") {
-        if ocr.screenshotPngBase64.trim().is_empty() {
-            continue;
-        }
-        out.push(ChatgptbrokerOcrWorkRow {
-            id: ocr.id,
-            jobId: ocr.jobId,
-            attemptId: ocr.attemptId,
-            screenshotPngBase64: ocr.screenshotPngBase64,
-            createdAt: ocr.createdAt,
-            updatedAt: ocr.updatedAt,
-        });
-    }
     out
 }
 
@@ -869,6 +792,30 @@ fn insert_event(
     safe_details_json: &str,
     now: Timestamp,
 ) {
+    insert_event_with_retention(
+        ctx,
+        job_id,
+        attempt_id,
+        visibility,
+        kind,
+        public_text,
+        safe_details_json,
+        now,
+        now + retention_duration(0),
+    );
+}
+
+fn insert_event_with_retention(
+    ctx: &ReducerContext,
+    job_id: &str,
+    attempt_id: &str,
+    visibility: &str,
+    kind: &str,
+    public_text: &str,
+    safe_details_json: &str,
+    now: Timestamp,
+    retention_delete_after: Timestamp,
+) {
     let id = format!("{}:{}:{}", job_id, kind, now.to_micros_since_unix_epoch());
     ctx.db.chatgptbroker_event().insert(ChatgptbrokerEvent {
         id,
@@ -879,7 +826,19 @@ fn insert_event(
         publicText: bounded(public_text, 300),
         safeDetailsJson: bounded(safe_details_json, 2048),
         createdAt: now,
+        retentionDeleteAfter: retention_delete_after,
     });
+}
+
+fn safe_event_details(level: &str, detail_json: &str) -> String {
+    let level = bounded(level, 40);
+    let parsed = serde_json::from_str::<serde_json::Value>(&bounded(detail_json, 2048))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    serde_json::json!({
+        "level": if level.is_empty() { "info" } else { level.as_str() },
+        "detail": parsed
+    })
+    .to_string()
 }
 
 fn require_phone_or_broker(ctx: &ReducerContext) -> Result<(), String> {

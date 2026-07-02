@@ -715,6 +715,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"scroll-snap-type:y proximity",
 		"body.screen-engaged",
 		"scroll-snap-type:none",
+		".shell{width:100%;min-height:var(--ticket-stage-height)",
+		".stage-page{width:100%;min-height:var(--ticket-stage-height)",
+		".stage{position:relative;z-index:1;width:100%;min-height:var(--ticket-stage-height)",
 		"--ticket-viewport-width",
 		"--ticket-viewport-height",
 		"--ticket-viewport-left",
@@ -815,6 +818,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	}
 	if !strings.Contains(indexHTML, "maximum-scale=1, user-scalable=no") {
 		t.Fatalf("ticket viewer viewport should disable Safari double-tap zoom")
+	}
+	if !strings.Contains(indexHTML, "interactive-widget=overlays-content") {
+		t.Fatalf("ticket viewer viewport should ask mobile browsers to overlay the keyboard instead of resizing the stream")
 	}
 	for _, snippet := range []string{
 		`class="panel-summary-item stream-summary"`,

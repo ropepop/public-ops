@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -13,14 +13,13 @@ import (
 
 	"chatgptbroker/internal/broker"
 	"chatgptbroker/internal/config"
-	"chatgptbroker/internal/ocr"
 	"chatgptbroker/internal/spacetime"
 )
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		os.Exit(1)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -40,21 +39,16 @@ func main() {
 		Role:        "broker",
 	})
 	if err != nil {
-		log.Fatalf("spacetime: %v", err)
+		os.Exit(1)
 	}
 	if err := queue.Register(ctx); err != nil {
-		log.Fatalf("spacetime register: %v", err)
+		recordEvent(context.Background(), queue, "broker", "error", "spacetime_register_failed", "Broker could not register with SpacetimeDB", map[string]string{"error": err.Error()})
+		os.Exit(1)
 	}
-	runner := broker.NewRunner(queue, broker.RunnerConfig{
-		Enabled:      cfg.OCREnabled,
-		PollInterval: cfg.OCRPollInterval,
-		OCR:          ocr.Extractor{TesseractPath: cfg.TesseractPath},
-	})
 	server := &http.Server{
 		Addr:    net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.Port)),
 		Handler: broker.NewServer(queue, cfg.DefaultProjectName, cfg.JobRetention).Handler(),
 	}
-	go runner.Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -62,11 +56,12 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("chatgpt broker listening on %s", server.Addr)
+	recordEvent(context.Background(), queue, "broker", "info", "broker_listening", "Broker listening", map[string]string{"addr": server.Addr})
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+		recordEvent(context.Background(), queue, "broker", "error", "http_listen_failed", "Broker HTTP server failed", map[string]string{"error": err.Error()})
+		os.Exit(1)
 	}
-	fmt.Println("chatgpt broker stopped")
+	recordEvent(context.Background(), queue, "broker", "info", "broker_stopped", "Broker stopped", nil)
 }
 
 func serviceRoles(configured []string, fallback ...string) []string {
@@ -74,4 +69,30 @@ func serviceRoles(configured []string, fallback ...string) []string {
 		return configured
 	}
 	return fallback
+}
+
+type eventRecorder interface {
+	RecordEvent(ctx context.Context, input spacetime.EventInput) error
+}
+
+func recordEvent(ctx context.Context, recorder eventRecorder, component, level, kind, publicText string, details map[string]string) {
+	if recorder == nil {
+		return
+	}
+	detailJSON := "{}"
+	if len(details) > 0 {
+		body, err := json.Marshal(details)
+		if err == nil {
+			detailJSON = string(body)
+		}
+	}
+	eventCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_ = recorder.RecordEvent(eventCtx, spacetime.EventInput{
+		Component:       component,
+		Level:           level,
+		Kind:            kind,
+		PublicText:      publicText,
+		SafeDetailsJSON: detailJSON,
+	})
 }

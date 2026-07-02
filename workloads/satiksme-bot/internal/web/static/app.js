@@ -3432,6 +3432,9 @@
     if (!app) {
       return;
     }
+    if (arrowHTML && arrowReactive) {
+      markArrowUIActive();
+    }
     if (String(config.mode || "public") === "public-incidents") {
       state.publicIncidentsLoading = true;
       state.publicIncidentsLoaded = false;

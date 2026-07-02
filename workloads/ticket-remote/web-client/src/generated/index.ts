@@ -67,6 +67,7 @@ import TicketremoteRevokeControlReducer from "./ticketremote_revoke_control_redu
 import TicketremoteServiceBootstrapReducer from "./ticketremote_service_bootstrap_reducer";
 import TicketremoteSetDevPerfMetricsReducer from "./ticketremote_set_dev_perf_metrics_reducer";
 import TicketremoteSetStreamDesiredStateReducer from "./ticketremote_set_stream_desired_state_reducer";
+import TicketremoteSnapshotRuntimeTablesToLogsReducer from "./ticketremote_snapshot_runtime_tables_to_logs_reducer";
 import TicketremoteUpdateControlCodeRequestReducer from "./ticketremote_update_control_code_request_reducer";
 import TicketremoteUpdatePhoneReducer from "./ticketremote_update_phone_reducer";
 import TicketremoteUpdatePhoneCurrentReportReducer from "./ticketremote_update_phone_current_report_reducer";
@@ -83,6 +84,7 @@ import TicketremotePhoneStatusRow from "./ticketremote_phone_status_table";
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
 import TicketremoteServiceControlSessionRow from "./ticketremote_service_control_session_table";
 import TicketremoteServicePhoneBackendRow from "./ticketremote_service_phone_backend_table";
+import TicketremoteServiceSafeOperationalLogRow from "./ticketremote_service_safe_operational_log_table";
 import TicketremoteServiceStreamCommandRow from "./ticketremote_service_stream_command_table";
 import TicketremoteServiceTicketRow from "./ticketremote_service_ticket_table";
 import TicketremoteServiceTicketMemberRow from "./ticketremote_service_ticket_member_table";
@@ -318,6 +320,13 @@ const tablesSchema = __schema({
     constraints: [
     ],
   }, TicketremoteServicePhoneBackendRow),
+  ticketremote_service_safe_operational_log: __table({
+    name: 'ticketremote_service_safe_operational_log',
+    indexes: [
+    ],
+    constraints: [
+    ],
+  }, TicketremoteServiceSafeOperationalLogRow),
   ticketremote_service_stream_command: __table({
     name: 'ticketremote_service_stream_command',
     indexes: [
@@ -383,6 +392,7 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_service_bootstrap", TicketremoteServiceBootstrapReducer),
   __reducerSchema("ticketremote_set_dev_perf_metrics", TicketremoteSetDevPerfMetricsReducer),
   __reducerSchema("ticketremote_set_stream_desired_state", TicketremoteSetStreamDesiredStateReducer),
+  __reducerSchema("ticketremote_snapshot_runtime_tables_to_logs", TicketremoteSnapshotRuntimeTablesToLogsReducer),
   __reducerSchema("ticketremote_update_control_code_request", TicketremoteUpdateControlCodeRequestReducer),
   __reducerSchema("ticketremote_update_phone", TicketremoteUpdatePhoneReducer),
   __reducerSchema("ticketremote_update_phone_current_report", TicketremoteUpdatePhoneCurrentReportReducer),

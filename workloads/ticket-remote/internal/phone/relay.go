@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strings"
 	"sync"
@@ -494,7 +493,6 @@ func (r *Relay) recordError(err error) {
 	r.lastError = err.Error()
 	handler := r.onMessage
 	r.mu.Unlock()
-	log.Printf("ticket phone relay: %v", err)
 	if handler != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"type":    "phone",

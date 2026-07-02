@@ -37,13 +37,13 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 420,
-      "sha256": "4e71a8aedd2a43c7efd15cc5abc73491dba55b023e8073177ee6c9ab921052c7",
+      "sha256": "af983f06f12fd2409f7076f3855c01b056789aaf35029f8896eb8005af7ce5ee",
       "size": 1079
     },
     "etc/arbuzas/env/chatgpt-broker.env": {
       "mode": 420,
-      "sha256": "c36787e46dd06cb0998aa590fdd64a10527f3ad6eae0738a10776bd419815cd4",
-      "size": 822
+      "sha256": "fee572c47bfb070f599e2108bfbe6878097635ba7ce76b62c9c0e54766db6607",
+      "size": 828
     },
     "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z.retired-20260618T215944Z": {
       "mode": 384,
@@ -57,8 +57,8 @@
     },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 420,
-      "sha256": "4bccbac8742324b52c69be558b92f248731e9afb5d29fec6abdb7dfbf763f41d",
-      "size": 3778
+      "sha256": "2a7fdba3d966cee347d482aa43776684bfc520236cfa730d5daf300ada803f98",
+      "size": 3779
     },
     "etc/arbuzas/env/satiksme-bot.env.bak-google-ai": {
       "mode": 384,
@@ -105,15 +105,30 @@
       "sha256": "5e5ff0bcb12be762eba18ceb8d247484f2b07e282bebddf1673ad04d05ac167c",
       "size": 3999
     },
+    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T043727Z": {
+      "mode": 384,
+      "sha256": "4bccbac8742324b52c69be558b92f248731e9afb5d29fec6abdb7dfbf763f41d",
+      "size": 3778
+    },
+    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T043931Z": {
+      "mode": 384,
+      "sha256": "2a7fdba3d966cee347d482aa43776684bfc520236cfa730d5daf300ada803f98",
+      "size": 3779
+    },
+    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T044137Z": {
+      "mode": 384,
+      "sha256": "664e49bbf4a2d6fb7b54b663ca985f02a069aa166e2f5c50599051838afdcf81",
+      "size": 3780
+    },
     "etc/arbuzas/env/subscription-bot.env": {
       "mode": 420,
       "sha256": "6ed9bf7b6f7ee22777de42dbcc399540c57685ba428dc5d578759404d45ed18b",
       "size": 1697
     },
     "etc/arbuzas/env/ticket-remote.env": {
-      "mode": 420,
-      "sha256": "2f756866dd197c94e728809333a5fa76f60f7b2c6aa48bf189b335a31d3d4319",
-      "size": 1314
+      "mode": 384,
+      "sha256": "f8d9f4c64e091a58b2c9e84d01bdce8ae44b8a8815136fc5c167d08618bf5483",
+      "size": 1360
     },
     "etc/arbuzas/env/ticket-remote.env.bak-20260509T0012": {
       "mode": 384,
@@ -202,5 +217,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1782853484
+  "updatedEpochSeconds": 1782893348
 }

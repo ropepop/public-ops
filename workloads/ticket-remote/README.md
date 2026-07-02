@@ -24,6 +24,7 @@ TICKET_REMOTE_AUTH_MODE=dev make run
 - Browser users connect directly to SpacetimeDB for authenticated ticket state, while code-request actions go through `ticket_remote`.
 - Browser users never talk directly to the Pixel; only this service talks to the phone bridge.
 - The production backend is the physical Pixel through the private `phone_broker`, backed by `ticket_phone_bridge`; the old in-container device path has been removed.
+- Runtime diagnostics are SpacetimeDB-only through safe operational/audit rows with retention cleanup. `ticket_remote`, the phone bridge, and Pixel ticket automation must not leave local runtime log files behind.
 - Public video is H.264 over the existing HTTPS WebSocket: the active phone backend emits one private root FFmpeg H.264 stream, and `ticket_remote` fans it out to authenticated browsers without public media ports.
 - Pixel capture quality is fixed by the phone service at the current readable profile: 900 px target width, 10 FPS, 5 Mbps, FFmpeg H.264 baseline/ultrafast, and the existing keyframe cadence. Compute-reduction work must keep that browser-visible output unchanged and remove only duplicate or orphan root capture helpers, FFmpeg encoders, and wrapper shells.
 - Interactive browser UI uses ArrowJS for changing presence, status, stream, and control areas. Keep static or no-JS pages simple until they need browser-side interactivity.
