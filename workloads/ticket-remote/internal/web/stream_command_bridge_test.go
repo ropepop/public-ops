@@ -236,9 +236,10 @@ func TestStreamCommandBridgeBacksOffWhenIdle(t *testing.T) {
 	}
 }
 
-func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T) {
+func TestStreamCommandBridgeRecoverStreamUsesExistingCommandSocket(t *testing.T) {
 	messages := make(chan map[string]any, 4)
 	var recoverRequests atomic.Int32
+	var startRequests atomic.Int32
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/session/stop":
@@ -246,9 +247,11 @@ func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T)
 			w.WriteHeader(http.StatusInternalServerError)
 		case "/api/v1/session/recover":
 			recoverRequests.Add(1)
-			w.WriteHeader(http.StatusOK)
+			t.Errorf("recover_stream must not call the removed phone recovery endpoint")
+			w.WriteHeader(http.StatusNotFound)
 		case "/api/v1/session/start":
-			t.Errorf("recover_stream should use the phone recovery endpoint, not start after stop")
+			startRequests.Add(1)
+			t.Errorf("recover_stream should not restart the phone session")
 			w.WriteHeader(http.StatusInternalServerError)
 		case "/api/v1/session":
 			conn, err := websocket.Accept(w, r, nil)
@@ -316,8 +319,11 @@ func TestStreamCommandBridgeRecoverStreamRestartsStalePhoneSession(t *testing.T)
 		t.Fatalf("phone payload = %#v", payload)
 	}
 	waitForBridgeAck(t, store, "cmd-recover-1")
-	if got := recoverRequests.Load(); got != 1 {
-		t.Fatalf("recover_stream recover requests = %d, want 1", got)
+	if got := recoverRequests.Load(); got != 0 {
+		t.Fatalf("recover_stream recover endpoint requests = %d, want 0", got)
+	}
+	if got := startRequests.Load(); got != 0 {
+		t.Fatalf("recover_stream start requests = %d, want 0", got)
 	}
 }
 
@@ -461,12 +467,15 @@ func TestStreamCommandBridgePurgesExpiredCommandsBeforeSignalGate(t *testing.T) 
 }
 
 func TestStreamCommandBridgeUsesLongTimeoutForPhoneStartRecovery(t *testing.T) {
-	longCommands := []string{"start", "prepare_control_code", "recover_stream", "force_ticket_reselect"}
+	longCommands := []string{"start", "prepare_control_code", "force_ticket_reselect"}
 	for _, commandType := range longCommands {
 		got := streamCommandDispatchTimeout(state.StreamCommand{CommandType: commandType})
 		if got != streamCommandBridgePhoneStartTimeout {
 			t.Fatalf("%s timeout = %s, want %s", commandType, got, streamCommandBridgePhoneStartTimeout)
 		}
+	}
+	if got := streamCommandDispatchTimeout(state.StreamCommand{CommandType: "recover_stream"}); got != streamCommandBridgeWriteTimeout {
+		t.Fatalf("recover_stream timeout = %s, want %s", got, streamCommandBridgeWriteTimeout)
 	}
 	if got := streamCommandDispatchTimeout(state.StreamCommand{CommandType: "keyframe"}); got != streamCommandBridgeWriteTimeout {
 		t.Fatalf("keyframe timeout = %s, want %s", got, streamCommandBridgeWriteTimeout)

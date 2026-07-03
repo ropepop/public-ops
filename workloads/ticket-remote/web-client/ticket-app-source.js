@@ -26,13 +26,50 @@ import { html, reactive } from '@arrow-js/core';
   let spacetimeClient = null;
 
   function enqueueClientLog(entry) {
-    pendingClientLogs.push(entry);
+    pendingClientLogs.push(compactClientLogEntry(entry));
     if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
     try {
       if (typeof queueMicrotask === 'function') {
         queueMicrotask(() => flushClientLogs());
       }
     } catch (_) {}
+  }
+
+  function compactClientLogEntry(entry) {
+    const rawEventName = String(entry && entry.event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    const eventName = compactClientEventName(rawEventName);
+    const normalized = Object.assign({}, entry, { event: eventName });
+    if (eventName === rawEventName) return normalized;
+    if (normalized.detailJson) {
+      normalized.detailJson = detailJsonWithOriginalEvent(normalized.detailJson, rawEventName);
+    } else if (normalized.detail) {
+      normalized.detail = detailTextWithOriginalEvent(normalized.detail, rawEventName);
+    } else {
+      normalized.detail = safeString({ originalEvent: rawEventName }).slice(0, 1000);
+    }
+    return normalized;
+  }
+
+  function detailJsonWithOriginalEvent(detailJson, rawEventName) {
+    try {
+      const parsed = JSON.parse(String(detailJson || '{}'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (!parsed.originalEvent) parsed.originalEvent = rawEventName;
+        return safeString(parsed).slice(0, 1000);
+      }
+    } catch (_) {}
+    return safeString({ detail: safeString(detailJson).slice(0, 800), originalEvent: rawEventName }).slice(0, 1000);
+  }
+
+  function detailTextWithOriginalEvent(detail, rawEventName) {
+    try {
+      const parsed = JSON.parse(String(detail || '{}'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (!parsed.originalEvent) parsed.originalEvent = rawEventName;
+        return safeString(parsed).slice(0, 1000);
+      }
+    } catch (_) {}
+    return safeString({ detail: safeString(detail).slice(0, 800), originalEvent: rawEventName }).slice(0, 1000);
   }
 
   function sampledClientLogDetail(event, detail) {
@@ -53,22 +90,102 @@ import { html, reactive } from '@arrow-js/core';
     });
   }
 
+  function compactClientEventName(event) {
+    switch (event) {
+      case 'page_boot':
+        return 'browser_opened';
+      case 'video_socket_opened':
+        return 'stream_opened';
+      case 'video_socket_closed':
+      case 'video_socket_closed_intentional':
+      case 'viewer_idle_disconnected':
+      case 'video_stream_paused_hidden':
+        return 'stream_closed';
+      case 'video_socket_connect_attempt':
+      case 'video_stream_restart':
+      case 'fresh_video_resume':
+      case 'cached_video_resume':
+      case 'viewer_idle_resumed':
+        return 'stream_started';
+      case 'keyframe_request':
+        return 'keyframe_requested';
+      case 'keyframe_request_failed':
+        return 'keyframe_failed';
+      case 'stream_recovery_request':
+      case 'h264_server_recover_requested':
+        return 'stream_recovery_requested';
+      case 'activation_resume_start':
+      case 'activation_resume_retry':
+      case 'activation_resume_deep_recover':
+      case 'activation_resume_recovery_decision':
+        return 'stream_recovery_requested';
+      case 'activation_resume_fresh_frame':
+      case 'activation_resume_finish':
+        return 'stream_recovered';
+      case 'activation_resume_exhausted':
+      case 'activation_resume_media_stuck':
+        return 'stream_failed';
+      case 'activation_resume_merged':
+      case 'activation_resume_paused':
+      case 'activation_resume_log_limit':
+        return 'stream_recovery_ignored';
+      case 'stream_recover_request_failed':
+        return 'stream_failed';
+      case 'stale_video_frames':
+      case 'server_stale_frames':
+      case 'loading_over_2s':
+        return 'stream_stalled';
+      case 'control_code_submitted':
+        return 'control_code_requested';
+      case 'control_code_prepare_complete':
+      case 'control_code_auto_prepare_complete':
+        return 'control_code_sent';
+      case 'control_code_request_failed':
+      case 'control_code_prepare_failed':
+      case 'control_code_auto_prepare_failed':
+      case 'control_code_close_failed':
+        return 'control_code_failed';
+      case 'control_code_capture_keepalive':
+        return 'control_code_capturing';
+      case 'control_code_message_ignored':
+      case 'control_code_close_ignored':
+        return 'control_code_ignored';
+      case 'spacetime_connect_failed':
+      case 'spacetime_reconnect_failed':
+      case 'spacetime_direct_unavailable':
+        return 'state_failed';
+      case 'spacetime_client_status':
+        return 'state_changed';
+      default:
+        break;
+    }
+    if (event.includes('recover') || event.includes('recovery')) return event.includes('failed') ? 'stream_failed' : 'stream_recovery_requested';
+    if (event.includes('keyframe')) return event.includes('failed') ? 'keyframe_failed' : 'keyframe_requested';
+    if (event.includes('control_code') && event.includes('failed')) return 'control_code_failed';
+    if (event.includes('video_socket') && event.includes('open')) return 'stream_opened';
+    if (event.includes('video_socket') && event.includes('closed')) return 'stream_closed';
+    return event;
+  }
+
   function reportClientFault(event, detail) {
-    const eventName = String(event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    const rawEventName = String(event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    const eventName = compactClientEventName(rawEventName);
     const detailText = safeString(detail).slice(0, 500);
-    const sampledDetail = sampledClientLogDetail(eventName, detailText);
+    const sampledDetail = sampledClientLogDetail(rawEventName, detailText);
     if (sampledDetail == null) return;
+    const detailPayload = {
+      pageVersion,
+      assetVersion,
+      detail: sampledDetail,
+      visibility: document.visibilityState,
+      webCodecs: 'VideoDecoder' in window,
+      userAgent: navigator.userAgent
+    };
+    if (eventName !== rawEventName) detailPayload.originalEvent = rawEventName;
     enqueueClientLog({
       level: 'info',
       event: eventName,
-      detail: safeString({
-        pageVersion,
-        assetVersion,
-        detail: sampledDetail,
-        visibility: document.visibilityState,
-        webCodecs: 'VideoDecoder' in window,
-        userAgent: navigator.userAgent
-      }).slice(0, 1000),
+      detail: safeString(detailPayload).slice(0, 1000),
       correlationId: typeof browserTraceId === 'string' ? browserTraceId : '',
       at: Date.now()
     });
@@ -1803,7 +1920,6 @@ import { html, reactive } from '@arrow-js/core';
     const now = performance.now();
     if (!force && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
-    sendVideoClientLog('h264_server_recover_requested', reason);
     clientLog('stream_recovery_request', JSON.stringify({
       reason: reason || 'browser_recovery',
       force: Boolean(force),

@@ -115,12 +115,13 @@ func (s *Server) recordProductEvent(input productEventInput) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 	defer cancel()
+	event := productEventName(category, action, status)
 	_ = s.store.AppendSafeOperationalLog(ctx, state.SafeOperationalLogInput{
-		ID:            state.NewSafeOperationalLogID(source, "product_"+category+"_"+action, correlationID, time.Now()),
+		ID:            state.NewSafeOperationalLogID(source, event, correlationID, time.Now()),
 		TicketID:      s.cfg.TicketID,
 		Source:        source,
 		Level:         level,
-		Event:         "product_" + category + "_" + action,
+		Event:         event,
 		CorrelationID: cleanRuntimeCorrelationID(correlationID),
 		DetailJSON:    state.ClampSafeOperationalLogDetail(string(body)),
 		Now:           time.Now(),
@@ -196,6 +197,95 @@ func productMessageString(value any) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func productEventName(category string, action string, status string) string {
+	category = cleanProductToken(category, "runtime")
+	action = cleanProductToken(action, "event")
+	status = cleanProductToken(status, "ok")
+	failed := productEventFailed(action, status)
+	switch category {
+	case "stream":
+		if failed {
+			return "stream_failed"
+		}
+		switch action {
+		case "verdict_changed":
+			switch status {
+			case "live":
+				return "stream_started"
+			case "idle", "stopped", "closed":
+				return "stream_closed"
+			default:
+				return "stream_changed"
+			}
+		case "frame_drop_threshold":
+			return "stream_stalled"
+		}
+	case "command":
+		if failed {
+			return "command_failed"
+		}
+		switch action {
+		case "queued":
+			return "command_queued"
+		case "dispatched":
+			return "command_sent"
+		case "acknowledged":
+			return "command_acknowledged"
+		}
+	case "control_code":
+		if failed {
+			return "control_code_failed"
+		}
+		switch action {
+		case "queued", "requested":
+			return "control_code_requested"
+		case "dispatched", "sent":
+			return "control_code_sent"
+		case "captured":
+			return "control_code_captured"
+		case "acknowledged", "completed", "cleaned_up":
+			return "control_code_completed"
+		}
+	case "broker":
+		if failed {
+			if strings.Contains(action, "http") || strings.Contains(action, "proxy") || strings.Contains(action, "upstream") {
+				return "bridge_failed"
+			}
+			return "phone_failed"
+		}
+		switch action {
+		case "started":
+			return "phone_connected"
+		case "upstream_health_changed":
+			if status == "ok" {
+				return "phone_connected"
+			}
+			return "phone_disconnected"
+		case "ticket_socket_opened", "upstream_proxy_opened":
+			return "bridge_connected"
+		case "ticket_socket_closed", "upstream_proxy_closed":
+			return "bridge_disconnected"
+		case "lease_acquired":
+			return "phone_lease_acquired"
+		case "lease_released", "lease_expired":
+			return "phone_lease_released"
+		case "presence_updated":
+			return "phone_presence_updated"
+		}
+	}
+	if failed {
+		return category + "_failed"
+	}
+	return category + "_" + action
+}
+
+func productEventFailed(action string, status string) bool {
+	if status == "failed" || status == "error" || status == "warn" {
+		return true
+	}
+	return strings.Contains(action, "failed") || strings.Contains(action, "timeout") || strings.Contains(action, "error")
 }
 
 func adminOperationalEventFromLog(row state.SafeOperationalLog) adminOperationalEvent {

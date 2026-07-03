@@ -151,7 +151,6 @@ func (s *Server) pollPendingStreamCommands(reader pendingStreamCommandReader, at
 				attempt.failures++
 				attempt.next = now.Add(streamCommandBridgeBackoff(attempt.failures))
 				attempts[command.ID] = attempt
-				s.appendStreamCommandBridgeLogAsync("warn", "stream_command_dispatch_failed", command, err)
 				continue
 			}
 			s.recordProductEventAsync(productEventInput{
@@ -243,7 +242,7 @@ func (s *Server) purgeExpiredStreamCommandsIfDue(reader pendingStreamCommandRead
 
 func streamCommandDispatchTimeout(command state.StreamCommand) time.Duration {
 	switch cleanStreamControlText(command.CommandType, "command") {
-	case "start", "prepare_control_code", "recover_stream", "force_ticket_reselect":
+	case "start", "prepare_control_code", "force_ticket_reselect":
 		return streamCommandBridgePhoneStartTimeout
 	default:
 		return streamCommandBridgeWriteTimeout
@@ -350,12 +349,12 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 		s.direct.recordKeyframeRequested()
 		return s.sendPhoneSessionCommand(ctx, payload)
 	case "recover_stream":
-		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=recover_stream id=%s", command.ID))
-		if err := s.restartPhoneSessionForRecovery(ctx); err != nil {
-			return err
+		s.direct.recordStartupPhase("spacetime_command_dispatch", fmt.Sprintf("type=stream_recovery id=%s", command.ID))
+		s.relay.Reconnect("spacetime_stream_recovery")
+		s.direct.recordKeyframeRequested()
+		if err := s.sendPhoneSessionCommand(ctx, payload); err != nil {
+			s.direct.recordClientTelemetry("stream_recovery_command_socket_unavailable", command.Reason)
 		}
-		s.relay.Reconnect("spacetime_command_recover_stream")
-		_ = s.sendPhoneSessionCommand(ctx, payload)
 		return nil
 	case "control_code_browser_capture", "control_code_result_ack":
 		err := s.sendPhoneSessionCommand(ctx, payload)
@@ -375,13 +374,6 @@ func (s *Server) dispatchStreamCommandToPhone(ctx context.Context, command state
 	default:
 		return s.sendPhoneSessionCommand(ctx, payload)
 	}
-}
-
-func (s *Server) restartPhoneSessionForRecovery(ctx context.Context) error {
-	if err := s.postPhoneSessionCommand(ctx, "/api/v1/session/recover"); err != nil {
-		return fmt.Errorf("recover phone session: %w", err)
-	}
-	return nil
 }
 
 func streamCommandPhonePayload(command state.StreamCommand) (map[string]any, error) {
@@ -492,31 +484,6 @@ func (s *Server) appendStreamCommandBridgeLogAsync(level string, event string, c
 			"commandType": cleanStreamControlText(command.CommandType, "command"),
 		},
 	})
-	go func() {
-		detail := map[string]any{
-			"commandId":   command.ID,
-			"commandType": cleanStreamControlText(command.CommandType, "command"),
-			"backendId":   cleanStreamControlText(command.BackendID, "pixel"),
-		}
-		if err != nil {
-			detail["error"] = safeStreamCommandBridgeError(err)
-		}
-		body, marshalErr := json.Marshal(detail)
-		if marshalErr != nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
-		defer cancel()
-		_ = s.store.AppendSafeOperationalLog(ctx, state.SafeOperationalLogInput{
-			TicketID:      s.cfg.TicketID,
-			Source:        "ticket_remote",
-			Level:         cleanStreamControlText(level, "info"),
-			Event:         cleanStreamControlText(event, "stream_command_bridge"),
-			CorrelationID: command.ID,
-			DetailJSON:    string(body),
-			Now:           time.Now(),
-		})
-	}()
 }
 
 func safeStreamCommandBridgeError(err error) string {

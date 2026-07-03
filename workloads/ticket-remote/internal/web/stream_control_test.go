@@ -146,7 +146,7 @@ func TestRelayViewerPublishesDesiredActiveAndTrace(t *testing.T) {
 		t.Fatal("timed out waiting for active desired-state update")
 	}
 
-	got := waitForSafeLog(t, logs, "relay_viewer_added")
+	got := waitForSafeLog(t, logs, "stream_opened")
 	if got.Source != "ticket_remote_relay" {
 		t.Fatalf("log source = %q, want ticket_remote_relay", got.Source)
 	}
@@ -164,7 +164,7 @@ func TestKeyframeWhileDisconnectedWritesWarningTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := waitForSafeLog(t, logs, "keyframe_while_phone_disconnected")
+	got := waitForSafeLog(t, logs, "keyframe_requested")
 	if got.Level != "warn" {
 		t.Fatalf("log level = %q, want warn", got.Level)
 	}
@@ -315,7 +315,7 @@ func TestPhoneCurrentReportIncludesStreamRecoveryStatus(t *testing.T) {
 	case got := <-phoneReports:
 		for _, needle := range []string{
 			`"currentRecoveryStage":"queued"`,
-			`"lastWatchdogAction":"recover_stream_command"`,
+			`"lastWatchdogAction":"stream_recovery"`,
 			`"lastRecoveryResult":"started"`,
 			`"lastRecoveryReason":"stale_frame"`,
 		} {

@@ -279,7 +279,6 @@ func (s *Server) appendStreamRecoveryCommandAsync(reason string) {
 			s.noteStreamAutoRecoveryResult("failed", reason, commandID, err)
 			return
 		}
-		s.recordRuntimeEventAsync("info", "stream_auto_recovery_started", commandID, map[string]any{"reason": reason})
 	}()
 }
 
@@ -346,12 +345,6 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 	}
 	if err == nil && (commandType == "start" || commandType == "keyframe" || commandType == "recover_stream") {
 		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
-		s.recordRuntimeEventForSourceAsync("ticket_remote_service", "info", "stream_command_append_ok", commandID, map[string]any{
-			"commandType": cleanStreamControlText(commandType, "command"),
-			"reason":      cleanStreamControlText(reason, "stream_command"),
-			"backendId":   backend.ID,
-			"ttlMillis":   ttl.Milliseconds(),
-		})
 	}
 	return commandID, err
 }
@@ -368,7 +361,7 @@ func (s *Server) beginStreamAutoRecovery(reason string, now time.Time) bool {
 	}
 	s.lastStreamRecoveryAt = now
 	s.lastStreamRecoveryStage = "queued"
-	s.lastStreamRecoveryAction = "recover_stream_command"
+	s.lastStreamRecoveryAction = "stream_recovery"
 	s.lastStreamRecoveryResult = "started"
 	s.lastStreamRecoveryReason = reason
 	s.lastStreamRecoveryFailure = ""
@@ -396,7 +389,10 @@ func (s *Server) noteStreamAutoRecoveryResult(result string, reason string, comm
 		s.lastStreamRecoveryCommandID = cleanRuntimeCorrelationID(commandID)
 	}
 	s.streamRecoveryMu.Unlock()
-	event := "stream_auto_recovery_" + result
+	event := "stream_failed"
+	if result == "succeeded" {
+		event = "stream_recovered"
+	}
 	if result == "succeeded" {
 		s.recordRuntimeEventAsync("info", event, commandID, map[string]any{"reason": reason})
 	} else if err != nil {
