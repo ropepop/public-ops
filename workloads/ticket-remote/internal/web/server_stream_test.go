@@ -19,6 +19,27 @@ import (
 	"ticketremote/internal/state"
 )
 
+func TestBrowserVideoSocketContextParsesOldPageQuery(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream?page_version=page-1&asset_version=asset-1&visibility=visible&restore_reason=pageshow&recovery_id=recover-1&frame_age_ms=13000&hidden_age_ms=8000&has_frame=1&configured=1&open_seq=7", nil)
+	detail := browserVideoSocketContext(req)
+	for key, want := range map[string]any{
+		"pageVersion":     "page-1",
+		"assetVersion":    "asset-1",
+		"visibility":      "visible",
+		"restoreReason":   "pageshow",
+		"recoveryId":      "recover-1",
+		"frameAgeMillis":  "13000",
+		"hiddenAgeMillis": "8000",
+		"hasFrame":        "1",
+		"configured":      "1",
+		"openSeq":         "7",
+	} {
+		if detail[key] != want {
+			t.Fatalf("%s = %#v, want %#v in %#v", key, detail[key], want, detail)
+		}
+	}
+}
+
 func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 

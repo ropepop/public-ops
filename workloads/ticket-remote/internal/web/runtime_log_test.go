@@ -1,8 +1,11 @@
 package web
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"ticketremote/internal/state"
 )
 
 func TestRuntimeLoggingStaysSpacetimeOnly(t *testing.T) {
@@ -45,5 +48,67 @@ func TestRuntimeLogDetailIsBoundedAndSanitized(t *testing.T) {
 	}
 	if len(value) != 240 {
 		t.Fatalf("sanitized detail length = %d, want 240", len(value))
+	}
+}
+
+func TestPixelTraceEventKeepsRecoveryBoundaryDetail(t *testing.T) {
+	logs := make(chan state.SafeOperationalLogInput, 4)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{logs: logs})
+
+	if !server.handlePixelTraceEvent(map[string]any{
+		"type":                            "ticket_trace_event",
+		"event":                           "stream_client_opened",
+		"level":                           "info",
+		"traceId":                         "trace-1",
+		"streamState":                     "starting",
+		"sessionState":                    "starting",
+		"streamActive":                    true,
+		"captureMode":                     "root_hardware_h264",
+		"videoClients":                    "1",
+		"frameSequence":                   "42",
+		"sentFrames":                      "42",
+		"lastFreshFrameAgeMillis":         "13000",
+		"phoneUptimeMillis":               "123456",
+		"hardwareH264State":               "idle",
+		"hardwareH264Active":              "false",
+		"hardwareH264Available":           "true",
+		"hardwareH264Restarts":            "1",
+		"hardwareH264LastExitReason":      "requested_restart:test",
+		"hardwareH264LastFrameAgeMillis":  "12000",
+		"hardwareH264HelperState":         "ready",
+		"hardwareH264Visibility":          "visible",
+		"lastStreamRecoveryResult":        "started",
+		"lastStreamRecoveryFailureReason": "",
+		"lastStreamRecoveryAgeMillis":     "4000",
+		"streamWatchdogStage":             "recovering",
+		"lastStreamWatchdogAction":        "restart_capture_engine",
+		"lastStreamWatchdogReason":        "watchdog_stale_visible_frame",
+		"lastVideoClientAgeMillis":        "250",
+		"timestampMillis":                 "1783150000000",
+	}) {
+		t.Fatal("pixel trace event was not accepted")
+	}
+
+	log := waitForSafeLog(t, logs, "stream_client_opened")
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(log.DetailJSON), &detail); err != nil {
+		t.Fatalf("decode detail JSON: %v", err)
+	}
+	for key, want := range map[string]any{
+		"lastFreshFrameAgeMillis":        "13000",
+		"hardwareH264State":              "idle",
+		"hardwareH264Restarts":           "1",
+		"hardwareH264LastFrameAgeMillis": "12000",
+		"hardwareH264HelperState":        "ready",
+		"hardwareH264Visibility":         "visible",
+		"lastStreamRecoveryResult":       "started",
+		"lastStreamRecoveryAgeMillis":    "4000",
+		"streamWatchdogStage":            "recovering",
+		"lastStreamWatchdogReason":       "watchdog_stale_visible_frame",
+		"lastVideoClientAgeMillis":       "250",
+	} {
+		if detail[key] != want {
+			t.Fatalf("%s = %#v, want %#v in %#v", key, detail[key], want, detail)
+		}
 	}
 }

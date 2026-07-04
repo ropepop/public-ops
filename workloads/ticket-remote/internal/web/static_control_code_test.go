@@ -238,6 +238,50 @@ func TestTicketViewerClaimsEarlyVideoSocketInsteadOfClosingItAtLoad(t *testing.T
 	}
 }
 
+func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
+	source := ticketAppSource(t)
+	template := ticketIndexTemplate(t)
+	streamURLBody := substringBetween(t, source,
+		"function streamURL(reason) {",
+		"  function setConnected(text) {")
+	connectBody := substringBetween(t, source,
+		"function connectDirectVideo() {",
+		"  function noteVideoSocketOpen(socket, reason) {")
+
+	for _, needle := range []string{
+		"appendStreamURLParam(url, 'page_version', pageVersion);",
+		"appendStreamURLParam(url, 'asset_version', assetVersion);",
+		"appendStreamURLParam(url, 'visibility', document.visibilityState);",
+		"appendStreamURLParam(url, 'restore_reason', videoOpenRestoreReason(reason));",
+		"appendStreamURLParam(url, 'recovery_id', activeVideoRecoveryID());",
+		"appendStreamURLParam(url, 'frame_age_ms', lastFrameAt > 0 ? Math.round(now - lastFrameAt) : '');",
+		"appendStreamURLParam(url, 'has_frame', hasRenderedFrame ? '1' : '0');",
+		"appendStreamURLParam(url, 'configured', configured ? '1' : '0');",
+		"appendStreamURLParam(url, 'open_seq', videoSocketOpenSeq);",
+	} {
+		if !strings.Contains(streamURLBody, needle) {
+			t.Fatalf("stream URL context missing %q", needle)
+		}
+	}
+	if !strings.Contains(connectBody, "videoSocketOpenSeq += 1;") ||
+		!strings.Contains(connectBody, "safeWebSocket(streamURL('connect_direct_video'), 'video')") {
+		t.Fatalf("direct video socket must attach current open context")
+	}
+	for _, needle := range []string{
+		`url.searchParams.set("page_version"`,
+		`url.searchParams.set("asset_version"`,
+		`url.searchParams.set("visibility"`,
+		`url.searchParams.set("restore_reason", "early_video_socket")`,
+		`url.searchParams.set("has_frame", "0")`,
+		`url.searchParams.set("configured", "0")`,
+		`new WebSocket(streamURL())`,
+	} {
+		if !strings.Contains(template, needle) {
+			t.Fatalf("early video socket context missing %q", needle)
+		}
+	}
+}
+
 func TestControlCodeBrowserCaptureAckIsNonBlockingAndTimerless(t *testing.T) {
 	source := controlCodeServerSource(t)
 	handler := substringBetween(t, source,
@@ -1163,7 +1207,7 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });",
 		"logResumeCheckpoint('activation_resume_recovery_decision'",
 		"if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {\n      clientLog('visibility_resume_recovery'",
-		"publishStreamFocus(true, reason || 'visibility_visible');",
+		"publishCurrentStreamFocus(reason || 'visibility_visible');",
 		"restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');",
 		"runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);",
 		"scheduleResumeWatchdogs(reason || 'visibility_visible');",
@@ -1333,7 +1377,7 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 		"setStatus('Atjauno tiešraidi...');",
 		"beginStreamOpenMetric('old_tab_resume'",
 		"connectSpacetimeState().catch",
-		"publishStreamFocus(true, reason || 'idle_resume');",
+		"publishCurrentStreamFocus(reason || 'idle_resume');",
 		"connectDirectVideo();",
 		"requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);",
 		"clientLog('viewer_idle_resumed', reason || 'idle_resume');",
@@ -1386,6 +1430,15 @@ func readTicketWebClientSource(t *testing.T, path string) string {
 func ticketAppCSS(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("static/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func ticketIndexTemplate(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("static/index.html.tmpl")
 	if err != nil {
 		t.Fatal(err)
 	}

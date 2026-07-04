@@ -395,6 +395,7 @@ import { html, reactive } from '@arrow-js/core';
   let activeResumeFlow = null;
   let pendingResumeFreshFrameFlow = null;
   let activationReconnectBurstTimer = null;
+  let videoSocketOpenSeq = 0;
   let lastHiddenWallAt = 0;
   let stableViewport = null;
   let screenEngaged = false;
@@ -556,8 +557,8 @@ import { html, reactive } from '@arrow-js/core';
     scheduleViewerIdleDisconnect(reason || 'idle_resume');
     beginStreamOpenMetric('old_tab_resume', reason || 'idle_resume', true);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
-    publishStreamFocus(true, reason || 'idle_resume');
     connectDirectVideo();
+    publishCurrentStreamFocus(reason || 'idle_resume');
     requestKeyframeDebounced(`${reason || 'idle_resume'}_keyframe`, 0, true);
     requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);
 	    scheduleResumeWatchdogs(reason || 'idle_resume');
@@ -808,8 +809,37 @@ import { html, reactive } from '@arrow-js/core';
 
   document.body.dataset.videoPath = 'https-h264';
 
-  function streamURL() {
-    return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/stream';
+  function appendStreamURLParam(url, key, value) {
+    if (value === null || value === undefined || value === '') return;
+    url.searchParams.set(key, String(value).slice(0, 120));
+  }
+
+  function activeVideoRecoveryID() {
+    if (activeResumeFlow && !activeResumeFlow.done && activeResumeFlow.id) return activeResumeFlow.id;
+    return '';
+  }
+
+  function videoOpenRestoreReason(fallback) {
+    if (activeResumeFlow && !activeResumeFlow.done) return activeResumeFlow.reason || activeResumeFlow.trigger || fallback || 'resume';
+    if (lastHiddenAt > 0 || fallbackFrameAvailable || hasRenderedFrame) return fallback || 'old_page_resume';
+    return fallback || 'cold_open';
+  }
+
+  function streamURL(reason) {
+    const url = new URL('/api/v1/stream', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const now = performance.now();
+    appendStreamURLParam(url, 'page_version', pageVersion);
+    appendStreamURLParam(url, 'asset_version', assetVersion);
+    appendStreamURLParam(url, 'visibility', document.visibilityState);
+    appendStreamURLParam(url, 'restore_reason', videoOpenRestoreReason(reason));
+    appendStreamURLParam(url, 'recovery_id', activeVideoRecoveryID());
+    appendStreamURLParam(url, 'frame_age_ms', lastFrameAt > 0 ? Math.round(now - lastFrameAt) : '');
+    appendStreamURLParam(url, 'hidden_age_ms', lastHiddenAt > 0 ? Math.round(now - lastHiddenAt) : '');
+    appendStreamURLParam(url, 'has_frame', hasRenderedFrame ? '1' : '0');
+    appendStreamURLParam(url, 'configured', configured ? '1' : '0');
+    appendStreamURLParam(url, 'open_seq', videoSocketOpenSeq);
+    return url.toString();
   }
 
   function setConnected(text) {
@@ -1176,6 +1206,22 @@ import { html, reactive } from '@arrow-js/core';
     return videoWs ? videoWs.readyState : -1;
   }
 
+  function videoSocketKeepsStreamActive() {
+    const state = videoSocketState();
+    return state === WebSocket.OPEN || state === WebSocket.CONNECTING;
+  }
+
+  function currentStreamFocusActive() {
+    if (idleDisconnected || streamUnsupported) return false;
+    if (controlCodeKeepsVideoAliveWhileHidden()) return true;
+    if (document.visibilityState === 'hidden') return false;
+    return videoSocketKeepsStreamActive();
+  }
+
+  function publishCurrentStreamFocus(reason) {
+    publishStreamFocus(currentStreamFocusActive(), reason || 'stream_focus_state');
+  }
+
   function beginStreamOpenMetric(kind, reason, force) {
     activeStreamOpenMetric = null;
     return null;
@@ -1285,15 +1331,15 @@ import { html, reactive } from '@arrow-js/core';
 	    }, detail || {});
 	  }
 
-	  function mediaSessionStuckOnPreservedFrame() {
-	    const socketState = videoSocketState();
-	    if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;
-	    if (!hasRenderedFrame && !fallbackFrameAvailable) return false;
+  function mediaSessionStuckOnPreservedFrame() {
+    const socketState = videoSocketState();
+    if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;
+    if (!hasRenderedFrame && !fallbackFrameAvailable) return false;
 	    const freshness = currentRenderedFreshness(performance.now());
 	    if (freshness.liveLabeled) return false;
-	    if (freshness.streamFreshnessState !== 'STALE') return false;
-	    return !configured || !decoderConfigured;
-	  }
+    if (freshness.streamFreshnessState !== 'STALE') return false;
+    return !configured || !decoderConfigured;
+  }
 
 	  function enqueueResumeSafeLog(flow, event, detail) {
 	    if (!flow || flow.done) return;
@@ -1342,6 +1388,21 @@ import { html, reactive } from '@arrow-js/core';
 	    }
 	  }
 
+  function recoverySocketReusable(flow) {
+    if (!flow || !flow.mediaRecoveryStartedAt) return false;
+    if (!videoSocketKeepsStreamActive()) return false;
+    return performance.now() - flow.mediaRecoveryStartedAt < recoveryVideoReconnectDebounceMs;
+  }
+
+  function noteRecoverySocketReuse(reason, kind, flow) {
+    if (!recoverySocketReusable(flow)) return false;
+    logResumeCheckpoint('activation_resume_socket_reused', {
+      reason: safeResumeLabel(reason, 'media_session_recovery'),
+      kind: safeResumeLabel(kind, 'media_session_recovery')
+    }, flow);
+    return true;
+  }
+
 	  function finishActivationResumeFlow(reason, flow) {
 	    const targetFlow = flow || activeResumeFlow;
 	    if (!targetFlow || targetFlow.done) return;
@@ -1388,6 +1449,7 @@ import { html, reactive } from '@arrow-js/core';
 	        startedAt: performance.now(),
 	        deadlineAt: performance.now() + activationReconnectBurstMs,
 	        attempts: 0,
+	        mediaRecoveryStartedAt: 0,
 	        logCount: 0,
 	        limitLogged: false,
 	        done: false,
@@ -1445,7 +1507,7 @@ import { html, reactive } from '@arrow-js/core';
 	      action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover' : (attempt === 0 ? 'keyframe' : 'socket_reconnect')
 	    }, flow);
 	    connectSpacetimeState().catch(() => clientLog('spacetime_reconnect_failed', 'activation_resume'));
-	    publishStreamFocus(true, safeResumeLabel(reason, 'activation'));
+	    publishCurrentStreamFocus(safeResumeLabel(reason, 'activation'));
 	    if (attempt === 0 && !mediaSessionStuckOnPreservedFrame()) {
 	      connectDirectVideo();
 	      requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);
@@ -1468,6 +1530,10 @@ import { html, reactive } from '@arrow-js/core';
       resumeRecoverySoftTimer = null;
       if (idleDisconnected || document.visibilityState !== 'visible') return;
       if (streamHasFreshRenderedFrame()) return;
+      if (noteRecoverySocketReuse(reason || 'resume', 'resume_soft_reconnect', activeResumeFlow)) {
+        requestKeyframeDebounced(`${reason || 'resume'}_soft_reconnect`, 500);
+        return;
+      }
       preserveCurrentFrame('resume_soft_reconnect');
       closeDirectVideo();
       resetStreamState({ preserveFrame: true });
@@ -1510,6 +1576,17 @@ import { html, reactive } from '@arrow-js/core';
 	        action: 'deep_recover'
 	      }, flow);
 	    }
+    if (noteRecoverySocketReuse(recoveryReason, recoveryKind, flow)) {
+      requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);
+      if (options.forceServerRecovery) {
+        requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);
+      }
+      if (options.watchdogs !== false) {
+        scheduleResumeWatchdogs(reason || 'resume');
+      }
+      return true;
+    }
+    if (flow) flow.mediaRecoveryStartedAt = performance.now();
 	    closeEarlyVideo(reason || 'media_session_recovery');
 	    if (hiddenVideoCloseTimer) {
 	      clearTimeout(hiddenVideoCloseTimer);
@@ -1584,7 +1661,7 @@ import { html, reactive } from '@arrow-js/core';
       beginStreamOpenMetric('cold_open', 'connect', false);
     }
     connectSpacetimeState().then(() => {
-      publishStreamFocus(true, 'public_connected');
+      publishCurrentStreamFocus('public_connected');
       setConnected('Savienots');
       if (!streamUnsupported) {
         showStreamWaiting(configured ? 'Gaida tiešraides kadru...' : 'Gaida biļetes straumi...');
@@ -1789,7 +1866,8 @@ import { html, reactive } from '@arrow-js/core';
       visibility: document.visibilityState,
       frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
     }));
-	    const socket = safeWebSocket(streamURL(), 'video');
+    videoSocketOpenSeq += 1;
+	    const socket = safeWebSocket(streamURL('connect_direct_video'), 'video');
 	    if (!socket) {
       clientLog('video_socket_create_failed', 'safe_websocket_unavailable');
 	      showStreamRecovery();
@@ -1822,6 +1900,7 @@ import { html, reactive } from '@arrow-js/core';
     videoWs = socket;
     activeVideoSockets.add(socket);
     socket.binaryType = 'arraybuffer';
+    publishCurrentStreamFocus(reason || 'video_socket_adopted');
     socket.onopen = () => noteVideoSocketOpen(socket, reason || 'video_socket_open');
     socket.onmessage = (event) => {
       if (idleDisconnected || videoWs !== socket) return;
@@ -1833,6 +1912,7 @@ import { html, reactive } from '@arrow-js/core';
     socket.onclose = (event) => {
       activeVideoSockets.delete(socket);
       if (videoWs === socket) videoWs = null;
+      publishCurrentStreamFocus('video_socket_closed');
       if (intentionallyClosedVideoSockets.has(socket)) {
         clientLog('video_socket_closed_intentional', JSON.stringify({
           code: event && event.code,
@@ -4597,7 +4677,7 @@ import { html, reactive } from '@arrow-js/core';
     }
     scheduleFirstScreenPin(false);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
-    publishStreamFocus(true, reason || 'visibility_visible');
+    publishCurrentStreamFocus(reason || 'visibility_visible');
 	    if (longHidden || oldHiddenTab || cacheRestored || connectingTooLong) {
 	      restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');
 	      runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);
@@ -4664,8 +4744,8 @@ import { html, reactive } from '@arrow-js/core';
       resumeFromIdleDisconnect('focus');
       return;
 	    }
-	    publishStreamFocus(true, 'focus');
 	    chaseLiveStream();
+	    publishCurrentStreamFocus('focus');
 	    startActivationResumeFlow('focus', 'focus');
 	  });
 	  window.addEventListener('pagehide', (event) => {
@@ -4697,7 +4777,8 @@ import { html, reactive } from '@arrow-js/core';
   setInterval(() => {
     if (idleDisconnected) return;
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
-      spacetimeClient.heartbeat(true);
+      const active = currentStreamFocusActive();
+      spacetimeClient.heartbeat(active, active ? 'browser_stream_heartbeat' : 'browser_no_stream_heartbeat');
     }
   }, 15000);
   setInterval(chaseLiveStream, 1000);

@@ -56,6 +56,7 @@ class TicketSpacetimeClient {
   private connectionGeneration = 0;
   private manuallyDisconnected = false;
   private lastHeartbeatAt = 0;
+  private lastStreamFocusActive: boolean | null = null;
   private readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void; timer: number }> = [];
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
@@ -130,23 +131,28 @@ class TicketSpacetimeClient {
     this.disconnect(true);
   }
 
-  heartbeat(connected = true): void {
+  heartbeat(connected = true, reason = ""): void {
     if (!this.isReady()) return;
-    const now = Date.now();
-    if (connected && this.lastHeartbeatAt && now - this.lastHeartbeatAt < 30000) return;
-    if (connected) this.lastHeartbeatAt = now;
+    const active = Boolean(connected);
+    if (this.lastStreamFocusActive === active) return;
+    this.lastStreamFocusActive = active;
+    this.lastHeartbeatAt = Date.now();
     const reducer = this.reducer("memberSetStreamFocus");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       sessionId: this.cfg.sessionId,
-      active: connected,
-      reason: connected ? "browser_heartbeat" : "browser_disconnect",
-    })).catch((error) => this.handlers.onStatus?.("heartbeat_failed", error && String(error)));
+      active,
+      reason: reason || (active ? "browser_stream_heartbeat" : "browser_no_stream_heartbeat"),
+    })).catch((error) => {
+      this.lastStreamFocusActive = null;
+      this.handlers.onStatus?.("heartbeat_failed", error && String(error));
+    });
   }
 
   disconnectPresence(): void {
     if (!this.isReady()) return;
+    this.lastStreamFocusActive = false;
     Promise.resolve(this.reducer("memberSetStreamFocus")({
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
@@ -157,12 +163,20 @@ class TicketSpacetimeClient {
   }
 
   setStreamFocus(active: boolean, reason: string): Promise<void> {
+    const nextActive = Boolean(active);
+    if (this.lastStreamFocusActive === nextActive) {
+      return Promise.resolve();
+    }
+    this.lastStreamFocusActive = nextActive;
     return this.callReducer("memberSetStreamFocus", {
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       sessionId: this.cfg.sessionId,
-      active,
+      active: nextActive,
       reason,
+    }).catch((error) => {
+      this.lastStreamFocusActive = null;
+      throw error;
     });
   }
 
@@ -283,7 +297,6 @@ class TicketSpacetimeClient {
           this.attachStateListeners(connection);
         }
         this.publishFocusedState();
-        this.heartbeat(true);
       })
       .subscribe([
         `SELECT * FROM ticketremote_stream_desired_state WHERE ticketId = ${ticket}`,

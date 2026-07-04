@@ -478,6 +478,96 @@ func TestProxyWebsocketRelaysMessages(t *testing.T) {
 	}
 }
 
+func TestProxyWebsocketClosedEventIncludesTransferDetail(t *testing.T) {
+	events := make(chan map[string]any, 16)
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		events <- payload
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer sink.Close()
+
+	upstream := newFakeUpstream(t)
+	defer upstream.Close()
+	b, err := New(Config{
+		UpstreamBaseURL: upstream.URL,
+		TicketGrace:     25 * time.Millisecond,
+		EventSink:       EventSinkConfig{URL: sink.URL, Token: "secret"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/api/v1/session"
+
+	client, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client ws: %v", err)
+	}
+	if err := client.Write(context.Background(), websocket.MessageText, []byte("ping-from-client")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	upstreamConn := upstream.acceptNext(t)
+	defer upstreamConn.Close(websocket.StatusNormalClosure, "test done")
+
+	if _, data, err := upstreamConn.Read(context.Background()); err != nil {
+		t.Fatalf("upstream read: %v", err)
+	} else if string(data) != "ping-from-client" {
+		t.Fatalf("upstream got %q, want ping-from-client", string(data))
+	}
+	if err := upstreamConn.Write(context.Background(), websocket.MessageText, []byte("pong-from-upstream")); err != nil {
+		t.Fatalf("upstream write: %v", err)
+	}
+	if _, data, err := client.Read(context.Background()); err != nil {
+		t.Fatalf("client read: %v", err)
+	} else if string(data) != "pong-from-upstream" {
+		t.Fatalf("client got %q, want pong-from-upstream", string(data))
+	}
+	_ = client.Close(websocket.StatusNormalClosure, "test done")
+
+	event := waitForBrokerEvent(t, events, "upstream_proxy_closed")
+	if event["source"] != "phone_broker" || event["category"] != "broker" {
+		t.Fatalf("event identity = %#v", event)
+	}
+	safeState, ok := event["safeState"].(map[string]any)
+	if !ok {
+		t.Fatalf("safeState missing from event: %#v", event)
+	}
+	if safeState["path"] != "/api/v1/session" {
+		t.Fatalf("path = %#v", safeState["path"])
+	}
+	for _, key := range []string{
+		"durationMillis",
+		"closeSide",
+		"closeStatus",
+		"closeOperation",
+		"clientToUpstreamMessages",
+		"clientToUpstreamBytes",
+		"upstreamToClientMessages",
+		"upstreamToClientBytes",
+	} {
+		if _, ok := safeState[key]; !ok {
+			t.Fatalf("safeState missing %q: %#v", key, safeState)
+		}
+	}
+	if got, _ := safeState["clientToUpstreamMessages"].(float64); got < 1 {
+		t.Fatalf("clientToUpstreamMessages = %#v, want at least 1", safeState["clientToUpstreamMessages"])
+	}
+	if got, _ := safeState["upstreamToClientMessages"].(float64); got < 1 {
+		t.Fatalf("upstreamToClientMessages = %#v, want at least 1", safeState["upstreamToClientMessages"])
+	}
+}
+
 func TestSnapshotJSONRedactionStripsInternalFields(t *testing.T) {
 	upstream := newFakeUpstream(t)
 	defer upstream.Close()
@@ -518,6 +608,21 @@ func getState(t *testing.T, baseURL string) map[string]any {
 		t.Fatalf("state missing: %s", body)
 	}
 	return state
+}
+
+func waitForBrokerEvent(t *testing.T, events <-chan map[string]any, action string) map[string]any {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event["action"] == action {
+				return event
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for broker event %q", action)
+		}
+	}
 }
 
 func postJSON(t *testing.T, url string, body string) *http.Response {

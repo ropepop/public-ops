@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -484,6 +485,7 @@ func (b *Broker) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 func (b *Broker) proxyWebsocket(w http.ResponseWriter, r *http.Request, targetPath string) {
 	b.beginTicketSocket()
 	defer b.endTicketSocket()
+	started := time.Now()
 
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
@@ -508,26 +510,122 @@ func (b *Broker) proxyWebsocket(w http.ResponseWriter, r *http.Request, targetPa
 	upstreamConn.SetReadLimit(websocketProxyReadLimitBytes)
 	defer upstreamConn.Close(websocket.StatusNormalClosure, "broker proxy closed")
 
-	errCh := make(chan error, 2)
-	go func() { errCh <- proxyMessages(r.Context(), upstreamConn, clientConn) }()
-	go func() { errCh <- proxyMessages(r.Context(), clientConn, upstreamConn) }()
+	stats := &proxyTransferStats{}
+	errCh := make(chan proxyTransferResult, 2)
+	go func() {
+		errCh <- proxyMessages(r.Context(), upstreamConn, clientConn, "client_to_upstream", "client", "upstream", stats)
+	}()
+	go func() {
+		errCh <- proxyMessages(r.Context(), clientConn, upstreamConn, "upstream_to_client", "upstream", "client", stats)
+	}()
+	result := proxyTransferResult{Side: "context", Operation: "done", Err: r.Context().Err()}
 	select {
 	case <-r.Context().Done():
-	case <-errCh:
+		result = proxyTransferResult{Side: "context", Operation: "done", Err: r.Context().Err()}
+	case result = <-errCh:
 	}
-	b.emitEvent("broker", "upstream_proxy_closed", "ok", "", "", map[string]any{"path": targetPath})
+	closeState := stats.snapshot()
+	closeState["path"] = targetPath
+	closeState["durationMillis"] = time.Since(started).Milliseconds()
+	closeState["closeSide"] = result.Side
+	closeState["closeOperation"] = result.Operation
+	if result.Direction != "" {
+		closeState["direction"] = result.Direction
+	}
+	if status, code, reason := proxyCloseStatus(result.Err); status != "" {
+		closeState["closeStatus"] = status
+		if code >= 0 {
+			closeState["closeCode"] = code
+		}
+		if reason != "" {
+			closeState["closeReason"] = reason
+		}
+	}
+	b.emitEvent("broker", "upstream_proxy_closed", "ok", "", "", closeState)
 }
 
-func proxyMessages(ctx context.Context, dst *websocket.Conn, src *websocket.Conn) error {
+type proxyTransferResult struct {
+	Direction string
+	Side      string
+	Operation string
+	Err       error
+}
+
+type proxyTransferStats struct {
+	mu                       sync.Mutex
+	clientToUpstreamMessages int64
+	clientToUpstreamBytes    int64
+	upstreamToClientMessages int64
+	upstreamToClientBytes    int64
+}
+
+func (s *proxyTransferStats) add(direction string, byteCount int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch direction {
+	case "client_to_upstream":
+		s.clientToUpstreamMessages++
+		s.clientToUpstreamBytes += int64(byteCount)
+	case "upstream_to_client":
+		s.upstreamToClientMessages++
+		s.upstreamToClientBytes += int64(byteCount)
+	}
+}
+
+func (s *proxyTransferStats) snapshot() map[string]any {
+	if s == nil {
+		return map[string]any{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"clientToUpstreamMessages": s.clientToUpstreamMessages,
+		"clientToUpstreamBytes":    s.clientToUpstreamBytes,
+		"upstreamToClientMessages": s.upstreamToClientMessages,
+		"upstreamToClientBytes":    s.upstreamToClientBytes,
+	}
+}
+
+func proxyMessages(ctx context.Context, dst *websocket.Conn, src *websocket.Conn, direction string, srcSide string, dstSide string, stats *proxyTransferStats) proxyTransferResult {
 	for {
 		typ, data, err := src.Read(ctx)
 		if err != nil {
-			return err
+			return proxyTransferResult{Direction: direction, Side: srcSide, Operation: "read", Err: err}
 		}
 		if err := dst.Write(ctx, typ, data); err != nil {
-			return err
+			return proxyTransferResult{Direction: direction, Side: dstSide, Operation: "write", Err: err}
 		}
+		stats.add(direction, len(data))
 	}
+}
+
+func proxyCloseStatus(err error) (status string, code int, reason string) {
+	if err == nil {
+		return "closed", -1, ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled", -1, ""
+	}
+	code = int(websocket.CloseStatus(err))
+	if code >= 0 {
+		var closeErr websocket.CloseError
+		if errors.As(err, &closeErr) {
+			reason = compactProxyReason(closeErr.Reason)
+		}
+		return "websocket_closed", code, reason
+	}
+	return "error", -1, compactProxyReason(err.Error())
+}
+
+func compactProxyReason(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 160 {
+		value = value[:160]
+	}
+	return value
 }
 
 func (b *Broker) websocketURL(targetPath string) (string, error) {

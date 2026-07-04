@@ -656,8 +656,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function controlCodeKeepsVideoAliveWhileHidden()",
 		"control_code_capture_keepalive",
 		"control_code_wait_reconnect",
-		"publishStreamFocus(true,'public_connected')",
-		"spacetimeClient.heartbeat(true)",
+		"publishCurrentStreamFocus('public_connected')",
+		"spacetimeClient.heartbeat(active,active?'browser_stream_heartbeat':'browser_no_stream_heartbeat')",
 		"window.visualViewport",
 		"clientLog('stream_vertical_scroll', 'allowed')",
 		"canvas.addEventListener('dblclick'",
@@ -1338,8 +1338,8 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"client.requestControlCode(digits)",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"usesDirectSpacetimeAuth()",
-		"publishStreamFocus(true,'public_connected')",
-		"spacetimeClient.heartbeat(true)",
+		"publishCurrentStreamFocus('public_connected')",
+		"spacetimeClient.heartbeat(active,active?'browser_stream_heartbeat':'browser_no_stream_heartbeat')",
 		"let spacetimeClientConnectPromise=null",
 		"if(spacetimeClientConnectPromise)return spacetimeClientConnectPromise",
 		"spacetimeClientConnectPromise=(async()=>",
@@ -1379,7 +1379,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"ticketremote_phone_current_report",
 		"ticketremote_relay_current_report",
 		"ticketremote_control_code_request",
-		"onApplied(()=>{if(!applied){applied=true;this.attachStateListeners(connection);}this.publishFocusedState();this.heartbeat(true);})",
+		"onApplied(()=>{if(!applied){applied=true;this.attachStateListeners(connection);}this.publishFocusedState();})",
 	} {
 		if !staticContains(string(clientBody), snippet) {
 			t.Fatalf("ticket Spacetime browser bundle missing %q", snippet)

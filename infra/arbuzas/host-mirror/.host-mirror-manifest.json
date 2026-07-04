@@ -36,9 +36,9 @@
       "size": 214
     },
     "etc/arbuzas/current/release.env": {
-      "mode": 420,
-      "sha256": "af983f06f12fd2409f7076f3855c01b056789aaf35029f8896eb8005af7ce5ee",
-      "size": 1079
+      "mode": 384,
+      "sha256": "1e632f631a52b6e9b21dc5bab9e5fd7d6a84f08e96468569c41536dd807ab980",
+      "size": 1186
     },
     "etc/arbuzas/env/chatgpt-broker.env": {
       "mode": 420,
@@ -217,5 +217,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1782893348
+  "updatedEpochSeconds": 1783153576
 }
