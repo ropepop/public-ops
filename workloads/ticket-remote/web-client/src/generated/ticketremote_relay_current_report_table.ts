@@ -20,4 +20,5 @@ export default __t.row({
   framesForwarded: __t.string(),
   statusJson: __t.string(),
   updatedAt: __t.string(),
+  lastFrameAt: __t.option(__t.string()),
 });

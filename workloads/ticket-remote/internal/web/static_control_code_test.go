@@ -245,7 +245,7 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 		"function streamURL(reason) {",
 		"  function setConnected(text) {")
 	connectBody := substringBetween(t, source,
-		"function connectDirectVideo() {",
+		"function connectDirectVideo(options) {",
 		"  function noteVideoSocketOpen(socket, reason) {")
 
 	for _, needle := range []string{
@@ -266,6 +266,16 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 	if !strings.Contains(connectBody, "videoSocketOpenSeq += 1;") ||
 		!strings.Contains(connectBody, "safeWebSocket(streamURL('connect_direct_video'), 'video')") {
 		t.Fatalf("direct video socket must attach current open context")
+	}
+	for _, needle := range []string{
+		"options = options || {};",
+		"if (options.skipEarlyGrace)",
+		"clientLog('early_video_connecting_grace_skipped', 'fast_resume');",
+		"closeEarlyVideo('fast_resume');",
+	} {
+		if !strings.Contains(connectBody, needle) {
+			t.Fatalf("fast restored-page video open missing %q", needle)
+		}
 	}
 	for _, needle := range []string{
 		`url.searchParams.set("page_version"`,
@@ -928,15 +938,15 @@ func TestSpacetimeClientReducersWaitForLiveConnection(t *testing.T) {
 	}
 }
 
-func TestControlCodeBridgeUsesFastActiveResultPolling(t *testing.T) {
-	source := ticketRemoteSourceFile(t, "internal", "web", "stream_command_bridge.go")
+func TestControlCodeUsesPixelOwnedSpacetimeCommandFlow(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "internal", "web", "control_code.go")
 	for _, needle := range []string{
-		"controlCodePhoneHealthPollInterval    = 100 * time.Millisecond",
-		"ticker := time.NewTicker(controlCodePhoneHealthPollInterval)",
-		"go s.pollPhoneControlCodeHealthForResult(ctx, requestID, observeBridgeMessage)",
+		"appendStreamCommand(ctx, \"generate_control_code\"",
+		"appendStreamCommand(ctx, \"control_code_browser_capture\"",
+		"appendStreamCommand(ctx, \"control_code_result_ack\"",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("control-code bridge must poll phone result health quickly only while a request is active, missing %q", needle)
+			t.Fatalf("control-code flow must stay Pixel-owned through Spacetime commands, missing %q", needle)
 		}
 	}
 }
@@ -1158,11 +1168,12 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"let activationReconnectBurstTimer = null;",
 		"const backgroundRecoveryHiddenMs = 30000;",
 		"const oldTabFreshResumeHiddenMs = 5000;",
-		"const resumeVideoReconnectDelayMs = 600;",
+		"const resumeVideoReconnectDelayMs = 0;",
 		"const resumeSoftReconnectMs = 1800;",
-		"const resumeHardRecoverMs = 3200;",
+		"const resumeHardRecoverMs = 4500;",
 		"const activationReconnectBurstMs = 10000;",
-		"const activationReconnectTickMs = 1000;",
+		"const activationReconnectFirstRetryMs = 150;",
+		"const activationReconnectTickMs = 500;",
 		"const activationReconnectMaxTicks = 10;",
 		"const activationResumeLogLimit = 32;",
 		"let pendingResumeFreshFrameFlow = null;",
@@ -1211,7 +1222,7 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');",
 		"runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);",
 		"scheduleResumeWatchdogs(reason || 'visibility_visible');",
-		"if (videoStale) {\n      setTimeout(() => {",
+		"if (videoStale) {\n      reconnectVideoForRecovery('visibility_resume_stale');",
 	}
 	for _, needle := range requiredRecoverySnippets {
 		if !strings.Contains(recoveryBody, needle) {
@@ -1252,8 +1263,9 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover'",
 		"requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);",
 		"recoverFreshMediaSession(reason || 'activation', 'activation_resume'",
-		"forceServerRecovery: mediaSessionStuckOnPreservedFrame() || attempt >= 2",
-		"activationReconnectBurstTimer = setTimeout(() => runActivationReconnectBurst(reason, flow), activationReconnectTickMs);",
+		"keyframeMinIntervalMs: 0,",
+		"forceServerRecovery: mediaSessionStuckOnPreservedFrame()",
+		"attempt === 0 ? activationReconnectFirstRetryMs : activationReconnectTickMs",
 	} {
 		if !strings.Contains(burstBody, needle) {
 			t.Fatalf("activation reconnect burst missing %q", needle)
@@ -1268,7 +1280,7 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"resetStreamState({ preserveFrame: true });",
 		"showStreamRecovery();",
 		"beginStreamOpenMetric(kind || 'media_session_recovery', reason || 'resume', true);",
-		"connectDirectVideo();",
+		"connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });",
 		"requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);",
 		"requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);",
 	} {
@@ -1279,8 +1291,10 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 	for _, needle := range []string{
 		"recoverFreshMediaSession(reason || 'cached_resume', kind || 'old_tab_resume'",
 		"keyframeReason: `${reason || 'resume'}_cached_keyframe`,",
+		"keyframeMinIntervalMs: 0,",
 		"serverRecoveryReason: `${reason || 'resume'}_cached_recover`,",
-		"forceServerRecovery: true",
+		"forceServerRecovery: false",
+		"skipEarlyGrace: true",
 	} {
 		if !strings.Contains(restoreBody, needle) {
 			t.Fatalf("cached-tab restore must aggressively request a fresh frame, missing %q", needle)
@@ -1323,7 +1337,7 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 		"function connect() {",
 		"  function resetStreamState(options) {")
 	videoBody := substringBetween(t, source,
-		"function connectDirectVideo() {",
+		"function connectDirectVideo(options) {",
 		"  function sendVideoClientLog(event, detail) {")
 	recoveryBody := substringBetween(t, source,
 		"function recoverAfterVisibilityResume(reason) {",

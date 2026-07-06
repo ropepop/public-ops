@@ -48,7 +48,6 @@ import TicketremoteMemberRequestControlCodeReducer from "./ticketremote_member_r
 import TicketremoteMemberRequestKeyframeReducer from "./ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "./ticketremote_member_set_stream_focus_reducer";
 import TicketremoteMemberUpsertMemberReducer from "./ticketremote_member_upsert_member_reducer";
-import TicketremotePurgeExpiredStreamCommandsReducer from "./ticketremote_purge_expired_stream_commands_reducer";
 import TicketremoteRegisterServiceIdentityReducer from "./ticketremote_register_service_identity_reducer";
 import TicketremoteRemoveMemberReducer from "./ticketremote_remove_member_reducer";
 import TicketremoteServiceBootstrapReducer from "./ticketremote_service_bootstrap_reducer";
@@ -121,24 +120,8 @@ const tablesSchema = __schema({
   ticketremote_phone_current_report: __table({
     name: 'ticketremote_phone_current_report',
     indexes: [
-      { accessor: 'backendId', name: 'ticketremote_phone_current_report_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'backendId',
-      ] },
       { accessor: 'id', name: 'ticketremote_phone_current_report_id_idx_btree', algorithm: 'btree', columns: [
         'id',
-      ] },
-      { accessor: 'streamState', name: 'ticketremote_phone_current_report_stream_state_idx_btree', algorithm: 'btree', columns: [
-        'streamState',
-      ] },
-      { accessor: 'ticketBackend', name: 'ticketremote_phone_current_report_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-        'backendId',
-      ] },
-      { accessor: 'ticketId', name: 'ticketremote_phone_current_report_ticket_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-      ] },
-      { accessor: 'updatedAt', name: 'ticketremote_phone_current_report_updated_at_idx_btree', algorithm: 'btree', columns: [
-        'updatedAt',
       ] },
     ],
     constraints: [
@@ -148,24 +131,8 @@ const tablesSchema = __schema({
   ticketremote_relay_current_report: __table({
     name: 'ticketremote_relay_current_report',
     indexes: [
-      { accessor: 'backendId', name: 'ticketremote_relay_current_report_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'backendId',
-      ] },
       { accessor: 'id', name: 'ticketremote_relay_current_report_id_idx_btree', algorithm: 'btree', columns: [
         'id',
-      ] },
-      { accessor: 'streamVerdict', name: 'ticketremote_relay_current_report_stream_verdict_idx_btree', algorithm: 'btree', columns: [
-        'streamVerdict',
-      ] },
-      { accessor: 'ticketBackend', name: 'ticketremote_relay_current_report_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-        'backendId',
-      ] },
-      { accessor: 'ticketId', name: 'ticketremote_relay_current_report_ticket_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-      ] },
-      { accessor: 'updatedAt', name: 'ticketremote_relay_current_report_updated_at_idx_btree', algorithm: 'btree', columns: [
-        'updatedAt',
       ] },
     ],
     constraints: [
@@ -175,24 +142,8 @@ const tablesSchema = __schema({
   ticketremote_stream_command_signal: __table({
     name: 'ticketremote_stream_command_signal',
     indexes: [
-      { accessor: 'backendId', name: 'ticketremote_stream_command_signal_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'backendId',
-      ] },
       { accessor: 'id', name: 'ticketremote_stream_command_signal_id_idx_btree', algorithm: 'btree', columns: [
         'id',
-      ] },
-      { accessor: 'revision', name: 'ticketremote_stream_command_signal_revision_idx_btree', algorithm: 'btree', columns: [
-        'revision',
-      ] },
-      { accessor: 'ticketBackend', name: 'ticketremote_stream_command_signal_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-        'backendId',
-      ] },
-      { accessor: 'ticketId', name: 'ticketremote_stream_command_signal_ticket_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-      ] },
-      { accessor: 'updatedAt', name: 'ticketremote_stream_command_signal_updated_at_idx_btree', algorithm: 'btree', columns: [
-        'updatedAt',
       ] },
     ],
     constraints: [
@@ -202,24 +153,12 @@ const tablesSchema = __schema({
   ticketremote_stream_desired_state: __table({
     name: 'ticketremote_stream_desired_state',
     indexes: [
-      { accessor: 'backendId', name: 'ticketremote_stream_desired_state_backend_id_idx_btree', algorithm: 'btree', columns: [
-        'backendId',
-      ] },
       { accessor: 'id', name: 'ticketremote_stream_desired_state_id_idx_btree', algorithm: 'btree', columns: [
         'id',
-      ] },
-      { accessor: 'revision', name: 'ticketremote_stream_desired_state_revision_idx_btree', algorithm: 'btree', columns: [
-        'revision',
       ] },
       { accessor: 'ticketBackend', name: 'ticketremote_stream_desired_state_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
         'ticketId',
         'backendId',
-      ] },
-      { accessor: 'ticketId', name: 'ticketremote_stream_desired_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
-        'ticketId',
-      ] },
-      { accessor: 'updatedAt', name: 'ticketremote_stream_desired_state_updated_at_idx_btree', algorithm: 'btree', columns: [
-        'updatedAt',
       ] },
     ],
     constraints: [
@@ -272,7 +211,6 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_request_keyframe", TicketremoteMemberRequestKeyframeReducer),
   __reducerSchema("ticketremote_member_set_stream_focus", TicketremoteMemberSetStreamFocusReducer),
   __reducerSchema("ticketremote_member_upsert_member", TicketremoteMemberUpsertMemberReducer),
-  __reducerSchema("ticketremote_purge_expired_stream_commands", TicketremotePurgeExpiredStreamCommandsReducer),
   __reducerSchema("ticketremote_register_service_identity", TicketremoteRegisterServiceIdentityReducer),
   __reducerSchema("ticketremote_remove_member", TicketremoteRemoveMemberReducer),
   __reducerSchema("ticketremote_service_bootstrap", TicketremoteServiceBootstrapReducer),

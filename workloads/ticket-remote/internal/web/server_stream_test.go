@@ -1060,7 +1060,7 @@ func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
 		t.Fatalf("viewer keyframe = %x", got)
 	}
 	server.handlePhoneMessage(phone.Message{Binary: deltaFrame})
-	if got := readNextBinaryFrame(t, ctx, viewerConn); parseTSF2(got).sequence != 80 || parseTSF2(got).keyFrame {
+	if got := readNextTSF2Sequence(t, ctx, viewerConn, 80); parseTSF2(got).keyFrame {
 		t.Fatalf("viewer delta frame = %x", got)
 	}
 }
@@ -1901,6 +1901,23 @@ func readNextBinaryFrame(t *testing.T, ctx context.Context, conn *websocket.Conn
 		}
 		if typ == websocket.MessageBinary {
 			return data
+		}
+	}
+}
+
+func readNextTSF2Sequence(t *testing.T, ctx context.Context, conn *websocket.Conn, sequence uint64) []byte {
+	t.Helper()
+	for {
+		frame := readNextBinaryFrame(t, ctx, conn)
+		meta := parseTSF2(frame)
+		if !meta.ok {
+			continue
+		}
+		if meta.sequence == sequence {
+			return frame
+		}
+		if meta.sequence > sequence {
+			t.Fatalf("read TSF2 sequence %d before %d", meta.sequence, sequence)
 		}
 	}
 }

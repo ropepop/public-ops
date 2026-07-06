@@ -45,6 +45,18 @@ function rowTicketId(row: any): string {
   return String(row && (row.ticketId || row.ticket_id) || "");
 }
 
+function rowId(row: any): string {
+  return String(row && row.id || "");
+}
+
+function ageMillisFromTimestamp(value: any): number {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const at = Date.parse(text);
+  if (!Number.isFinite(at)) return 0;
+  return Math.max(0, Date.now() - at);
+}
+
 class TicketSpacetimeClient {
   private cfg: TicketClientConfig;
   private handlers: TicketClientHandlers;
@@ -288,6 +300,7 @@ class TicketSpacetimeClient {
 
   private subscribeState(connection: DbConnection): void {
     const ticket = sqlString(this.cfg.ticketId);
+    const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);
     const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
     let applied = false;
     this.subscription = connection.subscriptionBuilder()
@@ -299,9 +312,9 @@ class TicketSpacetimeClient {
         this.publishFocusedState();
       })
       .subscribe([
-        `SELECT * FROM ticketremote_stream_desired_state WHERE ticketId = ${ticket}`,
-        `SELECT * FROM ticketremote_phone_current_report WHERE ticketId = ${ticket}`,
-        `SELECT * FROM ticketremote_relay_current_report WHERE ticketId = ${ticket}`,
+        `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       ]);
   }
@@ -309,12 +322,13 @@ class TicketSpacetimeClient {
   private publishFocusedState(): void {
     if (!this.isReady()) return;
     const db = this.requireConnection().db;
+    const backendRow = `${this.cfg.ticketId}:${this.backendId()}`;
     const desired = tableRows(this.streamDesiredStateTable(db))
-      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
+      .find((row) => rowId(row) === backendRow) || null;
     const phoneReport = tableRows(this.phoneCurrentReportTable(db))
-      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
+      .find((row) => rowId(row) === backendRow) || null;
     const relayReport = tableRows(this.relayCurrentReportTable(db))
-      .find((row) => rowTicketId(row) === this.cfg.ticketId) || null;
+      .find((row) => rowId(row) === backendRow) || null;
     const ownerPublicId = accountPublicId(this.cfg.email);
     const controlCodeRequests = tableRows(this.controlCodeRequestTable(db))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && String(row.ownerPublicId || row.owner_public_id || "") === ownerPublicId)
@@ -368,7 +382,8 @@ class TicketSpacetimeClient {
         backendId: String(relayReport.backendId || relayReport.backend_id || ""),
         videoClients: Number(relayReport.videoClients ?? relayReport.video_clients ?? 0),
         streamVerdict: String(relayReport.streamVerdict || relayReport.stream_verdict || ""),
-        lastFrameAgoMillis: Number(relayReport.lastFrameAgoMillis ?? relayReport.last_frame_ago_millis ?? 0),
+        lastFrameAt: String(relayReport.lastFrameAt || relayReport.last_frame_at || ""),
+        lastFrameAgoMillis: Number(relayReport.lastFrameAgoMillis ?? relayReport.last_frame_ago_millis ?? ageMillisFromTimestamp(relayReport.lastFrameAt || relayReport.last_frame_at)),
         framesForwarded: String(relayReport.framesForwarded || relayReport.frames_forwarded || "0"),
         statusJson: String(relayReport.statusJson || relayReport.status_json || "{}"),
         updatedAt: String(relayReport.updatedAt || relayReport.updated_at || ""),

@@ -77,109 +77,79 @@ pub struct TicketremotePhoneBackend {
 pub struct TicketremoteStreamDesiredState {
     #[primary_key]
     pub id: String,
-    #[index(btree)]
     pub ticketId: String,
-    #[index(btree)]
     pub backendId: String,
     pub desiredActive: bool,
     pub viewerCount: u32,
     pub reason: String,
-    #[index(btree)]
     pub revision: String,
     pub updatedBy: String,
-    #[index(btree)]
     pub updatedAt: String,
 }
 
 #[spacetimedb::table(accessor = ticketremote_stream_command,
     index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt])),
-    index(accessor = ticketBackendExpiresAt, btree(columns = [ticketId, backendId, expiresAt])),
-    index(accessor = ticketBackendStatus, btree(columns = [ticketId, backendId, status])),
-    index(accessor = ticketBackendStatusExpiresAt, btree(columns = [ticketId, backendId, status, expiresAt])),
-    index(accessor = ticketBackendRevision, btree(columns = [ticketId, backendId, revision]))
+    index(accessor = ticketBackendStatus, btree(columns = [ticketId, backendId, status]))
 )]
 #[derive(Clone)]
 pub struct TicketremoteStreamCommand {
     #[primary_key]
     pub id: String,
-    #[index(btree)]
     pub ticketId: String,
-    #[index(btree)]
     pub backendId: String,
-    #[index(btree)]
     pub commandType: String,
     #[index(btree)]
     pub status: String,
-    #[index(btree)]
     pub revision: String,
     pub reason: String,
     pub payloadJson: String,
-    #[index(btree)]
     pub createdAt: String,
-    #[index(btree)]
     pub updatedAt: String,
-    #[index(btree)]
     pub expiresAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_stream_command_signal, public,
-    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
-)]
+#[spacetimedb::table(accessor = ticketremote_stream_command_signal, public)]
 #[derive(Clone)]
 pub struct TicketremoteStreamCommandSignal {
     #[primary_key]
     pub id: String,
-    #[index(btree)]
     pub ticketId: String,
-    #[index(btree)]
     pub backendId: String,
-    #[index(btree)]
     pub revision: String,
     pub pendingCount: u32,
-    #[index(btree)]
     pub updatedAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_phone_current_report, public,
-    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
-)]
+#[spacetimedb::table(accessor = ticketremote_phone_current_report, public)]
 #[derive(Clone)]
 pub struct TicketremotePhoneCurrentReport {
     #[primary_key]
     pub id: String,
-    #[index(btree)]
     pub ticketId: String,
-    #[index(btree)]
     pub backendId: String,
-    #[index(btree)]
     pub streamState: String,
     pub desiredActive: bool,
     pub lastCommandId: String,
     pub lastCommandRevision: String,
     pub statusJson: String,
-    #[index(btree)]
     pub updatedAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_relay_current_report, public,
-    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
-)]
+#[spacetimedb::table(accessor = ticketremote_relay_current_report, public)]
 #[derive(Clone)]
 pub struct TicketremoteRelayCurrentReport {
     #[primary_key]
     pub id: String,
-    #[index(btree)]
     pub ticketId: String,
-    #[index(btree)]
     pub backendId: String,
     pub videoClients: u32,
-    #[index(btree)]
     pub streamVerdict: String,
     pub lastFrameAgoMillis: u32,
     pub framesForwarded: String,
     pub statusJson: String,
-    #[index(btree)]
     pub updatedAt: String,
+    #[default(None::<String>)]
+    pub lastFrameAt: Option<String>,
 }
 
 #[spacetimedb::table(accessor = ticketremote_control_code_request, public,
@@ -969,7 +939,7 @@ pub fn ticketremote_service_bootstrap(
             "{}",
             &now,
         );
-        upsert_relay_current_report(ctx, &ticket.id, &backend_id, 0, "idle", 0, "0", "{}", &now);
+        upsert_relay_current_report(ctx, &ticket.id, &backend_id, 0, "idle", "", "0", "{}", &now);
     }
     let issuer = authIssuer.trim().to_string();
     let audience = authAudience.trim().to_string();
@@ -1193,7 +1163,7 @@ pub fn ticketremote_update_relay_current_report(
     backendId: String,
     videoClients: u32,
     streamVerdict: String,
-    lastFrameAgoMillis: u32,
+    lastFrameAt: String,
     framesForwarded: String,
     statusJson: String,
     nowArg: String,
@@ -1207,7 +1177,7 @@ pub fn ticketremote_update_relay_current_report(
         &backendId,
         videoClients,
         &streamVerdict,
-        lastFrameAgoMillis,
+        &lastFrameAt,
         &framesForwarded,
         &statusJson,
         &now,
@@ -1379,20 +1349,6 @@ pub fn ticketremote_cleanup_expired(
         &now_or(ctx, &nowArg),
         batchSize,
     );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_purge_expired_stream_commands(
-    ctx: &ReducerContext,
-    ticketId: String,
-    nowArg: String,
-    batchSize: u32,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    purge_expired_stream_commands_for_ticket(ctx, &ticket.id, &now, batchSize);
     Ok(())
 }
 
@@ -2060,6 +2016,7 @@ fn upsert_stream_desired_state(
     ctx.db
         .ticketremote_stream_desired_state()
         .insert(row.clone());
+    upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);
     row
 }
 
@@ -2253,7 +2210,7 @@ fn upsert_relay_current_report(
     backend_id: &str,
     video_clients: u32,
     stream_verdict: &str,
-    last_frame_ago_millis: u32,
+    last_frame_at: &str,
     frames_forwarded: &str,
     status_json: &str,
     now: &str,
@@ -2270,15 +2227,17 @@ fn upsert_relay_current_report(
             |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
             "_",
         ),
-        lastFrameAgoMillis: last_frame_ago_millis,
+        lastFrameAgoMillis: 0,
         framesForwarded: non_empty(frames_forwarded, "0"),
         statusJson: safe_json_string(status_json, SAFE_JSON_MAX_BYTES),
         updatedAt: now.into(),
+        lastFrameAt: Some(bounded_text(last_frame_at.trim(), 80)),
     };
     if let Some(existing) = ctx.db.ticketremote_relay_current_report().id().find(&id) {
         if existing.videoClients == row.videoClients
             && existing.streamVerdict == row.streamVerdict
             && existing.lastFrameAgoMillis == row.lastFrameAgoMillis
+            && existing.lastFrameAt == row.lastFrameAt
             && existing.framesForwarded == row.framesForwarded
             && existing.statusJson == row.statusJson
         {

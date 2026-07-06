@@ -15,7 +15,7 @@ export default {
   backendId: __t.string(),
   videoClients: __t.u32(),
   streamVerdict: __t.string(),
-  lastFrameAgoMillis: __t.u32(),
+  lastFrameAt: __t.string(),
   framesForwarded: __t.string(),
   statusJson: __t.string(),
   nowArg: __t.string(),

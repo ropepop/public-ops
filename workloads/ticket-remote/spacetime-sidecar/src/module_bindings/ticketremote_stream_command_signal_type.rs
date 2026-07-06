@@ -49,22 +49,14 @@ impl __sdk::__query_builder::HasCols for TicketremoteStreamCommandSignal {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct TicketremoteStreamCommandSignalIxCols {
-    pub backend_id: __sdk::__query_builder::IxCol<TicketremoteStreamCommandSignal, String>,
     pub id: __sdk::__query_builder::IxCol<TicketremoteStreamCommandSignal, String>,
-    pub revision: __sdk::__query_builder::IxCol<TicketremoteStreamCommandSignal, String>,
-    pub ticket_id: __sdk::__query_builder::IxCol<TicketremoteStreamCommandSignal, String>,
-    pub updated_at: __sdk::__query_builder::IxCol<TicketremoteStreamCommandSignal, String>,
 }
 
 impl __sdk::__query_builder::HasIxCols for TicketremoteStreamCommandSignal {
     type IxCols = TicketremoteStreamCommandSignalIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TicketremoteStreamCommandSignalIxCols {
-            backend_id: __sdk::__query_builder::IxCol::new(table_name, "backend_id"),
             id: __sdk::__query_builder::IxCol::new(table_name, "id"),
-            revision: __sdk::__query_builder::IxCol::new(table_name, "revision"),
-            ticket_id: __sdk::__query_builder::IxCol::new(table_name, "ticket_id"),
-            updated_at: __sdk::__query_builder::IxCol::new(table_name, "updated_at"),
         }
     }
 }

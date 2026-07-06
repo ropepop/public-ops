@@ -16,6 +16,7 @@ pub struct TicketremoteRelayCurrentReport {
     pub frames_forwarded: String,
     pub status_json: String,
     pub updated_at: String,
+    pub last_frame_at: Option<String>,
 }
 
 impl __sdk::InModule for TicketremoteRelayCurrentReport {
@@ -35,6 +36,7 @@ pub struct TicketremoteRelayCurrentReportCols {
     pub frames_forwarded: __sdk::__query_builder::Col<TicketremoteRelayCurrentReport, String>,
     pub status_json: __sdk::__query_builder::Col<TicketremoteRelayCurrentReport, String>,
     pub updated_at: __sdk::__query_builder::Col<TicketremoteRelayCurrentReport, String>,
+    pub last_frame_at: __sdk::__query_builder::Col<TicketremoteRelayCurrentReport, Option<String>>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteRelayCurrentReport {
@@ -53,6 +55,7 @@ impl __sdk::__query_builder::HasCols for TicketremoteRelayCurrentReport {
             frames_forwarded: __sdk::__query_builder::Col::new(table_name, "frames_forwarded"),
             status_json: __sdk::__query_builder::Col::new(table_name, "status_json"),
             updated_at: __sdk::__query_builder::Col::new(table_name, "updated_at"),
+            last_frame_at: __sdk::__query_builder::Col::new(table_name, "last_frame_at"),
         }
     }
 }
@@ -61,22 +64,14 @@ impl __sdk::__query_builder::HasCols for TicketremoteRelayCurrentReport {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct TicketremoteRelayCurrentReportIxCols {
-    pub backend_id: __sdk::__query_builder::IxCol<TicketremoteRelayCurrentReport, String>,
     pub id: __sdk::__query_builder::IxCol<TicketremoteRelayCurrentReport, String>,
-    pub stream_verdict: __sdk::__query_builder::IxCol<TicketremoteRelayCurrentReport, String>,
-    pub ticket_id: __sdk::__query_builder::IxCol<TicketremoteRelayCurrentReport, String>,
-    pub updated_at: __sdk::__query_builder::IxCol<TicketremoteRelayCurrentReport, String>,
 }
 
 impl __sdk::__query_builder::HasIxCols for TicketremoteRelayCurrentReport {
     type IxCols = TicketremoteRelayCurrentReportIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TicketremoteRelayCurrentReportIxCols {
-            backend_id: __sdk::__query_builder::IxCol::new(table_name, "backend_id"),
             id: __sdk::__query_builder::IxCol::new(table_name, "id"),
-            stream_verdict: __sdk::__query_builder::IxCol::new(table_name, "stream_verdict"),
-            ticket_id: __sdk::__query_builder::IxCol::new(table_name, "ticket_id"),
-            updated_at: __sdk::__query_builder::IxCol::new(table_name, "updated_at"),
         }
     }
 }

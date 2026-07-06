@@ -59,6 +59,7 @@ Implemented ticket_remote cutover rule:
 
 - Browser video remains WebSocket-based through `/api/v1/stream`.
 - Opening and closing browser video viewers writes Spacetime desired stream state.
+- Opening an authenticated browser video socket may immediately write a Spacetime `start` command and wake the in-process bridge when the Pixel stream is disconnected or stale. The video socket is only a wake signal; Spacetime remains the durable command source.
 - Prewarm, keyframe, recovery, control-code prepare, control-code generate, capture acknowledgement, result acknowledgement, activity, and control-exit are Spacetime command rows.
 - `ticket_remote` must not use broker `/api/v1/session/start`, `/api/v1/session/stop`, or broker `/api/v1/session` as control authority.
 - `phone_broker` can remain the media proxy until the Pixel sidecar is deployed, but it is not the source of control truth.
@@ -79,6 +80,7 @@ Implemented ticket_remote cutover rule:
 ## Operational targets
 
 - Public `ticket.jolkins.id.lv` load to live ViVi ticket in 5 seconds or less on average.
+- Restored old/cached page video-open to fresh live frame should target 2.7 seconds or less without adding a long Pixel warm standby.
 - Public stream frame delay (visibleFrame / directStream last-frame age) at or below 1500 ms during close-out.
 - Upstream Pixel health (ticket_phone_bridge) green; broker `/api/v1/health?strict=1` returns 200.
 - Ticket lease hold time bounded by configured TTL; expired leases pruned on next snapshot.

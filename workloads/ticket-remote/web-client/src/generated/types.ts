@@ -102,6 +102,7 @@ export const TicketremoteRelayCurrentReport = __t.object("TicketremoteRelayCurre
   framesForwarded: __t.string(),
   statusJson: __t.string(),
   updatedAt: __t.string(),
+  lastFrameAt: __t.option(__t.string()),
 });
 export type TicketremoteRelayCurrentReport = __Infer<typeof TicketremoteRelayCurrentReport>;
 

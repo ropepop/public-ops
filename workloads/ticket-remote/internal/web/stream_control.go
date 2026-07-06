@@ -86,21 +86,32 @@ func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, r
 	for key, value := range s.streamAutoRecoveryStatus(now) {
 		status[key] = value
 	}
-	statusJSON, err := json.Marshal(status)
+	s.noteRelayProductState(status, now, reason)
+	statusJSON, err := json.Marshal(compactRelayCurrentReportStatus(status))
 	if err != nil {
 		return err
 	}
-	s.noteRelayProductState(status, now, reason)
 	return s.store.UpdateRelayCurrentReport(ctx, state.RelayCurrentReportInput{
-		TicketID:           s.cfg.TicketID,
-		BackendID:          backend.ID,
-		VideoClients:       uint32FromAny(status["activeVideoClients"]),
-		StreamVerdict:      cleanStreamControlText(stringFromAny(status["streamVerdict"]), "unknown"),
-		LastFrameAgoMillis: uint32FromAny(status["lastFrameAgoMillis"]),
-		FramesForwarded:    stringFromAny(status["framesForwarded"]),
-		StatusJSON:         string(statusJSON),
-		Now:                now,
+		TicketID:        s.cfg.TicketID,
+		BackendID:       backend.ID,
+		VideoClients:    uint32FromAny(status["activeVideoClients"]),
+		StreamVerdict:   cleanStreamControlText(stringFromAny(status["streamVerdict"]), "unknown"),
+		LastFrameAt:     stringFromAny(status["lastFrameAt"]),
+		FramesForwarded: stringFromAny(status["framesForwarded"]),
+		StatusJSON:      string(statusJSON),
+		Now:             now,
 	})
+}
+
+func compactRelayCurrentReportStatus(status map[string]any) map[string]any {
+	compact := make(map[string]any, len(status))
+	for key, value := range status {
+		if strings.HasSuffix(key, "AgoMillis") {
+			continue
+		}
+		compact[key] = value
+	}
+	return compact
 }
 
 func (s *Server) noteRelayProductState(status map[string]any, now time.Time, reason string) {

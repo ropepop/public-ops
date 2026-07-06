@@ -61,22 +61,14 @@ impl __sdk::__query_builder::HasCols for TicketremotePhoneCurrentReport {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct TicketremotePhoneCurrentReportIxCols {
-    pub backend_id: __sdk::__query_builder::IxCol<TicketremotePhoneCurrentReport, String>,
     pub id: __sdk::__query_builder::IxCol<TicketremotePhoneCurrentReport, String>,
-    pub stream_state: __sdk::__query_builder::IxCol<TicketremotePhoneCurrentReport, String>,
-    pub ticket_id: __sdk::__query_builder::IxCol<TicketremotePhoneCurrentReport, String>,
-    pub updated_at: __sdk::__query_builder::IxCol<TicketremotePhoneCurrentReport, String>,
 }
 
 impl __sdk::__query_builder::HasIxCols for TicketremotePhoneCurrentReport {
     type IxCols = TicketremotePhoneCurrentReportIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TicketremotePhoneCurrentReportIxCols {
-            backend_id: __sdk::__query_builder::IxCol::new(table_name, "backend_id"),
             id: __sdk::__query_builder::IxCol::new(table_name, "id"),
-            stream_state: __sdk::__query_builder::IxCol::new(table_name, "stream_state"),
-            ticket_id: __sdk::__query_builder::IxCol::new(table_name, "ticket_id"),
-            updated_at: __sdk::__query_builder::IxCol::new(table_name, "updated_at"),
         }
     }
 }

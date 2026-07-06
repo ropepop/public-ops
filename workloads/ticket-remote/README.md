@@ -22,7 +22,8 @@ TICKET_REMOTE_AUTH_MODE=dev make run
 - A requester can submit at most two code requests per rolling minute. A second successful request replaces the visible result on that user's page.
 - Other viewers stay connected to the shared raw ticket stream. They may briefly see the real phone open and close ViVi's control-code UI, but they never receive direct control.
 - Browser users connect directly to SpacetimeDB for authenticated ticket state, while code-request actions go through `ticket_remote`.
-- Browser users never talk directly to the Pixel; only this service talks to the phone bridge.
+- Browser users never talk directly to the Pixel; the server writes durable Spacetime state/commands and the Pixel executes them.
+- The Pixel's hot loop polls only the `ticketremote_stream_command_signal` row for its `ticket:backend` every 250 ms. It reads desired state or pending commands only when that signal changes, then writes one compact current report only when the stable state actually changes.
 - The production backend is the physical Pixel through the private `phone_broker`, backed by `ticket_phone_bridge`; the old in-container device path has been removed.
 - Runtime diagnostics are SpacetimeDB-only through safe operational/audit rows with retention cleanup. `ticket_remote`, the phone bridge, and Pixel ticket automation must not leave local runtime log files behind.
 - Public video is H.264 over the existing HTTPS WebSocket: the active phone backend emits one private root FFmpeg H.264 stream, and `ticket_remote` fans it out to authenticated browsers without public media ports.

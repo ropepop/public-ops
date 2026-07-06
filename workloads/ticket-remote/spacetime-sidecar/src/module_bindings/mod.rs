@@ -28,7 +28,6 @@ pub mod ticketremote_member_upsert_member_reducer;
 pub mod ticketremote_phone_backend_type;
 pub mod ticketremote_phone_current_report_table;
 pub mod ticketremote_phone_current_report_type;
-pub mod ticketremote_purge_expired_stream_commands_reducer;
 pub mod ticketremote_register_service_identity_reducer;
 pub mod ticketremote_relay_current_report_table;
 pub mod ticketremote_relay_current_report_type;
@@ -80,7 +79,6 @@ pub use ticketremote_member_upsert_member_reducer::ticketremote_member_upsert_me
 pub use ticketremote_phone_backend_type::TicketremotePhoneBackend;
 pub use ticketremote_phone_current_report_table::*;
 pub use ticketremote_phone_current_report_type::TicketremotePhoneCurrentReport;
-pub use ticketremote_purge_expired_stream_commands_reducer::ticketremote_purge_expired_stream_commands;
 pub use ticketremote_register_service_identity_reducer::ticketremote_register_service_identity;
 pub use ticketremote_relay_current_report_table::*;
 pub use ticketremote_relay_current_report_type::TicketremoteRelayCurrentReport;
@@ -211,11 +209,6 @@ pub enum Reducer {
         email: String,
         role: String,
     },
-    TicketremotePurgeExpiredStreamCommands {
-        ticket_id: String,
-        now_arg: String,
-        batch_size: u32,
-    },
     TicketremoteRegisterServiceIdentity {
         ticket_id: String,
         now: String,
@@ -287,7 +280,7 @@ pub enum Reducer {
         backend_id: String,
         video_clients: u32,
         stream_verdict: String,
-        last_frame_ago_millis: u32,
+        last_frame_at: String,
         frames_forwarded: String,
         status_json: String,
         now_arg: String,
@@ -338,9 +331,6 @@ impl __sdk::Reducer for Reducer {
                 "ticketremote_member_set_stream_focus"
             }
             Reducer::TicketremoteMemberUpsertMember { .. } => "ticketremote_member_upsert_member",
-            Reducer::TicketremotePurgeExpiredStreamCommands { .. } => {
-                "ticketremote_purge_expired_stream_commands"
-            }
             Reducer::TicketremoteRegisterServiceIdentity { .. } => {
                 "ticketremote_register_service_identity"
             }
@@ -538,15 +528,6 @@ impl __sdk::Reducer for Reducer {
                 email: email.clone(),
                 role: role.clone(),
 }),
-            Reducer::TicketremotePurgeExpiredStreamCommands{
-                ticket_id,
-                now_arg,
-                batch_size,
-}             => __sats::bsatn::to_vec(&ticketremote_purge_expired_stream_commands_reducer::TicketremotePurgeExpiredStreamCommandsArgs {
-                ticket_id: ticket_id.clone(),
-                now_arg: now_arg.clone(),
-                batch_size: batch_size.clone(),
-}),
             Reducer::TicketremoteRegisterServiceIdentity{
                 ticket_id,
                 now,
@@ -677,7 +658,7 @@ impl __sdk::Reducer for Reducer {
                 backend_id,
                 video_clients,
                 stream_verdict,
-                last_frame_ago_millis,
+                last_frame_at,
                 frames_forwarded,
                 status_json,
                 now_arg,
@@ -686,7 +667,7 @@ impl __sdk::Reducer for Reducer {
                 backend_id: backend_id.clone(),
                 video_clients: video_clients.clone(),
                 stream_verdict: stream_verdict.clone(),
-                last_frame_ago_millis: last_frame_ago_millis.clone(),
+                last_frame_at: last_frame_at.clone(),
                 frames_forwarded: frames_forwarded.clone(),
                 status_json: status_json.clone(),
                 now_arg: now_arg.clone(),

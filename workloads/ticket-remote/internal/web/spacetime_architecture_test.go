@@ -47,7 +47,6 @@ func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 		"ticketremote_member_append_safe_operational_log",
 		"ticketremote_append_safe_operational_log",
 		"ticketremote_cleanup_expired",
-		"ticketremote_purge_expired_stream_commands",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("SpacetimeDB module missing current product marker %q", required)
@@ -130,9 +129,9 @@ func TestSpacetimeBrowserClientSubscribesOnlyCurrentProductTables(t *testing.T) 
 	source := ticketRemoteSourceFile(t, "web-client", "src", "index.ts")
 
 	for _, required := range []string{
-		"SELECT * FROM ticketremote_stream_desired_state WHERE ticketId =",
-		"SELECT * FROM ticketremote_phone_current_report WHERE ticketId =",
-		"SELECT * FROM ticketremote_relay_current_report WHERE ticketId =",
+		"SELECT * FROM ticketremote_stream_desired_state WHERE id =",
+		"SELECT * FROM ticketremote_phone_current_report WHERE id =",
+		"SELECT * FROM ticketremote_relay_current_report WHERE id =",
 		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 		"AND ownerPublicId =",
 		"memberAppendSafeOperationalLog",
@@ -171,11 +170,9 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"SELECT * FROM ticketremote_service_ticket",
 		"SELECT * FROM ticketremote_service_ticket_member",
 		"SELECT * FROM ticketremote_service_phone_backend",
-		"SELECT * FROM ticketremote_service_stream_command",
-		"SELECT * FROM ticketremote_stream_command_signal WHERE ticketId =",
-		"SELECT * FROM ticketremote_stream_desired_state WHERE ticketId =",
-		"SELECT * FROM ticketremote_phone_current_report WHERE ticketId =",
-		"SELECT * FROM ticketremote_relay_current_report WHERE ticketId =",
+		"SELECT * FROM ticketremote_stream_desired_state WHERE id =",
+		"SELECT * FROM ticketremote_phone_current_report WHERE id =",
+		"SELECT * FROM ticketremote_relay_current_report WHERE id =",
 		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 	} {
 		if !strings.Contains(sidecar, required) {
@@ -186,6 +183,13 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"/logs",
 		"LogsResponse",
 		"safe_operational_logs",
+		"install_command_watchers(ctx, Arc::clone",
+		"\"/commands\"",
+		"\"/signal\"",
+		"SELECT * FROM ticketremote_service_stream_command",
+		"SELECT * FROM ticketremote_stream_command_signal WHERE ticketId =",
+		"ticketremote_purge_expired_stream_commands",
+		"ticketremote_service_stream_command().iter()",
 		"ticketremote_service_safe_operational_log",
 		"ticketremote_service_viewer_presence",
 		"ticketremote_service_control_session",
@@ -213,6 +217,69 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 	} {
 		if !strings.Contains(server+events, required) {
 			t.Fatalf("service event ingestion must remain, missing %q", required)
+		}
+	}
+}
+
+func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	server := ticketRemoteSourceFile(t, "internal", "web", "server.go")
+	browser := ticketRemoteSourceFile(t, "web-client", "src", "index.ts")
+
+	commandChunk := rustItemChunk(t, module, "#[spacetimedb::table(accessor = ticketremote_stream_command,")
+	for _, required := range []string{
+		"index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))",
+		"index(accessor = ticketBackendStatus, btree(columns = [ticketId, backendId, status]))",
+	} {
+		if !strings.Contains(commandChunk, required) {
+			t.Fatalf("stream command table missing retained lookup %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"ticketBackendExpiresAt",
+		"ticketBackendStatusExpiresAt",
+		"ticketBackendRevision",
+	} {
+		if strings.Contains(commandChunk, forbidden) {
+			t.Fatalf("stream command table still has extra hot index marker %q", forbidden)
+		}
+	}
+
+	for _, marker := range []string{
+		"#[spacetimedb::table(accessor = ticketremote_stream_command_signal, public)]",
+		"#[spacetimedb::table(accessor = ticketremote_phone_current_report, public)]",
+		"#[spacetimedb::table(accessor = ticketremote_relay_current_report, public)]",
+	} {
+		if !strings.Contains(module, marker) {
+			t.Fatalf("hot current table should use primary-key shape, missing %q", marker)
+		}
+	}
+	if !strings.Contains(module, "upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);") {
+		t.Fatalf("desired-state changes must wake the Pixel signal row")
+	}
+	if strings.Contains(module, "lastFrameAgoMillis: last_frame_ago_millis") {
+		t.Fatalf("relay current report must not write a constantly changing frame age")
+	}
+	if !strings.Contains(module, "lastFrameAgoMillis: 0") ||
+		!strings.Contains(module, "#[default(None::<String>)]") ||
+		!strings.Contains(module, "pub lastFrameAt: Option<String>") ||
+		!strings.Contains(module, "lastFrameAt: Some(bounded_text(last_frame_at.trim(), 80))") {
+		t.Fatalf("relay current report must store a stable lastFrameAt timestamp")
+	}
+	if _, err := os.Stat("stream_command_bridge.go"); !os.IsNotExist(err) {
+		t.Fatalf("old server-to-phone command bridge file must be deleted, stat error=%v", err)
+	}
+	if strings.Contains(server, "s.startStreamCommandBridge()") {
+		t.Fatalf("server startup must not run the phone command bridge")
+	}
+	for _, required := range []string{
+		"const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);",
+		"SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}",
+		"SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}",
+		"SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}",
+	} {
+		if !strings.Contains(browser, required) {
+			t.Fatalf("browser missing one-row subscription marker %q", required)
 		}
 	}
 }

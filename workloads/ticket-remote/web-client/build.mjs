@@ -48,7 +48,6 @@ const allowedGeneratedFiles = new Set([
   "ticketremote_member_set_stream_focus_reducer.ts",
   "ticketremote_member_upsert_member_reducer.ts",
   "ticketremote_phone_current_report_table.ts",
-  "ticketremote_purge_expired_stream_commands_reducer.ts",
   "ticketremote_register_service_identity_reducer.ts",
   "ticketremote_relay_current_report_table.ts",
   "ticketremote_remove_member_reducer.ts",

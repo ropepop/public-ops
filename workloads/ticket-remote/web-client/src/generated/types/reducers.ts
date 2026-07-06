@@ -20,7 +20,6 @@ import TicketremoteMemberRequestControlCodeReducer from "../ticketremote_member_
 import TicketremoteMemberRequestKeyframeReducer from "../ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_stream_focus_reducer";
 import TicketremoteMemberUpsertMemberReducer from "../ticketremote_member_upsert_member_reducer";
-import TicketremotePurgeExpiredStreamCommandsReducer from "../ticketremote_purge_expired_stream_commands_reducer";
 import TicketremoteRegisterServiceIdentityReducer from "../ticketremote_register_service_identity_reducer";
 import TicketremoteRemoveMemberReducer from "../ticketremote_remove_member_reducer";
 import TicketremoteServiceBootstrapReducer from "../ticketremote_service_bootstrap_reducer";
@@ -45,7 +44,6 @@ export type TicketremoteMemberRequestControlCodeParams = __Infer<typeof Ticketre
 export type TicketremoteMemberRequestKeyframeParams = __Infer<typeof TicketremoteMemberRequestKeyframeReducer>;
 export type TicketremoteMemberSetStreamFocusParams = __Infer<typeof TicketremoteMemberSetStreamFocusReducer>;
 export type TicketremoteMemberUpsertMemberParams = __Infer<typeof TicketremoteMemberUpsertMemberReducer>;
-export type TicketremotePurgeExpiredStreamCommandsParams = __Infer<typeof TicketremotePurgeExpiredStreamCommandsReducer>;
 export type TicketremoteRegisterServiceIdentityParams = __Infer<typeof TicketremoteRegisterServiceIdentityReducer>;
 export type TicketremoteRemoveMemberParams = __Infer<typeof TicketremoteRemoveMemberReducer>;
 export type TicketremoteServiceBootstrapParams = __Infer<typeof TicketremoteServiceBootstrapReducer>;

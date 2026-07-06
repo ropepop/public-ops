@@ -620,7 +620,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"function findStartCode(data,from)",
 		"function configureDecoder(config, options)",
 		"sendVideoClientLog('h264_decoder_recovery_avc_adapter', reason)",
-		"function connectDirectVideo()",
+		"function connectDirectVideo(options)",
 		"function switchToAvcAdapter(reason)",
 		"intentionallyClosedVideoSockets",
 		"activeVideoSockets",
