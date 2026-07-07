@@ -143,6 +143,55 @@ func TestAdminPhoneBackendsListsHealth(t *testing.T) {
 	}
 }
 
+func TestAdminStateIncludesFreshActivePhoneHealth(t *testing.T) {
+	activeHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/upstream/health" {
+			_, _ = w.Write([]byte(`{"serverVersion":"ticket-stream-test","latestTicketReselect":{"status":"succeeded","phase":"ready","proofSource":"self_proof_root_hardware_h264","freshFrameAgoMillis":42}}`))
+			return
+		}
+		if r.URL.Path == "/api/v1/health" {
+			_, _ = w.Write([]byte(`{"ok":true,"upstream":{"ok":true}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer activeHealth.Close()
+	pixelHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer pixelHealth.Close()
+
+	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
+	store := state.NewMemoryStore()
+	handler, _ := newBackendSwitchServer(t, store, activeFile, activeHealth.URL, pixelHealth.URL)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/state", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin state status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		OK    bool           `json:"ok"`
+		State state.Snapshot `json:"state"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.OK || payload.State.Phone == nil {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if !strings.Contains(payload.State.Phone.HealthJSON, `"latestTicketReselect"`) ||
+		!strings.Contains(payload.State.Phone.HealthJSON, `"self_proof_root_hardware_h264"`) {
+		t.Fatalf("admin state phone health = %s", payload.State.Phone.HealthJSON)
+	}
+}
+
 func TestAdminTicketReselectLatestQueuesForceCommand(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
 	memory := state.NewMemoryStore()

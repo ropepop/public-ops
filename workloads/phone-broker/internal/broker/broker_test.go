@@ -355,6 +355,44 @@ func TestHealthExposesUpstreamControlCodeRequest(t *testing.T) {
 	}
 }
 
+func TestUpstreamHealthEndpointReturnsRawUpstreamHealth(t *testing.T) {
+	upstream := newFakeUpstream(t)
+	defer upstream.Close()
+	b, err := New(Config{UpstreamBaseURL: upstream.URL, TicketGrace: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
+
+	upstream.setControlCodeRequest(map[string]any{
+		"requestId": "req-raw",
+		"status":    "succeeded",
+		"reason":    "generated",
+		"value":     "22222",
+	})
+	resp, err := http.Get(server.URL + "/api/v1/upstream/health")
+	if err != nil {
+		t.Fatalf("get upstream health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, readBody(t, resp))
+	}
+	body := readBody(t, resp)
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode upstream health: %v body=%s", err, body)
+	}
+	ctrl, ok := payload["controlCodeRequest"].(map[string]any)
+	if !ok {
+		t.Fatalf("controlCodeRequest missing from upstream health: %s", body)
+	}
+	if ctrl["requestId"] != "req-raw" {
+		t.Fatalf("controlCodeRequest.requestId = %#v", ctrl["requestId"])
+	}
+}
+
 func TestHealthReportsUpstreamErrorWhenDown(t *testing.T) {
 	b, err := New(Config{UpstreamBaseURL: "http://127.0.0.1:1", TicketGrace: 10 * time.Millisecond})
 	if err != nil {

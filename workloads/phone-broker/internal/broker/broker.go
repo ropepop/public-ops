@@ -23,6 +23,7 @@ const (
 	defaultTicketGrace = 10 * time.Second
 
 	healthUpstreamProbeTimeout   = time.Second
+	upstreamHealthReadLimitBytes = 256 * 1024
 	websocketProxyReadLimitBytes = 8 << 20
 
 	defaultTicketLeaseTTL = 45 * time.Second
@@ -139,6 +140,7 @@ func (b *Broker) Run(ctx context.Context) {
 func (b *Broker) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/health", b.handleHealth)
+	mux.HandleFunc("/api/v1/upstream/health", b.handleUpstreamHealth)
 	mux.HandleFunc("/api/v1/state", b.handleState)
 	mux.HandleFunc("/api/v1/ticket/presence", b.handleTicketPresence)
 	mux.HandleFunc("/api/v1/phone/leases/ticket", b.handleTicketLease)
@@ -344,6 +346,25 @@ func (b *Broker) handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, response)
+}
+
+func (b *Broker) handleUpstreamHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	setReleaseHeaders(w)
+	probeCtx, cancel := context.WithTimeout(r.Context(), healthUpstreamProbeTimeout)
+	defer cancel()
+	raw, err := b.fetchUpstreamHealthRaw(probeCtx)
+	if err != nil {
+		b.noteUpstreamHealth(false, err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	b.noteUpstreamHealth(true, nil)
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(raw)
 }
 
 func (b *Broker) handleState(w http.ResponseWriter, r *http.Request) {
@@ -660,23 +681,37 @@ type upstreamHealth struct {
 
 func (b *Broker) fetchUpstreamHealth(ctx context.Context) (upstreamHealth, error) {
 	var health upstreamHealth
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.UpstreamBaseURL+"/api/v1/health", nil)
+	raw, err := b.fetchUpstreamHealthRaw(ctx)
 	if err != nil {
 		return health, err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return health, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return health, fmt.Errorf("upstream health status %d", resp.StatusCode)
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+	if err := json.Unmarshal(raw, &health); err != nil {
 		return health, err
 	}
 	return health, nil
+}
+
+func (b *Broker) fetchUpstreamHealthRaw(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.UpstreamBaseURL+"/api/v1/health", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, upstreamHealthReadLimitBytes))
+	if readErr != nil {
+		return nil, readErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream health status %d", resp.StatusCode)
+	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("upstream health returned invalid JSON")
+	}
+	return body, nil
 }
 
 func normalizeTicketLeaseTTL(ttl time.Duration) time.Duration {
