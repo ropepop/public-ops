@@ -14,6 +14,8 @@ type TicketClientHandlers = {
   onStatus?: (status: string, detail?: string) => void;
 };
 
+const STREAM_FOCUS_REFRESH_MS = 30000;
+
 function pickAccessor<T = any>(source: any, candidates: string[]): T {
   for (const candidate of candidates) {
     if (candidate && source && candidate in source) {
@@ -45,8 +47,36 @@ function rowTicketId(row: any): string {
   return String(row && (row.ticketId || row.ticket_id) || "");
 }
 
+function rowBackendId(row: any): string {
+  return String(row && (row.backendId || row.backend_id) || "");
+}
+
 function rowId(row: any): string {
   return String(row && row.id || "");
+}
+
+function rowTime(row: any, field: string, snakeField: string): number {
+  const value = String(row && (row[field] || row[snakeField]) || "").trim();
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function activeViewerFocusRows(rows: any[], ticketId: string, backendId: string): any[] {
+  const now = Date.now();
+  return rows
+    .filter((row) => rowTicketId(row) === ticketId && rowBackendId(row) === backendId)
+    .filter((row) => (row.active ?? true) !== false)
+    .filter((row) => String(row.publicId || row.public_id || "").trim())
+    .filter((row) => {
+      const expiresAt = rowTime(row, "expiresAt", "expires_at");
+      return !expiresAt || expiresAt > now;
+    })
+    .sort((left, right) => {
+      const publicSort = String(left.publicId || left.public_id || "").localeCompare(String(right.publicId || right.public_id || ""));
+      if (publicSort) return publicSort;
+      return rowId(left).localeCompare(rowId(right));
+    });
 }
 
 function ageMillisFromTimestamp(value: any): number {
@@ -69,6 +99,7 @@ class TicketSpacetimeClient {
   private manuallyDisconnected = false;
   private lastHeartbeatAt = 0;
   private lastStreamFocusActive: boolean | null = null;
+  private viewerPresenceExpiryTimer = 0;
   private readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void; timer: number }> = [];
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
@@ -131,6 +162,7 @@ class TicketSpacetimeClient {
       try { this.subscription.unsubscribe(); } catch (_) {}
       this.subscription = null;
     }
+    this.clearViewerPresenceExpiryTimer();
     if (this.conn) {
       try { this.conn.disconnect(); } catch (_) {}
       this.conn = null;
@@ -146,9 +178,12 @@ class TicketSpacetimeClient {
   heartbeat(connected = true, reason = ""): void {
     if (!this.isReady()) return;
     const active = Boolean(connected);
-    if (this.lastStreamFocusActive === active) return;
+    const now = Date.now();
+    if (this.lastStreamFocusActive === active) {
+      if (!active || now - this.lastHeartbeatAt < STREAM_FOCUS_REFRESH_MS) return;
+    }
     this.lastStreamFocusActive = active;
-    this.lastHeartbeatAt = Date.now();
+    this.lastHeartbeatAt = now;
     const reducer = this.reducer("memberSetStreamFocus");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
@@ -216,12 +251,13 @@ class TicketSpacetimeClient {
     });
   }
 
-  requestControlCode(digits: string): Promise<void> {
+  requestControlCode(digits: string, expectedFastRevision = ""): Promise<void> {
     return this.callReducer("memberRequestControlCode", {
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       sessionId: this.cfg.sessionId,
       digits,
+      expectedFastRevision,
     });
   }
 
@@ -301,6 +337,7 @@ class TicketSpacetimeClient {
   private subscribeState(connection: DbConnection): void {
     const ticket = sqlString(this.cfg.ticketId);
     const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);
+    const backendId = sqlString(this.backendId());
     const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
     let applied = false;
     this.subscription = connection.subscriptionBuilder()
@@ -314,7 +351,9 @@ class TicketSpacetimeClient {
       .subscribe([
         `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_control_code_fast_state WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       ]);
   }
@@ -327,8 +366,26 @@ class TicketSpacetimeClient {
       .find((row) => rowId(row) === backendRow) || null;
     const phoneReport = tableRows(this.phoneCurrentReportTable(db))
       .find((row) => rowId(row) === backendRow) || null;
+    const controlCodeFastState = tableRows(this.controlCodeFastStateTable(db))
+      .find((row) => rowId(row) === backendRow) || null;
     const relayReport = tableRows(this.relayCurrentReportTable(db))
       .find((row) => rowId(row) === backendRow) || null;
+    const viewerFocusRows = activeViewerFocusRows(
+      tableRows(this.streamViewerFocusTable(db)),
+      this.cfg.ticketId,
+      this.backendId()
+    );
+    this.scheduleViewerPresenceExpiry(viewerFocusRows);
+    const viewerPresence = viewerFocusRows.map((row) => {
+      const publicId = String(row.publicId || row.public_id || "").trim();
+      return {
+        publicId,
+        label: publicId,
+        connected: true,
+        lastSeenAt: String(row.lastSeenAt || row.last_seen_at || ""),
+        expiresAt: String(row.expiresAt || row.expires_at || ""),
+      };
+    });
     const ownerPublicId = accountPublicId(this.cfg.email);
     const controlCodeRequests = tableRows(this.controlCodeRequestTable(db))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && String(row.ownerPublicId || row.owner_public_id || "") === ownerPublicId)
@@ -345,7 +402,8 @@ class TicketSpacetimeClient {
     );
     const phoneDesiredState = String(desired && (desired.desiredActive ?? desired.desired_active) ? "streaming" : "idle");
     const phoneLastSeenAt = String(phoneReport && (phoneReport.updatedAt || phoneReport.updated_at) || "");
-    const viewerCount = Number(desired && (desired.viewerCount ?? desired.viewer_count) || relayReport && (relayReport.videoClients ?? relayReport.video_clients) || 0);
+    const reportedViewerCount = Number(desired && (desired.viewerCount ?? desired.viewer_count) || relayReport && (relayReport.videoClients ?? relayReport.video_clients) || 0);
+    const viewerCount = Math.max(Number.isFinite(reportedViewerCount) ? reportedViewerCount : 0, viewerPresence.length);
     this.handlers.onState?.({
       ticket: {
         id: this.cfg.ticketId,
@@ -353,7 +411,7 @@ class TicketSpacetimeClient {
         updatedAt,
       },
       viewerCount,
-      viewerPresence: [],
+      viewerPresence,
       activeControl: null,
       phone: phoneBackendId ? {
         id: phoneBackendId,
@@ -377,6 +435,20 @@ class TicketSpacetimeClient {
         lastCommandRevision: String(phoneReport.lastCommandRevision || phoneReport.last_command_revision || ""),
         statusJson: String(phoneReport.statusJson || phoneReport.status_json || "{}"),
         updatedAt: String(phoneReport.updatedAt || phoneReport.updated_at || ""),
+      } : null,
+      controlCodeFastState: controlCodeFastState ? {
+        backendId: String(controlCodeFastState.backendId || controlCodeFastState.backend_id || ""),
+        status: String(controlCodeFastState.status || ""),
+        revision: String(controlCodeFastState.revision || ""),
+        reason: String(controlCodeFastState.reason || ""),
+        preparedAt: String(controlCodeFastState.preparedAt || controlCodeFastState.prepared_at || ""),
+        expiresAt: String(controlCodeFastState.expiresAt || controlCodeFastState.expires_at || ""),
+        streamEpoch: String(controlCodeFastState.streamEpoch || controlCodeFastState.stream_epoch || "0"),
+        frameSequence: String(controlCodeFastState.frameSequence || controlCodeFastState.frame_sequence || "0"),
+        rawTicketConfirmed: controlCodeFastState.rawTicketConfirmed ?? controlCodeFastState.raw_ticket_confirmed === true,
+        cleanupClear: controlCodeFastState.cleanupClear ?? controlCodeFastState.cleanup_clear === true,
+        streamLive: controlCodeFastState.streamLive ?? controlCodeFastState.stream_live === true,
+        updatedAt: String(controlCodeFastState.updatedAt || controlCodeFastState.updated_at || ""),
       } : null,
       relayCurrentReport: relayReport ? {
         backendId: String(relayReport.backendId || relayReport.backend_id || ""),
@@ -420,7 +492,9 @@ class TicketSpacetimeClient {
     return [
       this.streamDesiredStateTable(source),
       this.phoneCurrentReportTable(source),
+      this.controlCodeFastStateTable(source),
       this.relayCurrentReportTable(source),
+      this.streamViewerFocusTable(source),
       this.controlCodeRequestTable(source),
     ];
   }
@@ -441,11 +515,27 @@ class TicketSpacetimeClient {
     ]);
   }
 
+  private controlCodeFastStateTable(source: any): any {
+    return pickAccessor(source, [
+      "ticketremoteControlCodeFastState",
+      "ticketRemoteControlCodeFastState",
+      "ticketremote_control_code_fast_state",
+    ]);
+  }
+
   private relayCurrentReportTable(source: any): any {
     return pickAccessor(source, [
       "ticketremoteRelayCurrentReport",
       "ticketRemoteRelayCurrentReport",
       "ticketremote_relay_current_report",
+    ]);
+  }
+
+  private streamViewerFocusTable(source: any): any {
+    return pickAccessor(source, [
+      "ticketremoteStreamViewerFocus",
+      "ticketRemoteStreamViewerFocus",
+      "ticketremote_stream_viewer_focus",
     ]);
   }
 
@@ -492,6 +582,29 @@ class TicketSpacetimeClient {
 
   private isReady(): boolean {
     return Boolean(this.conn && this.connected);
+  }
+
+  private scheduleViewerPresenceExpiry(rows: any[]): void {
+    this.clearViewerPresenceExpiryTimer();
+    let nearest = 0;
+    for (const row of rows) {
+      const expiresAt = rowTime(row, "expiresAt", "expires_at");
+      if (expiresAt > Date.now() && (!nearest || expiresAt < nearest)) {
+        nearest = expiresAt;
+      }
+    }
+    if (!nearest) return;
+    const delayMs = Math.max(250, nearest - Date.now() + 250);
+    this.viewerPresenceExpiryTimer = window.setTimeout(() => {
+      this.viewerPresenceExpiryTimer = 0;
+      this.publishFocusedState();
+    }, delayMs);
+  }
+
+  private clearViewerPresenceExpiryTimer(): void {
+    if (!this.viewerPresenceExpiryTimer) return;
+    window.clearTimeout(this.viewerPresenceExpiryTimer);
+    this.viewerPresenceExpiryTimer = 0;
   }
 
   private whenReady(timeoutMs: number): Promise<void> {

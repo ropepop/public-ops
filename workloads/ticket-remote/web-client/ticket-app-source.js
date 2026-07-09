@@ -22,7 +22,7 @@ import { html, reactive } from '@arrow-js/core';
   const sampledClientLogState = new Map();
   const sampledClientLogEvents = new Set(['control_code_capture_keepalive', 'stream_command_dispatched']);
   const sampledClientLogIntervalMs = 60000;
-  const controlCodeAutoPrepareMinIntervalMs = 45000;
+  const controlCodeAutoPrepareMinIntervalMs = 5000;
   let spacetimeClient = null;
 
   function enqueueClientLog(entry) {
@@ -295,7 +295,7 @@ import { html, reactive } from '@arrow-js/core';
   if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot || !controlCodeCloseHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
-  const presenceState = reactive({ viewers: [], visibleViewerCount: 0 });
+  const presenceState = reactive({ viewers: [], visibleViewerCount: 0, identifiersPending: false });
   let presenceMounted = false;
 
   let videoWs = null;
@@ -359,6 +359,7 @@ import { html, reactive } from '@arrow-js/core';
   let latestStreamStatus = null;
   let lastStreamStatusAt = 0;
   let codeRequest = null;
+  let controlCodeFastState = null;
   let pendingFrameMetadata = [];
   let controlCodeResultCaptureTimer = null;
   let controlCodeResultCaptureRequestID = '';
@@ -370,6 +371,10 @@ import { html, reactive } from '@arrow-js/core';
   let lastControlCodeCaptureDebug = null;
   let lastControlCodeCaptureKeyframeRequestAt = 0;
   let lastControlCodeCaptureKeyframeRetryCount = 0;
+  let controlCodeResultCaptureStartedAt = 0;
+  let lastControlCodeMarkerReceivedLogKey = '';
+  let lastControlCodeMarkerWaitingLogKey = '';
+  let lastControlCodeCandidateRejectedLogKey = '';
   let controlCodeSafeGeneratedFrameRequestID = '';
   let controlCodeSafeGeneratedFrameEpoch = 0;
   let controlCodeSafeGeneratedFrameSequence = 0;
@@ -380,6 +385,7 @@ import { html, reactive } from '@arrow-js/core';
   let controlCodePreparedCaptureDisplayedRequestID = '';
   let controlCodeAutoPrepareInFlight = false;
   let lastControlCodeAutoPrepareAt = 0;
+  let controlCodeFastStateExpiryTimer = null;
   const localSessionID = String(cfg.sessionId || '').trim();
   const localPublicID = accountPublicId(cfg.email || '');
   const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);
@@ -446,6 +452,7 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
   const controlCodeCapturePollMs = 100;
+  const controlCodeResultInitialKeyframeDelayMs = 1200;
   const controlCodeCaptureKeyframeRetryMs = 5000;
   const controlCodeCaptureKeyframeRetryLimit = 2;
   const controlCodeGeneratedChipScanStartY = 0.50;
@@ -895,6 +902,8 @@ import { html, reactive } from '@arrow-js/core';
     ['waiting_for_stream_recovery', 'Tiešraide atjaunojas pirms koda pieprasījuma.'],
     ['control_code_recovery_queue_timeout', 'Tālrunis nepaguva atjaunot biļeti. Mēģini vēlreiz.'],
     ['control_code_stream_unstable', 'Tiešraide nav pietiekami stabila koda pieprasījumam.'],
+    ['fast_not_ready', 'Tālrunis vēl sagatavo ātro koda ceļu. Mēģini vēlreiz pēc mirkļa.'],
+    ['fast_state_stale', 'Tālrunis vēl atjauno gatavību kodam. Mēģini vēlreiz pēc mirkļa.'],
     ['extension_disabled', 'Pagarināšana ir izslēgta']
   ]);
 
@@ -1986,7 +1995,17 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function sendVideoSocketClientLog(event, detail) {
-    clientLog(event, safeString(detail).slice(0, 500));
+    const safeDetail = safeString(detail).slice(0, 500);
+    if (videoWs && videoWs.readyState === WebSocket.OPEN) {
+      try {
+        videoWs.send(JSON.stringify({
+          type: 'client_log',
+          event: String(event || 'client_log').slice(0, 96),
+          detail: safeDetail
+        }));
+      } catch (_) {}
+    }
+    clientLog(event, safeDetail);
   }
 
   function requestKeyframe(reason, force) {
@@ -2669,7 +2688,7 @@ import { html, reactive } from '@arrow-js/core';
     case 'closed':
       return 'Kods aizvērts';
     default:
-      return 'Gatavs';
+      return controlCodeFastStateFresh() ? 'Gatavs' : 'Gatavojas';
     }
   }
 
@@ -2681,7 +2700,9 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeDetailText(request) {
-    if (!request) return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
+    if (!request) return controlCodeFastStateFresh()
+      ? 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.'
+      : controlCodeReadinessMessage();
     if (request.status === 'queued') {
       const position = Number(request.queuePosition || 0);
       if (position > 1) return `Rindā: ${position}. vieta`;
@@ -2691,7 +2712,9 @@ import { html, reactive } from '@arrow-js/core';
     if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
     if (request.status === 'failed') return localizePublicMessage(request.reason || request.message || 'Kodu neizdevās izveidot');
     if (request.status === 'expired' || request.status === 'closed') return 'Vari pieprasīt jaunu kodu.';
-    return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
+    return controlCodeFastStateFresh()
+      ? 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.'
+      : controlCodeReadinessMessage();
   }
 
   function scheduleControlCodeTicker(request) {
@@ -2742,6 +2765,10 @@ import { html, reactive } from '@arrow-js/core';
     controlCodeResultCaptureRequestID = '';
     controlCodeResultCapturedRequestID = '';
     controlCodeCaptureAckInFlightRequestID = '';
+    controlCodeResultCaptureStartedAt = 0;
+    lastControlCodeMarkerReceivedLogKey = '';
+    lastControlCodeMarkerWaitingLogKey = '';
+    lastControlCodeCandidateRejectedLogKey = '';
     pendingControlCodeBaselineFrameFingerprint = null;
     controlCodeBaselineFrameFingerprint = null;
     controlCodeBaselineRequestID = '';
@@ -3169,6 +3196,21 @@ import { html, reactive } from '@arrow-js/core';
     return Math.max(0, Math.round(Date.now() + serverClockSkewMs - parsed));
   }
 
+  function controlCodeCaptureTrace(event, request, proof, detail) {
+    const requestID = String((proof && proof.requestId) || (request && request.requestId) || '').trim();
+    const payload = Object.assign({
+      requestKey: requestID ? accountPublicId(requestID) : '',
+      status: String(request && request.status || ''),
+      markerEpoch: Number((proof && proof.markerEpoch) || (request && (request.resultFrameEpoch || request.streamEpoch)) || 0),
+      markerSequence: Number((proof && proof.markerSequence) || (request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence)) || 0),
+      candidateFrameEpoch: Number(proof && proof.candidateFrameEpoch || controlCodeRenderedFrameEpoch() || 0),
+      candidateFrameSequence: Number(proof && proof.candidateFrameSequence || controlCodeRenderedFrameSequence() || 0),
+      safeGeneratedFrameCount: Number(proof && proof.safeGeneratedFrameCount || controlCodeSafeGeneratedFrameCount || 0),
+      keyframeRetryCount: Number(lastControlCodeCaptureKeyframeRetryCount || 0)
+    }, detail || {});
+    clientLog(event, JSON.stringify(payload));
+  }
+
   function controlCodeTrustedPhonePostSubmitProof(resultProof) {
     resultProof = String(resultProof || '').trim();
     return resultProof === 'phone_visual_root_confirmed' ||
@@ -3420,6 +3462,14 @@ import { html, reactive } from '@arrow-js/core';
       ? 'candidate_frame_at_or_after_phone_marker_and_generated_visual'
       : 'browser_prepared_generated_frame_before_marker';
     proof.provisional = allowProvisional && (!markerEpoch || !markerSequence || request.status !== 'succeeded');
+    controlCodeCaptureTrace('control_code_frame_frozen', request, proof, {
+      acceptedReason: proof.acceptedReason,
+      provisional: Boolean(proof.provisional)
+    });
+    controlCodeCaptureTrace('control_code_candidate_accepted', request, proof, {
+      acceptedReason: proof.acceptedReason,
+      provisional: Boolean(proof.provisional)
+    });
     return proof;
   }
 
@@ -3463,6 +3513,10 @@ import { html, reactive } from '@arrow-js/core';
         safeGeneratedFrameCount: controlCodeSafeGeneratedFrameCount,
         fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
         fingerprintChangedCells: proof.fingerprintChangedCells,
+        provisional: Boolean(proof.provisional)
+      });
+      controlCodeCaptureTrace('control_code_frame_displayed', { requestId: requestID, status: 'succeeded' }, proof, {
+        outcome: outcome || 'browser_capture_displayed',
         provisional: Boolean(proof.provisional)
       });
     }
@@ -3537,6 +3591,20 @@ import { html, reactive } from '@arrow-js/core';
       candidateRejectedReason: 'marker_waiting',
       keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
     };
+    const logKey = [
+      requestID,
+      markerEpoch,
+      markerSequence,
+      lastControlCodeCaptureDebug.candidateFrameEpoch,
+      lastControlCodeCaptureDebug.candidateFrameSequence
+    ].join(':');
+    if (logKey !== lastControlCodeMarkerWaitingLogKey) {
+      lastControlCodeMarkerWaitingLogKey = logKey;
+      controlCodeCaptureTrace('control_code_marker_frame_waiting', request, lastControlCodeCaptureDebug, {
+        reason: 'frame_before_marker',
+        captureWaitMs: controlCodeResultCaptureStartedAt ? Math.round(performance.now() - controlCodeResultCaptureStartedAt) : 0
+      });
+    }
     publishStreamDebug();
   }
 
@@ -3544,13 +3612,36 @@ import { html, reactive } from '@arrow-js/core';
     proof = proof || {};
     const now = performance.now();
     const reason = String(proof.candidateRejectedReason || proof.reason || 'candidate_rejected');
+    const logKey = [
+      String(proof.requestId || ''),
+      reason,
+      Number(proof.candidateFrameEpoch || 0),
+      Number(proof.candidateFrameSequence || 0)
+    ].join(':');
+    if (logKey !== lastControlCodeCandidateRejectedLogKey) {
+      lastControlCodeCandidateRejectedLogKey = logKey;
+      controlCodeCaptureTrace('control_code_candidate_rejected', codeRequest, proof, {
+        reason,
+        captureWaitMs: controlCodeResultCaptureStartedAt ? Math.round(now - controlCodeResultCaptureStartedAt) : 0
+      });
+    }
+    const firstRetryReady = !controlCodeResultCaptureStartedAt ||
+      now - controlCodeResultCaptureStartedAt >= controlCodeResultInitialKeyframeDelayMs;
+    const retryReady = lastControlCodeCaptureKeyframeRequestAt > 0
+      ? now - lastControlCodeCaptureKeyframeRequestAt >= controlCodeCaptureKeyframeRetryMs
+      : firstRetryReady;
     if (
       lastControlCodeCaptureKeyframeRetryCount < controlCodeCaptureKeyframeRetryLimit &&
-      now - lastControlCodeCaptureKeyframeRequestAt >= controlCodeCaptureKeyframeRetryMs
+      retryReady
     ) {
-      lastControlCodeCaptureKeyframeRequestAt = now;
       if (requestKeyframeDebounced(`control_code_candidate_rejected_${reason}`, controlCodeCaptureKeyframeRetryMs)) {
+        lastControlCodeCaptureKeyframeRequestAt = now;
         lastControlCodeCaptureKeyframeRetryCount += 1;
+        controlCodeCaptureTrace('control_code_frame_retry_requested', codeRequest, proof, {
+          reason,
+          retrySource: 'candidate_rejected',
+          captureWaitMs: controlCodeResultCaptureStartedAt ? Math.round(now - controlCodeResultCaptureStartedAt) : 0
+        });
       }
     }
     lastControlCodeCaptureDebug = Object.assign({}, proof, {
@@ -3572,6 +3663,9 @@ import { html, reactive } from '@arrow-js/core';
       Number(proof.candidateFrameSequence || 0),
       String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
     ), 'control_code_browser_capture');
+    controlCodeCaptureTrace('control_code_browser_capture_ack_sent', request, proof, {
+      acceptedReason: String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
+    });
     return true;
   }
 
@@ -3684,6 +3778,28 @@ import { html, reactive } from '@arrow-js/core';
     return true;
   }
 
+  function maybeRequestControlCodeResultWaitKeyframe(requestID, reason) {
+    const now = performance.now();
+    if (!controlCodeResultCaptureStartedAt) return false;
+    if (now - controlCodeResultCaptureStartedAt < controlCodeResultInitialKeyframeDelayMs) return false;
+    if (lastControlCodeCaptureKeyframeRetryCount >= controlCodeCaptureKeyframeRetryLimit) return false;
+    if (lastControlCodeCaptureKeyframeRequestAt > 0 &&
+      now - lastControlCodeCaptureKeyframeRequestAt < controlCodeCaptureKeyframeRetryMs) {
+      return false;
+    }
+    if (!requestKeyframeDebounced(reason || 'control_code_result_wait_retry', controlCodeCaptureKeyframeRetryMs)) {
+      return false;
+    }
+    lastControlCodeCaptureKeyframeRequestAt = now;
+    lastControlCodeCaptureKeyframeRetryCount += 1;
+    controlCodeCaptureTrace('control_code_frame_retry_requested', codeRequest || { requestId: requestID }, lastControlCodeCaptureDebug, {
+      reason: reason || 'control_code_result_wait_retry',
+      retrySource: 'result_wait',
+      captureWaitMs: Math.round(now - controlCodeResultCaptureStartedAt)
+    });
+    return true;
+  }
+
   function waitForControlCodeResultScreenshot(request) {
     const requestID = String(request && request.requestId || '').trim();
     if (!requestID) return;
@@ -3697,10 +3813,24 @@ import { html, reactive } from '@arrow-js/core';
       if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
       controlCodeResultCaptureRequestID = requestID;
+      controlCodeResultCaptureStartedAt = performance.now();
+      lastControlCodeMarkerReceivedLogKey = '';
+      lastControlCodeMarkerWaitingLogKey = '';
+      lastControlCodeCandidateRejectedLogKey = '';
       if (!resultAlreadyDisplayed) {
         codeResultImage.hidden = true;
         codeResultImage.removeAttribute('src');
       }
+    }
+    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
+    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    const markerLogKey = [requestID, markerEpoch, markerSequence].join(':');
+    if (markerLogKey !== lastControlCodeMarkerReceivedLogKey) {
+      lastControlCodeMarkerReceivedLogKey = markerLogKey;
+      controlCodeCaptureTrace('control_code_marker_received', request, null, {
+        markerEpoch,
+        markerSequence
+      });
     }
     if (resultAlreadyDisplayed) {
       codeResultArea.dataset.status = 'succeeded';
@@ -3724,16 +3854,18 @@ import { html, reactive } from '@arrow-js/core';
       setControlCodeResultVisible(false);
     }
     keepControlCodeVideoAlive('control_code_wait_reconnect');
-    requestKeyframeDebounced('control_code_result_wait_start', controlCodeCaptureKeyframeRetryMs);
     if (maybeCaptureControlCodeResultImage()) return;
+    maybeRequestControlCodeResultWaitKeyframe(requestID, 'control_code_result_wait_retry');
     const tick = () => {
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
         if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
         controlCodeResultCaptureTimer = null;
         controlCodeResultCaptureRequestID = '';
+        controlCodeResultCaptureStartedAt = 0;
         return;
       }
       if (maybeCaptureControlCodeResultImage()) return;
+      maybeRequestControlCodeResultWaitKeyframe(requestID, 'control_code_result_wait_retry');
       controlCodeResultCaptureTimer = setTimeout(tick, controlCodeCapturePollMs);
     };
     if (!controlCodeResultCaptureTimer) controlCodeResultCaptureTimer = setTimeout(tick, controlCodeCapturePollMs);
@@ -3874,9 +4006,7 @@ import { html, reactive } from '@arrow-js/core';
   function openControlCodeDialog() {
     if (!streamReadyForControlCode()) {
       codeError.textContent = '';
-      setStatus(liveFrameReadyForControlCode()
-        ? 'Savienojas ar vadības kanālu pirms koda pieprasījuma.'
-        : 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      setStatus(controlCodeReadinessMessage());
       refreshControlCodeReadiness('control_code_wait_for_ready');
       return;
     }
@@ -3926,10 +4056,14 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (!streamReadyForControlCode()) {
-      codeError.textContent = liveFrameReadyForControlCode()
-        ? 'Pagaidi, līdz vadības savienojums ir gatavs.'
-        : 'Pagaidi, līdz tiešraides kadrs atkal ir svaigs.';
+      codeError.textContent = controlCodeReadinessMessage();
       refreshControlCodeReadiness('control_code_submit_wait_for_ready');
+      return;
+    }
+    const fastRevision = controlCodeFastRevisionForRequest();
+    if (!fastRevision) {
+      codeError.textContent = localizePublicMessage('fast_not_ready');
+      refreshControlCodeReadiness('control_code_submit_fast_revision_missing');
       return;
     }
     codeError.textContent = '';
@@ -3938,7 +4072,7 @@ import { html, reactive } from '@arrow-js/core';
     beginControlCodeMetric(digits.length);
     const submittedAt = performance.now();
     try {
-      await runSpacetimeMutation((client) => client.requestControlCode(digits), 'control_code_request');
+      await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision), 'control_code_request');
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
       noteControlCodeMetricPhase('request_mutation_complete', null, true, {
         mutationLatencyMs
@@ -3964,6 +4098,9 @@ import { html, reactive } from '@arrow-js/core';
       finishControlCodeMetric('request_submit_failed', false, {
         error: error && error.message || 'request failed'
       });
+      if (String(error && error.message || '').indexOf('fast_not_ready') >= 0) {
+        refreshControlCodeReadiness('control_code_submit_fast_not_ready');
+      }
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
       updateControlCodeSubmitAvailability();
@@ -4011,9 +4148,7 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (!streamReadyForControlCode()) {
-      setStatus(liveFrameReadyForControlCode()
-        ? 'Savienojas ar vadības kanālu pirms koda pieprasījuma.'
-        : 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.');
+      setStatus(controlCodeReadinessMessage());
       if (!liveFrameReadyForControlCode()) reconnectVideoForRecovery('control_code_hotspot_wait_for_live_frame');
       refreshControlCodeReadiness('control_code_hotspot_wait_for_ready');
       return;
@@ -4103,6 +4238,9 @@ import { html, reactive } from '@arrow-js/core';
     const state = currentState;
     if (!state) return;
     rememberServerClock(state);
+    controlCodeFastState = state && state.controlCodeFastState || null;
+    renderControlCodeFastStateDataset();
+    scheduleControlCodeFastStateExpiryCheck();
     const viewers = activeViewerPresence(state);
     const visibleViewerCount = Number.isFinite(Number(state.viewerCount)) ? Number(state.viewerCount) : viewers.length;
     renderPanelSummary(viewers, visibleViewerCount);
@@ -4162,6 +4300,7 @@ import { html, reactive } from '@arrow-js/core';
       key: `${viewer.publicId || viewer.label || 'viewer'}-${index}`,
       label: viewer.label || `Skatītājs ${index + 1}`
     }));
+    presenceState.identifiersPending = countValue > 0 && presenceState.viewers.length === 0;
     if (presenceMounted) return;
     presence.textContent = '';
     document.documentElement.dataset.ticketUi = "arrow";
@@ -4178,6 +4317,13 @@ import { html, reactive } from '@arrow-js/core';
               <span class="presence-mark">skatās</span>
             </div>
           `.key(viewer.key))}
+        </div>
+      ` : presenceState.identifiersPending ? html`
+        <div class="presence-list">
+          <div class="presence-item">
+            <span class="presence-email">Identifikatori atjaunojas</span>
+            <span class="presence-mark">gaida</span>
+          </div>
         </div>
       ` : ''}
     `(presence);
@@ -4450,8 +4596,73 @@ import { html, reactive } from '@arrow-js/core';
     return Boolean(spacetimeClient && spacetimeClientStatus === 'live');
   }
 
-  function streamReadyForControlCode() {
+  function controlCodeTransportReadyForControlCode() {
     return liveFrameReadyForControlCode() && spacetimeReadyForControlCode();
+  }
+
+  function controlCodeFastStateExpiryMillis(state) {
+    const expiresAt = Date.parse(state && state.expiresAt || '');
+    return Number.isFinite(expiresAt) ? expiresAt : 0;
+  }
+
+  function controlCodeFastStateFresh(state) {
+    state = state || controlCodeFastState;
+    if (!state || String(state.status || '') !== 'fast_ready') return false;
+    if (!String(state.revision || '').trim()) return false;
+    if (state.rawTicketConfirmed !== true || state.cleanupClear !== true || state.streamLive !== true) return false;
+    const expiresAt = controlCodeFastStateExpiryMillis(state);
+    return Boolean(expiresAt && expiresAt > Date.now() + serverClockSkewMs + 750);
+  }
+
+  function controlCodeFastRevisionForRequest() {
+    return controlCodeFastStateFresh() ? String(controlCodeFastState.revision || '').trim() : '';
+  }
+
+  function controlCodeReadinessMessage() {
+    if (!liveFrameReadyForControlCode()) return 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.';
+    if (!spacetimeReadyForControlCode()) return 'Savienojas ar vadības kanālu pirms koda pieprasījuma.';
+    const state = controlCodeFastState || {};
+    const status = String(state.status || 'missing');
+    if (status === 'cleanup') return 'Tālrunis atgriežas pie biļetes pēc iepriekšējā koda.';
+    if (status === 'blocked') return localizePublicMessage(state.reason || 'fast_state_stale');
+    return localizePublicMessage('fast_not_ready');
+  }
+
+  function streamReadyForControlCode() {
+    return controlCodeTransportReadyForControlCode() && controlCodeFastStateFresh();
+  }
+
+  function renderControlCodeFastStateDataset() {
+    document.body.dataset.controlCodeFastState = String(controlCodeFastState && controlCodeFastState.status || 'missing');
+    document.body.dataset.controlCodeFastReady = controlCodeFastStateFresh() ? 'true' : 'false';
+  }
+
+  function scheduleControlCodeFastStateExpiryCheck() {
+    if (controlCodeFastStateExpiryTimer) {
+      clearTimeout(controlCodeFastStateExpiryTimer);
+      controlCodeFastStateExpiryTimer = null;
+    }
+    const expiresAt = controlCodeFastStateExpiryMillis(controlCodeFastState);
+    if (!expiresAt) return;
+    const refreshAt = expiresAt - serverClockSkewMs - 750 + 25;
+    const delayMs = Math.max(0, refreshAt - Date.now());
+    controlCodeFastStateExpiryTimer = setTimeout(() => {
+      controlCodeFastStateExpiryTimer = null;
+      renderControlCodeFastStateDataset();
+      refreshControlCodeReadiness('control_code_fast_state_expired');
+    }, Math.min(delayMs, 60_000));
+  }
+
+  function controlCodeRequestBusyForAutoPrepare() {
+    if (!codeRequest) return false;
+    const status = String(codeRequest.status || '');
+    if (status === 'queued' || status === 'running') return true;
+    if (status !== 'succeeded') return false;
+    const requestID = String(codeRequest.requestId || '').trim();
+    if (!requestID) return true;
+    return controlCodeResultCapturedRequestID !== requestID ||
+      controlCodePreparedCaptureDisplayedRequestID !== requestID ||
+      codeResultArea.hidden;
   }
 
   function refreshControlCodeReadiness(reason) {
@@ -4462,14 +4673,18 @@ import { html, reactive } from '@arrow-js/core';
     if (!spacetimeReadyForControlCode()) {
       connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     }
+    if (controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh()) {
+      maybeAutoPrepareControlCode(reason || 'control_code_wait_for_fast_ready');
+    }
     updateControlCodeSubmitAvailability();
   }
 
   function maybeAutoPrepareControlCode(reason) {
     if (document.visibilityState === 'hidden') return;
-    if (codeDialogOpen || !codeResultArea.hidden) return;
-    if (controlCodeAutoPrepareInFlight || !streamReadyForControlCode()) return;
-    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
+    if (!codeResultArea.hidden) return;
+    if (controlCodeAutoPrepareInFlight || !controlCodeTransportReadyForControlCode()) return;
+    if (controlCodeFastStateFresh()) return;
+    const busy = controlCodeRequestBusyForAutoPrepare();
     if (busy) return;
     const now = performance.now();
     if (lastControlCodeAutoPrepareAt && now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs) return;
@@ -4484,6 +4699,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function updateControlCodeSubmitAvailability() {
+    renderControlCodeFastStateDataset();
     const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
     const unavailable = Boolean(busy) || !streamReadyForControlCode();
     codeSubmit.disabled = unavailable || !codeDialogOpen;
@@ -4491,7 +4707,9 @@ import { html, reactive } from '@arrow-js/core';
     const hotspotUnavailable = unavailable && codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
-    if (!unavailable) maybeAutoPrepareControlCode('page_ready_control_code');
+    if (!busy && controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh()) {
+      maybeAutoPrepareControlCode('page_ready_control_code');
+    }
   }
 
   function reconnectVideoForRecovery(reason) {

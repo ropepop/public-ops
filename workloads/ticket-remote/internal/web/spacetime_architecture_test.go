@@ -249,6 +249,7 @@ func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
 		"#[spacetimedb::table(accessor = ticketremote_stream_command_signal, public)]",
 		"#[spacetimedb::table(accessor = ticketremote_phone_current_report, public)]",
 		"#[spacetimedb::table(accessor = ticketremote_relay_current_report, public)]",
+		"#[spacetimedb::table(accessor = ticketremote_stream_viewer_focus, public,",
 	} {
 		if !strings.Contains(module, marker) {
 			t.Fatalf("hot current table should use primary-key shape, missing %q", marker)
@@ -256,6 +257,9 @@ func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
 	}
 	if !strings.Contains(module, "upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);") {
 		t.Fatalf("desired-state changes must wake the Pixel signal row")
+	}
+	if !strings.Contains(module, `"keyframe" | "recover_stream" | "prepare_control_code"`) {
+		t.Fatalf("warm prepare commands must be deduped like other low-value repeated commands")
 	}
 	if strings.Contains(module, "lastFrameAgoMillis: last_frame_ago_millis") {
 		t.Fatalf("relay current report must not write a constantly changing frame age")
@@ -277,10 +281,68 @@ func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
 		"SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}",
 		"SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}",
 		"SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}",
+		"SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}",
 	} {
 		if !strings.Contains(browser, required) {
 			t.Fatalf("browser missing one-row subscription marker %q", required)
 		}
+	}
+}
+
+func TestStreamViewerFocusUsesSafePublicIDs(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	tableChunk := substringBetween(t, module,
+		"#[spacetimedb::table(accessor = ticketremote_stream_viewer_focus, public,",
+		"#[spacetimedb::table(accessor = ticketremote_stream_command")
+	reducerChunk := substringBetween(t, module,
+		"pub fn ticketremote_member_set_stream_focus(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_request_keyframe")
+	browser := readTicketWebClientSource(t, "src/index.ts")
+
+	for _, required := range []string{
+		"pub publicId: String",
+		"pub active: bool",
+		"pub lastSeenAt: String",
+		"pub expiresAt: String",
+		"index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))",
+		"index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))",
+	} {
+		if !strings.Contains(tableChunk, required) {
+			t.Fatalf("viewer focus table missing safe presence marker %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"pub email:",
+		"pub sessionId:",
+		"pub connectionId:",
+	} {
+		if strings.Contains(tableChunk, forbidden) {
+			t.Fatalf("viewer focus table must not expose private marker %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"upsert_stream_viewer_focus(",
+		"active_stream_viewer_focus_count(ctx, &ticket.id, &backend_id, &now)",
+		"viewers > 0",
+		"purge_expired_stream_viewer_focus_for_ticket_backend(",
+	} {
+		if !strings.Contains(reducerChunk, required) {
+			t.Fatalf("stream focus reducer missing presence marker %q", required)
+		}
+	}
+	for _, required := range []string{
+		"const STREAM_FOCUS_REFRESH_MS = 30000;",
+		"activeViewerFocusRows(",
+		"viewerPresence = viewerFocusRows.map",
+		"Math.max(Number.isFinite(reportedViewerCount) ? reportedViewerCount : 0, viewerPresence.length)",
+		"scheduleViewerPresenceExpiry(viewerFocusRows)",
+	} {
+		if !strings.Contains(browser, required) {
+			t.Fatalf("browser client missing viewer focus marker %q", required)
+		}
+	}
+	if strings.Contains(browser, "viewerPresence: []") {
+		t.Fatalf("browser client must not publish an always-empty viewerPresence list")
 	}
 }
 

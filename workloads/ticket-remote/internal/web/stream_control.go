@@ -216,7 +216,7 @@ func (s *Server) scheduleIdleStreamDesiredRelease(reason string) {
 	if s.store == nil {
 		return
 	}
-	if s.direct.activeVideoClientCount() > 0 {
+	if s.streamDemandStillPresent() {
 		s.cancelIdleStreamDesiredRelease()
 		return
 	}
@@ -244,7 +244,7 @@ func (s *Server) releaseStreamDesiredIfNoVideoClients(reason string) bool {
 	if s.store == nil {
 		return false
 	}
-	if s.direct.activeVideoClientCount() > 0 {
+	if s.streamDemandStillPresent() {
 		return false
 	}
 	reason = cleanStreamControlText(reason, "relay_no_video_clients")
@@ -264,6 +264,16 @@ func (s *Server) releaseStreamDesiredIfNoVideoClients(reason string) bool {
 		s.recordRuntimeErrorAsync("phone_current_report_idle_release_failed", reason, err, map[string]any{"reason": reason})
 	}
 	return true
+}
+
+func (s *Server) streamDemandStillPresent() bool {
+	if s.direct.activeVideoClientCount() > 0 {
+		return true
+	}
+	if s.relay != nil && s.relay.Snapshot().Viewers > 0 {
+		return true
+	}
+	return false
 }
 
 func (s *Server) appendStreamCommandAsync(commandType string, reason string, payload map[string]any, ttl time.Duration) {

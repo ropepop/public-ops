@@ -10,10 +10,19 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export default {
+export default __t.row({
+  id: __t.string().primaryKey(),
   ticketId: __t.string(),
   backendId: __t.string(),
-  sessionId: __t.string(),
-  digits: __t.string(),
-  expectedFastRevision: __t.string(),
-};
+  status: __t.string(),
+  revision: __t.string(),
+  reason: __t.string(),
+  preparedAt: __t.string(),
+  expiresAt: __t.string(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  rawTicketConfirmed: __t.bool(),
+  cleanupClear: __t.bool(),
+  streamLive: __t.bool(),
+  updatedAt: __t.string(),
+});

@@ -25,6 +25,24 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 	}
 }
 
+func TestStaticClientDoesNotRenderBlankPresenceWhenCountArrivesFirst(t *testing.T) {
+	source := ticketAppSource(t)
+	presenceBody := substringBetween(t, source,
+		"function renderPresence(viewers, visibleViewerCount) {",
+		"  codeDigits.addEventListener('focus', updateViewportVars);")
+
+	for _, required := range []string{
+		"identifiersPending",
+		"countValue > 0 && presenceState.viewers.length === 0",
+		"Identifikatori atjaunojas",
+		"presenceState.viewers.length ?",
+	} {
+		if !strings.Contains(presenceBody, required) {
+			t.Fatalf("presence UI must show an updating row instead of a blank list, missing %q", required)
+		}
+	}
+}
+
 func TestAdminTicketSelectionReadsPhoneStatusJson(t *testing.T) {
 	source := ticketAppSource(t)
 	adminBody := substringBetween(t, source,

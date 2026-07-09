@@ -263,6 +263,29 @@ func TestReleaseStreamDesiredIfNoVideoClientsWritesIdleState(t *testing.T) {
 	}
 }
 
+func TestReleaseStreamDesiredIfRelayViewerRetainedDoesNotWriteIdleState(t *testing.T) {
+	desired := make(chan state.StreamDesiredStateInput, 4)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{desired: desired})
+
+	server.addRelayViewer("session-a")
+	select {
+	case got := <-desired:
+		if !got.DesiredActive || got.ViewerCount != 1 {
+			t.Fatalf("viewer should publish active desired state, got %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for viewer desired-state update")
+	}
+	if server.releaseStreamDesiredIfNoVideoClients("test_retained") {
+		t.Fatal("retained relay viewer should prevent idle desired-state release")
+	}
+	select {
+	case got := <-desired:
+		t.Fatalf("unexpected idle desired-state release while relay viewer retained: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestPhoneCurrentReportIncludesStreamRecoveryStatus(t *testing.T) {
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{

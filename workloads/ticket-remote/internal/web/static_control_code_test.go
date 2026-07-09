@@ -146,12 +146,16 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	waitForScreenshot := substringBetween(t, source,
 		"function waitForControlCodeResultScreenshot(request) {",
 		"  function rememberOwnedControlCodeRequest(request) {")
+	resultWaitRetry := substringBetween(t, source,
+		"function maybeRequestControlCodeResultWaitKeyframe(requestID, reason) {",
+		"  function waitForControlCodeResultScreenshot(request) {")
 	keyframeBody := substringBetween(t, source,
 		"function requestKeyframe(reason, force) {",
 		"  function requestKeyframeDebounced(reason, minIntervalMs, force) {")
 
 	for _, needle := range []string{
 		"const controlCodeCapturePollMs = 100;",
+		"const controlCodeResultInitialKeyframeDelayMs = 1200;",
 		"const controlCodeCaptureKeyframeRetryMs = 5000;",
 		"const controlCodeCaptureKeyframeRetryLimit = 2;",
 		"const keyframeCommandMinIntervalMs = 2500;",
@@ -173,8 +177,26 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	if !strings.Contains(waitForScreenshot, "setTimeout(tick, controlCodeCapturePollMs)") {
 		t.Fatalf("control-code capture polling must use the named bounded interval")
 	}
-	if !strings.Contains(waitForScreenshot, "requestKeyframeDebounced('control_code_result_wait_start', controlCodeCaptureKeyframeRetryMs)") {
-		t.Fatalf("control-code result wait must use the bounded retry interval")
+	if strings.Contains(waitForScreenshot, "requestKeyframeDebounced('control_code_result_wait_start', controlCodeCaptureKeyframeRetryMs)") {
+		t.Fatalf("control-code result wait must not immediately request a keyframe before trying the rendered marker frame")
+	}
+	for _, needle := range []string{
+		"if (maybeCaptureControlCodeResultImage()) return;",
+		"maybeRequestControlCodeResultWaitKeyframe(requestID, 'control_code_result_wait_retry');",
+	} {
+		if !strings.Contains(waitForScreenshot, needle) {
+			t.Fatalf("control-code result wait must try capture first and then arm delayed retry, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"now - controlCodeResultCaptureStartedAt < controlCodeResultInitialKeyframeDelayMs",
+		"lastControlCodeCaptureKeyframeRetryCount >= controlCodeCaptureKeyframeRetryLimit",
+		"requestKeyframeDebounced(reason || 'control_code_result_wait_retry', controlCodeCaptureKeyframeRetryMs)",
+		"lastControlCodeCaptureKeyframeRetryCount += 1;",
+	} {
+		if !strings.Contains(resultWaitRetry, needle) {
+			t.Fatalf("control-code result retry helper must delay and bound extra keyframes, missing %q", needle)
+		}
 	}
 	if strings.Contains(waitForScreenshot, "setTimeout(tick, 20)") {
 		t.Fatalf("control-code capture polling must not run every 20ms")
@@ -394,6 +416,7 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 	for _, needle := range []string{
 		"let lastControlCodeCaptureDebug = null;",
 		"function controlCodeCandidateFrameProof(request)",
+		"function controlCodeCaptureTrace(event, request, proof, detail)",
 		"result_window_closed_before_capture",
 		"frame_before_marker",
 		"candidate_matches_pre_request_frame",
@@ -403,6 +426,21 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code freeze proof missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"control_code_marker_received",
+		"control_code_marker_frame_waiting",
+		"control_code_candidate_rejected",
+		"control_code_candidate_accepted",
+		"control_code_frame_frozen",
+		"control_code_frame_displayed",
+		"control_code_browser_capture_ack_sent",
+		"control_code_frame_retry_requested",
+		"requestKey: requestID ? accountPublicId(requestID) : ''",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code capture observability missing %q", needle)
 		}
 	}
 	candidateProof := substringBetween(t, source,
@@ -858,8 +896,20 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 	for _, needle := range []string{
 		"function liveFrameReadyForControlCode() {",
 		"function spacetimeReadyForControlCode() {",
+		"function controlCodeTransportReadyForControlCode() {",
+		"function controlCodeFastStateFresh(state) {",
+		"function renderControlCodeFastStateDataset() {",
+		"function scheduleControlCodeFastStateExpiryCheck() {",
+		"controlCodeFastStateExpiryTimer = setTimeout(() => {",
+		"refreshControlCodeReadiness('control_code_fast_state_expired');",
 		"spacetimeClientStatus === 'live'",
 		"return liveFrameReadyForControlCode() && spacetimeReadyForControlCode();",
+		"return controlCodeTransportReadyForControlCode() && controlCodeFastStateFresh();",
+		"function controlCodeRequestBusyForAutoPrepare() {",
+		"status === 'queued' || status === 'running'",
+		"status !== 'succeeded'",
+		"controlCodePreparedCaptureDisplayedRequestID !== requestID",
+		"codeResultArea.hidden",
 		"function refreshControlCodeReadiness(reason) {",
 		"connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));",
 	} {
@@ -867,13 +917,15 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 			t.Fatalf("control-code readiness must include live Spacetime state, missing %q", needle)
 		}
 	}
-	if !strings.Contains(source, "const controlCodeAutoPrepareMinIntervalMs = 45000;") {
+	if !strings.Contains(source, "const controlCodeAutoPrepareMinIntervalMs = 5000;") {
 		t.Fatalf("control-code auto-prepare must have a bounded interval")
 	}
 	for _, needle := range []string{
 		"if (document.visibilityState === 'hidden') return;",
-		"if (codeDialogOpen || !codeResultArea.hidden) return;",
-		"if (controlCodeAutoPrepareInFlight || !streamReadyForControlCode()) return;",
+		"if (!codeResultArea.hidden) return;",
+		"if (controlCodeAutoPrepareInFlight || !controlCodeTransportReadyForControlCode()) return;",
+		"if (controlCodeFastStateFresh()) return;",
+		"const busy = controlCodeRequestBusyForAutoPrepare();",
 		"now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs",
 		"client.prepareControlCode(reason || 'page_ready_control_code')",
 	} {
@@ -881,8 +933,23 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 			t.Fatalf("control-code auto-prepare must be visible-only and debounced, missing %q", needle)
 		}
 	}
-	if !strings.Contains(source, "if (!unavailable) maybeAutoPrepareControlCode('page_ready_control_code');") {
-		t.Fatalf("available control-code button should trigger one debounced prepare")
+	if !strings.Contains(source, "if (!busy && controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh())") {
+		t.Fatalf("transport-ready but fast-stale control-code page should trigger one debounced prepare")
+	}
+	if !strings.Contains(source, "let controlCodeFastStateExpiryTimer = null;") ||
+		!strings.Contains(source, "scheduleControlCodeFastStateExpiryCheck();") ||
+		!strings.Contains(source, "renderControlCodeFastStateDataset();\n    const busy = codeRequest") {
+		t.Fatalf("control-code readiness must re-evaluate when a fast-ready lease expires while the dialog is open")
+	}
+	for _, needle := range []string{
+		"const fastRevision = controlCodeFastRevisionForRequest();",
+		"client.requestControlCode(digits, fastRevision)",
+		"control_code_submit_fast_not_ready",
+		"document.body.dataset.controlCodeFastReady = controlCodeFastStateFresh() ? 'true' : 'false';",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code submit must require fresh fast-state revision, missing %q", needle)
+		}
 	}
 	for _, chunk := range []struct {
 		name string
@@ -892,9 +959,9 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 		{name: "submit", body: submitRequest},
 		{name: "hotspot", body: hotspot},
 	} {
-		if !strings.Contains(chunk.body, "liveFrameReadyForControlCode()") ||
+		if !strings.Contains(chunk.body, "controlCodeReadinessMessage()") ||
 			!strings.Contains(chunk.body, "refreshControlCodeReadiness(") {
-			t.Fatalf("%s must distinguish live-frame readiness from Spacetime readiness", chunk.name)
+			t.Fatalf("%s must report centralized control-code readiness and refresh stale state", chunk.name)
 		}
 	}
 }
@@ -1420,6 +1487,21 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 	}
 	if !strings.Contains(recoveryBody, "resumeFromIdleDisconnect(reason || 'visibility_resume');") {
 		t.Fatalf("visibility resume must recover an idle-disconnected tab")
+	}
+}
+
+func TestFirstRenderedFrameIsSentOverVideoSocket(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, needle := range []string{
+		"function sendVideoSocketClientLog(event, detail) {",
+		"videoWs.send(JSON.stringify({",
+		"type: 'client_log'",
+		"event: String(event || 'client_log').slice(0, 96)",
+		"sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("first rendered frame must be sent over the video socket, missing %q", needle)
+		}
 	}
 }
 

@@ -82,6 +82,7 @@ func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 		"ticketremote_stream_desired_state",
 		"ticketremote_phone_current_report",
 		"ticketremote_relay_current_report",
+		"ticketremote_stream_viewer_focus",
 		"ticketremote_control_code_request",
 		"memberAppendSafeOperationalLog",
 		"logRowId(\"browser\",event,correlationId)",
@@ -291,6 +292,67 @@ func TestRelayPrewarmDoesNotDoubleCountActiveBrowserSession(t *testing.T) {
 	server.releaseRetainedRelayViewer("session-a")
 	if got := server.relay.Snapshot().Viewers; got != 0 {
 		t.Fatalf("relay viewers after prewarm release = %d, want 0", got)
+	}
+}
+
+func TestPublicOpenGraceKeepsViewerAfterInitialSocketCloses(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
+
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after grace starts = %d, want 1", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after initial socket closes during grace = %d, want 1", got)
+	}
+	server.releaseRelayViewerPublicOpenGrace("session-a", "browser_first_rendered_frame")
+	if got := server.relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after grace release = %d, want 0", got)
+	}
+}
+
+func TestPublicOpenGraceExpiresIfNoFrameRenders(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", 20*time.Millisecond, "video_socket_open")
+	server.removeRelayViewer("session-a")
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("relay viewers after grace expiry = %d, want 0", server.relay.Snapshot().Viewers)
+		case <-ticker.C:
+			if got := server.relay.Snapshot().Viewers; got == 0 {
+				return
+			}
+		}
+	}
+}
+
+func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	client := &client{sessionID: "session-a", video: true}
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
+	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameSequence\":1}"}`))
+
+	if !client.firstVideoFrameRendered {
+		t.Fatal("client should be marked as having rendered its first video frame")
+	}
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers while active socket remains = %d, want 1", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after rendered socket closes = %d, want 0", got)
 	}
 }
 
@@ -576,7 +638,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"ownedControlCodeRequestIDs.has(String(requestID))",
 		"control_code_message_ignored",
 		"function closeCurrentControlCode(openNext)",
-		"client.requestControlCode(digits)",
+		"client.requestControlCode(digits,fastRevision)",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"ownerPublicId:localPublicID",
 		"codeResultArea.addEventListener('click'",
@@ -1127,7 +1189,7 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"locallyClosedControlCodeRequestIDs.add(String(requestID))",
 		"return String(value || '').replace(/\\D/g, '')",
 		"digits.length < 2 || digits.length > 8",
-		"client.requestControlCode(digits)",
+		"client.requestControlCode(digits,fastRevision)",
 		"renderControlCodeRequest({requestId:`pending:${Date.now()}`",
 		"closeCurrentControlCode(false)",
 		"scheduleControlCodeTicker(current)",
@@ -1335,7 +1397,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"/api/v1/auth/start",
 		"clearLocalAuthState()",
 		"/api/v1/auth/session",
-		"client.requestControlCode(digits)",
+		"client.requestControlCode(digits,fastRevision)",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"usesDirectSpacetimeAuth()",
 		"publishCurrentStreamFocus('public_connected')",

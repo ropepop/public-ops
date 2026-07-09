@@ -61,6 +61,7 @@ import TicketremoteUpsertMemberReducer from "./ticketremote_upsert_member_reduce
 // Import all procedure arg schemas
 
 // Import all table schema definitions
+import TicketremoteControlCodeFastStateRow from "./ticketremote_control_code_fast_state_table";
 import TicketremoteControlCodeRequestRow from "./ticketremote_control_code_request_table";
 import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_report_table";
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
@@ -70,11 +71,42 @@ import TicketremoteServiceTicketRow from "./ticketremote_service_ticket_table";
 import TicketremoteServiceTicketMemberRow from "./ticketremote_service_ticket_member_table";
 import TicketremoteStreamCommandSignalRow from "./ticketremote_stream_command_signal_table";
 import TicketremoteStreamDesiredStateRow from "./ticketremote_stream_desired_state_table";
+import TicketremoteStreamViewerFocusRow from "./ticketremote_stream_viewer_focus_table";
 
 /** Type-only namespace exports for generated type groups. */
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
+  ticketremote_control_code_fast_state: __table({
+    name: 'ticketremote_control_code_fast_state',
+    indexes: [
+      { accessor: 'backendId', name: 'ticketremote_control_code_fast_state_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'backendId',
+      ] },
+      { accessor: 'expiresAt', name: 'ticketremote_control_code_fast_state_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'expiresAt',
+      ] },
+      { accessor: 'id', name: 'ticketremote_control_code_fast_state_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'status', name: 'ticketremote_control_code_fast_state_status_idx_btree', algorithm: 'btree', columns: [
+        'status',
+      ] },
+      { accessor: 'ticketBackend', name: 'ticketremote_control_code_fast_state_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_control_code_fast_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+      { accessor: 'updatedAt', name: 'ticketremote_control_code_fast_state_updated_at_idx_btree', algorithm: 'btree', columns: [
+        'updatedAt',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_control_code_fast_state_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteControlCodeFastStateRow),
   ticketremote_control_code_request: __table({
     name: 'ticketremote_control_code_request',
     indexes: [
@@ -165,6 +197,34 @@ const tablesSchema = __schema({
       { name: 'ticketremote_stream_desired_state_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteStreamDesiredStateRow),
+  ticketremote_stream_viewer_focus: __table({
+    name: 'ticketremote_stream_viewer_focus',
+    indexes: [
+      { accessor: 'backendId', name: 'ticketremote_stream_viewer_focus_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'backendId',
+      ] },
+      { accessor: 'id', name: 'ticketremote_stream_viewer_focus_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'publicId', name: 'ticketremote_stream_viewer_focus_public_id_idx_btree', algorithm: 'btree', columns: [
+        'publicId',
+      ] },
+      { accessor: 'ticketBackend', name: 'ticketremote_stream_viewer_focus_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+      ] },
+      { accessor: 'ticketExpiresAt', name: 'ticketremote_stream_viewer_focus_ticket_id_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'expiresAt',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_stream_viewer_focus_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_stream_viewer_focus_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteStreamViewerFocusRow),
   ticketremote_service_phone_backend: __table({
     name: 'ticketremote_service_phone_backend',
     indexes: [

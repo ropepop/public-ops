@@ -28,6 +28,24 @@ export const TicketremoteCleanupSchedule = __t.object("TicketremoteCleanupSchedu
 });
 export type TicketremoteCleanupSchedule = __Infer<typeof TicketremoteCleanupSchedule>;
 
+export const TicketremoteControlCodeFastState = __t.object("TicketremoteControlCodeFastState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  status: __t.string(),
+  revision: __t.string(),
+  reason: __t.string(),
+  preparedAt: __t.string(),
+  expiresAt: __t.string(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  rawTicketConfirmed: __t.bool(),
+  cleanupClear: __t.bool(),
+  streamLive: __t.bool(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteControlCodeFastState = __Infer<typeof TicketremoteControlCodeFastState>;
+
 export const TicketremoteControlCodeOwner = __t.object("TicketremoteControlCodeOwner", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -212,6 +230,17 @@ export const TicketremoteStreamDesiredState = __t.object("TicketremoteStreamDesi
   updatedAt: __t.string(),
 });
 export type TicketremoteStreamDesiredState = __Infer<typeof TicketremoteStreamDesiredState>;
+
+export const TicketremoteStreamViewerFocus = __t.object("TicketremoteStreamViewerFocus", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  publicId: __t.string(),
+  active: __t.bool(),
+  lastSeenAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteStreamViewerFocus = __Infer<typeof TicketremoteStreamViewerFocus>;
 
 export const TicketremoteTicket = __t.object("TicketremoteTicket", {
   id: __t.string(),
