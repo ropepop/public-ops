@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://kitty-gration.local/schemas/ticket-phone-incident-trace.v1.schema.json",
   "title": "ticket-phone-incident-trace.v1",
-  "description": "User-impact incident trace for the ticket_phone_bridge / phone_broker / ticket_remote / public ticket.jolkins.id.lv surface. Required for any production ticket incident. No secrets, no raw user IDs, no raw broker job IDs, no RS monthly-ticket codes.",
+  "description": "User-impact incident trace for the ticket_phone_bridge / ticket_remote / public ticket.jolkins.id.lv surface. Required for any production ticket incident. No secrets, no raw user IDs, no raw request IDs, no ticket control codes.",
   "type": "object",
   "required": [
     "schema",
@@ -20,7 +20,7 @@
     },
     "traceId": {
       "type": "string",
-      "description": "Safe, non-secret trace identifier (e.g. ticket:<sequence>). No raw broker job ID."
+      "description": "Safe, non-secret trace identifier (e.g. ticket:<sequence>). No raw request ID."
     },
     "generatedAt": {
       "type": "string",
@@ -68,9 +68,22 @@
         "sessionStop": { "$ref": "#/$defs/phase" }
       }
     },
+    "controlPlane": {
+      "type": "object",
+      "description": "SpacetimeDB and direct-bridge state at incident time. Never include raw request IDs.",
+      "properties": {
+        "desiredState": { "type": "string" },
+        "viewerCount": { "type": "integer" },
+        "socketCount": { "type": "integer" },
+        "backendId": { "type": "string" },
+        "requestIdHash": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    },
     "broker": {
       "type": "object",
-      "description": "Broker-side state at incident time. Never include raw job IDs unless required for local triage.",
+      "deprecated": true,
+      "description": "Legacy phone-broker state retained only so old v1 traces remain valid. New traces use controlPlane.",
       "properties": {
         "desiredOwner": { "type": "string" },
         "desiredPriority": { "type": "array", "items": { "type": "string" } },

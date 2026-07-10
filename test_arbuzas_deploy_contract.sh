@@ -8,9 +8,14 @@ TRAIN_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/train-bot.Docker
 SATIKSME_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/satiksme-bot.Dockerfile"
 TICKET_PHONE_BRIDGE_DOCKERFILE_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket-phone-bridge.Dockerfile"
 TICKET_PHONE_BRIDGE_HEALTH_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket-phone-bridge-health.sh"
+ARBUZAS_EXAMPLE_ENV_PATH="${REPO_ROOT}/infra/arbuzas/docker/env/arbuzas.example.env"
+HOST_MIRROR_PATH="${REPO_ROOT}/tools/arbuzas/host_mirror.py"
+ACTIVE_PHONE_BROKER_WORKLOAD_PATH="${REPO_ROOT}/workloads/phone-broker"
+ARCHIVED_PHONE_BROKER_PATH="${REPO_ROOT}/archive/phone-broker"
 TRAIN_LDFLAGS_PATH="${REPO_ROOT}/workloads/train-bot/scripts/ldflags.sh"
 SATIKSME_LDFLAGS_PATH="${REPO_ROOT}/workloads/satiksme-bot/scripts/ldflags.sh"
 MEMORY_REPORT_PATH="${REPO_ROOT}/tools/arbuzas/memory_report.py"
+LOCAL_RELEASE_GC_PATH="${REPO_ROOT}/tools/arbuzas/local_release_gc.py"
 MEMORY_REPORT_DEFAULT_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/default/arbuzas-memory-report"
 MEMORY_REPORT_SERVICE_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/systemd/system/arbuzas-memory-report.service"
 MEMORY_REPORT_TIMER_PATH="${REPO_ROOT}/infra/arbuzas/memory-report/etc/systemd/system/arbuzas-memory-report.timer"
@@ -53,6 +58,11 @@ if [[ ! -f "${MEMORY_REPORT_PATH}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${LOCAL_RELEASE_GC_PATH}" ]]; then
+  echo "FAIL: missing Arbuzas local release cleanup helper at ${LOCAL_RELEASE_GC_PATH}" >&2
+  exit 1
+fi
+
 for memory_report_file in \
   "${MEMORY_REPORT_DEFAULT_PATH}" \
   "${MEMORY_REPORT_SERVICE_PATH}" \
@@ -66,7 +76,9 @@ done
 for ticket_phone_bridge_image_snippet in \
   "curl" \
   "ticket-phone-bridge-health.sh" \
-  "ticket-phone-bridge-health"; do
+  "ticket-phone-bridge-health" \
+  "USER 1002:1002" \
+  "ENV HOME=/home/ticketbridge"; do
   if ! grep -F "${ticket_phone_bridge_image_snippet}" "${TICKET_PHONE_BRIDGE_DOCKERFILE_PATH}" >/dev/null; then
     echo "FAIL: ticket phone bridge image must include health tooling: ${ticket_phone_bridge_image_snippet}" >&2
     exit 1
@@ -75,12 +87,77 @@ done
 
 for ticket_phone_bridge_compose_snippet in \
   "TICKET_PHONE_HEALTH_INTERVAL" \
-  "/usr/local/bin/ticket-phone-bridge-health >/dev/null"; do
+  "/usr/local/bin/ticket-phone-bridge-health >/dev/null" \
+  'user: "1002:1002"' \
+  "read_only: true" \
+  "no-new-privileges:true" \
+  "/home/ticketbridge/.android/adbkey:ro"; do
   if ! grep -F "${ticket_phone_bridge_compose_snippet}" "${COMPOSE_PATH}" >/dev/null; then
     echo "FAIL: ticket_phone_bridge compose healthcheck is missing or incomplete: ${ticket_phone_bridge_compose_snippet}" >&2
     exit 1
   fi
 done
+
+if grep -Eq '^  phone_broker:' "${COMPOSE_PATH}"; then
+  echo "FAIL: retired phone_broker service remains in compose.yml" >&2
+  exit 1
+fi
+if [[ -e "${ACTIVE_PHONE_BROKER_WORKLOAD_PATH}" ]]; then
+  echo "FAIL: retired phone broker remains under active workloads" >&2
+  exit 1
+fi
+for archived_phone_broker_file in \
+  "${ARCHIVED_PHONE_BROKER_PATH}/README.md" \
+  "${ARCHIVED_PHONE_BROKER_PATH}/phone-broker.Dockerfile" \
+  "${ARCHIVED_PHONE_BROKER_PATH}/workload/go.mod"; do
+  if [[ ! -f "${archived_phone_broker_file}" ]]; then
+    echo "FAIL: missing preserved phone broker archive file at ${archived_phone_broker_file}" >&2
+    exit 1
+  fi
+done
+for retired_phone_broker_config in \
+  "${ARBUZAS_EXAMPLE_ENV_PATH}" \
+  "${HOST_MIRROR_PATH}"; do
+  if grep -E 'phone_broker|ARBUZAS_PHONE_BROKER_PORT' "${retired_phone_broker_config}" >/dev/null; then
+    echo "FAIL: retired phone broker remains in active deployment configuration: ${retired_phone_broker_config}" >&2
+    exit 1
+  fi
+done
+
+python3 - "${HOST_MIRROR_PATH}" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("arbuzas_host_mirror", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+managed = {entry.rel for entry in module.PROFILES["arbuzas"]}
+if "etc/arbuzas/current/release.env" in managed:
+    raise SystemExit("generated current/release.env must not be managed by the host mirror")
+if "ticket_remote_spacetime_sidecar" not in module.SERVICE_ORDER:
+    raise SystemExit("host mirror service order omits the Ticket Remote Spacetime sidecar")
+
+expected = {
+    "etc/arbuzas/env/ticket-remote.env": {"ticket_remote_spacetime_sidecar", "ticket_remote"},
+    "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret": {
+        "ticket_remote_spacetime_sidecar",
+        "ticket_remote",
+    },
+    "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem": {
+        "ticket_remote_spacetime_sidecar",
+        "chatgpt_broker",
+    },
+}
+for rel, required in expected.items():
+    actual = module.affected_services_for_path(rel)
+    missing = required - actual
+    if missing:
+        raise SystemExit(f"host mirror restart mapping for {rel} omits: {sorted(missing)}")
+PY
 
 if ! grep -F 'ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"' "${SCRIPT_PATH}" >/dev/null; then
   echo "FAIL: Arbuzas train tunnel default must use vilciens.kontrole.info" >&2
@@ -223,6 +300,37 @@ if grep -F "DNS_ADMIN_NGINX" "${SCRIPT_PATH}" >/dev/null; then
   exit 1
 fi
 
+help_output="$(${SCRIPT_PATH} --help)"
+if ! grep -F -- "--validation-profile fast|standard|full" <<< "${help_output}" >/dev/null; then
+  echo "FAIL: deploy help does not document validation profiles" >&2
+  exit 1
+fi
+
+assert_cli_rejected() {
+  local expected_message="$1"
+  shift
+  local output=""
+  local status=0
+
+  set +e
+  output="$(${SCRIPT_PATH} "$@" 2>&1)"
+  status=$?
+  set -e
+  if [[ "${status}" -ne 2 ]]; then
+    echo "FAIL: expected CLI rejection status 2 for: $*" >&2
+    exit 1
+  fi
+  if ! grep -F -- "${expected_message}" <<< "${output}" >/dev/null; then
+    echo "FAIL: CLI rejection did not explain '$expected_message' for: $*" >&2
+    exit 1
+  fi
+}
+
+assert_cli_rejected "Unknown validation profile: invalid" deploy --services ticket_remote --validation-profile invalid
+assert_cli_rejected "Validation profile fast requires --services" deploy --validation-profile fast
+assert_cli_rejected "--validation-profile is only supported for deploy, validate, and rollback" cleanup-docker --validation-profile standard
+assert_cli_rejected "Unknown service: phone_broker" validate --services phone_broker
+
 if ! python3 - "${SCRIPT_PATH}" <<'PY'
 import sys
 from pathlib import Path
@@ -252,9 +360,15 @@ required_snippets = [
     "--release-id is not supported for install-thinkpad-fan",
     "--release-id is not supported for validate-thinkpad-fan",
     "--services NAME[,NAME...]",
+    "--validation-profile fast|standard|full",
+    "--validation-profile|--validation-level",
+    'VALIDATION_PROFILE="${ARBUZAS_VALIDATION_PROFILE:-full}"',
+    "Unknown validation profile: ${VALIDATION_PROFILE}; expected fast, standard, or full",
+    "Validation profile ${VALIDATION_PROFILE} requires --services",
     "--services is only supported for deploy, validate, and rollback",
     "--services requires at least one service name",
     "remote_run_docker_gc()",
+    "run_local_release_cleanup()",
     "remote_run_memory_report()",
     "remote_run_host_cache_cleanup()",
     "resolve_local_docker_gc_script()",
@@ -263,8 +377,27 @@ required_snippets = [
     "compose_target_tunnel_service_args()",
     "compose_all_service_args()",
     "compose_all_tunnel_service_args()",
+    "--no-deps --remove-orphans${non_tunnel_service_args}",
+    "--no-deps --remove-orphans${tunnel_service_args}",
+    "--no-deps --remove-orphans${service_args}",
     "render_remote_cloudflared_configs()",
     "cleanup_remote_public_bundle_versions()",
+    "run_timed_phase()",
+    "Phase timing: phase=${phase_name}",
+    "prepare_local_fast_release_overlay()",
+    "copy_fast_release_overlay_to_remote()",
+    '${FAST_RELEASE_OVERLAY_PATHS[@]+"${FAST_RELEASE_OVERLAY_PATHS[@]}"}',
+    "trap - RETURN",
+    "validate_remote_selected_smoke_health()",
+    "run_post_deploy_maintenance()",
+    'LOCAL_RELEASE_GC_SCRIPT="${SCRIPT_DIR}/local_release_gc.py"',
+    'ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS="${ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS:-72}"',
+    'ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY="${ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY:-10}"',
+    'ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN="${ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN:-false}"',
+    '--releases-root "${LOCAL_RELEASES_ROOT}"',
+    '--protect-release-id "${protect_release_id}"',
+    'Remote cleanup deferred by ${VALIDATION_PROFILE} profile; local expired release cleanup still completed',
+    'run_post_deploy_maintenance "${requested_release_id}"',
     "compute_release_source_sha256()",
     "validate_remote_release_identity()",
     "ARBUZAS_RELEASE_SOURCE_COMMIT",
@@ -304,8 +437,9 @@ required_snippets = [
     '--exclude="${path}/data/schedules/*.json"',
     '--exclude="${path}/spacetimedb/dist"',
     '--exclude="${path}/web-client/src/generated"',
-    'cp "${REPO_ROOT}/tools/arbuzas/render_cloudflared_config.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/render_cloudflared_config.py"',
-    'cp "${REPO_ROOT}/tools/arbuzas/docker_gc.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/docker_gc.py"',
+    'copy_tree_into_release "tools/arbuzas"',
+    'pathlib.Path("tools/arbuzas")',
+    'tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh',
     'MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"',
     "python3 - --source-label '/proc/meminfo on ${ARBUZAS_HOST}'",
     'MEMORY_REPORT_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/memory-report"',
@@ -360,15 +494,16 @@ required_snippets = [
     "--out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'",
     "--out '${remote_release_dir}/generated/cloudflared/ticket-remote.yml'",
     "append_unique COMPOSE_TARGET_SERVICES train_tunnel",
-    "ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel",
+    "ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel",
     "ticket-remote Spacetime sidecar health",
     "ticket_remote_spacetime_sidecar",
     "ticket-phone-bridge local health",
+    "ticket-remote direct bridge health",
     "/usr/local/bin/ticket-phone-bridge-health",
-    "/api/v1/health?strict=1",
-    # RS bot retired earlier; see archive/rs-bot/. Kept out of DNS scope.
-    "ARBUZAS_PHONE_BROKER_PORT",
-    "TICKET_REMOTE_PHONE_BROKER_URL",
+    "VALIDATE_TICKET_PHONE_BRIDGE",
+    "validate_remote_ticket_phone_bridge_workload_health",
+    "TICKET_REMOTE_PHONE_BASE_URL",
+    "http://ticket_phone_bridge:9388",
     "ticket-remote stale viewer code absent",
     "ARBUZAS_TICKET_REMOTE_AUTH_MODE=${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}",
     "ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}",
@@ -580,6 +715,12 @@ for retired_snippet in [
     "probe_dot_endpoint",
     "probe_public_https_status",
     "ddns-last-ipv4",
+    # Ticket phone broker retired 2026-07-10; see archive/phone-broker/.
+    "phone_" + "broker",
+    "phone-" + "broker",
+    "PHONE_" + "BROKER",
+    "ARBUZAS_PHONE_" + "BROKER_PORT",
+    "TICKET_REMOTE_PHONE_" + "BROKER_URL",
 ]:
     if retired_snippet in script:
         raise SystemExit(f"retired deploy contract snippet still present: {retired_snippet}")
@@ -591,6 +732,7 @@ def block_between(start: str, end: str) -> str:
 
 
 deploy_block = block_between('  deploy)\n', '  validate)\n')
+release_source_policy_block = block_between('enforce_release_source_policy() {\n', 'compute_release_source_sha256() {\n')
 validate_block = block_between('  validate)\n', '  rollback)\n')
 rollback_block = block_between('  rollback)\n', '  cleanup-docker)\n')
 cleanup_block = block_between('  cleanup-docker)\n', '  memory-report)\n')
@@ -606,23 +748,109 @@ render_cloudflared_block = block_between('render_remote_cloudflared_configs() {\
 target_non_dns_block = block_between('compose_target_service_args_without_tunnels() {\n', 'compose_target_tunnel_service_args() {\n')
 all_non_dns_block = block_between('compose_all_service_args() {\n', 'compose_all_tunnel_service_args() {\n')
 rollback_function_block = block_between('rollback_remote_release() {\n', 'while (( $# > 0 )); do\n')
+deploy_config_function_block = block_between('deploy_config_from_mirror() {\n', 'while (( $# > 0 )); do\n')
 validate_probe_block = block_between('validate_remote_probe() {\n', 'validate_remote_host_probe() {\n')
 validate_host_probe_block = block_between('validate_remote_host_probe() {\n', 'wait_until_local_ok() {\n')
 validate_release_block = block_between('validate_remote_release() {\n', 'repair_remote_portainer() {\n')
+fast_smoke_block = block_between('validate_remote_selected_smoke_health() {\n', 'validate_remote_workload_health() {\n')
+deploy_validation_block = block_between('validate_deployed_release() {\n', 'repair_remote_portainer() {\n')
+post_deploy_maintenance_block = block_between('run_post_deploy_maintenance() {\n', 'repair_remote_portainer() {\n')
+service_resolution_block = block_between('resolve_requested_services() {\n', 'populate_current_diagnostic_services() {\n')
+prepare_ticket_permissions_block = block_between('prepare_remote_ticket_runtime_permissions() {\n', 'prepare_remote_host_layout() {\n')
+prepare_host_block = block_between('prepare_remote_host_layout() {\n', 'copy_release_to_remote() {\n')
 
-if deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"') > deploy_block.index("run_automatic_remote_docker_gc"):
-    raise SystemExit("deploy cleanup runs before validation")
-if deploy_block.index("cleanup_remote_public_bundle_versions") < deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"'):
-    raise SystemExit("deploy cleans public bundles before validation")
-if deploy_block.index("cleanup_remote_public_bundle_versions") > deploy_block.index("run_automatic_remote_docker_gc"):
-    raise SystemExit("deploy cleans public bundles after docker cleanup")
-if deploy_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"') > deploy_block.index('validate_remote_release "${ARBUZAS_RELEASE_ID}"'):
-    raise SystemExit("deploy validates the release before confirming the current symlink")
-if 'log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in deploy_block:
+for timed_phase in (
+    "mirror_push",
+    "prepare_ticket_permissions",
+    "package_release",
+    "upload_release",
+    "render_tunnels",
+    "restart_services",
+    "validate_release",
+    "post_deploy_maintenance",
+):
+    if f"run_timed_phase {timed_phase}" not in deploy_block:
+        raise SystemExit(f"deploy block does not time the {timed_phase} phase")
+if 'enforce_release_source_policy' not in deploy_block:
+    raise SystemExit("deploy does not enforce clean source for production profiles")
+for policy_snippet in (
+    'if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then',
+    'ARBUZAS_ALLOW_DIRTY_FAST_RELEASE',
+    'replace it with a clean standard or full release before close-out',
+    'Refusing ${VALIDATION_PROFILE} deployment from ${source_dirty} source',
+):
+    if policy_snippet not in release_source_policy_block:
+        raise SystemExit(f"release source policy is missing: {policy_snippet}")
+if 'run_timed_phase validate_release validate_deployed_release' not in deploy_block:
+    raise SystemExit("deploy does not validate the deployed release through the profile-aware path")
+if 'log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"' not in deploy_block:
     raise SystemExit("deploy block does not announce targeted service deployments")
 
-if 'log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"' not in validate_block:
+if 'log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"' not in validate_block:
     raise SystemExit("validate block does not announce targeted service validation")
+if 'run_timed_phase validate_release validate_remote_release' not in validate_block:
+    raise SystemExit("validate action does not emit phase timing")
+
+if "if [[ \"${VALIDATION_PROFILE}\" == \"fast\" ]]; then" not in validate_release_block:
+    raise SystemExit("fast profile is not routed to selected-service smoke validation")
+if "validate_remote_selected_smoke_health \"${remote_release_dir}\" 0" not in validate_release_block:
+    raise SystemExit("fast validation does not use selected-service smoke readiness")
+if "if [[ \"${VALIDATION_PROFILE}\" == \"full\" ]]; then" not in validate_release_block:
+    raise SystemExit("full profile no longer guards strict host validation")
+if "validate_remote_swarm_baseline \"${remote_release_dir}\"" not in validate_release_block:
+    raise SystemExit("full profile no longer validates the swarm baseline")
+if "validate_remote_selected_workload_health \"${remote_release_dir}\"" not in validate_release_block:
+    raise SystemExit("standard profile no longer retains targeted workload readiness")
+
+for smoke_snippet in (
+    "ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS must be a positive integer",
+    'validate_remote_probe "${remote_release_dir}" "batched selected-service smoke readiness"',
+    "deadline=\\$((SECONDS + ${ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS}))",
+    "compose ps --services --status running",
+    "selected services did not pass batched smoke readiness before timeout",
+    "start_ticket_smoke_probe()",
+    "collect_ticket_smoke_probe_status()",
+    "setsid timeout --kill-after=1s 2s bash -c",
+    "trap 'cleanup_ticket_smoke_probes; exit 130' INT",
+    "trap 'cleanup_ticket_smoke_probes; exit 143' TERM",
+    "trap cleanup_ticket_smoke_probes EXIT",
+    "Ticket smoke probe failed: %s",
+    "curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez",
+    "https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/api/v1/health",
+    r'-w \"%{http_code}\"',
+    r'case \"\${public_code}\" in 200|302)',
+    r'[[ \"\${public_code}\" == 401 ]]',
+):
+    if smoke_snippet not in fast_smoke_block:
+        raise SystemExit(f"fast smoke validation is missing: {smoke_snippet}")
+
+ticket_probe_starts = fast_smoke_block.count("start_ticket_smoke_probe '")
+if ticket_probe_starts != 6:
+    raise SystemExit(f"Ticket Remote fast smoke must start six independent probes, found {ticket_probe_starts}")
+if "-w '%{http_code}'" in fast_smoke_block:
+    raise SystemExit("Ticket Remote public probes contain shell-breaking nested single quotes")
+running_gate_index = fast_smoke_block.index("compose ps --services --status running")
+first_ticket_probe_index = fast_smoke_block.index("start_ticket_smoke_probe 'ticket phone bridge local health'")
+collect_ticket_probe_index = fast_smoke_block.index("collect_ticket_smoke_probe_status || return 1")
+if first_ticket_probe_index <= running_gate_index:
+    raise SystemExit("Ticket Remote probes must start after the running-service gate")
+if collect_ticket_probe_index <= fast_smoke_block.rindex("start_ticket_smoke_probe '"):
+    raise SystemExit("Ticket Remote fast smoke must collect every concurrent probe before returning")
+if "ticket_smoke_probe_pids=()" not in fast_smoke_block or "kill -TERM -- \\\"-\\${probe_pid}\\\"" not in fast_smoke_block:
+    raise SystemExit("Ticket Remote fast smoke does not clean up probe process groups")
+
+if "if [[ \"${VALIDATION_PROFILE}\" == \"fast\" ]]; then" not in deploy_validation_block:
+    raise SystemExit("fast deployment does not require the current release link during smoke validation")
+if 'validate_remote_selected_smoke_health "${remote_release_dir}" 1' not in deploy_validation_block:
+    raise SystemExit("fast deployment smoke validation does not require the new current release")
+if 'if [[ "${VALIDATION_PROFILE}" != "full" ]]; then' not in post_deploy_maintenance_block:
+    raise SystemExit("non-full profiles do not defer slow post-deploy maintenance")
+if "cleanup_remote_public_bundle_versions" not in post_deploy_maintenance_block or "run_automatic_remote_docker_gc" not in post_deploy_maintenance_block:
+    raise SystemExit("full profile no longer preserves post-deploy cleanup")
+
+ticket_remote_fast_branch = block_between('      ticket_remote)\n', '      ticket_remote_spacetime_sidecar)\n')
+if 'if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then' not in ticket_remote_fast_branch or 'append_unique COMPOSE_TARGET_SERVICES ticket_remote' not in ticket_remote_fast_branch:
+    raise SystemExit("fast Ticket Remote iteration does not keep its restart scope to ticket_remote")
 
 if "mark_remote_validation_failed" not in validate_probe_block:
     raise SystemExit("remote compose validation failures must be recorded explicitly")
@@ -650,10 +878,18 @@ for cloudflared_config in (
     if render_cloudflared_block.count(cloudflared_config) != 1:
         raise SystemExit(f"cloudflared config should be rendered exactly once: {cloudflared_config}")
 
-if rollback_block.index('validate_remote_release "${requested_release_id}"') > rollback_block.index("run_automatic_remote_docker_gc"):
-    raise SystemExit("rollback cleanup runs before validation")
-if rollback_block.index('validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"') > rollback_block.index('validate_remote_release "${requested_release_id}"'):
-    raise SystemExit("rollback validates the release before confirming the current symlink")
+if 'run_timed_phase rollback_release rollback_remote_release' not in rollback_block:
+    raise SystemExit("rollback action does not emit phase timing")
+if 'if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then' not in rollback_block:
+    raise SystemExit("rollback does not preserve the fast selected-service smoke path")
+if 'run_timed_phase validate_rollback validate_remote_selected_smoke_health' not in rollback_block:
+    raise SystemExit("fast rollback does not use selected-service smoke readiness")
+if 'run_timed_phase validate_rollback_link validate_remote_current_release_link' not in rollback_block:
+    raise SystemExit("standard and full rollback do not verify the current release link")
+if 'run_timed_phase validate_rollback_services validate_remote_release' not in rollback_block:
+    raise SystemExit("standard and full rollback do not retain workload validation")
+if 'run_timed_phase post_rollback_maintenance run_post_deploy_maintenance' not in rollback_block:
+    raise SystemExit("rollback does not route maintenance through the validation profile")
 for rollback_snippet in (
     'rollback_service_args="$(compose_target_service_args_without_tunnels)"',
     'rollback_tunnel_service_args="$(compose_target_tunnel_service_args)"',
@@ -687,6 +923,37 @@ if host_cache_cleanup_block.index("report_memory 'before reclaimable cache flush
     raise SystemExit("host cache cleanup drops reclaimable memory before logging the pre-flush state")
 if host_cache_cleanup_block.index("printf '3\\n' > /proc/sys/vm/drop_caches") > host_cache_cleanup_block.index("report_memory 'after reclaimable cache flush'"):
     raise SystemExit("host cache cleanup logs the post-flush state before dropping reclaimable memory")
+
+for ownership_snippet in (
+    "install -d -o 1001 -g 1001 -m 0750 '/srv/arbuzas/ticket-remote/state'",
+    "'/etc/arbuzas/env/ticket-remote.env'",
+    "'/etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem'",
+    "'/etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret'",
+    "chown 1001:1001",
+    "chmod 0600",
+):
+    if ownership_snippet not in prepare_ticket_permissions_block:
+        raise SystemExit(f"Ticket Remote non-root host preparation is missing: {ownership_snippet}")
+for bridge_ownership_snippet in (
+    "'/etc/arbuzas/secrets/android-adb/adbkey'",
+    "'/etc/arbuzas/secrets/android-adb/adbkey.pub'",
+    "'/etc/arbuzas/secrets/android-adb/adb_known_hosts.pb'",
+    "chown 1002:1002",
+):
+    if bridge_ownership_snippet not in prepare_ticket_permissions_block:
+        raise SystemExit(f"Ticket phone bridge non-root host preparation is missing: {bridge_ownership_snippet}")
+if "prepare_remote_ticket_runtime_permissions" not in prepare_host_block:
+    raise SystemExit("full host preparation does not retain Ticket Remote runtime permissions")
+if "run_timed_phase prepare_ticket_permissions prepare_remote_ticket_runtime_permissions" not in deploy_block:
+    raise SystemExit("deploy does not prepare Ticket Remote permissions after mirror sync")
+if "prepare_remote_ticket_runtime_permissions" not in deploy_config_function_block:
+    raise SystemExit("deploy-config does not restore non-root Ticket and ADB secret ownership after mirror sync")
+if not (
+    deploy_config_function_block.index('run_host_mirror_push "${changed_paths_file}"')
+    < deploy_config_function_block.index("prepare_remote_ticket_runtime_permissions")
+    < deploy_config_function_block.index('host_mirror_affected_services "${changed_paths_file}"')
+):
+    raise SystemExit("deploy-config must restore secret ownership after mirror push and before service restart selection")
 
 if "remote_run_memory_report" not in memory_report_block:
     raise SystemExit("memory-report action does not invoke remote_run_memory_report")

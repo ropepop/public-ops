@@ -1,4 +1,7 @@
 import { DbConnection } from "./generated/index";
+import { installCspSafeSpacetimeCodecs } from "./csp-safe-codecs";
+
+installCspSafeSpacetimeCodecs();
 
 type TicketClientConfig = {
   host: string;
@@ -114,38 +117,48 @@ class TicketSpacetimeClient {
     this.manuallyDisconnected = false;
     this.connected = false;
     this.handlers.onStatus?.("connecting");
-    const builder = DbConnection.builder()
-      .withUri(this.websocketURL())
-      .withDatabaseName(this.cfg.database)
-      .withToken(this.cfg.token)
-      .onConnect((connection) => {
-        if (generation !== this.connectionGeneration) {
-          try { connection.disconnect(); } catch (_) {}
-          return;
-        }
-        this.conn = connection;
-        this.connected = true;
-        this.reconnectDelayMs = 1000;
-        this.handlers.onStatus?.("live");
-        this.resolveReadyWaiters();
-        this.subscribeState(connection);
-      })
-      .onDisconnect(() => {
-        if (generation !== this.connectionGeneration) return;
-        this.connected = false;
-        this.conn = null;
-        if (this.manuallyDisconnected) return;
-        this.handlers.onStatus?.("reconnecting");
-        this.scheduleReconnect();
-      })
-      .onConnectError((_ctx, error) => {
-        if (generation !== this.connectionGeneration) return;
-        this.connected = false;
-        this.conn = null;
-        this.handlers.onStatus?.("offline", error && String(error));
-        this.scheduleReconnect();
-      });
-    this.conn = builder.build();
+    try {
+      const builder = DbConnection.builder()
+        .withUri(this.websocketURL())
+        .withDatabaseName(this.cfg.database)
+        .withToken(this.cfg.token)
+        .onConnect((connection) => {
+          if (generation !== this.connectionGeneration) {
+            try { connection.disconnect(); } catch (_) {}
+            return;
+          }
+          this.conn = connection;
+          this.connected = true;
+          this.reconnectDelayMs = 1000;
+          this.handlers.onStatus?.("live");
+          this.resolveReadyWaiters();
+          this.subscribeState(connection);
+        })
+        .onDisconnect(() => {
+          if (generation !== this.connectionGeneration) return;
+          this.connected = false;
+          this.conn = null;
+          if (this.manuallyDisconnected) return;
+          this.handlers.onStatus?.("reconnecting");
+          this.scheduleReconnect();
+        })
+        .onConnectError((_ctx, error) => {
+          if (generation !== this.connectionGeneration) return;
+          this.connected = false;
+          this.conn = null;
+          this.handlers.onStatus?.("offline", error && String(error));
+          this.scheduleReconnect();
+        });
+      this.conn = builder.build();
+    } catch (error) {
+      if (generation !== this.connectionGeneration) return;
+      this.connected = false;
+      this.conn = null;
+      const connectionError = error instanceof Error ? error : new Error(String(error || "Spacetime connection failed"));
+      this.handlers.onStatus?.("offline", connectionError.message);
+      this.rejectReadyWaiters(connectionError);
+      if (!this.manuallyDisconnected) this.scheduleReconnect();
+    }
   }
 
   disconnect(markDisconnected = true): void {

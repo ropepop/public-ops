@@ -149,6 +149,12 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	resultWaitRetry := substringBetween(t, source,
 		"function maybeRequestControlCodeResultWaitKeyframe(requestID, reason) {",
 		"  function waitForControlCodeResultScreenshot(request) {")
+	lowLatencyBody := substringBetween(t, source,
+		"function resetControlCodeDecoderBacklog(requestID, reason) {",
+		"  function requestControlCodeLowLatencyFrame(requestID, reason) {")
+	renderRequestBody := substringBetween(t, source,
+		"function renderControlCodeRequest(request) {",
+		"  function setDetailsPanelVisible(visible) {")
 	keyframeBody := substringBetween(t, source,
 		"function requestKeyframe(reason, force) {",
 		"  function requestKeyframeDebounced(reason, minIntervalMs, force) {")
@@ -158,8 +164,12 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		"const controlCodeResultInitialKeyframeDelayMs = 1200;",
 		"const controlCodeCaptureKeyframeRetryMs = 5000;",
 		"const controlCodeCaptureKeyframeRetryLimit = 2;",
+		"const controlCodeLowLatencyVisualAgeMs = 750;",
+		"const controlCodeLowLatencyDecodeQueueLimit = 1;",
 		"const keyframeCommandMinIntervalMs = 2500;",
 		"let lastKeyframeCommandAt = 0;",
+		"let lastControlCodeLowLatencyFrameKey = '';",
+		"let lastControlCodeDecoderBacklogResetRequestID = '';",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code capture throttling missing %q", needle)
@@ -182,10 +192,31 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	}
 	for _, needle := range []string{
 		"if (maybeCaptureControlCodeResultImage()) return;",
+		"requestControlCodeLowLatencyFrame(requestID, 'control_code_result_marker_low_latency');",
 		"maybeRequestControlCodeResultWaitKeyframe(requestID, 'control_code_result_wait_retry');",
 	} {
 		if !strings.Contains(waitForScreenshot, needle) {
 			t.Fatalf("control-code result wait must try capture first and then arm delayed retry, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"decoder.reset();",
+		"pendingFrameMetadata = [];",
+		"needsKeyFrame = true;",
+		"lastAcceptedFrameSequence = Number(lastRenderedFrameSequence || 0);",
+		"lastControlCodeDecoderBacklogResetRequestID = requestID;",
+		"control_code_decoder_backlog_reset",
+	} {
+		if !strings.Contains(lowLatencyBody, needle) {
+			t.Fatalf("control-code low-latency reset missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"requestControlCodeLowLatencyFrame(currentRequestID, 'control_code_running_low_latency');",
+		"requestKeyframeDebounced('control_code_running', controlCodeCaptureKeyframeRetryMs);",
+	} {
+		if !strings.Contains(renderRequestBody, needle) {
+			t.Fatalf("running control-code request must arm low-latency stream capture, missing %q", needle)
 		}
 	}
 	for _, needle := range []string{
@@ -780,11 +811,11 @@ func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testin
 		t.Fatalf("control-code dialog close must blur focused input and release dialog-owned state")
 	}
 	if !strings.Contains(closeDialog, "updateControlCodeSubmitAvailability();") ||
-		!strings.Contains(updateSubmit, "codeSubmit.disabled = unavailable || !codeDialogOpen;") {
+		!strings.Contains(updateSubmit, "codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;") {
 		t.Fatalf("control-code submit must be unavailable while the dialog is closed")
 	}
-	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = unavailable;") {
-		t.Fatalf("closed-page request button should remain governed by stream freshness, not dialog-open state")
+	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = busy;") {
+		t.Fatalf("closed-page request button should be unavailable only while the phone lane is occupied")
 	}
 	if !strings.Contains(updateReveal, "if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;") {
 		t.Fatalf("details reveal must ignore modal-owned scroll while dialog body lock is active")
@@ -875,7 +906,7 @@ func TestSpacetimeClientIncludesControlCodeRequestExpiry(t *testing.T) {
 	}
 }
 
-func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
+func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	source := ticketAppSource(t)
 	readiness := substringBetween(t, source,
 		"function liveFrameReadyForControlCode() {",
@@ -892,29 +923,35 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 	hotspot := substringBetween(t, source,
 		"function requestControlCodeFromHotspot(event) {",
 		"  function closeControlCodeFromHotspot(event) {")
+	updateSubmit := substringBetween(t, source,
+		"function updateControlCodeSubmitAvailability() {",
+		"  function reconnectVideoForRecovery(reason) {")
 
 	for _, needle := range []string{
 		"function liveFrameReadyForControlCode() {",
 		"function spacetimeReadyForControlCode() {",
-		"function controlCodeTransportReadyForControlCode() {",
 		"function controlCodeFastStateFresh(state) {",
 		"function renderControlCodeFastStateDataset() {",
 		"function scheduleControlCodeFastStateExpiryCheck() {",
 		"controlCodeFastStateExpiryTimer = setTimeout(() => {",
 		"refreshControlCodeReadiness('control_code_fast_state_expired');",
 		"spacetimeClientStatus === 'live'",
-		"return liveFrameReadyForControlCode() && spacetimeReadyForControlCode();",
-		"return controlCodeTransportReadyForControlCode() && controlCodeFastStateFresh();",
 		"function controlCodeRequestBusyForAutoPrepare() {",
+		"if (controlCodeSubmitInFlight) return true;",
 		"status === 'queued' || status === 'running'",
 		"status !== 'succeeded'",
 		"controlCodePreparedCaptureDisplayedRequestID !== requestID",
 		"codeResultArea.hidden",
-		"function refreshControlCodeReadiness(reason) {",
+		"function refreshControlCodeReadiness(reason, options) {",
+		"const allowPrepare = !options || options.prepare !== false;",
 		"connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));",
+		"function controlCodeRequestOccupiesPhone(request) {",
+		"function controlCodeRequestOccupiesQueue() {",
+		"request.cleanupPending === true",
+		"request.captureRequired === true && request.captureAcknowledged !== true",
 	} {
 		if !strings.Contains(readiness, needle) {
-			t.Fatalf("control-code readiness must include live Spacetime state, missing %q", needle)
+			t.Fatalf("control-code background readiness/queue contract missing %q", needle)
 		}
 	}
 	if !strings.Contains(source, "const controlCodeAutoPrepareMinIntervalMs = 5000;") {
@@ -923,7 +960,7 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 	for _, needle := range []string{
 		"if (document.visibilityState === 'hidden') return;",
 		"if (!codeResultArea.hidden) return;",
-		"if (controlCodeAutoPrepareInFlight || !controlCodeTransportReadyForControlCode()) return;",
+		"if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;",
 		"if (controlCodeFastStateFresh()) return;",
 		"const busy = controlCodeRequestBusyForAutoPrepare();",
 		"now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs",
@@ -933,35 +970,92 @@ func TestControlCodeRequiresLiveSpacetimeBeforeRequest(t *testing.T) {
 			t.Fatalf("control-code auto-prepare must be visible-only and debounced, missing %q", needle)
 		}
 	}
-	if !strings.Contains(source, "if (!busy && controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh())") {
-		t.Fatalf("transport-ready but fast-stale control-code page should trigger one debounced prepare")
+	if !strings.Contains(updateSubmit, "if (!busy && spacetimeReadyForControlCode() && !controlCodeFastStateFresh())") {
+		t.Fatalf("Spacetime-ready but fast-stale control-code page should trigger one debounced prepare")
+	}
+	for _, needle := range []string{
+		"refreshControlCodeReadiness('control_code_dialog_background_warmup');",
+		"reconnectVideoForRecovery('control_code_dialog_stream_warmup');",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("dialog entry must warm the transport and fast path in the background, missing %q", needle)
+		}
+	}
+	if strings.Contains(autoPrepare, "if (codeDialogOpen) return;") {
+		t.Fatalf("an open control-code dialog must not block readiness preparation")
 	}
 	if !strings.Contains(source, "let controlCodeFastStateExpiryTimer = null;") ||
 		!strings.Contains(source, "scheduleControlCodeFastStateExpiryCheck();") ||
-		!strings.Contains(source, "renderControlCodeFastStateDataset();\n    const busy = codeRequest") {
+		!strings.Contains(source, "renderControlCodeFastStateDataset();\n    const busy = controlCodeRequestOccupiesQueue();") {
 		t.Fatalf("control-code readiness must re-evaluate when a fast-ready lease expires while the dialog is open")
 	}
 	for _, needle := range []string{
+		"let controlCodeSubmitInFlight = false;",
 		"const fastRevision = controlCodeFastRevisionForRequest();",
+		"return revision && controlCodeFastStateFresh(state) ? revision : '';",
 		"client.requestControlCode(digits, fastRevision)",
-		"control_code_submit_fast_not_ready",
+		"fastReady: controlCodeFastStateFresh()",
+		"fastRevisionSent: Boolean(fastRevision)",
 		"document.body.dataset.controlCodeFastReady = controlCodeFastStateFresh() ? 'true' : 'false';",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("control-code submit must require fresh fast-state revision, missing %q", needle)
+			t.Fatalf("control-code submit must carry optional fast-state telemetry, missing %q", needle)
 		}
 	}
-	for _, chunk := range []struct {
-		name string
-		body string
-	}{
-		{name: "open dialog", body: openDialog},
-		{name: "submit", body: submitRequest},
-		{name: "hotspot", body: hotspot},
+	for _, forbidden := range []string{
+		"if (!fastRevision) {",
+		"control_code_submit_fast_not_ready",
+		"const requestUnavailable = Boolean(busy) || !spacetimeReadyForControlCode();",
+		"const submitUnavailable = requestUnavailable || !controlCodeFastStateFresh();",
 	} {
-		if !strings.Contains(chunk.body, "controlCodeReadinessMessage()") ||
-			!strings.Contains(chunk.body, "refreshControlCodeReadiness(") {
-			t.Fatalf("%s must report centralized control-code readiness and refresh stale state", chunk.name)
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("cold control-code submission must not retain readiness gate %q", forbidden)
+		}
+	}
+	for name, body := range map[string]string{
+		"open dialog": openDialog,
+		"submit":      submitRequest,
+		"hotspot":     hotspot,
+	} {
+		if strings.Contains(body, "controlCodeReadinessMessage()") || strings.Contains(body, "fast_not_ready") {
+			t.Fatalf("%s must not block on setup readiness", name)
+		}
+	}
+	for _, needle := range []string{
+		"const digitCount = sanitizeControlDigits(codeDigits.value).length;",
+		"const digitsValid = digitCount >= 2 && digitCount <= 8;",
+		"codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;",
+		"codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';",
+		"codeSubmit.setAttribute('aria-busy', 'true');",
+		"requestCodeButton.disabled = busy;",
+	} {
+		if !strings.Contains(updateSubmit, needle) {
+			t.Fatalf("submit availability must depend only on valid digits and occupied work, missing %q", needle)
+		}
+	}
+	setInFlight := strings.Index(submitRequest, "controlCodeSubmitInFlight = true;")
+	mutation := strings.Index(submitRequest, "await runSpacetimeMutation")
+	clearInFlight := strings.Index(submitRequest, "controlCodeSubmitInFlight = false;")
+	if setInFlight < 0 || mutation < 0 || clearInFlight < 0 || !(setInFlight < mutation && mutation < clearInFlight) {
+		t.Fatalf("local submission guard must cover the complete asynchronous mutation")
+	}
+	for _, forbidden := range []string{
+		"controlCodeHotspot.addEventListener('touchend'",
+		"controlCodeCloseHotspot.addEventListener('touchend'",
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("native hotspot buttons must not fire touchend after a swipe: %q", forbidden)
+		}
+	}
+	for _, needle := range []string{
+		"--ticket-hotspot-width",
+		"--ticket-hotspot-height",
+		"stageViewport.width * 0.5",
+		"stageViewport.height * 0.25",
+		"Spacetime connection is not ready",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("mobile immediate-submit rough edge missing %q", needle)
 		}
 	}
 }
@@ -1001,6 +1095,64 @@ func TestSpacetimeClientReducersWaitForLiveConnection(t *testing.T) {
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("Spacetime client reducers must wait for a live connection, missing %q", needle)
+		}
+	}
+}
+
+func TestSpacetimeReconnectRefreshesOnlyExpiredTokens(t *testing.T) {
+	source := ticketAppSource(t)
+	recoverExpired := substringBetween(t, source,
+		"function recoverExpiredSpacetimeConnection(client, reason) {",
+		"  async function connectSpacetimeState() {")
+	statusPublisher := substringBetween(t, source,
+		"function publishSpacetimeClientStatus(status) {",
+		"  function usesDirectSpacetimeAuth() {")
+
+	for _, required := range []string{
+		"if (client !== spacetimeClient || spacetimeExpiredTokenRefreshPromise) return false;",
+		"if (!directSpacetimeToken || !spacetimeTokenExpired(directSpacetimeToken)) return false;",
+		"spacetimeClient = null;",
+		"if (client && typeof client.close === 'function') client.close();",
+		"clearLocalAuthState();",
+		"await fetchAuthSessionToken();",
+		"if (!idleDisconnected) await connectSpacetimeState();",
+		"spacetimeExpiredTokenRefreshPromise = null;",
+	} {
+		if !strings.Contains(recoverExpired, required) {
+			t.Fatalf("expired Spacetime token recovery missing %q", required)
+		}
+	}
+	guardAt := strings.Index(recoverExpired, "!directSpacetimeToken || !spacetimeTokenExpired")
+	dropAt := strings.Index(recoverExpired, "spacetimeClient = null;")
+	if guardAt < 0 || dropAt < 0 || guardAt > dropAt {
+		t.Fatalf("ordinary network outages must not drop the Spacetime client unless its token is expiring")
+	}
+	if strings.Contains(recoverExpired, "beginSpacetimeLogin(") {
+		t.Fatalf("connection errors must refresh the existing session first instead of directly starting an auth redirect")
+	}
+
+	for _, required := range []string{
+		"if (client !== spacetimeClient) return;",
+		"if (status === 'offline' || status === 'reconnecting') {",
+		"recoverExpiredSpacetimeConnection(client, status);",
+		"if (spacetimeClient === client) spacetimeClient = null;",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("Spacetime status lifecycle missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"heartbeat_failed: 'degraded'",
+		"})[normalized] || 'offline';",
+		"document.body.dataset.spacetimeConnection = safeStatus;",
+	} {
+		if !strings.Contains(statusPublisher, required) {
+			t.Fatalf("safe Spacetime status dataset missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"detail", "directSpacetimeToken", "token"} {
+		if strings.Contains(statusPublisher, forbidden) {
+			t.Fatalf("public Spacetime status dataset must not expose %q", forbidden)
 		}
 	}
 }
@@ -1502,6 +1654,32 @@ func TestFirstRenderedFrameIsSentOverVideoSocket(t *testing.T) {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("first rendered frame must be sent over the video socket, missing %q", needle)
 		}
+	}
+}
+
+func TestBrowserSuppressesBackgroundRecoveryWhenStreamIsFresh(t *testing.T) {
+	source := ticketAppSource(t)
+	keyframeBody := substringBetween(t, source,
+		"function requestKeyframe(reason, force) {",
+		"  function requestKeyframeDebounced(reason, minIntervalMs, force) {")
+	recoveryBody := substringBetween(t, source,
+		"function requestServerRecoveryDebounced(reason, force) {",
+		"  function resetFirstFrameServerRecovery() {")
+
+	for _, needle := range []string{
+		"function liveStreamSuppressesBackgroundRequest(reason) {",
+		"if (cleanReason.includes('control_code')) return false;",
+		"return streamHasFreshRenderedFrame();",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("fresh stream suppression missing %q", needle)
+		}
+	}
+	if !strings.Contains(keyframeBody, "if (liveStreamSuppressesBackgroundRequest(reason)) return false;") {
+		t.Fatalf("keyframe requests must no-op when the stream is already fresh")
+	}
+	if !strings.Contains(recoveryBody, "if (liveStreamSuppressesBackgroundRequest(reason)) return false;") {
+		t.Fatalf("server recovery requests must no-op when the stream is already fresh")
 	}
 }
 

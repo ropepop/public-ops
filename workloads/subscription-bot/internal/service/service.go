@@ -1571,19 +1571,6 @@ func (a *App) findInvoiceByProviderInvoiceID(ctx context.Context, providerInvoic
 	return scanInvoice(row)
 }
 
-func (a *App) lookupInvoiceTx(ctx context.Context, tx *sql.Tx, invoiceID string) (domain.Invoice, error) {
-	row := tx.QueryRowContext(ctx, `
-		SELECT i.id, i.membership_id, i.plan_id, i.user_id, u.telegram_id, i.cycle_start, i.cycle_end, i.due_at,
-		       i.base_minor, i.fee_minor, i.total_minor, i.credit_applied_minor, i.paid_minor, i.anchor_asset,
-		       i.pay_asset, i.network, i.quoted_pay_amount, i.quote_rate_label, i.quote_expires_at,
-		       i.payment_ref, i.provider_invoice_id, i.status, i.tx_hash, i.reminder_mask, i.created_at, i.updated_at
-		FROM invoices i
-		INNER JOIN users u ON u.id = i.user_id
-		WHERE i.id = ?
-	`, invoiceID)
-	return scanInvoice(row)
-}
-
 func (a *App) listInvoicesForPlan(ctx context.Context, planID string) ([]domain.Invoice, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT i.id, i.membership_id, i.plan_id, i.user_id, u.telegram_id, i.cycle_start, i.cycle_end, i.due_at,
@@ -1655,30 +1642,6 @@ func (a *App) listCreditsForPlan(ctx context.Context, planID string) ([]domain.C
 		}
 		credit.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		out = append(out, credit)
-	}
-	return out, rows.Err()
-}
-
-func (a *App) listEvents(ctx context.Context, entityType string, entityID string) ([]domain.Event, error) {
-	rows, err := a.db.QueryContext(ctx, `
-		SELECT id, entity_type, entity_id, event_name, payload_json, created_at
-		FROM events
-		WHERE entity_type = ? AND entity_id = ?
-		ORDER BY id DESC
-	`, entityType, entityID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]domain.Event, 0)
-	for rows.Next() {
-		var event domain.Event
-		var createdAt string
-		if err := rows.Scan(&event.ID, &event.EntityType, &event.EntityID, &event.EventName, &event.PayloadJSON, &createdAt); err != nil {
-			return nil, err
-		}
-		event.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		out = append(out, event)
 	}
 	return out, rows.Err()
 }

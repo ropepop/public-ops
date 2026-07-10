@@ -42,7 +42,6 @@ type PhoneConfig struct {
 	BackendID         string
 	AttachName        string
 	BaseURL           string
-	BrokerBaseURL     string
 	Backends          []PhoneBackend
 	DefaultBackendID  string
 	ActiveBackendFile string
@@ -118,27 +117,27 @@ func Load() (Config, error) {
 			OIDCRedirect:      strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_REDIRECT_URL", ""), "/"),
 		},
 		State: state.StoreConfig{
-			Backend:              getenv("TICKET_REMOTE_STATE_BACKEND", "auto"),
-			TicketID:             getenv("TICKET_REMOTE_TICKET_ID", state.DefaultTicketID),
-			SpacetimeHost:        strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_HOST", "https://maincloud.spacetimedb.com"), "/"),
-			SpacetimeDatabase:    getenv("TICKET_REMOTE_SPACETIME_DATABASE", ""),
-			SpacetimeClientURL:   strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_CLIENT_URL", ""), "/"),
-			SpacetimeBearerToken: getenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", ""),
-			SpacetimeIssuer:      getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", state.DefaultSpacetimeIssuer),
-			SpacetimeAudience:    getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", state.DefaultSpacetimeAudience),
-			SpacetimeKeyFile:     getenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", ""),
-			ServiceSubject:       getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", state.DefaultSpacetimeServiceSubject),
-			ServiceRoles:         splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", state.DefaultSpacetimeServiceRole)),
-			TokenTTL:             getenvDurationWithNever("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
-			HTTPTimeout:          getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", state.DefaultSpacetimeHTTPTimeout),
-			AuthIssuer:           strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
-			AuthAudience:         getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
+			Backend:                        getenv("TICKET_REMOTE_STATE_BACKEND", "auto"),
+			TicketID:                       getenv("TICKET_REMOTE_TICKET_ID", state.DefaultTicketID),
+			SpacetimeHost:                  strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_HOST", "https://maincloud.spacetimedb.com"), "/"),
+			SpacetimeDatabase:              getenv("TICKET_REMOTE_SPACETIME_DATABASE", ""),
+			SpacetimeClientURL:             strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_CLIENT_URL", ""), "/"),
+			SpacetimeSidecarWriteTokenFile: getenv("TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE", ""),
+			SpacetimeBearerToken:           getenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", ""),
+			SpacetimeIssuer:                getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", state.DefaultSpacetimeIssuer),
+			SpacetimeAudience:              getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", state.DefaultSpacetimeAudience),
+			SpacetimeKeyFile:               getenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", ""),
+			ServiceSubject:                 getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", state.DefaultSpacetimeServiceSubject),
+			ServiceRoles:                   splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", state.DefaultSpacetimeServiceRole)),
+			TokenTTL:                       getenvDurationWithNever("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
+			HTTPTimeout:                    getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", state.DefaultSpacetimeHTTPTimeout),
+			AuthIssuer:                     strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
+			AuthAudience:                   getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
 		},
 		Phone: PhoneConfig{
 			BackendID:         activePhone.ID,
 			AttachName:        activePhone.AttachName,
 			BaseURL:           activePhone.BaseURL,
-			BrokerBaseURL:     strings.TrimRight(getenv("TICKET_REMOTE_PHONE_BROKER_URL", ""), "/"),
 			Backends:          phoneBackends,
 			DefaultBackendID:  defaultPhoneID,
 			ActiveBackendFile: activeBackendFile,
@@ -218,8 +217,8 @@ func validateProductionConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.State.SpacetimeClientURL) == "" {
 		return fmt.Errorf("TICKET_REMOTE_SPACETIME_CLIENT_URL is required in production")
 	}
-	if strings.TrimSpace(cfg.State.SpacetimeBearerToken) == "" && strings.TrimSpace(cfg.State.SpacetimeKeyFile) == "" {
-		return fmt.Errorf("TICKET_REMOTE_SPACETIME_BEARER_TOKEN or TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE is required in production")
+	if strings.TrimSpace(cfg.State.SpacetimeSidecarWriteTokenFile) == "" {
+		return fmt.Errorf("TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE is required in production")
 	}
 	return nil
 }

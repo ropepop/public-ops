@@ -19,7 +19,7 @@ node_modules/
 build/
 out/
 dist/
-tools/arbuzas-rs/target/
+**/target/
 
 # Local runtime scratch
 .browser-use/
@@ -45,6 +45,8 @@ infra/arbuzas/docker/env/arbuzas.env
 # Stable local browser session exports and sensitive browser captures
 state/browser-use/
 state/
+!workloads/ticket-remote/internal/state/
+!workloads/ticket-remote/internal/state/**
 evidence/
 security-audit-evidence/
 security-audits/

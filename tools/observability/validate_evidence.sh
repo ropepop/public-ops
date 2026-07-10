@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 
 fail=0
-for module in orchestrator train-bot site-notifications task-executor pihole vpn-access; do
+for module in orchestrator train-bot task-executor pihole vpn-access; do
   if [ ! -d "ops/evidence/${module}" ]; then
     echo "missing evidence directory: ops/evidence/${module}"
     fail=1

@@ -70,16 +70,21 @@ func TestConfigHasNoPublicMediaPortConfig(t *testing.T) {
 	}
 }
 
-func TestLoadReadsPrivatePhoneBrokerURL(t *testing.T) {
+func TestLoadUsesDirectPhoneBridgeAndIgnoresRetiredBrokerSetting(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
-	t.Setenv("TICKET_REMOTE_PHONE_BROKER_URL", "http://phone_broker:9398/")
+	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "pixel|Pixel|http://ticket_phone_bridge:9388")
+	t.Setenv("TICKET_REMOTE_PHONE_BASE_URL", "http://ticket_phone_bridge:9388")
+	t.Setenv("TICKET_REMOTE_PHONE_"+"BROKER_URL", "http://phone_"+"broker:9398/")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Phone.BrokerBaseURL != "http://phone_broker:9398" {
-		t.Fatalf("broker URL = %q", cfg.Phone.BrokerBaseURL)
+	if cfg.Phone.BaseURL != "http://ticket_phone_bridge:9388" {
+		t.Fatalf("phone bridge URL = %q", cfg.Phone.BaseURL)
+	}
+	if _, ok := reflect.TypeOf(PhoneConfig{}).FieldByName("Broker" + "BaseURL"); ok {
+		t.Fatal("phone config must not expose the retired phone broker")
 	}
 }
 
@@ -181,5 +186,50 @@ func TestProductionModeRequiresSpacetimeState(t *testing.T) {
 
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "production state backend") {
 		t.Fatalf("expected production state rejection, got %v", err)
+	}
+}
+
+func setValidProductionSidecarEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("TICKET_REMOTE_PRODUCTION", "true")
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", "client_test")
+	t.Setenv("TICKET_REMOTE_SESSION_SIGNING_KEY", "test-signing-key")
+	t.Setenv("TICKET_REMOTE_STATE_BACKEND", "spacetime")
+	t.Setenv("TICKET_REMOTE_SPACETIME_DATABASE", "ticket_remote")
+	t.Setenv("TICKET_REMOTE_SPACETIME_CLIENT_URL", "http://ticket_remote_spacetime_sidecar:9340")
+	t.Setenv("TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE", "/run/secrets/ticket-remote-sidecar-write-token")
+	t.Setenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", "")
+	t.Setenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", "")
+}
+
+func TestProductionModeRequiresSidecarWriteTokenFile(t *testing.T) {
+	setValidProductionSidecarEnvironment(t)
+	t.Setenv("TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE", "")
+	// Direct Spacetime credentials must no longer satisfy the public service's
+	// production write contract.
+	t.Setenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", "legacy-direct-token")
+	t.Setenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", "/run/secrets/legacy-private-key")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE") {
+		t.Fatalf("expected sidecar write-token-file requirement, got %v", err)
+	}
+}
+
+func TestProductionModeLoadsSidecarOnlyWriteCredentials(t *testing.T) {
+	setValidProductionSidecarEnvironment(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.State.SpacetimeClientURL != "http://ticket_remote_spacetime_sidecar:9340" {
+		t.Fatalf("sidecar URL = %q", cfg.State.SpacetimeClientURL)
+	}
+	if cfg.State.SpacetimeSidecarWriteTokenFile != "/run/secrets/ticket-remote-sidecar-write-token" {
+		t.Fatalf("sidecar write-token file = %q", cfg.State.SpacetimeSidecarWriteTokenFile)
+	}
+	if cfg.State.SpacetimeBearerToken != "" || cfg.State.SpacetimeKeyFile != "" {
+		t.Fatalf("production sidecar config unexpectedly needs direct credentials: %#v", cfg.State)
 	}
 }

@@ -236,6 +236,9 @@ import { html, reactive } from '@arrow-js/core';
   let directSpacetimeTokenExpiresAt = 0;
   let spacetimeClientScriptPromise = null;
   let spacetimeClientConnectPromise = null;
+  let spacetimeExpiredTokenRefreshPromise = null;
+
+  if (document.body) document.body.dataset.spacetimeConnection = 'idle';
 
   if (!cfg.authenticated) {
     startAuthRedirect();
@@ -359,6 +362,7 @@ import { html, reactive } from '@arrow-js/core';
   let latestStreamStatus = null;
   let lastStreamStatusAt = 0;
   let codeRequest = null;
+  let controlCodeSubmitInFlight = false;
   let controlCodeFastState = null;
   let pendingFrameMetadata = [];
   let controlCodeResultCaptureTimer = null;
@@ -371,6 +375,8 @@ import { html, reactive } from '@arrow-js/core';
   let lastControlCodeCaptureDebug = null;
   let lastControlCodeCaptureKeyframeRequestAt = 0;
   let lastControlCodeCaptureKeyframeRetryCount = 0;
+  let lastControlCodeLowLatencyFrameKey = '';
+  let lastControlCodeDecoderBacklogResetRequestID = '';
   let controlCodeResultCaptureStartedAt = 0;
   let lastControlCodeMarkerReceivedLogKey = '';
   let lastControlCodeMarkerWaitingLogKey = '';
@@ -455,6 +461,8 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeResultInitialKeyframeDelayMs = 1200;
   const controlCodeCaptureKeyframeRetryMs = 5000;
   const controlCodeCaptureKeyframeRetryLimit = 2;
+  const controlCodeLowLatencyVisualAgeMs = 750;
+  const controlCodeLowLatencyDecodeQueueLimit = 1;
   const controlCodeGeneratedChipScanStartY = 0.50;
   const controlCodeGeneratedChipScanEndY = 0.61;
   const controlCodeGeneratedChipScanStepY = 0.01;
@@ -648,6 +656,8 @@ import { html, reactive } from '@arrow-js/core';
     document.documentElement.style.setProperty('--ticket-stage-height', `${stageViewport.height}px`);
     document.documentElement.style.setProperty('--ticket-viewport-width', `${stageViewport.width}px`);
     document.documentElement.style.setProperty('--ticket-viewport-height', `${stageViewport.height}px`);
+    document.documentElement.style.setProperty('--ticket-hotspot-width', `${stageViewport.width * 0.5}px`);
+    document.documentElement.style.setProperty('--ticket-hotspot-height', `${stageViewport.height * 0.25}px`);
     document.documentElement.style.setProperty('--ticket-viewport-left', `${stageViewport.offsetLeft}px`);
     document.documentElement.style.setProperty('--ticket-viewport-top', `${stageViewport.offsetTop}px`);
     document.documentElement.style.setProperty('--ticket-dialog-width', `${dialogViewport.width}px`);
@@ -886,6 +896,11 @@ import { html, reactive } from '@arrow-js/core';
     ['Video connection failed', 'Video savienojums neizdevās'],
     ['control_mode_removed', 'Kontroles režīms ir aizstāts ar koda pieprasījumiem'],
     ['invalid_code', 'Ievadi 2-8 ciparus'],
+    ['request_in_progress', 'Iepriekšējais koda pieprasījums vēl tiek pabeigts'],
+    ['Spacetime connection is unavailable.', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
+    ['Spacetime connection is not ready', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
+    ['Spacetime connection failed', 'Neizdevās savienot vadības kanālu. Mēģini vēlreiz.'],
+    ['Spacetime connection closed', 'Vadības kanāls pārtrauca savienojumu. Mēģini vēlreiz.'],
     ['rate_limited', 'Minūtē var pieprasīt divus kodus'],
     ['phone_timeout', 'Tālrunis nepaspēja izveidot kodu'],
     ['phone_unavailable', 'Tālrunis pašlaik nav pieejams'],
@@ -959,6 +974,20 @@ import { html, reactive } from '@arrow-js/core';
   function spacetimeTokenExpired(token) {
     const expiresAt = directSpacetimeTokenExpiresAt || jwtExpiresAtMillis(token);
     return expiresAt > 0 && Date.now() + 30000 >= expiresAt;
+  }
+
+  function publishSpacetimeClientStatus(status) {
+    const normalized = String(status || 'offline');
+    const safeStatus = ({
+      idle: 'idle',
+      connecting: 'connecting',
+      live: 'live',
+      reconnecting: 'reconnecting',
+      offline: 'offline',
+      heartbeat_failed: 'degraded'
+    })[normalized] || 'offline';
+    spacetimeClientStatus = normalized;
+    if (document.body) document.body.dataset.spacetimeConnection = safeStatus;
   }
 
   function usesDirectSpacetimeAuth() {
@@ -2008,7 +2037,14 @@ import { html, reactive } from '@arrow-js/core';
     clientLog(event, safeDetail);
   }
 
+  function liveStreamSuppressesBackgroundRequest(reason) {
+    const cleanReason = String(reason || '').toLowerCase();
+    if (cleanReason.includes('control_code')) return false;
+    return streamHasFreshRenderedFrame();
+  }
+
   function requestKeyframe(reason, force) {
+    if (liveStreamSuppressesBackgroundRequest(reason)) return false;
     const now = performance.now();
     if (!force && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
     lastKeyframeCommandAt = now;
@@ -2033,6 +2069,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function requestServerRecoveryDebounced(reason, force) {
+    if (liveStreamSuppressesBackgroundRequest(reason)) return false;
     const now = performance.now();
     if (!force && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
@@ -2095,6 +2132,64 @@ import { html, reactive } from '@arrow-js/core';
     configureDecoder(lastDecoderConfig, { preserveFrame: true, preserveSequence: true, requestReason: reason, preferAvc: decoderMode === 'avc' })
       .catch((error) => sendVideoClientLog('decoder_recovery_config_failed', error && error.message || 'decoder recovery failed'));
     return true;
+  }
+
+  function controlCodeDecoderBacklogReason() {
+    if (!decoder || !decoderConfigured || !hasRenderedFrame) return '';
+    const now = performance.now();
+    const freshness = currentRenderedFreshness(now);
+    const visualAgeMillis = Number(freshness.visualAgeMillis || 0);
+    const decodeQueueSize = Number(decoder.decodeQueueSize || 0);
+    if (visualAgeMillis > controlCodeLowLatencyVisualAgeMs) {
+      return `visual_age_${Math.round(visualAgeMillis)}ms`;
+    }
+    if (decodeQueueSize > controlCodeLowLatencyDecodeQueueLimit) {
+      return `decode_queue_${decodeQueueSize}`;
+    }
+    return '';
+  }
+
+  function resetControlCodeDecoderBacklog(requestID, reason) {
+    requestID = String(requestID || '').trim();
+    if (!requestID || lastControlCodeDecoderBacklogResetRequestID === requestID) return false;
+    if (!decoder || !decoderConfigured || typeof decoder.reset !== 'function') return false;
+    const backlogReason = controlCodeDecoderBacklogReason();
+    if (!backlogReason) return false;
+    try {
+      preserveCurrentFrame(`control_code_decoder_backlog:${reason || backlogReason}`);
+      decoder.reset();
+      pendingFrameMetadata = [];
+      needsKeyFrame = true;
+      lastAcceptedFrameSequence = Number(lastRenderedFrameSequence || 0);
+      lastAcceptedFrameTimestamp = Number(lastRenderedFrameTimestamp || 0);
+      lastAcceptedFrameReceivedAt = 0;
+      lastAcceptedFrameQueuedAt = 0;
+      lastAcceptedFrameVisualAgeMillis = 0;
+      lastControlCodeDecoderBacklogResetRequestID = requestID;
+      sendVideoClientLog('control_code_decoder_backlog_reset', JSON.stringify({
+        requestKey: accountPublicId(requestID),
+        reason: reason || 'control_code',
+        backlogReason,
+        renderedFrameEpoch: Number(lastRenderedFrameEpoch || 0),
+        renderedFrameSequence: Number(lastRenderedFrameSequence || 0)
+      }));
+      return true;
+    } catch (error) {
+      sendVideoClientLog('control_code_decoder_backlog_reset_failed', error && error.message || 'reset failed');
+      return false;
+    }
+  }
+
+  function requestControlCodeLowLatencyFrame(requestID, reason) {
+    requestID = String(requestID || '').trim();
+    const requestKey = `${requestID}:${reason || 'control_code_low_latency_frame'}`;
+    if (!requestID || lastControlCodeLowLatencyFrameKey === requestKey) return false;
+    if (!codeRequest || String(codeRequest.requestId || '').trim() !== requestID) return false;
+    const status = String(codeRequest.status || '');
+    if (status !== 'queued' && status !== 'running' && status !== 'succeeded') return false;
+    lastControlCodeLowLatencyFrameKey = requestKey;
+    resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency');
+    return requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);
   }
 
   function publishStreamDebug() {
@@ -2606,6 +2701,32 @@ import { html, reactive } from '@arrow-js/core';
     return spacetimeClientScriptPromise;
   }
 
+  function recoverExpiredSpacetimeConnection(client, reason) {
+    if (client !== spacetimeClient || spacetimeExpiredTokenRefreshPromise) return false;
+    if (!directSpacetimeToken || !spacetimeTokenExpired(directSpacetimeToken)) return false;
+
+    spacetimeClient = null;
+    publishSpacetimeClientStatus('offline');
+    try {
+      if (client && typeof client.close === 'function') client.close();
+    } catch (_) {}
+    clearLocalAuthState();
+    spacetimeDirectUnavailable = false;
+    spacetimeDirectUnavailableLogged = false;
+
+    spacetimeExpiredTokenRefreshPromise = (async () => {
+      try {
+        await fetchAuthSessionToken();
+        if (!idleDisconnected) await connectSpacetimeState();
+      } catch (error) {
+        clientLog('spacetime_token_refresh_failed', `${reason || 'connection_failed'}:${error && error.message || 'failed'}`);
+      } finally {
+        spacetimeExpiredTokenRefreshPromise = null;
+      }
+    })();
+    return true;
+  }
+
   async function connectSpacetimeState() {
     if (idleDisconnected) return;
     if (!usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
@@ -2626,7 +2747,7 @@ import { html, reactive } from '@arrow-js/core';
       }
       if (spacetimeClient) return;
       const st = cfg.spacetime || {};
-      spacetimeClient = window.TicketSpacetime.create({
+      const client = window.TicketSpacetime.create({
         host: st.host || 'https://maincloud.spacetimedb.com',
         database: st.database || '',
         token,
@@ -2640,15 +2761,27 @@ import { html, reactive } from '@arrow-js/core';
           renderState();
         },
         onStatus: (status, detail) => {
-          spacetimeClientStatus = status;
+          if (client !== spacetimeClient) return;
+          publishSpacetimeClientStatus(status);
           if (status === 'live') {
             flushClientLogs();
           }
           updateControlCodeSubmitAvailability();
           if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);
+          if (status === 'offline' || status === 'reconnecting') {
+            recoverExpiredSpacetimeConnection(client, status);
+          }
         }
       });
-      spacetimeClient.connect();
+      spacetimeClient = client;
+      try {
+        client.connect();
+      } catch (error) {
+        if (spacetimeClient === client) spacetimeClient = null;
+        publishSpacetimeClientStatus('offline');
+        try { client.close(); } catch (_) {}
+        throw error;
+      }
     })();
     try {
       await spacetimeClientConnectPromise;
@@ -2688,7 +2821,7 @@ import { html, reactive } from '@arrow-js/core';
     case 'closed':
       return 'Kods aizvērts';
     default:
-      return controlCodeFastStateFresh() ? 'Gatavs' : 'Gatavojas';
+      return 'Gatavs';
     }
   }
 
@@ -2700,9 +2833,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeDetailText(request) {
-    if (!request) return controlCodeFastStateFresh()
-      ? 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.'
-      : controlCodeReadinessMessage();
+    if (!request) return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
     if (request.status === 'queued') {
       const position = Number(request.queuePosition || 0);
       if (position > 1) return `Rindā: ${position}. vieta`;
@@ -2712,9 +2843,7 @@ import { html, reactive } from '@arrow-js/core';
     if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
     if (request.status === 'failed') return localizePublicMessage(request.reason || request.message || 'Kodu neizdevās izveidot');
     if (request.status === 'expired' || request.status === 'closed') return 'Vari pieprasīt jaunu kodu.';
-    return controlCodeFastStateFresh()
-      ? 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.'
-      : controlCodeReadinessMessage();
+    return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
   }
 
   function scheduleControlCodeTicker(request) {
@@ -3855,6 +3984,7 @@ import { html, reactive } from '@arrow-js/core';
     }
     keepControlCodeVideoAlive('control_code_wait_reconnect');
     if (maybeCaptureControlCodeResultImage()) return;
+    requestControlCodeLowLatencyFrame(requestID, 'control_code_result_marker_low_latency');
     maybeRequestControlCodeResultWaitKeyframe(requestID, 'control_code_result_wait_retry');
     const tick = () => {
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
@@ -3921,6 +4051,7 @@ import { html, reactive } from '@arrow-js/core';
       keepControlCodeVideoAlive('control_code_request_active');
       if (current.status === 'running') {
         requestKeyframeDebounced('control_code_running', controlCodeCaptureKeyframeRetryMs);
+        requestControlCodeLowLatencyFrame(currentRequestID, 'control_code_running_low_latency');
         maybePrepareControlCodeResultFrame();
       }
       if (controlCodeResultDisplayedForRequest(currentRequestID)) {
@@ -4004,11 +4135,12 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function openControlCodeDialog() {
-    if (!streamReadyForControlCode()) {
-      codeError.textContent = '';
-      setStatus(controlCodeReadinessMessage());
-      refreshControlCodeReadiness('control_code_wait_for_ready');
-      return;
+    if (controlCodeRequestOccupiesQueue()) return;
+    if (!liveFrameReadyForControlCode()) {
+      reconnectVideoForRecovery('control_code_dialog_stream_warmup');
+    }
+    if (!spacetimeReadyForControlCode() || !liveFrameReadyForControlCode() || !controlCodeFastStateFresh()) {
+      refreshControlCodeReadiness('control_code_dialog_background_warmup');
     }
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
       try {
@@ -4023,9 +4155,6 @@ import { html, reactive } from '@arrow-js/core';
     codeError.textContent = '';
     codeDigits.value = '';
     updateControlCodeSubmitAvailability();
-    runSpacetimeMutation((client) => client.prepareControlCode('dialog_open'), 'control_code_prepare')
-      .then(() => clientLog('control_code_prepare_complete', 'spacetime'))
-      .catch((error) => clientLog('control_code_prepare_failed', error && error.message || 'prepare failed'));
     setTimeout(() => {
       updateViewportVars();
       codeDigits.focus({ preventScroll: true });
@@ -4055,19 +4184,14 @@ import { html, reactive } from '@arrow-js/core';
       codeError.textContent = 'Ievadi 2-8 ciparus.';
       return;
     }
-    if (!streamReadyForControlCode()) {
-      codeError.textContent = controlCodeReadinessMessage();
-      refreshControlCodeReadiness('control_code_submit_wait_for_ready');
+    if (controlCodeRequestOccupiesQueue()) {
+      codeError.textContent = localizePublicMessage('request_in_progress');
       return;
     }
     const fastRevision = controlCodeFastRevisionForRequest();
-    if (!fastRevision) {
-      codeError.textContent = localizePublicMessage('fast_not_ready');
-      refreshControlCodeReadiness('control_code_submit_fast_revision_missing');
-      return;
-    }
     codeError.textContent = '';
-    codeSubmit.disabled = true;
+    controlCodeSubmitInFlight = true;
+    updateControlCodeSubmitAvailability();
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
     beginControlCodeMetric(digits.length);
     const submittedAt = performance.now();
@@ -4082,6 +4206,10 @@ import { html, reactive } from '@arrow-js/core';
         digitCount: digits.length,
         mutationLatencyMs,
         viewportHeight: window.innerHeight,
+        fastState: String(controlCodeFastState && controlCodeFastState.status || 'missing'),
+        fastReady: controlCodeFastStateFresh(),
+        fastRevisionSent: Boolean(fastRevision),
+        immediate: true,
       }));
       renderControlCodeRequest({
         requestId: `pending:${Date.now()}`,
@@ -4098,11 +4226,9 @@ import { html, reactive } from '@arrow-js/core';
       finishControlCodeMetric('request_submit_failed', false, {
         error: error && error.message || 'request failed'
       });
-      if (String(error && error.message || '').indexOf('fast_not_ready') >= 0) {
-        refreshControlCodeReadiness('control_code_submit_fast_not_ready');
-      }
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
+      controlCodeSubmitInFlight = false;
       updateControlCodeSubmitAvailability();
     }
   }
@@ -4141,18 +4267,12 @@ import { html, reactive } from '@arrow-js/core';
       event.preventDefault();
       event.stopPropagation();
     }
-    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
-    if (busy || codeDialogOpen) return;
+    if (codeDialogOpen) return;
     if (!codeResultArea.hidden && codeRequest) {
       closeCurrentControlCode(false);
       return;
     }
-    if (!streamReadyForControlCode()) {
-      setStatus(controlCodeReadinessMessage());
-      if (!liveFrameReadyForControlCode()) reconnectVideoForRecovery('control_code_hotspot_wait_for_live_frame');
-      refreshControlCodeReadiness('control_code_hotspot_wait_for_ready');
-      return;
-    }
+    if (controlCodeRequestOccupiesQueue()) return;
     openControlCodeDialog();
   }
 
@@ -4347,8 +4467,6 @@ import { html, reactive } from '@arrow-js/core';
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
   controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot);
-  controlCodeHotspot.addEventListener('touchend', requestControlCodeFromHotspot);
-  controlCodeCloseHotspot.addEventListener('touchend', closeControlCodeFromHotspot);
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
     if (event.target === codeDialog) closeControlCodeDialog();
@@ -4615,21 +4733,24 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeFastRevisionForRequest() {
-    return controlCodeFastStateFresh() ? String(controlCodeFastState.revision || '').trim() : '';
+    const state = controlCodeFastState || {};
+    const revision = String(state.revision || '').trim();
+    return revision && controlCodeFastStateFresh(state) ? revision : '';
   }
 
   function controlCodeReadinessMessage() {
-    if (!liveFrameReadyForControlCode()) return 'Gaida svaigu tiešraides kadru pirms koda pieprasījuma.';
     if (!spacetimeReadyForControlCode()) return 'Savienojas ar vadības kanālu pirms koda pieprasījuma.';
+    if (!liveFrameReadyForControlCode()) return 'Tālrunis sagatavo tiešraidi pirms koda pieprasījuma.';
     const state = controlCodeFastState || {};
     const status = String(state.status || 'missing');
-    if (status === 'cleanup') return 'Tālrunis atgriežas pie biļetes pēc iepriekšējā koda.';
-    if (status === 'blocked') return localizePublicMessage(state.reason || 'fast_state_stale');
-    return localizePublicMessage('fast_not_ready');
+    if (status === 'fast_ready' && controlCodeFastStateFresh()) return 'Gatavs';
+    if (status === 'cleanup') return 'Tālrunis pabeidz iepriekšējā koda tīrīšanu.';
+    if (status === 'blocked') return 'Tālrunis atjauno koda ceļu.';
+    return 'Tālrunis sagatavo koda ceļu.';
   }
 
   function streamReadyForControlCode() {
-    return controlCodeTransportReadyForControlCode() && controlCodeFastStateFresh();
+    return spacetimeReadyForControlCode() && controlCodeFastStateFresh();
   }
 
   function renderControlCodeFastStateDataset() {
@@ -4654,6 +4775,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeRequestBusyForAutoPrepare() {
+    if (controlCodeSubmitInFlight) return true;
     if (!codeRequest) return false;
     const status = String(codeRequest.status || '');
     if (status === 'queued' || status === 'running') return true;
@@ -4665,7 +4787,8 @@ import { html, reactive } from '@arrow-js/core';
       codeResultArea.hidden;
   }
 
-  function refreshControlCodeReadiness(reason) {
+  function refreshControlCodeReadiness(reason, options) {
+    const allowPrepare = !options || options.prepare !== false;
     if (!liveFrameReadyForControlCode()) {
       connectDirectVideo();
       requestServerRecoveryDebounced(reason || 'control_code_wait_for_live_frame');
@@ -4673,7 +4796,7 @@ import { html, reactive } from '@arrow-js/core';
     if (!spacetimeReadyForControlCode()) {
       connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     }
-    if (controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh()) {
+    if (allowPrepare && spacetimeReadyForControlCode() && !controlCodeFastStateFresh()) {
       maybeAutoPrepareControlCode(reason || 'control_code_wait_for_fast_ready');
     }
     updateControlCodeSubmitAvailability();
@@ -4682,7 +4805,7 @@ import { html, reactive } from '@arrow-js/core';
   function maybeAutoPrepareControlCode(reason) {
     if (document.visibilityState === 'hidden') return;
     if (!codeResultArea.hidden) return;
-    if (controlCodeAutoPrepareInFlight || !controlCodeTransportReadyForControlCode()) return;
+    if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;
     if (controlCodeFastStateFresh()) return;
     const busy = controlCodeRequestBusyForAutoPrepare();
     if (busy) return;
@@ -4698,16 +4821,42 @@ import { html, reactive } from '@arrow-js/core';
       });
   }
 
+  function controlCodeRequestOccupiesPhone(request) {
+    if (!request) return false;
+    const expiresAt = controlCodeRequestExpiryTime(request);
+    if (expiresAt && Date.now() + serverClockSkewMs > expiresAt + 1000) return false;
+    const status = String(request.status || '');
+    if (status === 'queued' || status === 'running') return true;
+    if (request.cleanupPending === true) return true;
+    return status === 'succeeded' && request.captureRequired === true && request.captureAcknowledged !== true;
+  }
+
+  function controlCodeRequestOccupiesQueue() {
+    if (controlCodeSubmitInFlight) return true;
+    if (controlCodeRequestOccupiesPhone(codeRequest)) return true;
+    const requests = Array.isArray(currentState && currentState.controlCodeRequests)
+      ? currentState.controlCodeRequests
+      : [];
+    return requests.some((request) => controlCodeRequestOccupiesPhone(request));
+  }
+
   function updateControlCodeSubmitAvailability() {
     renderControlCodeFastStateDataset();
-    const busy = codeRequest && (codeRequest.status === 'queued' || codeRequest.status === 'running');
-    const unavailable = Boolean(busy) || !streamReadyForControlCode();
-    codeSubmit.disabled = unavailable || !codeDialogOpen;
-    requestCodeButton.disabled = unavailable;
-    const hotspotUnavailable = unavailable && codeResultArea.hidden;
+    const busy = controlCodeRequestOccupiesQueue();
+    const digitCount = sanitizeControlDigits(codeDigits.value).length;
+    const digitsValid = digitCount >= 2 && digitCount <= 8;
+    codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;
+    codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';
+    if (controlCodeSubmitInFlight) {
+      codeSubmit.setAttribute('aria-busy', 'true');
+    } else {
+      codeSubmit.removeAttribute('aria-busy');
+    }
+    requestCodeButton.disabled = busy;
+    const hotspotUnavailable = busy && codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
-    if (!busy && controlCodeTransportReadyForControlCode() && !controlCodeFastStateFresh()) {
+    if (!busy && spacetimeReadyForControlCode() && !controlCodeFastStateFresh()) {
       maybeAutoPrepareControlCode('page_ready_control_code');
     }
   }
@@ -6050,6 +6199,7 @@ import { html, reactive } from '@arrow-js/core';
         await new Promise(r => requestAnimationFrame(() => setTimeout(r, 200)));
         try {
           codeDigits.value = pickDigits();
+          codeDigits.dispatchEvent(new Event('input', { bubbles: true }));
           const submitBtn = document.getElementById('controlCodeSubmit');
           if (submitBtn) submitBtn.click();
         } catch (_) {}

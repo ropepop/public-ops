@@ -6,6 +6,7 @@
 **/.artifacts
 **/output
 **/node_modules
+**/target
 **/__pycache__
 **/*.pyc
 
@@ -14,4 +15,3 @@ ops/evidence
 ops/reports
 state/pixel-diagnostics
 workloads/site-notifications/state
-

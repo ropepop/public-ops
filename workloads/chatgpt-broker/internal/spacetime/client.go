@@ -185,16 +185,6 @@ func (c *Client) RequestCancel(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
-func (c *Client) MarkSucceeded(ctx context.Context, jobID, attemptID, resultText string) error {
-	_, err := c.Call(ctx, "chatgptbroker_mark_succeeded", []any{jobID, attemptID, resultText})
-	return err
-}
-
-func (c *Client) MarkFailed(ctx context.Context, jobID, attemptID, failureCode string, retryable bool, publicStatus string) error {
-	_, err := c.Call(ctx, "chatgptbroker_mark_failed", []any{jobID, attemptID, failureCode, retryable, publicStatus})
-	return err
-}
-
 func (c *Client) MarkNotified(ctx context.Context, jobID string) error {
 	_, err := c.Call(ctx, "chatgptbroker_mark_notified", []any{jobID})
 	return err

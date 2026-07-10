@@ -17,6 +17,33 @@ func ticketRemoteSourceFile(t *testing.T, parts ...string) string {
 	return string(body)
 }
 
+func TestGoRuntimeUsesDirectPhoneBridgeWithoutRetiredBrokerLayer(t *testing.T) {
+	sources := []string{
+		ticketRemoteSourceFile(t, "internal", "config", "config.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "server.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "relay_viewers.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "control_code.go"),
+	}
+	for _, source := range sources {
+		for _, retired := range []string{
+			"Broker" + "BaseURL",
+			"TICKET_REMOTE_PHONE_" + "BROKER_URL",
+			"phone" + "BrokerHTTPClient",
+			"publishTicket" + "Presence",
+			"acquireTicketPhone" + "LeaseAsync",
+			"releaseTicketPhone" + "LeaseAsync",
+		} {
+			if strings.Contains(source, retired) {
+				t.Fatalf("Go runtime still contains retired phone-broker marker %q", retired)
+			}
+		}
+	}
+	leasePath := filepath.Join("..", "..", "internal", "web", "ticket_phone_"+"lease.go")
+	if _, err := os.Stat(leasePath); !os.IsNotExist(err) {
+		t.Fatalf("retired phone lease source still exists or could not be checked: %v", err)
+	}
+}
+
 func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 
@@ -60,14 +87,17 @@ func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 	}
 }
 
-func TestSafeOperationalLogsAreImmediateCheapRows(t *testing.T) {
+func TestSafeOperationalLogsUseBoundedSamplingAndOneRowLookup(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 
 	for _, required := range []string{
 		"pub fn ticketremote_append_safe_operational_log(\n    ctx: &ReducerContext,\n    id: String,",
 		"pub fn ticketremote_member_append_safe_operational_log(\n    ctx: &ReducerContext,\n    id: String,",
 		"detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),",
-		"id: safe_log_row_id(",
+		"let row_id = safe_log_sample_interval_ms(&level, &event)",
+		"sampled_safe_log_row_id(&ticket.id, &source, &event, now, interval_ms)",
+		".id()\n        .find(&row_id)",
+		"id: row_id,",
 		"ctx.db\n        .ticketremote_safe_operational_log()\n        .insert(TicketremoteSafeOperationalLog",
 	} {
 		if !strings.Contains(source, required) {
@@ -78,13 +108,21 @@ func TestSafeOperationalLogsAreImmediateCheapRows(t *testing.T) {
 	logBody := sourceBetween(t, source, "fn insert_safe_operational_log(", "fn safe_log_row_id(")
 	for _, forbidden := range []string{
 		"next_audit_ordinal",
-		"sampled_safe_log_event",
 		"coalesced_safe_log_detail",
-		".find(&id)",
 		".update(",
 	} {
 		if strings.Contains(logBody, forbidden) {
 			t.Fatalf("safe log insert path must not read/coalesce/update rows: %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"fn safe_log_sample_interval_ms(",
+		`"command_queued"`,
+		`"keyframe_requested"`,
+		"Some(60_000)",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("safe log sampling policy missing %q", required)
 		}
 	}
 
@@ -159,6 +197,59 @@ func TestSpacetimeBrowserClientSubscribesOnlyCurrentProductTables(t *testing.T) 
 	}
 }
 
+func TestSpacetimeBrowserInstallsCSPSafeCodecsBeforeBuildingConnection(t *testing.T) {
+	client := ticketRemoteSourceFile(t, "web-client", "src", "index.ts")
+	codecs := ticketRemoteSourceFile(t, "web-client", "src", "csp-safe-codecs.ts")
+	bundle := ticketRemoteSourceFile(t, "internal", "web", "static", "spacetime-client.js")
+
+	for _, required := range []string{
+		"const productSerializers = new WeakMap",
+		"const productDeserializers = new WeakMap",
+		"const sumSerializers = new WeakMap",
+		"const sumDeserializers = new WeakMap",
+		"ProductType.makeSerializer = productSerializer;",
+		"ProductType.makeDeserializer = productDeserializer;",
+		"SumType.makeSerializer = sumSerializer;",
+		"SumType.makeDeserializer = sumDeserializer;",
+		"__timestamp_micros_since_unix_epoch__",
+		"ty.variants[1].algebraicType",
+	} {
+		if !strings.Contains(codecs, required) {
+			t.Fatalf("CSP-safe Spacetime codec installer missing %q", required)
+		}
+	}
+	if strings.Contains(codecs, "Function(") {
+		t.Fatalf("CSP-safe Spacetime codec installer must not use the Function constructor")
+	}
+
+	for name, body := range map[string]string{"source": client, "bundle": bundle} {
+		installAt := strings.Index(body, "installCspSafeSpacetimeCodecs();")
+		connectAt := strings.Index(body, "const builder = DbConnection.builder()")
+		if installAt < 0 || connectAt < 0 {
+			t.Fatalf("%s missing codec installation or connection construction marker", name)
+		}
+		if installAt > connectAt {
+			t.Fatalf("%s must install CSP-safe codecs before constructing a Spacetime connection", name)
+		}
+	}
+
+	connectBody := sourceBetween(t, client, "  connect(): void {", "  disconnect(markDisconnected")
+	for _, required := range []string{
+		"try {",
+		"const builder = DbConnection.builder()",
+		"} catch (error) {",
+		"this.connected = false;",
+		"this.conn = null;",
+		"this.handlers.onStatus?.(\"offline\", connectionError.message);",
+		"this.rejectReadyWaiters(connectionError);",
+		"if (!this.manuallyDisconnected) this.scheduleReconnect();",
+	} {
+		if !strings.Contains(connectBody, required) {
+			t.Fatalf("Spacetime connection must recover from synchronous construction failures, missing %q", required)
+		}
+	}
+}
+
 func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 	sidecar := ticketRemoteSourceFile(t, "spacetime-sidecar", "src", "main.rs")
 	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
@@ -170,10 +261,7 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"SELECT * FROM ticketremote_service_ticket",
 		"SELECT * FROM ticketremote_service_ticket_member",
 		"SELECT * FROM ticketremote_service_phone_backend",
-		"SELECT * FROM ticketremote_stream_desired_state WHERE id =",
 		"SELECT * FROM ticketremote_phone_current_report WHERE id =",
-		"SELECT * FROM ticketremote_relay_current_report WHERE id =",
-		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 	} {
 		if !strings.Contains(sidecar, required) {
 			t.Fatalf("sidecar missing current subscription %q", required)
@@ -188,6 +276,9 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"\"/signal\"",
 		"SELECT * FROM ticketremote_service_stream_command",
 		"SELECT * FROM ticketremote_stream_command_signal WHERE ticketId =",
+		"SELECT * FROM ticketremote_stream_desired_state WHERE id =",
+		"SELECT * FROM ticketremote_relay_current_report WHERE id =",
+		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 		"ticketremote_purge_expired_stream_commands",
 		"ticketremote_service_stream_command().iter()",
 		"ticketremote_service_safe_operational_log",
@@ -258,8 +349,8 @@ func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
 	if !strings.Contains(module, "upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);") {
 		t.Fatalf("desired-state changes must wake the Pixel signal row")
 	}
-	if !strings.Contains(module, `"keyframe" | "recover_stream" | "prepare_control_code"`) {
-		t.Fatalf("warm prepare commands must be deduped like other low-value repeated commands")
+	if !strings.Contains(module, `"start" | "keyframe" | "recover_stream" | "prepare_control_code"`) {
+		t.Fatalf("background stream commands must be deduped like other low-value repeated commands")
 	}
 	if strings.Contains(module, "lastFrameAgoMillis: last_frame_ago_millis") {
 		t.Fatalf("relay current report must not write a constantly changing frame age")
@@ -343,6 +434,203 @@ func TestStreamViewerFocusUsesSafePublicIDs(t *testing.T) {
 	}
 	if strings.Contains(browser, "viewerPresence: []") {
 		t.Fatalf("browser client must not publish an always-empty viewerPresence list")
+	}
+}
+
+func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	insertRequest := substringBetween(t, module,
+		"fn insert_control_code_public_request(",
+		"#[derive(Default)]\nstruct ControlCodeChanges")
+	appendReducer := substringBetween(t, module,
+		"pub fn ticketremote_append_stream_command(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_ack_stream_command")
+	prepareReducer := substringBetween(t, module,
+		"pub fn ticketremote_member_prepare_control_code(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_request_control_code")
+	keyframeReducer := substringBetween(t, module,
+		"pub fn ticketremote_member_request_keyframe(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_recover_stream")
+	recoveryReducer := substringBetween(t, module,
+		"pub fn ticketremote_member_recover_stream(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_prepare_control_code")
+	helper := substringBetween(t, module,
+		"fn live_relay_suppresses_background_stream_command(",
+		"fn json_i64(")
+
+	for _, reducer := range []struct {
+		name string
+		body string
+	}{
+		{"keyframe", keyframeReducer},
+		{"recover_stream", recoveryReducer},
+	} {
+		if strings.Contains(reducer.body, "live_relay_suppresses_background_stream_command(") {
+			t.Fatalf("%s member reducer must not use relay-wide liveness to suppress one stale requester", reducer.name)
+		}
+		for _, required := range []string{"client_email_from_auth", "insert_stream_command(", `("source", "browser")`} {
+			if !strings.Contains(reducer.body, required) {
+				t.Fatalf("%s member reducer missing requester-scoped marker %q", reducer.name, required)
+			}
+		}
+	}
+	for _, required := range []string{
+		`status: "queued".into(),`,
+		`reason: "requested".into(),`,
+		"requestedAt: now.into(),",
+		"updatedAt: now.into(),",
+	} {
+		if !strings.Contains(insertRequest, required) {
+			t.Fatalf("accepted control-code request must become active immediately, missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"ticketremote_relay_current_report().id().find(id)",
+		"clean_reason.contains(\"control_code\")",
+		"report.videoClients == 0 || report.streamVerdict != \"live\"",
+		"STREAM_BACKGROUND_REPORT_MAX_AGE_MS",
+		"lastFrameVisualAgeMillis",
+		"liveFrameMaxAgeMillis",
+	} {
+		if !strings.Contains(helper, required) {
+			t.Fatalf("live relay suppression helper missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"suppressible_background_stream_command(&command_type)",
+		"command_type == \"prepare_control_code\"",
+		"control_code_fast_state_current_ready(ctx, &ticketId, &backendId, &now)",
+		"live_relay_suppresses_background_stream_command(",
+		"return Ok(());",
+	} {
+		if !strings.Contains(appendReducer, required) {
+			t.Fatalf("service stream command append reducer missing live suppression marker %q", required)
+		}
+	}
+	for _, required := range []string{
+		"control_code_fast_state_current_ready(ctx, &ticket.id, &backend_id, &now)",
+		"return Ok(());",
+		"insert_stream_command(",
+	} {
+		if !strings.Contains(prepareReducer, required) {
+			t.Fatalf("member prepare reducer missing fast-ready suppression marker %q", required)
+		}
+	}
+	for _, required := range []string{
+		"ticketremote_phone_current_report().id().find(id)",
+		"report.desiredActive",
+		"streamActive",
+		"sessionState",
+		"relayStreamState",
+		"hardwareH264Active",
+		"hardwareH264Visibility",
+		"streamWatchdogStage",
+		"activeVideoClients",
+		"videoClients",
+		"relayViewers",
+	} {
+		if !strings.Contains(helper, required) {
+			t.Fatalf("live phone suppression fallback missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"fn control_code_fast_state_current_ready(",
+		"row.status == \"fast_ready\"",
+		"row.rawTicketConfirmed",
+		"row.cleanupClear",
+		"row.streamLive",
+		"parse_time_ms(&row.expiresAt) > parse_time_ms(now)",
+	} {
+		if !strings.Contains(module, required) {
+			t.Fatalf("fast-ready prepare suppression helper missing %q", required)
+		}
+	}
+}
+
+func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	reducer := substringBetween(t, module,
+		"pub fn ticketremote_member_request_control_code(",
+		"#[spacetimedb::reducer]\npub fn ticketremote_member_confirm_control_code_browser_capture")
+	for _, required := range []string{
+		"client_email_from_auth(ctx, &ticket.id)?",
+		"valid_control_code_digits(&clean_digits)",
+		"ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now)",
+		`return Err("request_in_progress".into());`,
+		"CONTROL_CODE_RATE_LIMIT",
+		"control_code_submit_mode(fast_state_ready)",
+		`"fastStateReadyAtSubmit": fast_state_ready`,
+		`"submitMode": submit_mode`,
+		"insert_control_code_public_request(",
+		`"generate_control_code"`,
+		"unwrap_or_else(|| now.clone())",
+	} {
+		if !strings.Contains(reducer, required) {
+			t.Fatalf("queue-first control-code reducer missing %q", required)
+		}
+	}
+	if strings.Contains(reducer, `return Err("fast_not_ready".into());`) {
+		t.Fatalf("cold fast state must be telemetry, not a request admission gate")
+	}
+	if strings.Contains(reducer, "unwrap_or_else(|| expectedFastRevision.clone())") {
+		t.Fatalf("browser fast revision must not overwrite the authoritative server state")
+	}
+	for _, required := range []string{
+		`"fast_ready"`,
+		`"queued_warmup"`,
+		`matches!(row.status.as_str(), "queued" | "running")`,
+		"row.cleanupPending",
+		`row.status == "succeeded" && row.captureRequired && !row.captureAcknowledged`,
+		".ticketremote_control_code_request()",
+		".ticketId()",
+	} {
+		if !strings.Contains(module, required) {
+			t.Fatalf("control-code phone occupancy contract missing %q", required)
+		}
+	}
+}
+
+func TestTerminalControlCodeUpdateAtomicallyAcknowledgesGenerateCommand(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	updateReducer := substringBetween(t, module,
+		"pub fn ticketremote_update_control_code_request(",
+		"fn control_code_cleanup_reason(")
+
+	for _, required := range []string{
+		"if succeeded || terminal_failure",
+		`&format!("{}:generate_control_code", requestId.trim())`,
+		`"acknowledged"`,
+		`"terminal_request_published"`,
+	} {
+		if !strings.Contains(updateReducer, required) {
+			t.Fatalf("terminal request reducer missing atomic command acknowledgement marker %q", required)
+		}
+	}
+}
+
+func TestSensitiveControlCodeOperationalLogsHaveNarrowServicePurge(t *testing.T) {
+	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	body := sourceBetween(
+		t,
+		source,
+		"pub fn ticketremote_purge_sensitive_operational_logs(",
+		"pub fn ticketremote_cleanup_expired(",
+	)
+
+	for _, required := range []string{
+		"require_service(ctx)?;",
+		".ticketremote_safe_operational_log()",
+		".ticketId()",
+		`"pixel_ticket_control_code_result"`,
+		`"pixel_ticket_control_code_request_result_detected"`,
+		".delete(&row.id)",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("sensitive-log purge missing %q", required)
+		}
+	}
+	if strings.Contains(body, "detailJson") {
+		t.Fatal("sensitive-log purge must identify rows only by bounded event name")
 	}
 }
 

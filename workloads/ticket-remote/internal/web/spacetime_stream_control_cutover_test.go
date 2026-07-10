@@ -47,12 +47,14 @@ func TestStreamControlCutoverUsesSpacetimeCommandsAndVideoOnlyRelay(t *testing.T
 			"SetStreamDesiredState",
 			"AppendStreamCommand",
 			"UpdateRelayCurrentReport",
+			"relayReportLoop",
+			"relayReportHeartbeat",
+			"backgroundStreamCommandRequiresDemand",
 		},
 		"server.go": {
 			"publishRelayCurrentReportAsync",
-			"relayReportLoop",
 			"handleVideoStreamMessage",
-			"ctx.Err() != nil && errors.Is(err, context.Canceled)",
+			"identifyMember(w, r)",
 		},
 		"control_code.go": {
 			"appendStreamCommand(ctx, \"generate_control_code\"",

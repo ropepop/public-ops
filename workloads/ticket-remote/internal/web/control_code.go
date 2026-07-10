@@ -171,14 +171,12 @@ func (s *Server) retainControlCodeRelay(requestID string) {
 		return
 	}
 	hold := controlCodePhoneResultWait + controlCodePhoneCleanupWait + 5*time.Second
-	s.acquireTicketPhoneLeaseAsync(leaseID, requestID, "control_code_request", hold)
 	s.retainRelayViewerForPrewarm(leaseID, hold)
 }
 
 func (s *Server) releaseControlCodeRelay(requestID string) {
 	if leaseID := controlCodeRelayLeaseID(requestID); leaseID != "" {
 		s.releaseRetainedRelayViewer(leaseID)
-		s.releaseTicketPhoneLeaseAsync(leaseID, requestID)
 	}
 }
 
@@ -1317,7 +1315,6 @@ func (s *Server) handleControlCodePrepareHTTP(w http.ResponseWriter, r *http.Req
 	}
 	_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 1024))
 	prepareLeaseID := controlCodePrepareRelayLeaseID(sessionID)
-	s.acquireTicketPhoneLeaseAsync("prepare:"+prepareLeaseID, prepareLeaseID, "control_code_prepare", controlCodePrepareRelayHold)
 	s.retainRelayViewerForPrewarm(prepareLeaseID, controlCodePrepareRelayHold)
 	if !s.preparePhoneRelayForControlCode("dialog_open", controlCodeRelayConnectWait) {
 		writeJSON(w, http.StatusAccepted, map[string]any{

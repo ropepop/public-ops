@@ -41,6 +41,13 @@ Deploy only one service or a few services:
 ./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
+Use an explicit validation profile for targeted iteration:
+
+```bash
+./tools/arbuzas/deploy.sh deploy --services ticket_remote --validation-profile fast --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --services ticket_remote --validation-profile standard --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
+```
+
 Notes for targeted updates:
 
 - `--services` is available only for `deploy` and `validate`.
@@ -48,6 +55,10 @@ Notes for targeted updates:
 - `train_bot`, `satiksme_bot`, and `subscription_bot` automatically bring along their matching tunnel service so the public route stays aligned.
 - `site-notifications` is kept in the repo for reference and testing, but it is not part of the active kitty-gration deploy set.
 - Targeted validation checks the slice you touched instead of forcing a full-stack validation pass.
+- `fast` is the inner iteration lane. It requires `--services`, reuses the unchanged release content, restarts only the selected slice, runs bounded readiness probes concurrently, and defers remote Docker/release cleanup. It still prunes expired local release artifacts after successful validation.
+- `standard` is the targeted confidence lane. It validates the selected workload more deeply while still avoiding unrelated full-stack checks.
+- `full` is the release lane and remains the default for unscoped deploys. It validates the complete host and performs release and image cleanup.
+- Finish a sequence of fast iterations with an unscoped full deploy and validation. A fast release deliberately preserves unchanged service images and is not a replacement for the canonical full release.
 
 Validate an existing release:
 
@@ -124,6 +135,7 @@ Re-run the fan-controller checks without reinstalling it:
 - runs `docker compose -p arbuzas up -d --build`
 - when `--services` is set, rebuilds and restarts only the requested services instead of the full stack
 - validates Portainer, apps, and tunnels
+- after every successful validation profile, prunes expired local bundles under `output/arbuzas/releases` while protecting the deployed release
 - prunes unused Docker images after they have stayed unprotected for 7 days
 - prunes old release bundles beyond the newest 10 per release family
 - prunes Docker build cache older than 7 days
@@ -144,11 +156,13 @@ Rollback re-runs the same post-validation cleanup policy after the host is healt
 
 ## Cleanup
 
-The active kitty-gration runtime now applies cleanup in three ways:
+The deployment workflow applies cleanup in three ways:
 
-- automatically after a successful `deploy`
-- automatically after a successful `rollback`
-- manually through `./tools/arbuzas/deploy.sh cleanup-docker`
+- local release cleanup after every successful `deploy` profile and successful `rollback`
+- full remote cleanup after a successful `full` deploy or rollback
+- manual remote cleanup through `./tools/arbuzas/deploy.sh cleanup-docker`
+
+Local release cleanup is separate from remote Docker cleanup. It considers only direct child directories of `output/arbuzas/releases`, protects the deployed or rolled-back release id, and defaults to a 72-hour window with at most 10 releases per family. A release is selected when it is expired or exceeds the family limit. Files and symbolic links in that root are ignored, and evidence, state, secrets, databases, browser sessions, and workload paths are outside the managed root.
 
 What the cleanup protects:
 
@@ -181,6 +195,8 @@ What the cleanup does not touch:
 
 Implementation notes for operators:
 
+- Local release retention defaults to `ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS=72` and `ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY=10`.
+- Set `ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN=true` to preview deploy-time local cleanup without deleting bundles.
 - Cleanup state is tracked under `/etc/arbuzas/docker-gc/state.json`.
 - Release bundle retention defaults to `DOCKER_GC_RELEASE_KEEP_PER_FAMILY=10`.
 - Host scratch retention defaults to `ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS=7`.

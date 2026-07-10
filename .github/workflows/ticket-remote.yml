@@ -1,0 +1,132 @@
+name: Ticket Remote
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ticket-remote.yml"
+      - "infra/arbuzas/docker/**"
+      - "infra/arbuzas/host-mirror/**"
+      - "tools/arbuzas/deploy.sh"
+      - "test_arbuzas_deploy_contract.sh"
+      - "test_ticket_phone_bridge_hardening.sh"
+      - "workloads/ticket-remote/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ticket-remote.yml"
+      - "infra/arbuzas/docker/**"
+      - "infra/arbuzas/host-mirror/**"
+      - "tools/arbuzas/deploy.sh"
+      - "test_arbuzas_deploy_contract.sh"
+      - "test_ticket_phone_bridge_hardening.sh"
+      - "workloads/ticket-remote/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ticket-remote-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: workloads/ticket-remote
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: workloads/ticket-remote/go.mod
+          cache-dependency-path: workloads/ticket-remote/go.sum
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - run: govulncheck ./...
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy,rustfmt
+      - run: cargo fmt --check
+        working-directory: workloads/ticket-remote/spacetime-sidecar
+      - run: cargo fmt --check
+        working-directory: workloads/ticket-remote/spacetimedb
+      - run: cargo test --locked
+        working-directory: workloads/ticket-remote/spacetime-sidecar
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: workloads/ticket-remote/spacetime-sidecar
+      - run: cargo check --locked
+        working-directory: workloads/ticket-remote/spacetimedb
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: workloads/ticket-remote/spacetimedb
+      - run: cargo build --locked --release --target wasm32-unknown-unknown
+        working-directory: workloads/ticket-remote/spacetimedb
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit
+        working-directory: workloads/ticket-remote/spacetime-sidecar
+      - run: cargo audit
+        working-directory: workloads/ticket-remote/spacetimedb
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            workloads/ticket-remote/web-client/package-lock.json
+            workloads/ticket-remote/spacetimedb/package-lock.json
+      - run: npm ci
+        working-directory: workloads/ticket-remote/web-client
+      - run: npm ci
+        working-directory: workloads/ticket-remote/spacetimedb
+      - run: npx tsc --noEmit
+        working-directory: workloads/ticket-remote/web-client
+      - run: npm run check:spacetime-sdk
+        working-directory: workloads/ticket-remote/web-client
+      - run: npm run test:csp-codecs
+        working-directory: workloads/ticket-remote/web-client
+      - run: npm run build:ticket-app
+        working-directory: workloads/ticket-remote/web-client
+      - run: git diff --exit-code -- workloads/ticket-remote/internal/web/static/app.js
+      - run: npm audit --audit-level=high
+        working-directory: workloads/ticket-remote/web-client
+      - run: npm audit --audit-level=high
+        working-directory: workloads/ticket-remote/spacetimedb
+
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash ./test_ticket_phone_bridge_hardening.sh
+      - run: bash ./test_arbuzas_deploy_contract.sh
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -f infra/arbuzas/docker/images/ticket-remote.Dockerfile -t ticket-remote:ci .
+      - run: docker build -f infra/arbuzas/docker/images/ticket-remote-spacetime-sidecar.Dockerfile -t ticket-remote-spacetime-sidecar:ci .
+      - name: Verify non-root runtimes
+        run: |
+          for image in ticket-remote:ci ticket-remote-spacetime-sidecar:ci; do
+            runtime_user="$(docker image inspect --format '{{.Config.User}}' "$image")"
+            test -n "$runtime_user"
+            test "$runtime_user" != "0"
+            test "$runtime_user" != "0:0"
+          done

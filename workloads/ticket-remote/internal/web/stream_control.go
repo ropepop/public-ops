@@ -64,13 +64,58 @@ func (s *Server) publishStreamDesiredState(ctx context.Context, active bool, vie
 }
 
 func (s *Server) publishRelayCurrentReportAsync(reason string) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
-		defer cancel()
-		if err := s.publishRelayCurrentReport(ctx, time.Now(), reason); err != nil {
-			s.recordRuntimeErrorAsync("relay_report_publish_failed", reason, err, map[string]any{"reason": reason})
+	if s == nil || s.relayReportWake == nil {
+		return
+	}
+	reason = cleanStreamControlText(reason, "relay_state_changed")
+	select {
+	case s.relayReportWake <- reason:
+	default:
+		// A report is already queued. The shared reporter will publish the
+		// latest aggregate state after the short coalescing window.
+	}
+}
+
+func (s *Server) relayReportLoop(ctx context.Context) {
+	defer close(s.relayReportDone)
+	heartbeat := time.NewTicker(relayReportHeartbeat)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case reason := <-s.relayReportWake:
+			reason = s.coalesceRelayReportReason(ctx, reason)
+			s.publishRelayCurrentReportFromLoop(ctx, reason)
+		case <-heartbeat.C:
+			if s.streamDemandStillPresent() {
+				s.publishRelayCurrentReportFromLoop(ctx, "video_socket_heartbeat")
+			}
 		}
-	}()
+	}
+}
+
+func (s *Server) coalesceRelayReportReason(ctx context.Context, reason string) string {
+	timer := time.NewTimer(relayReportCoalesceWindow)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return reason
+		case next := <-s.relayReportWake:
+			reason = next
+		case <-timer.C:
+			return reason
+		}
+	}
+}
+
+func (s *Server) publishRelayCurrentReportFromLoop(ctx context.Context, reason string) {
+	writeCtx, cancel := context.WithTimeout(ctx, streamControlWriteTimeout)
+	defer cancel()
+	if err := s.publishRelayCurrentReport(writeCtx, time.Now(), reason); err != nil && ctx.Err() == nil {
+		s.recordRuntimeErrorAsync("relay_report_publish_failed", reason, err, map[string]any{"reason": reason})
+	}
 }
 
 func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, reason string) error {
@@ -241,6 +286,8 @@ func (s *Server) scheduleIdleStreamDesiredRelease(reason string) {
 }
 
 func (s *Server) releaseStreamDesiredIfNoVideoClients(reason string) bool {
+	s.streamLifecycleMu.Lock()
+	defer s.streamLifecycleMu.Unlock()
 	if s.store == nil {
 		return false
 	}
@@ -300,12 +347,24 @@ func (s *Server) appendStreamRecoveryCommandAsync(reason string) {
 			s.noteStreamAutoRecoveryResult("failed", reason, commandID, err)
 			return
 		}
+		if commandID == "" {
+			s.noteStreamAutoRecoveryResult("suppressed_no_demand", reason, "", nil)
+		}
 	}()
 }
 
 func (s *Server) appendStreamCommand(ctx context.Context, commandType string, reason string, payload map[string]any, ttl time.Duration) (string, error) {
 	if s.store == nil {
 		return "", nil
+	}
+	guardDemand := backgroundStreamCommandRequiresDemand(commandType, reason)
+	if guardDemand {
+		s.streamLifecycleMu.RLock()
+		defer s.streamLifecycleMu.RUnlock()
+		if !s.streamDemandStillPresent() {
+			s.direct.recordClientTelemetry("stream_command_suppressed_no_demand", cleanStreamControlText(commandType, "command"))
+			return "", nil
+		}
 	}
 	now := time.Now()
 	backend := s.activePhoneBackend()
@@ -368,6 +427,20 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
 	}
 	return commandID, err
+}
+
+func backgroundStreamCommandRequiresDemand(commandType string, reason string) bool {
+	commandType = strings.ToLower(strings.TrimSpace(commandType))
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	if strings.Contains(reason, "control_code") {
+		return false
+	}
+	switch commandType {
+	case "start", "keyframe", "recover_stream":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) beginStreamAutoRecovery(reason string, now time.Time) bool {

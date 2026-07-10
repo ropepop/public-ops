@@ -14,9 +14,37 @@ import (
 
 type streamDesiredRecordingStore struct {
 	state.Store
-	desired chan<- state.StreamDesiredStateInput
-	phone   chan<- state.PhoneCurrentReportInput
-	logs    chan<- state.SafeOperationalLogInput
+	desired      chan<- state.StreamDesiredStateInput
+	phone        chan<- state.PhoneCurrentReportInput
+	relayReports chan<- state.RelayCurrentReportInput
+	commands     chan<- state.StreamCommandInput
+	logs         chan<- state.SafeOperationalLogInput
+}
+
+func (s *streamDesiredRecordingStore) AppendStreamCommand(ctx context.Context, input state.StreamCommandInput) error {
+	if err := s.Store.AppendStreamCommand(ctx, input); err != nil {
+		return err
+	}
+	if s.commands != nil {
+		select {
+		case s.commands <- input:
+		default:
+		}
+	}
+	return nil
+}
+
+func (s *streamDesiredRecordingStore) UpdateRelayCurrentReport(ctx context.Context, input state.RelayCurrentReportInput) error {
+	if err := s.Store.UpdateRelayCurrentReport(ctx, input); err != nil {
+		return err
+	}
+	if s.relayReports != nil {
+		select {
+		case s.relayReports <- input:
+		default:
+		}
+	}
+	return nil
 }
 
 func (s *streamDesiredRecordingStore) SetStreamDesiredState(ctx context.Context, input state.StreamDesiredStateInput) error {
@@ -152,6 +180,61 @@ func TestRelayViewerPublishesDesiredActiveAndTrace(t *testing.T) {
 	}
 	if !strings.Contains(got.DetailJSON, `"viewerCount":1`) {
 		t.Fatalf("viewer trace missing viewer count: %s", got.DetailJSON)
+	}
+}
+
+func TestRelayReportEventsAreCoalescedByOneServerReporter(t *testing.T) {
+	if relayReportHeartbeat <= time.Second || relayReportHeartbeat > 5*time.Second {
+		t.Fatalf("relay heartbeat = %s, want a bounded cadence above one write per second", relayReportHeartbeat)
+	}
+	reports := make(chan state.RelayCurrentReportInput, 8)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{relayReports: reports})
+	for i := 0; i < 20; i++ {
+		server.publishRelayCurrentReportAsync("viewer_state_changed")
+	}
+	select {
+	case <-reports:
+	case <-time.After(time.Second):
+		t.Fatal("coalesced relay report was not published")
+	}
+	select {
+	case report := <-reports:
+		t.Fatalf("burst produced a duplicate relay report: %#v", report)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestIdleDesiredStateBlocksLateStartAndRecoveryCommands(t *testing.T) {
+	desired := make(chan state.StreamDesiredStateInput, 8)
+	commands := make(chan state.StreamCommandInput, 8)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{desired: desired, commands: commands})
+
+	server.addRelayViewer("viewer-one")
+	server.removeRelayViewer("viewer-one")
+	server.cancelIdleStreamDesiredRelease()
+	if !server.releaseStreamDesiredIfNoVideoClients("test_idle_authority") {
+		t.Fatal("expected authoritative idle state to be published")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case update := <-desired:
+			if !update.DesiredActive && update.ViewerCount == 0 {
+				goto idlePublished
+			}
+		case <-deadline:
+			t.Fatal("idle desired state was not observed")
+		}
+	}
+
+idlePublished:
+	server.appendStreamCommandAsync("start", "late_prewarm", map[string]any{"source": "test"}, streamCommandTTL)
+	server.appendStreamRecoveryCommandAsync("late_viewer_recovery")
+	select {
+	case command := <-commands:
+		t.Fatalf("late background command escaped idle guard: %#v", command)
+	case <-time.After(350 * time.Millisecond):
 	}
 }
 

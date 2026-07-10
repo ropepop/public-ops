@@ -20,4 +20,4 @@ This directory is the active production deployment layout for the single-host ki
 - Active deploy flow: `tools/arbuzas/deploy.sh`
 
 Portainer runs directly against the local Docker socket on port `9443`. The live kitty-gration host must stay out of Docker Swarm, and the active repair flow now rewrites stale `tasks.agent` state in place before falling back to a clean first-run setup. The old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
-The ticket service talks only to the physical Pixel through `phone_broker`, which privately proxies to `ticket_phone_bridge`; there is no ticket device lab inside the production compose project.
+The ticket service talks privately and directly to `ticket_phone_bridge`, which owns the ADB connection to the physical Pixel. Stream desired state and commands are durable in SpacetimeDB; there is no ticket device lab or separate phone broker inside the production Compose project.

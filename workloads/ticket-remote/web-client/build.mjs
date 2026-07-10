@@ -3,11 +3,13 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync }
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { verifySpacetimeSDKCompatibility } from "./check-spacetime-sdk.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const generatedDir = path.join(__dirname, "src", "generated");
 const outFile = path.join(__dirname, "..", "internal", "web", "static", "spacetime-client.js");
-const generatedBanner = "/* Generated from web-client/src/index.ts. Edit sources under web-client/, not internal/web/static/spacetime-client.js. */";
+const browserSDKVersion = JSON.parse(readFileSync(path.join(__dirname, "package.json"), "utf8")).dependencies.spacetimedb;
+const generatedBanner = `/* Generated from web-client/src/index.ts. Built with SpacetimeDB browser SDK ${browserSDKVersion}. Edit sources under web-client/, not internal/web/static/spacetime-client.js. */`;
 
 rmSync(generatedDir, { recursive: true, force: true });
 mkdirSync(generatedDir, { recursive: true });
@@ -62,6 +64,7 @@ const allowedGeneratedFiles = new Set([
   "ticketremote_stream_desired_state_table.ts",
   "ticketremote_stream_viewer_focus_table.ts",
   "ticketremote_update_control_code_request_reducer.ts",
+  "ticketremote_update_control_code_fast_state_reducer.ts",
   "ticketremote_update_phone_current_report_reducer.ts",
   "ticketremote_update_phone_reducer.ts",
   "ticketremote_update_relay_current_report_reducer.ts",
@@ -188,3 +191,5 @@ await build({
   sourcemap: false,
   logLevel: "info",
 });
+
+verifySpacetimeSDKCompatibility();

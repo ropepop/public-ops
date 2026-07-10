@@ -33,7 +33,6 @@ PROFILES: dict[str, list[Entry]] = {
         Entry("tree", "etc/arbuzas/env"),
         Entry("tree", "etc/arbuzas/secrets"),
         Entry("tree", "etc/arbuzas/cloudflared"),
-        Entry("file", "etc/arbuzas/current/release.env"),
     ],
     "pixel": [
         Entry("tree", "data/local/pixel-stack/conf"),
@@ -56,9 +55,9 @@ SERVICE_ORDER = [
     "subscription_bot",
     "subscription_tunnel",
     "ticket_phone_bridge",
-    "phone_broker",
     "chatgpt_broker",
     "chatgpt_bot",
+    "ticket_remote_spacetime_sidecar",
     "ticket_remote",
     "ticket_remote_tunnel",
 ]
@@ -435,8 +434,6 @@ def add_service(services: set[str], name: str) -> None:
 
 def affected_services_for_path(rel: str) -> set[str]:
     services: set[str] = set()
-    if rel == "etc/arbuzas/current/release.env":
-        services.update(SERVICE_ORDER)
     if rel == "etc/arbuzas/env/train-bot.env":
         add_service(services, "train_bot")
     elif rel == "etc/arbuzas/env/satiksme-bot.env":
@@ -444,11 +441,19 @@ def affected_services_for_path(rel: str) -> set[str]:
     elif rel == "etc/arbuzas/env/subscription-bot.env":
         add_service(services, "subscription_bot")
     elif rel == "etc/arbuzas/env/ticket-remote.env":
+        add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
     elif rel == "etc/arbuzas/env/chatgpt-broker.env":
         add_service(services, "chatgpt_broker")
         add_service(services, "chatgpt_bot")
+    elif rel == "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret":
+        add_service(services, "ticket_remote_spacetime_sidecar")
+        add_service(services, "ticket_remote")
+    elif rel == "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem":
+        add_service(services, "ticket_remote_spacetime_sidecar")
+        add_service(services, "chatgpt_broker")
     elif rel.startswith("etc/arbuzas/secrets/ticket-remote/"):
+        add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
         add_service(services, "chatgpt_broker")
     elif rel.startswith("etc/arbuzas/secrets/android-adb/"):

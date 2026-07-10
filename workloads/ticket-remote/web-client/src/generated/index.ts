@@ -52,6 +52,7 @@ import TicketremoteRegisterServiceIdentityReducer from "./ticketremote_register_
 import TicketremoteRemoveMemberReducer from "./ticketremote_remove_member_reducer";
 import TicketremoteServiceBootstrapReducer from "./ticketremote_service_bootstrap_reducer";
 import TicketremoteSetStreamDesiredStateReducer from "./ticketremote_set_stream_desired_state_reducer";
+import TicketremoteUpdateControlCodeFastStateReducer from "./ticketremote_update_control_code_fast_state_reducer";
 import TicketremoteUpdateControlCodeRequestReducer from "./ticketremote_update_control_code_request_reducer";
 import TicketremoteUpdatePhoneReducer from "./ticketremote_update_phone_reducer";
 import TicketremoteUpdatePhoneCurrentReportReducer from "./ticketremote_update_phone_current_report_reducer";
@@ -95,6 +96,10 @@ const tablesSchema = __schema({
       { accessor: 'ticketBackend', name: 'ticketremote_control_code_fast_state_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
         'ticketId',
         'backendId',
+      ] },
+      { accessor: 'ticketExpiresAt', name: 'ticketremote_control_code_fast_state_ticket_id_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'expiresAt',
       ] },
       { accessor: 'ticketId', name: 'ticketremote_control_code_fast_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
         'ticketId',
@@ -275,6 +280,7 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_remove_member", TicketremoteRemoveMemberReducer),
   __reducerSchema("ticketremote_service_bootstrap", TicketremoteServiceBootstrapReducer),
   __reducerSchema("ticketremote_set_stream_desired_state", TicketremoteSetStreamDesiredStateReducer),
+  __reducerSchema("ticketremote_update_control_code_fast_state", TicketremoteUpdateControlCodeFastStateReducer),
   __reducerSchema("ticketremote_update_control_code_request", TicketremoteUpdateControlCodeRequestReducer),
   __reducerSchema("ticketremote_update_phone", TicketremoteUpdatePhoneReducer),
   __reducerSchema("ticketremote_update_phone_current_report", TicketremoteUpdatePhoneCurrentReportReducer),

@@ -57,8 +57,8 @@ type Server struct {
 	spacetime           *spacetimeTokenIssuer
 	spacetimeIssueToken func(telegramAuth, time.Time) (spacetimeIssuedToken, error)
 	telegramLogin       *telegramweb.LoginVerifier
-	authConfigRate      *clientRateLimiter
-	authCompleteRate    *clientRateLimiter
+	authConfigRate      *telegramweb.ClientRateLimiter
+	authCompleteRate    *telegramweb.ClientRateLimiter
 	notifier            RideNotifier
 	static              fs.FS
 	release             releaseInfo
@@ -133,8 +133,8 @@ func NewServer(cfg config.Config, appSvc *trainapp.Service, catalog *i18n.Catalo
 		loc:              loc,
 		now:              time.Now,
 		pathPrefix:       pathPrefix,
-		authConfigRate:   newClientRateLimiter(authConfigRequestsPerMinute, authRateLimitWindow),
-		authCompleteRate: newClientRateLimiter(authCompleteRequestsPerMinute, authRateLimitWindow),
+		authConfigRate:   telegramweb.NewClientRateLimiter(telegramweb.LoginConfigRequestsPerMinute, telegramweb.LoginRateLimitWindow),
+		authCompleteRate: telegramweb.NewClientRateLimiter(telegramweb.LoginCompleteRequestsPerMinute, telegramweb.LoginRateLimitWindow),
 		static:           staticFiles,
 		release:          release,
 		pageTemplate: template.Must(template.New("shell").Parse(`<!doctype html>
@@ -1232,8 +1232,8 @@ func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusServiceUnavailable, "Telegram Login is not configured")
 		return
 	}
-	if ok, retryAfter := s.authConfigRate.allow(authRateLimitKey(r), now); !ok {
-		setAuthRetryAfter(w, retryAfter)
+	if ok, retryAfter := s.authConfigRate.Allow(telegramweb.RateLimitKey(r), now); !ok {
+		telegramweb.SetRetryAfter(w, retryAfter)
 		s.writeError(w, http.StatusTooManyRequests, "too many login requests")
 		return
 	}
@@ -1265,8 +1265,8 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	if !s.requireJSONContentType(w, r) {
 		return
 	}
-	if ok, retryAfter := s.authCompleteRate.allow(authRateLimitKey(r), now); !ok {
-		setAuthRetryAfter(w, retryAfter)
+	if ok, retryAfter := s.authCompleteRate.Allow(telegramweb.RateLimitKey(r), now); !ok {
+		telegramweb.SetRetryAfter(w, retryAfter)
 		s.writeError(w, http.StatusTooManyRequests, "too many login attempts")
 		return
 	}
@@ -1912,139 +1912,6 @@ func (s *Server) handleLocationReport(w http.ResponseWriter, r *http.Request, cl
 	s.writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) handleRouteDestinations(w http.ResponseWriter, r *http.Request, _ sessionClaims, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	originID := strings.TrimSpace(r.URL.Query().Get("originStationId"))
-	if originID == "" {
-		s.writeError(w, http.StatusBadRequest, "originStationId is required")
-		return
-	}
-	items, err := s.app.ReachableDestinations(r.Context(), now, originID, r.URL.Query().Get("q"))
-	if err != nil {
-		s.writeAppError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"stations": items,
-		"schedule": s.appScheduleContext(now),
-	})
-}
-
-func (s *Server) handleRouteTrains(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	originID := strings.TrimSpace(r.URL.Query().Get("originStationId"))
-	destinationID := strings.TrimSpace(r.URL.Query().Get("destinationStationId"))
-	if originID == "" || destinationID == "" {
-		s.writeError(w, http.StatusBadRequest, "originStationId and destinationStationId are required")
-		return
-	}
-	items, err := s.app.RouteTrains(r.Context(), claims.UserID, now, originID, destinationID, 18*time.Hour)
-	if err != nil {
-		s.writeAppError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"trains":   items,
-		"schedule": s.appScheduleContext(now),
-	})
-}
-
-func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request, claims sessionClaims) {
-	switch r.Method {
-	case http.MethodGet:
-		items, err := s.app.FavoriteRoutes(r.Context(), claims.UserID)
-		if err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"favorites": items})
-	case http.MethodPut:
-		var body struct {
-			FromStationID string `json:"fromStationId"`
-			ToStationID   string `json:"toStationId"`
-		}
-		if !s.decodeJSON(w, r, &body) {
-			return
-		}
-		if err := s.app.SaveFavoriteRoute(r.Context(), claims.UserID, strings.TrimSpace(body.FromStationID), strings.TrimSpace(body.ToStationID)); err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	case http.MethodDelete:
-		var body struct {
-			FromStationID string `json:"fromStationId"`
-			ToStationID   string `json:"toStationId"`
-		}
-		if !s.decodeJSON(w, r, &body) {
-			return
-		}
-		if err := s.app.DeleteFavoriteRoute(r.Context(), claims.UserID, strings.TrimSpace(body.FromStationID), strings.TrimSpace(body.ToStationID)); err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	default:
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func (s *Server) handleCurrentCheckIn(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
-	switch r.Method {
-	case http.MethodGet:
-		item, err := s.app.CurrentRide(r.Context(), claims.UserID, now)
-		if err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"currentRide": item})
-	case http.MethodPut:
-		var body struct {
-			TrainID           string `json:"trainId"`
-			BoardingStationID string `json:"boardingStationId"`
-			Source            string `json:"source"`
-		}
-		if !s.decodeJSON(w, r, &body) {
-			return
-		}
-		var stationID *string
-		if trimmed := strings.TrimSpace(body.BoardingStationID); trimmed != "" {
-			stationID = &trimmed
-		}
-		checkInSource := strings.ToLower(strings.TrimSpace(body.Source))
-		var err error
-		if checkInSource == "map" {
-			err = s.app.CheckInMap(r.Context(), claims.UserID, strings.TrimSpace(body.TrainID), stationID, now)
-		} else {
-			err = s.app.CheckIn(r.Context(), claims.UserID, strings.TrimSpace(body.TrainID), stationID, now)
-		}
-		if err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		item, err := s.app.CurrentRide(r.Context(), claims.UserID, now)
-		if err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"currentRide": item})
-	case http.MethodDelete:
-		if err := s.app.Checkout(r.Context(), claims.UserID, now); err != nil {
-			s.writeAppError(w, err)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	default:
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
 func (s *Server) handleCurrentRouteCheckIn(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
 	switch r.Method {
 	case http.MethodGet:
@@ -2094,19 +1961,6 @@ func routeCheckInPayload(item *domain.RouteCheckIn, now time.Time) map[string]an
 		payload["remainingSeconds"] = int(remaining.Seconds())
 	}
 	return payload
-}
-
-func (s *Server) handleUndoCheckOut(w http.ResponseWriter, r *http.Request, claims sessionClaims, now time.Time) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	ok, err := s.app.UndoCheckout(r.Context(), claims.UserID, now)
-	if err != nil {
-		s.writeAppError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"restored": ok})
 }
 
 func (s *Server) handleTrainStatus(w http.ResponseWriter, r *http.Request, claims sessionClaims, trainID string, now time.Time) {
@@ -2182,27 +2036,6 @@ func (s *Server) handleTrainReport(w http.ResponseWriter, r *http.Request, claim
 		}
 	}
 	s.writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleTrainMute(w http.ResponseWriter, r *http.Request, claims sessionClaims, trainID string, now time.Time) {
-	if r.Method != http.MethodPut {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var body struct {
-		DurationMinutes int `json:"durationMinutes"`
-	}
-	if !s.decodeJSON(w, r, &body) {
-		return
-	}
-	if body.DurationMinutes <= 0 {
-		body.DurationMinutes = 30
-	}
-	if err := s.app.MuteTrain(r.Context(), claims.UserID, trainID, now, time.Duration(body.DurationMinutes)*time.Minute); err != nil {
-		s.writeAppError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, claims sessionClaims) {
@@ -2364,13 +2197,6 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]any{"error": strings.TrimSpace(message)})
 }
 
-func (s *Server) writeDeferred(w http.ResponseWriter, message string) {
-	s.writeJSON(w, http.StatusGone, map[string]any{
-		"error":   "temporarily unavailable",
-		"message": strings.TrimSpace(message),
-	})
-}
-
 func (s *Server) writeRetired(w http.ResponseWriter, message string) {
 	s.writeJSON(w, http.StatusGone, map[string]any{
 		"error":   "removed",
@@ -2527,10 +2353,6 @@ func excludedGenericPublicAsset(assetPath string) bool {
 	cleanPath := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+assetPath)), "/")
 	name := strings.ToLower(filepath.Base(cleanPath))
 	return strings.HasSuffix(name, ".test.js") || strings.HasSuffix(name, ".test.css") || strings.HasSuffix(name, ".map")
-}
-
-func (s *Server) setReleaseHeaders(w http.ResponseWriter) {
-	s.setSecurityHeaders(w)
 }
 
 func (s *Server) setSecurityHeaders(w http.ResponseWriter) {

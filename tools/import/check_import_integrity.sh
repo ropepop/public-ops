@@ -6,7 +6,6 @@ cd "${ROOT}"
 
 required=(
   workloads/train-bot
-  workloads/site-notifications
   automation/task-executor
   infra/pihole/secrets
 )
@@ -36,7 +35,6 @@ count_check() {
 }
 
 count_check workloads/train-bot 40
-count_check workloads/site-notifications 30
 count_check automation/task-executor 10
 
 echo "import integrity checks passed"

@@ -35,11 +35,6 @@
       "sha256": "9de4a7e12ff5ef2430c7364dc25f1c0386fe9f76c7fd758aee7bcd06478b79be",
       "size": 214
     },
-    "etc/arbuzas/current/release.env": {
-      "mode": 420,
-      "sha256": "95b4f46ebfe0e22ff86dcdc9ab09943fafa93d1a45c887d6eb63960a5bf9dae7",
-      "size": 1186
-    },
     "etc/arbuzas/env/chatgpt-broker.env": {
       "mode": 420,
       "sha256": "fee572c47bfb070f599e2108bfbe6878097635ba7ce76b62c9c0e54766db6607",
@@ -127,8 +122,8 @@
     },
     "etc/arbuzas/env/ticket-remote.env": {
       "mode": 384,
-      "sha256": "f8d9f4c64e091a58b2c9e84d01bdce8ae44b8a8815136fc5c167d08618bf5483",
-      "size": 1360
+      "sha256": "71574d7eace5376a0ebc990b072d46e7992f9b01c0ad0ebcd82e3d659b391fce",
+      "size": 1356
     },
     "etc/arbuzas/env/ticket-remote.env.bak-20260509T0012": {
       "mode": 384,
@@ -190,6 +185,11 @@
       "sha256": "bbe29e9d5a8bd4eb18ced3c9350c129f0e535054b28f4b0f52237dbd7dfe3054",
       "size": 46
     },
+    "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret": {
+      "mode": 384,
+      "sha256": "06e31ef18018860ca001d92197595272817841700df1e72bb3ce64c2e67f0bc2",
+      "size": 65
+    },
     "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem": {
       "mode": 384,
       "sha256": "661e441a90382de6765b0fd40b575ae21fa63f3b5dbe5fd16841529f9bb0c4e7",
@@ -217,5 +217,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1783550363
+  "updatedEpochSeconds": 1783636483
 }

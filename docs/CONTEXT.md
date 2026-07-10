@@ -17,7 +17,6 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `../workloads/ticket-remote/README.md`: public ViVi ticket viewer runtime model.
 - `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
 - `../workloads/subscription-bot/README.md` and `../workloads/subscription-bot/AGENTS.md`: subscription bot and mini app overview plus web UI checks.
-- `../workloads/site-notifications/README.md`: smaller workload entrypoint.
 - For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
 
 ## Durable docs
@@ -34,7 +33,7 @@ Do not load these by default:
 
 - `../ops/evidence/`: screenshots, logs, browser snapshots, and generated proof.
 - `../ops/reports/`: local dated measurements and analyses; usually ignored/generated.
-- `archive/`: tracked historical docs kept for narrow archaeology, not normal implementation context.
+- `archive/README.md`: compact recovery index for retired source kept in Git history.
 - `../workloads/*/ops/evidence/`: workload-local historical proof.
 - `../workloads/*/ops/monitoring/`: watch logs and dated monitoring writeups.
 - `superpowers/plans/archive/` or old dated plan files: useful for archaeology, not normal implementation context.
@@ -48,7 +47,7 @@ When a task asks for evidence or historical debugging, read the narrow timestamp
 - Exhaustive config/API detail: `reference/`.
 - Current implementation plan: `plans/active/`.
 - Completed/old plan: `plans/archive/YYYY/`.
-- Dated measurements or analysis: `../ops/reports/YYYY-MM/` when local/generated, or `archive/<service>/...` when the Markdown should remain tracked.
+- Dated measurements or analysis: `../ops/reports/YYYY-MM/` when local/generated.
 - Browser snapshots, logs, screenshots, raw API captures: `../ops/evidence/<service>/<timestamp-or-topic>/` with a short `README.md` index.
 
 Keep root Markdown limited to `README.md`, `AGENTS.md`, license/changelog/contributing files, and maybe one deliberately current top-level plan.

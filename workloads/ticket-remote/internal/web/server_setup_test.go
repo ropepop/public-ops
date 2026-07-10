@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -122,7 +121,9 @@ func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"pub fn identity_connected(_ctx: &ReducerContext) {}",
+		"pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {",
+		"if has_valid_service_identity(ctx)",
+		"client_email_from_auth(ctx, DEFAULT_TICKET_ID)?",
 		"pub fn identity_disconnected(_ctx: &ReducerContext) {}",
 		"pub fn ticketremote_member_set_stream_focus(",
 	} {
@@ -133,136 +134,6 @@ func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 		if !strings.Contains(source, required) {
 			t.Fatalf("connection hook block missing %q", required)
 		}
-	}
-}
-
-func TestRelayViewerCountPublishesPhoneBrokerPresence(t *testing.T) {
-	presenceUpdates := make(chan int, 4)
-	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/phone/leases/ticket" || r.URL.Path == "/api/v1/phone/leases/ticket/release" {
-			_, _ = io.Copy(io.Discard, r.Body)
-			_, _ = w.Write([]byte(`{"ok":true}`))
-			return
-		}
-		if r.URL.Path != "/api/v1/ticket/presence" {
-			t.Fatalf("broker path = %s", r.URL.Path)
-		}
-		var req struct {
-			Viewers int `json:"viewers"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode presence: %v", err)
-		}
-		presenceUpdates <- req.Viewers
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer broker.Close()
-
-	server := newTicketSetupTestServer(t, "pixel")
-	server.cfg.Phone.BrokerBaseURL = broker.URL
-
-	server.addRelayViewer("session-a")
-	expectBrokerPresence(t, presenceUpdates, 1)
-
-	server.addRelayViewer("session-b")
-	expectBrokerPresence(t, presenceUpdates, 2)
-
-	server.removeRelayViewer("session-a")
-	expectBrokerPresence(t, presenceUpdates, 1)
-
-	server.removeRelayViewer("session-b")
-	expectBrokerPresence(t, presenceUpdates, 0)
-}
-
-func TestRelayViewerPublishesPhoneBrokerTicketLeaseLifecycle(t *testing.T) {
-	events := make(chan brokerLeaseEvent, 8)
-	broker := newTicketLeaseBrokerRecorder(t, events)
-	defer broker.Close()
-
-	server := newTicketSetupTestServer(t, "pixel")
-	server.cfg.Phone.BrokerBaseURL = broker.URL
-
-	server.addRelayViewer("session-a")
-	acquire := expectBrokerLeaseEvent(t, events, "/api/v1/phone/leases/ticket")
-	if acquire.LeaseID != "viewer:session-a" || acquire.RequestID != "session-a" || acquire.Reason != "stream_viewer" || acquire.TTLMillis <= 0 {
-		t.Fatalf("viewer lease acquire = %#v", acquire)
-	}
-
-	server.removeRelayViewer("session-a")
-	release := expectBrokerLeaseEvent(t, events, "/api/v1/phone/leases/ticket/release")
-	if release.LeaseID != "viewer:session-a" {
-		t.Fatalf("viewer lease release = %#v", release)
-	}
-}
-
-type brokerLeaseEvent struct {
-	Path      string
-	LeaseID   string `json:"leaseId"`
-	RequestID string `json:"requestId"`
-	Reason    string `json:"reason"`
-	TTLMillis int64  `json:"ttlMillis"`
-}
-
-func newTicketLeaseBrokerRecorder(t *testing.T, events chan<- brokerLeaseEvent) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/ticket/presence":
-			_, _ = io.Copy(io.Discard, r.Body)
-			_, _ = w.Write([]byte(`{"ok":true}`))
-		case "/api/v1/phone/leases/ticket", "/api/v1/phone/leases/ticket/release":
-			var event brokerLeaseEvent
-			if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-				t.Fatalf("decode broker lease event: %v", err)
-			}
-			event.Path = r.URL.Path
-			events <- event
-			_, _ = w.Write([]byte(`{"ok":true,"state":{"currentOwner":"ticket"},"lease":{"id":"` + event.LeaseID + `","owner":"ticket"}}`))
-		default:
-			t.Fatalf("broker path = %s", r.URL.Path)
-		}
-	}))
-}
-
-func expectBrokerLeaseEvent(t *testing.T, events <-chan brokerLeaseEvent, path string) brokerLeaseEvent {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case event := <-events:
-			if event.Path == path {
-				return event
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for broker lease event %s", path)
-		}
-	}
-}
-
-func expectBrokerLeaseEventWithLease(t *testing.T, events <-chan brokerLeaseEvent, path string, leaseID string) brokerLeaseEvent {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case event := <-events:
-			if event.Path == path && event.LeaseID == leaseID {
-				return event
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for broker lease event %s %s", path, leaseID)
-		}
-	}
-}
-
-func expectBrokerPresence(t *testing.T, updates <-chan int, want int) {
-	t.Helper()
-	select {
-	case got := <-updates:
-		if got != want {
-			t.Fatalf("broker presence = %d, want %d", got, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for broker presence %d", want)
 	}
 }
 
@@ -458,13 +329,41 @@ func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
 		}
 	}
 	csp := rec.Header().Get("Content-Security-Policy")
-	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'unsafe-eval'", "style-src 'self' 'nonce-", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self' https: wss:"} {
+	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'nonce-", "style-src 'self' 'nonce-", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self'"} {
 		if !strings.Contains(csp, snippet) {
 			t.Fatalf("CSP missing %q: %s", snippet, csp)
 		}
 	}
+	for _, forbidden := range []string{"'unsafe-eval'", "connect-src 'self' https:", " wss:", " ws:"} {
+		if strings.Contains(csp, forbidden) {
+			t.Fatalf("CSP retained broad source %q: %s", forbidden, csp)
+		}
+	}
 	if !strings.Contains(rec.Body.String(), `nonce="`) {
 		t.Fatalf("expected rendered scripts to carry CSP nonce")
+	}
+}
+
+func TestCSPAllowsOnlyConfiguredAuthAndSpacetimeOrigins(t *testing.T) {
+	server := &Server{cfg: config.Config{
+		Access: auth.AccessConfig{OIDCIssuer: "https://auth.spacetimedb.com/oidc"},
+		State:  state.StoreConfig{SpacetimeHost: "https://maincloud.spacetimedb.com/database/path"},
+	}}
+	rec := httptest.NewRecorder()
+	server.writeHTMLHeaders(rec, "test-nonce")
+	csp := rec.Header().Get("Content-Security-Policy")
+	for _, allowed := range []string{
+		"connect-src 'self' https://maincloud.spacetimedb.com wss://maincloud.spacetimedb.com https://auth.spacetimedb.com",
+		"script-src 'self' 'nonce-test-nonce'",
+	} {
+		if !strings.Contains(csp, allowed) {
+			t.Fatalf("CSP missing exact origin %q: %s", allowed, csp)
+		}
+	}
+	for _, broad := range []string{"'unsafe-eval'", " https: ", " wss: ", " ws: "} {
+		if strings.Contains(csp, broad) {
+			t.Fatalf("CSP contains broad source %q: %s", broad, csp)
+		}
 	}
 }
 
@@ -664,7 +563,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"navigator.wakeLock.request('screen')",
 		"if(!screenWakeLock)return;const lock=screenWakeLock",
 		"function openControlCodeDialog()",
-		"if(!streamReadyForControlCode())",
+		"if(!spacetimeReadyForControlCode())",
 		"document.exitFullscreen().catch",
 		"function layoutViewportRect()",
 		"function toolbarCollapseAnchorPx()",
@@ -833,27 +732,34 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			t.Fatalf("ticket viewer stream resume spinner should use top-left quick-spinner styling, found %q", snippet)
 		}
 	}
-	hotspotStart := strings.Index(css, ".control-code-hotspot{left:0;")
-	if hotspotStart < 0 {
-		hotspotStart = strings.Index(css, ".control-code-hotspot,.control-code-close-hotspot{")
-		if hotspotStart < 0 {
-			hotspotStart = strings.Index(css, ".control-code-hotspot{")
+	for _, snippet := range []string{
+		`id="controlCodeHotspot" class="control-code-hotspot"`,
+		`aria-label="Pieprasīt kontroles kodu"></button>`,
+		`background: rgba(0, 0, 0, 0.001);`,
+		`color: transparent;`,
+		`font-size: 0;`,
+		`top: 0;`,
+		`left: 0;`,
+		`width: var(--ticket-hotspot-width, 50vw);`,
+		`height: var(--ticket-hotspot-height, 25vh);`,
+		`.control-code-hotspot:focus-visible`,
+		`outline: 3px solid #8bb5ff;`,
+	} {
+		if !strings.Contains(indexHTML, snippet) {
+			t.Fatalf("invisible control-code hotspot missing %q", snippet)
 		}
 	}
-	if hotspotStart < 0 {
-		t.Fatalf("ticket viewer CSS missing isolated control-code hotspot block")
+	if strings.Contains(indexHTML, `id="controlCodeHotspot" class="control-code-hotspot" type="button" aria-label="Pieprasīt kontroles kodu" tabindex="-1"`) {
+		t.Fatalf("visible control-code action must remain keyboard focusable")
 	}
-	hotspotEnd := strings.Index(css[hotspotStart:], "}")
-	if hotspotEnd < 0 {
-		t.Fatalf("ticket viewer CSS missing complete control-code hotspot rule")
-	}
-	hotspotBlock := css[hotspotStart : hotspotStart+hotspotEnd]
-	for _, snippet := range []string{
-		"width:50vw",
-		"height:25vh",
+	for _, visible := range []string{
+		`aria-label="Pieprasīt kontroles kodu">Kods</button>`,
+		`background: rgba(7, 11, 16, 0.86);`,
+		`border: 1px solid rgba(255, 255, 255, 0.32);`,
+		`box-shadow: 0 4px 18px`,
 	} {
-		if !strings.Contains(hotspotBlock, snippet) {
-			t.Fatalf("control-code hotspot block missing %q", snippet)
+		if strings.Contains(indexHTML, visible) {
+			t.Fatalf("control-code hotspot must not expose the old visible pill: %q", visible)
 		}
 	}
 	for _, snippet := range []string{
@@ -931,13 +837,15 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	for _, snippet := range []string{
 		`<style nonce="{{.Nonce}}">`,
 		`.control-code-hotspot`,
-		`opacity: 1;`,
+		`.control-code-hotspot:focus-visible`,
 		`background: rgba(0, 0, 0, 0.001);`,
 		`color: transparent;`,
-		`font-size: 0;`,
+		`opacity: 1;`,
+		`width: var(--ticket-hotspot-width, 50vw);`,
+		`height: var(--ticket-hotspot-height, 25vh);`,
 	} {
 		if !strings.Contains(indexHTML, snippet) {
-			t.Fatalf("ticket viewer HTML must keep hotspot hit testing alive, missing %q", snippet)
+			t.Fatalf("ticket viewer HTML must preserve the invisible control-code hotspot, missing %q", snippet)
 		}
 	}
 	if !strings.Contains(serverGo, "assetVersionValue = serverVersion") {
@@ -1222,8 +1130,8 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	if !strings.Contains(hotspotHandler, "closeCurrentControlCode(false)") {
 		t.Fatalf("top-left hotspot should close visible result without immediately opening a new request")
 	}
-	if !strings.Contains(hotspotHandler, "reconnectVideoForRecovery(\"control_code_hotspot_wait_for_live_frame\")") {
-		t.Fatalf("top-left hotspot should force local video recovery when the rendered frame is stale")
+	if !strings.Contains(js, `reconnectVideoForRecovery("control_code_dialog_stream_warmup")`) {
+		t.Fatalf("opening the control-code dialog should warm local video recovery without blocking submission")
 	}
 	if strings.Contains(hotspotHandler, "closeCurrentControlCode(true)") {
 		t.Fatalf("top-left hotspot should not immediately reopen the request dialog after closing a visible result")
@@ -1706,7 +1614,7 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	}
 }
 
-func TestNonExpiringServerSessionRefreshesAuthCookieOnCachedIndex(t *testing.T) {
+func TestNeverTTLIsConvertedToFiniteBrowserSession(t *testing.T) {
 	store := state.NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
@@ -1747,16 +1655,17 @@ func TestNonExpiringServerSessionRefreshesAuthCookieOnCachedIndex(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	issuedAt := time.Now()
 	token, expiresAt, err := server.auth.IssueServerSession(auth.Identity{
 		Email:         "ticket@jolkins.id.lv",
 		Subject:       "user_123",
 		EmailVerified: true,
-	}, config.DurationNever, time.Now())
+	}, config.DurationNever, issuedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !expiresAt.IsZero() {
-		t.Fatalf("expiresAt = %s, want no expiry", expiresAt)
+	if got, want := expiresAt.Sub(issuedAt), auth.DefaultServerSessionTTL; got != want {
+		t.Fatalf("session TTL = %s, want %s", got, want)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1767,32 +1676,15 @@ func TestNonExpiringServerSessionRefreshesAuthCookieOnCachedIndex(t *testing.T) 
 		t.Fatalf("first index status = %d body = %s", first.Code, first.Body.String())
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	var sessionCookie *http.Cookie
 	for _, cookie := range first.Result().Cookies() {
 		if cookie.Name == "ticket_remote_session" {
-			req.AddCookie(cookie)
+			sessionCookie = cookie
+			break
 		}
 	}
-	second := httptest.NewRecorder()
-	server.ServeHTTP(second, req)
-	if second.Code != http.StatusOK {
-		t.Fatalf("cached index status = %d body = %s", second.Code, second.Body.String())
-	}
-	var refreshedAuth, refreshedSession bool
-	for _, cookie := range second.Result().Cookies() {
-		if cookie.Name == "ticket_remote_auth" && cookie.MaxAge == nonExpiringCookieMaxAge {
-			refreshedAuth = true
-		}
-		if cookie.Name == "ticket_remote_session" && cookie.MaxAge == nonExpiringCookieMaxAge {
-			refreshedSession = true
-		}
-	}
-	if !refreshedAuth {
-		t.Fatalf("cached index did not refresh non-expiring auth cookie: %#v", second.Result().Cookies())
-	}
-	if !refreshedSession {
-		t.Fatalf("cached index did not refresh non-expiring session cookie: %#v", second.Result().Cookies())
+	if sessionCookie == nil || sessionCookie.MaxAge != int(auth.DefaultServerSessionTTL.Seconds()) {
+		t.Fatalf("browser session cookie is not finite: %#v", first.Result().Cookies())
 	}
 }
 

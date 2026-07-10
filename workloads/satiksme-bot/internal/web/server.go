@@ -69,8 +69,8 @@ type Server struct {
 	sessionSecret    []byte
 	spacetime        *spacetimeTokenIssuer
 	telegramLogin    *telegramweb.LoginVerifier
-	authConfigRate   *clientRateLimiter
-	authCompleteRate *clientRateLimiter
+	authConfigRate   *telegramweb.ClientRateLimiter
+	authCompleteRate *telegramweb.ClientRateLimiter
 	static           fs.FS
 	pageTemplate     *template.Template
 	bundleStore      *staticBundleStore
@@ -125,8 +125,8 @@ func NewServer(
 		loc:              loc,
 		liveHTTPClient:   &http.Client{Timeout: time.Duration(cfg.HTTPTimeoutSec) * time.Second},
 		pathPrefix:       pathPrefix,
-		authConfigRate:   newClientRateLimiter(authConfigRequestsPerMinute, authRateLimitWindow),
-		authCompleteRate: newClientRateLimiter(authCompleteRequestsPerMinute, authRateLimitWindow),
+		authConfigRate:   telegramweb.NewClientRateLimiter(telegramweb.LoginConfigRequestsPerMinute, telegramweb.LoginRateLimitWindow),
+		authCompleteRate: telegramweb.NewClientRateLimiter(telegramweb.LoginCompleteRequestsPerMinute, telegramweb.LoginRateLimitWindow),
 		static:           static,
 		pageTemplate: template.Must(template.New("shell").Parse(`<!doctype html>
 <html lang="lv">
@@ -1272,8 +1272,8 @@ func (s *Server) handleAuthTelegramConfig(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "Telegram Login is not configured")
 		return
 	}
-	if ok, retryAfter := s.authConfigRate.allow(authRateLimitKey(r), now); !ok {
-		setAuthRetryAfter(w, retryAfter)
+	if ok, retryAfter := s.authConfigRate.Allow(telegramweb.RateLimitKey(r), now); !ok {
+		telegramweb.SetRetryAfter(w, retryAfter)
 		writeError(w, http.StatusTooManyRequests, "too many login requests")
 		return
 	}
@@ -1307,8 +1307,8 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	if !requireJSONContentType(w, r) {
 		return
 	}
-	if ok, retryAfter := s.authCompleteRate.allow(authRateLimitKey(r), now); !ok {
-		setAuthRetryAfter(w, retryAfter)
+	if ok, retryAfter := s.authCompleteRate.Allow(telegramweb.RateLimitKey(r), now); !ok {
+		telegramweb.SetRetryAfter(w, retryAfter)
 		writeError(w, http.StatusTooManyRequests, "too many login attempts")
 		return
 	}

@@ -11,8 +11,9 @@ import (
 func TestRuntimeLoggingStaysSpacetimeOnly(t *testing.T) {
 	files := []string{
 		ticketRemoteSourceFile(t, "internal", "web", "server.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "relay_viewers.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "phone_backend.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "stream_control.go"),
-		ticketRemoteSourceFile(t, "internal", "web", "ticket_phone_lease.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "control_code.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "runtime_log.go"),
 		ticketRemoteSourceFile(t, "internal", "phone", "relay.go"),

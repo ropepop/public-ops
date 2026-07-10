@@ -11,6 +11,7 @@ pub(super) struct TicketremoteMemberRequestControlCodeArgs {
     pub backend_id: String,
     pub session_id: String,
     pub digits: String,
+    pub expected_fast_revision: String,
 }
 
 impl From<TicketremoteMemberRequestControlCodeArgs> for super::Reducer {
@@ -20,6 +21,7 @@ impl From<TicketremoteMemberRequestControlCodeArgs> for super::Reducer {
             backend_id: args.backend_id,
             session_id: args.session_id,
             digits: args.digits,
+            expected_fast_revision: args.expected_fast_revision,
         }
     }
 }
@@ -45,12 +47,14 @@ pub trait ticketremote_member_request_control_code {
         backend_id: String,
         session_id: String,
         digits: String,
+        expected_fast_revision: String,
     ) -> __sdk::Result<()> {
         self.ticketremote_member_request_control_code_then(
             ticket_id,
             backend_id,
             session_id,
             digits,
+            expected_fast_revision,
             |_, _| {},
         )
     }
@@ -67,6 +71,7 @@ pub trait ticketremote_member_request_control_code {
         backend_id: String,
         session_id: String,
         digits: String,
+        expected_fast_revision: String,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -83,6 +88,7 @@ impl ticketremote_member_request_control_code for super::RemoteReducers {
         backend_id: String,
         session_id: String,
         digits: String,
+        expected_fast_revision: String,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -96,6 +102,7 @@ impl ticketremote_member_request_control_code for super::RemoteReducers {
                 backend_id,
                 session_id,
                 digits,
+                expected_fast_revision,
             },
             callback,
         )

@@ -31,8 +31,13 @@ RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
   && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --gid 1001 ticketremote \
+  && useradd --uid 1001 --gid ticketremote --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ticketremote
+
 WORKDIR /srv/ticket-remote-spacetime-sidecar
 
 COPY --from=build /tmp/ticket-remote-spacetime-sidecar /usr/local/bin/ticket-remote-spacetime-sidecar
+
+USER 1001:1001
 
 CMD ["/usr/local/bin/ticket-remote-spacetime-sidecar"]

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.5-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -31,11 +31,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
 RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends android-tools-adb ca-certificates curl \
-  && rm -rf /var/lib/apt/lists/*
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/* \
+  && mkdir -p /srv/ticket-remote/state \
+  && chown -R 1001:1001 /srv/ticket-remote
 
 WORKDIR /srv/ticket-remote
 
 COPY --from=build /out/ticket-remote /usr/local/bin/ticket-remote
+
+USER 1001:1001
 
 CMD ["/usr/local/bin/ticket-remote"]

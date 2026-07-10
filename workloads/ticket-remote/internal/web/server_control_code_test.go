@@ -192,14 +192,11 @@ func TestControlCodeRequestDoesNotDuplicateCommandWithoutPhoneAck(t *testing.T) 
 	}
 }
 
-func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
+func TestControlCodeRequestRetainsDirectRelayUntilPhoneCleanup(t *testing.T) {
 	messages := make(chan string, 20)
 	phoneResults := make(chan string, 20)
 	phoneServer := newTicketPhoneControlCodeTestServer(t, messages, phoneResults)
 	defer phoneServer.Close()
-	leaseEvents := make(chan brokerLeaseEvent, 8)
-	broker := newTicketLeaseBrokerRecorder(t, leaseEvents)
-	defer broker.Close()
 
 	store := newTicketMemoryStore(t, phoneServer.URL)
 	relay := phone.NewRelay(phone.RelayConfig{
@@ -212,19 +209,17 @@ func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
 	})
 	defer relay.Close()
 	server := newTicketWebServer(t, store, relay, phoneServer.URL)
-	server.cfg.Phone.BrokerBaseURL = broker.URL
 	httpServer := httptest.NewServer(server)
 	defer httpServer.Close()
 
 	requester := dialTicketControlClientWithSession(t, httpServer, "ticket@jolkins.id.lv", "requester-session")
 	defer requester.Close(websocket.StatusNormalClosure, "test complete")
 	waitForPhoneMessage(t, messages, `"type":"start"`)
+	baselineViewers := relay.Snapshot().Viewers
 
 	response := postControlCodeRequestWithSession(t, httpServer.URL, "ticket@jolkins.id.lv", "requester-session", "12345")
-	controlLeaseID := "control-code:" + response.Request.ID
-	acquire := expectBrokerLeaseEventWithLease(t, leaseEvents, "/api/v1/phone/leases/ticket", controlLeaseID)
-	if acquire.LeaseID != "control-code:"+response.Request.ID || acquire.RequestID != response.Request.ID || acquire.Reason != "control_code_request" {
-		t.Fatalf("control-code lease acquire = %#v request=%#v", acquire, response.Request)
+	if got := relay.Snapshot().Viewers; got != baselineViewers+1 {
+		t.Fatalf("control-code relay viewers after request = %d, want %d", got, baselineViewers+1)
 	}
 	phoneCommand := waitForPhoneMessageText(t, messages, `"type":"generate_control_code"`)
 	for _, snippet := range []string{
@@ -245,21 +240,19 @@ func TestControlCodeRequestHoldsTicketLeaseUntilPhoneCleanup(t *testing.T) {
 		t.Fatalf("browser capture failed: %#v", capture)
 	}
 	waitForPhoneMessageText(t, messages, `"type":"control_code_browser_capture"`)
-
-	select {
-	case event := <-leaseEvents:
-		if event.Path == "/api/v1/phone/leases/ticket/release" {
-			t.Fatalf("ticket lease released before phone cleanup: %#v", event)
-		}
-	case <-time.After(150 * time.Millisecond):
+	if got := relay.Snapshot().Viewers; got != baselineViewers+1 {
+		t.Fatalf("control-code relay viewers before cleanup = %d, want %d", got, baselineViewers+1)
 	}
+
 	server.handlePhoneText([]byte(`{"type":"control_code_cleanup_complete","requestId":"` + response.Request.ID + `","ok":true,"reason":"ticket_detail"}`))
-	release := expectBrokerLeaseEventWithLease(t, leaseEvents, "/api/v1/phone/leases/ticket/release", controlLeaseID)
-	if release.LeaseID != "control-code:"+response.Request.ID || release.RequestID != response.Request.ID {
-		t.Fatalf("control-code lease release = %#v", release)
+	deadline := time.Now().Add(2 * time.Second)
+	for relay.Snapshot().Viewers != baselineViewers && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := relay.Snapshot().Viewers; got != baselineViewers {
+		t.Fatalf("control-code relay viewers after cleanup = %d, want %d", got, baselineViewers)
 	}
 }
-
 func TestControlCodeAsyncFlowAcceptsDigitLengthsTwoThroughEight(t *testing.T) {
 	messages := make(chan string, 100)
 	phoneResults := make(chan string, 100)
@@ -1119,11 +1112,17 @@ func TestControlCodeRequestFailsFastWhenPhoneUnavailable(t *testing.T) {
 	for time.Now().Before(deadline) {
 		server.codeMu.Lock()
 		req := server.codeRequests[response.Request.ID]
+		status := ""
+		reason := ""
+		if req != nil {
+			status = req.Status
+			reason = req.Reason
+		}
 		running := server.codeRunning
 		server.codeMu.Unlock()
-		if req != nil && req.Status == controlCodeFailed {
-			if req.Reason != "phone_unavailable" {
-				t.Fatalf("reason = %q, want phone_unavailable", req.Reason)
+		if req != nil && status == controlCodeFailed {
+			if reason != "phone_unavailable" {
+				t.Fatalf("reason = %q, want phone_unavailable", reason)
 			}
 			if running != "" {
 				t.Fatalf("codeRunning = %q, want cleared", running)

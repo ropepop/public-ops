@@ -12,6 +12,8 @@ pub mod ticketremote_append_stream_command_reducer;
 pub mod ticketremote_auth_config_type;
 pub mod ticketremote_cleanup_expired_reducer;
 pub mod ticketremote_cleanup_schedule_type;
+pub mod ticketremote_control_code_fast_state_table;
+pub mod ticketremote_control_code_fast_state_type;
 pub mod ticketremote_control_code_owner_type;
 pub mod ticketremote_control_code_request_table;
 pub mod ticketremote_control_code_request_type;
@@ -49,8 +51,11 @@ pub mod ticketremote_stream_command_signal_type;
 pub mod ticketremote_stream_command_type;
 pub mod ticketremote_stream_desired_state_table;
 pub mod ticketremote_stream_desired_state_type;
+pub mod ticketremote_stream_viewer_focus_table;
+pub mod ticketremote_stream_viewer_focus_type;
 pub mod ticketremote_ticket_member_type;
 pub mod ticketremote_ticket_type;
+pub mod ticketremote_update_control_code_fast_state_reducer;
 pub mod ticketremote_update_control_code_request_reducer;
 pub mod ticketremote_update_phone_current_report_reducer;
 pub mod ticketremote_update_phone_reducer;
@@ -63,6 +68,8 @@ pub use ticketremote_append_stream_command_reducer::ticketremote_append_stream_c
 pub use ticketremote_auth_config_type::TicketremoteAuthConfig;
 pub use ticketremote_cleanup_expired_reducer::ticketremote_cleanup_expired;
 pub use ticketremote_cleanup_schedule_type::TicketremoteCleanupSchedule;
+pub use ticketremote_control_code_fast_state_table::*;
+pub use ticketremote_control_code_fast_state_type::TicketremoteControlCodeFastState;
 pub use ticketremote_control_code_owner_type::TicketremoteControlCodeOwner;
 pub use ticketremote_control_code_request_table::*;
 pub use ticketremote_control_code_request_type::TicketremoteControlCodeRequest;
@@ -100,8 +107,11 @@ pub use ticketremote_stream_command_signal_type::TicketremoteStreamCommandSignal
 pub use ticketremote_stream_command_type::TicketremoteStreamCommand;
 pub use ticketremote_stream_desired_state_table::*;
 pub use ticketremote_stream_desired_state_type::TicketremoteStreamDesiredState;
+pub use ticketremote_stream_viewer_focus_table::*;
+pub use ticketremote_stream_viewer_focus_type::TicketremoteStreamViewerFocus;
 pub use ticketremote_ticket_member_type::TicketremoteTicketMember;
 pub use ticketremote_ticket_type::TicketremoteTicket;
+pub use ticketremote_update_control_code_fast_state_reducer::ticketremote_update_control_code_fast_state;
 pub use ticketremote_update_control_code_request_reducer::ticketremote_update_control_code_request;
 pub use ticketremote_update_phone_current_report_reducer::ticketremote_update_phone_current_report;
 pub use ticketremote_update_phone_reducer::ticketremote_update_phone;
@@ -191,6 +201,7 @@ pub enum Reducer {
         backend_id: String,
         session_id: String,
         digits: String,
+        expected_fast_revision: String,
     },
     TicketremoteMemberRequestKeyframe {
         ticket_id: String,
@@ -237,6 +248,19 @@ pub enum Reducer {
         reason: String,
         revision: String,
         updated_by: String,
+        now_arg: String,
+    },
+    TicketremoteUpdateControlCodeFastState {
+        ticket_id: String,
+        backend_id: String,
+        status: String,
+        revision: String,
+        reason: String,
+        stream_epoch: String,
+        frame_sequence: String,
+        raw_ticket_confirmed: bool,
+        cleanup_clear: bool,
+        stream_live: bool,
         now_arg: String,
     },
     TicketremoteUpdateControlCodeRequest {
@@ -338,6 +362,9 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteServiceBootstrap { .. } => "ticketremote_service_bootstrap",
             Reducer::TicketremoteSetStreamDesiredState { .. } => {
                 "ticketremote_set_stream_desired_state"
+            }
+            Reducer::TicketremoteUpdateControlCodeFastState { .. } => {
+                "ticketremote_update_control_code_fast_state"
             }
             Reducer::TicketremoteUpdateControlCodeRequest { .. } => {
                 "ticketremote_update_control_code_request"
@@ -491,11 +518,13 @@ impl __sdk::Reducer for Reducer {
                 backend_id,
                 session_id,
                 digits,
+                expected_fast_revision,
 }             => __sats::bsatn::to_vec(&ticketremote_member_request_control_code_reducer::TicketremoteMemberRequestControlCodeArgs {
                 ticket_id: ticket_id.clone(),
                 backend_id: backend_id.clone(),
                 session_id: session_id.clone(),
                 digits: digits.clone(),
+                expected_fast_revision: expected_fast_revision.clone(),
 }),
             Reducer::TicketremoteMemberRequestKeyframe{
                 ticket_id,
@@ -582,6 +611,31 @@ impl __sdk::Reducer for Reducer {
                 reason: reason.clone(),
                 revision: revision.clone(),
                 updated_by: updated_by.clone(),
+                now_arg: now_arg.clone(),
+}),
+            Reducer::TicketremoteUpdateControlCodeFastState{
+                ticket_id,
+                backend_id,
+                status,
+                revision,
+                reason,
+                stream_epoch,
+                frame_sequence,
+                raw_ticket_confirmed,
+                cleanup_clear,
+                stream_live,
+                now_arg,
+}             => __sats::bsatn::to_vec(&ticketremote_update_control_code_fast_state_reducer::TicketremoteUpdateControlCodeFastStateArgs {
+                ticket_id: ticket_id.clone(),
+                backend_id: backend_id.clone(),
+                status: status.clone(),
+                revision: revision.clone(),
+                reason: reason.clone(),
+                stream_epoch: stream_epoch.clone(),
+                frame_sequence: frame_sequence.clone(),
+                raw_ticket_confirmed: raw_ticket_confirmed.clone(),
+                cleanup_clear: cleanup_clear.clone(),
+                stream_live: stream_live.clone(),
                 now_arg: now_arg.clone(),
 }),
             Reducer::TicketremoteUpdateControlCodeRequest{
@@ -694,6 +748,7 @@ impl __sdk::Reducer for Reducer {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct DbUpdate {
+    ticketremote_control_code_fast_state: __sdk::TableUpdate<TicketremoteControlCodeFastState>,
     ticketremote_control_code_request: __sdk::TableUpdate<TicketremoteControlCodeRequest>,
     ticketremote_phone_current_report: __sdk::TableUpdate<TicketremotePhoneCurrentReport>,
     ticketremote_relay_current_report: __sdk::TableUpdate<TicketremoteRelayCurrentReport>,
@@ -703,6 +758,7 @@ pub struct DbUpdate {
     ticketremote_service_ticket_member: __sdk::TableUpdate<TicketremoteServiceMember>,
     ticketremote_stream_command_signal: __sdk::TableUpdate<TicketremoteStreamCommandSignal>,
     ticketremote_stream_desired_state: __sdk::TableUpdate<TicketremoteStreamDesiredState>,
+    ticketremote_stream_viewer_focus: __sdk::TableUpdate<TicketremoteStreamViewerFocus>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -711,6 +767,13 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_update in __sdk::transaction_update_iter_table_updates(raw) {
             match &table_update.table_name[..] {
+                "ticketremote_control_code_fast_state" => {
+                    db_update.ticketremote_control_code_fast_state.append(
+                        ticketremote_control_code_fast_state_table::parse_table_update(
+                            table_update,
+                        )?,
+                    )
+                }
                 "ticketremote_control_code_request" => {
                     db_update.ticketremote_control_code_request.append(
                         ticketremote_control_code_request_table::parse_table_update(table_update)?,
@@ -756,6 +819,11 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                         ticketremote_stream_desired_state_table::parse_table_update(table_update)?,
                     )
                 }
+                "ticketremote_stream_viewer_focus" => {
+                    db_update.ticketremote_stream_viewer_focus.append(
+                        ticketremote_stream_viewer_focus_table::parse_table_update(table_update)?,
+                    )
+                }
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -782,6 +850,12 @@ impl __sdk::DbUpdate for DbUpdate {
     ) -> AppliedDiff<'_> {
         let mut diff = AppliedDiff::default();
 
+        diff.ticketremote_control_code_fast_state = cache
+            .apply_diff_to_table::<TicketremoteControlCodeFastState>(
+                "ticketremote_control_code_fast_state",
+                &self.ticketremote_control_code_fast_state,
+            )
+            .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_control_code_request = cache
             .apply_diff_to_table::<TicketremoteControlCodeRequest>(
                 "ticketremote_control_code_request",
@@ -810,6 +884,12 @@ impl __sdk::DbUpdate for DbUpdate {
             .apply_diff_to_table::<TicketremoteStreamDesiredState>(
                 "ticketremote_stream_desired_state",
                 &self.ticketremote_stream_desired_state,
+            )
+            .with_updates_by_pk(|row| &row.id);
+        diff.ticketremote_stream_viewer_focus = cache
+            .apply_diff_to_table::<TicketremoteStreamViewerFocus>(
+                "ticketremote_stream_viewer_focus",
+                &self.ticketremote_stream_viewer_focus,
             )
             .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_service_phone_backend = cache
@@ -843,6 +923,9 @@ impl __sdk::DbUpdate for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_rows in raw.tables {
             match &table_rows.table[..] {
+                "ticketremote_control_code_fast_state" => db_update
+                    .ticketremote_control_code_fast_state
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_control_code_request" => db_update
                     .ticketremote_control_code_request
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
@@ -869,6 +952,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_stream_desired_state" => db_update
                     .ticketremote_stream_desired_state
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "ticketremote_stream_viewer_focus" => db_update
+                    .ticketremote_stream_viewer_focus
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -883,6 +969,9 @@ impl __sdk::DbUpdate for DbUpdate {
         let mut db_update = DbUpdate::default();
         for table_rows in raw.tables {
             match &table_rows.table[..] {
+                "ticketremote_control_code_fast_state" => db_update
+                    .ticketremote_control_code_fast_state
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_control_code_request" => db_update
                     .ticketremote_control_code_request
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -909,6 +998,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_stream_desired_state" => db_update
                     .ticketremote_stream_desired_state
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "ticketremote_stream_viewer_focus" => db_update
+                    .ticketremote_stream_viewer_focus
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -925,6 +1017,8 @@ impl __sdk::DbUpdate for DbUpdate {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct AppliedDiff<'r> {
+    ticketremote_control_code_fast_state:
+        __sdk::TableAppliedDiff<'r, TicketremoteControlCodeFastState>,
     ticketremote_control_code_request: __sdk::TableAppliedDiff<'r, TicketremoteControlCodeRequest>,
     ticketremote_phone_current_report: __sdk::TableAppliedDiff<'r, TicketremotePhoneCurrentReport>,
     ticketremote_relay_current_report: __sdk::TableAppliedDiff<'r, TicketremoteRelayCurrentReport>,
@@ -936,6 +1030,7 @@ pub struct AppliedDiff<'r> {
     ticketremote_stream_command_signal:
         __sdk::TableAppliedDiff<'r, TicketremoteStreamCommandSignal>,
     ticketremote_stream_desired_state: __sdk::TableAppliedDiff<'r, TicketremoteStreamDesiredState>,
+    ticketremote_stream_viewer_focus: __sdk::TableAppliedDiff<'r, TicketremoteStreamViewerFocus>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -949,6 +1044,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         event: &EventContext,
         callbacks: &mut __sdk::DbCallbacks<RemoteModule>,
     ) {
+        callbacks.invoke_table_row_callbacks::<TicketremoteControlCodeFastState>(
+            "ticketremote_control_code_fast_state",
+            &self.ticketremote_control_code_fast_state,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<TicketremoteControlCodeRequest>(
             "ticketremote_control_code_request",
             &self.ticketremote_control_code_request,
@@ -992,6 +1092,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<TicketremoteStreamDesiredState>(
             "ticketremote_stream_desired_state",
             &self.ticketremote_stream_desired_state,
+            event,
+        );
+        callbacks.invoke_table_row_callbacks::<TicketremoteStreamViewerFocus>(
+            "ticketremote_stream_viewer_focus",
+            &self.ticketremote_stream_viewer_focus,
             event,
         );
     }
@@ -1654,6 +1759,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
     type QueryBuilder = __sdk::QueryBuilder;
 
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
+        ticketremote_control_code_fast_state_table::register_table(client_cache);
         ticketremote_control_code_request_table::register_table(client_cache);
         ticketremote_phone_current_report_table::register_table(client_cache);
         ticketremote_relay_current_report_table::register_table(client_cache);
@@ -1663,8 +1769,10 @@ impl __sdk::SpacetimeModule for RemoteModule {
         ticketremote_service_ticket_member_table::register_table(client_cache);
         ticketremote_stream_command_signal_table::register_table(client_cache);
         ticketremote_stream_desired_state_table::register_table(client_cache);
+        ticketremote_stream_viewer_focus_table::register_table(client_cache);
     }
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
+        "ticketremote_control_code_fast_state",
         "ticketremote_control_code_request",
         "ticketremote_phone_current_report",
         "ticketremote_relay_current_report",
@@ -1674,5 +1782,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "ticketremote_service_ticket_member",
         "ticketremote_stream_command_signal",
         "ticketremote_stream_desired_state",
+        "ticketremote_stream_viewer_focus",
     ];
 }

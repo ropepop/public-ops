@@ -63,6 +63,15 @@ func TestValidatorAcceptsSpacetimeAuthJWT(t *testing.T) {
 	if !identity.EmailVerified || identity.Subject != "user_123" {
 		t.Fatalf("identity = %#v", identity)
 	}
+	missingExpiry := signTestJWT(t, key, kid, map[string]any{
+		"iss":            server.URL,
+		"aud":            []string{"client-a"},
+		"email":          "member@example.com",
+		"email_verified": true,
+	})
+	if _, err := validator.ValidateOIDCJWT(context.Background(), missingExpiry); err == nil || !strings.Contains(err.Error(), "expiry is missing") {
+		t.Fatalf("OIDC token without expiry was accepted: %v", err)
+	}
 }
 
 func TestValidatorRejectsAudienceMismatch(t *testing.T) {
@@ -132,7 +141,7 @@ func TestValidatorAcceptsServerSessionToken(t *testing.T) {
 	}
 }
 
-func TestValidatorAcceptsNonExpiringServerSessionToken(t *testing.T) {
+func TestValidatorConvertsNeverTTLToFiniteServerSession(t *testing.T) {
 	validator := NewValidator(AccessConfig{
 		Mode:              "spacetime",
 		AuthCookieName:    "ticket_remote_auth",
@@ -147,19 +156,45 @@ func TestValidatorAcceptsNonExpiringServerSessionToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !expiresAt.IsZero() {
-		t.Fatalf("expiresAt = %s, want zero for non-expiring session", expiresAt)
+	if got, want := expiresAt.Sub(now), DefaultServerSessionTTL; got != want {
+		t.Fatalf("session TTL = %s, want %s", got, want)
 	}
 	claims := decodeServerSessionClaimsForTest(t, token)
-	if claims.ExpiresAt != 0 {
-		t.Fatalf("encoded exp = %d, want omitted/zero", claims.ExpiresAt)
+	if claims.ExpiresAt == 0 || claims.Version != serverSessionVersion {
+		t.Fatalf("finite versioned claims missing: %#v", claims)
 	}
-	identity, err := validator.ValidateServerSession(token, now.AddDate(20, 0, 0))
+	identity, info, err := validator.ValidateServerSessionWithInfo(token, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if info.ExpiresAt.IsZero() || info.Legacy || info.Version != serverSessionVersion {
+		t.Fatalf("session info = %#v", info)
+	}
 	if identity.Email != "member@example.com" || identity.Subject != "user_123" || !identity.EmailVerified {
 		t.Fatalf("identity = %#v", identity)
+	}
+}
+
+func TestValidatorAcceptsLegacySessionOnlyForMigration(t *testing.T) {
+	validator := NewValidator(AccessConfig{SessionSigningKey: "test-signing-key"})
+	now := time.Now().UTC()
+	claims := serverSessionClaims{
+		Email:     "member@example.com",
+		IssuedAt:  now.Add(-time.Hour).Unix(),
+		ExpiresAt: 0,
+	}
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(raw)
+	token := serverSessionTokenPrefix + payload + "." + validator.signSessionPayload(payload)
+	_, info, err := validator.ValidateServerSessionWithInfo(token, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Legacy || !info.ExpiresAt.IsZero() {
+		t.Fatalf("legacy session info = %#v", info)
 	}
 }
 

@@ -17,14 +17,19 @@ PORTAINER_LOCAL_ENDPOINT="unix:///var/run/docker.sock"
 PORTAINER_DB_TOOL_DIR="${SCRIPT_DIR}/portainerdb"
 PORTAINER_TOOLBOX_IMAGE="${PORTAINER_TOOLBOX_IMAGE:-busybox:1.36.1}"
 DOCKER_GC_SCRIPT="${SCRIPT_DIR}/docker_gc.py"
+LOCAL_RELEASE_GC_SCRIPT="${SCRIPT_DIR}/local_release_gc.py"
 MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"
 DOCKER_GC_REMOTE_STATE_DIR="/etc/arbuzas/docker-gc"
 DOCKER_GC_REMOTE_STATE_FILE="${DOCKER_GC_REMOTE_STATE_DIR}/state.json"
 DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-24h}"
 DOCKER_GC_RELEASE_KEEP_PER_FAMILY="${DOCKER_GC_RELEASE_KEEP_PER_FAMILY:-10}"
+ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS="${ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS:-72}"
+ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY="${ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY:-10}"
+ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN="${ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN:-false}"
 ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS="${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS:-7}"
 ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE="${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE:-100M}"
 ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE="${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE:-true}"
+ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS="${ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS:-45}"
 NETDATA_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/netdata"
 NETDATA_REMOTE_CONFIG_DIR="/etc/netdata"
 NETDATA_REMOTE_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/netdata.conf"
@@ -69,8 +74,9 @@ ARBUZAS_SATIKSME_BOT_PORT="${ARBUZAS_SATIKSME_BOT_PORT:-9318}"
 ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
 ARBUZAS_CHATGPT_BROKER_PORT="${ARBUZAS_CHATGPT_BROKER_PORT:-9348}"
-ARBUZAS_PHONE_BROKER_PORT="${ARBUZAS_PHONE_BROKER_PORT:-9398}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
+ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
+ARBUZAS_TICKET_TUNNEL_GID="${ARBUZAS_TICKET_TUNNEL_GID:-50}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
 ARBUZAS_TAILSCALE_IPV4="${ARBUZAS_TAILSCALE_IPV4:-}"
 ARBUZAS_FAN_ENTER_AUTO_C="${ARBUZAS_FAN_ENTER_AUTO_C:-89}"
@@ -82,20 +88,25 @@ ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME="${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME:-farel-su
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
 ARBUZAS_PORTAINER_IMAGE="${ARBUZAS_PORTAINER_IMAGE:-portainer/portainer-ce:lts}"
 ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
+ARBUZAS_TICKET_CLOUDFLARED_IMAGE="${ARBUZAS_TICKET_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0}"
 
 action=""
 requested_release_id=""
+VALIDATION_PROFILE="${ARBUZAS_VALIDATION_PROFILE:-full}"
+VALIDATION_PROFILE_OPTION_SET=0
 TARGETED_MODE=0
 VALIDATE_PORTAINER=0
 VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
 VALIDATE_SUBSCRIPTION=0
-VALIDATE_PHONE_BROKER=0
+VALIDATE_TICKET_PHONE_BRIDGE=0
 VALIDATE_CHATGPT=0
 VALIDATE_TICKET_REMOTE=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
+FAST_RELEASE_OVERLAY_PATHS=()
+RUN_STARTED_SECONDS="${SECONDS}"
 
 ALL_SERVICES=(
   portainer
@@ -103,7 +114,6 @@ ALL_SERVICES=(
   satiksme_bot
   subscription_bot
   ticket_phone_bridge
-  phone_broker
   chatgpt_broker
   chatgpt_bot
   ticket_remote_spacetime_sidecar
@@ -116,6 +126,24 @@ ALL_SERVICES=(
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2
+}
+
+run_timed_phase() {
+  local phase_name="$1"
+  shift
+  local phase_started_seconds="${SECONDS}"
+  local phase_status="ok"
+  local phase_exit_code=0
+
+  log "Phase start: ${phase_name} profile=${VALIDATION_PROFILE}"
+  if "$@"; then
+    phase_exit_code=0
+  else
+    phase_exit_code=$?
+    phase_status="failed"
+  fi
+  log "Phase timing: phase=${phase_name} status=${phase_status} duration_seconds=$((SECONDS - phase_started_seconds)) total_seconds=$((SECONDS - RUN_STARTED_SECONDS)) profile=${VALIDATION_PROFILE}"
+  return "${phase_exit_code}"
 }
 
 require_cmd() {
@@ -315,6 +343,44 @@ resolve_local_docker_gc_script() {
   done
 
   return 1
+}
+
+run_local_release_cleanup() {
+  local protect_release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+  local -a cleanup_args
+
+  [[ -f "${LOCAL_RELEASE_GC_SCRIPT}" ]] || {
+    echo "missing local release cleanup helper: ${LOCAL_RELEASE_GC_SCRIPT}" >&2
+    return 1
+  }
+  if [[ ! "${ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS}" =~ ^[0-9]+$ ]]; then
+    echo "ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS must be a non-negative integer" >&2
+    return 2
+  fi
+  if [[ ! "${ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY}" =~ ^[0-9]+$ ]]; then
+    echo "ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY must be a non-negative integer" >&2
+    return 2
+  fi
+  case "${ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN}" in
+    true|false)
+      ;;
+    *)
+      echo "ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN must be true or false" >&2
+      return 2
+      ;;
+  esac
+
+  cleanup_args=(
+    python3 "${LOCAL_RELEASE_GC_SCRIPT}"
+    --releases-root "${LOCAL_RELEASES_ROOT}"
+    --protect-release-id "${protect_release_id}"
+    --max-age-hours "${ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS}"
+    --keep-per-family "${ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY}"
+  )
+  if [[ "${ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN}" == "true" ]]; then
+    cleanup_args+=(--dry-run)
+  fi
+  "${cleanup_args[@]}"
 }
 
 remote_run_docker_gc() {
@@ -776,6 +842,7 @@ Actions:
 Options:
   --release-id VALUE
   --services NAME[,NAME...]
+  --validation-profile fast|standard|full
   --ssh-host HOST
   --ssh-user USER
   --ssh-port PORT
@@ -783,7 +850,7 @@ Options:
 
 Services:
   portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
-  subscription_bot, subscription_tunnel, ticket_phone_bridge, phone_broker,
+  subscription_bot, subscription_tunnel, ticket_phone_bridge,
   chatgpt_broker, chatgpt_bot, ticket_remote_spacetime_sidecar,
   ticket_remote, ticket_remote_tunnel
 EOF
@@ -824,6 +891,17 @@ trim_whitespace() {
   printf '%s\n' "${value}"
 }
 
+validate_validation_profile() {
+  case "${VALIDATION_PROFILE}" in
+    fast|standard|full)
+      ;;
+    *)
+      echo "Unknown validation profile: ${VALIDATION_PROFILE}; expected fast, standard, or full" >&2
+      exit 2
+      ;;
+  esac
+}
+
 is_known_service() {
   local service_name="$1"
   array_contains "${service_name}" "${ALL_SERVICES[@]}"
@@ -851,10 +929,9 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES subscription_bot
       append_unique DIAGNOSTIC_SERVICES subscription_tunnel
       ;;
-    phone_broker)
-      VALIDATE_PHONE_BROKER=1
+    ticket_phone_bridge)
+      VALIDATE_TICKET_PHONE_BRIDGE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
-      append_unique DIAGNOSTIC_SERVICES phone_broker
       ;;
     chatgpt)
       VALIDATE_CHATGPT=1
@@ -864,7 +941,6 @@ mark_validation_group() {
     ticket_remote)
       VALIDATE_TICKET_REMOTE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
-      append_unique DIAGNOSTIC_SERVICES phone_broker
       append_unique DIAGNOSTIC_SERVICES ticket_remote_spacetime_sidecar
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
@@ -921,35 +997,34 @@ resolve_requested_services() {
         ;;
       ticket_phone_bridge)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-        append_unique COMPOSE_TARGET_SERVICES phone_broker
-        mark_validation_group phone_broker
+        mark_validation_group ticket_phone_bridge
         ;;
-    phone_broker)
-      append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-      append_unique COMPOSE_TARGET_SERVICES phone_broker
-      mark_validation_group phone_broker
-      ;;
-    chatgpt_broker)
-      append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
-      append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
-      mark_validation_group chatgpt
-      ;;
-    chatgpt_bot)
-      append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
-      append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
-      mark_validation_group chatgpt
-      ;;
-    ticket_remote)
-        append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
-        append_unique COMPOSE_TARGET_SERVICES phone_broker
-        append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
-        append_unique COMPOSE_TARGET_SERVICES ticket_remote
-        append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
+      chatgpt_broker)
+        append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
+        append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
+        mark_validation_group chatgpt
+        ;;
+      chatgpt_bot)
+        append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
+        append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
+        mark_validation_group chatgpt
+        ;;
+      ticket_remote)
+        if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote
+        else
+          append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
+        fi
         mark_validation_group ticket_remote
         ;;
       ticket_remote_spacetime_sidecar)
         append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
-        append_unique COMPOSE_TARGET_SERVICES ticket_remote
+        if [[ "${VALIDATION_PROFILE}" != "fast" ]]; then
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote
+        fi
         mark_validation_group ticket_remote
         ;;
       ticket_remote_tunnel)
@@ -1020,7 +1095,6 @@ compose_all_service_args() {
     satiksme_bot
     subscription_bot
     ticket_phone_bridge
-    phone_broker
     chatgpt_broker
     chatgpt_bot
     ticket_remote_spacetime_sidecar
@@ -1604,10 +1678,29 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/phone-broker workloads/chatgpt-broker)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
+  fi
+}
+
+enforce_release_source_policy() {
+  local source_dirty
+  source_dirty="$(compute_release_source_dirty)"
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    if [[ "${source_dirty}" != "clean" ]]; then
+      if [[ "${ARBUZAS_ALLOW_DIRTY_FAST_RELEASE:-0}" != "1" ]]; then
+        echo "Refusing fast deployment from ${source_dirty} source. Commit the release inputs or explicitly set ARBUZAS_ALLOW_DIRTY_FAST_RELEASE=1 for a temporary iteration release." >&2
+        return 1
+      fi
+      log "Explicit temporary dirty fast release allowed; replace it with a clean standard or full release before close-out"
+    fi
+    return 0
+  fi
+  if [[ "${source_dirty}" != "clean" ]]; then
+    echo "Refusing ${VALIDATION_PROFILE} deployment from ${source_dirty} source. Commit the release inputs or use an explicitly targeted fast iteration deploy first." >&2
+    return 1
   fi
 }
 
@@ -1620,11 +1713,13 @@ import sys
 root = pathlib.Path(sys.argv[1])
 included_roots = [
     pathlib.Path("infra/arbuzas/docker"),
+    pathlib.Path("tools/arbuzas"),
     pathlib.Path("workloads/shared-go"),
     pathlib.Path("workloads/train-bot"),
     pathlib.Path("workloads/satiksme-bot"),
-    pathlib.Path("workloads/phone-broker"),
+    pathlib.Path("workloads/subscription-bot"),
     pathlib.Path("workloads/chatgpt-broker"),
+    pathlib.Path("workloads/ticket-remote"),
 ]
 entries = []
 for included in included_roots:
@@ -1661,25 +1756,8 @@ validate_release_identity_values() {
   fi
 }
 
-prepare_local_release_bundle() {
-  log "Preparing local release bundle ${ARBUZAS_RELEASE_ID}"
-  rm -rf "${ARBUZAS_RELEASE_DIR}"
-  mkdir -p "${ARBUZAS_RELEASE_DIR}/generated/cloudflared"
-
-  copy_tree_into_release "infra/arbuzas/docker"
-  copy_tree_into_release "workloads/shared-go"
-  copy_tree_into_release "workloads/train-bot"
-  copy_tree_into_release "workloads/satiksme-bot"
-  copy_tree_into_release "workloads/subscription-bot"
-  copy_tree_into_release "workloads/phone-broker"
-  copy_tree_into_release "workloads/chatgpt-broker"
-  copy_tree_into_release "workloads/ticket-remote"
-
-  mkdir -p "${ARBUZAS_RELEASE_DIR}/tools/arbuzas"
-  cp "${REPO_ROOT}/tools/arbuzas/render_cloudflared_config.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/render_cloudflared_config.py"
-  if [[ -f "${REPO_ROOT}/tools/arbuzas/docker_gc.py" ]]; then
-    cp "${REPO_ROOT}/tools/arbuzas/docker_gc.py" "${ARBUZAS_RELEASE_DIR}/tools/arbuzas/docker_gc.py"
-  fi
+prepare_local_release_metadata() {
+  copy_tree_into_release "tools/arbuzas"
 
   ARBUZAS_RELEASE_SOURCE_COMMIT="$(compute_release_source_commit)"
   ARBUZAS_RELEASE_SOURCE_DIRTY="$(compute_release_source_dirty)"
@@ -1697,8 +1775,9 @@ ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
 ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
 ARBUZAS_CHATGPT_BROKER_PORT=${ARBUZAS_CHATGPT_BROKER_PORT}
-ARBUZAS_PHONE_BROKER_PORT=${ARBUZAS_PHONE_BROKER_PORT}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
+ARBUZAS_TICKET_TUNNEL_UID=${ARBUZAS_TICKET_TUNNEL_UID}
+ARBUZAS_TICKET_TUNNEL_GID=${ARBUZAS_TICKET_TUNNEL_GID}
 ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
 ARBUZAS_SATIKSME_BOT_HOSTNAME=${ARBUZAS_SATIKSME_BOT_HOSTNAME}
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME=${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}
@@ -1711,7 +1790,76 @@ ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=${ARBUZAS_TICKET_REMOTE_SPACETIME
 ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN=${ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN:-}
 ARBUZAS_PORTAINER_IMAGE=${ARBUZAS_PORTAINER_IMAGE}
 ARBUZAS_CLOUDFLARED_IMAGE=${ARBUZAS_CLOUDFLARED_IMAGE}
+ARBUZAS_TICKET_CLOUDFLARED_IMAGE=${ARBUZAS_TICKET_CLOUDFLARED_IMAGE}
 EOF
+}
+
+prepare_local_release_bundle() {
+  log "Preparing local release bundle ${ARBUZAS_RELEASE_ID}"
+  rm -rf "${ARBUZAS_RELEASE_DIR}"
+  mkdir -p "${ARBUZAS_RELEASE_DIR}/generated/cloudflared"
+
+  copy_tree_into_release "infra/arbuzas/docker"
+  copy_tree_into_release "workloads/shared-go"
+  copy_tree_into_release "workloads/train-bot"
+  copy_tree_into_release "workloads/satiksme-bot"
+  copy_tree_into_release "workloads/subscription-bot"
+  copy_tree_into_release "workloads/chatgpt-broker"
+  copy_tree_into_release "workloads/ticket-remote"
+
+  prepare_local_release_metadata
+}
+
+copy_tree_into_fast_release_overlay() {
+  local path="$1"
+
+  if array_contains "${path}" ${FAST_RELEASE_OVERLAY_PATHS[@]+"${FAST_RELEASE_OVERLAY_PATHS[@]}"}; then
+    return
+  fi
+  copy_tree_into_release "${path}"
+  append_unique FAST_RELEASE_OVERLAY_PATHS "${path}"
+}
+
+prepare_local_fast_release_overlay() {
+  local service_name
+
+  log "Preparing selected-service release overlay ${ARBUZAS_RELEASE_ID}"
+  rm -rf "${ARBUZAS_RELEASE_DIR}"
+  mkdir -p "${ARBUZAS_RELEASE_DIR}"
+  FAST_RELEASE_OVERLAY_PATHS=()
+
+  copy_tree_into_fast_release_overlay "infra/arbuzas/docker"
+  for service_name in "${COMPOSE_TARGET_SERVICES[@]}"; do
+    case "${service_name}" in
+      train_bot)
+        copy_tree_into_fast_release_overlay "workloads/shared-go"
+        copy_tree_into_fast_release_overlay "workloads/train-bot"
+        ;;
+      satiksme_bot)
+        copy_tree_into_fast_release_overlay "workloads/shared-go"
+        copy_tree_into_fast_release_overlay "workloads/satiksme-bot"
+        ;;
+      subscription_bot)
+        copy_tree_into_fast_release_overlay "workloads/subscription-bot"
+        ;;
+      chatgpt_broker|chatgpt_bot)
+        copy_tree_into_fast_release_overlay "workloads/chatgpt-broker"
+        ;;
+      ticket_remote_spacetime_sidecar|ticket_remote)
+        copy_tree_into_fast_release_overlay "workloads/ticket-remote"
+        ;;
+      portainer|train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
+        ;;
+      *)
+        echo "No fast release overlay mapping for service: ${service_name}" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  prepare_local_release_metadata
+  append_unique FAST_RELEASE_OVERLAY_PATHS "tools/arbuzas"
+  append_unique FAST_RELEASE_OVERLAY_PATHS "release.env"
 }
 
 append_csv_unique() {
@@ -1740,6 +1888,27 @@ append_csv_unique() {
   else
     printf '%s,%s' "${existing}" "${candidate}"
   fi
+}
+
+prepare_remote_ticket_runtime_permissions() {
+  remote_root_command "
+    install -d -o 1001 -g 1001 -m 0750 '/srv/arbuzas/ticket-remote/state'
+    for path in \
+      '/etc/arbuzas/env/ticket-remote.env' \
+      '/etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem' \
+      '/etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret'; do
+      if [[ -f \"\${path}\" ]]; then
+        chown 1001:1001 \"\${path}\"
+        chmod 0600 \"\${path}\"
+      fi
+    done
+    for path in '/etc/arbuzas/secrets/android-adb/adbkey' '/etc/arbuzas/secrets/android-adb/adbkey.pub' '/etc/arbuzas/secrets/android-adb/adb_known_hosts.pb'; do
+      if [[ -f \"\${path}\" ]]; then
+        chown 1002:1002 \"\${path}\"
+        chmod 0600 \"\${path}\"
+      fi
+    done
+  "
 }
 
 prepare_remote_host_layout() {
@@ -1777,6 +1946,7 @@ prepare_remote_host_layout() {
       '/etc/arbuzas/env/subscription-bot.env' \
       '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
   "
+  prepare_remote_ticket_runtime_permissions
 }
 
 copy_release_to_remote() {
@@ -1786,7 +1956,7 @@ copy_release_to_remote() {
   local local_tarball=""
 
   local_tarball="$(mktemp "${TMPDIR:-/tmp}/arbuzas-${ARBUZAS_RELEASE_ID}.XXXXXX.tar")"
-  trap 'rm -f "${local_tarball}"' RETURN
+  trap "rm -f '${local_tarball}'; trap - RETURN" RETURN
 
   log "Packing release bundle ${ARBUZAS_RELEASE_ID}"
   (
@@ -1809,6 +1979,99 @@ copy_release_to_remote() {
     sudo -n rm -rf '${remote_release_dir}'
     sudo -n mv '${remote_tmp_dir}' '${remote_release_dir}'
   "
+}
+
+copy_fast_release_overlay_to_remote() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+  local remote_tmp_dir="${remote_release_dir}.uploading.$$"
+  local remote_tarball="/tmp/arbuzas-${ARBUZAS_RELEASE_ID}.$$.overlay.tar"
+  local local_tarball=""
+  local overlay_path=""
+  local overlay_path_args=""
+
+  for overlay_path in ${FAST_RELEASE_OVERLAY_PATHS[@]+"${FAST_RELEASE_OVERLAY_PATHS[@]}"}; do
+    overlay_path_args+=" $(shell_quote "${overlay_path}")"
+  done
+  if [[ -z "${overlay_path_args}" ]]; then
+    echo "fast release overlay has no selected paths" >&2
+    return 2
+  fi
+
+  local_tarball="$(mktemp "${TMPDIR:-/tmp}/arbuzas-${ARBUZAS_RELEASE_ID}.XXXXXX.overlay.tar")"
+  trap "rm -f '${local_tarball}'; trap - RETURN" RETURN
+
+  log "Packing selected-service release overlay ${ARBUZAS_RELEASE_ID}"
+  (
+    cd "${ARBUZAS_RELEASE_DIR}"
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "${local_tarball}" .
+  )
+
+  log "Uploading selected-service release overlay to ${ARBUZAS_HOST}:${remote_tarball}"
+  upload_remote_file "${local_tarball}" "${remote_tarball}"
+
+  remote_shell "
+    current_target=\$(readlink -f '${REMOTE_CURRENT_LINK}' 2>/dev/null || true)
+    [[ -n \"\${current_target}\" && -f \"\${current_target}/release.env\" ]] || {
+      echo 'fast profile requires a complete active release to seed the overlay' >&2
+      exit 1
+    }
+    sudo -n rm -rf '${remote_tmp_dir}'
+    sudo -n mkdir -p '${remote_tmp_dir}'
+    sudo -n cp -al \"\${current_target}/.\" '${remote_tmp_dir}/'
+    for overlay_path in${overlay_path_args}; do
+      sudo -n rm -rf '${remote_tmp_dir}/'\"\${overlay_path}\"
+    done
+    sudo -n tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
+    sudo -n rm -f '${remote_tarball}'
+    [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete fast overlay: missing release.env' >&2; exit 1; }
+    [[ -f '${remote_tmp_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'incomplete fast overlay: missing compose.yml' >&2; exit 1; }
+    [[ -f '${remote_tmp_dir}/tools/arbuzas/render_cloudflared_config.py' ]] || { echo 'incomplete fast overlay: missing tunnel renderer' >&2; exit 1; }
+    for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote; do
+      [[ -d '${remote_tmp_dir}/'\"\${required_root}\" ]] || {
+        echo \"incomplete fast overlay: missing \${required_root}\" >&2
+        exit 1
+      }
+    done
+    sudo -n rm -rf '${remote_release_dir}'
+    sudo -n mv '${remote_tmp_dir}' '${remote_release_dir}'
+  "
+}
+
+fast_profile_requires_cloudflared_render() {
+  local service_name
+
+  for service_name in "${COMPOSE_TARGET_SERVICES[@]}"; do
+    case "${service_name}" in
+      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+prepare_deploy_release_payload() {
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    prepare_local_fast_release_overlay
+  else
+    prepare_local_release_bundle
+  fi
+}
+
+copy_deploy_release_payload() {
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    copy_fast_release_overlay_to_remote
+  else
+    copy_release_to_remote
+  fi
+}
+
+render_deploy_cloudflared_configs() {
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]] && ! fast_profile_requires_cloudflared_render; then
+    log "Tunnel config rendering skipped: fast profile did not select a tunnel"
+    return 0
+  fi
+  render_remote_cloudflared_configs
 }
 
 render_remote_cloudflared_configs() {
@@ -1863,13 +2126,39 @@ remote_compose_up() {
   if (( TARGETED_MODE == 1 )); then
     remote_shell "
       cd '${remote_release_dir}'
+      if [[ '${VALIDATION_PROFILE}' == 'fast' ]]; then
+        for service_image in \
+          train_bot=arbuzas/train-bot \
+          satiksme_bot=arbuzas/satiksme-bot \
+          subscription_bot=arbuzas/subscription-bot \
+          ticket_phone_bridge=arbuzas/ticket-phone-bridge \
+          chatgpt_broker=arbuzas/chatgpt-broker \
+          chatgpt_bot=arbuzas/chatgpt-bot \
+          ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
+          ticket_remote=arbuzas/ticket-remote; do
+          service_name=\${service_image%%=*}
+          image_repository=\${service_image#*=}
+          case ' ${non_tunnel_service_args} ' in
+            *\" \${service_name} \"*) continue ;;
+          esac
+          new_image=\"\${image_repository}:${ARBUZAS_RELEASE_ID}\"
+          docker image inspect \"\${new_image}\" >/dev/null 2>&1 && continue
+          container_id=\$(docker ps -aq \
+            --filter 'label=com.docker.compose.project=arbuzas' \
+            --filter \"label=com.docker.compose.service=\${service_name}\" \
+            | head -n 1)
+          [[ -n \"\${container_id}\" ]] || continue
+          image_id=\$(docker inspect --format '{{.Image}}' \"\${container_id}\")
+          docker image tag \"\${image_id}\" \"\${new_image}\"
+        done
+      fi
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
       if [[ -n '${non_tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps --remove-orphans${non_tunnel_service_args}
       fi
       if [[ -n '${tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps --remove-orphans${tunnel_service_args}
       fi
     "
     return
@@ -3909,16 +4198,13 @@ validate_remote_subscription_workload_health() {
     subscription_bot subscription_tunnel
 }
 
-validate_remote_phone_broker_workload_health() {
+validate_remote_ticket_phone_bridge_workload_health() {
   local remote_release_dir="$1"
 
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge
   validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
     "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker
-  validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker
+    ticket_phone_bridge
 }
 
 validate_remote_chatgpt_workload_health() {
@@ -3933,19 +4219,19 @@ validate_remote_chatgpt_workload_health() {
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
     "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
-  validate_remote_probe "${remote_release_dir}" "phone-broker local health" \
-    "wait_until_ok compose exec -T phone_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_PHONE_BROKER_PORT}/api/v1/health?strict=1\" >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+  validate_remote_probe "${remote_release_dir}" "ticket-remote direct bridge health" \
+    "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://ticket_phone_bridge:9388/api/v1/health >/dev/null 2>/dev/null'" \
+    ticket_phone_bridge ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote Spacetime sidecar health" \
     "wait_until_ok compose exec -T ticket_remote_spacetime_sidecar sh -lc 'curl -fsS http://127.0.0.1:9346/healthz | grep -F \"\\\"status\\\":\\\"ok\\\"\" >/dev/null'" \
     ticket_remote_spacetime_sidecar ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote production state backend" \
     "ticket_state_backend_ok() {
       file_backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
@@ -3963,13 +4249,13 @@ validate_remote_ticket_remote_workload_health() {
         active=pixel
       fi
       [[ \"\${active}\" = pixel ]] || return 1
-      compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PHONE_BACKEND_ID}\" = pixel && test \"\${TICKET_REMOTE_PHONE_BROKER_URL}\" = \"http://phone_broker:${ARBUZAS_PHONE_BROKER_PORT}\" && curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
+      compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PHONE_BACKEND_ID}\" = pixel && test \"\${TICKET_REMOTE_PHONE_BASE_URL}\" = \"http://ticket_phone_bridge:9388\" && curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
     }
     wait_until_ok active_configured_backend_ok" \
-    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote
+    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
-    ticket_phone_bridge phone_broker ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
   validate_remote_probe "${remote_release_dir}" "ticket-remote public HTTP redirects to HTTPS" \
     "wait_until_ok sh -lc 'result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" http://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${result}\" in \"301 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*|\"308 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*) exit 0 ;; *) printf \"%s\\n\" \"\${result}\" >&2; exit 1 ;; esac'" \
     ticket_remote ticket_remote_tunnel
@@ -4045,6 +4331,154 @@ validate_remote_ticket_remote_workload_health() {
     ticket_remote
 }
 
+validate_remote_selected_smoke_health() {
+  local remote_release_dir="$1"
+  local require_current_link="${2:-0}"
+  local selected_service_args=""
+  local diagnostics_services=()
+
+  if ! [[ "${ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS must be a positive integer" >&2
+    return 2
+  fi
+
+  selected_service_args="$(compose_target_service_args)"
+  populate_current_diagnostic_services diagnostics_services
+  validate_remote_probe "${remote_release_dir}" "batched selected-service smoke readiness" "
+    ticket_smoke_probe_pids=()
+    ticket_smoke_probe_labels=()
+    ticket_smoke_probe_logs=()
+
+    cleanup_ticket_smoke_probes() {
+      local probe_pid=''
+      local probe_log=''
+
+      for probe_pid in \"\${ticket_smoke_probe_pids[@]}\"; do
+        kill -TERM -- \"-\${probe_pid}\" >/dev/null 2>&1 || true
+      done
+      for probe_pid in \"\${ticket_smoke_probe_pids[@]}\"; do
+        wait \"\${probe_pid}\" >/dev/null 2>&1 || true
+      done
+      for probe_log in \"\${ticket_smoke_probe_logs[@]}\"; do
+        rm -f \"\${probe_log}\"
+      done
+      ticket_smoke_probe_pids=()
+      ticket_smoke_probe_labels=()
+      ticket_smoke_probe_logs=()
+    }
+
+    trap 'cleanup_ticket_smoke_probes; exit 130' INT
+    trap 'cleanup_ticket_smoke_probes; exit 143' TERM
+    trap cleanup_ticket_smoke_probes EXIT
+
+    start_ticket_smoke_probe() {
+      local probe_label=\"\$1\"
+      local probe_command=\"\$2\"
+      local probe_log=''
+
+      probe_log=\$(mktemp /tmp/arbuzas-ticket-smoke.XXXXXX) || return 1
+      ticket_smoke_probe_labels+=(\"\${probe_label}\")
+      ticket_smoke_probe_logs+=(\"\${probe_log}\")
+      export -f compose
+      setsid timeout --kill-after=1s 2s bash -c \"\${probe_command}\" >\"\${probe_log}\" 2>&1 &
+      ticket_smoke_probe_pids+=(\"\$!\")
+    }
+
+    collect_ticket_smoke_probe_status() {
+      local probe_index=0
+      local probe_pid=''
+      local failed=0
+
+      for probe_pid in \"\${ticket_smoke_probe_pids[@]}\"; do
+        if ! wait \"\${probe_pid}\"; then
+          printf 'Ticket smoke probe failed: %s\\n' \"\${ticket_smoke_probe_labels[probe_index]}\" >&2
+          sed 's/^/  /' \"\${ticket_smoke_probe_logs[probe_index]}\" >&2 || true
+          failed=1
+        fi
+        ((probe_index += 1))
+      done
+
+      for probe_index in \"\${!ticket_smoke_probe_logs[@]}\"; do
+        rm -f \"\${ticket_smoke_probe_logs[probe_index]}\"
+      done
+      ticket_smoke_probe_pids=()
+      ticket_smoke_probe_labels=()
+      ticket_smoke_probe_logs=()
+      (( failed == 0 ))
+    }
+
+    smoke_ready() {
+      local running=''
+      local service_name=''
+
+      [[ -f '${remote_release_dir}/release.env' ]] || return 1
+      [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || return 1
+      if [[ '${require_current_link}' == '1' ]]; then
+        [[ \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" == \"\$(readlink -f '${remote_release_dir}')\" ]] || return 1
+      fi
+
+      running=\$(compose ps --services --status running | tr '\n' ' ') || return 1
+      for service_name in${selected_service_args}; do
+        case \" \${running} \" in
+          *\" \${service_name} \"*) ;;
+          *) return 1 ;;
+        esac
+      done
+
+      if [[ '${VALIDATE_PORTAINER}' == '1' ]]; then
+        case \" \${running} \" in *' portainer '*) ;; *) return 1 ;; esac
+        curl -skf --connect-timeout 2 --max-time 4 https://127.0.0.1:9443/ >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_TRAIN}' == '1' ]]; then
+        compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
+        curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_SATIKSME}' == '1' ]]; then
+        compose exec -T satiksme_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
+        curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_SUBSCRIPTION}' == '1' ]]; then
+        compose exec -T subscription_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SUBSCRIPTION_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
+        curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_TICKET_PHONE_BRIDGE}' == '1' ]]; then
+        case \" \${running} \" in *' ticket_phone_bridge '*) ;; *) return 1 ;; esac
+        compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null' >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_CHATGPT}' == '1' ]]; then
+        case \" \${running} \" in *' chatgpt_broker '*) ;; *) return 1 ;; esac
+        case \" \${running} \" in *' chatgpt_bot '*) ;; *) return 1 ;; esac
+        compose exec -T chatgpt_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz >/dev/null' >/dev/null 2>&1 || return 1
+      fi
+      if [[ '${VALIDATE_TICKET_REMOTE}' == '1' ]]; then
+        for service_name in ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel; do
+          case \" \${running} \" in
+            *\" \${service_name} \"*) ;;
+            *) return 1 ;;
+          esac
+        done
+        start_ticket_smoke_probe 'ticket phone bridge local health' \"compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null'\" || return 1
+        start_ticket_smoke_probe 'Ticket Remote direct bridge health' \"compose exec -T ticket_remote sh -lc 'curl -fsS http://ticket_phone_bridge:9388/api/v1/health >/dev/null'\" || return 1
+        start_ticket_smoke_probe 'Ticket Remote Spacetime sidecar health' \"compose exec -T ticket_remote_spacetime_sidecar sh -lc 'curl -fsS http://127.0.0.1:9346/healthz | grep -F \\\"status\\\" >/dev/null'\" || return 1
+        start_ticket_smoke_probe 'Ticket Remote livez' \"compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'\" || return 1
+        start_ticket_smoke_probe 'Ticket Remote public page' 'public_code=\$(curl -sS --connect-timeout 2 --max-time 4 -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${public_code}\" in 200|302) ;; *) echo \"expected Ticket Remote public page status 200 or 302, got \${public_code}\" >&2; exit 1 ;; esac' || return 1
+        start_ticket_smoke_probe 'Ticket Remote public health authorization' 'public_code=\$(curl -sS --connect-timeout 2 --max-time 4 -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/api/v1/health 2>/dev/null || true); [[ \"\${public_code}\" == 401 ]] || { echo \"expected Ticket Remote health status 401, got \${public_code}\" >&2; exit 1; }' || return 1
+        collect_ticket_smoke_probe_status || return 1
+      fi
+    }
+
+    deadline=\$((SECONDS + ${ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS}))
+    until smoke_ready; do
+      if (( SECONDS >= deadline )); then
+        echo 'selected services did not pass batched smoke readiness before timeout' >&2
+        compose ps >&2 || true
+        exit 1
+      fi
+      sleep 1
+    done
+  " "${diagnostics_services[@]}"
+}
+
 validate_remote_workload_health() {
   local remote_release_dir="$1"
 
@@ -4052,7 +4486,7 @@ validate_remote_workload_health() {
   validate_remote_train_workload_health "${remote_release_dir}"
   validate_remote_satiksme_workload_health "${remote_release_dir}"
   validate_remote_subscription_workload_health "${remote_release_dir}"
-  validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
   validate_remote_chatgpt_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
 }
@@ -4072,8 +4506,8 @@ validate_remote_selected_workload_health() {
   if (( VALIDATE_SUBSCRIPTION == 1 )); then
     validate_remote_subscription_workload_health "${remote_release_dir}"
   fi
-  if (( VALIDATE_PHONE_BROKER == 1 )); then
-    validate_remote_phone_broker_workload_health "${remote_release_dir}"
+  if (( VALIDATE_TICKET_PHONE_BRIDGE == 1 )); then
+    validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_CHATGPT == 1 )); then
     validate_remote_chatgpt_workload_health "${remote_release_dir}"
@@ -4179,6 +4613,12 @@ validate_remote_release() {
   remote_release_dir="$(resolve_remote_release_dir "${target_release_id}")"
   populate_current_diagnostic_services diagnostics_services
 
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    validate_remote_selected_smoke_health "${remote_release_dir}" 0
+    return_remote_validation_status
+    return
+  fi
+
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
@@ -4186,9 +4626,11 @@ validate_remote_release() {
 
   if (( TARGETED_MODE == 1 )); then
     validate_remote_selected_workload_health "${remote_release_dir}"
-    validate_remote_swarm_baseline "${remote_release_dir}"
-    if (( VALIDATE_PORTAINER == 1 )); then
-      validate_remote_portainer_state "${remote_release_dir}"
+    if [[ "${VALIDATION_PROFILE}" == "full" ]]; then
+      validate_remote_swarm_baseline "${remote_release_dir}"
+      if (( VALIDATE_PORTAINER == 1 )); then
+        validate_remote_portainer_state "${remote_release_dir}"
+      fi
     fi
     return_remote_validation_status
     return
@@ -4197,6 +4639,30 @@ validate_remote_release() {
   validate_remote_workload_health "${remote_release_dir}"
   validate_remote_host_baseline "${remote_release_dir}"
   return_remote_validation_status
+}
+
+validate_deployed_release() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    validate_remote_selected_smoke_health "${remote_release_dir}" 1
+    return
+  fi
+  validate_remote_current_release_link "${remote_release_dir}" && validate_remote_release "${ARBUZAS_RELEASE_ID}"
+}
+
+run_post_deploy_maintenance() {
+  local protect_release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+
+  if ! run_local_release_cleanup "${protect_release_id}"; then
+    log "Cleanup warning: local release cleanup failed, but the validated release remains successful"
+  fi
+  if [[ "${VALIDATION_PROFILE}" != "full" ]]; then
+    log "Remote cleanup deferred by ${VALIDATION_PROFILE} profile; local expired release cleanup still completed"
+    return 0
+  fi
+  cleanup_remote_public_bundle_versions
+  run_automatic_remote_docker_gc
 }
 
 repair_remote_portainer() {
@@ -4212,7 +4678,7 @@ repair_remote_portainer() {
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
   validate_remote_workload_health "${remote_release_dir}"
 
   validate_remote_host_probe "${remote_release_dir}" \
@@ -4229,7 +4695,7 @@ repair_remote_portainer() {
         exit 1
       fi
     " \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge phone_broker chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
+    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
 
   backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_path="${REMOTE_PORTAINER_BACKUPS_DIR}/portainer-${backup_timestamp}.tar.gz"
@@ -4391,9 +4857,10 @@ deploy_config_from_mirror() {
   local service_name=""
   local service_args=""
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
-  trap 'rm -f "${changed_paths_file}"' RETURN
+  trap "rm -f '${changed_paths_file}'; trap - RETURN" RETURN
 
   run_host_mirror_push "${changed_paths_file}"
+  prepare_remote_ticket_runtime_permissions
   affected_output="$(host_mirror_affected_services "${changed_paths_file}")"
   if [[ -z "${affected_output}" ]]; then
     log "Deploy config: mirror is already in sync; no services need restart"
@@ -4416,7 +4883,7 @@ deploy_config_from_mirror() {
   done
   remote_shell "
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps --remove-orphans${service_args}
   "
 }
 
@@ -4454,6 +4921,15 @@ while (( $# > 0 )); do
       done
       if [[ "${#REQUESTED_SERVICES[@]}" == "${local_services_before}" ]]; then
         echo "--services requires at least one service name" >&2
+        exit 2
+      fi
+      ;;
+    --validation-profile|--validation-level)
+      shift
+      VALIDATION_PROFILE="${1:-}"
+      VALIDATION_PROFILE_OPTION_SET=1
+      if [[ -z "${VALIDATION_PROFILE}" ]]; then
+        echo "--validation-profile requires a value" >&2
         exit 2
       fi
       ;;
@@ -4496,6 +4972,19 @@ if [[ -z "${action}" ]]; then
   exit 2
 fi
 
+validate_validation_profile
+
+if (( VALIDATION_PROFILE_OPTION_SET == 1 )); then
+  case "${action}" in
+    deploy|validate|rollback)
+      ;;
+    *)
+      echo "--validation-profile is only supported for deploy, validate, and rollback" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 if (( ${#REQUESTED_SERVICES[@]} > 0 )); then
   case "${action}" in
     deploy|validate|rollback)
@@ -4508,6 +4997,15 @@ if (( ${#REQUESTED_SERVICES[@]} > 0 )); then
 fi
 
 resolve_requested_services
+
+case "${action}" in
+  deploy|validate|rollback)
+    if [[ "${VALIDATION_PROFILE}" != "full" ]] && (( TARGETED_MODE == 0 )); then
+      echo "Validation profile ${VALIDATION_PROFILE} requires --services; unscoped operations use the full profile" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 require_cmd ssh
 require_cmd python3
@@ -4550,43 +5048,59 @@ case "${action}" in
     require_cmd tar
     ARBUZAS_RELEASE_ID="${requested_release_id:-${ARBUZAS_RELEASE_ID}}"
     ARBUZAS_RELEASE_DIR="${LOCAL_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
-    previous_release_id="$(resolve_remote_current_release_id || true)"
+    enforce_release_source_policy
+    previous_release_id="$(run_timed_phase resolve_current_release resolve_remote_current_release_id || true)"
     if (( TARGETED_MODE == 1 )); then
-      log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]}"
+      log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
     fi
     mirror_changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
     trap 'rm -f "${mirror_changed_paths_file}"' EXIT
-    run_host_mirror_push "${mirror_changed_paths_file}"
-    prepare_local_release_bundle
-    prepare_remote_host_layout
-    copy_release_to_remote
-    render_remote_cloudflared_configs
-    remote_compose_up
-    if validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}" && validate_remote_release "${ARBUZAS_RELEASE_ID}"; then
-      cleanup_remote_public_bundle_versions
-      run_automatic_remote_docker_gc
+    run_timed_phase mirror_push run_host_mirror_push "${mirror_changed_paths_file}"
+    run_timed_phase prepare_ticket_permissions prepare_remote_ticket_runtime_permissions
+    run_timed_phase package_release prepare_deploy_release_payload
+    if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+      log "Host layout preparation skipped: fast profile reuses the active complete release"
+    else
+      run_timed_phase prepare_host prepare_remote_host_layout
+    fi
+    run_timed_phase upload_release copy_deploy_release_payload
+    run_timed_phase render_tunnels render_deploy_cloudflared_configs
+    deploy_ready_for_validation=1
+    if ! run_timed_phase restart_services remote_compose_up; then
+      deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )) && run_timed_phase validate_release validate_deployed_release; then
+      run_timed_phase post_deploy_maintenance run_post_deploy_maintenance
       exit 0
     fi
     if [[ -n "${previous_release_id}" && "${previous_release_id}" != "${ARBUZAS_RELEASE_ID}" ]]; then
       log "Deploy validation failed; rolling back to ${previous_release_id}"
       requested_release_id="${previous_release_id}"
-      rollback_remote_release
-      validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
-      validate_remote_release "${previous_release_id}"
+      run_timed_phase rollback_release rollback_remote_release
+      if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+        run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${previous_release_id}" 1
+      else
+        run_timed_phase validate_rollback validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
+        run_timed_phase validate_rollback_services validate_remote_release "${previous_release_id}"
+      fi
     fi
     exit 1
     ;;
   validate)
     if (( TARGETED_MODE == 1 )); then
-      log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]}"
+      log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
     fi
-    validate_remote_release "${requested_release_id}"
+    run_timed_phase validate_release validate_remote_release "${requested_release_id}"
     ;;
   rollback)
-    rollback_remote_release
-    validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
-    validate_remote_release "${requested_release_id}"
-    run_automatic_remote_docker_gc
+    run_timed_phase rollback_release rollback_remote_release
+    if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+      run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${requested_release_id}" 1
+    else
+      run_timed_phase validate_rollback_link validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
+      run_timed_phase validate_rollback_services validate_remote_release "${requested_release_id}"
+    fi
+    run_timed_phase post_rollback_maintenance run_post_deploy_maintenance "${requested_release_id}"
     ;;
   cleanup-docker)
     if [[ -n "${requested_release_id}" ]]; then

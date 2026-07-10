@@ -443,7 +443,7 @@ func TestStreamPrewarmHTTPStartAllowsSlowPixelWake(t *testing.T) {
 	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 }
 
-func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T) {
+func TestAuthenticatedIndexPrewarmWaitsForCurrentMembership(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +493,11 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("index request did not reach state lookup")
 	}
-	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
+	select {
+	case command := <-phoneCommands:
+		t.Fatalf("phone command was sent before current membership completed: %s", command)
+	case <-time.After(250 * time.Millisecond):
+	}
 	close(blockingStore.releaseSnapshot)
 	select {
 	case rec := <-done:
@@ -503,6 +507,7 @@ func TestAuthenticatedIndexPrewarmStartsBeforeStateLookupCompletes(t *testing.T)
 	case <-time.After(3 * time.Second):
 		t.Fatal("index response did not finish after state lookup was released")
 	}
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
 }
 
 func TestAuthenticatedIndexSessionCookiePrewarmStartsPhone(t *testing.T) {
@@ -625,7 +630,76 @@ func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 	}
 }
 
-func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
+func TestRemovedMemberCachedPageCannotPrewarmPhone(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	memberEmail := "removed@example.com"
+	cached, err := store.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", memberEmail, state.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID:         "pixel",
+		AttachName:        "Pixel",
+		BaseURL:           phoneServer.URL,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	server, err := NewServer(config.Config{
+		PublicBaseURL: "http://ticket.test",
+		TicketID:      "vivi-default",
+		CookieName:    "ticket_remote_session",
+		CookieTTL:     time.Hour,
+		Access: auth.AccessConfig{
+			Mode:              "spacetime",
+			AuthCookieName:    "ticket_remote_auth",
+			SessionSigningKey: "test-signing-key",
+		},
+		Phone: config.PhoneConfig{BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL},
+	}, store, relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.cacheSnapshot(cached)
+	if _, err := store.RemoveMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", memberEmail); err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := server.auth.IssueServerSession(auth.Identity{Email: memberEmail}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "ticket_remote_auth", Value: token})
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cached page status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case command := <-phoneCommands:
+		t.Fatalf("removed member triggered phone prewarm: %s", command)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestVideoSocketWaitsForCurrentMembershipBeforePhoneWake(t *testing.T) {
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/stream":
@@ -647,7 +721,6 @@ func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 		snapshotStarted: make(chan struct{}),
 		releaseSnapshot: make(chan struct{}),
 	}
-	defer close(store.releaseSnapshot)
 	relay := phone.NewRelay(phone.RelayConfig{
 		BackendID:         "pixel",
 		AttachName:        "Pixel",
@@ -673,12 +746,25 @@ func TestVideoSocketUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 		connReady <- dialStreamTestClient(t, ctx, ticketServer.URL, "cached-fast-video")
 	}()
 
+	select {
+	case <-store.snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("video socket did not start current membership lookup")
+	}
+	select {
+	case conn := <-connReady:
+		_ = conn.Close(websocket.StatusNormalClosure, "unexpected early connection")
+		t.Fatal("video socket was accepted from cached membership")
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(store.releaseSnapshot)
+
 	var conn *websocket.Conn
 	select {
 	case conn = <-connReady:
 		defer conn.Close(websocket.StatusNormalClosure, "test complete")
-	case <-time.After(350 * time.Millisecond):
-		t.Fatal("video socket waited for store refresh despite fresh cached state")
+	case <-time.After(2 * time.Second):
+		t.Fatal("video socket did not connect after current membership completed")
 	}
 }
 
@@ -1396,6 +1482,44 @@ func TestPhoneRecoveryCommandQueueIsServerRateLimited(t *testing.T) {
 	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
 		t.Fatalf("server recovery cooldown allowed duplicate recover_stream commands: %d", got)
 	}
+}
+
+func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+
+	now := time.Now()
+	server.direct.mu.Lock()
+	server.direct.streamEpoch = 7
+	server.direct.lastFrameAt = now
+	server.direct.lastKeyFrameAt = now
+	server.direct.lastFrameEpoch = 7
+	server.direct.lastKeyFrameEpoch = 7
+	server.direct.lastFrameSequence = 42
+	server.direct.lastKeyFrameSequence = 42
+	server.direct.lastFrameVisualAgeMillis = 100
+	server.direct.lastKeyFrameVisualAgeMillis = 100
+	server.direct.lastFrameVisualAgeKnown = true
+	server.direct.lastKeyFrameVisualAgeKnown = true
+	server.direct.lastBrowserMediaError = ""
+	server.direct.mu.Unlock()
+	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
+
+	if err := server.requestPhoneKeyframeNow("stale_video_frames"); err != nil {
+		t.Fatalf("background keyframe suppression returned error: %v", err)
+	}
+	server.requestPhoneRecovery("stale_video_frames")
+
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("live stream allowed background keyframe commands: %d", got)
+	}
+	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
+		t.Fatalf("live stream allowed background recovery commands: %d", got)
+	}
+
+	if err := server.requestPhoneKeyframeNow("control_code_result_marker_low_latency"); err != nil {
+		t.Fatalf("control-code keyframe returned error: %v", err)
+	}
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "control-code keyframe")
 }
 
 func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T) {

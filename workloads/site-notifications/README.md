@@ -1,64 +1,17 @@
-# Notifications
+# Notifications (retired)
 
-Telegram-controlled notifier for new gribu.lv messages.
+The standalone gribu.lv notifier is not part of the kitty-gration runtime and
+is not running on the Pixel. Its checked-out implementation was removed during
+the 2026-07 code-footprint reduction so inactive code does not remain mixed
+with production workloads.
 
-## Features
-
-- Telegram control commands and navigation buttons
-- Adaptive polling cadence with watchdogs and restart backoff
-- Session refresh and automatic cookie rotation
-- Healthcheck and diagnostics commands
-- Managed-service runtime gate for production
-
-## Reliability Model
-
-- daemon startup is allowed only when `RUNTIME_CONTEXT_POLICY=managed_service`
-- non-managed daemon launch exits with code `11`
-- worker exits `20/21` are restarted by the daemon supervisor with exponential backoff
-
-## Local Development
+The last complete implementation is recoverable from Git commit
+`de42a1c526cc3c13c4a927c1007f2a7ee03bef9f` if a future product decision brings
+the notifier back:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-cp .env.example .env
-PYTHONPATH=. pytest -q
-make docker-image-build
+git restore --source=de42a1c526cc3c13c4a927c1007f2a7ee03bef9f -- workloads/site-notifications
 ```
 
-## Run
-
-Start the daemon locally only through a managed wrapper:
-
-```bash
-RUNTIME_CONTEXT_POLICY=managed_service python app.py daemon
-```
-
-Run a single check:
-
-```bash
-python app.py check-once
-```
-
-Run the health check:
-
-```bash
-python app.py healthcheck
-```
-
-## Active Deployment
-
-```bash
-../../tools/arbuzas/deploy.sh deploy --ssh-host kitty-gration --ssh-user "$USER"
-../../tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
-```
-
-The production service stores state under `/srv/arbuzas/site-notifications/state` and uses `/etc/arbuzas/env/site-notifications.env` as its managed env file.
-
-## Notes
-
-- Only the configured Telegram chat can control the bot.
-- Manual daemon launches outside a managed service remain unsupported.
-- The old Pixel diagnostics flow is rollback-only legacy material.
+Restoration is source recovery only. A new deployment design, current tests,
+fresh credentials, and explicit production approval are still required.
