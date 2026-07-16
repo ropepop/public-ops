@@ -40,185 +40,6 @@ func TestBrowserVideoSocketContextParsesOldPageQuery(t *testing.T) {
 	}
 }
 
-func TestBrowserHeartbeatKeepsPhoneBackendActive(t *testing.T) {
-	phoneCommands := make(chan string, 8)
-
-	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/stream":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone video websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-			defer cancel()
-			<-ctx.Done()
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer phoneServer.Close()
-	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
-
-	store := state.NewMemoryStore()
-	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
-		TicketID:        "vivi-default",
-		DisplayName:     "ViVi timed ticket",
-		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "pixel",
-		PhoneBaseURL:    phoneServer.URL,
-		PhoneAttachName: "Pixel",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         "pixel",
-		AttachName:        "Pixel",
-		BaseURL:           phoneServer.URL,
-		ReconnectMinDelay: time.Hour,
-		ReconnectMaxDelay: time.Hour,
-		NoViewerStopDelay: time.Hour,
-	})
-	storeForServer := state.Store(store)
-	if sink := ticketStreamCommandSink(phoneServer.URL); sink != nil {
-		storeForServer = &recordingTicketStore{Store: store, commandSink: sink}
-	}
-	server, err := NewServer(config.Config{
-		PublicBaseURL: "http://ticket.test",
-		TicketID:      "vivi-default",
-		CookieName:    "ticket_remote_session",
-		CookieTTL:     time.Hour,
-		Access: auth.AccessConfig{
-			Mode:     "dev",
-			DevEmail: "ticket@jolkins.id.lv",
-		},
-		Phone: config.PhoneConfig{
-			BackendID:  "pixel",
-			AttachName: "Pixel",
-			BaseURL:    phoneServer.URL,
-			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
-		},
-	}, storeForServer, relay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticketServer := httptest.NewServer(server)
-	defer ticketServer.Close()
-	defer relay.Close()
-
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
-	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	videoConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/stream", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser video websocket: %v", err)
-	}
-	defer videoConn.Close(websocket.StatusNormalClosure, "test complete")
-
-	controlConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser control websocket: %v", err)
-	}
-	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
-	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"activity"}`)); err != nil {
-		t.Fatalf("send browser activity: %v", err)
-	}
-
-	got := waitForPhoneMessageText(t, phoneCommands, `"type":"activity"`)
-	if !strings.Contains(got, `"reason":"browser_activity"`) {
-		t.Fatalf("stream activity command = %s", got)
-	}
-}
-
-func TestBrowserControlSocketAloneDoesNotStartPhoneBackend(t *testing.T) {
-	phoneCommands := make(chan string, 8)
-
-	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/stream":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone video websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-			defer cancel()
-			<-ctx.Done()
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer phoneServer.Close()
-	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
-
-	store := state.NewMemoryStore()
-	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
-		TicketID:        "vivi-default",
-		DisplayName:     "ViVi timed ticket",
-		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "pixel",
-		PhoneBaseURL:    phoneServer.URL,
-		PhoneAttachName: "Pixel",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         "pixel",
-		AttachName:        "Pixel",
-		BaseURL:           phoneServer.URL,
-		ReconnectMinDelay: time.Hour,
-		ReconnectMaxDelay: time.Hour,
-		NoViewerStopDelay: time.Hour,
-	})
-	server, err := NewServer(config.Config{
-		PublicBaseURL: "http://ticket.test",
-		TicketID:      "vivi-default",
-		CookieName:    "ticket_remote_session",
-		CookieTTL:     time.Hour,
-		Access: auth.AccessConfig{
-			Mode:     "dev",
-			DevEmail: "ticket@jolkins.id.lv",
-		},
-		Phone: config.PhoneConfig{
-			BackendID:  "pixel",
-			AttachName: "Pixel",
-			BaseURL:    phoneServer.URL,
-			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL}},
-		},
-	}, store, relay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticketServer := httptest.NewServer(server)
-	defer ticketServer.Close()
-	defer relay.Close()
-
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
-	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	controlConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser control websocket: %v", err)
-	}
-	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
-
-	if got := relay.Snapshot().Viewers; got != 0 {
-		t.Fatalf("control socket should not count as a stream viewer, got %d", got)
-	}
-	select {
-	case message := <-phoneCommands:
-		if strings.Contains(message, `"type":"start"`) {
-			t.Fatalf("control socket without video viewer started the phone stream: %s", message)
-		}
-	case <-time.After(250 * time.Millisecond):
-	}
-}
-
 func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 
@@ -777,16 +598,7 @@ func TestStreamPrewarmHoldIsOnlyAStartupBridge(t *testing.T) {
 	}
 }
 
-func TestStreamRecoveryRateLimitsStayInsideFreshnessContract(t *testing.T) {
-	if recoveryRequestGlobalInterval > 1500*time.Millisecond {
-		t.Fatalf("global stream recovery interval = %s, want <= 1.5s so stale recovery can complete inside 2s", recoveryRequestGlobalInterval)
-	}
-	if recoveryRequestPerClientInterval > 1500*time.Millisecond {
-		t.Fatalf("per-client stream recovery interval = %s, want <= 1.5s so stale recovery can complete inside 2s", recoveryRequestPerClientInterval)
-	}
-}
-
-func TestVideoWarmStartKeyFrameIsSharedDuringControlSession(t *testing.T) {
+func TestVideoWarmStartKeyFrameIsShared(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
@@ -794,7 +606,6 @@ func TestVideoWarmStartKeyFrameIsSharedDuringControlSession(t *testing.T) {
 	keyFrame := testTSF2FrameWithTimestamp(1, 1, true, 10000)
 	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 	server.direct.recordFrame(keyFrame)
-	setTestControlGate(server, "controller-session", "ticket@jolkins.id.lv")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -846,123 +657,10 @@ func TestProvisionalWarmConfigIsSentWithoutStaleKeyframeWhileRelayDisconnected(t
 	}
 }
 
-func TestVideoWarmConfigIsSentBeforePresenceHeartbeatFinishes(t *testing.T) {
-	store := state.NewMemoryStore()
-	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
-		TicketID:        "vivi-default",
-		DisplayName:     "ViVi timed ticket",
-		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "pixel",
-		PhoneBaseURL:    "http://127.0.0.1:1",
-		PhoneAttachName: "Pixel",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	blockingStore := &blockingHeartbeatStore{
-		Store:            store,
-		heartbeatStarted: make(chan struct{}),
-		releaseHeartbeat: make(chan struct{}),
-	}
-	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         "pixel",
-		AttachName:        "Pixel",
-		BaseURL:           "http://127.0.0.1:1",
-		ReconnectMinDelay: time.Hour,
-		ReconnectMaxDelay: time.Hour,
-		NoViewerStopDelay: time.Hour,
-	})
-	server, err := NewServer(config.Config{
-		PublicBaseURL: "http://ticket.test",
-		TicketID:      "vivi-default",
-		CookieName:    "ticket_remote_session",
-		CookieTTL:     time.Hour,
-		Access: auth.AccessConfig{
-			Mode:     "dev",
-			DevEmail: "ticket@jolkins.id.lv",
-		},
-		Phone: config.PhoneConfig{
-			BackendID:  "pixel",
-			AttachName: "Pixel",
-			BaseURL:    "http://127.0.0.1:1",
-			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: "http://127.0.0.1:1"}},
-		},
-	}, blockingStore, relay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticketServer := httptest.NewServer(server)
-	defer ticketServer.Close()
-	defer relay.Close()
-	defer close(blockingStore.releaseHeartbeat)
-
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":7}`))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
-	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
-
-	readCtx, readCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer readCancel()
-	msg := readNextTextMessageOfType(t, readCtx, viewerConn, "config")
-	if msg["provisional"] != true || int64(msg["streamEpoch"].(float64)) != 0 {
-		t.Fatalf("warm config should be provisional with epoch 0: %#v", msg)
-	}
-	select {
-	case <-blockingStore.heartbeatStarted:
-	case <-time.After(time.Second):
-		t.Fatal("presence heartbeat did not start after warm config")
-	}
-}
-
 func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
-	store := state.NewMemoryStore()
-	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
-		TicketID:        "vivi-default",
-		DisplayName:     "ViVi timed ticket",
-		AdminEmail:      "ticket@jolkins.id.lv",
-		PhoneBackendID:  "pixel",
-		PhoneBaseURL:    "http://127.0.0.1:1",
-		PhoneAttachName: "Pixel",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	blockingStore := &blockingHeartbeatStore{
-		Store:            store,
-		heartbeatStarted: make(chan struct{}),
-		releaseHeartbeat: make(chan struct{}),
-	}
-	relay := phone.NewRelay(phone.RelayConfig{
-		BackendID:         "pixel",
-		AttachName:        "Pixel",
-		BaseURL:           "http://127.0.0.1:1",
-		ReconnectMinDelay: time.Hour,
-		ReconnectMaxDelay: time.Hour,
-		NoViewerStopDelay: time.Hour,
-	})
-	server, err := NewServer(config.Config{
-		PublicBaseURL: "http://ticket.test",
-		TicketID:      "vivi-default",
-		CookieName:    "ticket_remote_session",
-		CookieTTL:     time.Hour,
-		Access: auth.AccessConfig{
-			Mode:     "dev",
-			DevEmail: "ticket@jolkins.id.lv",
-		},
-		Phone: config.PhoneConfig{
-			BackendID:  "pixel",
-			AttachName: "Pixel",
-			BaseURL:    "http://127.0.0.1:1",
-			Backends:   []config.PhoneBackend{{ID: "pixel", AttachName: "Pixel", BaseURL: "http://127.0.0.1:1"}},
-		},
-	}, blockingStore, relay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ticketServer := httptest.NewServer(server)
+	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
-	defer close(blockingStore.releaseHeartbeat)
 
 	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":7}`))
 
@@ -971,22 +669,12 @@ func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
 	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
 
-	readCtx, readCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer readCancel()
-	_ = readNextTextMessageOfType(t, readCtx, viewerConn, "config")
-	select {
-	case <-blockingStore.heartbeatStarted:
-	case <-time.After(time.Second):
-		t.Fatal("presence heartbeat did not start")
-	}
-	writeCtx, writeCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	if err := viewerConn.Write(writeCtx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_first_packet_ms","detail":"123"}`)); err != nil {
-		writeCancel()
+	_ = readNextTextMessageOfType(t, ctx, viewerConn, "config")
+	if err := viewerConn.Write(ctx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_first_packet_ms","detail":"123"}`)); err != nil {
 		t.Fatalf("write client log: %v", err)
 	}
-	writeCancel()
 
-	time.Sleep(350 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
 	event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent)
 	if ok && event.Event == "stream_first_packet_ms" {
@@ -994,17 +682,8 @@ func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
 	}
 }
 
-func TestPresenceUpdatesUseBackgroundTimeoutLongerThanPageLookup(t *testing.T) {
-	if presenceUpdateTimeout <= stateLookupTimeout {
-		t.Fatalf("presence updates run outside the user path and should tolerate slower Spacetime calls: presence=%s lookup=%s", presenceUpdateTimeout, stateLookupTimeout)
-	}
-	if presenceUpdateTimeout > 5*time.Second {
-		t.Fatalf("presence timeout should stay bounded: %s", presenceUpdateTimeout)
-	}
-}
-
 func TestDirectSpacetimePresenceRejectsControlSocket(t *testing.T) {
-	memoryStore := state.NewMemoryStore()
+	memoryStore := NewMemoryStore()
 	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1082,12 +761,9 @@ func TestDirectSpacetimePresenceRejectsControlSocket(t *testing.T) {
 	if response.StatusCode != http.StatusGone {
 		t.Fatalf("control socket response status = %d, want %d", response.StatusCode, http.StatusGone)
 	}
-	if got := store.heartbeats.Load(); got != 0 {
-		t.Fatalf("direct Spacetime presence should not write through server control socket, got %d writes", got)
-	}
 }
 
-func TestLiveFramesAreSharedDuringControlSession(t *testing.T) {
+func TestLiveFramesAreShared(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
@@ -1099,7 +775,6 @@ func TestLiveFramesAreSharedDuringControlSession(t *testing.T) {
 	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
 
-	setTestControlGate(server, "controller-session", "ticket@jolkins.id.lv")
 	frame := testTSF2KeyFrameWithEpoch(1, 77, true)
 	server.broadcastFrame(frame)
 
@@ -1192,7 +867,7 @@ func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) 
 	defer phoneServer.Close()
 	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1307,7 +982,6 @@ func TestVideoKeyframeRequestsDuringStartupBypassPerViewerCooldown(t *testing.T)
 		t.Fatalf("startup keyframe text on media socket should be ignored; got=%d", got)
 	}
 
-	time.Sleep(keyframeRequestGlobalInterval + 100*time.Millisecond)
 	if err := videoConn.Write(ctx, websocket.MessageText, []byte(`{"type":"keyframe","reason":"startup_second"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -1522,105 +1196,6 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "control-code keyframe")
 }
 
-func TestControlSocketCanRequestStreamRecoveryWhenVideoSocketIsGone(t *testing.T) {
-	phoneSignals := make(chan string, 64)
-	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/stream":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone video websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			readPhoneSignals(r.Context(), conn, phoneSignals)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(phoneServer.Close)
-	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
-
-	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
-	t.Cleanup(ticketServer.Close)
-	t.Cleanup(relay.Close)
-
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
-	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	controlConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser control websocket: %v", err)
-	}
-	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
-
-	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
-	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
-
-	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"recover_stream","reason":"control_video_gone"}`)); err != nil {
-		t.Fatalf("write recover_stream over control socket: %v", err)
-	}
-	waitForPhoneSignalCounts(t, phoneSignals, map[string]int{"recover_stream": 1}, "control recovery command")
-	if got := countPhoneSignalsWithin(phoneSignals, "start", 250*time.Millisecond); got != 0 {
-		t.Fatalf("connected control recovery should not restart phone stream; starts=%d", got)
-	}
-}
-
-func TestStreamRecoveryAfterRelayReconnectDoesNotDuplicateStart(t *testing.T) {
-	phoneSignals := make(chan string, 64)
-	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/stream":
-			conn, err := websocket.Accept(w, r, nil)
-			if err != nil {
-				t.Errorf("accept phone video websocket: %v", err)
-				return
-			}
-			defer conn.Close(websocket.StatusNormalClosure, "test complete")
-			readPhoneSignals(r.Context(), conn, phoneSignals)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(phoneServer.Close)
-	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
-
-	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
-	t.Cleanup(ticketServer.Close)
-	t.Cleanup(relay.Close)
-
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
-	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	controlConn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/session", &websocket.DialOptions{HTTPHeader: header})
-	if err != nil {
-		t.Fatalf("dial browser control websocket: %v", err)
-	}
-	defer controlConn.Close(websocket.StatusNormalClosure, "test complete")
-
-	server.retainRelayViewerForPrewarm("test-visible-page", streamPrewarmHold)
-	relay.Reconnect("test_force_disconnected_relay")
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if snapshot := server.relay.Snapshot(); snapshot.Desired && snapshot.Viewers > 0 && !snapshot.Connected {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
-
-	if err := controlConn.Write(ctx, websocket.MessageText, []byte(`{"type":"recover_stream","reason":"relay_disconnected"}`)); err != nil {
-		t.Fatalf("write recover_stream over control socket: %v", err)
-	}
-
-	waitForPhoneSignal(t, phoneSignals, "recover_stream", "recovered relay command")
-	if got := countPhoneSignalsWithin(phoneSignals, "start", 250*time.Millisecond); got != 0 {
-		t.Fatalf("recovered relay should use keyframes without duplicate starts; starts=%d", got)
-	}
-}
-
 func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *websocket.Conn) {
 	t.Helper()
 	phoneSignals := make(chan string, 64)
@@ -1641,7 +1216,7 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 	t.Cleanup(phoneServer.Close)
 	registerTicketStreamCommandSink(t, phoneServer.URL, phoneSignals)
 
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1701,7 +1276,7 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 
 func newTicketRecoveryTestServer(t *testing.T, phoneBaseURL string) (*Server, *httptest.Server, *phone.Relay) {
 	t.Helper()
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1888,7 +1463,7 @@ func countPhoneSignalTypesWithin(phoneSignals <-chan string, duration time.Durat
 
 func newStreamSharingTestServer(t *testing.T) (*Server, *httptest.Server, *phone.Relay) {
 	t.Helper()
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1929,30 +1504,16 @@ func newStreamSharingTestServer(t *testing.T) (*Server, *httptest.Server, *phone
 	return server, httptest.NewServer(server), relay
 }
 
-type blockingHeartbeatStore struct {
-	state.Store
-	heartbeatStarted chan struct{}
-	releaseHeartbeat chan struct{}
-}
-
 type spacetimeBackendCountingStore struct {
 	state.Store
-	heartbeats  atomic.Int32
-	disconnects atomic.Int32
 }
 
 func (s *spacetimeBackendCountingStore) Backend() string {
 	return "spacetime"
 }
 
-func (s *spacetimeBackendCountingStore) HeartbeatPresence(ctx context.Context, input state.PresenceInput) (state.Snapshot, error) {
-	s.heartbeats.Add(1)
-	return s.Store.HeartbeatPresence(ctx, input)
-}
-
-func (s *spacetimeBackendCountingStore) DisconnectPresence(ctx context.Context, ticketID string, sessionID string, now time.Time) (state.Snapshot, error) {
-	s.disconnects.Add(1)
-	return s.Store.DisconnectPresence(ctx, ticketID, sessionID, now)
+func (s *spacetimeBackendCountingStore) IssueMemberToken(context.Context, string) (string, string, error) {
+	return "sidecar-member-token", time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339), nil
 }
 
 func waitForAtomicCount(t *testing.T, counter *atomic.Int32, want int32, timeout time.Duration, label string) {
@@ -1988,20 +1549,6 @@ func (s *blockingSnapshotStore) Snapshot(ctx context.Context, ticketID string, n
 		return state.Snapshot{}, ctx.Err()
 	}
 	return s.Store.Snapshot(ctx, ticketID, now)
-}
-
-func (s *blockingHeartbeatStore) HeartbeatPresence(ctx context.Context, input state.PresenceInput) (state.Snapshot, error) {
-	select {
-	case <-s.heartbeatStarted:
-	default:
-		close(s.heartbeatStarted)
-	}
-	select {
-	case <-s.releaseHeartbeat:
-	case <-ctx.Done():
-		return state.Snapshot{}, ctx.Err()
-	}
-	return s.Store.HeartbeatPresence(ctx, input)
 }
 
 func dialStreamTestClient(t *testing.T, ctx context.Context, serverURL string, sessionID string) *websocket.Conn {
@@ -2072,16 +1619,6 @@ func waitForSignal(t *testing.T, ch <-chan struct{}, label string) {
 	case <-ch:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timed out waiting for %s", label)
-	}
-}
-
-func setTestControlGate(server *Server, sessionID string, email string) {
-	server.gateMu.Lock()
-	defer server.gateMu.Unlock()
-	server.gate = &controlGate{
-		sessionID: sessionID,
-		email:     strings.ToLower(strings.TrimSpace(email)),
-		expiresAt: time.Now().Add(time.Minute),
 	}
 }
 

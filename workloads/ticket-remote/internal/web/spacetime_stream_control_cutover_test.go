@@ -12,7 +12,6 @@ import (
 func TestStreamControlCutoverDoesNotUseRemovedPhoneControlAuthority(t *testing.T) {
 	productionFiles := []string{
 		"server.go",
-		"control_code.go",
 		"stream_control.go",
 		"../phone/relay.go",
 	}
@@ -56,10 +55,10 @@ func TestStreamControlCutoverUsesSpacetimeCommandsAndVideoOnlyRelay(t *testing.T
 			"handleVideoStreamMessage",
 			"identifyMember(w, r)",
 		},
-		"control_code.go": {
-			"appendStreamCommand(ctx, \"generate_control_code\"",
-			"appendStreamCommand(ctx, \"control_code_browser_capture\"",
-			"appendStreamCommand(ctx, \"control_code_result_ack\"",
+		"static/spacetime-client.js": {
+			"this.callReducer(\"memberRequestControlCode\"",
+			"this.callReducer(\"memberConfirmControlCodeBrowserCapture\"",
+			"this.callReducer(\"memberCloseControlCode\"",
 		},
 		"../phone/relay.go": {
 			"websocketURL(\"/api/v1/stream\")",
@@ -86,7 +85,7 @@ func TestPhoneDisconnectDoesNotLogNormalViewerCloseCancellation(t *testing.T) {
 	}
 	disconnectBody := substringBetween(t, string(body),
 		"func (s *Server) handlePhoneDisconnect(err error) {",
-		"func (s *Server) rejectQuickClaim(")
+		"func expectedPhoneDisconnect(err error) bool {")
 	if !strings.Contains(disconnectBody, "err != nil && !expectedPhoneDisconnect(err)") {
 		t.Fatalf("normal page-close phone disconnect cancellation must not be logged as a production oddity")
 	}

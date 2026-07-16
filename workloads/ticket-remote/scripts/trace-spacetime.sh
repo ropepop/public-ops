@@ -4,51 +4,8 @@ set -euo pipefail
 server="${TICKET_REMOTE_SPACETIME_HOST:-${SPACETIME_HOST:-https://maincloud.spacetimedb.com}}"
 database="${TICKET_REMOTE_SPACETIME_DATABASE:-${SPACETIME_DATABASE:-ticket-remote-prod-v3}}"
 ticket="${TICKET_REMOTE_TICKET_ID:-vivi-default}"
-since=""
+since="${TRACE_SINCE:-}"
 limit="${TRACE_LIMIT:-80}"
-
-usage() {
-  cat <<'USAGE'
-Usage: trace-spacetime.sh [--since RFC3339] [--ticket ID] [--database NAME] [--server URL] [--limit N]
-
-Prints current Ticket Remote desired/relay/phone state, pending stream commands,
-and recent one-day safe operational trace rows from SpacetimeDB.
-USAGE
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --since)
-      since="${2:-}"
-      shift 2
-      ;;
-    --ticket)
-      ticket="${2:-}"
-      shift 2
-      ;;
-    --database)
-      database="${2:-}"
-      shift 2
-      ;;
-    --server)
-      server="${2:-}"
-      shift 2
-      ;;
-    --limit)
-      limit="${2:-}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-done
 
 if [[ -z "$since" ]]; then
   since="$(date -u -v-30M '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')"

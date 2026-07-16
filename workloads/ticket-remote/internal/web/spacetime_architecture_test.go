@@ -22,7 +22,6 @@ func TestGoRuntimeUsesDirectPhoneBridgeWithoutRetiredBrokerLayer(t *testing.T) {
 		ticketRemoteSourceFile(t, "internal", "config", "config.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "server.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "relay_viewers.go"),
-		ticketRemoteSourceFile(t, "internal", "web", "control_code.go"),
 	}
 	for _, source := range sources {
 		for _, retired := range []string{
@@ -41,6 +40,10 @@ func TestGoRuntimeUsesDirectPhoneBridgeWithoutRetiredBrokerLayer(t *testing.T) {
 	leasePath := filepath.Join("..", "..", "internal", "web", "ticket_phone_"+"lease.go")
 	if _, err := os.Stat(leasePath); !os.IsNotExist(err) {
 		t.Fatalf("retired phone lease source still exists or could not be checked: %v", err)
+	}
+	coordinatorPath := filepath.Join("..", "..", "internal", "web", "control_code.go")
+	if _, err := os.Stat(coordinatorPath); !os.IsNotExist(err) {
+		t.Fatalf("retired Go control-code coordinator still exists or could not be checked: %v", err)
 	}
 }
 
@@ -91,14 +94,14 @@ func TestSafeOperationalLogsUseBoundedSamplingAndOneRowLookup(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 
 	for _, required := range []string{
-		"pub fn ticketremote_append_safe_operational_log(\n    ctx: &ReducerContext,\n    id: String,",
-		"pub fn ticketremote_member_append_safe_operational_log(\n    ctx: &ReducerContext,\n    id: String,",
+		"ticketremote_append_safe_operational_log(ctx; id: String, ticketId: String, source: String,",
+		"ticketremote_member_append_safe_operational_log(ctx; id: String, ticketId: String,",
 		"detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),",
 		"let row_id = safe_log_sample_interval_ms(&level, &event)",
 		"sampled_safe_log_row_id(&ticket.id, &source, &event, now, interval_ms)",
-		".id()\n        .find(&row_id)",
+		"table.id().find(&row_id)",
 		"id: row_id,",
-		"ctx.db\n        .ticketremote_safe_operational_log()\n        .insert(TicketremoteSafeOperationalLog",
+		"table.insert(TicketremoteSafeOperationalLog",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("safe log path missing cheap-row marker %q", required)
@@ -146,7 +149,7 @@ func TestSafeOperationalLogsUseBoundedSamplingAndOneRowLookup(t *testing.T) {
 		}
 	}
 
-	cleanupBody := sourceBetween(t, source, "fn cleanup_expired(", "fn purge_expired_stream_commands_for_ticket(")
+	cleanupBody := sourceBetween(t, source, "fn cleanup_expired(", "ticket_expiry_purgers! {")
 	for _, forbidden := range []string{
 		"insert_safe_operational_log",
 		"cleanup_expired_completed",
@@ -156,7 +159,7 @@ func TestSafeOperationalLogsUseBoundedSamplingAndOneRowLookup(t *testing.T) {
 			t.Fatalf("cleanup must not write routine log rows: %q", forbidden)
 		}
 	}
-	for _, required := range []string{"CLEANUP_BATCH_SIZE", "cleanup_limit_reached"} {
+	for _, required := range []string{"batch_size.min(CLEANUP_BATCH_SIZE)", "deleted < limit"} {
 		if !strings.Contains(cleanupBody, required) {
 			t.Fatalf("cleanup must keep bounded deletes, missing %q", required)
 		}
@@ -173,7 +176,7 @@ func TestSpacetimeBrowserClientSubscribesOnlyCurrentProductTables(t *testing.T) 
 		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 		"AND ownerPublicId =",
 		"memberAppendSafeOperationalLog",
-		"id: this.logRowId(\"browser\", event, correlationId)",
+		"id: rowId || this.logRowId(\"browser\", event, correlationId)",
 		"publishFocusedState(",
 	} {
 		if !strings.Contains(source, required) {
@@ -255,7 +258,7 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
 	server := ticketRemoteSourceFile(t, "internal", "web", "server.go")
 	admin := ticketRemoteSourceFile(t, "internal", "web", "static", "admin.html.tmpl")
-	events := ticketRemoteSourceFile(t, "internal", "web", "operational_events.go")
+	events := ticketRemoteSourceFile(t, "internal", "web", "event_sink.go")
 
 	for _, required := range []string{
 		"SELECT * FROM ticketremote_service_ticket",
@@ -386,8 +389,8 @@ func TestStreamViewerFocusUsesSafePublicIDs(t *testing.T) {
 		"#[spacetimedb::table(accessor = ticketremote_stream_viewer_focus, public,",
 		"#[spacetimedb::table(accessor = ticketremote_stream_command")
 	reducerChunk := substringBetween(t, module,
-		"pub fn ticketremote_member_set_stream_focus(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_member_request_keyframe")
+		"ticketremote_member_set_stream_focus(ctx;",
+		"macro_rules! member_stream_reducers")
 	browser := readTicketWebClientSource(t, "src/index.ts")
 
 	for _, required := range []string{
@@ -444,34 +447,29 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 		"#[derive(Default)]\nstruct ControlCodeChanges")
 	appendReducer := substringBetween(t, module,
 		"pub fn ticketremote_append_stream_command(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_ack_stream_command")
+		"service_reducers! {\n    ticketremote_ack_stream_command")
 	prepareReducer := substringBetween(t, module,
-		"pub fn ticketremote_member_prepare_control_code(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_member_request_control_code")
-	keyframeReducer := substringBetween(t, module,
-		"pub fn ticketremote_member_request_keyframe(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_member_recover_stream")
-	recoveryReducer := substringBetween(t, module,
-		"pub fn ticketremote_member_recover_stream(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_member_prepare_control_code")
+		"ticketremote_member_prepare_control_code(ctx;",
+		"ticketremote_member_request_control_code(ctx;")
+	memberStreamReducers := substringBetween(t, module,
+		"macro_rules! member_stream_reducers",
+		"member_reducers! {\n    ticketremote_member_prepare_control_code")
 	helper := substringBetween(t, module,
 		"fn live_relay_suppresses_background_stream_command(",
-		"fn json_i64(")
+		"fn control_code_fast_state_current_ready(")
 
-	for _, reducer := range []struct {
-		name string
-		body string
-	}{
-		{"keyframe", keyframeReducer},
-		{"recover_stream", recoveryReducer},
+	if strings.Contains(memberStreamReducers, "live_relay_suppresses_background_stream_command(") {
+		t.Fatalf("member stream reducers must not use relay-wide liveness to suppress one stale requester")
+	}
+	for _, required := range []string{
+		"let email = client_email_from_auth(ctx, &ticket.id)?;",
+		"insert_stream_command(",
+		`("source", "browser")`,
+		`ticketremote_member_request_keyframe => "keyframe"`,
+		`ticketremote_member_recover_stream => "recover_stream"`,
 	} {
-		if strings.Contains(reducer.body, "live_relay_suppresses_background_stream_command(") {
-			t.Fatalf("%s member reducer must not use relay-wide liveness to suppress one stale requester", reducer.name)
-		}
-		for _, required := range []string{"client_email_from_auth", "insert_stream_command(", `("source", "browser")`} {
-			if !strings.Contains(reducer.body, required) {
-				t.Fatalf("%s member reducer missing requester-scoped marker %q", reducer.name, required)
-			}
+		if !strings.Contains(memberStreamReducers, required) {
+			t.Fatalf("member stream reducers missing requester-scoped marker %q", required)
 		}
 	}
 	for _, required := range []string{
@@ -539,7 +537,7 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 		"row.rawTicketConfirmed",
 		"row.cleanupClear",
 		"row.streamLive",
-		"parse_time_ms(&row.expiresAt) > parse_time_ms(now)",
+		"parse_time_ms(&row.expiresAt) > parse_time_ms(clock)",
 	} {
 		if !strings.Contains(module, required) {
 			t.Fatalf("fast-ready prepare suppression helper missing %q", required)
@@ -550,10 +548,10 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	reducer := substringBetween(t, module,
-		"pub fn ticketremote_member_request_control_code(",
-		"#[spacetimedb::reducer]\npub fn ticketremote_member_confirm_control_code_browser_capture")
+		"ticketremote_member_request_control_code(ctx;",
+		"ticketremote_member_confirm_control_code_browser_capture(ctx;")
 	for _, required := range []string{
-		"client_email_from_auth(ctx, &ticket.id)?",
+		"let session_id = non_empty(&sessionId, &connection_session_id(ctx));",
 		"valid_control_code_digits(&clean_digits)",
 		"ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now)",
 		`return Err("request_in_progress".into());`,
@@ -563,7 +561,7 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 		`"submitMode": submit_mode`,
 		"insert_control_code_public_request(",
 		`"generate_control_code"`,
-		"unwrap_or_else(|| now.clone())",
+		"unwrap_or_else(|| (false, \"missing\".into(), now.clone()",
 	} {
 		if !strings.Contains(reducer, required) {
 			t.Fatalf("queue-first control-code reducer missing %q", required)
@@ -576,6 +574,7 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 		t.Fatalf("browser fast revision must not overwrite the authoritative server state")
 	}
 	for _, required := range []string{
+		"let $email = client_email_from_auth($ctx, &$ticket.id)?;",
 		`"fast_ready"`,
 		`"queued_warmup"`,
 		`matches!(row.status.as_str(), "queued" | "running")`,
@@ -613,12 +612,11 @@ func TestSensitiveControlCodeOperationalLogsHaveNarrowServicePurge(t *testing.T)
 	body := sourceBetween(
 		t,
 		source,
-		"pub fn ticketremote_purge_sensitive_operational_logs(",
-		"pub fn ticketremote_cleanup_expired(",
+		"ticketremote_purge_sensitive_operational_logs(ctx;",
+		"ticketremote_cleanup_expired(ctx;",
 	)
 
 	for _, required := range []string{
-		"require_service(ctx)?;",
 		".ticketremote_safe_operational_log()",
 		".ticketId()",
 		`"pixel_ticket_control_code_result"`,
@@ -628,6 +626,9 @@ func TestSensitiveControlCodeOperationalLogsHaveNarrowServicePurge(t *testing.T)
 		if !strings.Contains(body, required) {
 			t.Fatalf("sensitive-log purge missing %q", required)
 		}
+	}
+	if !strings.Contains(source, "require_service($ctx)?;") {
+		t.Fatalf("service reducer macro must preserve fail-closed service authentication")
 	}
 	if strings.Contains(body, "detailJson") {
 		t.Fatal("sensitive-log purge must identify rows only by bounded event name")

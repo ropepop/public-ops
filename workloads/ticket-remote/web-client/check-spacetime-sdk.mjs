@@ -4,103 +4,71 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function readJSON(filePath) {
-  return JSON.parse(readFileSync(filePath, "utf8"));
+function read(relativePath, json = false) {
+  const value = readFileSync(path.join(__dirname, relativePath), "utf8");
+  return json ? JSON.parse(value) : value;
 }
 
 function releaseLine(version) {
-  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version || ""));
-  if (!match) {
+  const [, major, minor] = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version || "")) || [];
+  if (!major) {
     throw new Error(`expected an exact semantic version, got ${JSON.stringify(version)}`);
   }
-  return `${match[1]}.${match[2]}`;
+  return `${major}.${minor}`;
 }
 
-function requireVersion(label, source, pattern) {
-  const match = source.match(pattern);
-  if (!match) {
+function versionFrom(label, relativePath, pattern) {
+  const [, version] = read(relativePath).match(pattern) || [];
+  if (!version) {
     throw new Error(`could not determine ${label}`);
   }
-  return match[1];
+  return version;
 }
 
-function assertEqual(label, actual, expected) {
-  if (actual !== expected) {
-    throw new Error(`${label} is ${JSON.stringify(actual)}; expected ${JSON.stringify(expected)}`);
-  }
-}
-
-function assertCompatible(label, version, expectedLine) {
-  const actualLine = releaseLine(version);
-  if (actualLine !== expectedLine) {
-    throw new Error(`${label} ${version} is incompatible with the Ticket server release line ${expectedLine}.x`);
-  }
-}
-
-export function verifySpacetimeVersions({
-  browserSDK,
-  rootLockSDK,
-  resolvedSDK,
-  installedSDK,
-  bundledSDK,
-  serverSDK,
-  bindingsCLI,
-}) {
+export function verifySpacetimeVersions(versions) {
+  const { browserSDK, bundledSDK, serverSDK, bindingsCLI } = versions;
   const expectedLine = releaseLine(browserSDK);
-
-  assertEqual("package-lock root SpacetimeDB dependency", rootLockSDK, browserSDK);
-  assertEqual("package-lock resolved SpacetimeDB version", resolvedSDK, browserSDK);
-  assertEqual("installed SpacetimeDB version", installedSDK, browserSDK);
-  assertEqual("browser bundle SpacetimeDB version", bundledSDK, browserSDK);
-  assertCompatible("server SpacetimeDB crate", serverSDK, expectedLine);
-  assertCompatible("generated bindings CLI", bindingsCLI, expectedLine);
+  for (const [label, key] of [
+    ["package-lock root SpacetimeDB dependency", "rootLockSDK"],
+    ["package-lock resolved SpacetimeDB version", "resolvedSDK"],
+    ["installed SpacetimeDB version", "installedSDK"],
+    ["browser bundle SpacetimeDB version", "bundledSDK"],
+  ]) {
+    const version = versions[key];
+    if (version !== browserSDK) {
+      throw new Error(`${label} is ${JSON.stringify(version)}; expected ${JSON.stringify(browserSDK)}`);
+    }
+  }
+  for (const [label, version] of [
+    ["server SpacetimeDB crate", serverSDK],
+    ["generated bindings CLI", bindingsCLI],
+  ]) {
+    if (releaseLine(version) !== expectedLine) {
+      throw new Error(`${label} ${version} is incompatible with the Ticket server release line ${expectedLine}.x`);
+    }
+  }
 
   return { browserSDK, bundledSDK, serverSDK, bindingsCLI };
 }
 
 export function verifySpacetimeSDKCompatibility() {
-  const packageJSON = readJSON(path.join(__dirname, "package.json"));
-  const packageLock = readJSON(path.join(__dirname, "package-lock.json"));
-  const installedPackage = readJSON(path.join(__dirname, "node_modules", "spacetimedb", "package.json"));
-  const cargoLock = readFileSync(path.join(__dirname, "..", "spacetimedb", "Cargo.lock"), "utf8");
-  const generatedBindings = readFileSync(path.join(__dirname, "src", "generated", "index.ts"), "utf8");
-  const browserBundle = readFileSync(path.join(__dirname, "..", "internal", "web", "static", "spacetime-client.js"), "utf8");
-
-  const browserSDK = packageJSON.dependencies?.spacetimedb;
-  const rootLockSDK = packageLock.packages?.[""]?.dependencies?.spacetimedb;
-  const resolvedSDK = packageLock.packages?.["node_modules/spacetimedb"]?.version;
-  const serverSDK = requireVersion(
-    "server SpacetimeDB crate version",
-    cargoLock,
-    /\[\[package\]\]\nname = "spacetimedb"\nversion = "([^"]+)"/
-  );
-  const bindingsCLI = requireVersion(
-    "generated bindings CLI version",
-    generatedBindings,
-    /generated using spacetimedb cli version (\d+\.\d+\.\d+)/i
-  );
-  const bundledSDK = requireVersion(
-    "browser bundle SpacetimeDB SDK version",
-    browserBundle,
-    /Built with SpacetimeDB browser SDK (\d+\.\d+\.\d+)/
-  );
-
+  const packageJSON = read("package.json", true);
+  const packageLock = read("package-lock.json", true);
   return verifySpacetimeVersions({
-    browserSDK,
-    rootLockSDK,
-    resolvedSDK,
-    installedSDK: installedPackage.version,
-    bundledSDK,
-    serverSDK,
-    bindingsCLI,
+    browserSDK: packageJSON.dependencies?.spacetimedb,
+    rootLockSDK: packageLock.packages?.[""]?.dependencies?.spacetimedb,
+    resolvedSDK: packageLock.packages?.["node_modules/spacetimedb"]?.version,
+    installedSDK: read("node_modules/spacetimedb/package.json", true).version,
+    serverSDK: versionFrom("server SpacetimeDB crate version", "../spacetimedb/Cargo.lock",
+      /\[\[package\]\]\nname = "spacetimedb"\nversion = "([^"]+)"/),
+    bindingsCLI: versionFrom("generated bindings CLI version", "src/generated/index.ts",
+      /generated using spacetimedb cli version (\d+\.\d+\.\d+)/i),
+    bundledSDK: versionFrom("browser bundle SpacetimeDB SDK version", "../internal/web/static/spacetime-client.js",
+      /Built with SpacetimeDB browser SDK (\d+\.\d+\.\d+)/),
   });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const versions = verifySpacetimeSDKCompatibility();
-  console.log(
-    `SpacetimeDB compatibility verified: browser SDK ${versions.browserSDK}, ` +
-      `bundle ${versions.bundledSDK}, server crate ${versions.serverSDK}, ` +
-      `generated bindings CLI ${versions.bindingsCLI}.`
-  );
+  console.log(`SpacetimeDB compatibility verified: browser SDK ${versions.browserSDK}, bundle ${versions.bundledSDK}, server crate ${versions.serverSDK}, generated bindings CLI ${versions.bindingsCLI}.`);
 }

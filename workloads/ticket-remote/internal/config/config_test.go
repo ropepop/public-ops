@@ -134,10 +134,9 @@ func TestSpacetimeAuthModeLoadsWithSessionSigningKey(t *testing.T) {
 	}
 }
 
-func TestLoadParsesNoExpirySessionAndSpacetimeTokenTTL(t *testing.T) {
+func TestLoadParsesNoExpirySessionTTL(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
 	t.Setenv("TICKET_REMOTE_COOKIE_TTL", "never")
-	t.Setenv("TICKET_REMOTE_SPACETIME_TOKEN_TTL", "never")
 
 	cfg, err := Load()
 	if err != nil {
@@ -145,9 +144,6 @@ func TestLoadParsesNoExpirySessionAndSpacetimeTokenTTL(t *testing.T) {
 	}
 	if cfg.CookieTTL != DurationNever {
 		t.Fatalf("cookie TTL = %s, want no-expiry sentinel", cfg.CookieTTL)
-	}
-	if cfg.State.TokenTTL != DurationNever {
-		t.Fatalf("Spacetime token TTL = %s, want no-expiry sentinel", cfg.State.TokenTTL)
 	}
 }
 
@@ -228,8 +224,5 @@ func TestProductionModeLoadsSidecarOnlyWriteCredentials(t *testing.T) {
 	}
 	if cfg.State.SpacetimeSidecarWriteTokenFile != "/run/secrets/ticket-remote-sidecar-write-token" {
 		t.Fatalf("sidecar write-token file = %q", cfg.State.SpacetimeSidecarWriteTokenFile)
-	}
-	if cfg.State.SpacetimeBearerToken != "" || cfg.State.SpacetimeKeyFile != "" {
-		t.Fatalf("production sidecar config unexpectedly needs direct credentials: %#v", cfg.State)
 	}
 }

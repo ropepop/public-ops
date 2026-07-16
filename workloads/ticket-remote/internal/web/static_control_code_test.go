@@ -45,7 +45,7 @@ func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing
 		}
 	}
 
-	captureVisibleIndex := strings.Index(captureScreenshot, "displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');")
+	captureVisibleIndex := strings.Index(captureScreenshot, "const painted = await displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');")
 	captureIndex := strings.Index(captureScreenshot, "const capturedImage = captureControlCodeResultImage(proof);")
 	ackIndex := strings.Index(captureScreenshot, "await confirmControlCodeBrowserCapture(request, proof);")
 	if captureVisibleIndex < 0 {
@@ -58,8 +58,9 @@ func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing
 	if freezeIndex < 0 || captureIndex < freezeIndex {
 		t.Fatalf("capturing the Aztec frame must use the frozen proven stream frame")
 	}
-	if ackIndex < 0 || captureIndex > captureVisibleIndex || captureVisibleIndex > ackIndex {
-		t.Fatalf("captured image must be locally snapped, revealed, then browser-acked")
+	paintGuardIndex := strings.Index(captureScreenshot, "if (!painted) return false;")
+	if ackIndex < 0 || paintGuardIndex < 0 || captureIndex > captureVisibleIndex || captureVisibleIndex > paintGuardIndex || paintGuardIndex > ackIndex {
+		t.Fatalf("captured image must be locally snapped, painted, verified, then browser-acked")
 	}
 	if !strings.Contains(waitForScreenshot, "controlCodeResultCaptureRequestID = requestID;") ||
 		!strings.Contains(waitForScreenshot, "keepControlCodeVideoAlive('control_code_wait_reconnect');") {
@@ -68,6 +69,89 @@ func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing
 	if strings.Contains(waitForScreenshot, "const timeoutMs =") ||
 		strings.Contains(waitForScreenshot, "failControlCodeResultScreenshotWait();") {
 		t.Fatalf("quiet waiting path must not give up locally while the phone is holding the generated code for browser capture")
+	}
+}
+
+func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *testing.T) {
+	source := ticketAppSource(t)
+	imageReadyBody := substringBetween(t, source,
+		"function waitForControlCodeResultImageReady(image) {",
+		"  function controlCodeResultPaintReady(requestID) {")
+	paintReadyBody := substringBetween(t, source,
+		"function controlCodeResultPaintReady(requestID) {",
+		"  function waitForControlCodePaintFrame() {")
+	displayBody := substringBetween(t, source,
+		"async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {",
+		"  function controlCodeResultDisplayedForRequest(requestID) {")
+	captureBody := substringBetween(t, source,
+		"async function captureControlCodeResultScreenshot(request, proof) {",
+		"  function failControlCodeResultScreenshotWait() {")
+
+	for _, needle := range []string{
+		"const controlCodeResultImageReadyTimeoutMs = 1200;",
+		"const controlCodeResultPaintFrameTimeoutMs = 500;",
+		"image.addEventListener('load', onLoad, { once: true });",
+		"image.addEventListener('error', onError, { once: true });",
+		"timer = setTimeout(() => finish(false), controlCodeResultImageReadyTimeoutMs);",
+		"image.decode()",
+		"decodeSettled = true;",
+		"if (decodeSettled && ready()) finish(true);",
+	} {
+		if !strings.Contains(source, needle) && !strings.Contains(imageReadyBody, needle) {
+			t.Fatalf("result image decode/load handshake missing %q", needle)
+		}
+	}
+	if strings.Contains(imageReadyBody, "if (ready()) return Promise.resolve(true);") {
+		t.Fatal("a complete image must not bypass the explicit decode handshake")
+	}
+	for _, needle := range []string{
+		"document.visibilityState !== 'visible'",
+		"codeResultArea.hidden || codeResultImage.hidden",
+		"codeResultImage.naturalWidth <= 0 || codeResultImage.naturalHeight <= 0",
+		"areaRect.width <= 0 || areaRect.height <= 0 || imageRect.width <= 0 || imageRect.height <= 0",
+		"visibleWidth <= 0 || visibleHeight <= 0",
+		"areaStyle.display !== 'none'",
+		"imageStyle.visibility !== 'hidden'",
+	} {
+		if !strings.Contains(paintReadyBody, needle) {
+			t.Fatalf("paint visibility proof missing %q", needle)
+		}
+	}
+
+	srcIndex := strings.Index(displayBody, "codeResultImage.src = capturedImage;")
+	decodeIndex := strings.Index(displayBody, "await waitForControlCodeResultImageReady(codeResultImage)")
+	firstPaintIndex := strings.Index(displayBody, "await waitForControlCodePaintFrame()")
+	secondPaintRelative := -1
+	if firstPaintIndex >= 0 {
+		secondPaintRelative = strings.Index(displayBody[firstPaintIndex+1:], "await waitForControlCodePaintFrame()")
+	}
+	secondPaintIndex := -1
+	if secondPaintRelative >= 0 {
+		secondPaintIndex = firstPaintIndex + 1 + secondPaintRelative
+	}
+	reverifyIndex := strings.LastIndex(displayBody, "if (!controlCodeResultPaintReady(requestID)) return false;")
+	paintedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_painted'")
+	displayedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_displayed'")
+	if srcIndex < 0 || decodeIndex < 0 || firstPaintIndex < 0 || secondPaintIndex < 0 || reverifyIndex < 0 || paintedEventIndex < 0 || displayedEventIndex < 0 {
+		t.Fatal("control-code display path is missing a complete paint handshake")
+	}
+	if !(srcIndex < decodeIndex && decodeIndex < firstPaintIndex && firstPaintIndex < secondPaintIndex && secondPaintIndex < reverifyIndex && reverifyIndex < paintedEventIndex && paintedEventIndex < displayedEventIndex) {
+		t.Fatal("image must decode, survive two paints, and be reverified before painted/displayed events")
+	}
+	if strings.Contains(displayBody[:paintedEventIndex], "confirmControlCodeBrowserCapture(") {
+		t.Fatal("display helper must never acknowledge before its painted event")
+	}
+
+	displayAwaitIndex := strings.Index(captureBody, "const painted = await displayControlCodeResultImage(")
+	paintGuardIndex := strings.Index(captureBody, "if (!painted) return false;")
+	closedGuardIndex := strings.Index(captureBody[paintGuardIndex+1:], "if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;")
+	ackIndex := strings.Index(captureBody, "await confirmControlCodeBrowserCapture(request, proof);")
+	if displayAwaitIndex < 0 || paintGuardIndex < 0 || closedGuardIndex < 0 || ackIndex < 0 || !(displayAwaitIndex < paintGuardIndex && paintGuardIndex < ackIndex) {
+		t.Fatal("Spacetime capture acknowledgement must remain behind successful paint verification")
+	}
+	if !strings.Contains(captureBody, "scheduleControlCodeResultCaptureRetry(requestID);") ||
+		!strings.Contains(captureBody, "if (!capturedAndAcknowledged") {
+		t.Fatal("a failed or hidden paint must re-arm capture instead of acknowledging")
 	}
 }
 
@@ -243,6 +327,44 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	}
 }
 
+func TestControlCodeLowLatencyResetReconfiguresDecoderBeforeFreshKeyframe(t *testing.T) {
+	source := ticketAppSource(t)
+	resetConfigBody := substringBetween(t, source,
+		"function controlCodeDecoderResetConfig() {",
+		"  function resetControlCodeDecoderBacklog(requestID, reason) {")
+	resetBody := substringBetween(t, source,
+		"function resetControlCodeDecoderBacklog(requestID, reason) {",
+		"  function requestControlCodeLowLatencyFrame(requestID, reason) {")
+
+	for _, needle := range []string{
+		"const config = lastDecoderConfig || {};",
+		"if (decoderMode === 'avc') {",
+		"if (!avcDescription) return null;",
+		"return { codec, codedWidth, codedHeight, description: avcDescription };",
+		"return { codec, codedWidth, codedHeight, avc: { format: 'annexb' } };",
+	} {
+		if !strings.Contains(resetConfigBody, needle) {
+			t.Fatalf("control-code decoder reset config missing %q", needle)
+		}
+	}
+
+	resetIndex := strings.Index(resetBody, "decoder.reset();")
+	disabledIndex := strings.Index(resetBody, "decoderConfigured = false;")
+	configureIndex := strings.Index(resetBody, "decoder.configure(resetConfig);")
+	enabledIndex := strings.Index(resetBody, "decoderConfigured = true;")
+	keyframeIndex := strings.Index(resetBody, "needsKeyFrame = true;")
+	if resetIndex < 0 || disabledIndex < 0 || configureIndex < 0 || enabledIndex < 0 || keyframeIndex < 0 {
+		t.Fatal("control-code low-latency reset must explicitly restore the decoder configuration")
+	}
+	if !(resetIndex < disabledIndex && disabledIndex < configureIndex && configureIndex < enabledIndex && enabledIndex < keyframeIndex) {
+		t.Fatal("decoder must be reconfigured successfully before the fresh control-code keyframe is requested")
+	}
+	if !strings.Contains(resetBody, "const resetConfig = controlCodeDecoderResetConfig();") ||
+		!strings.Contains(resetBody, "if (!resetConfig) return false;") {
+		t.Fatal("decoder reset must not run unless its replacement configuration is ready")
+	}
+}
+
 func TestControlCodePhoneImageResultDoesNotBypassBrowserFrameCapture(t *testing.T) {
 	source := ticketAppSource(t)
 	succeededBranch := substringBetween(t, source,
@@ -305,8 +427,8 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 		"appendStreamURLParam(url, 'page_version', pageVersion);",
 		"appendStreamURLParam(url, 'asset_version', assetVersion);",
 		"appendStreamURLParam(url, 'visibility', document.visibilityState);",
-		"appendStreamURLParam(url, 'restore_reason', videoOpenRestoreReason(reason));",
-		"appendStreamURLParam(url, 'recovery_id', activeVideoRecoveryID());",
+		"appendStreamURLParam(url, 'restore_reason', restoreReason);",
+		"appendStreamURLParam(url, 'recovery_id', resuming && resuming.id);",
 		"appendStreamURLParam(url, 'frame_age_ms', lastFrameAt > 0 ? Math.round(now - lastFrameAt) : '');",
 		"appendStreamURLParam(url, 'has_frame', hasRenderedFrame ? '1' : '0');",
 		"appendStreamURLParam(url, 'configured', configured ? '1' : '0');",
@@ -342,40 +464,6 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 		if !strings.Contains(template, needle) {
 			t.Fatalf("early video socket context missing %q", needle)
 		}
-	}
-}
-
-func TestControlCodeBrowserCaptureAckIsNonBlockingAndTimerless(t *testing.T) {
-	source := controlCodeServerSource(t)
-	handler := substringBetween(t, source,
-		"func (s *Server) handleControlCodeCaptureHTTP(",
-		"func (s *Server) confirmControlCodeBrowserCapture(")
-
-	for _, forbidden := range []string{
-		"controlCodeBrowserCaptureWait",
-		"timeoutControlCodeBrowserCapture",
-		"failControlCodeBrowserCapture",
-		"browser_capture_expired",
-	} {
-		if strings.Contains(source, forbidden) {
-			t.Fatalf("control-code browser capture must not have timer-driven cleanup, found %q", forbidden)
-		}
-	}
-	if !strings.Contains(handler, "go s.sendControlCodeBrowserCaptureAckUntilCleanup(") {
-		t.Fatalf("capture endpoint must acknowledge the browser before persistently delivering phone ack in the background")
-	}
-	if strings.Contains(handler, "s.sendControlCodeBrowserCaptureAck(") {
-		t.Fatalf("capture endpoint must not block the browser response on a direct phone ack send")
-	}
-	if strings.Contains(handler, "timeoutControlCodeCleanup(") {
-		t.Fatalf("capture endpoint must not synthesize cleanup failure while the phone may still be waiting for browser ack")
-	}
-	ackLoop := substringBetween(t, source,
-		"func (s *Server) sendControlCodeBrowserCaptureAckUntilCleanup(",
-		"func (s *Server) closeControlCodeRequest(")
-	if !strings.Contains(ackLoop, "controlCodeBrowserCaptureAckStillNeeded(requestID)") ||
-		!strings.Contains(ackLoop, "for attempt := 1; ; attempt++") {
-		t.Fatalf("phone ack delivery must repeat until Pixel cleanup is observed")
 	}
 }
 
@@ -465,6 +553,7 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"control_code_candidate_rejected",
 		"control_code_candidate_accepted",
 		"control_code_frame_frozen",
+		"control_code_frame_painted",
 		"control_code_frame_displayed",
 		"control_code_browser_capture_ack_sent",
 		"control_code_frame_retry_requested",
@@ -556,6 +645,27 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		if !strings.Contains(debugPublisher, needle) {
 			t.Fatalf("stream debug must expose browser frame/capture proof state, missing %q", needle)
 		}
+	}
+}
+
+func TestStreamResumeSpinnerDebugStateIsSelfContainedInSourceAndBundle(t *testing.T) {
+	source := ticketAppSource(t)
+	debugPublisher := substringBetween(t, source,
+		"function publishStreamDebug() {",
+		"  function readUint64(view, offset) {")
+
+	if !strings.Contains(debugPublisher, "streamResumeSpinnerVisible: Boolean(streamResumeSpinner && !streamResumeSpinner.hidden),") {
+		t.Fatal("stream debug publisher must compute spinner visibility without an external helper")
+	}
+	bundle, err := os.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(bundle), "streamResumeSpinnerVisible:Boolean(streamResumeSpinner&&!streamResumeSpinner.hidden)") {
+		t.Fatal("shipped bundle must contain the self-contained spinner visibility check")
+	}
+	if strings.Contains(debugPublisher, "streamResumeSpinnerVisible()") || strings.Contains(string(bundle), "streamResumeSpinnerVisible()") {
+		t.Fatal("stream debug must not depend on a separate spinner visibility symbol")
 	}
 }
 
@@ -651,7 +761,8 @@ func TestControlCodeCaptureRejectsPopupFadeAndRequiresVerifiedGeneratedFrame(t *
 		"dimOverlayVisible",
 		"unsafeOverlayVisible",
 		"const popupKeyboardVisible = dialogVisible && keyboardVisible;",
-		"popupVisible: dialogVisible && (okButtonVisible || inputLineVisible)",
+		"const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);",
+		"popupVisible,",
 		"unsafeOverlayVisible: popupVisible || popupKeyboardVisible || dialogGhostVisible || (dimOverlayVisible && (popupVisible || dialogGhostVisible || popupKeyboardVisible))",
 	} {
 		if !strings.Contains(popupProof, needle) {
@@ -659,9 +770,8 @@ func TestControlCodeCaptureRejectsPopupFadeAndRequiresVerifiedGeneratedFrame(t *
 		}
 	}
 	for _, needle := range []string{
-		"proof.popupGhostVisible = popupProof.dialogGhostVisible;",
-		"proof.dimOverlayVisible = popupProof.dimOverlayVisible;",
-		"proof.unsafeOverlayVisible = popupProof.unsafeOverlayVisible;",
+		"Object.assign(proof, popupProof, {",
+		"popupGhostVisible: popupProof.dialogGhostVisible",
 		"if (popupProof.unsafeOverlayVisible)",
 		"control_popup_fade_frame",
 		"const safeFrameCount = noteControlCodeSafeGeneratedFrame(proof);",
@@ -922,7 +1032,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"  async function closeCurrentControlCode(openNext) {")
 	hotspot := substringBetween(t, source,
 		"function requestControlCodeFromHotspot(event) {",
-		"  function closeControlCodeFromHotspot(event) {")
+		"  function relayReportToStreamStatus(report) {")
 	updateSubmit := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
@@ -936,12 +1046,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"controlCodeFastStateExpiryTimer = setTimeout(() => {",
 		"refreshControlCodeReadiness('control_code_fast_state_expired');",
 		"spacetimeClientStatus === 'live'",
-		"function controlCodeRequestBusyForAutoPrepare() {",
 		"if (controlCodeSubmitInFlight) return true;",
-		"status === 'queued' || status === 'running'",
-		"status !== 'succeeded'",
-		"controlCodePreparedCaptureDisplayedRequestID !== requestID",
-		"codeResultArea.hidden",
 		"function refreshControlCodeReadiness(reason, options) {",
 		"const allowPrepare = !options || options.prepare !== false;",
 		"connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));",
@@ -962,7 +1067,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"if (!codeResultArea.hidden) return;",
 		"if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;",
 		"if (controlCodeFastStateFresh()) return;",
-		"const busy = controlCodeRequestBusyForAutoPrepare();",
+		"const busy = controlCodeRequestOccupiesQueue();",
 		"now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs",
 		"client.prepareControlCode(reason || 'page_ready_control_code')",
 	} {
@@ -983,6 +1088,9 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	}
 	if strings.Contains(autoPrepare, "if (codeDialogOpen) return;") {
 		t.Fatalf("an open control-code dialog must not block readiness preparation")
+	}
+	if strings.Contains(source, "function controlCodeRequestBusyForAutoPrepare() {") {
+		t.Fatalf("auto-prepare must not maintain a second, divergent phone-occupancy predicate")
 	}
 	if !strings.Contains(source, "let controlCodeFastStateExpiryTimer = null;") ||
 		!strings.Contains(source, "scheduleControlCodeFastStateExpiryCheck();") ||
@@ -1041,7 +1149,6 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"controlCodeHotspot.addEventListener('touchend'",
-		"controlCodeCloseHotspot.addEventListener('touchend'",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("native hotspot buttons must not fire touchend after a swipe: %q", forbidden)
@@ -1071,11 +1178,108 @@ func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
 		"clientLog('video_socket_closed'",
 		"clientLog('keyframe_request'",
 		"clientLog('stream_recovery_request'",
-		"clientLog('visibility_resume_recovery'",
+		"logResumeCheckpoint('activation_resume_recovery_decision'",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("browser stream trace breadcrumb missing %q", needle)
 		}
+	}
+}
+
+func TestTicketBrowserRuntimeLogRetriesReuseTheOriginalRowID(t *testing.T) {
+	source := ticketAppSource(t)
+	clientSource := readTicketWebClientSource(t, "src/index.ts")
+	for _, needle := range []string{
+		"function newClientLogRowID(entry) {",
+		"if (!compacted.rowId) compacted.rowId = newClientLogRowID(compacted);",
+		"pendingClientLogs.unshift(entry);",
+		"entry.correlationId || '', entry.rowId || ''",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("browser safe-log retry must preserve its enqueue-time row ID, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		`appendSafeLog(level: string, event: string, detailJson: string, correlationId = "", rowId = "")`,
+		`id: rowId || this.logRowId("browser", event, correlationId)`,
+	} {
+		if !strings.Contains(clientSource, needle) {
+			t.Fatalf("Spacetime browser client must accept a retry-stable safe-log row ID, missing %q", needle)
+		}
+	}
+}
+
+func TestTicketBrowserDeduplicatesResumeOutcomesAndHiddenDecoderNoise(t *testing.T) {
+	source := ticketAppSource(t)
+	eventMap := substringBetween(t, source,
+		"function compactClientEventName(value) {",
+		"  function compactClientLogEntry(entry) {")
+	resumeQueue := substringBetween(t, source,
+		"function logResumeCheckpoint(event, detail, flow) {",
+		"  function finishActivationResumeFlow(reason, flow) {")
+	decoderReport := substringBetween(t, source,
+		"function reportDecoderError(error, mode) {",
+		"  function sendVideoSocketClientLog(event, detail) {")
+	visibility := substringBetween(t, source,
+		"document.addEventListener('visibilitychange', () => {",
+		"  window.addEventListener('pageshow'")
+
+	for _, needle := range []string{
+		"if (/activation_resume_fresh_frame/.test(event)) return 'stream_recovered';",
+		"if (/recover|recovery/.test(event)) return /failed|exhausted/.test(event) ? 'stream_failed' : 'stream_recovery_requested';",
+	} {
+		if !strings.Contains(eventMap, needle) {
+			t.Fatalf("resume event classification must reserve terminal outcomes for fresh/exhausted, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"if (!target || target.done || target.logs >= 6) return;",
+		"target.logs += 1;",
+		"correlationId: target.id",
+	} {
+		if !strings.Contains(resumeQueue, needle) {
+			t.Fatalf("resume safe-log path must allow at most one failure and one recovery per flow, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"if (document.visibilityState === 'hidden') {",
+		"if (hiddenDecoderTransientLogged) return;",
+		"sendVideoClientLog('decoder_transient_hidden'",
+		"sendVideoClientLog('decoder_error'",
+	} {
+		if !strings.Contains(decoderReport, needle) {
+			t.Fatalf("hidden decoder faults must collapse into one transient diagnostic per hidden episode, missing %q", needle)
+		}
+	}
+	if strings.Count(source, "reportDecoderError(error,") != 3 {
+		t.Fatalf("both decoder error callbacks must use the bounded classifier")
+	}
+	if strings.Count(visibility, "hiddenDecoderTransientLogged = false;") != 2 {
+		t.Fatalf("decoder transient gate must reset at the visible/hidden episode boundaries")
+	}
+}
+
+func TestControlCodeRequestRenderingIsIdempotentAcrossUnrelatedStateUpdates(t *testing.T) {
+	source := ticketAppSource(t)
+	renderBody := substringBetween(t, source,
+		"function renderControlCodeRequest(request) {",
+		"  function setDetailsPanelVisible(visible) {")
+	for _, needle := range []string{
+		"let lastRenderedControlCodeRequestSignature = '';",
+		"function normalizedControlCodeRequestSignature(request) {",
+		"const renderSignature = normalizedControlCodeRequestSignature(nextRequest);",
+		"if (renderSignature === lastRenderedControlCodeRequestSignature) return;",
+		"lastRenderedControlCodeRequestSignature = renderSignature;",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("control-code subscription rendering must use a normalized idempotence signature, missing %q", needle)
+		}
+	}
+	availabilityIndex := strings.Index(renderBody, "updateControlCodeSubmitAvailability();")
+	guardIndex := strings.Index(renderBody, "if (renderSignature === lastRenderedControlCodeRequestSignature) return;")
+	requestSideEffectIndex := strings.Index(renderBody, "keepControlCodeVideoAlive('control_code_request_active');")
+	if availabilityIndex < 0 || guardIndex < 0 || requestSideEffectIndex < 0 || availabilityIndex > guardIndex || guardIndex > requestSideEffectIndex {
+		t.Fatalf("idempotence guard must preserve global submit readiness while skipping repeated request side effects")
 	}
 }
 
@@ -1101,6 +1305,9 @@ func TestSpacetimeClientReducersWaitForLiveConnection(t *testing.T) {
 
 func TestSpacetimeReconnectRefreshesOnlyExpiredTokens(t *testing.T) {
 	source := ticketAppSource(t)
+	if strings.Contains(source, "spacetimeDirectUnavailable = true") || !strings.Contains(source, "setTimeout(() => { if (!idleDisconnected && !spacetimeClient) connectSpacetimeState()") {
+		t.Fatal("a transient token or script failure must retry instead of permanently disabling direct state")
+	}
 	recoverExpired := substringBetween(t, source,
 		"function recoverExpiredSpacetimeConnection(client, reason) {",
 		"  async function connectSpacetimeState() {")
@@ -1157,15 +1364,26 @@ func TestSpacetimeReconnectRefreshesOnlyExpiredTokens(t *testing.T) {
 	}
 }
 
-func TestControlCodeUsesPixelOwnedSpacetimeCommandFlow(t *testing.T) {
-	source := ticketRemoteSourceFile(t, "internal", "web", "control_code.go")
+func TestControlCodeUsesDirectSpacetimeReducerFlow(t *testing.T) {
+	appSource := ticketAppSource(t)
 	for _, needle := range []string{
-		"appendStreamCommand(ctx, \"generate_control_code\"",
-		"appendStreamCommand(ctx, \"control_code_browser_capture\"",
-		"appendStreamCommand(ctx, \"control_code_result_ack\"",
+		"client.requestControlCode(digits, fastRevision)",
+		"client.confirmControlCodeBrowserCapture(",
+		"client.closeControlCode(requestID, 'browser_closed')",
 	} {
-		if !strings.Contains(source, needle) {
-			t.Fatalf("control-code flow must stay Pixel-owned through Spacetime commands, missing %q", needle)
+		if !strings.Contains(appSource, needle) {
+			t.Fatalf("control-code browser flow must call Spacetime directly, missing %q", needle)
+		}
+	}
+
+	clientSource := ticketRemoteSourceFile(t, "internal", "web", "static", "spacetime-client.js")
+	for _, needle := range []string{
+		"this.callReducer(\"memberRequestControlCode\"",
+		"this.callReducer(\"memberConfirmControlCodeBrowserCapture\"",
+		"this.callReducer(\"memberCloseControlCode\"",
+	} {
+		if !strings.Contains(clientSource, needle) {
+			t.Fatalf("Spacetime client must own the control-code mutation, missing %q", needle)
 		}
 	}
 }
@@ -1200,14 +1418,8 @@ func TestControlCodeGeneratedProofScansLowerResultStrip(t *testing.T) {
 	if !strings.Contains(generatedProof, "y: Math.max(0.12, chip.chipY - 0.34)") {
 		t.Fatalf("generated code-area proof must be anchored to the detected result strip")
 	}
-	for _, needle := range []string{
-		"proof.generatedChipY = generatedProof.generatedChipY;",
-		"proof.generatedChipScore = generatedProof.generatedChipScore;",
-		"proof.generatedCodeScore = generatedProof.generatedCodeScore;",
-	} {
-		if !strings.Contains(candidateProof, needle) {
-			t.Fatalf("candidate proof debug must expose generated proof details, missing %q", needle)
-		}
+	if !strings.Contains(candidateProof, "Object.assign(proof, generatedProof);") {
+		t.Fatalf("candidate proof debug must retain every generated proof field")
 	}
 }
 
@@ -1218,22 +1430,15 @@ func TestControlCodePopupProofTargetsCenteredEntryDialog(t *testing.T) {
 		"  function controlCodeResultChipProof() {")
 
 	for _, needle := range []string{
-		"const dialog = canvasRegionFingerprint({",
-		"y: 0.38",
-		"height: 0.22",
-		"const dialogUpper = canvasRegionFingerprint({",
-		"y: 0.30",
-		"const inputLineUpper = canvasRegionFingerprint({",
-		"y: 0.41",
-		"const okButton = canvasRegionFingerprint({",
-		"x: 0.64",
-		"y: 0.51",
-		"const okButtonUpper = canvasRegionFingerprint({",
-		"y: 0.43",
+		"const dialog = sample(0.16, 0.38, 0.68, 0.22);",
+		"const dialogUpper = sample(0.16, 0.30, 0.68, 0.22);",
+		"const inputLineUpper = sample(0.24, 0.41, 0.52, 0.045);",
+		"const okButton = sample(0.64, 0.51, 0.18, 0.07);",
+		"const okButtonUpper = sample(0.64, 0.43, 0.18, 0.07);",
 		"function regionOrangeCellRatio(region) {",
 		"okButtonOrangeRatio",
 		"okButtonVisible",
-		"popupVisible: dialogVisible && (okButtonVisible || inputLineVisible)",
+		"const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);",
 		"dialogGhostVisible",
 		"dialogProof.darkCellRatio <= 0.30",
 		"dialogProof.contrastScore <= 106",
@@ -1271,6 +1476,44 @@ func TestControlCodeCloseHidesGeneratedResultBeforeNetworkRoundTrip(t *testing.T
 	}
 }
 
+func TestControlCodeCloseLocallyDismissesFailedResultWithoutOwnershipCache(t *testing.T) {
+	source := ticketAppSource(t)
+	closeBody := substringBetween(t, source,
+		"async function closeCurrentControlCode(openNext) {",
+		"  function requestControlCodeFromHotspot(event) {")
+	hotspotBody := substringBetween(t, source,
+		"function requestControlCodeFromHotspot(event) {",
+		"  function relayReportToStreamStatus(report) {")
+
+	for _, required := range []string{
+		"const request = codeRequest;",
+		"const canCloseRequest = Boolean(requestID && (",
+		"ownedControlCodeRequestIDs.has(String(requestID)) || isOwnedControlCodeRequest(request)",
+		"locallyClosedControlCodeRequestIDs.add(String(requestID));",
+		"setControlCodeResultVisible(false);",
+		"clearControlCodeResultCapture();",
+		"scheduleControlCodeTicker(null);",
+		"codeRequest = null;",
+		"clientLog('control_code_close_local_only', 'not_owned');",
+	} {
+		if !strings.Contains(closeBody, required) {
+			t.Fatalf("result close must locally dismiss even when the ownership cache is late, missing %q", required)
+		}
+	}
+	if strings.Contains(closeBody, "if (!ownedControlCodeRequestIDs.has(String(requestID)))") {
+		t.Fatal("a late ownership cache must not block immediate local result dismissal")
+	}
+	cleanupIndex := strings.Index(closeBody, "setControlCodeResultVisible(false);")
+	postGuardIndex := strings.Index(closeBody, "if (requestID && canCloseRequest) {")
+	if cleanupIndex < 0 || postGuardIndex < 0 || cleanupIndex > postGuardIndex {
+		t.Fatal("result close must clear the local overlay before deciding whether the server close may run")
+	}
+	if !strings.Contains(hotspotBody, "if (!codeResultArea.hidden) {") ||
+		strings.Contains(hotspotBody, "if (!codeResultArea.hidden && codeRequest)") {
+		t.Fatal("the left result-dismiss action must work even when a failed result no longer has request state")
+	}
+}
+
 func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	source := ticketAppSource(t)
 	closeBody := substringBetween(t, source,
@@ -1299,7 +1542,7 @@ func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 		t.Fatalf("browser capture must check for locally closed requests before and after async capture work")
 	}
 	ackIndex := strings.Index(captureBody, "await confirmControlCodeBrowserCapture(request, proof);")
-	revealIndex := strings.Index(captureBody, "displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');")
+	revealIndex := strings.Index(captureBody, "const painted = await displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');")
 	if ackIndex < 0 || revealIndex < 0 || revealIndex > ackIndex {
 		t.Fatalf("capture path must reveal the safe browser frame before waiting for the ack")
 	}
@@ -1326,221 +1569,134 @@ func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	}
 }
 
-func TestControlCodeProvisionalResultStaysVisibleWhileRunning(t *testing.T) {
+func TestControlCodeRunningOnlyPreparesHiddenResult(t *testing.T) {
 	source := ticketAppSource(t)
-	renderBody := substringBetween(t, source,
-		"function renderControlCodeRequest(request) {",
-		"  function setDetailsPanelVisible(visible) {")
+	prepareBody := substringBetween(t, source,
+		"function maybePrepareControlCodeResultFrame() {",
+		"  function noteControlCodeMarkerWaiting(request) {")
+	captureBody := substringBetween(t, source,
+		"async function captureControlCodeResultScreenshot(request, proof) {",
+		"  function failControlCodeResultScreenshotWait() {")
 
 	for _, needle := range []string{
-		"function controlCodeResultDisplayedForRequest(requestID) {",
-		"controlCodePreparedCaptureDisplayedRequestID === requestID",
-		"!codeResultArea.hidden",
-		"!codeResultImage.hidden",
-		"Boolean(codeResultImage.currentSrc || codeResultImage.src)",
-		"const currentRequestID = String(current && current.requestId || '').trim();",
-		"maybePrepareControlCodeResultFrame();",
-		"if (controlCodeResultDisplayedForRequest(currentRequestID)) {",
-		"scheduleControlCodeTicker(current);",
-		"return;",
+		"if (!codeRequest || codeRequest.status !== 'running') return false;",
+		"const proof = controlCodeCandidateFrameProof(codeRequest, { allowProvisional: true });",
+		"controlCodePreparedCaptureProof = Object.assign({}, proof, {",
+		"preparedAt: Date.now()",
 	} {
-		if !strings.Contains(source, needle) && !strings.Contains(renderBody, needle) {
-			t.Fatalf("provisional control-code result visibility guard missing %q", needle)
+		if !strings.Contains(prepareBody, needle) {
+			t.Fatalf("running control-code request must only prepare a hidden frozen frame, missing %q", needle)
 		}
+	}
+	for _, forbidden := range []string{
+		"displayControlCodeResultImage(",
+		"captureControlCodeResultImage(",
+		"confirmControlCodeBrowserCapture(",
+		"setControlCodeResultVisible(true)",
+		"control_code_frame_displayed",
+		"control_code_frame_painted",
+	} {
+		if strings.Contains(prepareBody, forbidden) {
+			t.Fatalf("running control-code request must not display or acknowledge provisionally, found %q", forbidden)
+		}
+	}
+	if !strings.Contains(captureBody, "if (!request || request.status !== 'succeeded'") {
+		t.Fatal("browser result display must reject any direct provisional capture call")
 	}
 }
 
 func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 	source := ticketAppSource(t)
-	visibilityBody := substringBetween(t, source,
-		"document.addEventListener('visibilitychange', () => {",
-		"  window.addEventListener('pageshow'")
-	pageshowBody := substringBetween(t, source,
-		"window.addEventListener('pageshow'",
-		"  window.addEventListener('focus'")
-	recoveryBody := substringBetween(t, source,
-		"function recoverAfterVisibilityResume(reason) {",
-		"  window.addEventListener('resize', resizeCanvasBox);")
-	restoreBody := substringBetween(t, source,
-		"function restoreCachedVideoForFreshFrame(reason, kind) {",
-		"  function connect() {")
-	resumeWatchdogsBody := substringBetween(t, source,
-		"function scheduleResumeWatchdogs(reason) {",
-		"  function recoverFreshMediaSession(reason, kind, options) {")
-	recoverMediaBody := substringBetween(t, source,
-		"function recoverFreshMediaSession(reason, kind, options) {",
-		"  function forceFreshVideoResume(reason, kind) {")
-	activationBody := substringBetween(t, source,
-		"function startActivationResumeFlow(reason, trigger, options) {",
-		"  function activationRetryPhase(attempt) {")
-	burstBody := substringBetween(t, source,
-		"function runActivationReconnectBurst(reason, flow) {",
-		"  function scheduleResumeWatchdogs(reason) {")
-	chaseBody := substringBetween(t, source,
-		"function chaseLiveStream() {",
-		"  function recoverAfterVisibilityResume(reason) {")
-
 	for _, needle := range []string{
-		"let lastHiddenAt = 0;",
-		"let lastHiddenWallAt = 0;",
 		"let activeResumeFlow = null;",
 		"let activationReconnectBurstTimer = null;",
-		"const backgroundRecoveryHiddenMs = 30000;",
-		"const oldTabFreshResumeHiddenMs = 5000;",
-		"const resumeVideoReconnectDelayMs = 0;",
-		"const resumeSoftReconnectMs = 1800;",
-		"const resumeHardRecoverMs = 4500;",
+		"let lastRecoveryVideoReconnectSeq = -1;",
 		"const activationReconnectBurstMs = 10000;",
 		"const activationReconnectFirstRetryMs = 150;",
 		"const activationReconnectTickMs = 500;",
 		"const activationReconnectMaxTicks = 10;",
-		"const activationResumeLogLimit = 32;",
-		"let pendingResumeFreshFrameFlow = null;",
-		"function resumeDiagnosticSnapshot(detail) {",
-		"decoder: decoderStateLabel(),",
-		"function mediaSessionStuckOnPreservedFrame() {",
-		"if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;",
-		"if (!hasRenderedFrame && !fallbackFrameAvailable) return false;",
-		"return !configured || !decoderConfigured;",
+		"function startActivationResumeFlow(reason, trigger, options) {",
+		"function runActivationReconnectBurst(reason, flow) {",
+		"if (!flow || flow !== activeResumeFlow || flow.done) return;",
+		"flow.attempts >= activationReconnectMaxTicks",
+		"performance.now() - flow.startedAt >= activationReconnectBurstMs",
+		"requestServerRecoveryDebounced(`${reason || 'resume'}_exhausted`, true);",
+		"connectSpacetimeState().catch",
+		"publishCurrentStreamFocus(reason || 'activation');",
+		"requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);",
+		"recoverFreshMediaSession(reason || 'activation', 'activation_resume'",
+		"flow.attempts += 1;",
+		"flow.attempts === 1 ? activationReconnectFirstRetryMs : activationReconnectTickMs",
 		"function recoverFreshMediaSession(reason, kind, options) {",
-		"function enqueueCompletedResumeSafeLog(flow, event, detail) {",
-		"function logResumeCheckpoint(event, detail, flow) {",
-		"function finishActivationResumeFlow(reason, flow) {",
-		"pendingResumeFreshFrameFlow = {",
-		"result: 'late_fresh'",
-		"spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '')",
+		"lastRecoveryVideoReconnectSeq === videoSocketOpenSeq",
+		"now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs",
+		"lastRecoveryVideoReconnectSeq = videoSocketOpenSeq;",
+		"preserveCurrentFrame(`media_recovery:${reason || 'unknown'}`);",
+		"closeDirectVideo();",
+		"resetStreamState({ preserveFrame: true });",
+		"connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });",
+		"recoverFreshMediaSession(reason || 'visibility_resume', 'old_tab_resume'",
+		"keyframeReason: `${reason || 'resume'}_cached_keyframe`",
+		"startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');",
+		"startActivationResumeFlow('focus', 'focus');",
+		"startActivationResumeFlow('initial_load', 'initial_load');",
+		"startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });",
+		"recoverAfterVisibilityResume('visibility_resume');",
+		"spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '', entry.rowId || '')",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("missing visibility resume state/cadence %q", needle)
+			t.Fatalf("explicit bounded stream lifecycle missing %q", needle)
 		}
 	}
-	if !strings.Contains(visibilityBody, "lastHiddenAt = performance.now();") ||
-		!strings.Contains(visibilityBody, "lastHiddenWallAt = Date.now();") ||
-		!strings.Contains(visibilityBody, "recoverAfterVisibilityResume('visibility_resume');") ||
-		!strings.Contains(visibilityBody, "startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });") ||
-		!strings.Contains(visibilityBody, "logResumeCheckpoint('activation_visibility_hidden'") {
-		t.Fatalf("visibility changes must record hidden time and resume through the bounded recovery path")
-	}
-	if !strings.Contains(pageshowBody, "startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');") ||
-		!strings.Contains(source, "startActivationResumeFlow('focus', 'focus');") ||
-		!strings.Contains(source, "startActivationResumeFlow('initial_load', 'initial_load');") {
-		t.Fatalf("initial load, pageshow, and focus must all start the bounded activation watcher")
-	}
-	requiredRecoverySnippets := []string{
-		"const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;",
-		"const hiddenWallMs = lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0;",
-		"const hiddenMs = Math.max(hiddenPerfMs, hiddenWallMs);",
-		"const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;",
-		"const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;",
-		"const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));",
-		"const cacheRestored = reason === 'pageshow_persisted'",
-		"const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });",
-		"logResumeCheckpoint('activation_resume_recovery_decision'",
-		"if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {\n      clientLog('visibility_resume_recovery'",
-		"publishCurrentStreamFocus(reason || 'visibility_visible');",
-		"restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');",
-		"runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);",
-		"scheduleResumeWatchdogs(reason || 'visibility_visible');",
-		"if (videoStale) {\n      reconnectVideoForRecovery('visibility_resume_stale');",
-	}
-	for _, needle := range requiredRecoverySnippets {
-		if !strings.Contains(recoveryBody, needle) {
-			t.Fatalf("resume recovery missing bounded behavior %q", needle)
-		}
-	}
-	for _, needle := range []string{
-		"recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover'",
-	} {
-		if !strings.Contains(resumeWatchdogsBody, needle) {
-			t.Fatalf("stream recovery watchdog must still perform hard recovery, missing %q", needle)
-		}
-	}
-	for _, needle := range []string{
+	for _, forbidden := range []string{
+		"pendingResumeFreshFrameFlow",
+		"resumeRecoverySoftTimer",
+		"resumeRecoveryHardTimer",
+		"activationResumeLogLimit",
 		"recordDevPerfMetric(",
 		"randomMetricFlowId(",
 		"memberAppendDevPerfMetric",
 	} {
-		if strings.Contains(resumeWatchdogsBody, needle) {
-			t.Fatalf("stream recovery watchdog must not emit removed dev-performance metrics %q", needle)
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("stream lifecycle still contains retired overlapping state %q", forbidden)
 		}
 	}
-	for _, needle := range []string{
-		"deadlineAt: performance.now() + activationReconnectBurstMs",
-		"logResumeCheckpoint('activation_resume_start'",
-		"logResumeCheckpoint('activation_resume_merged'",
-		"runActivationReconnectBurst(reason || 'activation', flow);",
-	} {
-		if !strings.Contains(activationBody, needle) {
-			t.Fatalf("activation flow missing bounded start/merge behavior %q", needle)
-		}
+}
+
+func TestTicketViewerResumeRecoveryWaitsForLiveFrameAndReusesFreshSocket(t *testing.T) {
+	source := ticketAppSource(t)
+	recoveryBody := substringBetween(t, source,
+		"function recoverFreshMediaSession(reason, kind, options) {",
+		"  function connect() {")
+	renderBody := substringBetween(t, source,
+		"function renderDecodedFrame(frame, source) {",
+		"  async function configureDecoder(config, options) {")
+	freshnessBody := substringBetween(t, source,
+		"function updateStreamFreshnessStatus(reason) {",
+		"  function liveFrameReadyForControlCode() {")
+
+	if !strings.Contains(recoveryBody, "lastRecoveryVideoReconnectSeq === videoSocketOpenSeq") ||
+		!strings.Contains(recoveryBody, "now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs") ||
+		!strings.Contains(recoveryBody, "if (reusable) {") ||
+		!strings.Contains(recoveryBody, "requestKeyframeDebounced(options.keyframeReason") {
+		t.Fatalf("a newly opened recovery socket must be reused during its bounded cooldown")
 	}
-	for _, needle := range []string{
-		"if (streamHasFreshRenderedFrame())",
-		"logResumeCheckpoint('activation_resume_fresh_frame'",
-		"if (flow.attempts >= activationReconnectMaxTicks || now >= flow.deadlineAt)",
-		"logResumeCheckpoint('activation_resume_exhausted'",
-		"action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover'",
-		"requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);",
-		"recoverFreshMediaSession(reason || 'activation', 'activation_resume'",
-		"keyframeMinIntervalMs: 0,",
-		"forceServerRecovery: mediaSessionStuckOnPreservedFrame()",
-		"attempt === 0 ? activationReconnectFirstRetryMs : activationReconnectTickMs",
-	} {
-		if !strings.Contains(burstBody, needle) {
-			t.Fatalf("activation reconnect burst missing %q", needle)
-		}
+	if strings.Contains(recoveryBody, "reusable && !mediaSessionStuckOnPreservedFrame()") {
+		t.Fatalf("a preserved stale frame must not bypass the recovery socket cooldown")
 	}
-	for _, needle := range []string{
-		"logResumeCheckpoint('activation_resume_media_stuck'",
-		"logResumeCheckpoint('activation_resume_deep_recover'",
-		"closeEarlyVideo(reason || 'media_session_recovery');",
-		"preserveCurrentFrame(`fresh_media_session:${reason || 'unknown'}`);",
-		"closeDirectVideo();",
-		"resetStreamState({ preserveFrame: true });",
-		"showStreamRecovery();",
-		"beginStreamOpenMetric(kind || 'media_session_recovery', reason || 'resume', true);",
-		"connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });",
-		"requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);",
-		"requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);",
-	} {
-		if !strings.Contains(recoverMediaBody, needle) {
-			t.Fatalf("fresh media-session recovery helper missing %q", needle)
-		}
+	connect := strings.Index(recoveryBody, "connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });")
+	guard := strings.Index(recoveryBody, "lastRecoveryVideoReconnectSeq = videoSocketOpenSeq;")
+	if connect < 0 || guard < connect {
+		t.Fatalf("the recovery guard must record the generation of the newly opened socket")
 	}
-	for _, needle := range []string{
-		"recoverFreshMediaSession(reason || 'cached_resume', kind || 'old_tab_resume'",
-		"keyframeReason: `${reason || 'resume'}_cached_keyframe`,",
-		"keyframeMinIntervalMs: 0,",
-		"serverRecoveryReason: `${reason || 'resume'}_cached_recover`,",
-		"forceServerRecovery: false",
-		"skipEarlyGrace: true",
-	} {
-		if !strings.Contains(restoreBody, needle) {
-			t.Fatalf("cached-tab restore must aggressively request a fresh frame, missing %q", needle)
-		}
+	if strings.Contains(renderBody, "clearActivationReconnectBurst();") ||
+		strings.Contains(renderBody, "finishActivationResumeFlow(") {
+		t.Fatalf("an arbitrary decoded frame must not finish the activation recovery burst")
 	}
-	for _, needle := range []string{
-		"if (pendingAge > streamStaleDecoderResetMs && mediaSessionStuckOnPreservedFrame())",
-		"recoverFreshMediaSession('h264_first_frame_pending', 'first_frame_pending'",
-		"keyframeReason: 'h264_first_frame_pending_keyframe'",
-		"serverRecoveryReason: 'h264_first_frame_pending_recover'",
-		"forceServerRecovery: true",
-	} {
-		if !strings.Contains(chaseBody, needle) {
-			t.Fatalf("first-frame-pending recovery must escalate before long loading stalls, missing %q", needle)
-		}
-	}
-	for _, needle := range []string{
-		"const firstFrameServerRecoveryMaxAttempts = 2;",
-		"function requestFirstFrameServerRecovery(reason, phase) {",
-		"event: 'h264_first_frame_recovery_exhausted'",
-		"requestFirstFrameServerRecovery('h264_start_pending', 'unconfigured');",
-		"requestFirstFrameServerRecovery('first_frame_server_recover', 'configured');",
-		"resetFirstFrameServerRecovery();",
-	} {
-		if !strings.Contains(source, needle) {
-			t.Fatalf("first-frame-pending server recovery must stay capped, missing %q", needle)
-		}
+	liveBranch := strings.Index(freshnessBody, "} else if (freshness.liveLabeled) {")
+	finish := strings.Index(freshnessBody, "finishActivationResumeFlow('fresh_frame');")
+	if liveBranch < 0 || finish < liveBranch {
+		t.Fatalf("only a live-labeled frame may finish the activation recovery burst")
 	}
 }
 
@@ -1608,7 +1764,6 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 	for _, needle := range []string{
 		"idleDisconnected = false;",
 		"setStatus('Atjauno tiešraidi...');",
-		"beginStreamOpenMetric('old_tab_resume'",
 		"connectSpacetimeState().catch",
 		"publishCurrentStreamFocus(reason || 'idle_resume');",
 		"connectDirectVideo();",
@@ -1713,15 +1868,6 @@ func ticketAppCSS(t *testing.T) string {
 func ticketIndexTemplate(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("static/index.html.tmpl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
-}
-
-func controlCodeServerSource(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile("control_code.go")
 	if err != nil {
 		t.Fatal(err)
 	}

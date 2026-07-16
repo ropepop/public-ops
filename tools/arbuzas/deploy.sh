@@ -8,6 +8,7 @@ DOCKER_DEFAULT_ENV_FILE="${DOCKER_ROOT}/env/arbuzas.env"
 LOCAL_RELEASES_ROOT="${REPO_ROOT}/output/arbuzas/releases"
 HOST_MIRROR_SCRIPT="${REPO_ROOT}/tools/arbuzas/host_mirror.py"
 HOST_MIRROR_ROOT="${ARBUZAS_HOST_MIRROR_ROOT:-${REPO_ROOT}/infra/arbuzas/host-mirror}"
+HOST_MIRROR_PROFILE="${ARBUZAS_HOST_MIRROR_PROFILE:-arbuzas}"
 REMOTE_RELEASES_ROOT="/etc/arbuzas/releases"
 REMOTE_CURRENT_LINK="/etc/arbuzas/current"
 REMOTE_PORTAINER_DATA_DIR="/srv/arbuzas/portainer"
@@ -65,6 +66,7 @@ fi
 ARBUZAS_HOST="${ARBUZAS_HOST:-kitty-gration}"
 ARBUZAS_USER="${ARBUZAS_USER:-${USER}}"
 ARBUZAS_SSH_PORT="${ARBUZAS_SSH_PORT:-}"
+ARBUZAS_SSH_KNOWN_HOSTS_FILE="${ARBUZAS_SSH_KNOWN_HOSTS_FILE:-}"
 ARBUZAS_TZ="${ARBUZAS_TZ:-Europe/Riga}"
 ARBUZAS_RELEASE_ID="${ARBUZAS_RELEASE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 ARBUZAS_RELEASE_DIR="${ARBUZAS_RELEASE_DIR:-${LOCAL_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}}"
@@ -107,6 +109,16 @@ COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
 FAST_RELEASE_OVERLAY_PATHS=()
 RUN_STARTED_SECONDS="${SECONDS}"
+DEPLOYMENT_TIMING_REPORTER="${REPO_ROOT}/workloads/deployment-timing/scripts/report.sh"
+DEPLOYMENT_TIMING_ACTIVE=0
+DEPLOYMENT_TIMING_FINALIZED=0
+DEPLOYMENT_TIMING_RUN_ID=""
+DEPLOYMENT_TIMING_ACTION=""
+DEPLOYMENT_TIMING_RELEASE_ID="none"
+DEPLOYMENT_TIMING_PROFILE="none"
+DEPLOYMENT_TIMING_TARGET="none"
+DEPLOYMENT_TIMING_PHASE_BUNDLE="-"
+DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH=""
 
 ALL_SERVICES=(
   portainer
@@ -128,12 +140,128 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2
 }
 
+# Deployment timing is intentionally detached from the deploy path. The
+# reporter only receives compact identifiers and durations, and a missing or
+# failed reporter must never alter the command's exit status.
+deployment_timing_safe_token_or_none() {
+  local value="${1:-}"
+  local max_length="$2"
+
+  if [[ -n "${value}" && ${#value} -le "${max_length}" && "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@=-]*$ ]]; then
+    printf '%s' "${value}"
+  else
+    printf 'none'
+  fi
+}
+
+deployment_timing_total_millis() {
+  printf '%s' "$(( (SECONDS - RUN_STARTED_SECONDS) * 1000 ))"
+}
+
+deployment_timing_report() {
+  local python_bin=""
+  [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" && -x "${DEPLOYMENT_TIMING_REPORTER}" ]] || return 0
+  python_bin="${DEPLOY_TIMING_PYTHON_BIN:-/usr/bin/python3}"
+  if [[ ! -x "${python_bin}" ]]; then
+    python_bin="$(command -v python3 || true)"
+  fi
+  [[ -n "${python_bin}" ]] || return 0
+
+  # The worker is detached from the deployment, then waits for its one
+  # Spacetime call. Avoiding a second detach makes final events reliable while
+  # keeping local CLI setup and network latency off the critical path.
+  "${python_bin}" -c \
+    'import subprocess, sys; subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)' \
+    "${DEPLOYMENT_TIMING_REPORTER}" "$@" --wait >/dev/null 2>&1 || true
+  return 0
+}
+
+deployment_timing_append_phase() {
+  local phase_name="$1"
+  local phase_status="$2"
+  local phase_duration_millis="$3"
+  local phase_total_duration_millis="$4"
+  local phase_record="${phase_name}=${phase_status}=${phase_duration_millis}=${phase_total_duration_millis}"
+
+  if [[ "${DEPLOYMENT_TIMING_PHASE_BUNDLE}" == "-" ]]; then
+    DEPLOYMENT_TIMING_PHASE_BUNDLE="${phase_record}"
+  else
+    DEPLOYMENT_TIMING_PHASE_BUNDLE+="@${phase_record}"
+  fi
+}
+
+deployment_timing_finish() {
+  local exit_code="$1"
+  local status="failed"
+
+  [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" && "${DEPLOYMENT_TIMING_FINALIZED}" == "0" ]] || return 0
+  DEPLOYMENT_TIMING_FINALIZED=1
+  if [[ "${exit_code}" == "0" ]]; then
+    status="ok"
+  fi
+
+  deployment_timing_report run-complete \
+    --run-id "${DEPLOYMENT_TIMING_RUN_ID}" \
+    --source ops \
+    --action "${DEPLOYMENT_TIMING_ACTION}" \
+    --status "${status}" \
+    --total-duration-ms "$(deployment_timing_total_millis)" \
+    --phase-bundle "${DEPLOYMENT_TIMING_PHASE_BUNDLE}" \
+    --release-id "${DEPLOYMENT_TIMING_RELEASE_ID}" \
+    --profile "${DEPLOYMENT_TIMING_PROFILE}" \
+    --target "${DEPLOYMENT_TIMING_TARGET}"
+}
+
+deployment_timing_on_exit() {
+  local exit_code="$1"
+  trap - EXIT
+
+  if [[ -n "${DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH}" ]]; then
+    rm -f -- "${DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH}" || true
+  fi
+  deployment_timing_finish "${exit_code}" || true
+  exit "${exit_code}"
+}
+
+start_deployment_timing_reporting() {
+  case "${action}" in
+    deploy|validate|deploy-config)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  [[ -x "${DEPLOYMENT_TIMING_REPORTER}" ]] || return 0
+
+  DEPLOYMENT_TIMING_ACTIVE=1
+  DEPLOYMENT_TIMING_ACTION="${action}"
+  DEPLOYMENT_TIMING_RUN_ID="ops-${action}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  DEPLOYMENT_TIMING_RELEASE_ID="$(deployment_timing_safe_token_or_none "${requested_release_id:-${ARBUZAS_RELEASE_ID}}" 160)"
+  DEPLOYMENT_TIMING_TARGET="$(deployment_timing_safe_token_or_none "${ARBUZAS_HOST}" 160)"
+  if [[ "${action}" == "deploy-config" ]]; then
+    DEPLOYMENT_TIMING_PROFILE="none"
+  else
+    DEPLOYMENT_TIMING_PROFILE="$(deployment_timing_safe_token_or_none "${VALIDATION_PROFILE}" 48)"
+  fi
+
+  trap 'deployment_timing_on_exit "$?"' EXIT
+  deployment_timing_report run-start \
+    --run-id "${DEPLOYMENT_TIMING_RUN_ID}" \
+    --source ops \
+    --action "${DEPLOYMENT_TIMING_ACTION}" \
+    --release-id "${DEPLOYMENT_TIMING_RELEASE_ID}" \
+    --profile "${DEPLOYMENT_TIMING_PROFILE}" \
+    --target "${DEPLOYMENT_TIMING_TARGET}"
+}
+
 run_timed_phase() {
   local phase_name="$1"
   shift
   local phase_started_seconds="${SECONDS}"
   local phase_status="ok"
   local phase_exit_code=0
+  local phase_duration_millis=0
+  local phase_total_duration_millis=0
 
   log "Phase start: ${phase_name} profile=${VALIDATION_PROFILE}"
   if "$@"; then
@@ -142,7 +270,12 @@ run_timed_phase() {
     phase_exit_code=$?
     phase_status="failed"
   fi
+  phase_duration_millis="$(( (SECONDS - phase_started_seconds) * 1000 ))"
+  phase_total_duration_millis="$(deployment_timing_total_millis)"
   log "Phase timing: phase=${phase_name} status=${phase_status} duration_seconds=$((SECONDS - phase_started_seconds)) total_seconds=$((SECONDS - RUN_STARTED_SECONDS)) profile=${VALIDATION_PROFILE}"
+  if [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" ]]; then
+    deployment_timing_append_phase "${phase_name}" "${phase_status}" "${phase_duration_millis}" "${phase_total_duration_millis}"
+  fi
   return "${phase_exit_code}"
 }
 
@@ -160,6 +293,9 @@ remote_target() {
 
 run_ssh() {
   local -a args=()
+  if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
+    args+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${ARBUZAS_SSH_KNOWN_HOSTS_FILE}")
+  fi
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(-p "${ARBUZAS_SSH_PORT}")
   fi
@@ -172,6 +308,9 @@ run_ssh() {
 
 run_scp() {
   local -a args=()
+  if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
+    args+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${ARBUZAS_SSH_KNOWN_HOSTS_FILE}")
+  fi
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(-P "${ARBUZAS_SSH_PORT}")
   fi
@@ -846,6 +985,7 @@ Options:
   --ssh-host HOST
   --ssh-user USER
   --ssh-port PORT
+  --ssh-known-hosts-file PATH
   --env-file PATH
 
 Services:
@@ -1908,11 +2048,15 @@ prepare_remote_ticket_runtime_permissions() {
         chmod 0600 \"\${path}\"
       fi
     done
+    if [[ -f '/etc/arbuzas/cloudflared/ticket-remote.json' ]]; then
+      chown '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}' '/etc/arbuzas/cloudflared/ticket-remote.json'
+      chmod 0600 '/etc/arbuzas/cloudflared/ticket-remote.json'
+    fi
   "
 }
 
 prepare_remote_host_layout() {
-  remote_shell "
+  remote_root_command "
     command -v docker >/dev/null 2>&1 || { echo 'docker is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     docker compose version >/dev/null 2>&1 || { echo 'docker compose is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     command -v python3 >/dev/null 2>&1 || { echo 'python3 is required on ${ARBUZAS_HOST}' >&2; exit 1; }
@@ -1940,7 +2084,7 @@ prepare_remote_host_layout() {
     if [[ ! -f '${DOCKER_GC_REMOTE_STATE_FILE}' && -r '/srv/arbuzas/docker-gc/state.json' ]]; then
       cp '/srv/arbuzas/docker-gc/state.json' '${DOCKER_GC_REMOTE_STATE_FILE}'
     fi
-    sudo -n touch \
+    touch \
       '/etc/arbuzas/env/train-bot.env' \
       '/etc/arbuzas/env/satiksme-bot.env' \
       '/etc/arbuzas/env/subscription-bot.env' \
@@ -4313,12 +4457,12 @@ validate_remote_ticket_remote_workload_health() {
       grep -aF \"/api/v1/control-code/request\" \"\${binary}\" >/dev/null
       grep -aF \"/api/v1/control-code/close\" \"\${binary}\" >/dev/null
       grep -aF \"control_code_request\" \"\${binary}\" >/dev/null
-      grep -aF \"generate_control_code\" \"\${binary}\" >/dev/null
+      grep -aF \"generate_control_code\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"requestControlCode\" \"\${binary}\" >/dev/null
       grep -aF \"sanitizeControlDigits\" \"\${binary}\" >/dev/null
       grep -aF \"navigator.wakeLock.request\" \"\${binary}\" >/dev/null
       grep -aF \"requestFullscreen\" \"\${binary}\" >/dev/null
-      grep -aF \"toolbarCollapseAnchorPx\" \"\${binary}\" >/dev/null
+      grep -aF \"toolbarCollapseAnchorPx\" \"\${binary}\" >/dev/null && exit 1
       grep -aF -- \"--ticket-viewport-height\" \"\${binary}\" >/dev/null
       grep -aF \"gesturechange\" \"\${binary}\" >/dev/null
       grep -aF \"dblclick\" \"\${binary}\" >/dev/null
@@ -4793,7 +4937,7 @@ rollback_remote_release() {
   remote_shell "
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing release bundle: ${remote_release_dir}' >&2; exit 1; }
     cd '${remote_release_dir}'
-    ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+    sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     if [[ '${TARGETED_MODE}' == '1' ]]; then
       if [[ -n '${rollback_service_args}' ]]; then
@@ -4812,9 +4956,12 @@ run_host_mirror() {
   local mirror_action="$1"
   shift || true
   local args=()
-  args=("${HOST_MIRROR_SCRIPT}" "${mirror_action}" --profile arbuzas --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)")
+  args=("${HOST_MIRROR_SCRIPT}" "${mirror_action}" --profile "${HOST_MIRROR_PROFILE}" --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)")
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
+  fi
+  if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
+    args+=(--ssh-known-hosts-file "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}")
   fi
   ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
     python3 "${args[@]}" "$@"
@@ -4823,9 +4970,12 @@ run_host_mirror() {
 run_host_mirror_push() {
   local changed_paths_file="$1"
   local args=()
-  args=("${HOST_MIRROR_SCRIPT}" push --profile arbuzas --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)" --changed-paths-file "${changed_paths_file}")
+  args=("${HOST_MIRROR_SCRIPT}" push --profile "${HOST_MIRROR_PROFILE}" --mirror-root "${HOST_MIRROR_ROOT}" --ssh-target "$(remote_target)" --changed-paths-file "${changed_paths_file}")
   if [[ -n "${ARBUZAS_SSH_PORT}" ]]; then
     args+=(--ssh-port "${ARBUZAS_SSH_PORT}")
+  fi
+  if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
+    args+=(--ssh-known-hosts-file "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}")
   fi
   ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
     python3 "${args[@]}"
@@ -4834,7 +4984,7 @@ run_host_mirror_push() {
 host_mirror_affected_services() {
   local changed_paths_file="$1"
   ARBUZAS_HOST_MIRROR_PRIVILEGED="${ARBUZAS_HOST_MIRROR_PRIVILEGED:-1}" \
-    python3 "${HOST_MIRROR_SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths_file}"
+    python3 "${HOST_MIRROR_SCRIPT}" affected --profile "${HOST_MIRROR_PROFILE}" --changed-paths-file "${changed_paths_file}"
 }
 
 csv_join_services() {
@@ -4859,9 +5009,13 @@ deploy_config_from_mirror() {
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
   trap "rm -f '${changed_paths_file}'; trap - RETURN" RETURN
 
-  run_host_mirror_push "${changed_paths_file}"
-  prepare_remote_ticket_runtime_permissions
-  affected_output="$(host_mirror_affected_services "${changed_paths_file}")"
+  run_host_mirror_push "${changed_paths_file}" || return $?
+  prepare_remote_ticket_runtime_permissions || return $?
+  if affected_output="$(host_mirror_affected_services "${changed_paths_file}")"; then
+    :
+  else
+    return $?
+  fi
   if [[ -z "${affected_output}" ]]; then
     log "Deploy config: mirror is already in sync; no services need restart"
     return 0
@@ -4876,7 +5030,7 @@ deploy_config_from_mirror() {
   remote_shell "
     [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]] || { echo 'missing active release: ${REMOTE_CURRENT_LINK}/release.env' >&2; exit 1; }
     [[ -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing active compose file under ${REMOTE_CURRENT_LINK}' >&2; exit 1; }
-  "
+  " || return $?
 
   for service_name in "${affected_services[@]}"; do
     service_args+=" ${service_name}"
@@ -4884,7 +5038,7 @@ deploy_config_from_mirror() {
   remote_shell "
     cd '${REMOTE_CURRENT_LINK}'
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps --remove-orphans${service_args}
-  "
+  " || return $?
 }
 
 while (( $# > 0 )); do
@@ -4945,6 +5099,10 @@ while (( $# > 0 )); do
       shift
       ARBUZAS_SSH_PORT="${1:-}"
       ;;
+    --ssh-known-hosts-file)
+      shift
+      ARBUZAS_SSH_KNOWN_HOSTS_FILE="${1:-}"
+      ;;
     --env-file)
       shift
       if [[ -f "${1:-}" ]]; then
@@ -4970,6 +5128,17 @@ done
 if [[ -z "${action}" ]]; then
   usage >&2
   exit 2
+fi
+
+if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
+  [[ "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" == /* ]] || {
+    echo "--ssh-known-hosts-file must be an absolute path" >&2
+    exit 2
+  }
+  [[ -f "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" && -r "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]] || {
+    echo "--ssh-known-hosts-file must name a readable file" >&2
+    exit 2
+  }
 fi
 
 validate_validation_profile
@@ -5007,6 +5176,8 @@ case "${action}" in
     ;;
 esac
 
+start_deployment_timing_reporting
+
 require_cmd ssh
 require_cmd python3
 case "${action}" in
@@ -5042,7 +5213,7 @@ case "${action}" in
     fi
     ;;
   deploy-config)
-    deploy_config_from_mirror
+    run_timed_phase deploy_config deploy_config_from_mirror
     ;;
   deploy)
     require_cmd tar
@@ -5054,7 +5225,7 @@ case "${action}" in
       log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
     fi
     mirror_changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
-    trap 'rm -f "${mirror_changed_paths_file}"' EXIT
+    DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH="${mirror_changed_paths_file}"
     run_timed_phase mirror_push run_host_mirror_push "${mirror_changed_paths_file}"
     run_timed_phase prepare_ticket_permissions prepare_remote_ticket_runtime_permissions
     run_timed_phase package_release prepare_deploy_release_payload

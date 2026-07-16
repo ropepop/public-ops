@@ -106,10 +106,14 @@ func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	start := strings.Index(module, "pub fn identity_connected")
-	end := strings.Index(module, "pub fn ticketremote_register_service_identity")
-	if start < 0 || end < 0 || end <= start {
+	if start < 0 {
 		t.Fatalf("Spacetime connection hook block not found")
 	}
+	endOffset := strings.Index(module[start:], "service_reducers! {")
+	if endOffset < 0 {
+		t.Fatalf("Spacetime connection hook block not found")
+	}
+	end := start + endOffset
 	chunk := module[start:end]
 	for _, forbidden := range []string{
 		"upsertPresence(",
@@ -125,10 +129,10 @@ func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 		"if has_valid_service_identity(ctx)",
 		"client_email_from_auth(ctx, DEFAULT_TICKET_ID)?",
 		"pub fn identity_disconnected(_ctx: &ReducerContext) {}",
-		"pub fn ticketremote_member_set_stream_focus(",
+		"ticketremote_member_set_stream_focus(ctx;",
 	} {
 		source := chunk
-		if required == "pub fn ticketremote_member_set_stream_focus(" {
+		if required == "ticketremote_member_set_stream_focus(ctx;" {
 			source = module
 		}
 		if !strings.Contains(source, required) {
@@ -137,12 +141,9 @@ func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 	}
 }
 
-func TestRelayPrewarmUsesBrowserSessionLease(t *testing.T) {
+func TestStreamPrewarmUsesBrowserSessionLease(t *testing.T) {
 	if got := streamPrewarmRelayLeaseID(" session-a "); got != "session-a" {
 		t.Fatalf("stream prewarm lease = %q, want session-a", got)
-	}
-	if got := controlCodePrepareRelayLeaseID(" session-a "); got != "session-a" {
-		t.Fatalf("control-code prepare lease = %q, want session-a", got)
 	}
 }
 
@@ -151,7 +152,6 @@ func TestRelayPrewarmDoesNotDoubleCountActiveBrowserSession(t *testing.T) {
 
 	server.addRelayViewer("session-a")
 	server.retainRelayViewerForPrewarm(streamPrewarmRelayLeaseID("session-a"), time.Hour)
-	server.retainRelayViewerForPrewarm(controlCodePrepareRelayLeaseID("session-a"), time.Hour)
 
 	if got := server.relay.Snapshot().Viewers; got != 1 {
 		t.Fatalf("relay viewers after active session prewarm = %d, want 1", got)
@@ -209,7 +209,7 @@ func TestPublicOpenGraceExpiresIfNoFrameRenders(t *testing.T) {
 
 func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
 	server := newTicketSetupTestServer(t, "pixel")
-	client := &client{sessionID: "session-a", video: true}
+	client := &client{sessionID: "session-a"}
 
 	server.addRelayViewer("session-a")
 	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
@@ -228,7 +228,7 @@ func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
 }
 
 func TestPublicHTTPRedirectsToHTTPS(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		AdminEmail:      "ticket@jolkins.id.lv",
@@ -276,7 +276,7 @@ func TestPublicHTTPRedirectsToHTTPS(t *testing.T) {
 }
 
 func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		AdminEmail:      "ticket@jolkins.id.lv",
@@ -368,7 +368,7 @@ func TestCSPAllowsOnlyConfiguredAuthAndSpacetimeOrigins(t *testing.T) {
 }
 
 func TestVersionedStaticAssetsAreCacheable(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		AdminEmail:      "ticket@jolkins.id.lv",
@@ -410,7 +410,7 @@ func TestVersionedStaticAssetsAreCacheable(t *testing.T) {
 }
 
 func TestUnversionedStaticAssetsAreNotLongLived(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		AdminEmail:      "ticket@jolkins.id.lv",
@@ -566,10 +566,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"if(!spacetimeReadyForControlCode())",
 		"document.exitFullscreen().catch",
 		"function layoutViewportRect()",
-		"function toolbarCollapseAnchorPx()",
-		"Math.min(96,Math.max(24,viewportHeight()*.12))",
-		"function firstScreenAnchorTop()",
-		"streamLive=rootCapture.active||phoneHealth.streamVerdict==='live'||pipeline.streamVerdict==='live'",
+		"const engagedOffset=screenEngaged?Math.round(Math.min(96,Math.max(24,height*.12))):0",
 		"function activeViewers(viewers)",
 		"function preserveCurrentFrame(reason)",
 		"function redrawPreservedFrame()",
@@ -704,7 +701,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"-webkit-tap-highlight-color:transparent",
 		".stream-resume-spinner",
 		".control-code-hotspot",
-		".control-code-close-hotspot",
 		".control-code-result",
 		".code-dialog",
 		".code-dialog-field input",
@@ -768,7 +764,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`id="controlCodeResultArea"`,
 		`class="control-code-result"`,
 		`id="controlCodeHotspot"`,
-		`id="controlCodeCloseHotspot"`,
 		`id="requestControlCode"`,
 		`id="controlCodeDialog"`,
 		`id="controlCodeForm"`,
@@ -777,6 +772,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`pattern="[0-9]*"`,
 		`minlength="2"`,
 		`id="closeControlCodeResult"`,
+		`class="control-code-close" type="button"`,
 		`id="viewerCount"`,
 		`id="viewerCountDetail"`,
 		`name="theme-color" content="#020304"`,
@@ -786,6 +782,12 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		if !strings.Contains(indexHTML, snippet) {
 			t.Fatalf("ticket viewer HTML missing %q", snippet)
 		}
+	}
+	if strings.Contains(indexHTML, "controlCodeCloseHotspot") || strings.Contains(js, "controlCodeCloseHotspot") {
+		t.Fatal("the result must close through its visible cross, not an overlapping invisible close hotspot")
+	}
+	if !strings.Contains(indexHTML, `<button id="closeControlCodeResult" class="control-code-close" type="button"`) {
+		t.Fatal("the visible control-code result cross must be a standalone button")
 	}
 	for _, snippet := range []string{
 		"<svg",
@@ -1107,7 +1109,7 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"publicPresence=Array.isArray(state&&state.viewerPresence)",
 		"activeViewers(state&&state.viewers||[])",
 		"controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot)",
-		"controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot)",
+		"codeResultClose.addEventListener('click'",
 		"controlCodeHotspot.disabled=hotspotUnavailable",
 		"controlCodeHotspot.setAttribute('aria-disabled',hotspotUnavailable?'true':'false')",
 		"codeDialog.addEventListener('click'",
@@ -1122,9 +1124,9 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	if hotspotStart < 0 {
 		t.Fatalf("control-code request hotspot handler missing")
 	}
-	hotspotEnd := strings.Index(js[hotspotStart:], "function closeControlCodeFromHotspot(event)")
+	hotspotEnd := strings.Index(js[hotspotStart:], "function relayReportToStreamStatus(report)")
 	if hotspotEnd < 0 {
-		t.Fatalf("control-code close hotspot handler missing")
+		t.Fatalf("control-code request hotspot handler boundary missing")
 	}
 	hotspotHandler := js[hotspotStart : hotspotStart+hotspotEnd]
 	if !strings.Contains(hotspotHandler, "closeCurrentControlCode(false)") {
@@ -1164,9 +1166,9 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 func TestTicketSpacetimeModuleRemovesOldControlMutations(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
-		"pub fn ticketremote_member_request_control_code(",
-		"pub fn ticketremote_member_prepare_control_code(",
-		"pub fn ticketremote_member_close_control_code(",
+		"ticketremote_member_request_control_code(ctx;",
+		"ticketremote_member_prepare_control_code(ctx;",
+		"ticketremote_member_close_control_code(ctx;",
 	} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("SpacetimeDB module missing %q", snippet)
@@ -1200,22 +1202,18 @@ func TestTicketSpacetimeMemberReducersUseServerClockAndConnectionID(t *testing.T
 		"ticketremote_member_upsert_member",
 		"ticketremote_member_remove_member",
 	} {
-		start := strings.Index(module, "pub fn "+reducer+"(")
-		if start < 0 {
+		declarative := reducer + "(ctx;"
+		if !strings.Contains(module, declarative) && !strings.Contains(module, "pub fn "+reducer+"(") {
 			t.Fatalf("missing reducer %s", reducer)
 		}
-		end := strings.Index(module[start+1:], "\n#[spacetimedb::reducer]")
-		if end < 0 {
-			end = min(len(module)-start, 900)
-		} else {
-			end++
-		}
-		chunk := module[start : start+end]
-		if strings.Contains(chunk, "nowArg") {
-			t.Fatalf("%s must not accept browser-supplied now", reducer)
-		}
 	}
-	for _, snippet := range []string{"ctx.timestamp", "ctx.connection_id()", "fn now(ctx: &ReducerContext)", "fn connection_session_id(ctx: &ReducerContext)"} {
+	for _, snippet := range []string{
+		"let $clock = now($ctx);",
+		"ctx.timestamp",
+		"ctx.connection_id()",
+		"fn now(ctx: &ReducerContext)",
+		"fn connection_session_id(ctx: &ReducerContext)",
+	} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("module missing %q", snippet)
 		}
@@ -1255,7 +1253,7 @@ func TestSpacetimeControlCodeOwnershipIsRequesterScoped(t *testing.T) {
 		"ticketremote_control_code_owner",
 		"ownerPublicId",
 		"client_email_from_auth(ctx, &ticket.id)",
-		"if owner.ticketId != ticket.id || clean_email(&owner.email) != email",
+		"if owner.ticketId != ticket_id || clean_email(&owner.email) != email",
 	} {
 		if !strings.Contains(source, snippet) {
 			t.Fatalf("SpacetimeDB control-code ownership missing snippet %q", snippet)
@@ -1282,7 +1280,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"#[spacetimedb::table(accessor = ticketremote_control_code_request, public",
 		"client_email_from_auth(ctx, &ticket.id)",
 		"payload.get(\"email_verified\").and_then(|v| v.as_bool()) != Some(true)",
-		"pub fn ticketremote_member_set_stream_focus",
+		"ticketremote_member_set_stream_focus(ctx;",
 		"let session_id = non_empty(&sessionId, &connection_session_id(ctx));",
 		"upsert_stream_desired_state(",
 	} {
@@ -1316,10 +1314,6 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"loadSpacetimeClientScript()",
 		"document.head.appendChild(script)",
 		`document.documentElement.dataset.ticketUi="arrow"`,
-		"apiFetch('/api/v1/admin/members'",
-		"apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`",
-		"activeMembers(state)",
-		"adminRefreshMs=5e3",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer SpacetimeAuth JS missing %q", snippet)
@@ -1452,7 +1446,7 @@ func TestDevAdminMemberDeleteUsesConfiguredIdentityNotTargetEmailQuery(t *testin
 }
 
 func TestSpacetimeAuthUnauthenticatedAdminServesRedirectShell(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1515,7 +1509,7 @@ func TestSpacetimeAuthUnauthenticatedAdminServesRedirectShell(t *testing.T) {
 }
 
 func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1584,11 +1578,8 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 		t.Fatal(err)
 	}
 	spacetimePayload, _ := payload["spacetime"].(map[string]any)
-	if spacetimePayload["token"] != nil {
-		t.Fatalf("server session token must not be exposed as direct Spacetime token: %#v", spacetimePayload)
-	}
-	if spacetimePayload["authRequired"] != true {
-		t.Fatalf("missing direct Spacetime cookie should require a direct auth refresh: %#v", spacetimePayload)
+	if spacetimePayload["token"] != "sidecar-member-token" {
+		t.Fatalf("authenticated member should receive a sidecar-issued direct token: %#v", spacetimePayload)
 	}
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
@@ -1615,7 +1606,7 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 }
 
 func TestNeverTTLIsConvertedToFiniteBrowserSession(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -1690,7 +1681,7 @@ func TestNeverTTLIsConvertedToFiniteBrowserSession(t *testing.T) {
 
 func newTicketSetupTestServer(t *testing.T, activeBackendID string) *Server {
 	t.Helper()
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	activeURL := "http://pixel.test"
 	activeName := "Pixel"
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{

@@ -36,7 +36,7 @@ python3 "${SCRIPT}" pull --profile arbuzas --remote-root "${remote_root}" --mirr
 test -f "${mirror_root}/etc/arbuzas/env/train-bot.env"
 test -f "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey"
 test -f "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json"
-test -f "${mirror_root}/etc/arbuzas/current/release.env"
+test ! -f "${mirror_root}/etc/arbuzas/current/release.env"
 
 cat > "${mirror_root}/etc/arbuzas/env/train-bot.env" <<'EOF'
 BOT_TOKEN=local-change
@@ -80,5 +80,60 @@ if printf '%s\n' "${affected}" | grep -Fx 'satiksme_bot' >/dev/null; then
   echo "FAIL: unrelated services should not be affected" >&2
   exit 1
 fi
+
+known_hosts="${tmpdir}/known_hosts"
+printf 'example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest\n' > "${known_hosts}"
+python3 - "${SCRIPT}" "${known_hosts}" <<'PY'
+import importlib.util
+import pathlib
+import types
+import sys
+
+spec = importlib.util.spec_from_file_location("host_mirror", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+args = types.SimpleNamespace(
+    ssh_port="2222",
+    ssh_target="deploy@example.invalid",
+    ssh_known_hosts_file=str(pathlib.Path(sys.argv[2]).resolve()),
+)
+expected = [
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", f"UserKnownHostsFile={args.ssh_known_hosts_file}",
+]
+ssh_args = module.ssh_base_args(args)
+scp_args = module.scp_base_args(args)
+for fragment in expected:
+    if fragment not in ssh_args or fragment not in scp_args:
+        raise SystemExit(f"known_hosts option missing from ssh/scp args: {fragment}")
+PY
+
+if python3 "${SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths}" \
+  --ssh-known-hosts-file relative-known-hosts >/dev/null 2>&1; then
+  echo "FAIL: relative known_hosts file should be rejected" >&2
+  exit 1
+fi
+
+narrow_remote="${tmpdir}/narrow-remote"
+narrow_mirror="${tmpdir}/narrow-mirror"
+mkdir -p "${narrow_remote}/etc/arbuzas/env" "${narrow_remote}/etc/arbuzas/cloudflared"
+printf 'ticket=remote\n' > "${narrow_remote}/etc/arbuzas/env/ticket-remote.env"
+printf 'train=remote\n' > "${narrow_remote}/etc/arbuzas/env/train-bot.env"
+printf 'satiksme=unrelated\n' > "${narrow_remote}/etc/arbuzas/env/satiksme-bot.env"
+python3 "${SCRIPT}" pull --profile ticket-recovery --remote-root "${narrow_remote}" --mirror-root "${narrow_mirror}"
+test -f "${narrow_mirror}/etc/arbuzas/env/ticket-remote.env"
+test -f "${narrow_mirror}/etc/arbuzas/env/train-bot.env"
+test ! -e "${narrow_mirror}/etc/arbuzas/env/satiksme-bot.env"
+
+printf 'satiksme=changed-but-unrelated\n' > "${narrow_remote}/etc/arbuzas/env/satiksme-bot.env"
+python3 "${SCRIPT}" audit --profile ticket-recovery --remote-root "${narrow_remote}" --mirror-root "${narrow_mirror}" >/dev/null
+printf 'ticket=selected-drift\n' > "${narrow_remote}/etc/arbuzas/env/ticket-remote.env"
+if python3 "${SCRIPT}" audit --profile ticket-recovery --remote-root "${narrow_remote}" --mirror-root "${narrow_mirror}" >"${tmpdir}/narrow-audit.out" 2>&1; then
+  echo "FAIL: Ticket recovery profile ignored selected remote drift" >&2
+  exit 1
+fi
+grep -Fq 'remote changed: etc/arbuzas/env/ticket-remote.env' "${tmpdir}/narrow-audit.out"
 
 echo "PASS: Arbuzas host mirror pulls, audits, pushes, detects conflicts, and maps affected services"

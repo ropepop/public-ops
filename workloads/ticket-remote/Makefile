@@ -1,9 +1,6 @@
-.PHONY: run test build tidy spacetime-install spacetime-build spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build docker-image-build clean-local
+.PHONY: test build tidy spacetime-install spacetime-build spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build docker-image-build clean-local
 
 SPACETIME ?= $(HOME)/.local/bin/spacetime
-
-run:
-	TICKET_REMOTE_AUTH_MODE=dev TICKET_REMOTE_STATE_BACKEND=memory go run ./cmd/ticket-remote
 
 test:
 	go test ./...

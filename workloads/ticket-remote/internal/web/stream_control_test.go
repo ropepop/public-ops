@@ -88,7 +88,7 @@ func (s *streamDesiredRecordingStore) AppendSafeOperationalLog(ctx context.Conte
 
 func newStreamControlTestServer(t *testing.T, recorder *streamDesiredRecordingStore) *Server {
 	t.Helper()
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -243,7 +243,7 @@ func TestKeyframeWhileDisconnectedWritesWarningTrace(t *testing.T) {
 	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{logs: logs})
 
 	server.addRelayViewer("session-b")
-	if err := server.sendPhoneKeyframe("test_keyframe"); err != nil {
+	if err := server.requestPhoneKeyframeNow("test_keyframe"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -257,7 +257,7 @@ func TestKeyframeWhileDisconnectedWritesWarningTrace(t *testing.T) {
 }
 
 func TestReleaseStreamDesiredIfNoVideoClientsWritesIdleState(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -370,7 +370,7 @@ func TestReleaseStreamDesiredIfRelayViewerRetainedDoesNotWriteIdleState(t *testi
 }
 
 func TestPhoneCurrentReportIncludesStreamRecoveryStatus(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",

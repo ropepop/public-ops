@@ -28,6 +28,11 @@ function pickAccessor<T = any>(source: any, candidates: string[]): T {
   throw new Error(`missing accessor: ${candidates.join(", ")}`);
 }
 
+function tableAccessor(source: any, name: string): any {
+  const title = name.split("_").map((part) => part[0].toUpperCase() + part.slice(1)).join("");
+  return pickAccessor(source, [`ticketremote${title}`, `ticketRemote${title}`, `ticketremote_${name}`]);
+}
+
 function sqlString(value: string): string {
   return `'${String(value || "").replace(/'/g, "''")}'`;
 }
@@ -212,14 +217,7 @@ class TicketSpacetimeClient {
 
   disconnectPresence(): void {
     if (!this.isReady()) return;
-    this.lastStreamFocusActive = false;
-    Promise.resolve(this.reducer("memberSetStreamFocus")({
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      sessionId: this.cfg.sessionId,
-      active: false,
-      reason: "browser_disconnect",
-    })).catch(() => {});
+    this.setStreamFocus(false, "browser_disconnect").catch(() => {});
   }
 
   setStreamFocus(active: boolean, reason: string): Promise<void> {
@@ -241,27 +239,15 @@ class TicketSpacetimeClient {
   }
 
   requestKeyframe(reason: string): Promise<void> {
-    return this.callReducer("memberRequestKeyframe", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      reason,
-    });
+    return this.streamAction("memberRequestKeyframe", reason);
   }
 
   recoverStream(reason: string): Promise<void> {
-    return this.callReducer("memberRecoverStream", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      reason,
-    });
+    return this.streamAction("memberRecoverStream", reason);
   }
 
   prepareControlCode(reason: string): Promise<void> {
-    return this.callReducer("memberPrepareControlCode", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      reason,
-    });
+    return this.streamAction("memberPrepareControlCode", reason);
   }
 
   requestControlCode(digits: string, expectedFastRevision = ""): Promise<void> {
@@ -296,29 +282,14 @@ class TicketSpacetimeClient {
     });
   }
 
-  appendSafeLog(level: string, event: string, detailJson: string, correlationId = ""): Promise<void> {
+  appendSafeLog(level: string, event: string, detailJson: string, correlationId = "", rowId = ""): Promise<void> {
     return this.callReducer("memberAppendSafeOperationalLog", {
-      id: this.logRowId("browser", event, correlationId),
+      id: rowId || this.logRowId("browser", event, correlationId),
       ticketId: this.cfg.ticketId,
       level,
       event,
       correlationId,
       detailJson,
-    });
-  }
-
-  upsertMember(email: string, role: string): Promise<void> {
-    return this.callReducer("memberUpsertMember", {
-      ticketId: this.cfg.ticketId,
-      email,
-      role,
-    });
-  }
-
-  removeMember(email: string): Promise<void> {
-    return this.callReducer("memberRemoveMember", {
-      ticketId: this.cfg.ticketId,
-      email,
     });
   }
 
@@ -375,16 +346,16 @@ class TicketSpacetimeClient {
     if (!this.isReady()) return;
     const db = this.requireConnection().db;
     const backendRow = `${this.cfg.ticketId}:${this.backendId()}`;
-    const desired = tableRows(this.streamDesiredStateTable(db))
+    const desired = tableRows(tableAccessor(db, "stream_desired_state"))
       .find((row) => rowId(row) === backendRow) || null;
-    const phoneReport = tableRows(this.phoneCurrentReportTable(db))
+    const phoneReport = tableRows(tableAccessor(db, "phone_current_report"))
       .find((row) => rowId(row) === backendRow) || null;
-    const controlCodeFastState = tableRows(this.controlCodeFastStateTable(db))
+    const controlCodeFastState = tableRows(tableAccessor(db, "control_code_fast_state"))
       .find((row) => rowId(row) === backendRow) || null;
-    const relayReport = tableRows(this.relayCurrentReportTable(db))
+    const relayReport = tableRows(tableAccessor(db, "relay_current_report"))
       .find((row) => rowId(row) === backendRow) || null;
     const viewerFocusRows = activeViewerFocusRows(
-      tableRows(this.streamViewerFocusTable(db)),
+      tableRows(tableAccessor(db, "stream_viewer_focus")),
       this.cfg.ticketId,
       this.backendId()
     );
@@ -400,7 +371,7 @@ class TicketSpacetimeClient {
       };
     });
     const ownerPublicId = accountPublicId(this.cfg.email);
-    const controlCodeRequests = tableRows(this.controlCodeRequestTable(db))
+    const controlCodeRequests = tableRows(tableAccessor(db, "control_code_request"))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && String(row.ownerPublicId || row.owner_public_id || "") === ownerPublicId)
       .sort((a, b) => String(b.updatedAt || b.updated_at || "").localeCompare(String(a.updatedAt || a.updated_at || "")));
     const updatedAt = String(
@@ -502,62 +473,8 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return [
-      this.streamDesiredStateTable(source),
-      this.phoneCurrentReportTable(source),
-      this.controlCodeFastStateTable(source),
-      this.relayCurrentReportTable(source),
-      this.streamViewerFocusTable(source),
-      this.controlCodeRequestTable(source),
-    ];
-  }
-
-  private streamDesiredStateTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteStreamDesiredState",
-      "ticketRemoteStreamDesiredState",
-      "ticketremote_stream_desired_state",
-    ]);
-  }
-
-  private phoneCurrentReportTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremotePhoneCurrentReport",
-      "ticketRemotePhoneCurrentReport",
-      "ticketremote_phone_current_report",
-    ]);
-  }
-
-  private controlCodeFastStateTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteControlCodeFastState",
-      "ticketRemoteControlCodeFastState",
-      "ticketremote_control_code_fast_state",
-    ]);
-  }
-
-  private relayCurrentReportTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteRelayCurrentReport",
-      "ticketRemoteRelayCurrentReport",
-      "ticketremote_relay_current_report",
-    ]);
-  }
-
-  private streamViewerFocusTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteStreamViewerFocus",
-      "ticketRemoteStreamViewerFocus",
-      "ticketremote_stream_viewer_focus",
-    ]);
-  }
-
-  private controlCodeRequestTable(source: any): any {
-    return pickAccessor(source, [
-      "ticketremoteControlCodeRequest",
-      "ticketRemoteControlCodeRequest",
-      "ticketremote_control_code_request",
-    ]);
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request"]
+      .map((name) => tableAccessor(source, name));
   }
 
   private backendId(): string {
@@ -584,6 +501,10 @@ class TicketSpacetimeClient {
     await this.whenReady(5000);
     const reducer = this.reducer(name);
     await reducer(args);
+  }
+
+  private streamAction(name: string, reason: string): Promise<void> {
+    return this.callReducer(name, { ticketId: this.cfg.ticketId, backendId: this.backendId(), reason });
   }
 
   private requireConnection(): DbConnection {

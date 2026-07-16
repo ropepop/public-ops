@@ -4,7 +4,7 @@ Public manager for `ticket.jolkins.id.lv`.
 
 For agent-specific context, browser verification, auth-mode selection, and control-code pitfalls, start with [AGENTS.md](./AGENTS.md).
 
-The service validates SpacetimeAuth email identity, checks ticket membership in SpacetimeDB, relays the active phone backend stream to viewers, and brokers short automated control-code requests without exposing direct phone control to browsers.
+The service validates the configured email identity, checks ticket membership in SpacetimeDB, and relays the active phone backend stream. Authenticated browsers request control codes through member-only Spacetime reducers; they never receive direct phone control.
 
 ## Local Development
 
@@ -12,22 +12,21 @@ The service validates SpacetimeAuth email identity, checks ticket membership in 
 make test
 make spacetime-build
 make web-client-build
-TICKET_REMOTE_AUTH_MODE=dev make run
 ```
 
 ## Runtime Model
 
 - General mode: linked users can view the ViVi ticket stream together.
-- Control-code requests: a linked user enters 2-8 digits in the webpage, `ticket_remote` queues the request, the phone automates ViVi, and the requester browser freezes a stable stream-resolution live frame to capture the result locally. Pixel must not send ViVi result screenshot bytes to the browser.
+- Control-code requests: a linked user enters 2-8 digits in the webpage, a member-only Spacetime reducer queues the request, the phone automates ViVi, and the requester browser freezes a stable stream-resolution live frame to capture the result locally. The browser acknowledges capture only after that frozen image has decoded, remained visible through two paint frames, and passed an on-screen bounds check; assigning an image URL is not an acknowledgement. Pixel must not send ViVi result screenshot bytes to the browser.
 - A requester can submit at most two code requests per rolling minute. A second successful request replaces the visible result on that user's page.
 - Other viewers stay connected to the shared raw ticket stream. They may briefly see the real phone open and close ViVi's control-code UI, but they never receive direct control.
-- Browser users connect directly to SpacetimeDB for authenticated ticket state, while code-request actions go through `ticket_remote`.
+- Browser users connect directly to SpacetimeDB for authenticated ticket state and code-request actions. `ticket_remote` handles login, membership preflight, media, admin actions, and safe operational events, but is not a second control authority.
 - Browser users never talk directly to the Pixel; the server writes durable Spacetime state/commands and the Pixel executes them.
-- The Pixel's hot loop polls only the `ticketremote_stream_command_signal` row for its `ticket:backend` every 250 ms. It reads desired state or pending commands only when that signal changes, then writes one compact current report only when the stable state actually changes.
+- While the Ticket stream or a control-code request is active, Pixel reads pending commands once at the start of each 75 ms cycle and skips the idle lane's duplicate pending, signal, and desired-state reads. Idle reconciliation still uses the compact signal and writes the phone report only when stable state changes.
 - The production backend is the physical Pixel through the private `ticket_phone_bridge`; `ticket_remote` relays media directly from that bridge while SpacetimeDB owns durable stream intent and commands.
 - Runtime diagnostics are SpacetimeDB-only through safe operational/audit rows with retention cleanup. `ticket_remote`, the phone bridge, and Pixel ticket automation must not leave local runtime log files behind.
-- Public video is H.264 over the existing HTTPS WebSocket: the active phone backend emits one private root FFmpeg H.264 stream, and `ticket_remote` fans it out to authenticated browsers without public media ports.
-- Pixel capture quality is fixed by the phone service at the current readable profile: 900 px target width, 10 FPS, 5 Mbps, FFmpeg H.264 baseline/ultrafast, and the existing keyframe cadence. Compute-reduction work must keep that browser-visible output unchanged and remove only duplicate or orphan root capture helpers, FFmpeg encoders, and wrapper shells.
+- Public video is H.264 over the existing HTTPS WebSocket: the active phone backend emits one private rooted hardware H.264 stream, and `ticket_remote` fans it out to authenticated browsers without public media ports.
+- Pixel capture uses the current readable hardware profile: 720 px target width at about 1.2 Mbps, 1 FPS steady viewing, a three-frame 5 FPS cold-start burst, a bounded 4 FPS control-code request window through requester-browser freeze, and a separate short 5 FPS cleanup-proof window. These modes share one root capture helper and one MediaCodec encoder without restarting it for a request.
 - Interactive browser UI uses ArrowJS for changing presence, status, stream, and control areas. Keep static or no-JS pages simple until they need browser-side interactivity.
 - Edit browser UI in `web-client/`, rebuild with `make web-client-build`, and verify the deployed page mounts the Arrow-backed path.
 
@@ -65,6 +64,7 @@ Production currently depends on one kitty-gration host and one physical Pixel. S
 - `TICKET_REMOTE_SPACETIME_CLIENT_URL=http://ticket_remote_spacetime_sidecar:9346`
 - `TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE=/run/secrets/ticket-remote/sidecar-write-token.secret`
 - the Spacetime private signing key is mounted only into `ticket_remote_spacetime_sidecar`; the public `ticket_remote` container must not receive it
+- after login and a current membership check, the sidecar issues a five-minute member-proxy token using that key's real issuer and audience; the module separately pins its proxy role, `member:<email>` subject, verified email, and live membership, without granting service reducers
 - `TICKET_REMOTE_PHONE_BACKENDS`
 - `TICKET_REMOTE_PHONE_BASE_URL=http://ticket_phone_bridge:9388`
 - `TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID`

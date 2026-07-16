@@ -6,53 +6,21 @@
 import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
-import TicketremoteAckStreamCommandReducer from "../ticketremote_ack_stream_command_reducer";
-import TicketremoteAppendSafeOperationalLogReducer from "../ticketremote_append_safe_operational_log_reducer";
-import TicketremoteAppendStreamCommandReducer from "../ticketremote_append_stream_command_reducer";
-import TicketremoteCleanupExpiredReducer from "../ticketremote_cleanup_expired_reducer";
 import TicketremoteMemberAppendSafeOperationalLogReducer from "../ticketremote_member_append_safe_operational_log_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberPrepareControlCodeReducer from "../ticketremote_member_prepare_control_code_reducer";
 import TicketremoteMemberRecoverStreamReducer from "../ticketremote_member_recover_stream_reducer";
-import TicketremoteMemberRemoveMemberReducer from "../ticketremote_member_remove_member_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "../ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "../ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_stream_focus_reducer";
-import TicketremoteMemberUpsertMemberReducer from "../ticketremote_member_upsert_member_reducer";
-import TicketremoteRegisterServiceIdentityReducer from "../ticketremote_register_service_identity_reducer";
-import TicketremoteRemoveMemberReducer from "../ticketremote_remove_member_reducer";
-import TicketremoteServiceBootstrapReducer from "../ticketremote_service_bootstrap_reducer";
-import TicketremoteSetStreamDesiredStateReducer from "../ticketremote_set_stream_desired_state_reducer";
-import TicketremoteUpdateControlCodeFastStateReducer from "../ticketremote_update_control_code_fast_state_reducer";
-import TicketremoteUpdateControlCodeRequestReducer from "../ticketremote_update_control_code_request_reducer";
-import TicketremoteUpdatePhoneReducer from "../ticketremote_update_phone_reducer";
-import TicketremoteUpdatePhoneCurrentReportReducer from "../ticketremote_update_phone_current_report_reducer";
-import TicketremoteUpdateRelayCurrentReportReducer from "../ticketremote_update_relay_current_report_reducer";
-import TicketremoteUpsertMemberReducer from "../ticketremote_upsert_member_reducer";
 
-export type TicketremoteAckStreamCommandParams = __Infer<typeof TicketremoteAckStreamCommandReducer>;
-export type TicketremoteAppendSafeOperationalLogParams = __Infer<typeof TicketremoteAppendSafeOperationalLogReducer>;
-export type TicketremoteAppendStreamCommandParams = __Infer<typeof TicketremoteAppendStreamCommandReducer>;
-export type TicketremoteCleanupExpiredParams = __Infer<typeof TicketremoteCleanupExpiredReducer>;
 export type TicketremoteMemberAppendSafeOperationalLogParams = __Infer<typeof TicketremoteMemberAppendSafeOperationalLogReducer>;
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
 export type TicketremoteMemberPrepareControlCodeParams = __Infer<typeof TicketremoteMemberPrepareControlCodeReducer>;
 export type TicketremoteMemberRecoverStreamParams = __Infer<typeof TicketremoteMemberRecoverStreamReducer>;
-export type TicketremoteMemberRemoveMemberParams = __Infer<typeof TicketremoteMemberRemoveMemberReducer>;
 export type TicketremoteMemberRequestControlCodeParams = __Infer<typeof TicketremoteMemberRequestControlCodeReducer>;
 export type TicketremoteMemberRequestKeyframeParams = __Infer<typeof TicketremoteMemberRequestKeyframeReducer>;
 export type TicketremoteMemberSetStreamFocusParams = __Infer<typeof TicketremoteMemberSetStreamFocusReducer>;
-export type TicketremoteMemberUpsertMemberParams = __Infer<typeof TicketremoteMemberUpsertMemberReducer>;
-export type TicketremoteRegisterServiceIdentityParams = __Infer<typeof TicketremoteRegisterServiceIdentityReducer>;
-export type TicketremoteRemoveMemberParams = __Infer<typeof TicketremoteRemoveMemberReducer>;
-export type TicketremoteServiceBootstrapParams = __Infer<typeof TicketremoteServiceBootstrapReducer>;
-export type TicketremoteSetStreamDesiredStateParams = __Infer<typeof TicketremoteSetStreamDesiredStateReducer>;
-export type TicketremoteUpdateControlCodeFastStateParams = __Infer<typeof TicketremoteUpdateControlCodeFastStateReducer>;
-export type TicketremoteUpdateControlCodeRequestParams = __Infer<typeof TicketremoteUpdateControlCodeRequestReducer>;
-export type TicketremoteUpdatePhoneParams = __Infer<typeof TicketremoteUpdatePhoneReducer>;
-export type TicketremoteUpdatePhoneCurrentReportParams = __Infer<typeof TicketremoteUpdatePhoneCurrentReportReducer>;
-export type TicketremoteUpdateRelayCurrentReportParams = __Infer<typeof TicketremoteUpdateRelayCurrentReportReducer>;
-export type TicketremoteUpsertMemberParams = __Infer<typeof TicketremoteUpsertMemberReducer>;
 

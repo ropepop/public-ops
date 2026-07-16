@@ -37,10 +37,26 @@ PROFILES: dict[str, list[Entry]] = {
     "pixel": [
         Entry("tree", "data/local/pixel-stack/conf"),
     ],
+    "ticket-recovery": [
+        Entry("file", "etc/arbuzas/env/ticket-remote.env"),
+        Entry("file", "etc/arbuzas/env/train-bot.env"),
+        Entry("file", "etc/arbuzas/secrets/android-adb/adbkey"),
+        Entry("file", "etc/arbuzas/secrets/android-adb/adbkey.pub"),
+        Entry("file", "etc/arbuzas/secrets/android-adb/adb_known_hosts.pb"),
+        Entry("file", "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem"),
+        Entry("file", "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret"),
+        Entry("file", "etc/arbuzas/secrets/ticket-remote/turn.secret"),
+        Entry("file", "etc/arbuzas/secrets/train-bot-spacetime.key"),
+        Entry("file", "etc/arbuzas/secrets/train-bot-web-session-secret"),
+        Entry("file", "etc/arbuzas/secrets/train-bot-test-ticket.secret"),
+        Entry("file", "etc/arbuzas/cloudflared/ticket-remote.json"),
+        Entry("file", "etc/arbuzas/cloudflared/train-bot.json"),
+    ],
 }
 
 EXCLUDES: dict[str, tuple[str, ...]] = {
     "arbuzas": (),
+    "ticket-recovery": (),
     "pixel": (
         "data/local/pixel-stack/conf/runtime/artifacts",
     ),
@@ -184,6 +200,13 @@ def classify(
 
 def ssh_base_args(args: argparse.Namespace) -> list[str]:
     command = ["ssh"]
+    if args.ssh_known_hosts_file:
+        command += [
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={args.ssh_known_hosts_file}",
+        ]
     if args.ssh_port:
         command += ["-p", args.ssh_port]
     command.append(args.ssh_target)
@@ -192,6 +215,13 @@ def ssh_base_args(args: argparse.Namespace) -> list[str]:
 
 def scp_base_args(args: argparse.Namespace) -> list[str]:
     command = ["scp"]
+    if args.ssh_known_hosts_file:
+        command += [
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={args.ssh_known_hosts_file}",
+        ]
     if args.ssh_port:
         command += ["-P", args.ssh_port]
     return command
@@ -474,7 +504,7 @@ def affected_services_for_path(rel: str) -> set[str]:
 
 
 def command_affected(args: argparse.Namespace) -> int:
-    if args.profile != "arbuzas":
+    if args.profile not in ("arbuzas", "ticket-recovery"):
         return 0
     changed_file = pathlib.Path(args.changed_paths_file)
     if not changed_file.exists():
@@ -499,8 +529,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--remote-root", default="")
     parser.add_argument("--ssh-target", default="")
     parser.add_argument("--ssh-port", default="")
+    parser.add_argument("--ssh-known-hosts-file", default="")
     parser.add_argument("--changed-paths-file", default="")
     args = parser.parse_args(argv)
+
+    if args.ssh_known_hosts_file:
+        known_hosts = pathlib.Path(args.ssh_known_hosts_file)
+        if not known_hosts.is_absolute() or not known_hosts.is_file() or not os.access(known_hosts, os.R_OK):
+            parser.error("--ssh-known-hosts-file must name a readable absolute file")
 
     if args.command != "affected" and not args.mirror_root:
         parser.error("--mirror-root is required")

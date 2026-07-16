@@ -7,9 +7,7 @@ import { verifySpacetimeSDKCompatibility } from "./check-spacetime-sdk.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const generatedDir = path.join(__dirname, "src", "generated");
-const outFile = path.join(__dirname, "..", "internal", "web", "static", "spacetime-client.js");
-const browserSDKVersion = JSON.parse(readFileSync(path.join(__dirname, "package.json"), "utf8")).dependencies.spacetimedb;
-const generatedBanner = `/* Generated from web-client/src/index.ts. Built with SpacetimeDB browser SDK ${browserSDKVersion}. Edit sources under web-client/, not internal/web/static/spacetime-client.js. */`;
+const generatedBanner = `/* Generated from web-client/src/index.ts. Built with SpacetimeDB browser SDK ${JSON.parse(readFileSync(path.join(__dirname, "package.json"), "utf8")).dependencies.spacetimedb}. Edit sources under web-client/, not internal/web/static/spacetime-client.js. */`;
 
 rmSync(generatedDir, { recursive: true, force: true });
 mkdirSync(generatedDir, { recursive: true });
@@ -32,151 +30,45 @@ execFileSync(
   }
 );
 
+const keptBindings = new Set([
+  ...["control_code_fast_state", "control_code_request", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus"]
+    .map((name) => `ticketremote_${name}_table`),
+  ...["append_safe_operational_log", "close_control_code", "confirm_control_code_browser_capture", "prepare_control_code", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus"]
+    .map((name) => `ticketremote_member_${name}_reducer`),
+]);
 const allowedGeneratedFiles = new Set([
-  "index.ts",
-  "ticketremote_ack_stream_command_reducer.ts",
-  "ticketremote_append_safe_operational_log_reducer.ts",
-  "ticketremote_append_stream_command_reducer.ts",
-  "ticketremote_cleanup_expired_reducer.ts",
-  "ticketremote_control_code_request_table.ts",
-  "ticketremote_control_code_fast_state_table.ts",
-  "ticketremote_member_append_safe_operational_log_reducer.ts",
-  "ticketremote_member_close_control_code_reducer.ts",
-  "ticketremote_member_confirm_control_code_browser_capture_reducer.ts",
-  "ticketremote_member_prepare_control_code_reducer.ts",
-  "ticketremote_member_recover_stream_reducer.ts",
-  "ticketremote_member_remove_member_reducer.ts",
-  "ticketremote_member_request_control_code_reducer.ts",
-  "ticketremote_member_request_keyframe_reducer.ts",
-  "ticketremote_member_set_stream_focus_reducer.ts",
-  "ticketremote_member_upsert_member_reducer.ts",
-  "ticketremote_phone_current_report_table.ts",
-  "ticketremote_register_service_identity_reducer.ts",
-  "ticketremote_relay_current_report_table.ts",
-  "ticketremote_remove_member_reducer.ts",
-  "ticketremote_service_bootstrap_reducer.ts",
-  "ticketremote_service_phone_backend_table.ts",
-  "ticketremote_service_stream_command_table.ts",
-  "ticketremote_service_ticket_member_table.ts",
-  "ticketremote_service_ticket_table.ts",
-  "ticketremote_set_stream_desired_state_reducer.ts",
-  "ticketremote_stream_command_signal_table.ts",
-  "ticketremote_stream_desired_state_table.ts",
-  "ticketremote_stream_viewer_focus_table.ts",
-  "ticketremote_update_control_code_request_reducer.ts",
-  "ticketremote_update_control_code_fast_state_reducer.ts",
-  "ticketremote_update_phone_current_report_reducer.ts",
-  "ticketremote_update_phone_reducer.ts",
-  "ticketremote_update_relay_current_report_reducer.ts",
-  "ticketremote_upsert_member_reducer.ts",
-  "types.ts",
-  path.join("types", "procedures.ts"),
-  path.join("types", "reducers.ts"),
+  "index.ts", "types.ts", path.join("types", "procedures.ts"), path.join("types", "reducers.ts"),
+  ...[...keptBindings].map((name) => `${name}.ts`),
 ]);
+const keepsType = (name) => keptBindings.has(`ticketremote_${name.slice(12).replace(/[A-Z]/g, (letter, offset) => `${offset ? "_" : ""}${letter.toLowerCase()}`)}_table`);
 
-const allowedTypeNames = new Set([
-  "TicketremoteAuthConfig",
-  "TicketremoteCleanupSchedule",
-  "TicketremoteControlCodeOwner",
-  "TicketremoteControlCodeFastState",
-  "TicketremoteControlCodeRequest",
-  "TicketremotePhoneBackend",
-  "TicketremotePhoneCurrentReport",
-  "TicketremoteRelayCurrentReport",
-  "TicketremoteSafeOperationalLog",
-  "TicketremoteServiceIdentity",
-  "TicketremoteServiceMember",
-  "TicketremoteServicePhone",
-  "TicketremoteServiceStreamCommand",
-  "TicketremoteServiceTicket",
-  "TicketremoteStreamCommand",
-  "TicketremoteStreamCommandSignal",
-  "TicketremoteStreamDesiredState",
-  "TicketremoteStreamViewerFocus",
-  "TicketremoteTicket",
-  "TicketremoteTicketMember",
-]);
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function rewrite(relativeFile, update) {
+  const file = path.join(generatedDir, relativeFile);
+  writeFileSync(file, update(readFileSync(file, "utf8")), "utf8");
 }
 
-function walkFiles(root, base = root) {
-  const output = [];
-  for (const entry of readdirSync(root)) {
-    const fullPath = path.join(root, entry);
-    const stat = statSync(fullPath);
-    if (stat.isDirectory()) {
-      output.push(...walkFiles(fullPath, base));
-    } else {
-      output.push(path.relative(base, fullPath));
+function pruneBindings(relativeFile, importPattern, referencePattern) {
+  rewrite(relativeFile, (source) => {
+    for (const [line, symbol, name] of source.matchAll(importPattern)) {
+      if (keptBindings.has(name)) continue;
+      source = source.replace(`${line}\n`, "").replace(referencePattern(symbol, name), "");
     }
-  }
-  return output;
-}
-
-function pruneGeneratedIndex() {
-  const indexFile = path.join(generatedDir, "index.ts");
-  let source = readFileSync(indexFile, "utf8");
-  for (const match of [...source.matchAll(/^import\s+(\w+)\s+from\s+"\.\/(ticketremote_[^"]+)";$/gm)]) {
-    const [line, importName, generatedName] = match;
-    const relativeFile = `${generatedName}.ts`;
-    if (allowedGeneratedFiles.has(relativeFile)) continue;
-    source = source.replace(`${line}\n`, "");
-    if (generatedName.endsWith("_table")) {
-      const tableName = generatedName.slice(0, -"_table".length);
-      source = source.replace(new RegExp(`\\n  ${escapeRegExp(tableName)}: __table\\(\\{[\\s\\S]*?\\n  \\}, ${escapeRegExp(importName)}\\),`, "g"), "");
-    } else if (generatedName.endsWith("_reducer")) {
-      const reducerName = generatedName.slice(0, -"_reducer".length);
-      source = source.replace(new RegExp(`\\n  __reducerSchema\\("${escapeRegExp(reducerName)}", ${escapeRegExp(importName)}\\),`, "g"), "");
-    }
-  }
-  writeFileSync(indexFile, source, "utf8");
-}
-
-function pruneGeneratedReducerTypes() {
-  const reducerTypesFile = path.join(generatedDir, "types", "reducers.ts");
-  let source = readFileSync(reducerTypesFile, "utf8");
-  for (const match of [...source.matchAll(/^import\s+(\w+)\s+from\s+"\.\.\/(ticketremote_[^"]+)";$/gm)]) {
-    const [line, importName, generatedName] = match;
-    const relativeFile = `${generatedName}.ts`;
-    if (allowedGeneratedFiles.has(relativeFile)) continue;
-    source = source.replace(`${line}\n`, "");
-    source = source.replace(new RegExp(`^export type \\w+ = __Infer<typeof ${escapeRegExp(importName)}>;\\n`, "gm"), "");
-  }
-  writeFileSync(reducerTypesFile, source, "utf8");
-}
-
-function pruneGeneratedTypes() {
-  const typesFile = path.join(generatedDir, "types.ts");
-  let source = readFileSync(typesFile, "utf8");
-  source = source.replace(/\nexport const (Ticketremote\w+) = __t\.object\("\1", \{[\s\S]*?\n\}\);\nexport type \1 = __Infer<typeof \1>;\n/g, (block, name) => {
-    return allowedTypeNames.has(name) ? block : "";
+    return source;
   });
-  writeFileSync(typesFile, source, "utf8");
 }
 
-function preserveSafeLogReducerIDArgs() {
-  for (const fileName of [
-    "ticketremote_append_safe_operational_log_reducer.ts",
-    "ticketremote_member_append_safe_operational_log_reducer.ts",
-  ]) {
-    const filePath = path.join(generatedDir, fileName);
-    let source = readFileSync(filePath, "utf8");
-    if (source.includes("id: __t.string()")) continue;
-    source = source.replace("export default {\n", "export default {\n  id: __t.string(),\n");
-    writeFileSync(filePath, source, "utf8");
-  }
-}
-
-pruneGeneratedIndex();
-pruneGeneratedReducerTypes();
-pruneGeneratedTypes();
-preserveSafeLogReducerIDArgs();
-for (const relativeFile of walkFiles(generatedDir)) {
-  if (!allowedGeneratedFiles.has(relativeFile)) {
-    rmSync(path.join(generatedDir, relativeFile), { force: true });
-  }
+pruneBindings("index.ts", /^import\s+(\w+)\s+from\s+"\.\/(ticketremote_[^"]+)";$/gm, (symbol, name) => name.endsWith("_table")
+  ? new RegExp(`\\n  ${name.slice(0, -6)}: __table\\(\\{[\\s\\S]*?\\n  \\}, ${symbol}\\),`, "g")
+  : new RegExp(`\\n  __reducerSchema\\("${name.slice(0, -8)}", ${symbol}\\),`, "g"));
+pruneBindings(path.join("types", "reducers.ts"), /^import\s+(\w+)\s+from\s+"\.\.\/(ticketremote_[^"]+)";$/gm,
+  (symbol) => new RegExp(`^export type \\w+ = __Infer<typeof ${symbol}>;\\n`, "gm"));
+rewrite("types.ts", (source) => source.replace(/\nexport const (Ticketremote\w+) = __t\.object\("\1", \{[\s\S]*?\n\}\);\nexport type \1 = __Infer<typeof \1>;\n/g,
+  (block, name) => keepsType(name) ? block : ""));
+rewrite("ticketremote_member_append_safe_operational_log_reducer.ts", (source) => source.includes("id: __t.string()")
+  ? source : source.replace("export default {\n", "export default {\n  id: __t.string(),\n"));
+for (const relativeFile of readdirSync(generatedDir, { recursive: true })) {
+  const file = path.join(generatedDir, relativeFile);
+  if (statSync(file).isFile() && !allowedGeneratedFiles.has(relativeFile)) rmSync(file, { force: true });
 }
 
 await build({
@@ -187,7 +79,7 @@ await build({
   },
   format: "iife",
   target: "es2020",
-  outfile: outFile,
+  outfile: path.join(__dirname, "..", "internal", "web", "static", "spacetime-client.js"),
   sourcemap: false,
   logLevel: "info",
 });

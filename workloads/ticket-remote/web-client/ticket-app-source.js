@@ -24,168 +24,87 @@ import { html, reactive } from '@arrow-js/core';
   const sampledClientLogIntervalMs = 60000;
   const controlCodeAutoPrepareMinIntervalMs = 5000;
   let spacetimeClient = null;
+  let clientLogSequence = 0;
 
-  function enqueueClientLog(entry) {
-    pendingClientLogs.push(compactClientLogEntry(entry));
-    if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
-    try {
-      if (typeof queueMicrotask === 'function') {
-        queueMicrotask(() => flushClientLogs());
-      }
-    } catch (_) {}
+  function newClientLogRowID(entry) {
+    clientLogSequence = (clientLogSequence + 1) % 1679616;
+    const clean = (value, fallback) => String(value || fallback).replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 48) || fallback;
+    const nonce = window.crypto && typeof window.crypto.randomUUID === 'function'
+      ? window.crypto.randomUUID().slice(0, 12)
+      : Math.random().toString(36).slice(2, 14);
+    return [clean(cfg.ticketId, 'ticket'), Date.now().toString(36), clean(entry && entry.event, 'event'), clientLogSequence.toString(36), nonce].join(':');
+  }
+
+  function compactClientEventName(value) {
+    const event = String(value || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    if (event === 'page_boot') return 'browser_opened';
+    if (/video_socket.*open/.test(event)) return 'stream_opened';
+    if (/video_socket.*closed|viewer_idle_disconnected|video_stream_paused_hidden/.test(event)) return 'stream_closed';
+    if (/video_socket_connect_attempt|video_stream_restart|fresh_video_resume|cached_video_resume|viewer_idle_resumed/.test(event)) return 'stream_started';
+    if (/keyframe/.test(event)) return /failed/.test(event) ? 'keyframe_failed' : 'keyframe_requested';
+    if (/activation_resume_fresh_frame/.test(event)) return 'stream_recovered';
+    if (/recover|recovery/.test(event)) return /failed|exhausted/.test(event) ? 'stream_failed' : 'stream_recovery_requested';
+    if (/stale_video_frames|server_stale_frames|loading_over_2s/.test(event)) return 'stream_stalled';
+    if (event === 'control_code_submitted') return 'control_code_requested';
+    if (/control_code.*prepare.*complete/.test(event)) return 'control_code_sent';
+    if (/control_code.*failed/.test(event)) return 'control_code_failed';
+    if (event === 'control_code_capture_keepalive') return 'control_code_capturing';
+    if (/control_code.*ignored/.test(event)) return 'control_code_ignored';
+    if (/spacetime.*failed|spacetime_direct_unavailable/.test(event)) return 'state_failed';
+    if (event === 'spacetime_client_status') return 'state_changed';
+    return event;
   }
 
   function compactClientLogEntry(entry) {
-    const rawEventName = String(entry && entry.event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
-    const eventName = compactClientEventName(rawEventName);
-    const normalized = Object.assign({}, entry, { event: eventName });
-    if (eventName === rawEventName) return normalized;
-    if (normalized.detailJson) {
-      normalized.detailJson = detailJsonWithOriginalEvent(normalized.detailJson, rawEventName);
-    } else if (normalized.detail) {
-      normalized.detail = detailTextWithOriginalEvent(normalized.detail, rawEventName);
-    } else {
-      normalized.detail = safeString({ originalEvent: rawEventName }).slice(0, 1000);
-    }
-    return normalized;
-  }
-
-  function detailJsonWithOriginalEvent(detailJson, rawEventName) {
-    try {
-      const parsed = JSON.parse(String(detailJson || '{}'));
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        if (!parsed.originalEvent) parsed.originalEvent = rawEventName;
-        return safeString(parsed).slice(0, 1000);
-      }
-    } catch (_) {}
-    return safeString({ detail: safeString(detailJson).slice(0, 800), originalEvent: rawEventName }).slice(0, 1000);
-  }
-
-  function detailTextWithOriginalEvent(detail, rawEventName) {
+    const raw = String(entry && entry.event || 'client_event');
+    const event = compactClientEventName(raw);
+    const normalized = Object.assign({}, entry, { event });
+    if (event === raw) return normalized;
+    let detail = normalized.detailJson || normalized.detail || '';
     try {
       const parsed = JSON.parse(String(detail || '{}'));
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        if (!parsed.originalEvent) parsed.originalEvent = rawEventName;
-        return safeString(parsed).slice(0, 1000);
-      }
-    } catch (_) {}
-    return safeString({ detail: safeString(detail).slice(0, 800), originalEvent: rawEventName }).slice(0, 1000);
+      detail = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? Object.assign({ originalEvent: raw }, parsed)
+        : { originalEvent: raw, detail: safeString(detail).slice(0, 800) };
+    } catch (_) {
+      detail = { originalEvent: raw, detail: safeString(detail).slice(0, 800) };
+    }
+    normalized.detailJson = safeString(detail).slice(0, 1000);
+    delete normalized.detail;
+    return normalized;
   }
 
   function sampledClientLogDetail(event, detail) {
     if (!sampledClientLogEvents.has(event)) return detail;
     const now = Date.now();
-    const previous = sampledClientLogState.get(event) || { at: 0, dropped: 0 };
-    if (now - previous.at < sampledClientLogIntervalMs) {
-      previous.dropped += 1;
-      sampledClientLogState.set(event, previous);
-      return null;
-    }
-    const dropped = previous.dropped || 0;
-    sampledClientLogState.set(event, { at: now, dropped: 0 });
-    if (!dropped) return detail;
-    return safeString({
-      detail,
-      droppedSinceLast: dropped
-    });
+    const previous = sampledClientLogState.get(event) || 0;
+    if (now - previous < sampledClientLogIntervalMs) return null;
+    sampledClientLogState.set(event, now);
+    return detail;
   }
 
-  function compactClientEventName(event) {
-    switch (event) {
-      case 'page_boot':
-        return 'browser_opened';
-      case 'video_socket_opened':
-        return 'stream_opened';
-      case 'video_socket_closed':
-      case 'video_socket_closed_intentional':
-      case 'viewer_idle_disconnected':
-      case 'video_stream_paused_hidden':
-        return 'stream_closed';
-      case 'video_socket_connect_attempt':
-      case 'video_stream_restart':
-      case 'fresh_video_resume':
-      case 'cached_video_resume':
-      case 'viewer_idle_resumed':
-        return 'stream_started';
-      case 'keyframe_request':
-        return 'keyframe_requested';
-      case 'keyframe_request_failed':
-        return 'keyframe_failed';
-      case 'stream_recovery_request':
-      case 'h264_server_recover_requested':
-        return 'stream_recovery_requested';
-      case 'activation_resume_start':
-      case 'activation_resume_retry':
-      case 'activation_resume_deep_recover':
-      case 'activation_resume_recovery_decision':
-        return 'stream_recovery_requested';
-      case 'activation_resume_fresh_frame':
-      case 'activation_resume_finish':
-        return 'stream_recovered';
-      case 'activation_resume_exhausted':
-      case 'activation_resume_media_stuck':
-        return 'stream_failed';
-      case 'activation_resume_merged':
-      case 'activation_resume_paused':
-      case 'activation_resume_log_limit':
-        return 'stream_recovery_ignored';
-      case 'stream_recover_request_failed':
-        return 'stream_failed';
-      case 'stale_video_frames':
-      case 'server_stale_frames':
-      case 'loading_over_2s':
-        return 'stream_stalled';
-      case 'control_code_submitted':
-        return 'control_code_requested';
-      case 'control_code_prepare_complete':
-      case 'control_code_auto_prepare_complete':
-        return 'control_code_sent';
-      case 'control_code_request_failed':
-      case 'control_code_prepare_failed':
-      case 'control_code_auto_prepare_failed':
-      case 'control_code_close_failed':
-        return 'control_code_failed';
-      case 'control_code_capture_keepalive':
-        return 'control_code_capturing';
-      case 'control_code_message_ignored':
-      case 'control_code_close_ignored':
-        return 'control_code_ignored';
-      case 'spacetime_connect_failed':
-      case 'spacetime_reconnect_failed':
-      case 'spacetime_direct_unavailable':
-        return 'state_failed';
-      case 'spacetime_client_status':
-        return 'state_changed';
-      default:
-        break;
-    }
-    if (event.includes('recover') || event.includes('recovery')) return event.includes('failed') ? 'stream_failed' : 'stream_recovery_requested';
-    if (event.includes('keyframe')) return event.includes('failed') ? 'keyframe_failed' : 'keyframe_requested';
-    if (event.includes('control_code') && event.includes('failed')) return 'control_code_failed';
-    if (event.includes('video_socket') && event.includes('open')) return 'stream_opened';
-    if (event.includes('video_socket') && event.includes('closed')) return 'stream_closed';
-    return event;
+  function enqueueClientLog(entry) {
+    const compacted = compactClientLogEntry(entry);
+    if (!compacted.rowId) compacted.rowId = newClientLogRowID(compacted);
+    pendingClientLogs.push(compacted);
+    if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
+    if (typeof queueMicrotask === 'function') queueMicrotask(flushClientLogs);
   }
 
   function reportClientFault(event, detail) {
-    const rawEventName = String(event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
-    const eventName = compactClientEventName(rawEventName);
-    const detailText = safeString(detail).slice(0, 500);
-    const sampledDetail = sampledClientLogDetail(rawEventName, detailText);
-    if (sampledDetail == null) return;
-    const detailPayload = {
-      pageVersion,
-      assetVersion,
-      detail: sampledDetail,
-      visibility: document.visibilityState,
-      webCodecs: 'VideoDecoder' in window,
-      userAgent: navigator.userAgent
-    };
-    if (eventName !== rawEventName) detailPayload.originalEvent = rawEventName;
+    const raw = String(event || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
+    const sampled = sampledClientLogDetail(raw, safeString(detail).slice(0, 500));
+    if (sampled == null) return;
     enqueueClientLog({
       level: 'info',
-      event: eventName,
-      detail: safeString(detailPayload).slice(0, 1000),
+      event: raw,
+      detailJson: safeString({
+        pageVersion,
+        assetVersion,
+        detail: sampled,
+        visibility: document.visibilityState,
+        webCodecs: 'VideoDecoder' in window
+      }).slice(0, 1000),
       correlationId: typeof browserTraceId === 'string' ? browserTraceId : '',
       at: Date.now()
     });
@@ -230,7 +149,6 @@ import { html, reactive } from '@arrow-js/core';
   normalizeAssetVersionURL();
 
   let spacetimeClientStatus = 'idle';
-  let spacetimeDirectUnavailable = false;
   let spacetimeDirectUnavailableLogged = false;
   let directSpacetimeToken = '';
   let directSpacetimeTokenExpiresAt = 0;
@@ -242,11 +160,6 @@ import { html, reactive } from '@arrow-js/core';
 
   if (!cfg.authenticated) {
     startAuthRedirect();
-    return;
-  }
-
-  if (document.querySelector('[data-admin="true"]')) {
-    startAdmin();
     return;
   }
 
@@ -294,11 +207,10 @@ import { html, reactive } from '@arrow-js/core';
   const codeResultTimer = requireElement('#controlCodeResultTimer', 'controlCodeResultTimer');
   const codeResultClose = requireElement('#closeControlCodeResult', 'closeControlCodeResult');
   const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');
-  const controlCodeCloseHotspot = requireElement('#controlCodeCloseHotspot', 'controlCodeCloseHotspot');
-  if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot || !controlCodeCloseHotspot) return;
+  if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
-  const presenceState = reactive({ viewers: [], visibleViewerCount: 0, identifiersPending: false });
+  const presenceState = reactive({ viewers: [], visibleViewerCount: 0 });
   let presenceMounted = false;
 
   let videoWs = null;
@@ -336,6 +248,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastKeyframeCommandAt = 0;
   let lastRecoveryDecoderResetAt = 0;
   let lastRecoveryVideoReconnectAt = 0;
+  let lastRecoveryVideoReconnectSeq = -1;
   let lastRecoveryServerRecoverAt = 0;
   let firstFrameServerRecoveryAttempts = 0;
   let firstFrameServerRecoveryExhausted = false;
@@ -392,6 +305,7 @@ import { html, reactive } from '@arrow-js/core';
   let controlCodeAutoPrepareInFlight = false;
   let lastControlCodeAutoPrepareAt = 0;
   let controlCodeFastStateExpiryTimer = null;
+  let lastRenderedControlCodeRequestSignature = '';
   const localSessionID = String(cfg.sessionId || '').trim();
   const localPublicID = accountPublicId(cfg.email || '');
   const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);
@@ -400,12 +314,8 @@ import { html, reactive } from '@arrow-js/core';
   let codeDialogOpen = false;
   let controlCodeDialogScrollLock = null;
   let codeResultTickTimer = null;
-  let activeStreamOpenMetric = null;
-  let activeControlCodeMetric = null;
-  let resumeRecoverySoftTimer = null;
-  let resumeRecoveryHardTimer = null;
   let activeResumeFlow = null;
-  let pendingResumeFreshFrameFlow = null;
+  let hiddenDecoderTransientLogged = false;
   let activationReconnectBurstTimer = null;
   let videoSocketOpenSeq = 0;
   let lastHiddenWallAt = 0;
@@ -415,7 +325,6 @@ import { html, reactive } from '@arrow-js/core';
   let screenWakeLockRequesting = false;
   let screenWakeLockUnavailableLogged = false;
   let ticketFullscreenAttempted = false;
-  let toolbarAnchorLogged = false;
   let idleDisconnected = false;
   let idleDisconnectTimer = null;
   const intentionallyClosedVideoSockets = new WeakSet();
@@ -438,14 +347,11 @@ import { html, reactive } from '@arrow-js/core';
   const hiddenVideoCloseDelayMs = 3000;
   const backgroundRecoveryHiddenMs = 30000;
   const oldTabFreshResumeHiddenMs = 5000;
-  const resumeVideoReconnectDelayMs = 0;
   const resumeSoftReconnectMs = 1800;
-  const resumeHardRecoverMs = 4500;
   const activationReconnectBurstMs = 10000;
   const activationReconnectFirstRetryMs = 150;
   const activationReconnectTickMs = 500;
   const activationReconnectMaxTicks = 10;
-  const activationResumeLogLimit = 32;
   const firstFrameServerRecoveryMaxAttempts = 2;
   const idleDisconnectMs = 15 * 60 * 1000;
   const recoveryKeyframeDebounceMs = 2000;
@@ -463,6 +369,8 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeCaptureKeyframeRetryLimit = 2;
   const controlCodeLowLatencyVisualAgeMs = 750;
   const controlCodeLowLatencyDecodeQueueLimit = 1;
+  const controlCodeResultImageReadyTimeoutMs = 1200;
+  const controlCodeResultPaintFrameTimeoutMs = 500;
   const controlCodeGeneratedChipScanStartY = 0.50;
   const controlCodeGeneratedChipScanEndY = 0.61;
   const controlCodeGeneratedChipScanStepY = 0.01;
@@ -544,7 +452,6 @@ import { html, reactive } from '@arrow-js/core';
 	      clearTimeout(hiddenStreamFocusTimer);
 	      hiddenStreamFocusTimer = null;
 	    }
-	    clearResumeWatchdogs();
 	    clearActivationReconnectBurst();
 	    closeEarlyVideo('idle_disconnect');
     closeDirectVideo();
@@ -571,13 +478,12 @@ import { html, reactive } from '@arrow-js/core';
     setStatus('Atjauno tiešraidi...');
     showStreamRecovery();
     scheduleViewerIdleDisconnect(reason || 'idle_resume');
-    beginStreamOpenMetric('old_tab_resume', reason || 'idle_resume', true);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     connectDirectVideo();
     publishCurrentStreamFocus(reason || 'idle_resume');
     requestKeyframeDebounced(`${reason || 'idle_resume'}_keyframe`, 0, true);
     requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);
-	    scheduleResumeWatchdogs(reason || 'idle_resume');
+	    startActivationResumeFlow(reason || 'idle_resume', 'watchdog');
 	    publishStreamDebug();
 	    clientLog('viewer_idle_resumed', reason || 'idle_resume');
 	    startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
@@ -601,10 +507,6 @@ import { html, reactive } from '@arrow-js/core';
       };
     }
     return fallback;
-  }
-
-  function ticketViewportRect() {
-    return visualViewportRect();
   }
 
 	  function keyboardLikelyOpen(layout, visual) {
@@ -646,10 +548,6 @@ import { html, reactive } from '@arrow-js/core';
     return stableStageViewportRect().height;
   }
 
-  function toolbarCollapseAnchorPx() {
-    return Math.round(Math.min(96, Math.max(24, viewportHeight() * 0.12)));
-  }
-
   function updateViewportVars() {
     const stageViewport = stableStageViewportRect();
     const dialogViewport = visualViewportRect();
@@ -664,20 +562,13 @@ import { html, reactive } from '@arrow-js/core';
     document.documentElement.style.setProperty('--ticket-dialog-height', `${dialogViewport.height}px`);
     document.documentElement.style.setProperty('--ticket-dialog-left', `${dialogViewport.offsetLeft}px`);
     document.documentElement.style.setProperty('--ticket-dialog-top', `${dialogViewport.offsetTop}px`);
-    // --ticket-toolbar-anchor write removed: the CSS no longer references it after the
-    // .stage / .stage-page / .shell rules were migrated to min-height:100dvh. The JS-side
-    // helper toolbarCollapseAnchorPx() and the toolbarAnchorLogged flag are left in place
-    // as dead-but-harmless code so the clientLog('toolbar_collapse_anchor', ...) line
-    // history is not lost; they will be removed in the next cleanup pass.
-  }
-
-  function firstScreenAnchorTop() {
-    return screenEngaged ? toolbarCollapseAnchorPx() : 0;
   }
 
   function updateDetailsReveal() {
     if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;
-    const revealed = window.scrollY >= Math.max(1, firstScreenAnchorTop() + viewportHeight() * 0.82);
+    const height = viewportHeight();
+    const engagedOffset = screenEngaged ? Math.round(Math.min(96, Math.max(24, height * 0.12))) : 0;
+    const revealed = window.scrollY >= Math.max(1, engagedOffset + height * 0.82);
     document.body.classList.toggle('details-visible', revealed);
     if (panel) panel.setAttribute('aria-hidden', revealed ? 'false' : 'true');
   }
@@ -688,14 +579,6 @@ import { html, reactive } from '@arrow-js/core';
       if (panel) panel.setAttribute('aria-hidden', 'true');
     }
     updateDetailsReveal();
-  }
-
-  function scheduleFirstScreenPin(force) {
-    keepFirstScreenPinned(force);
-  }
-
-  function anchorToolbarCollapse(_reason) {
-    updateViewportVars();
   }
 
   async function requestScreenWakeLock(reason) {
@@ -780,7 +663,6 @@ import { html, reactive } from '@arrow-js/core';
     if (!target || target === document || target === window) return false;
     return Boolean(
       controlCodeHotspot.contains(target) ||
-      controlCodeCloseHotspot.contains(target) ||
       requestCodeButton.contains(target) ||
       codeDialog.contains(target) ||
       codeResultArea.contains(target)
@@ -832,17 +714,6 @@ import { html, reactive } from '@arrow-js/core';
     url.searchParams.set(key, String(value).slice(0, 120));
   }
 
-  function activeVideoRecoveryID() {
-    if (activeResumeFlow && !activeResumeFlow.done && activeResumeFlow.id) return activeResumeFlow.id;
-    return '';
-  }
-
-  function videoOpenRestoreReason(fallback) {
-    if (activeResumeFlow && !activeResumeFlow.done) return activeResumeFlow.reason || activeResumeFlow.trigger || fallback || 'resume';
-    if (lastHiddenAt > 0 || fallbackFrameAvailable || hasRenderedFrame) return fallback || 'old_page_resume';
-    return fallback || 'cold_open';
-  }
-
   function streamURL(reason) {
     const url = new URL('/api/v1/stream', location.href);
     url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -850,8 +721,12 @@ import { html, reactive } from '@arrow-js/core';
     appendStreamURLParam(url, 'page_version', pageVersion);
     appendStreamURLParam(url, 'asset_version', assetVersion);
     appendStreamURLParam(url, 'visibility', document.visibilityState);
-    appendStreamURLParam(url, 'restore_reason', videoOpenRestoreReason(reason));
-    appendStreamURLParam(url, 'recovery_id', activeVideoRecoveryID());
+    const resuming = activeResumeFlow && !activeResumeFlow.done ? activeResumeFlow : null;
+    const restoreReason = resuming
+      ? resuming.reason || resuming.trigger || reason || 'resume'
+      : reason || (lastHiddenAt > 0 || fallbackFrameAvailable || hasRenderedFrame ? 'old_page_resume' : 'cold_open');
+    appendStreamURLParam(url, 'restore_reason', restoreReason);
+    appendStreamURLParam(url, 'recovery_id', resuming && resuming.id);
     appendStreamURLParam(url, 'frame_age_ms', lastFrameAt > 0 ? Math.round(now - lastFrameAt) : '');
     appendStreamURLParam(url, 'hidden_age_ms', lastHiddenAt > 0 ? Math.round(now - lastHiddenAt) : '');
     appendStreamURLParam(url, 'has_frame', hasRenderedFrame ? '1' : '0');
@@ -878,48 +753,29 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   const publicMessageTranslations = new Map([
-    ['Phone stream reconnecting', 'Tālruņa straume savienojas no jauna'],
     ['Ticket server is starting', 'Biļetes serveris startējas'],
     ['Ticket server is stopped', 'Biļetes serveris ir apturēts'],
-    ['Ticket session is active through root capture', 'Biļetes sesija darbojas ar root ekrāna tveršanu'],
-    ['Root capture is idle', 'Root ekrāna tveršana ir gaidstāvē'],
     ['Root shell is unavailable', 'Root komandrinda nav pieejama'],
-    ['Root screenrecord capture is available', 'Root ekrāna tveršana ir pieejama'],
-    ['Root capture is starting', 'Root ekrāna tveršana startējas'],
-    ['Root capture is active', 'Root ekrāna tveršana ir aktīva'],
-    ['Root capture is unavailable', 'Root ekrāna tveršana nav pieejama'],
     ['ViVi is not installed from a local Pixel app store yet', 'ViVi vēl nav instalēta no vietējā Pixel lietotņu veikala'],
     ['ViVi launch intent is unavailable', 'ViVi palaišana nav pieejama'],
     ['No visible frame has been sent yet', 'Vēl nav nosūtīts neviens redzams kadrs'],
     ['Unavailable', 'Nav pieejams'],
-    ['Connection failed', 'Savienojums neizdevās'],
-    ['Video connection failed', 'Video savienojums neizdevās'],
-    ['control_mode_removed', 'Kontroles režīms ir aizstāts ar koda pieprasījumiem'],
     ['invalid_code', 'Ievadi 2-8 ciparus'],
     ['request_in_progress', 'Iepriekšējais koda pieprasījums vēl tiek pabeigts'],
-    ['Spacetime connection is unavailable.', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
     ['Spacetime connection is not ready', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
     ['Spacetime connection failed', 'Neizdevās savienot vadības kanālu. Mēģini vēlreiz.'],
     ['Spacetime connection closed', 'Vadības kanāls pārtrauca savienojumu. Mēģini vēlreiz.'],
     ['rate_limited', 'Minūtē var pieprasīt divus kodus'],
-    ['phone_timeout', 'Tālrunis nepaspēja izveidot kodu'],
     ['phone_unavailable', 'Tālrunis pašlaik nav pieejams'],
     ['control_code_result_timeout', 'Tālrunis nepaspēja izveidot kodu'],
     ['control_code_not_generated', 'Tālrunis neatgrieza ģenerētu kodu'],
-    ['control_code_submit_returned_no_result', 'ViVi neatgrieza ģenerētu kodu'],
-    ['control_code_submit_timeout', 'ViVi neapstiprināja kodu laikā'],
-    ['control_code_request_hierarchy_unavailable', 'Tālrunis atjauno biļetes skatu. Mēģini vēlreiz.'],
-    ['control_code_request_preflight_cleanup_failed', 'Tālrunis vēl atgriežas pie biļetes. Mēģini vēlreiz.'],
-    ['control_code_request_previous_result_cleanup_failed', 'Iepriekšējais kods vēl aizveras. Mēģini vēlreiz.'],
     ['control_code_cleanup_attention_needed', 'Tālrunim vajag mirkli, lai atgrieztos pie biļetes'],
     ['control_code_stream_marker_required', 'Tālrunis nepaguva apstiprināt ģenerēto kodu'],
     ['waiting_for_ticket_reselect', 'Tālrunis vēl izvēlas biļeti. Uzgaidi mirkli.'],
     ['waiting_for_stream_recovery', 'Tiešraide atjaunojas pirms koda pieprasījuma.'],
     ['control_code_recovery_queue_timeout', 'Tālrunis nepaguva atjaunot biļeti. Mēģini vēlreiz.'],
     ['control_code_stream_unstable', 'Tiešraide nav pietiekami stabila koda pieprasījumam.'],
-    ['fast_not_ready', 'Tālrunis vēl sagatavo ātro koda ceļu. Mēģini vēlreiz pēc mirkļa.'],
-    ['fast_state_stale', 'Tālrunis vēl atjauno gatavību kodam. Mēģini vēlreiz pēc mirkļa.'],
-    ['extension_disabled', 'Pagarināšana ir izslēgta']
+    ['fast_not_ready', 'Tālrunis vēl sagatavo ātro koda ceļu. Mēģini vēlreiz pēc mirkļa.']
   ]);
 
   function localizePublicMessage(value) {
@@ -930,33 +786,19 @@ import { html, reactive } from '@arrow-js/core';
     for (const [prefix, translation] of [
       ['Ticket server is listening on ', 'Biļetes serveris klausās uz '],
       ['Ticket server failed to start: ', 'Biļetes serveri neizdevās palaist: '],
-      ['Ticket session stopped: ', 'Biļetes sesija apturēta: '],
-      ['Root capture stopped: ', 'Root ekrāna tveršana apturēta: '],
-      ['Root capture restarting: ', 'Root ekrāna tveršana restartējas: '],
-      ['Root capture exited with code ', 'Root ekrāna tveršana aizvērās ar kodu '],
-      ['Root capture stream closed during restart', 'Root ekrāna tveršanas straume aizvērās restartēšanas laikā'],
-      ['Root capture failed: ', 'Root ekrāna tveršana neizdevās: ']
+      ['Ticket session stopped: ', 'Biļetes sesija apturēta: ']
     ]) {
       if (text.startsWith(prefix)) return translation + text.slice(prefix.length);
     }
     return text;
   }
 
-  function isTechnicalPublicStatusMessage(value) {
-    const text = String(value || '').trim();
-    return /\b(ffmpeg|h\.?264|h265|h\.?265|root capture|root screenrecord|root shell|screenrecord|codec)\b/i.test(text);
-  }
-
-  function decodeBase64UrlJSON(value) {
-    const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
-    return JSON.parse(atob(padded));
-  }
-
   function jwtExpiresAtMillis(token) {
     const parts = String(token || '').split('.');
     if (parts.length !== 3) return 0;
     try {
-      const payload = decodeBase64UrlJSON(parts[1]);
+      const encoded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const payload = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '=')));
       const exp = Number(payload && payload.exp);
       return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
     } catch (_) {
@@ -966,7 +808,6 @@ import { html, reactive } from '@arrow-js/core';
 
   function rememberSpacetimeToken(token) {
     directSpacetimeToken = String(token || '');
-    spacetimeDirectUnavailable = false;
     spacetimeDirectUnavailableLogged = false;
     directSpacetimeTokenExpiresAt = jwtExpiresAtMillis(token);
   }
@@ -992,7 +833,7 @@ import { html, reactive } from '@arrow-js/core';
 
   function usesDirectSpacetimeAuth() {
     const mode = String((cfg.auth && cfg.auth.mode) || 'spacetime').toLowerCase();
-    return !['cloudflare', 'cloudflare-access', 'cf-access', 'dev', 'development', 'none'].includes(mode);
+    return !['dev', 'development', 'none'].includes(mode);
   }
 
   function safeAuthReturnTo(value) {
@@ -1021,10 +862,6 @@ import { html, reactive } from '@arrow-js/core';
     const next = new URL('/api/v1/auth/start', location.origin);
     next.searchParams.set('returnTo', safeAuthReturnTo(returnTo || authReturnTarget()));
     location.assign(next.toString());
-  }
-
-  async function finishSpacetimeCallback() {
-    location.replace('/');
   }
 
   function clearLocalAuthState() {
@@ -1056,21 +893,15 @@ import { html, reactive } from '@arrow-js/core';
     document.body.className = 'auth-redirect-page';
     document.body.innerHTML = '';
     if (location.pathname === '/auth/callback') {
-      finishSpacetimeCallback().catch(showAuthError);
+      location.replace('/');
       return;
     }
     beginSpacetimeLogin(authReturnTarget()).catch(showAuthError);
   }
 
   function setStatus(text) {
-    if (isTechnicalPublicStatusMessage(text)) return;
+    if (/\b(ffmpeg|h\.?264|h265|h\.?265|root capture|root screenrecord|root shell|screenrecord|codec)\b/i.test(String(text || '').trim())) return;
     statusLine.textContent = localizePublicMessage(text);
-  }
-
-  function sameEmail(left, right) {
-    const cleanLeft = String(left || '').trim().toLowerCase();
-    const cleanRight = String(right || '').trim().toLowerCase();
-    return Boolean(cleanLeft && cleanRight && cleanLeft === cleanRight);
   }
 
   function accountPublicId(email) {
@@ -1104,32 +935,23 @@ import { html, reactive } from '@arrow-js/core';
 	        detail: entry.detail,
 	        queuedAt: entry.at
 	      }).slice(0, 1000);
-	      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '')
+	      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '', entry.rowId || '')
 	        .catch(() => {
 	          if (pendingClientLogs.length < 100) pendingClientLogs.unshift(entry);
 	        });
 	    });
 	  }
 
-  function streamResumeSpinnerVisible() {
-    return Boolean(streamResumeSpinner && !streamResumeSpinner.hidden);
-  }
-
   function showStreamResumeSpinner() {
-    if (!streamResumeSpinner || streamResumeSpinnerVisible()) return;
+    if (!streamResumeSpinner || !streamResumeSpinner.hidden) return;
     streamResumeSpinner.hidden = false;
     publishStreamDebug();
   }
 
   function hideStreamResumeSpinner() {
-    if (!streamResumeSpinner || !streamResumeSpinnerVisible()) return;
+    if (!streamResumeSpinner || streamResumeSpinner.hidden) return;
     streamResumeSpinner.hidden = true;
     publishStreamDebug();
-  }
-
-  function clearPreservedFrame() {
-    fallbackFrameAvailable = false;
-    lastFallbackFrameAt = 0;
   }
 
   function preserveCurrentFrame(reason) {
@@ -1261,444 +1083,171 @@ import { html, reactive } from '@arrow-js/core';
     publishStreamFocus(currentStreamFocusActive(), reason || 'stream_focus_state');
   }
 
-  function beginStreamOpenMetric(kind, reason, force) {
-    activeStreamOpenMetric = null;
-    return null;
+  function clearActivationReconnectBurst() {
+    if (activationReconnectBurstTimer) clearTimeout(activationReconnectBurstTimer);
+    activationReconnectBurstTimer = null;
   }
 
-  function finishStreamOpenMetric(phase, ok, detail) {
-    activeStreamOpenMetric = null;
-    clearResumeWatchdogs();
+  function streamHasFreshRenderedFrame() {
+    return currentRenderedFreshness(performance.now()).liveLabeled;
   }
 
-  function clearResumeWatchdogs() {
-    if (resumeRecoverySoftTimer) {
-      clearTimeout(resumeRecoverySoftTimer);
-      resumeRecoverySoftTimer = null;
-    }
-    if (resumeRecoveryHardTimer) {
-      clearTimeout(resumeRecoveryHardTimer);
-      resumeRecoveryHardTimer = null;
-    }
+  function safeResumeLabel(value, fallback) {
+    return String(value || fallback || 'unknown')
+      .toLowerCase()
+      .replace(/[0-9]/g, '')
+      .replace(/[^a-z_-]+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 48) || fallback || 'unknown';
   }
 
-	  function streamHasFreshRenderedFrame() {
-	    return currentRenderedFreshness(performance.now()).liveLabeled;
-	  }
+  function resumeBooleanLabel(value) { return value ? 'yes' : 'no'; }
 
-	  function safeResumeLabel(value, fallback) {
-	    const label = String(value || fallback || 'unknown')
-	      .toLowerCase()
-	      .replace(/[0-9]/g, '')
-	      .replace(/[^a-z_-]+/g, '_')
-	      .replace(/_+/g, '_')
-	      .replace(/^_+|_+$/g, '')
-	      .slice(0, 48);
-	    return label || fallback || 'unknown';
-	  }
-
-	  function resumeBooleanLabel(value) {
-	    return value ? 'yes' : 'no';
-	  }
-
-	  function randomResumeLetters(length) {
-	    const alphabet = 'abcdefghijklmnopqrstuvwxyz';
-	    const size = Math.max(1, Math.min(24, length || 10));
-	    let out = '';
-	    try {
-	      if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
-	        const bytes = new Uint8Array(size);
-	        window.crypto.getRandomValues(bytes);
-	        for (let i = 0; i < bytes.length; i += 1) out += alphabet[bytes[i] % alphabet.length];
-	        return out;
-	      }
-	    } catch (_) {}
-	    for (let i = 0; i < size; i += 1) out += alphabet[Math.floor(Math.random() * alphabet.length) % alphabet.length];
-	    return out;
-	  }
-
-	  function randomResumeFlowId() {
-	    return `resume_${randomResumeLetters(12)}`;
-	  }
-
-	  function socketStateLabel(state) {
-	    switch (state) {
-	      case WebSocket.CONNECTING:
-	        return 'connecting';
-	      case WebSocket.OPEN:
-	        return 'open';
-	      case WebSocket.CLOSING:
-	        return 'closing';
-	      case WebSocket.CLOSED:
-	        return 'closed';
-	      case -1:
-	        return 'none';
-	      default:
-	        return 'unknown';
-	    }
-	  }
-
-	  function hiddenDurationBucket(hiddenMs) {
-	    if (!Number.isFinite(hiddenMs) || hiddenMs <= 0) return 'none';
-	    if (hiddenMs >= backgroundRecoveryHiddenMs) return 'long';
-	    if (hiddenMs >= oldTabFreshResumeHiddenMs) return 'old';
-	    return 'short';
-	  }
-
-	  function renderedFreshnessLabel() {
-	    const freshness = currentRenderedFreshness(performance.now());
-	    if (!freshness.hasFrame) return 'no_frame';
-	    return safeResumeLabel(freshness.streamFreshnessState, 'stale');
-	  }
-
-	  function decoderStateLabel() {
-	    if (decoderConfigured) return 'configured';
-	    return configured ? 'pending' : 'unconfigured';
-	  }
-
-	  function resumeDiagnosticSnapshot(detail) {
-	    return Object.assign({
-	      visibility: safeResumeLabel(document.visibilityState, 'unknown'),
-	      focus: typeof document.hasFocus === 'function' ? (document.hasFocus() ? 'focused' : 'blurred') : 'unknown',
-	      socket: socketStateLabel(videoSocketState()),
-	      frame: renderedFreshnessLabel(),
-	      configured: resumeBooleanLabel(configured),
-	      decoder: decoderStateLabel(),
-	      rendered: resumeBooleanLabel(hasRenderedFrame),
-	      fallback: resumeBooleanLabel(fallbackFrameAvailable),
-	      stream: streamUnsupported ? 'unsupported' : 'supported'
-	    }, detail || {});
-	  }
+  function hiddenDurationBucket(hiddenMs) {
+    if (!Number.isFinite(hiddenMs) || hiddenMs <= 0) return 'none';
+    if (hiddenMs >= backgroundRecoveryHiddenMs) return 'long';
+    if (hiddenMs >= oldTabFreshResumeHiddenMs) return 'old';
+    return 'short';
+  }
 
   function mediaSessionStuckOnPreservedFrame() {
-    const socketState = videoSocketState();
-    if (socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) return false;
-    if (!hasRenderedFrame && !fallbackFrameAvailable) return false;
-	    const freshness = currentRenderedFreshness(performance.now());
-	    if (freshness.liveLabeled) return false;
-    if (freshness.streamFreshnessState !== 'STALE') return false;
-    return !configured || !decoderConfigured;
+    if (!videoSocketKeepsStreamActive() || (!hasRenderedFrame && !fallbackFrameAvailable)) return false;
+    const freshness = currentRenderedFreshness(performance.now());
+    return !freshness.liveLabeled && freshness.streamFreshnessState === 'STALE' && (!configured || !decoderConfigured);
   }
 
-	  function enqueueResumeSafeLog(flow, event, detail) {
-	    if (!flow || flow.done) return;
-	    if (flow.logCount >= activationResumeLogLimit) {
-	      if (!flow.limitLogged) {
-	        flow.limitLogged = true;
-	        enqueueClientLog({
-	          level: 'info',
-	          event: 'activation_resume_log_limit',
-	          detailJson: safeString({ state: 'limited' }).slice(0, 600),
-	          correlationId: flow.id
-	        });
-	      }
-	      return;
-	    }
-	    flow.logCount += 1;
-	    enqueueClientLog({
-	      level: 'info',
-	      event: safeResumeLabel(event, 'activation_resume_checkpoint'),
-	      detailJson: safeString(detail || {}).slice(0, 600),
-	      correlationId: flow.id
-	    });
-	  }
-
-	  function enqueueCompletedResumeSafeLog(flow, event, detail) {
-	    if (!flow || flow.freshLogged) return;
-	    flow.freshLogged = true;
-	    enqueueClientLog({
-	      level: 'info',
-	      event: safeResumeLabel(event, 'activation_resume_checkpoint'),
-	      detailJson: safeString(detail || {}).slice(0, 600),
-	      correlationId: flow.id
-	    });
-	  }
-
-	  function logResumeCheckpoint(event, detail, flow) {
-	    const targetFlow = flow || activeResumeFlow;
-	    if (!targetFlow) return;
-	    enqueueResumeSafeLog(targetFlow, event, resumeDiagnosticSnapshot(detail));
-	  }
-
-	  function clearActivationReconnectBurst() {
-	    if (activationReconnectBurstTimer) {
-	      clearTimeout(activationReconnectBurstTimer);
-	      activationReconnectBurstTimer = null;
-	    }
-	  }
-
-  function recoverySocketReusable(flow) {
-    if (!flow || !flow.mediaRecoveryStartedAt) return false;
-    if (!videoSocketKeepsStreamActive()) return false;
-    return performance.now() - flow.mediaRecoveryStartedAt < recoveryVideoReconnectDebounceMs;
+  function resumeDiagnosticSnapshot(detail) {
+    return Object.assign({
+      visibility: safeResumeLabel(document.visibilityState, 'unknown'),
+      socket: ['connecting', 'open', 'closing', 'closed'][videoSocketState()] || 'none',
+      fresh: resumeBooleanLabel(streamHasFreshRenderedFrame()),
+      configured: resumeBooleanLabel(configured),
+      decoder: resumeBooleanLabel(decoderConfigured)
+    }, detail || {});
   }
 
-  function noteRecoverySocketReuse(reason, kind, flow) {
-    if (!recoverySocketReusable(flow)) return false;
-    logResumeCheckpoint('activation_resume_socket_reused', {
-      reason: safeResumeLabel(reason, 'media_session_recovery'),
-      kind: safeResumeLabel(kind, 'media_session_recovery')
-    }, flow);
-    return true;
+  function logResumeCheckpoint(event, detail, flow) {
+    const target = flow || activeResumeFlow;
+    if (!target || target.done || target.logs >= 6) return;
+    target.logs += 1;
+    enqueueClientLog({
+      level: 'info',
+      event: compactClientEventName(event),
+      detailJson: safeString(resumeDiagnosticSnapshot(detail)).slice(0, 600),
+      correlationId: target.id
+    });
   }
 
-	  function finishActivationResumeFlow(reason, flow) {
-	    const targetFlow = flow || activeResumeFlow;
-	    if (!targetFlow || targetFlow.done) return;
-	    enqueueResumeSafeLog(targetFlow, 'activation_resume_finish', resumeDiagnosticSnapshot({
-	      result: safeResumeLabel(reason, 'complete'),
-	      phase: targetFlow.phase || 'unknown'
-	    }));
-	    if (reason === 'fresh_frame') {
-	      pendingResumeFreshFrameFlow = null;
-	    } else {
-	      pendingResumeFreshFrameFlow = {
-	        id: targetFlow.id,
-	        reason: targetFlow.reason,
-	        trigger: targetFlow.trigger,
-	        phase: safeResumeLabel(reason, 'complete'),
-	        freshLogged: false
-	      };
-	    }
-	    targetFlow.done = true;
-	    if (targetFlow === activeResumeFlow) {
-	      clearActivationReconnectBurst();
-	      activeResumeFlow = null;
-	    }
-	  }
+  function finishActivationResumeFlow(reason, flow) {
+    const target = flow || activeResumeFlow;
+    if (!target || target.done) return;
+    logResumeCheckpoint(reason === 'fresh_frame' ? 'activation_resume_fresh_frame' : 'activation_resume_finish', {
+      result: safeResumeLabel(reason, 'complete'),
+      elapsedMs: Math.round(performance.now() - target.startedAt)
+    }, target);
+    target.done = true;
+    if (target === activeResumeFlow) {
+      clearActivationReconnectBurst();
+      activeResumeFlow = null;
+    }
+  }
 
-	  function startActivationResumeFlow(reason, trigger, options) {
-	    if (streamUnsupported) return null;
-	    const pauseBurst = Boolean(options && options.pauseBurst);
-	    let flow = activeResumeFlow;
-	    if (flow && !flow.done) {
-	      flow.reason = safeResumeLabel(reason, flow.reason);
-	      flow.trigger = safeResumeLabel(trigger, flow.trigger);
-	      logResumeCheckpoint('activation_resume_merged', {
-	        reason: flow.reason,
-	        trigger: flow.trigger,
-	        phase: pauseBurst ? 'paused' : 'active'
-	      }, flow);
-	    } else {
-	      pendingResumeFreshFrameFlow = null;
-	      flow = {
-	        id: randomResumeFlowId(),
-	        reason: safeResumeLabel(reason, 'activation'),
-	        trigger: safeResumeLabel(trigger, 'activation'),
-	        startedAt: performance.now(),
-	        deadlineAt: performance.now() + activationReconnectBurstMs,
-	        attempts: 0,
-	        mediaRecoveryStartedAt: 0,
-	        logCount: 0,
-	        limitLogged: false,
-	        done: false,
-	        phase: pauseBurst ? 'paused' : 'starting'
-	      };
-	      activeResumeFlow = flow;
-	      logResumeCheckpoint('activation_resume_start', {
-	        reason: flow.reason,
-	        trigger: flow.trigger,
-	        phase: flow.phase
-	      }, flow);
-	    }
-	    if (pauseBurst) return flow;
-	    runActivationReconnectBurst(reason || 'activation', flow);
-	    return flow;
-	  }
+  function startActivationResumeFlow(reason, trigger, options) {
+    if (streamUnsupported) return null;
+    const paused = Boolean(options && options.pauseBurst);
+    let flow = activeResumeFlow;
+    if (!flow || flow.done) {
+      flow = {
+        id: `resume_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        reason: safeResumeLabel(reason, 'activation'),
+        trigger: safeResumeLabel(trigger, 'activation'),
+        startedAt: performance.now(),
+        attempts: 0,
+        logs: 0,
+        done: false,
+        paused
+      };
+      activeResumeFlow = flow;
+      logResumeCheckpoint('activation_resume_start', { trigger: flow.trigger, paused: resumeBooleanLabel(paused) }, flow);
+    } else {
+      flow.reason = safeResumeLabel(reason, flow.reason);
+      flow.trigger = safeResumeLabel(trigger, flow.trigger);
+      flow.paused = paused;
+    }
+    if (paused) {
+      clearActivationReconnectBurst();
+    } else {
+      runActivationReconnectBurst(flow.reason, flow);
+    }
+    return flow;
+  }
 
-	  function activationRetryPhase(attempt) {
-	    if (attempt <= 0) return 'initial';
-	    if (attempt < 4) return 'early';
-	    if (attempt < 8) return 'middle';
-	    return 'late';
-	  }
+  function runActivationReconnectBurst(reason, flow) {
+    if (!flow || flow !== activeResumeFlow || flow.done) return;
+    clearActivationReconnectBurst();
+    if (streamHasFreshRenderedFrame()) {
+      finishActivationResumeFlow('fresh_frame', flow);
+      return;
+    }
+    if (idleDisconnected || document.visibilityState !== 'visible') {
+      flow.paused = true;
+      return;
+    }
+    if (flow.attempts >= activationReconnectMaxTicks || performance.now() - flow.startedAt >= activationReconnectBurstMs) {
+      requestServerRecoveryDebounced(`${reason || 'resume'}_exhausted`, true);
+      finishActivationResumeFlow('exhausted', flow);
+      return;
+    }
+    flow.paused = false;
+    connectSpacetimeState().catch(() => clientLog('spacetime_reconnect_failed', 'activation_resume'));
+    publishCurrentStreamFocus(reason || 'activation');
+    if (flow.attempts === 0 && !mediaSessionStuckOnPreservedFrame()) {
+      connectDirectVideo({ skipEarlyGrace: flow.trigger !== 'initial_load' });
+      requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);
+    } else {
+      recoverFreshMediaSession(reason || 'activation', 'activation_resume', {
+        forceServerRecovery: mediaSessionStuckOnPreservedFrame(),
+        skipEarlyGrace: flow.trigger !== 'initial_load'
+      });
+    }
+    flow.attempts += 1;
+    activationReconnectBurstTimer = setTimeout(
+      () => runActivationReconnectBurst(reason, flow),
+      flow.attempts === 1 ? activationReconnectFirstRetryMs : activationReconnectTickMs
+    );
+  }
 
-	  function runActivationReconnectBurst(reason, flow) {
-	    if (!flow || activeResumeFlow !== flow || flow.done) return;
-	    clearActivationReconnectBurst();
-	    if (streamHasFreshRenderedFrame()) {
-	      flow.phase = 'fresh';
-	      logResumeCheckpoint('activation_resume_fresh_frame', { result: 'fresh' }, flow);
-	      finishActivationResumeFlow('fresh_frame', flow);
-	      return;
-	    }
-	    if (idleDisconnected) {
-	      finishActivationResumeFlow('idle_disconnected', flow);
-	      return;
-	    }
-	    if (document.visibilityState !== 'visible') {
-	      flow.phase = 'paused';
-	      logResumeCheckpoint('activation_resume_paused', { reason: 'hidden' }, flow);
-	      return;
-	    }
-	    const now = performance.now();
-	    if (flow.attempts >= activationReconnectMaxTicks || now >= flow.deadlineAt) {
-	      flow.phase = 'exhausted';
-	      logResumeCheckpoint('activation_resume_exhausted', { result: 'exhausted' }, flow);
-	      finishActivationResumeFlow('exhausted', flow);
-	      return;
-	    }
-	    const attempt = flow.attempts;
-	    const phase = activationRetryPhase(attempt);
-	    flow.phase = phase;
-	    logResumeCheckpoint('activation_resume_retry', {
-	      phase,
-	      action: mediaSessionStuckOnPreservedFrame() ? 'media_deep_recover' : (attempt === 0 ? 'keyframe' : 'socket_reconnect')
-	    }, flow);
-	    connectSpacetimeState().catch(() => clientLog('spacetime_reconnect_failed', 'activation_resume'));
-	    publishCurrentStreamFocus(safeResumeLabel(reason, 'activation'));
-	    const fastResume = flow && flow.trigger !== 'initial_load';
-	    if (attempt === 0 && !mediaSessionStuckOnPreservedFrame()) {
-	      connectDirectVideo({ skipEarlyGrace: fastResume });
-	      requestKeyframeDebounced(`${reason || 'activation'}_activation_keyframe`, 0, true);
-	    } else {
-	      recoverFreshMediaSession(reason || 'activation', 'activation_resume', {
-	        flow,
-	        watchdogs: false,
-	        keyframeReason: `${reason || 'activation'}_activation_keyframe`,
-	        keyframeMinIntervalMs: 0,
-	        serverRecoveryReason: `${reason || 'activation'}_activation_recover`,
-	        forceServerRecovery: mediaSessionStuckOnPreservedFrame(),
-	        skipEarlyGrace: fastResume
-	      });
-	    }
-	    flow.attempts += 1;
-	    activationReconnectBurstTimer = setTimeout(
-	      () => runActivationReconnectBurst(reason, flow),
-	      attempt === 0 ? activationReconnectFirstRetryMs : activationReconnectTickMs
-	    );
-	  }
-
-	  function scheduleResumeWatchdogs(reason) {
-    clearResumeWatchdogs();
-    resumeRecoverySoftTimer = setTimeout(() => {
-      resumeRecoverySoftTimer = null;
-      if (idleDisconnected || document.visibilityState !== 'visible') return;
-      if (streamHasFreshRenderedFrame()) return;
-      if (noteRecoverySocketReuse(reason || 'resume', 'resume_soft_reconnect', activeResumeFlow)) {
-        requestKeyframeDebounced(`${reason || 'resume'}_soft_reconnect`, 0, true);
-        return;
-      }
-      preserveCurrentFrame('resume_soft_reconnect');
+  function recoverFreshMediaSession(reason, kind, options) {
+    if (idleDisconnected || streamUnsupported) return false;
+    options = options || {};
+    const now = performance.now();
+    const reusable = videoSocketKeepsStreamActive()
+      && lastRecoveryVideoReconnectSeq === videoSocketOpenSeq
+      && now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs;
+    if (reusable) {
+      requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_keyframe`, 0, true);
+    } else {
+      lastRecoveryVideoReconnectAt = now;
+      closeEarlyVideo(reason || 'media_session_recovery');
+      if (hiddenVideoCloseTimer) clearTimeout(hiddenVideoCloseTimer);
+      if (hiddenStreamFocusTimer) clearTimeout(hiddenStreamFocusTimer);
+      hiddenVideoCloseTimer = null;
+      hiddenStreamFocusTimer = null;
+      preserveCurrentFrame(`media_recovery:${reason || 'unknown'}`);
       closeDirectVideo();
       resetStreamState({ preserveFrame: true });
-      connectDirectVideo({ skipEarlyGrace: true });
-      requestKeyframeDebounced(`${reason || 'resume'}_soft_reconnect`, 0, true);
-    }, resumeSoftReconnectMs);
-    resumeRecoveryHardTimer = setTimeout(() => {
-      resumeRecoveryHardTimer = null;
-	      if (idleDisconnected || document.visibilityState !== 'visible') return;
-	      if (streamHasFreshRenderedFrame()) return;
-	      recoverFreshMediaSession(reason || 'resume', 'resume_hard_recover', {
-	        flow: activeResumeFlow,
-	        watchdogs: false,
-	        keyframeReason: `${reason || 'resume'}_hard_recover`,
-	        keyframeMinIntervalMs: 0,
-	        serverRecoveryReason: `${reason || 'resume'}_hard_recover`,
-	        forceServerRecovery: false,
-	        skipEarlyGrace: true
-	      });
-	    }, resumeHardRecoverMs);
-	  }
-
-	  function recoverFreshMediaSession(reason, kind, options) {
-	    if (idleDisconnected || streamUnsupported) return false;
-	    options = options || {};
-	    const recoveryReason = safeResumeLabel(reason, 'media_session_recovery');
-	    const recoveryKind = safeResumeLabel(kind, 'media_session_recovery');
-	    const flow = options.flow || activeResumeFlow;
-	    const stuck = mediaSessionStuckOnPreservedFrame();
-	    if (flow) {
-	      if (stuck) {
-	        logResumeCheckpoint('activation_resume_media_stuck', {
-	          reason: recoveryReason,
-	          kind: recoveryKind,
-	          action: 'deep_recover'
-	        }, flow);
-	      }
-	      logResumeCheckpoint('activation_resume_deep_recover', {
-	        reason: recoveryReason,
-	        kind: recoveryKind,
-	        action: 'deep_recover'
-	      }, flow);
-	    }
-    if (noteRecoverySocketReuse(recoveryReason, recoveryKind, flow)) {
-      requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);
-      if (options.forceServerRecovery) {
-        requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);
-      }
-      if (options.watchdogs !== false) {
-        scheduleResumeWatchdogs(reason || 'resume');
-      }
-      return true;
+      showStreamRecovery();
+      connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });
+      lastRecoveryVideoReconnectSeq = videoSocketOpenSeq;
+      requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_keyframe`, 0, true);
+      clientLog('fresh_video_resume', safeString({ reason, kind }));
     }
-    if (flow) flow.mediaRecoveryStartedAt = performance.now();
-	    closeEarlyVideo(reason || 'media_session_recovery');
-	    if (hiddenVideoCloseTimer) {
-	      clearTimeout(hiddenVideoCloseTimer);
-	      hiddenVideoCloseTimer = null;
-	    }
-	    if (hiddenStreamFocusTimer) {
-	      clearTimeout(hiddenStreamFocusTimer);
-	      hiddenStreamFocusTimer = null;
-	    }
-	    preserveCurrentFrame(`fresh_media_session:${reason || 'unknown'}`);
-	    closeDirectVideo();
-	    resetStreamState({ preserveFrame: true });
-	    showStreamRecovery();
-	    beginStreamOpenMetric(kind || 'media_session_recovery', reason || 'resume', true);
-	    connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });
-	    requestKeyframeDebounced(options.keyframeReason || `${reason || 'resume'}_fresh_media`, options.keyframeMinIntervalMs || 0, true);
-	    if (options.forceServerRecovery) {
-	      requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_fresh_media_recover`, true);
-	    }
-	    if (options.watchdogs !== false) {
-	      scheduleResumeWatchdogs(reason || 'resume');
-	    }
-	    return true;
-	  }
-
-	  function forceFreshVideoResume(reason, kind) {
-	    if (idleDisconnected || streamUnsupported) return;
-	    const now = performance.now();
-	    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
-    clientLog('fresh_video_resume', JSON.stringify({
-      reason,
-      kind,
-      configured,
-      frameAgeMs: Math.round(frameAgeMs),
-      socketState: videoSocketState(),
-	      hasRenderedFrame,
-	      fallbackFrameAvailable
-	    }));
-	    recoverFreshMediaSession(reason || 'fresh_resume', kind || 'old_tab_resume', {
-	      keyframeReason: `${reason || 'resume'}_fresh_socket`,
-	      keyframeMinIntervalMs: 0,
-	      skipEarlyGrace: true
-	    });
-	  }
-
-  function restoreCachedVideoForFreshFrame(reason, kind) {
-    if (idleDisconnected || streamUnsupported) return;
-    const now = performance.now();
-    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : -1;
-    clientLog('cached_video_resume', JSON.stringify({
-      reason,
-      kind,
-      configured,
-        frameAgeMs: Math.round(frameAgeMs),
-        socketState: videoSocketState(),
-        hasRenderedFrame,
-        fallbackFrameAvailable
-      }));
-	    recoverFreshMediaSession(reason || 'cached_resume', kind || 'old_tab_resume', {
-	      keyframeReason: `${reason || 'resume'}_cached_keyframe`,
-	      keyframeMinIntervalMs: 0,
-	      serverRecoveryReason: `${reason || 'resume'}_cached_recover`,
-	      forceServerRecovery: false,
-	      skipEarlyGrace: true
-	    });
-	  }
+    if (options.forceServerRecovery) {
+      requestServerRecoveryDebounced(options.serverRecoveryReason || `${reason || 'resume'}_recover`, true);
+    }
+    return true;
+  }
 
   function connect() {
     if (idleDisconnected) return;
@@ -1706,9 +1255,6 @@ import { html, reactive } from '@arrow-js/core';
     keepFirstScreenPinned();
     setConnected('Savienojas');
     connectedAt = performance.now();
-    if (!hasRenderedFrame) {
-      beginStreamOpenMetric('cold_open', 'connect', false);
-    }
     connectSpacetimeState().then(() => {
       publishCurrentStreamFocus('public_connected');
       setConnected('Savienots');
@@ -1727,7 +1273,7 @@ import { html, reactive } from '@arrow-js/core';
     });
     connectDirectVideo();
     if (!hasRenderedFrame) {
-      scheduleResumeWatchdogs('cold_open');
+      startActivationResumeFlow('cold_open', 'watchdog');
     }
   }
 
@@ -1762,7 +1308,8 @@ import { html, reactive } from '@arrow-js/core';
     avcPps = null;
     if (!preserveFrame) {
       hasRenderedFrame = false;
-      clearPreservedFrame();
+      fallbackFrameAvailable = false;
+      lastFallbackFrameAt = 0;
     }
     closeDecoder();
     if (preserveFrame) {
@@ -2023,6 +1570,19 @@ import { html, reactive } from '@arrow-js/core';
     clientLog(event, safeDetail);
   }
 
+  function reportDecoderError(error, mode) {
+    if (document.visibilityState === 'hidden') {
+      if (hiddenDecoderTransientLogged) return;
+      hiddenDecoderTransientLogged = true;
+      sendVideoClientLog('decoder_transient_hidden', {
+        mode: safeResumeLabel(mode, 'unknown'),
+        state: 'hidden_transient'
+      });
+      return;
+    }
+    sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
+  }
+
   function sendVideoSocketClientLog(event, detail) {
     const safeDetail = safeString(detail).slice(0, 500);
     if (videoWs && videoWs.readyState === WebSocket.OPEN) {
@@ -2149,16 +1709,36 @@ import { html, reactive } from '@arrow-js/core';
     return '';
   }
 
+  function controlCodeDecoderResetConfig() {
+    const config = lastDecoderConfig || {};
+    const codec = String(config.codec || '');
+    const codedWidth = Number(config.width || canvas.width || 0);
+    const codedHeight = Number(config.height || canvas.height || 0);
+    if (!codec || !codedWidth || !codedHeight) return null;
+    if (decoderMode === 'avc') {
+      if (!avcDescription) return null;
+      return { codec, codedWidth, codedHeight, description: avcDescription };
+    }
+    return { codec, codedWidth, codedHeight, avc: { format: 'annexb' } };
+  }
+
   function resetControlCodeDecoderBacklog(requestID, reason) {
     requestID = String(requestID || '').trim();
     if (!requestID || lastControlCodeDecoderBacklogResetRequestID === requestID) return false;
     if (!decoder || !decoderConfigured || typeof decoder.reset !== 'function') return false;
     const backlogReason = controlCodeDecoderBacklogReason();
     if (!backlogReason) return false;
+    const resetConfig = controlCodeDecoderResetConfig();
+    if (!resetConfig) return false;
     try {
       preserveCurrentFrame(`control_code_decoder_backlog:${reason || backlogReason}`);
       decoder.reset();
+      decoderConfigured = false;
       pendingFrameMetadata = [];
+      // VideoDecoder.reset() leaves the decoder unconfigured. Re-arm the same
+      // decoder before asking the phone for the fresh control-code keyframe.
+      decoder.configure(resetConfig);
+      decoderConfigured = true;
       needsKeyFrame = true;
       lastAcceptedFrameSequence = Number(lastRenderedFrameSequence || 0);
       lastAcceptedFrameTimestamp = Number(lastRenderedFrameTimestamp || 0);
@@ -2175,6 +1755,7 @@ import { html, reactive } from '@arrow-js/core';
       }));
       return true;
     } catch (error) {
+      decoderConfigured = false;
       sendVideoClientLog('control_code_decoder_backlog_reset_failed', error && error.message || 'reset failed');
       return false;
     }
@@ -2214,7 +1795,7 @@ import { html, reactive } from '@arrow-js/core';
       hasRenderedFrame,
       hasFallbackFrame: fallbackFrameAvailable,
       lastFallbackFrameAt,
-      streamResumeSpinnerVisible: streamResumeSpinnerVisible(),
+      streamResumeSpinnerVisible: Boolean(streamResumeSpinner && !streamResumeSpinner.hidden),
       latestStreamStatus,
       controlCodeCapture: lastControlCodeCaptureDebug
     };
@@ -2494,7 +2075,6 @@ import { html, reactive } from '@arrow-js/core';
         firstRenderedTraceSent = true;
         sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);
       }
-      finishStreamOpenMetric('first_fresh_frame', true, firstFrameDetail);
       maybePrepareControlCodeResultFrame();
       maybeCaptureControlCodeResultImage();
       hideEmpty();
@@ -2591,7 +2171,7 @@ import { html, reactive } from '@arrow-js/core';
         renderDecodedFrame(frame, 'annexb');
       },
       error: (error) => {
-        sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
+        reportDecoderError(error, 'annexb');
         needsKeyFrame = true;
         switchToAvcAdapter('decoder_error');
       }
@@ -2616,7 +2196,7 @@ import { html, reactive } from '@arrow-js/core';
         renderDecodedFrame(frame, 'avc');
       },
       error: (error) => {
-        sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
+        reportDecoderError(error, 'avc');
         needsKeyFrame = true;
         resetDecoderForRecovery('decoder_error_avc');
         requestKeyframe('decoder_error_avc');
@@ -2656,14 +2236,12 @@ import { html, reactive } from '@arrow-js/core';
   }
 
 	  async function fetchAuthSessionToken() {
-	    if (!usesDirectSpacetimeAuth()) {
-	      throw new Error('Direct SpacetimeAuth is disabled for this ticket session.');
-	    }
+	    if (!usesDirectSpacetimeAuth()) throw new Error('Direct ticket state is disabled.');
 	    const response = await fetch('/api/v1/auth/session', { cache: 'no-store' });
 	    const payload = await response.json().catch(() => ({}));
 	    if (payload && payload.authenticated && payload.spacetime && payload.spacetime.authRequired) {
-	      beginSpacetimeLogin(authReturnTarget());
-	      throw new Error('Direct SpacetimeAuth session refresh required.');
+	      if (String((cfg.auth && cfg.auth.mode) || '').toLowerCase() === 'spacetime') beginSpacetimeLogin(authReturnTarget());
+	      throw new Error('Direct ticket session refresh required.');
 	    }
 	    if (!response.ok || !payload.ok || !payload.spacetime || !payload.spacetime.token) {
 	      throw new Error(payload.message || payload.error || 'SpacetimeAuth session is unavailable.');
@@ -2711,7 +2289,6 @@ import { html, reactive } from '@arrow-js/core';
       if (client && typeof client.close === 'function') client.close();
     } catch (_) {}
     clearLocalAuthState();
-    spacetimeDirectUnavailable = false;
     spacetimeDirectUnavailableLogged = false;
 
     spacetimeExpiredTokenRefreshPromise = (async () => {
@@ -2729,20 +2306,20 @@ import { html, reactive } from '@arrow-js/core';
 
   async function connectSpacetimeState() {
     if (idleDisconnected) return;
-    if (!usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
+    if (!usesDirectSpacetimeAuth() || spacetimeClient) return;
     if (spacetimeClientConnectPromise) return spacetimeClientConnectPromise;
     spacetimeClientConnectPromise = (async () => {
-      if (idleDisconnected || !usesDirectSpacetimeAuth() || spacetimeClient || spacetimeDirectUnavailable) return;
+      if (idleDisconnected || !usesDirectSpacetimeAuth() || spacetimeClient) return;
       let token = '';
       try {
         await loadSpacetimeClientScript();
         token = await spacetimeToken();
       } catch (error) {
-        spacetimeDirectUnavailable = true;
         if (!spacetimeDirectUnavailableLogged) {
           spacetimeDirectUnavailableLogged = true;
           clientLog('spacetime_direct_unavailable', error && error.message);
         }
+		setTimeout(() => { if (!idleDisconnected && !spacetimeClient) connectSpacetimeState().catch(() => {}); }, 1000);
         return;
       }
       if (spacetimeClient) return;
@@ -2987,6 +2564,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodePopupFrameProof() {
+    const sample = (x, y, width, height) => canvasRegionFingerprint({ x, y, width, height });
     function regionOrangeCellRatio(region) {
       if (!hasRenderedFrame || !canvas.width || !canvas.height || !region) return 0;
       const width = Math.max(1, Math.round(Number(region.width || 0) * canvas.width));
@@ -3019,54 +2597,14 @@ import { html, reactive } from '@arrow-js/core';
         return 0;
       }
     }
-    const keyboard = canvasRegionFingerprint({
-      x: 0.08,
-      y: 0.62,
-      width: 0.84,
-      height: 0.34
-    });
-    const dialog = canvasRegionFingerprint({
-      x: 0.16,
-      y: 0.38,
-      width: 0.68,
-      height: 0.22
-    });
-    const dialogUpper = canvasRegionFingerprint({
-      x: 0.16,
-      y: 0.30,
-      width: 0.68,
-      height: 0.22
-    });
-    const inputLine = canvasRegionFingerprint({
-      x: 0.24,
-      y: 0.52,
-      width: 0.52,
-      height: 0.045
-    });
-    const inputLineUpper = canvasRegionFingerprint({
-      x: 0.24,
-      y: 0.41,
-      width: 0.52,
-      height: 0.045
-    });
-    const dimOverlay = canvasRegionFingerprint({
-      x: 0.08,
-      y: 0.30,
-      width: 0.84,
-      height: 0.44
-    });
-    const okButton = canvasRegionFingerprint({
-      x: 0.64,
-      y: 0.51,
-      width: 0.18,
-      height: 0.07
-    });
-    const okButtonUpper = canvasRegionFingerprint({
-      x: 0.64,
-      y: 0.43,
-      width: 0.18,
-      height: 0.07
-    });
+    const keyboard = sample(0.08, 0.62, 0.84, 0.34);
+    const dialog = sample(0.16, 0.38, 0.68, 0.22);
+    const dialogUpper = sample(0.16, 0.30, 0.68, 0.22);
+    const inputLine = sample(0.24, 0.52, 0.52, 0.045);
+    const inputLineUpper = sample(0.24, 0.41, 0.52, 0.045);
+    const dimOverlay = sample(0.08, 0.30, 0.84, 0.44);
+    const okButton = sample(0.64, 0.51, 0.18, 0.07);
+    const okButtonUpper = sample(0.64, 0.43, 0.18, 0.07);
     const keyboardVisible = Boolean(keyboard &&
       keyboard.lightCellRatio >= 0.58 &&
       keyboard.mean >= 150 &&
@@ -3088,18 +2626,8 @@ import { html, reactive } from '@arrow-js/core';
       inputLine.contrastScore >= 18) || Boolean(inputLineUpper &&
       inputLineUpper.darkCellRatio >= 0.08 &&
       inputLineUpper.contrastScore >= 18);
-    const okButtonLowerOrangeRatio = regionOrangeCellRatio({
-      x: 0.64,
-      y: 0.51,
-      width: 0.18,
-      height: 0.07
-    });
-    const okButtonUpperOrangeRatio = regionOrangeCellRatio({
-      x: 0.64,
-      y: 0.43,
-      width: 0.18,
-      height: 0.07
-    });
+    const okButtonLowerOrangeRatio = regionOrangeCellRatio({ x: 0.64, y: 0.51, width: 0.18, height: 0.07 });
+    const okButtonUpperOrangeRatio = regionOrangeCellRatio({ x: 0.64, y: 0.43, width: 0.18, height: 0.07 });
     const okButtonOrangeRatio = Math.max(okButtonLowerOrangeRatio, okButtonUpperOrangeRatio);
     const dialogGhostVisible = Boolean(dialogProof &&
       dialogProof.lightCellRatio >= 0.24 &&
@@ -3126,7 +2654,7 @@ import { html, reactive } from '@arrow-js/core';
     const popupKeyboardVisible = dialogVisible && keyboardVisible;
     return {
       keyboardVisible: popupKeyboardVisible,
-      popupVisible: dialogVisible && (okButtonVisible || inputLineVisible),
+      popupVisible,
       dialogGhostVisible,
       dimOverlayVisible,
       unsafeOverlayVisible: popupVisible || popupKeyboardVisible || dialogGhostVisible || (dimOverlayVisible && (popupVisible || dialogGhostVisible || popupKeyboardVisible)),
@@ -3138,7 +2666,6 @@ import { html, reactive } from '@arrow-js/core';
       popupContrastScore: dialogProof ? Math.round(Number(dialogProof.contrastScore || 0) * 10) / 10 : 0,
       dimOverlayMean: dimOverlay ? Math.round(Number(dimOverlay.mean || 0) * 10) / 10 : 0,
       dimOverlayContrastScore: dimOverlay ? Math.round(Number(dimOverlay.contrastScore || 0) * 10) / 10 : 0,
-      popupInputLineDarkCellRatio: inputLine ? Math.round(Number(inputLine.darkCellRatio || 0) * 100) / 100 : 0,
       okButtonOrangeRatio: Math.round(okButtonOrangeRatio * 100) / 100,
       okButtonVisible,
       inputLineVisible
@@ -3229,18 +2756,8 @@ import { html, reactive } from '@arrow-js/core';
 
   function controlCodeGeneratedFrameProof() {
     const chip = controlCodeResultChipProof();
-    const resultBar = canvasRegionFingerprint({
-      x: 0.14,
-      y: chip.chipY || 0.55,
-      width: 0.72,
-      height: 0.06
-    });
-    const codeArea = canvasRegionFingerprint({
-      x: 0.18,
-      y: Math.max(0.12, chip.chipY - 0.34),
-      width: 0.64,
-      height: 0.30
-    });
+    const resultBar = canvasRegionFingerprint({ x: 0.14, y: chip.chipY || 0.55, width: 0.72, height: 0.06 });
+    const codeArea = canvasRegionFingerprint({ x: 0.18, y: Math.max(0.12, chip.chipY - 0.34), width: 0.64, height: 0.30 });
     const generatedBarVisible = Boolean(resultBar &&
       Number(resultBar.darkCellRatio || 0) >= 0.24 &&
       Number(resultBar.lightCellRatio || 0) >= 0.22 &&
@@ -3348,23 +2865,6 @@ import { html, reactive } from '@arrow-js/core';
 
   const controlCodeSafeGeneratedFrameRequiredCount = 1;
   const controlCodeTrustedProofSafeGeneratedFrameRequiredCount = 1;
-
-  function beginControlCodeMetric(digitCount) {
-    activeControlCodeMetric = null;
-    return null;
-  }
-
-  function noteControlCodeMetricPhase(phase, request, ok, detail) {
-    return;
-  }
-
-  function noteControlCodeRequestMetric(request) {
-    return;
-  }
-
-  function finishControlCodeMetric(outcome, ok, detail) {
-    activeControlCodeMetric = null;
-  }
 
   function controlCodeCandidateFrameKey(proof) {
     return [
@@ -3497,19 +2997,10 @@ import { html, reactive } from '@arrow-js/core';
     proof.fingerprintDifferenceScore = Math.round(Number(difference.score || 0) * 10) / 10;
     proof.fingerprintChangedCells = Number(difference.changedCells || 0);
     const popupProof = controlCodePopupFrameProof();
-    proof.popupKeyboardVisible = popupProof.keyboardVisible;
-    proof.popupVisible = popupProof.popupVisible;
-    proof.popupGhostVisible = popupProof.dialogGhostVisible;
-    proof.dimOverlayVisible = popupProof.dimOverlayVisible;
-    proof.unsafeOverlayVisible = popupProof.unsafeOverlayVisible;
-    proof.popupLightCellRatio = popupProof.popupLightCellRatio;
-    proof.popupDarkCellRatio = popupProof.popupDarkCellRatio;
-    proof.popupContrastScore = popupProof.popupContrastScore;
-    proof.dimOverlayMean = popupProof.dimOverlayMean;
-    proof.dimOverlayContrastScore = popupProof.dimOverlayContrastScore;
-    proof.keyboardLightCellRatio = popupProof.keyboardLightCellRatio;
-    proof.keyboardMean = popupProof.keyboardMean;
-    proof.keyboardContrastScore = popupProof.keyboardContrastScore;
+    Object.assign(proof, popupProof, {
+      popupKeyboardVisible: popupProof.keyboardVisible,
+      popupGhostVisible: popupProof.dialogGhostVisible
+    });
     if (popupProof.unsafeOverlayVisible) {
       resetControlCodeSafeGeneratedFrame('unsafe_overlay');
       proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
@@ -3526,22 +3017,7 @@ import { html, reactive } from '@arrow-js/core';
       proof.trustedPhonePostSubmitProof = true;
     }
     const generatedProof = controlCodeGeneratedFrameProof();
-    proof.generatedVisible = generatedProof.generatedVisible;
-    proof.generatedChipVisible = generatedProof.generatedChipVisible;
-    proof.generatedChipDarkRatio = generatedProof.generatedChipDarkRatio;
-    proof.generatedChipLightRatio = generatedProof.generatedChipLightRatio;
-    proof.generatedChipRows = generatedProof.generatedChipRows;
-    proof.generatedChipY = generatedProof.generatedChipY;
-    proof.generatedChipScore = generatedProof.generatedChipScore;
-    proof.generatedBarVisible = generatedProof.generatedBarVisible;
-    proof.generatedCodeVisible = generatedProof.generatedCodeVisible;
-    proof.generatedBarDarkCellRatio = generatedProof.generatedBarDarkCellRatio;
-    proof.generatedBarLightCellRatio = generatedProof.generatedBarLightCellRatio;
-    proof.generatedBarContrastScore = generatedProof.generatedBarContrastScore;
-    proof.generatedCodeDarkCellRatio = generatedProof.generatedCodeDarkCellRatio;
-    proof.generatedCodeLightCellRatio = generatedProof.generatedCodeLightCellRatio;
-    proof.generatedCodeContrastScore = generatedProof.generatedCodeContrastScore;
-    proof.generatedCodeScore = generatedProof.generatedCodeScore;
+    Object.assign(proof, generatedProof);
     const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||
       Boolean(trustedPhonePostSubmitProof &&
         generatedProof.generatedChipVisible &&
@@ -3620,7 +3096,97 @@ import { html, reactive } from '@arrow-js/core';
     return true;
   }
 
-  function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {
+  function clearUnpaintedControlCodeResultImage(requestID) {
+    if (controlCodePreparedCaptureDisplayedRequestID === requestID) return;
+    setControlCodeResultVisible(false);
+    codeResultImage.hidden = true;
+    codeResultImage.removeAttribute('src');
+    codeResultArea.dataset.status = 'waiting';
+    codeResultArea.style.background = '';
+  }
+
+  function waitForControlCodeResultImageReady(image) {
+    const ready = () => Boolean(image && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      let decodeSettled = typeof image.decode !== 'function';
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        image.removeEventListener('load', onLoad);
+        image.removeEventListener('error', onError);
+        resolve(Boolean(value));
+      };
+      const finishWhenReady = () => {
+        if (decodeSettled && ready()) finish(true);
+      };
+      const onLoad = () => finishWhenReady();
+      const onError = () => finish(false);
+      image.addEventListener('load', onLoad, { once: true });
+      image.addEventListener('error', onError, { once: true });
+      timer = setTimeout(() => finish(false), controlCodeResultImageReadyTimeoutMs);
+      if (typeof image.decode === 'function') {
+        try {
+          image.decode()
+            .then(() => {
+              decodeSettled = true;
+              finishWhenReady();
+            })
+            .catch(() => {
+              // A browser may reject decode() for an already decoded data URL.
+              // Fall back only when load state and natural dimensions prove it.
+              decodeSettled = true;
+              finishWhenReady();
+            });
+        } catch (_) {
+          decodeSettled = true;
+          finishWhenReady();
+        }
+      } else {
+        finishWhenReady();
+      }
+    });
+  }
+
+  function controlCodeResultPaintReady(requestID) {
+    if (!requestID || document.visibilityState !== 'visible') return false;
+    if (!document.documentElement.contains(codeResultArea) || !document.documentElement.contains(codeResultImage)) return false;
+    if (codeResultArea.hidden || codeResultImage.hidden) return false;
+    if (!codeResultImage.complete || codeResultImage.naturalWidth <= 0 || codeResultImage.naturalHeight <= 0) return false;
+    const areaRect = codeResultArea.getBoundingClientRect();
+    const imageRect = codeResultImage.getBoundingClientRect();
+    if (areaRect.width <= 0 || areaRect.height <= 0 || imageRect.width <= 0 || imageRect.height <= 0) return false;
+    const viewportWidth = Math.max(0, Number(window.innerWidth || document.documentElement.clientWidth || 0));
+    const viewportHeight = Math.max(0, Number(window.innerHeight || document.documentElement.clientHeight || 0));
+    const visibleWidth = Math.min(imageRect.right, viewportWidth) - Math.max(imageRect.left, 0);
+    const visibleHeight = Math.min(imageRect.bottom, viewportHeight) - Math.max(imageRect.top, 0);
+    if (viewportWidth <= 0 || viewportHeight <= 0 || visibleWidth <= 0 || visibleHeight <= 0) return false;
+    const areaStyle = window.getComputedStyle(codeResultArea);
+    const imageStyle = window.getComputedStyle(codeResultImage);
+    return areaStyle.display !== 'none' && areaStyle.visibility !== 'hidden' && Number(areaStyle.opacity || 1) > 0 &&
+      imageStyle.display !== 'none' && imageStyle.visibility !== 'hidden' && Number(imageStyle.opacity || 1) > 0;
+  }
+
+  function waitForControlCodePaintFrame() {
+    return new Promise((resolve) => {
+      let settled = false;
+      let frameID = 0;
+      let timer = null;
+      const finish = (painted) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (!painted && frameID) cancelAnimationFrame(frameID);
+        resolve(Boolean(painted));
+      };
+      timer = setTimeout(() => finish(false), controlCodeResultPaintFrameTimeoutMs);
+      frameID = requestAnimationFrame(() => finish(true));
+    });
+  }
+
+  async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {
     if (!requestID || !capturedImage) return false;
     codeResultImage.src = capturedImage;
     setControlCodeResultVisible(true);
@@ -3634,33 +3200,45 @@ import { html, reactive } from '@arrow-js/core';
     codeResultTimer.textContent = '';
     codeResultArea.dataset.status = 'succeeded';
     codeResultArea.style.background = '#000';
-    if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
-      controlCodePreparedCaptureDisplayedRequestID = requestID;
-      finishControlCodeMetric(outcome || 'browser_capture_displayed', true, {
-        candidateFrameEpoch: Number(proof.candidateFrameEpoch || 0),
-        candidateFrameSequence: Number(proof.candidateFrameSequence || 0),
-        safeGeneratedFrameCount: controlCodeSafeGeneratedFrameCount,
+    let painted = false;
+    try {
+      if (!await waitForControlCodeResultImageReady(codeResultImage)) return false;
+      if (!controlCodeResultPaintReady(requestID)) return false;
+      if (!await waitForControlCodePaintFrame()) return false;
+      if (!await waitForControlCodePaintFrame()) return false;
+      if (!controlCodeResultPaintReady(requestID)) return false;
+      if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+      painted = true;
+      if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
+        controlCodePreparedCaptureDisplayedRequestID = requestID;
+        controlCodeCaptureTrace('control_code_frame_painted', { requestId: requestID, status: 'succeeded' }, proof, {
+          outcome: outcome || 'browser_capture_painted',
+          provisional: false
+        });
+        // Compatibility event: this now means the image survived the paint
+        // handshake, not merely that its data URL was assigned.
+        controlCodeCaptureTrace('control_code_frame_displayed', { requestId: requestID, status: 'succeeded' }, proof, {
+          outcome: outcome || 'browser_capture_displayed',
+          provisional: false
+        });
+      }
+      lastControlCodeCaptureDebug = Object.assign({}, proof, {
+        accepted: proof.accepted,
+        candidateAccepted: true,
         fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
-        fingerprintChangedCells: proof.fingerprintChangedCells,
-        provisional: Boolean(proof.provisional)
+        capturedNaturalWidth: codeResultImage.naturalWidth,
+        capturedNaturalHeight: codeResultImage.naturalHeight,
+        capturedRenderedWidth: Math.round(codeResultImage.getBoundingClientRect().width),
+        capturedRenderedHeight: Math.round(codeResultImage.getBoundingClientRect().height),
+        controlCodeSafeGeneratedFrameCount,
+        controlCodeFrozenFrameKey,
+        capturedAt: Date.now()
       });
-      controlCodeCaptureTrace('control_code_frame_displayed', { requestId: requestID, status: 'succeeded' }, proof, {
-        outcome: outcome || 'browser_capture_displayed',
-        provisional: Boolean(proof.provisional)
-      });
+      publishStreamDebug();
+      return true;
+    } finally {
+      if (!painted) clearUnpaintedControlCodeResultImage(requestID);
     }
-    lastControlCodeCaptureDebug = Object.assign({}, proof, {
-      accepted: proof.accepted,
-      candidateAccepted: true,
-      fingerprintDifferenceScore: proof.fingerprintDifferenceScore,
-      capturedNaturalWidth: canvas.width,
-      capturedNaturalHeight: canvas.height,
-      controlCodeSafeGeneratedFrameCount,
-      controlCodeFrozenFrameKey,
-      capturedAt: Date.now()
-    });
-    publishStreamDebug();
-    return true;
   }
 
   function controlCodeResultDisplayedForRequest(requestID) {
@@ -3697,10 +3275,6 @@ import { html, reactive } from '@arrow-js/core';
     controlCodePreparedCaptureProof = Object.assign({}, proof, {
       preparedAt: Date.now()
     });
-    const capturedImage = captureControlCodeResultImage(proof);
-    if (capturedImage) {
-      displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');
-    }
     return true;
   }
 
@@ -3813,27 +3387,35 @@ import { html, reactive } from '@arrow-js/core';
     return captureCanvas.toDataURL('image/png');
   }
 
+  function scheduleControlCodeResultCaptureRetry(requestID) {
+    requestID = String(requestID || '').trim();
+    if (!requestID || controlCodeResultCaptureTimer || locallyClosedControlCodeRequestIDs.has(requestID)) return;
+    controlCodeResultCaptureTimer = setTimeout(() => {
+      controlCodeResultCaptureTimer = null;
+      if (!codeRequest || String(codeRequest.requestId || '').trim() !== requestID || codeRequest.status !== 'succeeded') return;
+      waitForControlCodeResultScreenshot(codeRequest);
+    }, controlCodeCapturePollMs);
+  }
+
   async function captureControlCodeResultScreenshot(request, proof) {
-    if (!request || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
+    if (!request || request.status !== 'succeeded' || !hasRenderedFrame || !canvas.width || !canvas.height) return false;
     if (!proof || !proof.accepted) return false;
     const requestID = String(request.requestId || '').trim();
     if (!requestID) return false;
     if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+    let capturedAndAcknowledged = false;
+    controlCodeCaptureAckInFlightRequestID = requestID;
     try {
       if (!controlCodeFrozenCandidateFrameForProof(proof)) return false;
       const capturedImage = captureControlCodeResultImage(proof);
       if (!capturedImage) return false;
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
-      displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');
-      controlCodeCaptureAckInFlightRequestID = requestID;
-      try {
-        await confirmControlCodeBrowserCapture(request, proof);
-        controlCodeResultCapturedRequestID = requestID;
-      } finally {
-        if (controlCodeCaptureAckInFlightRequestID === requestID) {
-          controlCodeCaptureAckInFlightRequestID = '';
-        }
-      }
+      const painted = await displayControlCodeResultImage(requestID, proof, capturedImage, 'browser_capture_displayed');
+      if (!painted) return false;
+      if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+      await confirmControlCodeBrowserCapture(request, proof);
+      controlCodeResultCapturedRequestID = requestID;
+      capturedAndAcknowledged = true;
       if (!codeRequest || String(codeRequest.requestId || '').trim() !== requestID || codeRequest.status !== 'succeeded') {
         return false;
       }
@@ -3843,12 +3425,16 @@ import { html, reactive } from '@arrow-js/core';
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
       reportClientFault('control_code_browser_capture_failed', error);
       if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
-        finishControlCodeMetric('browser_capture_failed', false, {
-          error: error && error.message || 'capture failed'
-        });
         failControlCodeResultScreenshotWait();
       }
       return false;
+    } finally {
+      if (controlCodeCaptureAckInFlightRequestID === requestID) {
+        controlCodeCaptureAckInFlightRequestID = '';
+      }
+      if (!capturedAndAcknowledged && !locallyClosedControlCodeRequestIDs.has(requestID)) {
+        scheduleControlCodeResultCaptureRetry(requestID);
+      }
     }
   }
 
@@ -3869,9 +3455,6 @@ import { html, reactive } from '@arrow-js/core';
     codeResultValue.textContent = '';
     codeResultValue.style.display = '';
     codeResultTimer.hidden = false;
-    finishControlCodeMetric('browser_capture_wait_failed', false, {
-      requestKey: codeRequest && codeRequest.requestId ? accountPublicId(String(codeRequest.requestId)) : ''
-    });
   }
 
   function maybeCaptureControlCodeResultImage() {
@@ -4019,6 +3602,19 @@ import { html, reactive } from '@arrow-js/core';
       Boolean(codeRequest && codeRequest.requestId === requestID);
   }
 
+  function normalizedControlCodeRequestSignature(request) {
+    if (!request) return 'none';
+    const fields = [
+      'requestId', 'ownerPublicId', 'sessionId', 'status', 'reason', 'message',
+      'queuePosition', 'requestedAt', 'updatedAt', 'expiresAt', 'resultExpiresAt',
+      'resultProof', 'resultProofAt', 'captureRequired', 'captureAcknowledged',
+      'cleanupPending', 'streamEpoch', 'frameSequence', 'minFrameSequence',
+      'resultFrameEpoch', 'resultMinFrameSequence', 'captureFrameEpoch',
+      'captureFrameSequence'
+    ];
+    return fields.map((field) => `${field}=${safeString(request[field])}`).join('|');
+  }
+
   function renderControlCodeRequest(request) {
     if (request && !isOwnedControlCodeRequest(request)) {
       clientLog('control_code_message_ignored', 'not_requesting_session');
@@ -4037,13 +3633,17 @@ import { html, reactive } from '@arrow-js/core';
         request = codeRequest;
       }
     }
-    codeRequest = request || codeRequest;
+    const nextRequest = request || codeRequest;
+    const renderSignature = normalizedControlCodeRequestSignature(nextRequest);
+    codeRequest = nextRequest;
+    updateControlCodeSubmitAvailability();
+    if (renderSignature === lastRenderedControlCodeRequestSignature) return;
+    lastRenderedControlCodeRequestSignature = renderSignature;
     const current = codeRequest;
     const currentRequestID = String(current && current.requestId || '').trim();
     const busy = current && (current.status === 'queued' || current.status === 'running');
     codeRequestState.textContent = controlCodeStatusText(current && current.status, current && current.reason);
     codeRequestDetail.textContent = controlCodeDetailText(current);
-    updateControlCodeSubmitAvailability();
     if (requestID && !requestID.startsWith('pending:') && current && (busy || current.status === 'succeeded')) {
       rememberControlCodeBaselineFrame(requestID);
     }
@@ -4058,9 +3658,6 @@ import { html, reactive } from '@arrow-js/core';
         scheduleControlCodeTicker(current);
         return;
       }
-    }
-    if (current) {
-      noteControlCodeRequestMetric(current);
     }
     if (!current || current.status === 'closed' || current.status === 'expired') {
       setControlCodeResultVisible(false);
@@ -4083,9 +3680,6 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     if (current.status === 'failed') {
-      finishControlCodeMetric('request_failed', false, {
-        reason: String(current.reason || current.message || 'failed')
-      });
       setControlCodeResultVisible(true);
       clearControlCodeResultCapture();
       codeResultArea.dataset.status = 'failed';
@@ -4193,14 +3787,10 @@ import { html, reactive } from '@arrow-js/core';
     controlCodeSubmitInFlight = true;
     updateControlCodeSubmitAvailability();
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
-    beginControlCodeMetric(digits.length);
     const submittedAt = performance.now();
     try {
       await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision), 'control_code_request');
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
-      noteControlCodeMetricPhase('request_mutation_complete', null, true, {
-        mutationLatencyMs
-      });
       requestKeyframeDebounced('control_code_request_submitted', 0, true);
       clientLog('control_code_submitted', JSON.stringify({
         digitCount: digits.length,
@@ -4223,9 +3813,6 @@ import { html, reactive } from '@arrow-js/core';
       setStatus('Pieprasījums nosūtīts.');
     } catch (error) {
       clientLog('control_code_request_failed', error && error.message || 'request failed');
-      finishControlCodeMetric('request_submit_failed', false, {
-        error: error && error.message || 'request failed'
-      });
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
       controlCodeSubmitInFlight = false;
@@ -4234,30 +3821,30 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   async function closeCurrentControlCode(openNext) {
-    const requestID = codeRequest && codeRequest.requestId;
+    const request = codeRequest;
+    const requestID = String(request && request.requestId || '').trim();
+    const canCloseRequest = Boolean(requestID && (
+      ownedControlCodeRequestIDs.has(String(requestID)) || isOwnedControlCodeRequest(request)
+    ));
     if (requestID) {
-      if (!ownedControlCodeRequestIDs.has(String(requestID))) {
-        clientLog('control_code_close_ignored', 'not_owned');
-        setControlCodeResultVisible(false);
-        return;
-      }
+      // The result overlay is requester-local. Clear it first even if a delayed
+      // subscription update has not restored the ownership cache yet.
       locallyClosedControlCodeRequestIDs.add(String(requestID));
-      setControlCodeResultVisible(false);
-      clearControlCodeResultCapture();
-      scheduleControlCodeTicker(null);
-      if (codeRequest && String(codeRequest.requestId || '').trim() === String(requestID)) {
-        codeRequest = null;
-      }
-      finishControlCodeMetric('closed_by_browser', false, {
-        requestKey: accountPublicId(String(requestID))
-      });
+    }
+    setControlCodeResultVisible(false);
+    clearControlCodeResultCapture();
+    scheduleControlCodeTicker(null);
+    if (requestID && codeRequest && String(codeRequest.requestId || '').trim() === requestID) {
+      codeRequest = null;
+    }
+    if (requestID && canCloseRequest) {
       try {
         await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'), 'control_code_close');
       } catch (error) {
         clientLog('control_code_close_failed', error && error.message || 'close failed');
       }
-    } else {
-      setControlCodeResultVisible(false);
+    } else if (requestID) {
+      clientLog('control_code_close_local_only', 'not_owned');
     }
     if (openNext) openControlCodeDialog();
   }
@@ -4268,35 +3855,12 @@ import { html, reactive } from '@arrow-js/core';
       event.stopPropagation();
     }
     if (codeDialogOpen) return;
-    if (!codeResultArea.hidden && codeRequest) {
+    if (!codeResultArea.hidden) {
       closeCurrentControlCode(false);
       return;
     }
     if (controlCodeRequestOccupiesQueue()) return;
     openControlCodeDialog();
-  }
-
-  function closeControlCodeFromHotspot(event) {
-    if (event) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-    if (codeDialogOpen || codeResultArea.hidden) return;
-    closeCurrentControlCode(false);
-  }
-
-  function configureStreamInfo(config) {
-    if (config.width && config.height && !configured) {
-      preserveCurrentFrame('configure_stream_info');
-      canvas.width = config.width;
-      canvas.height = config.height;
-      redrawPreservedFrame();
-      streamSize = { width: config.width, height: config.height };
-      resizeCanvasBox();
-    }
-    if (config.type === 'config' && videoWs && videoWs.readyState === WebSocket.OPEN) {
-      configureDecoder(config).catch((error) => sendVideoClientLog('decoder_config_failed', error && error.message || 'config failed'));
-    }
   }
 
   function relayReportToStreamStatus(report) {
@@ -4363,7 +3927,7 @@ import { html, reactive } from '@arrow-js/core';
     scheduleControlCodeFastStateExpiryCheck();
     const viewers = activeViewerPresence(state);
     const visibleViewerCount = Number.isFinite(Number(state.viewerCount)) ? Number(state.viewerCount) : viewers.length;
-    renderPanelSummary(viewers, visibleViewerCount);
+    renderViewerSummary(viewers, visibleViewerCount);
     const relayStatus = relayReportToStreamStatus(state.relayCurrentReport);
     if (relayStatus) handleStreamStatus(relayStatus);
     const ownedRequest = latestOwnedControlCodeRequest(state);
@@ -4402,10 +3966,6 @@ import { html, reactive } from '@arrow-js/core';
     }));
   }
 
-  function renderPanelSummary(viewers, visibleViewerCount) {
-    renderViewerSummary(viewers, visibleViewerCount);
-  }
-
   function renderViewerSummary(viewers, visibleViewerCount) {
     const count = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : activeViewers(viewers).length;
     if (viewerCount) viewerCount.textContent = String(count);
@@ -4416,11 +3976,19 @@ import { html, reactive } from '@arrow-js/core';
     const active = activeViewers(viewers);
     const countValue = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : active.length;
     presenceState.visibleViewerCount = countValue;
-    presenceState.viewers = active.map((viewer, index) => ({
+    const nextViewers = active.map((viewer, index) => ({
       key: `${viewer.publicId || viewer.label || 'viewer'}-${index}`,
-      label: viewer.label || `Skatītājs ${index + 1}`
+      label: viewer.label || `Skatītājs ${index + 1}`,
+      mark: 'skatās'
     }));
-    presenceState.identifiersPending = countValue > 0 && presenceState.viewers.length === 0;
+    if (!nextViewers.length && countValue > 0) {
+      nextViewers.push({
+        key: 'viewer-identifiers-pending',
+        label: 'Identifikatori atjaunojas',
+        mark: 'gaida'
+      });
+    }
+    presenceState.viewers = nextViewers;
     if (presenceMounted) return;
     presence.textContent = '';
     document.documentElement.dataset.ticketUi = "arrow";
@@ -4429,23 +3997,14 @@ import { html, reactive } from '@arrow-js/core';
         <span>Skatītāji</span>
         <strong>${() => `${presenceState.visibleViewerCount} lapā`}</strong>
       </div>
-      ${() => presenceState.viewers.length ? html`
-        <div class="presence-list">
-          ${() => presenceState.viewers.map((viewer) => html`
-            <div class="presence-item">
-              <span class="presence-email">${viewer.label}</span>
-              <span class="presence-mark">skatās</span>
-            </div>
-          `.key(viewer.key))}
-        </div>
-      ` : presenceState.identifiersPending ? html`
-        <div class="presence-list">
+      <div class="presence-list" hidden="${() => presenceState.viewers.length === 0}">
+        ${() => presenceState.viewers.map((viewer) => html`
           <div class="presence-item">
-            <span class="presence-email">Identifikatori atjaunojas</span>
-            <span class="presence-mark">gaida</span>
+            <span class="presence-email">${viewer.label}</span>
+            <span class="presence-mark">${viewer.mark}</span>
           </div>
-        </div>
-      ` : ''}
+        `.key(viewer.key))}
+      </div>
     `(presence);
     presenceMounted = true;
   }
@@ -4466,7 +4025,6 @@ import { html, reactive } from '@arrow-js/core';
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
-  controlCodeCloseHotspot.addEventListener('click', closeControlCodeFromHotspot);
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
     if (event.target === codeDialog) closeControlCodeDialog();
@@ -4686,20 +4244,7 @@ import { html, reactive } from '@arrow-js/core';
 	      showStreamResumeSpinner();
 	    } else if (freshness.liveLabeled) {
 	      hideStreamResumeSpinner();
-	      if (activeResumeFlow && !activeResumeFlow.done) {
-	        logResumeCheckpoint('activation_resume_fresh_frame', {
-	          reason: safeResumeLabel(reason, 'frame_rendered'),
-	          result: 'fresh'
-	        });
-	        finishActivationResumeFlow('fresh_frame');
-	      } else if (pendingResumeFreshFrameFlow && !pendingResumeFreshFrameFlow.freshLogged) {
-	        enqueueCompletedResumeSafeLog(pendingResumeFreshFrameFlow, 'activation_resume_fresh_frame', resumeDiagnosticSnapshot({
-	          reason: safeResumeLabel(reason, 'frame_rendered'),
-	          result: 'late_fresh',
-	          phase: pendingResumeFreshFrameFlow.phase || 'complete'
-	        }));
-	        pendingResumeFreshFrameFlow = null;
-	      }
+	      if (activeResumeFlow && !activeResumeFlow.done) finishActivationResumeFlow('fresh_frame');
 	    }
     updateControlCodeSubmitAvailability();
     return freshness;
@@ -4712,10 +4257,6 @@ import { html, reactive } from '@arrow-js/core';
 
   function spacetimeReadyForControlCode() {
     return Boolean(spacetimeClient && spacetimeClientStatus === 'live');
-  }
-
-  function controlCodeTransportReadyForControlCode() {
-    return liveFrameReadyForControlCode() && spacetimeReadyForControlCode();
   }
 
   function controlCodeFastStateExpiryMillis(state) {
@@ -4736,21 +4277,6 @@ import { html, reactive } from '@arrow-js/core';
     const state = controlCodeFastState || {};
     const revision = String(state.revision || '').trim();
     return revision && controlCodeFastStateFresh(state) ? revision : '';
-  }
-
-  function controlCodeReadinessMessage() {
-    if (!spacetimeReadyForControlCode()) return 'Savienojas ar vadības kanālu pirms koda pieprasījuma.';
-    if (!liveFrameReadyForControlCode()) return 'Tālrunis sagatavo tiešraidi pirms koda pieprasījuma.';
-    const state = controlCodeFastState || {};
-    const status = String(state.status || 'missing');
-    if (status === 'fast_ready' && controlCodeFastStateFresh()) return 'Gatavs';
-    if (status === 'cleanup') return 'Tālrunis pabeidz iepriekšējā koda tīrīšanu.';
-    if (status === 'blocked') return 'Tālrunis atjauno koda ceļu.';
-    return 'Tālrunis sagatavo koda ceļu.';
-  }
-
-  function streamReadyForControlCode() {
-    return spacetimeReadyForControlCode() && controlCodeFastStateFresh();
   }
 
   function renderControlCodeFastStateDataset() {
@@ -4774,19 +4300,6 @@ import { html, reactive } from '@arrow-js/core';
     }, Math.min(delayMs, 60_000));
   }
 
-  function controlCodeRequestBusyForAutoPrepare() {
-    if (controlCodeSubmitInFlight) return true;
-    if (!codeRequest) return false;
-    const status = String(codeRequest.status || '');
-    if (status === 'queued' || status === 'running') return true;
-    if (status !== 'succeeded') return false;
-    const requestID = String(codeRequest.requestId || '').trim();
-    if (!requestID) return true;
-    return controlCodeResultCapturedRequestID !== requestID ||
-      controlCodePreparedCaptureDisplayedRequestID !== requestID ||
-      codeResultArea.hidden;
-  }
-
   function refreshControlCodeReadiness(reason, options) {
     const allowPrepare = !options || options.prepare !== false;
     if (!liveFrameReadyForControlCode()) {
@@ -4807,7 +4320,7 @@ import { html, reactive } from '@arrow-js/core';
     if (!codeResultArea.hidden) return;
     if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;
     if (controlCodeFastStateFresh()) return;
-    const busy = controlCodeRequestBusyForAutoPrepare();
+    const busy = controlCodeRequestOccupiesQueue();
     if (busy) return;
     const now = performance.now();
     if (lastControlCodeAutoPrepareAt && now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs) return;
@@ -5014,15 +4527,13 @@ import { html, reactive } from '@arrow-js/core';
 	      return;
 	    }
 	    const now = performance.now();
-	    const hiddenPerfMs = lastHiddenAt > 0 ? now - lastHiddenAt : 0;
-	    const hiddenWallMs = lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0;
-	    const hiddenMs = Math.max(hiddenPerfMs, hiddenWallMs);
-	    const frameAgeMs = lastFrameAt > 0 ? now - lastFrameAt : null;
+	    const hiddenMs = Math.max(lastHiddenAt > 0 ? now - lastHiddenAt : 0, lastHiddenWallAt > 0 ? Date.now() - lastHiddenWallAt : 0);
 	    const longHidden = hiddenMs >= backgroundRecoveryHiddenMs;
 	    const oldHiddenTab = hiddenMs >= oldTabFreshResumeHiddenMs;
-	    const videoStale = configured && (lastFrameAt === 0 || (frameAgeMs !== null && frameAgeMs > streamStaleVideoReconnectMs));
+	    const videoStale = configured && (lastFrameAt === 0 || now - lastFrameAt > streamStaleVideoReconnectMs);
 	    const cacheRestored = reason === 'pageshow_persisted' || (typeof document !== 'undefined' && document.wasDiscarded === true);
 	    const connectingTooLong = videoWs && videoWs.readyState === WebSocket.CONNECTING && videoSocketCreatedAt > 0 && now - videoSocketCreatedAt > resumeSoftReconnectMs;
+	    const hardRestore = longHidden || oldHiddenTab || cacheRestored || connectingTooLong;
 	    const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });
 	    logResumeCheckpoint('activation_resume_recovery_decision', {
 	      reason: safeResumeLabel(reason, 'visibility_resume'),
@@ -5030,24 +4541,10 @@ import { html, reactive } from '@arrow-js/core';
 	      cache: resumeBooleanLabel(cacheRestored),
 	      stale: resumeBooleanLabel(videoStale),
 	      connecting: resumeBooleanLabel(connectingTooLong),
-	      action: longHidden || oldHiddenTab || cacheRestored || connectingTooLong ? 'cached_restore' : 'watch'
+	      action: hardRestore ? 'cached_restore' : 'watch'
 	    }, resumeFlow);
 	    lastHiddenAt = 0;
 	    lastHiddenWallAt = 0;
-    if (longHidden || oldHiddenTab || videoStale || cacheRestored || connectingTooLong) {
-      clientLog('visibility_resume_recovery', JSON.stringify({
-        reason,
-        hiddenMs: Math.round(hiddenMs),
-        hiddenPerfMs: Math.round(hiddenPerfMs),
-        hiddenWallMs: Math.round(hiddenWallMs),
-        oldHiddenTab,
-        cacheRestored,
-        connectingTooLong,
-        configured,
-        frameAgeMs: frameAgeMs === null ? null : Math.round(frameAgeMs),
-        videoState: videoWs ? videoWs.readyState : -1
-      }));
-    }
     if (hiddenVideoCloseTimer) {
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
@@ -5059,20 +4556,20 @@ import { html, reactive } from '@arrow-js/core';
     if (screenEngaged) {
       requestScreenWakeLock(reason || 'visibility_visible');
     }
-    scheduleFirstScreenPin(false);
+    keepFirstScreenPinned(false);
     connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     publishCurrentStreamFocus(reason || 'visibility_visible');
-	    if (longHidden || oldHiddenTab || cacheRestored || connectingTooLong) {
-	      restoreCachedVideoForFreshFrame(reason || 'visibility_resume', 'old_tab_resume');
+	    if (hardRestore) {
+	      recoverFreshMediaSession(reason || 'visibility_resume', 'old_tab_resume', {
+	        skipEarlyGrace: true,
+	        keyframeReason: `${reason || 'resume'}_cached_keyframe`
+	      });
 	      runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);
 	      return;
 	    }
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
-      beginStreamOpenMetric('old_tab_resume', reason || 'visibility_visible', true);
       connectDirectVideo();
-      scheduleResumeWatchdogs(reason || 'visibility_visible');
-    } else if (videoWs.readyState === WebSocket.OPEN && (longHidden || videoStale)) {
-      requestKeyframe('visibility_resume');
+      startActivationResumeFlow(reason || 'visibility_visible', 'watchdog');
     }
     if (videoStale) {
       reconnectVideoForRecovery('visibility_resume_stale');
@@ -5089,6 +4586,7 @@ import { html, reactive } from '@arrow-js/core';
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
+	      hiddenDecoderTransientLogged = false;
       noteViewerActivity(null, 'visibility_visible');
       if (hiddenStreamFocusTimer) {
         clearTimeout(hiddenStreamFocusTimer);
@@ -5096,11 +4594,11 @@ import { html, reactive } from '@arrow-js/core';
       }
       recoverAfterVisibilityResume('visibility_resume');
 	    } else if (document.visibilityState === 'hidden') {
+	      hiddenDecoderTransientLogged = false;
 	      const flow = startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });
 	      logResumeCheckpoint('activation_visibility_hidden', { reason: 'hidden' }, flow);
 	      lastHiddenAt = performance.now();
 	      lastHiddenWallAt = Date.now();
-	      clearResumeWatchdogs();
 	      clearActivationReconnectBurst();
 	      releaseScreenWakeLock('visibility_hidden');
 	      releaseStreamFocusAfterHiddenGrace('visibility_hidden');
@@ -5113,7 +4611,7 @@ import { html, reactive } from '@arrow-js/core';
 	    if (screenEngaged) {
 	      requestScreenWakeLock('pageshow');
 	    }
-    scheduleFirstScreenPin(true);
+    keepFirstScreenPinned(true);
     if (event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true)) recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');
     chaseLiveStream();
   });
@@ -5133,7 +4631,6 @@ import { html, reactive } from '@arrow-js/core';
 	      cache: resumeBooleanLabel(Boolean(event && event.persisted))
 	    }, flow);
 	    closeEarlyVideo('pagehide');
-	    clearResumeWatchdogs();
 	    clearActivationReconnectBurst();
     if (hiddenStreamFocusTimer) {
       clearTimeout(hiddenStreamFocusTimer);
@@ -5152,7 +4649,7 @@ import { html, reactive } from '@arrow-js/core';
       spacetimeClient.disconnectPresence();
     }
   });
-  window.addEventListener('load', () => scheduleFirstScreenPin(true));
+  window.addEventListener('load', () => keepFirstScreenPinned(true));
   setInterval(() => {
     if (idleDisconnected) return;
     if (spacetimeClient && typeof spacetimeClient.heartbeat === 'function') {
@@ -5162,7 +4659,7 @@ import { html, reactive } from '@arrow-js/core';
   }, 15000);
   setInterval(chaseLiveStream, 1000);
   updateViewportVars();
-  scheduleFirstScreenPin(true);
+  keepFirstScreenPinned(true);
   updateDetailsReveal();
   resizeCanvasBox();
   scheduleViewerIdleDisconnect('initial_load');
@@ -5171,1092 +4668,4 @@ import { html, reactive } from '@arrow-js/core';
 	  connect();
 	  startActivationResumeFlow('initial_load', 'initial_load');
 
-	  async function startAdmin() {
-    const memberForm = document.getElementById('memberForm');
-    const memberEmail = document.getElementById('memberEmail');
-    const memberRole = document.getElementById('memberRole');
-    const membersEl = document.getElementById('adminMembers');
-    const stateEl = document.getElementById('adminState');
-    const notice = document.getElementById('adminNotice');
-    const memberSummary = document.getElementById('adminMemberSummary');
-    const sessionSummary = document.getElementById('adminSessionSummary');
-    const phoneState = document.getElementById('adminPhoneState');
-    const phoneDetail = document.getElementById('adminPhoneDetail');
-    const streamState = document.getElementById('adminStreamState');
-    const streamDetail = document.getElementById('adminStreamDetail');
-    const controlState = document.getElementById('adminControlState');
-    const controlDetail = document.getElementById('adminControlDetail');
-    const safetyState = document.getElementById('adminSafetyState');
-    const safetyDetail = document.getElementById('adminSafetyDetail');
-    const backendSummary = document.getElementById('adminBackendSummary');
-    const backendList = document.getElementById('adminBackendList');
-    const ticketSummary = document.getElementById('adminTicketSummary');
-    const ticketState = document.getElementById('adminTicketState');
-    const ticketDetail = document.getElementById('adminTicketDetail');
-    const ticketResult = document.getElementById('adminTicketResult');
-    const ticketResultDetail = document.getElementById('adminTicketResultDetail');
-    const ticketReselect = document.getElementById('adminTicketReselect');
-    const simSetup = document.querySelector('[data-simulator-setup="true"]');
-    const simSetupSummary = document.getElementById('simSetupSummary');
-    const simSetupPackages = document.getElementById('simSetupPackages');
-    const simSetupScreenshot = document.getElementById('simSetupScreenshot');
-    const simSetupRefreshButton = document.getElementById('simSetupRefresh');
-    const simSetupTextForm = document.getElementById('simSetupTextForm');
-    const simSetupText = document.getElementById('simSetupText');
-    const simSetupLastInput = document.getElementById('simSetupLastInput');
-    const requiredAdminElements = [
-      memberForm,
-      memberEmail,
-      memberRole,
-      membersEl,
-      stateEl,
-      notice,
-      memberSummary,
-      sessionSummary,
-      phoneState,
-      phoneDetail,
-      streamState,
-      streamDetail,
-      controlState,
-      controlDetail,
-      safetyState,
-      safetyDetail,
-      backendSummary,
-      backendList,
-      ticketSummary,
-      ticketState,
-      ticketDetail,
-      ticketResult,
-      ticketResultDetail,
-      ticketReselect
-    ];
-    if (requiredAdminElements.some((element) => !element)) {
-      reportClientFault('missing_admin_dom', 'admin shell incomplete');
-      showFatalPage('Admin lapa nav pilnībā ielādējusies. Mēģini pārlādēt lapu.');
-      return;
-    }
-    let simSetupDisplay = { width: 720, height: 1280 };
-    let simSetupPointer = null;
-    let simSetupLongPressTimer = null;
-    const simSetupTapMaxDistance = 12;
-    const simSetupLongPressDelayMs = 650;
-    const adminRefreshMs = 5000;
-    let adminLoadInFlight = null;
-    let adminActionDepth = 0;
-    let activeBackendId = '';
-
-    async function load(options) {
-      const quiet = Boolean(options && options.quiet);
-      if (adminLoadInFlight) {
-        try {
-          await adminLoadInFlight;
-        } catch (error) {
-          if (!quiet) throw error;
-        }
-        return;
-      }
-      adminLoadInFlight = (async () => {
-        const [stateResponse, backendResponse] = await Promise.all([
-          fetch('/api/v1/admin/state', { cache: 'no-store' }),
-          fetch('/api/v1/admin/phone/backends', { cache: 'no-store' })
-        ]);
-        const payload = await stateResponse.json();
-        const backendsPayload = await backendResponse.json();
-        if (!stateResponse.ok || !payload.ok) throw new Error(payload.message || 'load failed');
-        if (!backendResponse.ok || !backendsPayload.ok) throw new Error(backendsPayload.message || 'backend load failed');
-        renderAdmin(payload.state, payload.phone, backendsPayload);
-        if (simSetup && simulatorSetupActive()) {
-          loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
-        }
-      })();
-      try {
-        await adminLoadInFlight;
-      } catch (error) {
-        if (!quiet) throw error;
-      } finally {
-        adminLoadInFlight = null;
-      }
-    }
-
-    function renderAdmin(state, phone, backendsPayload) {
-      const phoneRecord = state.phone || {};
-      const phoneHealth = parsePhoneHealth(phoneRecord.statusJson || phoneRecord.healthJson);
-      renderStatus(state, phone, phoneHealth);
-      renderTicketSelection(phoneHealth);
-      renderBackends(backendsPayload);
-      membersEl.textContent = '';
-      activeMembers(state).forEach((member) => {
-        const row = document.createElement('div');
-        row.className = 'admin-member';
-        const main = document.createElement('div');
-        main.className = 'admin-member-main';
-        const email = document.createElement('span');
-        email.className = 'admin-member-email';
-        email.textContent = member.email;
-        const publicId = document.createElement('span');
-        publicId.className = 'admin-member-public-id';
-        publicId.textContent = member.publicId || '----';
-        const updated = document.createElement('span');
-        updated.className = 'admin-muted';
-        updated.textContent = relativeTime(member.updatedAt);
-        main.append(email, publicId, updated);
-        const role = document.createElement('span');
-        role.className = `admin-pill ${member.role || 'member'}`;
-        role.textContent = member.role;
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.textContent = 'Remove';
-        remove.disabled = member.role === 'owner';
-        remove.addEventListener('click', async () => {
-          await runAdminAction(remove, 'Removing member...', async () => {
-            await apiFetch(`/api/v1/admin/members?email=${encodeURIComponent(member.email)}`, { method: 'DELETE', cache: 'no-store' });
-            showNotice('Member removed');
-            await load();
-          });
-        });
-        row.append(main, role, remove);
-        membersEl.appendChild(row);
-      });
-      stateEl.textContent = JSON.stringify({ state, phone, phoneBackends: backendsPayload }, null, 2);
-    }
-
-    memberForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      await runAdminAction(memberForm.querySelector('button[type="submit"]'), 'Adding member...', async () => {
-        await apiFetch('/api/v1/admin/members', {
-          method: 'POST',
-          cache: 'no-store',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: memberEmail.value, role: memberRole.value })
-        });
-        memberEmail.value = '';
-        showNotice('Member saved');
-        await load();
-      });
-    });
-
-    ticketReselect.addEventListener('click', async () => {
-      await runAdminAction(ticketReselect, 'Requesting...', async () => {
-        const response = await apiFetch('/api/v1/admin/ticket/reselect-latest', {
-          method: 'POST',
-          cache: 'no-store'
-        });
-        let payload = {};
-        try {
-          payload = await response.json();
-        } catch (_) {}
-        showNotice(payload.commandId ? `Latest ticket reselect request sent · ${payload.commandId}` : 'Latest ticket reselect request sent');
-        await load();
-      });
-    });
-
-    function renderStatus(state, phone, phoneHealth) {
-      const members = activeMembers(state);
-      const viewers = state.viewers || [];
-      const activeViewers = viewers.filter((viewer) => viewer.connected !== false);
-      const phoneRecord = state.phone || {};
-      const rootCapture = phoneHealth.rootCapture || {};
-      const pipeline = phoneHealth.streamPipeline || {};
-      const inputGate = phoneHealth.inputGate || {};
-      const lockdown = phoneHealth.notificationLockdown || {};
-      const controlCode = phoneHealth.controlCodeRequest || {};
-      const streamLive = rootCapture.active || phoneHealth.streamVerdict === 'live' || pipeline.streamVerdict === 'live';
-
-      memberSummary.textContent = `${members.length} member${members.length === 1 ? '' : 's'} configured`;
-      sessionSummary.textContent = `${activeViewers.length} viewer${activeViewers.length === 1 ? '' : 's'} on page`;
-
-      phoneState.textContent = phone && phone.connected ? 'Connected' : phoneRecord.desiredState || 'Idle';
-      phoneDetail.textContent = `${phoneRecord.attachName || phoneRecord.id || 'Pixel'} · seen ${relativeTime(phoneRecord.lastSeenAt || (phone && phone.lastSeenAt))}`;
-
-      streamState.textContent = streamLive ? 'Live' : (phoneHealth.streamActive ? 'Starting' : 'Idle');
-      streamDetail.textContent = rootCapture.message || (streamLive ? 'Ticket stream is live' : pipeline.secureWindowCaptureBypassMessage) || 'Waiting for viewers';
-
-      controlState.textContent = controlCode.status || 'Ready';
-      controlDetail.textContent = controlCode.reason || 'Requests are handled by the phone one at a time';
-
-      safetyState.textContent = lockdown.active ? 'Locked down' : 'Ready';
-      safetyDetail.textContent = inputGate.reason
-        ? `Input gate: ${inputGate.reason}`
-        : (lockdown.reason || 'Tap-only controls');
-
-    }
-
-    function renderTicketSelection(phoneHealth) {
-      const vivi = phoneHealth.viviState || {};
-      const reselect = phoneHealth.latestTicketReselect || {};
-      const stateName = vivi.state || 'UNKNOWN_VIVI';
-      const ticketId = vivi.ticketId || '';
-      const observed = durationAgo(vivi.observedAgoMillis);
-      const source = vivi.source || 'unknown';
-      const reason = vivi.reason || 'unknown';
-      const selected = stateName === 'TICKET_DETAIL';
-      ticketSummary.textContent = selected
-        ? `Selected: ${ticketId || 'ticket detail'}`
-        : `ViVi state: ${humanState(stateName)}`;
-      ticketState.textContent = ticketId || humanState(stateName);
-      ticketDetail.textContent = `${selected ? 'Ticket detail' : humanState(stateName)} · ${observed ? `seen ${observed}` : 'not observed'} · ${source} · ${reason}`;
-
-      const reselectStatus = String(reselect.status || '').toLowerCase();
-      const reselectActive = Boolean(reselect.active);
-      ticketReselect.disabled = reselectActive;
-      if (reselectStatus && reselectStatus !== 'idle') {
-        const started = durationAgo(reselect.startedAgoMillis);
-        const completed = durationAgo(reselect.completedAgoMillis);
-        const fresh = durationAgo(reselect.freshFrameAgoMillis);
-        if (reselectStatus === 'pending') {
-          ticketResult.textContent = reselectActive ? 'Pending' : 'Failed';
-          ticketResultDetail.textContent = reselectActive
-            ? `Phone is selecting the latest ticket${started ? ` · started ${started}` : ''}`
-            : `Phone did not finish ticket selection${started ? ` · started ${started}` : ''}`;
-          return;
-        }
-        if (reselectStatus === 'succeeded') {
-          ticketResult.textContent = fresh ? 'Ready' : 'Pending';
-          ticketResultDetail.textContent = fresh
-            ? `Fresh ticket stream confirmed ${fresh}`
-            : `Ticket selected${completed ? ` ${completed}` : ''}; waiting for fresh stream frame`;
-          return;
-        }
-        if (reselectStatus === 'failed') {
-          ticketResult.textContent = 'Failed';
-          ticketResultDetail.textContent = `${reselect.reason || 'Ticket reselect failed'}${completed ? ` · ${completed}` : ''}`;
-          return;
-        }
-      }
-
-      const latest = latestTicketReselectEvent(phoneHealth.recentEvents || []);
-      if (!latest) {
-        ticketResult.textContent = 'No request yet';
-        ticketResultDetail.textContent = 'Use this only when the phone should forget the remembered ticket and pick again.';
-        return;
-      }
-      const event = latest.event || '';
-      const ok = event.indexOf('succeeded') >= 0 || event.indexOf('requested') >= 0;
-      const failed = event.indexOf('failed') >= 0 || event.indexOf('blocked') >= 0;
-      ticketResult.textContent = failed ? 'Failed' : (ok ? 'Accepted' : humanState(event));
-      ticketResultDetail.textContent = `${humanState(event)} · ${durationAgo(latest.atAgoMillis) || 'just now'}${latest.detail ? ` · ${latest.detail}` : ''}`;
-    }
-
-    function latestTicketReselectEvent(events) {
-      for (let index = events.length - 1; index >= 0; index -= 1) {
-        const item = events[index] || {};
-        if (String(item.event || '').indexOf('latest_ticket_reselect') === 0) return item;
-      }
-      return null;
-    }
-
-    function humanState(value) {
-      return String(value || 'unknown')
-        .replace(/_/g, ' ')
-        .toLowerCase()
-        .replace(/\b\w/g, (letter) => letter.toUpperCase());
-    }
-
-    function activeMembers(state) {
-      return (state.members || []).filter((member) => member.active !== false);
-    }
-
-    function renderBackends(payload) {
-      const activeId = payload.activeBackendId || '';
-      activeBackendId = activeId;
-      const backends = payload.backends || [];
-      const active = backends.find((backend) => backend.id === activeId);
-      backendSummary.textContent = active
-        ? `Active: ${active.attachName || active.id}`
-        : 'No active backend selected';
-      backendList.textContent = '';
-      backends.forEach((backend) => {
-        const row = document.createElement('div');
-        row.className = `admin-backend ${backend.active ? 'active' : ''}`;
-        const main = document.createElement('div');
-        main.className = 'admin-backend-main';
-        const name = document.createElement('strong');
-        name.textContent = backend.attachName || backend.id;
-        const detail = document.createElement('span');
-        detail.className = 'admin-muted';
-        const relay = backend.relay || {};
-        const state = backend.active
-          ? `${relay.streamState || 'idle'}${relay.connected ? ' · connected' : ''}`
-          : (backend.healthOk ? 'reachable' : 'not reachable');
-        detail.textContent = `${state} · ${backend.baseUrl || ''}`;
-        main.append(name, detail);
-
-        const badge = document.createElement('span');
-        badge.className = `admin-pill ${backend.active ? 'owner' : ''}`;
-        badge.textContent = backend.active ? 'active' : (backend.healthOk ? 'ready' : 'offline');
-
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = backend.active ? 'Selected' : 'Use';
-        button.disabled = backend.active;
-        button.addEventListener('click', async () => {
-          await runAdminAction(button, 'Switching...', async () => {
-            await apiFetch('/api/v1/admin/phone/backend', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ backendId: backend.id })
-            });
-            showNotice(`Switched to ${backend.attachName || backend.id}`);
-            await load();
-          });
-        });
-
-        row.append(main, badge, button);
-        backendList.appendChild(row);
-      });
-      renderSimulatorAvailability(active);
-    }
-
-    function simulatorSetupActive() {
-      return Boolean(simSetup && activeBackendId && activeBackendId === (cfg.simulatorSetupBackendId || 'android-sim'));
-    }
-
-    function renderSimulatorAvailability(activeBackend) {
-      if (!simSetup) return;
-      const enabled = simulatorSetupActive();
-      simSetup.classList.toggle('is-disabled', !enabled);
-      simSetup.querySelectorAll('button, input').forEach((control) => {
-        control.disabled = !enabled;
-      });
-      if (!enabled) {
-        const label = activeBackend ? (activeBackend.attachName || activeBackend.id) : 'selected backend';
-        renderSimulatorSetupError(`Simulator control is available only when the Android simulator backend is active. Current backend: ${label}.`);
-        if (simSetupPackages) simSetupPackages.textContent = '';
-        if (simSetupScreenshot) simSetupScreenshot.removeAttribute('src');
-        setSimulatorLastInput('Simulator backend is not active');
-      }
-    }
-
-    async function loadSimulatorSetup() {
-      if (!simSetup || !simulatorSetupActive()) return;
-      const response = await fetch('/api/v1/admin/phone/setup/status', { cache: 'no-store' });
-      const payload = await response.json();
-      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || 'Simulator control unavailable');
-      renderSimulatorSetup(payload);
-    }
-
-    function renderSimulatorSetup(payload) {
-      const display = payload.display || {};
-      if (display.width && display.height) simSetupDisplay = display;
-      const displayLabel = `${simSetupDisplay.width}x${simSetupDisplay.height}${simSetupDisplay.density ? ` · ${simSetupDisplay.density} dpi` : ''}`;
-      simSetupSummary.textContent = payload.connected
-        ? `Connected · ${displayLabel}${payload.message ? ` · ${payload.message}` : ''}`
-        : payload.error || 'Simulator is not connected';
-      simSetupPackages.textContent = '';
-      const packages = payload.packages || {};
-      [
-        ['vivi', 'ViVi'],
-        ['accrescent', 'Accrescent'],
-        ['aurora', 'Aurora'],
-        ['controller', 'Controller']
-      ].forEach(([key, label]) => {
-        const info = packages[key] || {};
-        const pill = document.createElement('span');
-        pill.className = `admin-pill ${info.installed ? 'owner' : ''}`;
-        pill.textContent = `${label}: ${info.installed ? 'installed' : 'missing'}`;
-        simSetupPackages.appendChild(pill);
-      });
-      if (payload.connected && simSetupScreenshot) {
-        refreshSimulatorScreenshot();
-      }
-    }
-
-    function renderSimulatorSetupError(message) {
-      if (!simSetupSummary) return;
-      simSetupSummary.textContent = message;
-    }
-
-    function refreshSimulatorScreenshot(delayMs) {
-      if (!simSetupScreenshot) return;
-      const refresh = () => {
-        simSetupScreenshot.src = `/api/v1/admin/phone/setup/screenshot?t=${Date.now()}`;
-      };
-      if (delayMs && delayMs > 0) {
-        setTimeout(refresh, delayMs);
-        return;
-      }
-      refresh();
-    }
-
-    function setSimulatorLastInput(message, failed) {
-      if (!simSetupLastInput) return;
-      simSetupLastInput.textContent = message;
-      simSetupLastInput.classList.toggle('admin-error', Boolean(failed));
-    }
-
-    async function postSimulatorInput(body, label) {
-      await apiFetch('/api/v1/admin/phone/setup/input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      setSimulatorLastInput(label || 'Input sent');
-      refreshSimulatorScreenshot();
-      refreshSimulatorScreenshot(450);
-      refreshSimulatorScreenshot(1100);
-      setTimeout(() => loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable')), 1200);
-    }
-
-    function simulatorScreenPoint(event) {
-      if (!simSetupScreenshot) return null;
-      const rect = simSetupScreenshot.getBoundingClientRect();
-      if (!rect.width || !rect.height) return null;
-      const width = simSetupDisplay.width || simSetupScreenshot.naturalWidth || rect.width;
-      const height = simSetupDisplay.height || simSetupScreenshot.naturalHeight || rect.height;
-      const x = Math.max(0, Math.min(width - 1, Math.round(((event.clientX - rect.left) / rect.width) * width)));
-      const y = Math.max(0, Math.min(height - 1, Math.round(((event.clientY - rect.top) / rect.height) * height)));
-      return { x, y, at: Date.now() };
-    }
-
-    function simulatorPointDistance(a, b) {
-      if (!a || !b) return 0;
-      const dx = a.x - b.x;
-      const dy = a.y - b.y;
-      return Math.sqrt(dx * dx + dy * dy);
-    }
-
-    function clearSimulatorLongPressTimer() {
-      if (simSetupLongPressTimer) {
-        clearTimeout(simSetupLongPressTimer);
-        simSetupLongPressTimer = null;
-      }
-    }
-
-    function simulatorGestureDuration(start, end) {
-      return Math.max(50, Math.min(1000, Math.round(((end && end.at) || Date.now()) - ((start && start.at) || Date.now()))));
-    }
-
-    function simulatorKeyInput(event) {
-      if (event.ctrlKey || event.metaKey || event.altKey) return null;
-      switch (event.key) {
-        case 'Backspace':
-          return { body: { type: 'key', key: 'delete' }, label: 'Delete sent' };
-        case 'Enter':
-          return { body: { type: 'key', key: 'enter' }, label: 'Enter sent' };
-        case ' ':
-        case 'Spacebar':
-          return { body: { type: 'key', key: 'space' }, label: 'Space sent' };
-        case 'Tab':
-          return { body: { type: 'key', key: 'tab' }, label: 'Tab sent' };
-        case 'Escape':
-          return { body: { type: 'key', key: 'escape' }, label: 'Escape sent' };
-        default:
-          break;
-      }
-      if (event.key && event.key.length === 1) {
-        return { body: { type: 'text', text: event.key }, label: 'Text sent' };
-      }
-      return null;
-    }
-
-    if (simSetup) {
-      if (simSetupRefreshButton) {
-        simSetupRefreshButton.addEventListener('click', async () => {
-          await runAdminAction(simSetupRefreshButton, 'Refreshing...', async () => {
-            await loadSimulatorSetup();
-            refreshSimulatorScreenshot();
-            setSimulatorLastInput('Screen refreshed');
-          });
-        });
-      }
-      simSetup.querySelectorAll('[data-sim-open]').forEach((button) => {
-        button.addEventListener('click', async () => {
-          await runAdminAction(button, 'Opening...', async () => {
-            await apiFetch('/api/v1/admin/phone/setup/open', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ target: button.dataset.simOpen })
-            });
-            setSimulatorLastInput(`${button.textContent.trim()} opened`);
-            refreshSimulatorScreenshot();
-            refreshSimulatorScreenshot(650);
-            setTimeout(() => loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable')), 900);
-          });
-        });
-      });
-      simSetup.querySelectorAll('[data-sim-key]').forEach((button) => {
-        button.addEventListener('click', async () => {
-          await runAdminAction(button, 'Sending...', async () => {
-            await postSimulatorInput({ type: 'key', key: button.dataset.simKey }, `${button.textContent.trim()} sent`);
-          });
-        });
-      });
-      if (simSetupTextForm) {
-        simSetupTextForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          await runAdminAction(simSetupTextForm.querySelector('button[type="submit"]'), 'Typing...', async () => {
-            await postSimulatorInput({ type: 'text', text: simSetupText.value }, 'Text sent');
-            simSetupText.value = '';
-          });
-        });
-      }
-      if (simSetupScreenshot) {
-        simSetupScreenshot.addEventListener('pointerdown', (event) => {
-          if (event.button !== undefined && event.button !== 0) return;
-          const point = simulatorScreenPoint(event);
-          if (!point) return;
-          event.preventDefault();
-          simSetupScreenshot.focus({ preventScroll: true });
-          try { simSetupScreenshot.setPointerCapture(event.pointerId); } catch (_) {}
-          simSetupPointer = {
-            id: event.pointerId,
-            start: point,
-            last: point,
-            longPressSent: false
-          };
-          clearSimulatorLongPressTimer();
-          simSetupLongPressTimer = setTimeout(() => {
-            if (!simSetupPointer || simSetupPointer.id !== event.pointerId) return;
-            simSetupPointer.longPressSent = true;
-            postSimulatorInput({ type: 'long_press', x: point.x, y: point.y, durationMs: simSetupLongPressDelayMs }, 'Long press sent')
-              .catch((error) => {
-                setSimulatorLastInput(error.message || 'Long press failed', true);
-                showNotice(error.message || 'Long press failed', true);
-              });
-          }, simSetupLongPressDelayMs);
-        });
-        simSetupScreenshot.addEventListener('pointermove', (event) => {
-          if (!simSetupPointer || simSetupPointer.id !== event.pointerId) return;
-          const point = simulatorScreenPoint(event);
-          if (!point) return;
-          simSetupPointer.last = point;
-          if (simulatorPointDistance(simSetupPointer.start, point) > simSetupTapMaxDistance) {
-            clearSimulatorLongPressTimer();
-          }
-        });
-        simSetupScreenshot.addEventListener('pointerup', async (event) => {
-          if (!simSetupPointer || simSetupPointer.id !== event.pointerId) return;
-          event.preventDefault();
-          clearSimulatorLongPressTimer();
-          const pointer = simSetupPointer;
-          simSetupPointer = null;
-          try { simSetupScreenshot.releasePointerCapture(event.pointerId); } catch (_) {}
-          if (pointer.longPressSent) return;
-          const end = simulatorScreenPoint(event) || pointer.last || pointer.start;
-          const distance = simulatorPointDistance(pointer.start, end);
-          const body = distance > simSetupTapMaxDistance
-            ? { type: 'drag', startX: pointer.start.x, startY: pointer.start.y, endX: end.x, endY: end.y, durationMs: simulatorGestureDuration(pointer.start, end) }
-            : { type: 'tap', x: end.x, y: end.y };
-          const label = distance > simSetupTapMaxDistance ? 'Swipe sent' : 'Tap sent';
-          await postSimulatorInput(body, label).catch((error) => {
-            setSimulatorLastInput(error.message || `${label} failed`, true);
-            showNotice(error.message || `${label} failed`, true);
-          });
-        });
-        simSetupScreenshot.addEventListener('pointercancel', (event) => {
-          if (simSetupPointer && simSetupPointer.id === event.pointerId) {
-            simSetupPointer = null;
-            clearSimulatorLongPressTimer();
-          }
-        });
-        simSetupScreenshot.addEventListener('keydown', async (event) => {
-          const input = simulatorKeyInput(event);
-          if (!input) return;
-          event.preventDefault();
-          await postSimulatorInput(input.body, input.label).catch((error) => {
-            setSimulatorLastInput(error.message || 'Keyboard input failed', true);
-            showNotice(error.message || 'Keyboard input failed', true);
-          });
-        });
-      }
-      setInterval(() => {
-        loadSimulatorSetup().catch((error) => renderSimulatorSetupError(error.message || 'Simulator control unavailable'));
-      }, 3500);
-    }
-
-    function extractJsonObjectField(raw, field) {
-      const text = String(raw || '');
-      const key = `"${field}"`;
-      const keyIndex = text.indexOf(key);
-      if (keyIndex < 0) return null;
-      const colonIndex = text.indexOf(':', keyIndex + key.length);
-      if (colonIndex < 0) return null;
-      let start = colonIndex + 1;
-      while (start < text.length && /\s/.test(text[start])) start += 1;
-      if (text[start] !== '{') return null;
-      let depth = 0;
-      let inString = false;
-      let escaped = false;
-      for (let index = start; index < text.length; index += 1) {
-        const char = text[index];
-        if (inString) {
-          if (escaped) {
-            escaped = false;
-          } else if (char === '\\') {
-            escaped = true;
-          } else if (char === '"') {
-            inString = false;
-          }
-          continue;
-        }
-        if (char === '"') {
-          inString = true;
-        } else if (char === '{') {
-          depth += 1;
-        } else if (char === '}') {
-          depth -= 1;
-          if (depth === 0) {
-            try {
-              return JSON.parse(text.slice(start, index + 1));
-            } catch (_) {
-              return null;
-            }
-          }
-        }
-      }
-      return null;
-    }
-
-    function extractJsonStringField(raw, field) {
-      const pattern = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
-      const match = String(raw || '').match(pattern);
-      if (!match) return '';
-      try {
-        return JSON.parse(`"${match[1]}"`);
-      } catch (_) {
-        return match[1];
-      }
-    }
-
-    function extractJsonBooleanField(raw, field) {
-      const pattern = new RegExp(`"${field}"\\s*:\\s*(true|false)`);
-      const match = String(raw || '').match(pattern);
-      if (!match) return null;
-      return match[1] === 'true';
-    }
-
-    function parsePartialPhoneHealth(raw) {
-      const partial = {};
-      ['latestTicketReselect', 'controlCodeRequest', 'inputGate', 'viviState', 'rootCapture', 'streamPipeline', 'notificationLockdown'].forEach((field) => {
-        const value = extractJsonObjectField(raw, field);
-        if (value) partial[field] = value;
-      });
-      const streamActive = extractJsonBooleanField(raw, 'streamActive');
-      if (streamActive !== null) partial.streamActive = streamActive;
-      const streamVerdict = extractJsonStringField(raw, 'streamVerdict');
-      if (streamVerdict) partial.streamVerdict = streamVerdict;
-      const sessionState = extractJsonStringField(raw, 'sessionState');
-      if (sessionState) partial.sessionState = sessionState;
-      return partial;
-    }
-
-    function parsePhoneHealth(raw) {
-      if (!raw) return {};
-      try {
-        const parsed = JSON.parse(raw);
-        return parsed && parsed.data ? parsed.data : parsed;
-      } catch (_) {
-        return parsePartialPhoneHealth(raw);
-      }
-    }
-
-    function relativeTime(value) {
-      if (!value) return 'never';
-      const at = Date.parse(value);
-      if (!Number.isFinite(at)) return value;
-      const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
-      if (seconds < 5) return 'just now';
-      if (seconds < 60) return `${seconds}s ago`;
-      const minutes = Math.round(seconds / 60);
-      if (minutes < 60) return `${minutes}m ago`;
-      const hours = Math.round(minutes / 60);
-      if (hours < 24) return `${hours}h ago`;
-      const days = Math.round(hours / 24);
-      return `${days}d ago`;
-    }
-
-    function durationAgo(value) {
-      if (value === null || value === undefined || value === '') return '';
-      const millis = Number(value);
-      if (!Number.isFinite(millis)) return '';
-      const seconds = Math.max(0, Math.round(millis / 1000));
-      if (seconds < 5) return 'just now';
-      if (seconds < 60) return `${seconds}s ago`;
-      const minutes = Math.round(seconds / 60);
-      if (minutes < 60) return `${minutes}m ago`;
-      const hours = Math.round(minutes / 60);
-      if (hours < 24) return `${hours}h ago`;
-      const days = Math.round(hours / 24);
-      return `${days}d ago`;
-    }
-
-
-    function showNotice(message, error = false) {
-      notice.textContent = message;
-      notice.classList.toggle('error', error);
-      notice.hidden = false;
-    }
-
-    async function apiFetch(url, options) {
-      const response = await fetch(url, options);
-      if (response.ok) return response;
-      let message = `${response.status} ${response.statusText}`.trim();
-      try {
-        const payload = await response.json();
-        message = payload.message || payload.error || message;
-      } catch (_) {}
-      throw new Error(message);
-    }
-
-    async function runAdminAction(button, pending, action) {
-      const original = button ? button.textContent : '';
-      const wasDisabled = button ? button.disabled : false;
-      adminActionDepth += 1;
-      try {
-        if (button) {
-          button.disabled = true;
-          button.textContent = pending;
-        }
-        await action();
-      } catch (error) {
-        showNotice(error.message || 'Action failed', true);
-      } finally {
-        if (button) {
-          button.textContent = original;
-          button.disabled = wasDisabled;
-        }
-        adminActionDepth = Math.max(0, adminActionDepth - 1);
-      }
-    }
-
-    load().catch((error) => {
-      showNotice(error.message || 'Load failed', true);
-      stateEl.textContent = error.stack || error.message;
-    });
-    setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
-      if (adminActionDepth > 0) return;
-      load({ quiet: true });
-    }, adminRefreshMs);
-  }
-
-  // ============================================================
-  // Test harness: enabled by visiting ticket.jolkins.id.lv#test-harness
-  // Captures every clientLog event with millisecond timestamps,
-  // times each control-code request end-to-end, and offers an
-  // automated 93-minute loop that opens the dialog, submits a
-  // control code, waits for the result, and repeats every 60s.
-  // Exposes window.__ticketTest for inspection.
-  //
-  // Gated by process.env.TICKET_APP_DEV: the harness is stripped from
-  // the production build (TICKET_APP_MODE=prod) so end users get the
-  // slim bundle. Build the dev bundle with TICKET_APP_MODE=dev.
-  // ============================================================
-  if (process.env.TICKET_APP_DEV && (() => {
-    const harnessEnabled = (() => {
-      try {
-        return (typeof window !== 'undefined')
-          && (window.location.hash === '#test-harness'
-              || window.location.hash === '#harness'
-              || /[?&]test=1\b/.test(window.location.search));
-      } catch (_) { return false; }
-    })();
-    return harnessEnabled;
-  })()) {
-    const harnessState = {
-      startedAt: performance.now(),
-      pageLoadAt: 0,
-      firstFrameAt: 0,
-      firstDecodedFrameAt: 0,
-      streamStatusHistory: [],
-      clientLogHistory: [],
-      controlCodeRequests: [],
-      keyframeEvents: [],
-      phoneEngineStates: [],
-      autoTestRunning: false,
-      autoTestStopRequested: false,
-      autoTestStartedAt: 0,
-      autoTestResults: [],
-    };
-    const HARNESS_MAX_HISTORY = 5000;
-    function harnessPushHistory(arr, item) {
-      arr.push(item);
-      if (arr.length > HARNESS_MAX_HISTORY) arr.shift();
-    }
-    function harnessTimestamp() {
-      return Math.round(performance.now() - harnessState.startedAt);
-    }
-    const originalClientLog = clientLog;
-    clientLog = function(event, detail) {
-      const entry = { t: harnessTimestamp(), event, detail: typeof detail === 'string' ? detail : (function(){ try { return JSON.stringify(detail); } catch(_){ return String(detail); } })() };
-      harnessPushHistory(harnessState.clientLogHistory, entry);
-      try { originalClientLog(event, detail); } catch (_) {}
-      try { updateHarnessPanel(); } catch (_) {}
-    };
-    const healthPollInterval = setInterval(async () => {
-      try {
-        const ds = relayReportToStreamStatus(currentState && currentState.relayCurrentReport);
-        if (ds) {
-          harnessPushHistory(harnessState.phoneEngineStates, {
-            t: harnessTimestamp(),
-            streamVerdict: ds.streamVerdict,
-            phoneStreamState: ds.phoneStreamState,
-            phoneConnected: ds.phoneConnected,
-            phoneDesired: ds.phoneDesired,
-            streamActive: ds.streamActive,
-            lastFrameAgoMillis: ds.lastFrameAgoMillis,
-            activeVideoClients: ds.activeVideoClients,
-          });
-          try { updateHarnessPanel(); } catch (_) {}
-        }
-      } catch (_) {}
-    }, 1000);
-    // Hook first-frame detection
-    const origNoteFirstFrame = function(){
-      if (harnessState.firstFrameAt === 0) {
-        harnessState.firstFrameAt = harnessTimestamp();
-      }
-    };
-    // Track first decoded frame
-    const origRenderDecoded = renderDecodedFrame;
-    // (We can't easily wrap the function without breaking closures; instead we
-    // poll for firstFrameReceived via the existing setter. The capture below
-    // catches it after the fact.)
-    const firstFrameWatcher = setInterval(() => {
-      if (firstFrameReceived && harnessState.firstDecodedFrameAt === 0) {
-        harnessState.firstDecodedFrameAt = harnessTimestamp();
-        clearInterval(firstFrameWatcher);
-        try { updateHarnessPanel(); } catch (_) {}
-      }
-    }, 100);
-    // Track stream_status
-    const origHandleStreamStatus = handleStreamStatus;
-    // (cannot wrap without breaking closure scope; record in handleStreamStatus inline)
-    // Track control-code request lifecycle
-    function harnessWrapControlCodeLifecycle() {
-      const origSubmit = submitControlCodeRequest;
-      // We can't directly wrap because of closure; lifecycle timings are
-      // captured by watching the local request state.
-    }
-    // Inject a wrapper that records each control_code_submitted event with
-    // extra state: at submit time, record T0. When the codeRequest state
-    // transitions, record the rest.
-    const origRenderControlCode = renderControlCodeRequest;
-    // We instrument via a polling loop that watches codeRequest.status.
-    let lastObservedCodeRequestId = '';
-    let activeCodeRequestStartedAt = 0;
-    const controlCodeWatcher = setInterval(() => {
-      const cur = codeRequest;
-      const id = cur && cur.requestId ? String(cur.requestId) : '';
-      const status = cur && cur.status ? String(cur.status) : '';
-      if (id && id !== lastObservedCodeRequestId) {
-        // New request
-        if (lastObservedCodeRequestId !== '') {
-          // Previous request changed under us; close it out
-          const prev = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
-          if (prev) prev.finalStatus = 'changed';
-        }
-        lastObservedCodeRequestId = id;
-        activeCodeRequestStartedAt = harnessTimestamp();
-        harnessPushHistory(harnessState.controlCodeRequests, {
-          requestId: id,
-          t_observed: activeCodeRequestStartedAt,
-          initialStatus: status,
-          transitions: [],
-        });
-        try { updateHarnessPanel(); } catch (_) {}
-      }
-      if (id && status) {
-        const last = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
-        if (last && last.requestId === id) {
-          const lastTransition = last.transitions[last.transitions.length - 1];
-          if (!lastTransition || lastTransition.status !== status) {
-            last.transitions.push({ t: harnessTimestamp(), status });
-            if (last.initialStatus === 'succeeded' || status === 'succeeded' || status === 'failed') {
-              last.finalStatus = status;
-              last.t_completed = harnessTimestamp();
-              last.t_total_ms = last.t_completed - last.t_observed;
-            }
-            try { updateHarnessPanel(); } catch (_) {}
-          }
-        }
-      }
-      if (!id && lastObservedCodeRequestId !== '') {
-        const last = harnessState.controlCodeRequests[harnessState.controlCodeRequests.length - 1];
-        if (last) {
-          last.finalStatus = last.finalStatus || 'cleared';
-          last.t_completed = last.t_completed || harnessTimestamp();
-          last.t_total_ms = last.t_total_ms || (last.t_completed - last.t_observed);
-        }
-        lastObservedCodeRequestId = '';
-        try { updateHarnessPanel(); } catch (_) {}
-      }
-    }, 200);
-
-    // Build the harness UI
-    function ensureHarnessPanel() {
-      let panel = document.getElementById('__ticketHarnessPanel');
-      if (panel) return panel;
-      panel = document.createElement('div');
-      panel.id = '__ticketHarnessPanel';
-      panel.style.cssText = 'position:fixed;left:8px;bottom:8px;width:480px;max-height:60vh;overflow:auto;background:rgba(0,0,0,0.85);color:#eef3f8;font:12px/1.4 ui-monospace,Menlo,monospace;padding:10px 12px;border:1px solid #4f8cff;border-radius:6px;z-index:2147483647;box-sizing:border-box;';
-      panel.innerHTML = `
-        <div style="font-weight:bold;color:#4f8cff;margin-bottom:6px;">Ticket Test Harness</div>
-        <div id="__ticketHarnessSummary" style="margin-bottom:8px;white-space:pre;"></div>
-        <div id="__ticketHarnessLastRequests" style="margin-bottom:8px;white-space:pre;"></div>
-        <div id="__ticketHarnessPhone" style="margin-bottom:8px;white-space:pre;color:#fbbf24;"></div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button id="__ticketHarnessStart" type="button" style="padding:4px 8px;background:#2167d5;color:#fff;border:1px solid #4f8cff;border-radius:4px;cursor:pointer;">Start 93-min auto-test (60s interval)</button>
-          <button id="__ticketHarnessStop" type="button" style="padding:4px 8px;background:#7f1d1d;color:#fff;border:1px solid #ef4444;border-radius:4px;cursor:pointer;">Stop</button>
-          <button id="__ticketHarnessExport" type="button" style="padding:4px 8px;background:#374151;color:#fff;border:1px solid #6b7280;border-radius:4px;cursor:pointer;">Export JSON</button>
-          <button id="__ticketHarnessClear" type="button" style="padding:4px 8px;background:#374151;color:#fff;border:1px solid #6b7280;border-radius:4px;cursor:pointer;">Clear log</button>
-        </div>
-        <div id="__ticketHarnessLog" style="margin-top:8px;max-height:200px;overflow:auto;white-space:pre;color:#94a3b8;"></div>
-      `;
-      document.body.appendChild(panel);
-      document.getElementById('__ticketHarnessStart').addEventListener('click', startHarnessAutoTest);
-      document.getElementById('__ticketHarnessStop').addEventListener('click', () => { harnessState.autoTestStopRequested = true; });
-      document.getElementById('__ticketHarnessExport').addEventListener('click', exportHarnessJson);
-      document.getElementById('__ticketHarnessClear').addEventListener('click', () => {
-        harnessState.clientLogHistory.length = 0;
-        harnessState.controlCodeRequests.length = 0;
-        harnessState.phoneEngineStates.length = 0;
-        harnessState.streamStatusHistory.length = 0;
-        updateHarnessPanel();
-      });
-      return panel;
-    }
-    function updateHarnessPanel() {
-      ensureHarnessPanel();
-      const summary = document.getElementById('__ticketHarnessSummary');
-      const lastReq = document.getElementById('__ticketHarnessLastRequests');
-      const phone = document.getElementById('__ticketHarnessPhone');
-      const log = document.getElementById('__ticketHarnessLog');
-      const pageLoadMs = harnessState.firstFrameAt;
-      const firstDecodedMs = harnessState.firstDecodedFrameAt;
-      const completedReqs = harnessState.controlCodeRequests.filter(r => r.t_total_ms != null);
-      const totalReqs = harnessState.controlCodeRequests.length;
-      const maxReqMs = completedReqs.length ? Math.max(...completedReqs.map(r => r.t_total_ms)) : 0;
-      const avgReqMs = completedReqs.length ? Math.round(completedReqs.reduce((a, r) => a + r.t_total_ms, 0) / completedReqs.length) : 0;
-      const reqsOver5s = completedReqs.filter(r => r.t_total_ms > 5000).length;
-      summary.textContent =
-        `page→firstFrame: ${pageLoadMs ? pageLoadMs + 'ms' : '—'}    ` +
-        `page→firstDecoded: ${firstDecodedMs ? firstDecodedMs + 'ms' : '—'}\n` +
-        `requests: ${totalReqs} total / ${completedReqs.length} completed\n` +
-        `max req ms: ${maxReqMs}    avg req ms: ${avgReqMs}    reqs > 5s: ${reqsOver5s}`;
-      const last5 = harnessState.controlCodeRequests.slice(-5).reverse();
-      lastReq.textContent = last5.map(r => {
-        const total = r.t_total_ms != null ? r.t_total_ms + 'ms' : 'pending';
-        const transitions = (r.transitions || []).map(t => `${t.status}@${t.t}ms`).join(' → ');
-        return `${r.requestId.slice(-6)} ${total}\n  ${transitions}`;
-      }).join('\n');
-      const lastPhone = harnessState.phoneEngineStates.slice(-3);
-      phone.textContent = lastPhone.map(p => `${p.t}ms  verdict=${p.streamVerdict}  phoneStreamState=${p.phoneStreamState}  lastFrameAgo=${p.lastFrameAgoMillis}ms`).join('\n');
-      const lastLogs = harnessState.clientLogHistory.slice(-20);
-      log.textContent = lastLogs.map(l => `${l.t}ms  ${l.event}  ${l.detail ? l.detail.slice(0, 80) : ''}`).join('\n');
-    }
-    function startHarnessAutoTest() {
-      if (harnessState.autoTestRunning) return;
-      harnessState.autoTestRunning = true;
-      harnessState.autoTestStopRequested = false;
-      harnessState.autoTestStartedAt = harnessTimestamp();
-      harnessState.autoTestResults = [];
-      const intervalMs = 60000;
-      const totalMs = 93 * 60 * 1000;
-      const endAt = harnessState.autoTestStartedAt + totalMs;
-      // Pick a per-iteration digit pattern to avoid rate-limit collisions
-      // (the server allows 2 per 60s per email; the harness itself is one
-      // request per minute, but the user may submit manually in parallel).
-      function pickDigits() {
-        const cycle = ['11111', '22222', '33333', '44444', '55555', '66666', '77777', '88888', '99999', '00000'];
-        return cycle[harnessState.controlCodeRequests.length % cycle.length];
-      }
-      const tick = async () => {
-        if (harnessState.autoTestStopRequested) {
-          harnessState.autoTestRunning = false;
-          try { updateHarnessPanel(); } catch (_) {}
-          return;
-        }
-        if (harnessTimestamp() >= endAt) {
-          harnessState.autoTestRunning = false;
-          try { updateHarnessPanel(); } catch (_) {}
-          try { document.title = 'DONE: ' + (document.title || ''); } catch (_) {}
-          return;
-        }
-        // Cleanup: close any leftover result window from a previous iteration.
-        try {
-          if (codeResultArea && !codeResultArea.hidden) {
-            closeCurrentControlCode(false);
-          }
-          if (codeDialogOpen) {
-            closeControlCodeDialog();
-          }
-        } catch (_) {}
-        // Wait for state to fully settle. Use yield-via-rAF so the browser
-        // can paint and the agent-browser command isn't blocked.
-        let preWait = 0;
-        while ((codeRequest || codeDialogOpen || (codeResultArea && !codeResultArea.hidden)) && preWait < 45000 && !harnessState.autoTestStopRequested) {
-          await new Promise(r => requestAnimationFrame(() => setTimeout(r, 250)));
-          preWait += 250;
-        }
-        if (harnessState.autoTestStopRequested) {
-          harnessState.autoTestRunning = false;
-          try { updateHarnessPanel(); } catch (_) {}
-          return;
-        }
-        // Open the dialog and submit. Use rAF yields between each interaction.
-        try { openControlCodeDialog(); } catch (_) {}
-        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 200)));
-        try {
-          codeDigits.value = pickDigits();
-          codeDigits.dispatchEvent(new Event('input', { bubbles: true }));
-          const submitBtn = document.getElementById('controlCodeSubmit');
-          if (submitBtn) submitBtn.click();
-        } catch (_) {}
-        // Wait for the request to fully complete. The phone-side ViVi
-        // automation can take 5-20s in the worst case, plus the 30s
-        // cleanup window, so allow 90s.
-        const requestDeadline = harnessTimestamp() + 90000;
-        while (harnessTimestamp() < requestDeadline && !harnessState.autoTestStopRequested) {
-          const cur = codeRequest;
-          if (!cur || (cur.status !== 'running' && cur.status !== 'queued')) {
-            // Request finished. Give the UI 2s to settle.
-            await new Promise(r => requestAnimationFrame(() => setTimeout(r, 2000)));
-            break;
-          }
-          await new Promise(r => requestAnimationFrame(() => setTimeout(r, 500)));
-        }
-        try { updateHarnessPanel(); } catch (_) {}
-        // Schedule the next tick
-        setTimeout(tick, intervalMs);
-      };
-      tick();
-    }
-    function exportHarnessJson() {
-      const data = {
-        capturedAt: new Date().toISOString(),
-        userAgent: navigator.userAgent,
-        url: window.location.href,
-        harnessStartedAtT: harnessState.startedAt,
-        firstFrameAt: harnessState.firstFrameAt,
-        firstDecodedFrameAt: harnessState.firstDecodedFrameAt,
-        clientLogHistory: harnessState.clientLogHistory,
-        controlCodeRequests: harnessState.controlCodeRequests,
-        phoneEngineStates: harnessState.phoneEngineStates,
-        autoTestResults: harnessState.autoTestResults,
-        summary: {
-          totalRequests: harnessState.controlCodeRequests.length,
-          completedRequests: harnessState.controlCodeRequests.filter(r => r.t_total_ms != null).length,
-          maxRequestMs: Math.max(0, ...harnessState.controlCodeRequests.filter(r => r.t_total_ms != null).map(r => r.t_total_ms)),
-          avgRequestMs: (() => {
-            const a = harnessState.controlCodeRequests.filter(r => r.t_total_ms != null);
-            return a.length ? Math.round(a.reduce((s, r) => s + r.t_total_ms, 0) / a.length) : 0;
-          })(),
-          requestsOver5s: harnessState.controlCodeRequests.filter(r => r.t_total_ms > 5000).length,
-        },
-      };
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `ticket-harness-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-    }
-    // Initialize the panel
-    setTimeout(() => { try { ensureHarnessPanel(); updateHarnessPanel(); } catch (_) {} }, 100);
-    // Expose for inspection
-    window.__ticketTest = harnessState;
-    window.__ticketTestHarness = { state: harnessState, export: exportHarnessJson, start: startHarnessAutoTest, stop: () => { harnessState.autoTestStopRequested = true; } };
-  }
 })();

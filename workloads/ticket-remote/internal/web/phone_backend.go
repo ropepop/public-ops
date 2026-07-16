@@ -165,7 +165,6 @@ func (s *Server) cachePhoneStatusUpdate(input state.PhoneInput, health phone.Hea
 	}
 	snapshot = s.withActivePhoneBackend(snapshot, health)
 	s.cacheSnapshot(snapshot)
-	s.rememberControlGate(snapshot, now)
 }
 
 func (s *Server) probePhoneBackend(ctx context.Context, backend config.PhoneBackend) (bool, int, error) {
@@ -189,11 +188,6 @@ func (s *Server) probePhoneBackend(ctx context.Context, backend config.PhoneBack
 		return false, resp.StatusCode, fmt.Errorf("health returned %d", resp.StatusCode)
 	}
 	return true, resp.StatusCode, nil
-}
-
-func (s *Server) broadcastPhoneStatus(stateText string, message string) {
-	payload, _ := json.Marshal(map[string]any{"type": "phone", "state": stateText, "message": message, "phone": s.relay.Snapshot()})
-	s.broadcastText(payload)
 }
 
 func (s *Server) maybeRequestPhoneStart(data map[string]any, reason string) {
@@ -262,9 +256,6 @@ func (s *Server) requestPhoneKeyframeNow(reason string) error {
 }
 
 func (s *Server) sendPhoneKeyframe(reason string) error {
-	if s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
-		return nil
-	}
 	relayHealth := s.relay.Snapshot()
 	if relayHealth.Viewers > 0 && !relayHealth.Connected {
 		s.direct.recordClientTelemetry("keyframe_waiting_phone_connect", reason)
@@ -390,18 +381,4 @@ func (s *Server) connectedRecoveryShouldStayKeyframeOnly(reason string, now time
 		}
 	}
 	return false
-}
-
-func (s *Server) maybeRequestPhoneStartFromSnapshot(snapshot state.Snapshot) {
-	if snapshot.Phone == nil || strings.TrimSpace(snapshot.Phone.HealthJSON) == "" {
-		return
-	}
-	var msg struct {
-		Type string         `json:"type"`
-		Data map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(snapshot.Phone.HealthJSON), &msg); err != nil || msg.Type != "health" {
-		return
-	}
-	s.maybeRequestPhoneStart(msg.Data, "state_tick")
 }

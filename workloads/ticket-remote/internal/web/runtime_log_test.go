@@ -14,8 +14,7 @@ func TestRuntimeLoggingStaysSpacetimeOnly(t *testing.T) {
 		ticketRemoteSourceFile(t, "internal", "web", "relay_viewers.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "phone_backend.go"),
 		ticketRemoteSourceFile(t, "internal", "web", "stream_control.go"),
-		ticketRemoteSourceFile(t, "internal", "web", "control_code.go"),
-		ticketRemoteSourceFile(t, "internal", "web", "runtime_log.go"),
+		ticketRemoteSourceFile(t, "internal", "web", "event_sink.go"),
 		ticketRemoteSourceFile(t, "internal", "phone", "relay.go"),
 	}
 	for _, source := range files {
@@ -26,11 +25,11 @@ func TestRuntimeLoggingStaysSpacetimeOnly(t *testing.T) {
 		}
 	}
 
-	runtimeLog := ticketRemoteSourceFile(t, "internal", "web", "runtime_log.go")
+	runtimeLog := ticketRemoteSourceFile(t, "internal", "web", "event_sink.go")
 	for _, required := range []string{
 		"AppendSafeOperationalLog",
 		"safeRuntimeLogDetail",
-		`body = ` + "`" + `{"truncated":true}` + "`",
+		"ClampSafeOperationalLogDetail(string(body))",
 	} {
 		if !strings.Contains(runtimeLog, required) {
 			t.Fatalf("runtime log path must keep safe Spacetime logging, missing %q", required)

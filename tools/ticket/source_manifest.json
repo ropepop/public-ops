@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "description": "Immutable first-party Ticket production-source footprint contract across ops and pixel-phone.",
+  "line_definition": "Physical text lines as returned by bytes.splitlines(); blank and comment lines count.",
+  "scope_policy": {
+    "included": [
+      "Ticket Remote production runtime, browser source, build source, and static source assets",
+      "Ticket Remote SpacetimeDB module and Rust sidecar hand-written source",
+      "dedicated kitty-gration Ticket bridge and container source",
+      "Pixel Ticket Android runtime, native keyboard helper, and runtime shell assets",
+      "dedicated Pixel Ticket browser, setup, deployment, and health-monitor source"
+    ],
+    "excluded": [
+      "tests and test fixtures",
+      "documentation, reports, and evidence",
+      "generated browser bundles and generated Spacetime bindings",
+      "dependencies, lockfiles, build output, caches, and APK artifacts",
+      "configuration values, secrets, databases, logs, and runtime state",
+      "mixed shared orchestrator, deployment, and health files whose Ticket-only share cannot be measured reproducibly"
+    ],
+    "anti_gaming": "Line and byte reductions are both required; formatting, minification, generated output, and test deletion receive no credit.",
+    "protected_scope": "Rigas Satiksme source remains counted as Pixel Ticket production source but must not be edited or removed for this reduction."
+  },
+  "contract": {
+    "baseline_lines": 53747,
+    "maximum_lines": {
+      "ops": 17763,
+      "pixel": 19859,
+      "combined": 37622
+    },
+    "minimum_line_reduction": 16125,
+    "minimum_repo_line_reduction_percent": 20.0,
+    "minimum_combined_byte_reduction_percent": 25.0
+  },
+  "repositories": {
+    "ops": {
+      "baseline_commit": "5040f751dbb2d892b36ccb5bfb4ad84117e52023",
+      "expected_baseline": {
+        "files": 43,
+        "lines": 25376,
+        "bytes": 895240
+      },
+      "rules": [
+        {
+          "label": "go-runtime",
+          "prefix": "workloads/ticket-remote/",
+          "extensions": [".go"]
+        },
+        {
+          "label": "spacetime-module",
+          "prefix": "workloads/ticket-remote/spacetimedb/src/",
+          "extensions": [".rs"]
+        },
+        {
+          "label": "sidecar-runtime",
+          "prefix": "workloads/ticket-remote/spacetime-sidecar/src/",
+          "extensions": [".rs"]
+        },
+        {
+          "label": "browser-source",
+          "prefix": "workloads/ticket-remote/web-client/",
+          "extensions": [".js", ".ts", ".mjs"]
+        },
+        {
+          "label": "runtime-scripts",
+          "prefix": "workloads/ticket-remote/scripts/",
+          "extensions": [".sh"]
+        },
+        {
+          "label": "static-source",
+          "prefix": "workloads/ticket-remote/internal/web/static/",
+          "extensions": [".tmpl", ".css", ".svg"]
+        },
+        {
+          "label": "dedicated-bridge-deployment",
+          "prefix": "infra/arbuzas/docker/images/",
+          "name_contains": "ticket",
+          "extensions": [".sh", ".Dockerfile"]
+        }
+      ],
+      "exclude_prefixes": [
+        "workloads/ticket-remote/spacetime-sidecar/src/module_bindings/",
+        "workloads/ticket-remote/web-client/src/generated/",
+        "workloads/ticket-remote/node_modules/",
+        "workloads/ticket-remote/target/"
+      ],
+      "exclude_path_parts": [
+        "node_modules",
+        "target",
+        "dist",
+        "ops",
+        "evidence"
+      ],
+      "exclude_suffixes": [
+        "_test.go",
+        ".test.js",
+        ".test.mjs",
+        ".test.ts"
+      ],
+      "exclude_files": [
+        "workloads/ticket-remote/web-client/.ticket-app-source.prod.js",
+        "workloads/ticket-remote/internal/web/static/app.js",
+        "workloads/ticket-remote/internal/web/static/spacetime-client.js"
+      ]
+    },
+    "pixel": {
+      "baseline_commit": "c9a60e41a01fa1002e747ab2634cea4c24586919",
+      "expected_baseline": {
+        "files": 46,
+        "lines": 28371,
+        "bytes": 1125650
+      },
+      "rules": [
+        {
+          "label": "android-ticket-runtime",
+          "prefix": "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/",
+          "extensions": [".kt", ".java"]
+        },
+        {
+          "label": "native-keyboard-helper",
+          "files": [
+            "orchestrator/android-orchestrator/app/src/main/cpp/ticket_root_keyboard.c"
+          ]
+        },
+        {
+          "label": "ticket-runtime-entrypoints",
+          "prefix": "orchestrator/android-orchestrator/app/src/main/assets/runtime/entrypoints/",
+          "name_contains": "pixel-ticket-",
+          "extensions": [".sh"]
+        },
+        {
+          "label": "ticket-runtime-template",
+          "prefix": "orchestrator/android-orchestrator/app/src/main/assets/runtime/templates/ticket/",
+          "extensions": [".sh"]
+        },
+        {
+          "label": "ticket-browser-tools",
+          "prefix": "ops/scripts/",
+          "name_contains": "ticket",
+          "extensions": [".mjs", ".py", ".sh"]
+        },
+        {
+          "label": "ticket-build-tools",
+          "prefix": "orchestrator/scripts/android/",
+          "name_contains": "ticket",
+          "extensions": [".sh"]
+        },
+        {
+          "label": "ticket-health-monitor",
+          "prefix": "tools/observability/",
+          "name_contains": "ticket",
+          "extensions": [".py"]
+        },
+        {
+          "label": "ticket-setup-deployment",
+          "prefix": "tools/pixel/",
+          "name_contains": "ticket",
+          "extensions": [".sh"]
+        }
+      ],
+      "exclude_prefixes": [
+        "orchestrator/android-orchestrator/app/src/test/",
+        "orchestrator/android-orchestrator/runtime-tests/",
+        "tools/observability/tests/",
+        "docs/",
+        "ops/reports/",
+        "ops/evidence/"
+      ],
+      "exclude_path_parts": [
+        "build",
+        ".gradle",
+        "node_modules",
+        "target",
+        "cache",
+        "evidence"
+      ],
+      "exclude_suffixes": [
+        "Test.java",
+        "Test.kt",
+        ".test.js",
+        ".test.mjs",
+        ".test.ts",
+        "_test.py"
+      ],
+      "exclude_files": [],
+      "protected_files": [
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeDirectTapDriver.kt",
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeLoginClassifier.kt",
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeLoginOperation.kt",
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeMonthlyTicketOperation.kt",
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeSemanticClassifier.kt",
+        "orchestrator/android-orchestrator/app/src/main/java/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeUiAutomatorParser.kt",
+        "orchestrator/android-orchestrator/app/src/test/kotlin/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeDirectTapDriverTest.kt",
+        "orchestrator/android-orchestrator/app/src/test/kotlin/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeLoginClassifierTest.kt",
+        "orchestrator/android-orchestrator/app/src/test/kotlin/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeLoginOperationTest.kt",
+        "orchestrator/android-orchestrator/app/src/test/kotlin/lv/jolkins/pixelorchestrator/app/ticket/RigasSatiksmeUiAutomatorParserTest.kt"
+      ]
+    }
+  }
+}

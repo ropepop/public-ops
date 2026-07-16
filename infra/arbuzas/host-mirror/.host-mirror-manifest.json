@@ -122,7 +122,7 @@
     },
     "etc/arbuzas/env/ticket-remote.env": {
       "mode": 384,
-      "sha256": "71574d7eace5376a0ebc990b072d46e7992f9b01c0ad0ebcd82e3d659b391fce",
+      "sha256": "66deb4c4c30cc3f0c2f49ccaaac1435ee495d5fb85522da1975c0a8fa1c6fd39",
       "size": 1356
     },
     "etc/arbuzas/env/ticket-remote.env.bak-20260509T0012": {
@@ -166,7 +166,7 @@
       "size": 1704
     },
     "etc/arbuzas/secrets/android-adb/adbkey.pub": {
-      "mode": 420,
+      "mode": 384,
       "sha256": "f1dc35abb4eb3dbeab003be702fd01fb4fe1a338de2684f453499325bff959c5",
       "size": 755
     },
@@ -217,5 +217,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1783636483
+  "updatedEpochSeconds": 1783899809
 }

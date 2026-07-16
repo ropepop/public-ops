@@ -137,7 +137,6 @@ type pixelTicketEvent struct {
 	TicketState            string           `json:"ticketState"`
 	Reason                 string           `json:"reason,omitempty"`
 	RequestID              string           `json:"requestId,omitempty"`
-	Value                  string           `json:"value,omitempty"`
 	StreamEpoch            int64            `json:"streamEpoch,omitempty"`
 	FrameSequence          int64            `json:"frameSequence,omitempty"`
 	MinFrameSequence       int64            `json:"minFrameSequence,omitempty"`

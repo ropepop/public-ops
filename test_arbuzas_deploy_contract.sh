@@ -11,7 +11,6 @@ TICKET_PHONE_BRIDGE_HEALTH_PATH="${REPO_ROOT}/infra/arbuzas/docker/images/ticket
 ARBUZAS_EXAMPLE_ENV_PATH="${REPO_ROOT}/infra/arbuzas/docker/env/arbuzas.example.env"
 HOST_MIRROR_PATH="${REPO_ROOT}/tools/arbuzas/host_mirror.py"
 ACTIVE_PHONE_BROKER_WORKLOAD_PATH="${REPO_ROOT}/workloads/phone-broker"
-ARCHIVED_PHONE_BROKER_PATH="${REPO_ROOT}/archive/phone-broker"
 TRAIN_LDFLAGS_PATH="${REPO_ROOT}/workloads/train-bot/scripts/ldflags.sh"
 SATIKSME_LDFLAGS_PATH="${REPO_ROOT}/workloads/satiksme-bot/scripts/ldflags.sh"
 MEMORY_REPORT_PATH="${REPO_ROOT}/tools/arbuzas/memory_report.py"
@@ -31,6 +30,27 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
   echo "FAIL: missing Arbuzas deploy script at ${SCRIPT_PATH}" >&2
   exit 1
 fi
+
+for ssh_known_hosts_contract in \
+  'ARBUZAS_SSH_KNOWN_HOSTS_FILE="${ARBUZAS_SSH_KNOWN_HOSTS_FILE:-}"' \
+  '--ssh-known-hosts-file PATH' \
+  'StrictHostKeyChecking=yes' \
+  'UserKnownHostsFile=${ARBUZAS_SSH_KNOWN_HOSTS_FILE}' \
+  'args+=(--ssh-known-hosts-file "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}")'; do
+  if ! grep -Fq -- "${ssh_known_hosts_contract}" "${SCRIPT_PATH}"; then
+    echo "FAIL: explicit known_hosts deploy contract is missing: ${ssh_known_hosts_contract}" >&2
+    exit 1
+  fi
+done
+
+for mirror_profile_contract in \
+  'HOST_MIRROR_PROFILE="${ARBUZAS_HOST_MIRROR_PROFILE:-arbuzas}"' \
+  '--profile "${HOST_MIRROR_PROFILE}"'; do
+  if ! grep -Fq -- "${mirror_profile_contract}" "${SCRIPT_PATH}"; then
+    echo "FAIL: selectable host-mirror profile contract is missing: ${mirror_profile_contract}" >&2
+    exit 1
+  fi
+done
 
 if [[ ! -f "${COMPOSE_PATH}" ]]; then
   echo "FAIL: missing Arbuzas compose file at ${COMPOSE_PATH}" >&2
@@ -106,15 +126,6 @@ if [[ -e "${ACTIVE_PHONE_BROKER_WORKLOAD_PATH}" ]]; then
   echo "FAIL: retired phone broker remains under active workloads" >&2
   exit 1
 fi
-for archived_phone_broker_file in \
-  "${ARCHIVED_PHONE_BROKER_PATH}/README.md" \
-  "${ARCHIVED_PHONE_BROKER_PATH}/phone-broker.Dockerfile" \
-  "${ARCHIVED_PHONE_BROKER_PATH}/workload/go.mod"; do
-  if [[ ! -f "${archived_phone_broker_file}" ]]; then
-    echo "FAIL: missing preserved phone broker archive file at ${archived_phone_broker_file}" >&2
-    exit 1
-  fi
-done
 for retired_phone_broker_config in \
   "${ARBUZAS_EXAMPLE_ENV_PATH}" \
   "${HOST_MIRROR_PATH}"; do
@@ -715,7 +726,7 @@ for retired_snippet in [
     "probe_dot_endpoint",
     "probe_public_https_status",
     "ddns-last-ipv4",
-    # Ticket phone broker retired 2026-07-10; see archive/phone-broker/.
+    # Ticket phone broker retired 2026-07-10; recover via archive/README.md.
     "phone_" + "broker",
     "phone-" + "broker",
     "PHONE_" + "BROKER",
@@ -942,6 +953,14 @@ for bridge_ownership_snippet in (
 ):
     if bridge_ownership_snippet not in prepare_ticket_permissions_block:
         raise SystemExit(f"Ticket phone bridge non-root host preparation is missing: {bridge_ownership_snippet}")
+for tunnel_ownership_snippet in (
+    "'/etc/arbuzas/cloudflared/ticket-remote.json'",
+    "chown '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}'",
+):
+    if tunnel_ownership_snippet not in prepare_ticket_permissions_block:
+        raise SystemExit(f"Ticket tunnel non-root credential preparation is missing: {tunnel_ownership_snippet}")
+if 'remote_root_command "' not in prepare_host_block:
+    raise SystemExit("host layout preparation is not root-safe for clean non-root sudo hosts")
 if "prepare_remote_ticket_runtime_permissions" not in prepare_host_block:
     raise SystemExit("full host preparation does not retain Ticket Remote runtime permissions")
 if "run_timed_phase prepare_ticket_permissions prepare_remote_ticket_runtime_permissions" not in deploy_block:

@@ -18,6 +18,7 @@ const SERVICE_OIDC_ISSUER: &str = "https://vilciens.kontrole.info/oidc";
 const SERVICE_OIDC_AUDIENCE: &str = "train-bot-web";
 const SERVICE_OIDC_SUBJECT: &str = "service:ticket-remote";
 const SERVICE_ROLE: &str = "ticketremote_service";
+const MEMBER_PROXY_ROLE: &str = "ticketremote_member_proxy";
 // The database owner may connect for read-only operational SQL. Reducer writes
 // still require member or service authorization below.
 const OPERATOR_IDENTITY: &str = "c200ba2b19cf478fbb75ce99bd969ebe47cb313909a7ebf4d5f19c6bf3e325f9";
@@ -42,6 +43,227 @@ const SAFE_JSON_MAX_BYTES: usize = 4096;
 const SAFE_LOG_DETAIL_MAX_BYTES: usize = 1024;
 const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 2_500;
 const STREAM_BACKGROUND_REPORT_MAX_AGE_MS: i64 = 5_000;
+
+macro_rules! same_fields {
+    ($left:expr, $right:expr; $($field:ident),+ $(,)?) => {
+        true $(&& $left.$field == $right.$field)+
+    };
+}
+
+macro_rules! upsert_row {
+    ($ctx:expr, $table:ident, $row:expr) => {{
+        let row = $row;
+        let id = row.id.clone();
+        if $ctx.db.$table().id().find(&id).is_some() {
+            $ctx.db.$table().id().update(row.clone());
+        } else {
+            $ctx.db.$table().insert(row.clone());
+        }
+        row
+    }};
+}
+
+macro_rules! apply_changes {
+    ($row:expr, $changes:expr; $($field:ident),+ $(,)?) => {
+        $(if let Some(value) = $changes.$field { $row.$field = value; })+
+    };
+}
+
+macro_rules! purge_control_code_rows {
+    ($ctx:expr, $table:ident, $paired:ident, $ticket:expr, $bound:expr, $limit:expr, $deleted:expr) => {{
+        let rows: Vec<_> = $ctx
+            .db
+            .$table()
+            .ticketExpiresAt()
+            .filter(($ticket, ..=$bound))
+            .take(cleanup_remaining($limit, $deleted) as usize)
+            .collect();
+        for row in rows {
+            let paired = $ctx.db.$paired().id().find(&row.id).is_some();
+            let cost = 1 + u32::from(paired);
+            if cleanup_remaining($limit, $deleted) < cost {
+                break;
+            }
+            delete_control_code_request($ctx, &row.id);
+            $deleted += cost;
+        }
+    }};
+}
+
+macro_rules! purge_expired_rows {
+    ($ctx:expr, $table:ident, $ticket:expr, $bound:expr, $limit:expr, $deleted:expr) => {{
+        let rows: Vec<_> = $ctx
+            .db
+            .$table()
+            .ticketExpiresAt()
+            .filter(($ticket, ..=$bound))
+            .take(cleanup_remaining($limit, $deleted) as usize)
+            .collect();
+        for row in rows {
+            $ctx.db.$table().id().delete(&row.id);
+            $deleted += 1;
+        }
+    }};
+}
+
+macro_rules! ticket_expiry_purgers {
+    ($( $name:ident($table:ident) |$ctx:ident, $ticket:ident, $touched:ident, $clock:ident|
+        $after:block )+) => {$(
+        fn $name(
+            $ctx: &ReducerContext,
+            ticket_id: &str,
+            $clock: &str,
+            batch_size: u32,
+        ) -> u32 {
+            let $ticket = clean_ticket_id(ticket_id);
+            let expiry = canonical_time($clock);
+            let table = $ctx.db.$table();
+            let rows: Vec<_> = table.ticketExpiresAt()
+                .filter((&$ticket, ..=expiry.as_str())).take(batch_size as usize).collect();
+            let mut $touched = Vec::<String>::new();
+            for row in &rows {
+                if !$touched.contains(&row.backendId) { $touched.push(row.backendId.clone()); }
+                table.id().delete(&row.id);
+            }
+            $after
+            rows.len().min(u32::MAX as usize) as u32
+        }
+    )+};
+}
+
+macro_rules! purge_ticket_history {
+    ($ctx:expr, $ticket:expr, $bound:expr, $limit:expr, $deleted:expr) => {{
+        purge_control_code_rows!(
+            $ctx,
+            ticketremote_control_code_request,
+            ticketremote_control_code_owner,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_control_code_rows!(
+            $ctx,
+            ticketremote_control_code_owner,
+            ticketremote_control_code_request,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_control_code_fast_state,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_safe_operational_log,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+    }};
+}
+
+macro_rules! bootstrap_stream_state {
+    ($ctx:expr, $ticket:expr, $backend:expr, $clock:expr) => {{
+        upsert_stream_desired_state(
+            $ctx,
+            $ticket,
+            $backend,
+            false,
+            0,
+            "bootstrap",
+            $clock,
+            "service_bootstrap",
+            $clock,
+        );
+        upsert_phone_current_report($ctx, $ticket, $backend, "idle", false, "", "", "{}", $clock);
+        upsert_relay_current_report($ctx, $ticket, $backend, 0, "idle", "", "0", "{}", $clock);
+    }};
+}
+
+macro_rules! service_ticket_reducers {
+    ($( $name:ident($ctx:ident; $ticket_arg:ident; $($arg:ident: $kind:ty),+; $now_arg:ident)
+        |$ticket:ident, $clock:ident| $body:block )+) => {$(
+        #[spacetimedb::reducer]
+        pub fn $name(
+            $ctx: &ReducerContext,
+            $ticket_arg: String,
+            $($arg: $kind,)+
+            $now_arg: String,
+        ) -> Result<(), String> {
+            require_service($ctx)?;
+            let $clock = now_or($ctx, &$now_arg);
+            let $ticket = ensure_ticket($ctx, &$ticket_arg, "", &$clock);
+            $body;
+            Ok(())
+        }
+    )+};
+}
+
+macro_rules! service_reducers {
+    ($( $name:ident($ctx:ident; $($arg:ident: $kind:ty),* $(,)?) $body:block )+) => {$(
+        #[spacetimedb::reducer]
+        pub fn $name($ctx: &ReducerContext, $($arg: $kind),*) -> Result<(), String> {
+            require_service($ctx)?;
+            $body;
+            Ok(())
+        }
+    )+};
+}
+
+macro_rules! member_reducers {
+    ($( $name:ident($ctx:ident; $($arg:ident: $kind:ty),*; ticket = $ticket_arg:ident)
+        |$ticket:ident, $email:ident, $clock:ident| $body:block )+) => {$(
+        #[spacetimedb::reducer]
+        pub fn $name(
+            $ctx: &ReducerContext,
+            $($arg: $kind),*
+        ) -> Result<(), String> {
+            let $clock = now($ctx);
+            let $ticket = ensure_ticket($ctx, &$ticket_arg, "", &$clock);
+            let $email = client_email_from_auth($ctx, &$ticket.id)?;
+            $body;
+            Ok(())
+        }
+    )+};
+}
+
+macro_rules! cloned_projection {
+    ($name:ident from $source:ident with $convert:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
+        #[derive(Clone, SpacetimeType)]
+        pub struct $name { $(pub $field: $kind,)+ }
+
+        fn $convert(row: &$source) -> $name {
+            $name { $($field: row.$field.clone(),)+ }
+        }
+    };
+}
+
+macro_rules! service_views {
+    ($( $accessor:ident => $name:ident -> $row:ty
+        |$ctx:ident, $ticket:ident| $body:block )+) => {$(
+        #[spacetimedb::view(accessor = $accessor, public, primary_key = id)]
+        pub fn $name($ctx: &ViewContext) -> Vec<$row> {
+            let Some($ticket) = service_ticket_id_for_viewer($ctx) else {
+                return Vec::new();
+            };
+            $body
+        }
+    )+};
+}
+
+macro_rules! expression_functions {
+    ($(fn $name:ident($($arg:ident: $kind:ty),* $(,)?) -> $output:ty = $body:expr;)+) => {$(
+        fn $name($($arg: $kind),*) -> $output { $body }
+    )+};
+}
 
 #[spacetimedb::table(accessor = ticketremote_ticket)]
 #[derive(Clone)]
@@ -336,11 +558,10 @@ pub struct TicketremoteServiceIdentity {
     pub updatedAt: String,
 }
 
-#[derive(Clone, SpacetimeType)]
-pub struct TicketremoteServiceTicket {
-    pub id: String,
-    pub displayName: String,
-    pub updatedAt: String,
+cloned_projection! {
+    TicketremoteServiceTicket from TicketremoteTicket with service_ticket_from_row {
+        id: String, displayName: String, updatedAt: String
+    }
 }
 
 #[derive(Clone, SpacetimeType)]
@@ -354,89 +575,44 @@ pub struct TicketremoteServiceMember {
     pub updatedAt: String,
 }
 
-#[derive(Clone, SpacetimeType)]
-pub struct TicketremoteServicePhone {
-    pub id: String,
-    pub ticketId: String,
-    pub backendId: String,
-    pub attachName: String,
-    pub baseUrl: String,
-    pub desiredState: String,
-    pub streamState: String,
-    pub healthJson: String,
-    pub lastError: String,
-    pub lastSeenAt: String,
+cloned_projection! {
+    TicketremoteServicePhone from TicketremotePhoneBackend with service_phone_from_row {
+        id: String, ticketId: String, backendId: String, attachName: String, baseUrl: String,
+        desiredState: String, streamState: String, healthJson: String, lastError: String,
+        lastSeenAt: String
+    }
 }
 
-#[derive(Clone, SpacetimeType)]
-pub struct TicketremoteServiceStreamCommand {
-    pub id: String,
-    pub ticketId: String,
-    pub backendId: String,
-    pub commandType: String,
-    pub status: String,
-    pub revision: String,
-    pub reason: String,
-    pub payloadJson: String,
-    pub createdAt: String,
-    pub updatedAt: String,
-    pub expiresAt: String,
+cloned_projection! {
+    TicketremoteServiceStreamCommand from TicketremoteStreamCommand with service_stream_command_from_row {
+        id: String, ticketId: String, backendId: String, commandType: String, status: String,
+        revision: String, reason: String, payloadJson: String, createdAt: String, updatedAt: String,
+        expiresAt: String
+    }
 }
 
-#[spacetimedb::view(accessor = ticketremote_service_ticket, public, primary_key = id)]
-pub fn ticketremote_service_ticket_view(ctx: &ViewContext) -> Vec<TicketremoteServiceTicket> {
-    let Some(ticket_id) = service_ticket_id_for_viewer(ctx) else {
-        return Vec::new();
-    };
-    ctx.db
-        .ticketremote_ticket()
-        .id()
-        .find(&ticket_id)
-        .map(|row| vec![service_ticket_from_row(&row)])
-        .unwrap_or_default()
-}
-
-#[spacetimedb::view(accessor = ticketremote_service_ticket_member, public, primary_key = id)]
-pub fn ticketremote_service_ticket_member_view(
-    ctx: &ViewContext,
-) -> Vec<TicketremoteServiceMember> {
-    let Some(ticket_id) = service_ticket_id_for_viewer(ctx) else {
-        return Vec::new();
-    };
-    ctx.db
-        .ticketremote_ticket_member()
-        .ticketId()
-        .filter(&ticket_id)
-        .map(|row| service_member_from_row(&row))
-        .collect()
-}
-
-#[spacetimedb::view(accessor = ticketremote_service_phone_backend, public, primary_key = id)]
-pub fn ticketremote_service_phone_backend_view(ctx: &ViewContext) -> Vec<TicketremoteServicePhone> {
-    let Some(ticket_id) = service_ticket_id_for_viewer(ctx) else {
-        return Vec::new();
-    };
-    ctx.db
-        .ticketremote_phone_backend()
-        .ticketId()
-        .filter(&ticket_id)
-        .map(|row| service_phone_from_row(&row))
-        .collect()
-}
-
-#[spacetimedb::view(accessor = ticketremote_service_stream_command, public, primary_key = id)]
-pub fn ticketremote_service_stream_command_view(
-    ctx: &ViewContext,
-) -> Vec<TicketremoteServiceStreamCommand> {
-    let Some(ticket_id) = service_ticket_id_for_viewer(ctx) else {
-        return Vec::new();
-    };
-    ctx.db
-        .ticketremote_stream_command()
-        .ticketBackendStatus()
-        .filter((&ticket_id, "pixel", "pending"))
-        .map(|row| service_stream_command_from_row(&row))
-        .collect()
+service_views! {
+    ticketremote_service_ticket => ticketremote_service_ticket_view -> TicketremoteServiceTicket
+    |ctx, ticket| {
+        ctx.db.ticketremote_ticket().id().find(&ticket)
+            .map(|row| vec![service_ticket_from_row(&row)]).unwrap_or_default()
+    }
+    ticketremote_service_ticket_member => ticketremote_service_ticket_member_view -> TicketremoteServiceMember
+    |ctx, ticket| {
+        ctx.db.ticketremote_ticket_member().ticketId().filter(&ticket)
+            .map(|row| service_member_from_row(&row)).collect()
+    }
+    ticketremote_service_phone_backend => ticketremote_service_phone_backend_view -> TicketremoteServicePhone
+    |ctx, ticket| {
+        ctx.db.ticketremote_phone_backend().ticketId().filter(&ticket)
+            .map(|row| service_phone_from_row(&row)).collect()
+    }
+    ticketremote_service_stream_command => ticketremote_service_stream_command_view -> TicketremoteServiceStreamCommand
+    |ctx, ticket| {
+        ctx.db.ticketremote_stream_command().ticketBackendStatus()
+            .filter((&ticket, "pixel", "pending"))
+            .map(|row| service_stream_command_from_row(&row)).collect()
+    }
 }
 
 #[spacetimedb::reducer(init)]
@@ -457,29 +633,15 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
 #[spacetimedb::reducer(client_disconnected)]
 pub fn identity_disconnected(_ctx: &ReducerContext) {}
 
-#[spacetimedb::reducer]
-pub fn ticketremote_register_service_identity(
-    ctx: &ReducerContext,
-    ticketId: String,
-    now: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    register_service_identity(ctx, clean_ticket_id(&ticketId), &now_or(ctx, &now));
-    Ok(())
+service_reducers! {
+    ticketremote_register_service_identity(ctx; ticketId: String, now: String) {
+        register_service_identity(ctx, clean_ticket_id(&ticketId), &now_or(ctx, &now))
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_set_stream_focus(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    sessionId: String,
-    active: bool,
-    reason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+member_reducers! {
+    ticketremote_member_set_stream_focus(ctx; ticketId: String, backendId: String,
+        sessionId: String, active: bool, reason: String; ticket = ticketId) |ticket, email, now| {
     let session_id = non_empty(&sessionId, &connection_session_id(ctx));
     let backend_id = clean_backend_id(&backendId);
     let focus_reason = bounded_text(
@@ -518,84 +680,46 @@ pub fn ticketremote_member_set_stream_focus(
         "browser",
         &now,
     );
-    Ok(())
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_request_keyframe(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    reason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
-    let backend_id = clean_backend_id(&backendId);
-    let command_reason = non_empty(&reason, "browser_request");
-    // A shared relay report cannot prove that this requester's decoder is
-    // healthy. Respect the authenticated browser's local stale-frame decision;
-    // insert_stream_command still coalesces an already-pending global keyframe.
-    insert_stream_command(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        &format!("{}:browser:{}:keyframe", ticket.id, stable_stamp(&now)),
-        "keyframe",
-        &now,
-        &bounded_text(&command_reason, 120),
-        &json_object(&[("source", "browser"), ("actor", &account_public_id(&email))]),
-        30_000,
-        &now,
-    );
-    Ok(())
+macro_rules! member_stream_reducers {
+    ($($name:ident => $command:literal, $fallback:literal, $ttl:expr);+ $(;)?) => {$(
+        #[spacetimedb::reducer]
+        pub fn $name(
+            ctx: &ReducerContext,
+            ticketId: String,
+            backendId: String,
+            reason: String,
+        ) -> Result<(), String> {
+            let clock = now(ctx);
+            let ticket = ensure_ticket(ctx, &ticketId, "", &clock);
+            let email = client_email_from_auth(ctx, &ticket.id)?;
+            let command_reason = bounded_text(&non_empty(&reason, $fallback), 120);
+            insert_stream_command(
+                ctx, &ticket.id, &clean_backend_id(&backendId),
+                &format!("{}:browser:{}:{}", ticket.id, stable_stamp(&clock), $command),
+                $command, &clock, &command_reason,
+                &json_object(&[("source", "browser"), ("actor", &account_public_id(&email))]),
+                $ttl, &clock,
+            );
+            Ok(())
+        }
+    )+};
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_recover_stream(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    reason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
-    let backend_id = clean_backend_id(&backendId);
-    let command_reason = non_empty(&reason, "browser_recovery");
-    // As above, relay-wide liveness must not suppress recovery for one stale
-    // requester while another viewer remains healthy.
-    insert_stream_command(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        &format!(
-            "{}:browser:{}:recover_stream",
-            ticket.id,
-            stable_stamp(&now)
-        ),
-        "recover_stream",
-        &now,
-        &bounded_text(&command_reason, 120),
-        &json_object(&[("source", "browser"), ("actor", &account_public_id(&email))]),
-        CONTROL_CODE_COMMAND_TTL_MS,
-        &now,
-    );
-    Ok(())
+member_stream_reducers! {
+    ticketremote_member_request_keyframe => "keyframe", "browser_request", 30_000;
+    ticketremote_member_recover_stream => "recover_stream", "browser_recovery", CONTROL_CODE_COMMAND_TTL_MS;
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_prepare_control_code(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    reason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+member_reducers! {
+    ticketremote_member_prepare_control_code(ctx; ticketId: String, backendId: String,
+        reason: String; ticket = ticketId) |ticket, email, now| {
     let backend_id = clean_backend_id(&backendId);
-    if control_code_fast_state_current_ready(ctx, &ticket.id, &backend_id, &now) {
+    if control_code_fast_state_current_ready(ctx, &ticket.id, &backend_id, &now)
+        || ticket_has_control_code_phone_occupancy(ctx, &ticket.id, &backend_id, &now)
+    {
         return Ok(());
     }
     let owner_public_id = account_public_id(&email);
@@ -624,22 +748,14 @@ pub fn ticketremote_member_prepare_control_code(
         CONTROL_CODE_COMMAND_TTL_MS,
         &now,
     );
-    Ok(())
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_request_control_code(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    sessionId: String,
-    digits: String,
-    expectedFastRevision: String,
-) -> Result<(), String> {
-    let now = now(ctx);
+member_reducers! {
+    ticketremote_member_request_control_code(ctx; ticketId: String, backendId: String,
+        sessionId: String, digits: String, expectedFastRevision: String; ticket = ticketId)
+        |ticket, email, now| {
     let session_id = non_empty(&sessionId, &connection_session_id(ctx));
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
     let clean_digits = digits
         .chars()
         .filter(|c| c.is_ascii_digit())
@@ -662,14 +778,13 @@ pub fn ticketremote_member_request_control_code(
         .ticketremote_control_code_fast_state()
         .id()
         .find(&fast_state_id);
-    let fast_state_ready = fast_state
-        .as_ref()
-        .map(|row| control_code_fast_state_row_ready(row, &expectedFastRevision, &now))
-        .unwrap_or(false);
-    let fast_state_status = fast_state
-        .as_ref()
-        .map(|row| row.status.clone())
-        .unwrap_or_else(|| "missing".into());
+    let (fast_state_ready, fast_state_status, cleanup_revision, cleanup_stream_epoch,
+        cleanup_frame_sequence, stream_was_live) = fast_state.as_ref().map(|row| (
+            control_code_fast_state_row_ready(row, &expectedFastRevision, &now),
+            row.status.clone(), row.revision.clone(), row.streamEpoch.clone(),
+            row.frameSequence.clone(), row.streamLive,
+        )).unwrap_or_else(|| (false, "missing".into(), now.clone(), String::new(),
+            String::new(), false));
     let submit_mode = control_code_submit_mode(fast_state_ready);
     let request_id = control_code_request_id(&ticket.id, &session_id, &now);
     let owner_public_id = account_public_id(&email);
@@ -685,9 +800,7 @@ pub fn ticketremote_member_request_control_code(
     ctx.db
         .ticketremote_control_code_owner()
         .insert(owner.clone());
-    let public_request =
-        insert_control_code_public_request(ctx, &ticket.id, &request_id, &owner_public_id, &now);
-    let _ = public_request;
+    insert_control_code_public_request(ctx, &ticket.id, &request_id, &owner_public_id, &now);
     let payload = serde_json::json!({
         "type": "generate_control_code",
         "owner": "ticket",
@@ -717,22 +830,6 @@ pub fn ticketremote_member_request_control_code(
         CONTROL_CODE_PHONE_TTL_MS,
         &now,
     );
-    let cleanup_revision = fast_state
-        .as_ref()
-        .map(|row| row.revision.clone())
-        .unwrap_or_else(|| now.clone());
-    let cleanup_stream_epoch = fast_state
-        .as_ref()
-        .map(|row| row.streamEpoch.clone())
-        .unwrap_or_default();
-    let cleanup_frame_sequence = fast_state
-        .as_ref()
-        .map(|row| row.frameSequence.clone())
-        .unwrap_or_default();
-    let stream_was_live = fast_state
-        .as_ref()
-        .map(|row| row.streamLive)
-        .unwrap_or(false);
     upsert_control_code_fast_state(
         ctx,
         &ticket.id,
@@ -747,40 +844,16 @@ pub fn ticketremote_member_request_control_code(
         stream_was_live,
         &now,
     );
-    Ok(())
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_confirm_control_code_browser_capture(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    _sessionId: String,
-    requestId: String,
-    candidateFrameEpoch: String,
-    candidateFrameSequence: String,
-    acceptedReason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+member_reducers! {
+    ticketremote_member_confirm_control_code_browser_capture(ctx; ticketId: String,
+        backendId: String, _sessionId: String, requestId: String, candidateFrameEpoch: String,
+        candidateFrameSequence: String, acceptedReason: String; ticket = ticketId)
+        |ticket, email, now| {
     let request_id = requestId.trim().to_string();
-    let Some(owner) = ctx
-        .db
-        .ticketremote_control_code_owner()
-        .id()
-        .find(&request_id)
-    else {
-        return Err("not_found".into());
-    };
-    if owner.ticketId != ticket.id || clean_email(&owner.email) != email {
-        return Err("not_found".into());
-    }
-    let Some(current) = ctx
-        .db
-        .ticketremote_control_code_request()
-        .id()
-        .find(&request_id)
+    let Some(current) = owned_control_code_request(ctx, &ticket.id, &email, &request_id, true)?
     else {
         return Err("request_not_ready".into());
     };
@@ -789,19 +862,7 @@ pub fn ticketremote_member_confirm_control_code_browser_capture(
     }
     let frame_epoch = bounded_frame_ordinal(&candidateFrameEpoch);
     let frame_sequence = bounded_frame_ordinal(&candidateFrameSequence);
-    let marker_epoch = bounded_frame_ordinal(if current.resultFrameEpoch != "0" {
-        &current.resultFrameEpoch
-    } else {
-        &current.streamEpoch
-    });
-    let marker_sequence_source = if current.resultMinFrameSequence != "0" {
-        &current.resultMinFrameSequence
-    } else if current.minFrameSequence != "0" {
-        &current.minFrameSequence
-    } else {
-        &current.frameSequence
-    };
-    let marker_sequence = bounded_frame_ordinal(marker_sequence_source);
+    let (marker_epoch, marker_sequence) = control_code_result_marker(&current);
     if marker_epoch != "0" && frame_epoch != marker_epoch {
         return Err("frame_before_marker".into());
     }
@@ -809,8 +870,6 @@ pub fn ticketremote_member_confirm_control_code_browser_capture(
         return Err("frame_before_marker".into());
     }
     let accepted_reason = non_empty(&acceptedReason, "browser_capture_confirmed");
-    let frame_epoch_number = frame_ordinal_number(&frame_epoch);
-    let frame_sequence_number = frame_ordinal_number(&frame_sequence);
     update_control_code_public_request(
         ctx,
         &request_id,
@@ -825,80 +884,34 @@ pub fn ticketremote_member_confirm_control_code_browser_capture(
         },
         &now,
     );
-    let payload = serde_json::json!({
-        "owner": "ticket",
-        "app": "vivi",
-        "flow": "control_code",
-        "requestId": &request_id,
-        "accepted": true,
-        "reason": &accepted_reason,
-        "candidateFrameEpoch": frame_epoch_number,
-        "candidateFrameSequence": frame_sequence_number,
-        "source": "browser_spacetime"
-    })
-    .to_string();
-    insert_stream_command(
+    publish_browser_capture(
         ctx,
         &ticket.id,
         &clean_backend_id(&backendId),
-        &format!("{}:control_code_browser_capture", request_id),
-        "control_code_browser_capture",
-        &now,
-        &bounded_text(&accepted_reason, 120),
-        &payload,
-        CONTROL_CODE_COMMAND_TTL_MS,
+        &request_id,
+        true,
+        &accepted_reason,
+        &frame_epoch,
+        &frame_sequence,
         &now,
     );
-    Ok(())
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_close_control_code(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    _sessionId: String,
-    requestId: String,
-    reason: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+member_reducers! {
+    ticketremote_member_close_control_code(ctx; ticketId: String, backendId: String,
+        _sessionId: String, requestId: String, reason: String; ticket = ticketId)
+        |ticket, email, now| {
     let request_id = requestId.trim().to_string();
-    let Some(owner) = ctx
-        .db
-        .ticketremote_control_code_owner()
-        .id()
-        .find(&request_id)
+    let Some(current_request) =
+        owned_control_code_request(ctx, &ticket.id, &email, &request_id, false)?
     else {
-        return Err("not_found".into());
+        return Ok(());
     };
-    if owner.ticketId != ticket.id || clean_email(&owner.email) != email {
-        return Err("not_found".into());
-    }
-    let current_request = ctx
-        .db
-        .ticketremote_control_code_request()
-        .id()
-        .find(&request_id);
-    let capture_acknowledged = current_request
-        .as_ref()
-        .map(|row| row.captureAcknowledged)
-        .unwrap_or(false);
-    if capture_acknowledged {
-        update_control_code_public_request(
-            ctx,
-            &request_id,
-            ControlCodeChanges {
-                captureRequired: Some(false),
-                cleanupPending: Some(false),
-                expiresAt: Some(control_code_result_expires_at(&now)),
-                ..Default::default()
-            },
-            &now,
-        );
+    if control_code_close_is_idempotent(Some(&current_request)) {
         return Ok(());
     }
+    let capture_acknowledged = current_request.captureAcknowledged;
     let close_reason = non_empty(&reason, "browser_closed");
     let capture_reason = non_empty(&reason, "browser_capture_closed");
     update_control_code_public_request(
@@ -916,93 +929,38 @@ pub fn ticketremote_member_close_control_code(
         },
         &now,
     );
-    let payload = serde_json::json!({
-        "owner": "ticket",
-        "app": "vivi",
-        "flow": "control_code",
-        "requestId": &request_id,
-        "accepted": false,
-        "reason": &capture_reason,
-        "candidateFrameEpoch": 0,
-        "candidateFrameSequence": 0,
-        "source": "browser_spacetime"
-    })
-    .to_string();
-    insert_stream_command(
+    publish_browser_capture(
         ctx,
         &ticket.id,
         &clean_backend_id(&backendId),
-        &format!("{}:control_code_browser_capture_closed", request_id),
-        "control_code_browser_capture",
-        &now,
-        &bounded_text(&capture_reason, 120),
-        &payload,
-        CONTROL_CODE_COMMAND_TTL_MS,
-        &now,
-    );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_member_append_safe_operational_log(
-    ctx: &ReducerContext,
-    id: String,
-    ticketId: String,
-    level: String,
-    event: String,
-    correlationId: String,
-    detailJson: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    client_email_from_auth(ctx, &ticket.id)?;
-    insert_safe_operational_log(
-        ctx,
-        &ticket.id,
-        "browser",
-        &level,
-        &event,
-        &correlationId,
-        &detailJson,
-        &id,
+        &request_id,
+        false,
+        &capture_reason,
+        "0",
+        "0",
         &now,
     );
-    Ok(())
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_member_upsert_member(
-    ctx: &ReducerContext,
-    ticketId: String,
-    email: String,
-    role: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let actor = client_email_from_auth(ctx, &ticket.id)?;
-    if !is_admin(ctx, &ticket.id, &actor) {
-        return Err("forbidden".into());
+member_reducers! {
+    ticketremote_member_append_safe_operational_log(ctx; id: String, ticketId: String,
+        level: String, event: String, correlationId: String, detailJson: String; ticket = ticketId)
+        |ticket, _email, now| {
+        insert_safe_operational_log(ctx, &ticket.id, "browser", &level, &event, &correlationId,
+            &detailJson, &id, &now)
     }
-    upsert_member_row(ctx, &ticket.id, &email, &role, &now);
-    let _ = actor;
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_member_remove_member(
-    ctx: &ReducerContext,
-    ticketId: String,
-    email: String,
-) -> Result<(), String> {
-    let now = now(ctx);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let actor = client_email_from_auth(ctx, &ticket.id)?;
-    if !is_admin(ctx, &ticket.id, &actor) {
-        return Err("forbidden".into());
+    ticketremote_member_upsert_member(ctx; ticketId: String, email: String, role: String;
+        ticket = ticketId)
+        |ticket, actor, now| {
+        require_admin(ctx, &ticket.id, &actor)?;
+        upsert_member_row(ctx, &ticket.id, &email, &role, &now)
     }
-    deactivate_member_row(ctx, &ticket.id, &email, &now);
-    let _ = actor;
-    Ok(())
+    ticketremote_member_remove_member(ctx; ticketId: String, email: String; ticket = ticketId)
+        |ticket, actor, now| {
+        require_admin(ctx, &ticket.id, &actor)?;
+        deactivate_member_row(ctx, &ticket.id, &email, &now)
+    }
 }
 
 #[spacetimedb::reducer]
@@ -1022,15 +980,9 @@ pub fn ticketremote_service_bootstrap(
     let ticket = ensure_ticket(ctx, &ticketId, &displayName, &now);
     register_service_identity(ctx, ticket.id.clone(), &now);
     let email = clean_email(&adminEmail);
-    if !email.is_empty()
-        && ctx
-            .db
-            .ticketremote_ticket_member()
-            .id()
-            .find(member_id(&ticket.id, &email))
-            .is_none()
-    {
-        let member = TicketremoteTicketMember {
+    let members = ctx.db.ticketremote_ticket_member();
+    if !email.is_empty() && members.id().find(member_id(&ticket.id, &email)).is_none() {
+        members.insert(TicketremoteTicketMember {
             id: member_id(&ticket.id, &email),
             ticketId: ticket.id.clone(),
             email,
@@ -1038,79 +990,46 @@ pub fn ticketremote_service_bootstrap(
             active: true,
             createdAt: now.clone(),
             updatedAt: now.clone(),
-        };
-        ctx.db.ticketremote_ticket_member().insert(member.clone());
-        upsert_service_member_projection(ctx, &member);
+        });
     }
     if !phoneBackendId.trim().is_empty() {
         let backend_id = clean_backend_id(&phoneBackendId);
         let attach_name = non_empty(&phoneAttachName, &backend_id);
         clear_phone_backends(ctx, &ticket.id);
-        let phone = TicketremotePhoneBackend {
-            id: phone_row_id(&ticket.id, &backend_id),
-            ticketId: ticket.id.clone(),
-            backendId: backend_id.clone(),
-            attachName: attach_name.clone(),
-            baseUrl: phoneBaseUrl.trim().to_string(),
-            desiredState: "idle".into(),
-            streamState: "idle".into(),
-            healthJson: String::new(),
-            lastError: String::new(),
-            lastSeenAt: now.clone(),
-        };
-        ctx.db.ticketremote_phone_backend().insert(phone.clone());
-        upsert_service_phone_projection(ctx, &phone);
-        upsert_stream_desired_state(
-            ctx,
-            &ticket.id,
-            &backend_id,
-            false,
-            0,
-            "bootstrap",
-            &now,
-            "service_bootstrap",
-            &now,
-        );
-        upsert_phone_current_report(
-            ctx,
-            &ticket.id,
-            &backend_id,
-            "idle",
-            false,
-            "",
-            "",
-            "{}",
-            &now,
-        );
-        upsert_relay_current_report(ctx, &ticket.id, &backend_id, 0, "idle", "", "0", "{}", &now);
+        ctx.db
+            .ticketremote_phone_backend()
+            .insert(TicketremotePhoneBackend {
+                id: phone_row_id(&ticket.id, &backend_id),
+                ticketId: ticket.id.clone(),
+                backendId: backend_id.clone(),
+                attachName: attach_name.clone(),
+                baseUrl: phoneBaseUrl.trim().to_string(),
+                desiredState: "idle".into(),
+                streamState: "idle".into(),
+                healthJson: String::new(),
+                lastError: String::new(),
+                lastSeenAt: now.clone(),
+            });
+        bootstrap_stream_state!(ctx, &ticket.id, &backend_id, &now);
     }
     let issuer = authIssuer.trim().to_string();
     let audience = authAudience.trim().to_string();
     if !issuer.is_empty() && !audience.is_empty() {
-        if ctx
-            .db
-            .ticketremote_auth_config()
-            .ticketId()
-            .find(&ticket.id)
-            .is_some()
-        {
-            ctx.db
-                .ticketremote_auth_config()
-                .ticketId()
-                .delete(&ticket.id);
+        let auth = ctx.db.ticketremote_auth_config();
+        let row = TicketremoteAuthConfig {
+            ticketId: ticket.id.clone(),
+            issuer,
+            audience,
+            updatedAt: now.clone(),
+        };
+        if auth.ticketId().find(&ticket.id).is_some() {
+            auth.ticketId().update(row);
+        } else {
+            auth.insert(row);
         }
-        ctx.db
-            .ticketremote_auth_config()
-            .insert(TicketremoteAuthConfig {
-                ticketId: ticket.id.clone(),
-                issuer,
-                audience,
-                updatedAt: now.clone(),
-            });
     }
     ensure_cleanup_schedule(ctx, &ticket.id, &now);
     cleanup_expired(ctx, &ticket.id, &now, CLEANUP_BATCH_SIZE);
-    sync_service_projections(ctx, &ticket.id);
     Ok(())
 }
 
@@ -1132,97 +1051,26 @@ pub fn ticketremote_scheduled_cleanup_expired(
     Ok(())
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_upsert_member(
-    ctx: &ReducerContext,
-    ticketId: String,
-    actorEmail: String,
-    email: String,
-    role: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    if !is_admin(ctx, &ticket.id, &actorEmail) {
-        return Err("forbidden".into());
+service_reducers! {
+    ticketremote_upsert_member(ctx; ticketId: String, actorEmail: String, email: String,
+        role: String, nowArg: String) {
+        let now = now_or(ctx, &nowArg);
+        let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+        require_admin(ctx, &ticket.id, &actorEmail)?;
+        upsert_member_row(ctx, &ticket.id, &email, &role, &now)
     }
-    upsert_member_row(ctx, &ticket.id, &email, &role, &now);
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_remove_member(
-    ctx: &ReducerContext,
-    ticketId: String,
-    actorEmail: String,
-    email: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    if !is_admin(ctx, &ticket.id, &actorEmail) {
-        return Err("forbidden".into());
+    ticketremote_remove_member(ctx; ticketId: String, actorEmail: String, email: String,
+        nowArg: String) {
+        let now = now_or(ctx, &nowArg);
+        let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+        require_admin(ctx, &ticket.id, &actorEmail)?;
+        deactivate_member_row(ctx, &ticket.id, &email, &now)
     }
-    deactivate_member_row(ctx, &ticket.id, &email, &now);
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_update_phone(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    attachName: String,
-    baseUrl: String,
-    desiredState: String,
-    healthJson: String,
-    lastError: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    apply_phone_update(
-        ctx,
-        &ticketId,
-        &backendId,
-        &attachName,
-        &baseUrl,
-        &desiredState,
-        &healthJson,
-        &lastError,
-        &now_or(ctx, &nowArg),
-    );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_set_stream_desired_state(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    desiredActive: bool,
-    viewerCount: u32,
-    reason: String,
-    revision: String,
-    updatedBy: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    upsert_stream_desired_state(
-        ctx,
-        &ticket.id,
-        &backendId,
-        desiredActive,
-        viewerCount,
-        &reason,
-        &revision,
-        &updatedBy,
-        &now,
-    );
-    Ok(())
+    ticketremote_update_phone(ctx; ticketId: String, backendId: String, attachName: String,
+        baseUrl: String, desiredState: String, healthJson: String, lastError: String, nowArg: String) {
+        apply_phone_update(ctx, &ticketId, &backendId, &attachName, &baseUrl, &desiredState,
+            &healthJson, &lastError, &now_or(ctx, &nowArg))
+    }
 }
 
 #[spacetimedb::reducer]
@@ -1240,32 +1088,28 @@ pub fn ticketremote_append_stream_command(
 ) -> Result<(), String> {
     require_service(ctx)?;
     let now = now_or(ctx, &nowArg);
-    let command_type = clean_token(&commandType, "command");
+    let command_type = non_empty(&commandType, "command");
     let command_reason = non_empty(&reason, "stream_command");
-    if command_type == "prepare_control_code"
-        && control_code_fast_state_current_ready(ctx, &ticketId, &backendId, &now)
+    let background = suppressible_background_stream_command(&command_type);
+    if (command_type == "prepare_control_code"
+        && (control_code_fast_state_current_ready(ctx, &ticketId, &backendId, &now)
+            || ticket_has_control_code_phone_occupancy(ctx, &ticketId, &backendId, &now)))
+        || (background
+            && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
+            && !idle_stream_command_is_allowed(&command_reason, &payloadJson))
+        || (background
+            && !stream_command_is_requester_scoped(&command_reason, &payloadJson)
+            && live_relay_suppresses_background_stream_command(
+                ctx,
+                &ticketId,
+                &backendId,
+                &command_reason,
+                &now,
+            ))
     {
         return Ok(());
     }
-    if suppressible_background_stream_command(&command_type)
-        && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
-        && !idle_stream_command_is_allowed(&command_reason, &payloadJson)
-    {
-        return Ok(());
-    }
-    if suppressible_background_stream_command(&command_type)
-        && !stream_command_is_requester_scoped(&command_reason, &payloadJson)
-        && live_relay_suppresses_background_stream_command(
-            ctx,
-            &ticketId,
-            &backendId,
-            &command_reason,
-            &now,
-        )
-    {
-        return Ok(());
-    }
-    let row = insert_stream_command(
+    insert_stream_command(
         ctx,
         &ticketId,
         &backendId,
@@ -1277,115 +1121,45 @@ pub fn ticketremote_append_stream_command(
         ttlMillis as i64,
         &now,
     );
-    let _ = row;
     Ok(())
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_ack_stream_command(
-    ctx: &ReducerContext,
-    commandId: String,
-    status: String,
-    reason: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    update_stream_command_status(ctx, &commandId, &status, &reason, &now);
-    Ok(())
+service_reducers! {
+    ticketremote_ack_stream_command(ctx; commandId: String, status: String, reason: String,
+        nowArg: String) {
+        update_stream_command_status(ctx, &commandId, &status, &reason, &now_or(ctx, &nowArg))
+    }
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_update_phone_current_report(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    streamState: String,
-    desiredActive: bool,
-    lastCommandId: String,
-    lastCommandRevision: String,
-    statusJson: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    upsert_phone_current_report(
-        ctx,
-        &ticket.id,
-        &backendId,
-        &streamState,
-        desiredActive,
-        &lastCommandId,
-        &lastCommandRevision,
-        &statusJson,
-        &now,
-    );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_update_control_code_fast_state(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    status: String,
-    revision: String,
-    reason: String,
-    streamEpoch: String,
-    frameSequence: String,
-    rawTicketConfirmed: bool,
-    cleanupClear: bool,
-    streamLive: bool,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    upsert_control_code_fast_state(
-        ctx,
-        &ticket.id,
-        &backendId,
-        &status,
-        &revision,
-        &reason,
-        &streamEpoch,
-        &frameSequence,
-        rawTicketConfirmed,
-        cleanupClear,
-        streamLive,
-        &now,
-    );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_update_relay_current_report(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    videoClients: u32,
-    streamVerdict: String,
-    lastFrameAt: String,
-    framesForwarded: String,
-    statusJson: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    upsert_relay_current_report(
-        ctx,
-        &ticket.id,
-        &backendId,
-        videoClients,
-        &streamVerdict,
-        &lastFrameAt,
-        &framesForwarded,
-        &statusJson,
-        &now,
-    );
-    Ok(())
+service_ticket_reducers! {
+    ticketremote_set_stream_desired_state(ctx; ticketId;
+        backendId: String, desiredActive: bool, viewerCount: u32, reason: String,
+        revision: String, updatedBy: String; nowArg
+    ) |ticket, now| {
+        upsert_stream_desired_state(ctx, &ticket.id, &backendId, desiredActive, viewerCount,
+            &reason, &revision, &updatedBy, &now);
+    }
+    ticketremote_update_phone_current_report(ctx; ticketId;
+        backendId: String, streamState: String, desiredActive: bool, lastCommandId: String,
+        lastCommandRevision: String, statusJson: String; nowArg
+    ) |ticket, now| {
+        upsert_phone_current_report(ctx, &ticket.id, &backendId, &streamState, desiredActive,
+            &lastCommandId, &lastCommandRevision, &statusJson, &now);
+    }
+    ticketremote_update_control_code_fast_state(ctx; ticketId;
+        backendId: String, status: String, revision: String, reason: String, streamEpoch: String,
+        frameSequence: String, rawTicketConfirmed: bool, cleanupClear: bool, streamLive: bool; nowArg
+    ) |ticket, now| {
+        upsert_control_code_fast_state(ctx, &ticket.id, &backendId, &status, &revision, &reason,
+            &streamEpoch, &frameSequence, rawTicketConfirmed, cleanupClear, streamLive, &now);
+    }
+    ticketremote_update_relay_current_report(ctx; ticketId;
+        backendId: String, videoClients: u32, streamVerdict: String, lastFrameAt: String,
+        framesForwarded: String, statusJson: String; nowArg
+    ) |ticket, now| {
+        upsert_relay_current_report(ctx, &ticket.id, &backendId, videoClients, &streamVerdict,
+            &lastFrameAt, &framesForwarded, &statusJson, &now);
+    }
 }
 
 #[spacetimedb::reducer]
@@ -1420,10 +1194,7 @@ pub fn ticketremote_update_control_code_request(
     if existing.ticketId != ticket.id {
         return Ok(());
     }
-    let mut clean_status = clean_token(&non_empty(&status, &existing.status), "queued").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
+    let mut clean_status = safe_token(&status, &existing.status);
     let incoming_reason = bounded_text(&non_empty(&reason, &existing.reason), 200);
     let preserve_captured_success = existing.status == "succeeded"
         && existing.captureAcknowledged
@@ -1432,7 +1203,16 @@ pub fn ticketremote_update_control_code_request(
     if preserve_captured_success {
         clean_status = existing.status.clone();
     }
-    let terminal_failure = matches!(clean_status.as_str(), "failed" | "expired" | "closed");
+    let preserve_terminal_failure =
+        control_code_cleanup_preserves_terminal_failure(&existing, &clean_status, &incoming_reason);
+    let (next_reason, next_message) = control_code_update_text(
+        &existing,
+        &incoming_reason,
+        &message,
+        preserve_captured_success,
+        preserve_terminal_failure,
+    );
+    let terminal_failure = control_code_terminal_failure_status(&clean_status);
     let succeeded = clean_status == "succeeded";
     let clean_result_proof = clean_control_code_result_proof(&resultProof);
     let clean_result_proof_at = bounded_text(resultProofAt.trim(), 80);
@@ -1441,42 +1221,18 @@ pub fn ticketremote_update_control_code_request(
         &requestId,
         ControlCodeChanges {
             status: Some(clean_status.clone()),
-            reason: Some(if preserve_captured_success {
-                existing.reason.clone()
-            } else {
-                incoming_reason
-            }),
-            message: Some(bounded_text(&message, 240)),
-            streamEpoch: Some(bounded_frame_ordinal(&non_empty(
-                &streamEpoch,
-                &existing.streamEpoch,
-            ))),
-            frameSequence: Some(bounded_frame_ordinal(&non_empty(
-                &frameSequence,
-                &existing.frameSequence,
-            ))),
-            minFrameSequence: Some(bounded_frame_ordinal(&non_empty(
-                &minFrameSequence,
-                &existing.minFrameSequence,
-            ))),
-            resultFrameEpoch: Some(bounded_frame_ordinal(&non_empty(
-                &resultFrameEpoch,
-                &existing.resultFrameEpoch,
-            ))),
-            resultMinFrameSequence: Some(bounded_frame_ordinal(&non_empty(
+            reason: Some(next_reason),
+            message: Some(next_message),
+            streamEpoch: updated_ordinal(&streamEpoch, &existing.streamEpoch),
+            frameSequence: updated_ordinal(&frameSequence, &existing.frameSequence),
+            minFrameSequence: updated_ordinal(&minFrameSequence, &existing.minFrameSequence),
+            resultFrameEpoch: updated_ordinal(&resultFrameEpoch, &existing.resultFrameEpoch),
+            resultMinFrameSequence: updated_ordinal(
                 &resultMinFrameSequence,
                 &existing.resultMinFrameSequence,
-            ))),
-            resultProof: if clean_result_proof.is_empty() {
-                None
-            } else {
-                Some(clean_result_proof)
-            },
-            resultProofAt: if clean_result_proof_at.is_empty() {
-                None
-            } else {
-                Some(clean_result_proof_at)
-            },
+            ),
+            resultProof: optional_text(clean_result_proof),
+            resultProofAt: optional_text(clean_result_proof_at),
             captureRequired: Some(succeeded && !existing.captureAcknowledged),
             cleanupPending: Some(cleanupPending),
             resultExpiresAt: Some(if succeeded {
@@ -1508,113 +1264,313 @@ pub fn ticketremote_update_control_code_request(
     Ok(())
 }
 
-fn control_code_cleanup_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "ticket_detail"
-            | "return_to_raw_complete"
-            | "browser_capture_confirmed"
-            | "control_code_cleanup_attention_needed"
-            | "rs_monthly_ticket_cleanup_attention_needed"
-    )
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_append_safe_operational_log(
+fn owned_control_code_request(
     ctx: &ReducerContext,
-    id: String,
-    ticketId: String,
-    source: String,
-    level: String,
-    event: String,
-    correlationId: String,
-    detailJson: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    insert_safe_operational_log(
-        ctx,
-        &clean_ticket_id(&ticketId),
-        &source,
-        &level,
-        &event,
-        &correlationId,
-        &detailJson,
-        &id,
-        &now,
-    );
-    Ok(())
-}
-
-#[spacetimedb::reducer]
-pub fn ticketremote_purge_sensitive_operational_logs(
-    ctx: &ReducerContext,
-    ticketId: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let ticket_id = clean_ticket_id(&ticketId);
-    let rows: Vec<_> = ctx
+    ticket_id: &str,
+    email: &str,
+    request_id: &str,
+    owner_required: bool,
+) -> Result<Option<TicketremoteControlCodeRequest>, String> {
+    let request_id = request_id.to_string();
+    let owner = ctx
         .db
-        .ticketremote_safe_operational_log()
-        .ticketId()
-        .filter(&ticket_id)
-        .filter(|row| {
-            matches!(
-                row.event.as_str(),
-                "pixel_ticket_control_code_result"
-                    | "pixel_ticket_control_code_request_result_detected"
-            )
-        })
-        .collect();
-    for row in rows {
-        ctx.db
-            .ticketremote_safe_operational_log()
-            .id()
-            .delete(&row.id);
+        .ticketremote_control_code_owner()
+        .id()
+        .find(&request_id);
+    let Some(owner) = owner else {
+        return if owner_required {
+            Err("not_found".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if owner.ticketId != ticket_id || clean_email(&owner.email) != email {
+        return Err("not_found".into());
     }
-    Ok(())
+    Ok(ctx
+        .db
+        .ticketremote_control_code_request()
+        .id()
+        .find(&request_id))
 }
 
-#[spacetimedb::reducer]
-pub fn ticketremote_cleanup_expired(
+fn publish_browser_capture(
     ctx: &ReducerContext,
-    ticketId: String,
-    nowArg: String,
-    batchSize: u32,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    cleanup_expired(
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    accepted: bool,
+    reason: &str,
+    frame_epoch: &str,
+    frame_sequence: &str,
+    now: &str,
+) {
+    let payload = serde_json::json!({
+        "owner": "ticket", "app": "vivi", "flow": "control_code",
+        "requestId": request_id, "accepted": accepted, "reason": reason,
+        "candidateFrameEpoch": frame_ordinal_number(frame_epoch),
+        "candidateFrameSequence": frame_ordinal_number(frame_sequence),
+        "source": "browser_spacetime"
+    })
+    .to_string();
+    insert_stream_command(
         ctx,
-        &clean_ticket_id(&ticketId),
-        &now_or(ctx, &nowArg),
-        batchSize,
+        ticket_id,
+        backend_id,
+        &format!(
+            "{}:control_code_browser_capture{}",
+            request_id,
+            if accepted { "" } else { "_closed" }
+        ),
+        "control_code_browser_capture",
+        now,
+        &bounded_text(reason, 120),
+        &payload,
+        CONTROL_CODE_COMMAND_TTL_MS,
+        now,
     );
-    Ok(())
 }
 
-fn now(ctx: &ReducerContext) -> String {
-    iso(ctx.timestamp)
-}
-
-fn now_or(ctx: &ReducerContext, value: &str) -> String {
-    let clean = value.trim();
-    if clean.is_empty() {
-        now(ctx)
+fn control_code_update_text(
+    existing: &TicketremoteControlCodeRequest,
+    incoming_reason: &str,
+    incoming_message: &str,
+    preserve_captured_success: bool,
+    preserve_terminal_failure: bool,
+) -> (String, String) {
+    let reason = if preserve_captured_success || preserve_terminal_failure {
+        existing.reason.clone()
     } else {
-        clean.to_string()
+        incoming_reason.into()
+    };
+    let message = if preserve_terminal_failure {
+        existing.message.clone()
+    } else {
+        bounded_text(incoming_message, 240)
+    };
+    (reason, message)
+}
+
+service_reducers! {
+    ticketremote_append_safe_operational_log(ctx; id: String, ticketId: String, source: String,
+        level: String, event: String, correlationId: String, detailJson: String, nowArg: String) {
+        insert_safe_operational_log(ctx, &clean_ticket_id(&ticketId), &source, &level, &event,
+            &correlationId, &detailJson, &id, &now_or(ctx, &nowArg))
+    }
+    ticketremote_purge_sensitive_operational_logs(ctx; ticketId: String) {
+        let ticket_id = clean_ticket_id(&ticketId);
+        let table = ctx.db.ticketremote_safe_operational_log();
+        let rows: Vec<_> = table.ticketId().filter(&ticket_id).filter(|row| matches!(
+            row.event.as_str(), "pixel_ticket_control_code_result"
+                | "pixel_ticket_control_code_request_result_detected"
+        )).collect();
+        for row in rows { table.id().delete(&row.id); }
+    }
+    ticketremote_cleanup_expired(ctx; ticketId: String, nowArg: String, batchSize: u32) {
+        cleanup_expired(ctx, &clean_ticket_id(&ticketId), &now_or(ctx, &nowArg), batchSize)
     }
 }
 
-fn iso(timestamp: Timestamp) -> String {
-    timestamp
-        .to_rfc3339()
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
-}
-
-fn add_ms(value: &str, ms: i64) -> String {
-    let micros = parse_time_micros(value).saturating_add(ms.saturating_mul(1000));
-    iso(Timestamp::from_micros_since_unix_epoch(micros))
+expression_functions! {
+    fn now(ctx: &ReducerContext) -> String = iso(ctx.timestamp);
+    fn parse_time_ms(value: &str) -> i64 = parse_time_micros(value) / 1000;
+    fn suppressible_background_stream_command(value: &str) -> bool =
+        matches!(value.trim(), "start" | "keyframe" | "recover_stream");
+    fn clean_ticket_id(value: &str) -> String = non_empty(value, DEFAULT_TICKET_ID);
+    fn clean_backend_id(value: &str) -> String = non_empty(value, "pixel");
+    fn clean_email(value: &str) -> String = value.trim().to_ascii_lowercase();
+    fn bounded_text(value: &str, max: usize) -> String = value.chars().take(max).collect();
+    fn member_id(ticket: &str, email: &str) -> String =
+        format!("{}:{}", clean_ticket_id(ticket), clean_email(email));
+    fn phone_row_id(ticket: &str, backend: &str) -> String =
+        format!("{}:{}", clean_ticket_id(ticket), clean_backend_id(backend));
+    fn history_expires_at(clock: &str) -> String = add_ms(clock, HISTORY_TTL_MS);
+    fn stream_viewer_focus_expires_at(clock: &str) -> String = add_ms(clock, STREAM_VIEWER_FOCUS_TTL_MS);
+    fn control_code_request_expires_at(clock: &str) -> String = add_ms(clock, CONTROL_CODE_REQUEST_TTL_MS);
+    fn control_code_result_expires_at(clock: &str) -> String = add_ms(clock, CONTROL_CODE_RESULT_TTL_MS);
+    fn valid_control_code_digits(value: &str) -> bool =
+        (2..=8).contains(&value.len()) && value.chars().all(|c| c.is_ascii_digit());
+    fn frame_ordinal_number(value: &str) -> i64 = value.trim().parse::<i64>().unwrap_or(0);
+    fn operator_identity_is_valid(identity: &str) -> bool = identity.trim() == OPERATOR_IDENTITY;
+    fn control_code_fast_state_id(ticket: &str, backend: &str) -> String = phone_row_id(ticket, backend);
+    fn control_code_submit_mode(ready: bool) -> &'static str = if ready { "fast_ready" } else { "queued_warmup" };
+    fn cleanup_remaining(limit: u32, deleted: u32) -> u32 =
+        if limit == 0 { 0 } else { limit.saturating_sub(deleted) };
+    fn stream_viewer_focus_expired(row: &TicketremoteStreamViewerFocus, clock: &str) -> bool =
+        !row.active || parse_time_ms(&row.expiresAt) <= parse_time_ms(clock);
+    fn control_code_terminal_failure_status(status: &str) -> bool =
+        matches!(status, "failed" | "expired" | "closed");
+    fn canonical_time(value: &str) -> String =
+        iso(Timestamp::from_micros_since_unix_epoch(parse_time_micros(value)));
+    fn account_public_id(email: &str) -> String = public_hash(&clean_email(email), 4);
+    fn auth_config(ctx: &ReducerContext, ticket: &str) -> Option<TicketremoteAuthConfig> =
+        ctx.db.ticketremote_auth_config().ticketId().find(clean_ticket_id(ticket));
+    fn has_valid_service_identity(ctx: &ReducerContext) -> bool =
+        jwt_payload(ctx).map(|claims| service_claims_are_valid(&claims)).unwrap_or(false);
+    fn is_member(ctx: &ReducerContext, ticket: &str, email: &str) -> bool =
+        ctx.db.ticketremote_ticket_member().id().find(member_id(ticket, email))
+            .map(|row| row.active).unwrap_or(false);
+    fn is_admin(ctx: &ReducerContext, ticket: &str, email: &str) -> bool =
+        ctx.db.ticketremote_ticket_member().id().find(member_id(ticket, email))
+            .map(|row| row.active && matches!(row.role.as_str(), "owner" | "admin"))
+            .unwrap_or(false);
+    fn stream_desired_core_equal(row: &TicketremoteStreamDesiredState,
+        active: bool, viewers: u32) -> bool = row.desiredActive == active && row.viewerCount == viewers;
+    fn control_code_cleanup_preserves_terminal_failure(existing: &TicketremoteControlCodeRequest,
+        status: &str, reason: &str) -> bool = control_code_terminal_failure_status(&existing.status)
+            && status == existing.status && control_code_cleanup_reason(reason);
+    fn updated_ordinal(value: &str, fallback: &str) -> Option<String> =
+        Some(bounded_frame_ordinal(&non_empty(value, fallback)));
+    fn optional_text(value: String) -> Option<String> = (!value.is_empty()).then_some(value);
+    fn control_code_stream_command_occupies_phone(row: &TicketremoteStreamCommand,
+        clock: &str) -> bool = row.status == "pending"
+            && parse_time_ms(&row.expiresAt) > parse_time_ms(clock)
+            && (matches!(row.commandType.as_str(), "prepare_control_code" | "generate_control_code"
+                | "control_code_browser_capture")
+                || stream_command_is_control_code(&row.reason, &row.payloadJson));
+    fn control_code_request_same_payload(left: &TicketremoteControlCodeRequest,
+        right: &TicketremoteControlCodeRequest) -> bool = same_fields!(left, right;
+            status, reason, message, resultProof, resultProofAt, captureRequired,
+            captureAcknowledged, cleanupPending, streamEpoch, frameSequence, minFrameSequence,
+            resultFrameEpoch, resultMinFrameSequence, captureFrameEpoch, captureFrameSequence);
+    fn now_or(ctx: &ReducerContext, value: &str) -> String = {
+        let value = value.trim();
+        if value.is_empty() { now(ctx) } else { value.into() }
+    };
+    fn iso(timestamp: Timestamp) -> String =
+        timestamp.to_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+    fn add_ms(value: &str, ms: i64) -> String = iso(Timestamp::from_micros_since_unix_epoch(
+        parse_time_micros(value).saturating_add(ms.saturating_mul(1000))));
+    fn json_i64(value: &serde_json::Value) -> Option<i64> = value.as_i64()
+        .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+        .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()));
+    fn json_str(value: &serde_json::Value, key: &str) -> String = value.get(key)
+        .and_then(|raw| raw.as_str()).map(|raw| raw.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    fn clean_role(value: &str) -> String = allowlisted(value, &["owner", "admin"], "member");
+    fn non_empty(value: &str, fallback: &str) -> String = {
+        let value = value.trim();
+        if value.is_empty() { fallback.into() } else { value.into() }
+    };
+    fn safe_token(value: &str, fallback: &str) -> String = non_empty(value, fallback)
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-', "_");
+    fn safe_json_string(value: &str, max: usize) -> String = {
+        let raw = match value.trim() { "" => "{}", value => value };
+        let valid = serde_json::from_str::<serde_json::Value>(raw).is_ok();
+        (if valid { raw } else { "{}" }).chars().take(max).collect()
+    };
+    fn command_expires_at(clock: &str, ttl: i64) -> String = add_ms(clock,
+        if ttl <= 0 || ttl > HISTORY_TTL_MS { HISTORY_TTL_MS } else { ttl });
+    fn clean_control_code_result_proof(value: &str) -> String = allowlisted(value,
+        &["phone_root", "phone_visual", "phone_visual_root_confirmed",
+        "phone_visual_raw_ticket_after_submit", "phone_root_image", "browser_frame"], "");
+    fn bounded_frame_ordinal(value: &str) -> String = non_empty(
+        &value.chars().filter(|c| c.is_ascii_digit()).take(24).collect::<String>(), "0");
+    fn connection_session_id(ctx: &ReducerContext) -> String = ctx.connection_id()
+        .map(|id| format!("{id:?}")).unwrap_or_else(|| ctx.sender().to_string());
+    fn control_code_cleanup_reason(reason: &str) -> bool = matches!(reason,
+        "ticket_detail" | "return_to_raw_complete" | "browser_capture_confirmed"
+        | "control_code_cleanup_attention_needed" | "rs_monthly_ticket_cleanup_attention_needed");
+    fn control_code_result_marker(request: &TicketremoteControlCodeRequest) -> (String, String) = {
+        let epoch = if request.resultFrameEpoch != "0" { &request.resultFrameEpoch }
+            else { &request.streamEpoch };
+        let sequence = if request.resultMinFrameSequence != "0" { &request.resultMinFrameSequence }
+            else if request.minFrameSequence != "0" { &request.minFrameSequence }
+            else { &request.frameSequence };
+        (bounded_frame_ordinal(epoch), bounded_frame_ordinal(sequence))
+    };
+    fn control_code_close_is_idempotent(request: Option<&TicketremoteControlCodeRequest>) -> bool =
+        request.is_none_or(|row| control_code_terminal_failure_status(&row.status)
+            || (row.status == "succeeded" && row.captureAcknowledged));
+    fn allowlisted(value: &str, allowed: &[&str], fallback: &str) -> String = {
+        let value = value.trim();
+        if allowed.contains(&value) { value.into() } else { fallback.into() }
+    };
+    fn json_object(pairs: &[(&str, &str)]) -> String = serde_json::Value::Object(
+        pairs.iter().map(|(key, value)| ((*key).into(), (*value).into())).collect()).to_string();
+    fn stable_stamp(value: &str) -> String = non_empty(
+        &value.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(), "time");
+    fn control_code_request_id(ticket: &str, session: &str, clock: &str) -> String =
+        format!("{}:{}:{}:control_code", clean_ticket_id(ticket), session.trim(), stable_stamp(clock));
+    fn jwt_payload(ctx: &ReducerContext) -> Result<serde_json::Value, String> = {
+        let Some(jwt) = ctx.sender_auth().jwt() else { return Err("auth required".into()); };
+        serde_json::from_str(jwt.raw_payload()).map_err(|_| "invalid auth payload".into())
+    };
+    fn service_claims_are_valid(payload: &serde_json::Value) -> bool = payload.get("iss")
+        .and_then(|value| value.as_str()).map(str::trim) == Some(SERVICE_OIDC_ISSUER)
+        && jwt_audience_includes(payload, SERVICE_OIDC_AUDIENCE)
+        && payload.get("sub").and_then(|value| value.as_str()).map(str::trim)
+            == Some(SERVICE_OIDC_SUBJECT)
+        && jwt_roles_include(payload, SERVICE_ROLE);
+    fn member_proxy_claims_are_valid(payload: &serde_json::Value, email: &str) -> bool = payload.get("iss")
+        .and_then(|value| value.as_str()).map(str::trim) == Some(SERVICE_OIDC_ISSUER)
+        && jwt_audience_includes(payload, SERVICE_OIDC_AUDIENCE)
+        && payload.get("sub").and_then(|value| value.as_str()).map(str::trim)
+            == Some(format!("member:{email}").as_str())
+        && jwt_roles_include(payload, MEMBER_PROXY_ROLE);
+    fn require_service(ctx: &ReducerContext) -> Result<(), String> = has_valid_service_identity(ctx)
+        .then_some(()).ok_or_else(|| "service role required".into());
+    fn service_ticket_id_for_viewer(ctx: &ViewContext) -> Option<String> = ctx.db
+        .ticketremote_service_identity().identity().filter(&ctx.sender()).next()
+        .map(|row| clean_ticket_id(&row.ticketId));
+    fn service_member_from_row(row: &TicketremoteTicketMember) -> TicketremoteServiceMember = {
+        let email = clean_email(&row.email);
+        TicketremoteServiceMember { id: row.id.clone(), ticketId: row.ticketId.clone(),
+            email: email.clone(), publicId: account_public_id(&email), role: clean_role(&row.role),
+            active: row.active, updatedAt: row.updatedAt.clone() }
+    };
+    fn public_hash(value: &str, len: usize) -> String = {
+        let mut out = to_base36(fnv32(value.trim()));
+        if out.len() < len { out = format!("{:0>width$}", out, width = len); }
+        out.chars().take(len).collect()
+    };
+    fn require_admin(ctx: &ReducerContext, ticket: &str, email: &str) -> Result<(), String> =
+        is_admin(ctx, ticket, email).then_some(()).ok_or_else(|| "forbidden".into());
+    fn jwt_audience_includes(payload: &serde_json::Value, expected: &str) -> bool = {
+        let expected = expected.trim();
+        if expected.is_empty() { return false; }
+        match payload.get("aud") {
+            Some(serde_json::Value::String(value)) => value.trim() == expected,
+            Some(serde_json::Value::Array(values)) =>
+                values.iter().any(|value| value.as_str().is_some_and(|raw| raw.trim() == expected)),
+            _ => false,
+        }
+    };
+    fn jwt_roles_include(payload: &serde_json::Value, expected: &str) -> bool = match payload.get("roles") {
+        Some(serde_json::Value::String(value)) => value.split(',').any(|raw| raw.trim() == expected),
+        Some(serde_json::Value::Array(values)) =>
+            values.iter().any(|value| value.as_str().is_some_and(|raw| raw.trim() == expected)),
+        _ => false,
+    };
+    fn control_code_fast_state_expires_at(status: &str, clock: &str) -> String = add_ms(clock,
+        if status == "fast_ready" { CONTROL_CODE_FAST_READY_TTL_MS }
+        else { CONTROL_CODE_FAST_STATE_TTL_MS });
+    fn clean_control_code_fast_status(value: &str) -> String = allowlisted(&non_empty(value, "stale"),
+        &["fast_ready", "warming", "cleanup", "blocked", "stale"], "blocked");
+    fn control_code_fast_state_row_ready(row: &TicketremoteControlCodeFastState,
+        expected: &str, clock: &str) -> bool = !expected.trim().is_empty()
+            && row.status == "fast_ready" && row.revision == expected.trim()
+            && row.rawTicketConfirmed && row.cleanupClear && row.streamLive
+            && parse_time_ms(&row.expiresAt) > parse_time_ms(clock);
+    fn control_code_request_occupies_phone(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
+        if parse_time_ms(&row.expiresAt) <= parse_time_ms(clock) { return false; }
+        matches!(row.status.as_str(), "queued" | "running") || row.cleanupPending
+            || (row.status == "succeeded" && row.captureRequired && !row.captureAcknowledged)
+    };
+    fn control_code_request_ttl_is_healthy(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
+        let now = parse_time_ms(clock);
+        if parse_time_ms(&row.expiresAt).saturating_sub(now) <= CONTROL_CODE_COMMAND_TTL_MS / 2 {
+            return false;
+        }
+        row.status != "succeeded" || parse_time_ms(&row.resultExpiresAt).saturating_sub(now)
+            > CONTROL_CODE_RESULT_TTL_MS / 2
+    };
+    fn fnv32(value: &str) -> u32 = value.as_bytes().iter().fold(0x811c9dc5, |hash, byte|
+        (hash ^ *byte as u32).wrapping_mul(0x01000193));
+    fn refresh_touched_signals(ctx: &ReducerContext, ticket: &str,
+        backends: &[String], clock: &str) -> () = for backend in backends {
+            upsert_stream_command_signal(ctx, ticket, backend, clock, clock);
+        };
 }
 
 fn parse_time_micros(value: &str) -> i64 {
@@ -1627,16 +1583,6 @@ fn parse_time_micros(value: &str) -> i64 {
                 .map(|dt| dt.timestamp_micros())
         })
         .unwrap_or(0)
-}
-
-fn parse_time_ms(value: &str) -> i64 {
-    parse_time_micros(value) / 1000
-}
-
-fn canonical_time(value: &str) -> String {
-    iso(Timestamp::from_micros_since_unix_epoch(parse_time_micros(
-        value,
-    )))
 }
 
 fn live_relay_suppresses_background_stream_command(
@@ -1655,10 +1601,6 @@ fn live_relay_suppresses_background_stream_command(
         return true;
     }
     phone_current_report_suppresses_background_stream_command(ctx, &id, now)
-}
-
-fn suppressible_background_stream_command(command_type: &str) -> bool {
-    matches!(command_type.trim(), "start" | "keyframe" | "recover_stream")
 }
 
 fn stream_command_is_requester_scoped(reason: &str, payload_json: &str) -> bool {
@@ -1776,8 +1718,7 @@ fn phone_current_report_suppresses_background_stream_command(
     let Some(report) = ctx.db.ticketremote_phone_current_report().id().find(id) else {
         return false;
     };
-    let stream_state = report.streamState.trim();
-    if !report.desiredActive || (stream_state != "streaming" && stream_state != "live") {
+    if !report.desiredActive || !matches!(report.streamState.trim(), "streaming" | "live") {
         return false;
     }
     let report_age_ms = parse_time_ms(now).saturating_sub(parse_time_ms(&report.updatedAt));
@@ -1787,156 +1728,37 @@ fn phone_current_report_suppresses_background_stream_command(
     let Ok(status) = serde_json::from_str::<serde_json::Value>(&report.statusJson) else {
         return false;
     };
-    let stream_active = status
-        .get("streamActive")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
-    if !stream_active {
-        return false;
-    }
-    let session_state = json_str(&status, "sessionState");
-    if !session_state.is_empty() && session_state != "live" && session_state != "streaming" {
-        return false;
-    }
-    let relay_state = json_str(&status, "relayStreamState");
-    if !relay_state.is_empty() && relay_state != "live" && relay_state != "streaming" {
-        return false;
-    }
-    if status
-        .get("hardwareH264Active")
-        .and_then(|value| value.as_bool())
-        == Some(false)
+    if status.get("streamActive").and_then(|value| value.as_bool()) == Some(false)
+        || status
+            .get("hardwareH264Active")
+            .and_then(|value| value.as_bool())
+            == Some(false)
     {
         return false;
     }
-    let hardware_visibility = json_str(&status, "hardwareH264Visibility");
-    if !hardware_visibility.is_empty() && hardware_visibility != "visible" {
+    if ["sessionState", "relayStreamState"]
+        .iter()
+        .map(|key| json_str(&status, key))
+        .any(|state| !state.is_empty() && !matches!(state.as_str(), "live" | "streaming"))
+        || {
+            let state = json_str(&status, "hardwareH264Visibility");
+            !state.is_empty() && state != "visible"
+        }
+    {
         return false;
     }
     let watchdog_stage = json_str(&status, "streamWatchdogStage");
-    if watchdog_stage.contains("recover")
-        || watchdog_stage.contains("restart")
-        || watchdog_stage.contains("fail")
+    if ["recover", "restart", "fail"]
+        .iter()
+        .any(|token| watchdog_stage.contains(token))
     {
         return false;
     }
-    let active_clients = status
-        .get("activeVideoClients")
-        .and_then(json_i64)
-        .or_else(|| status.get("videoClients").and_then(json_i64))
-        .or_else(|| status.get("relayViewers").and_then(json_i64))
-        .unwrap_or(0);
-    active_clients > 0
-}
-
-fn json_i64(value: &serde_json::Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|raw| raw.trim().parse::<i64>().ok())
-        })
-}
-
-fn json_str(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(|raw| raw.as_str())
-        .map(|raw| raw.trim().to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-fn clean_ticket_id(value: &str) -> String {
-    non_empty(value, DEFAULT_TICKET_ID)
-}
-
-fn clean_backend_id(value: &str) -> String {
-    non_empty(value, "pixel")
-}
-
-fn clean_email(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
-}
-
-fn clean_role(value: &str) -> String {
-    match value.trim() {
-        "owner" => "owner".into(),
-        "admin" => "admin".into(),
-        _ => "member".into(),
-    }
-}
-
-fn clean_token(value: &str, fallback: &str) -> String {
-    let clean = value.trim();
-    if clean.is_empty() {
-        fallback.to_string()
-    } else {
-        clean.to_string()
-    }
-}
-
-fn non_empty(value: &str, fallback: &str) -> String {
-    let clean = value.trim();
-    if clean.is_empty() {
-        fallback.to_string()
-    } else {
-        clean.to_string()
-    }
-}
-
-fn bounded_text(value: &str, max: usize) -> String {
-    value.chars().take(max).collect()
-}
-
-fn safe_json_string(value: &str, max: usize) -> String {
-    let trimmed = value.trim();
-    let raw = if trimmed.is_empty() { "{}" } else { trimmed };
-    let valid = serde_json::from_str::<serde_json::Value>(raw).is_ok();
-    let source = if valid { raw } else { "{}" };
-    source.chars().take(max).collect()
-}
-
-fn json_object(pairs: &[(&str, &str)]) -> String {
-    let mut map = serde_json::Map::new();
-    for (key, value) in pairs {
-        map.insert((*key).into(), serde_json::Value::String((*value).into()));
-    }
-    serde_json::Value::Object(map).to_string()
-}
-
-fn member_id(ticket_id: &str, email: &str) -> String {
-    format!("{}:{}", clean_ticket_id(ticket_id), clean_email(email))
-}
-
-fn phone_row_id(ticket_id: &str, backend_id: &str) -> String {
-    format!(
-        "{}:{}",
-        clean_ticket_id(ticket_id),
-        clean_backend_id(backend_id)
-    )
-}
-
-fn stable_stamp(value: &str) -> String {
-    let out: String = value
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    non_empty(&out, "time")
-}
-
-fn account_public_id(email: &str) -> String {
-    let mut hash: u32 = 0x811c9dc5;
-    for byte in clean_email(email).as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    let mut value = to_base36(hash);
-    if value.len() < 4 {
-        value = format!("{:0>4}", value);
-    }
-    value.chars().take(4).collect()
+    ["activeVideoClients", "videoClients", "relayViewers"]
+        .iter()
+        .find_map(|key| status.get(key).and_then(json_i64))
+        .unwrap_or(0)
+        > 0
 }
 
 fn to_base36(mut value: u32) -> String {
@@ -1955,60 +1777,6 @@ fn to_base36(mut value: u32) -> String {
     chars.iter().rev().collect()
 }
 
-fn history_expires_at(now: &str) -> String {
-    add_ms(now, HISTORY_TTL_MS)
-}
-
-fn command_expires_at(now: &str, ttl_ms: i64) -> String {
-    let ttl = if ttl_ms <= 0 || ttl_ms > HISTORY_TTL_MS {
-        HISTORY_TTL_MS
-    } else {
-        ttl_ms
-    };
-    add_ms(now, ttl)
-}
-
-fn stream_viewer_focus_expires_at(now: &str) -> String {
-    add_ms(now, STREAM_VIEWER_FOCUS_TTL_MS)
-}
-
-fn control_code_request_expires_at(now: &str) -> String {
-    add_ms(now, CONTROL_CODE_REQUEST_TTL_MS)
-}
-
-fn control_code_result_expires_at(now: &str) -> String {
-    add_ms(now, CONTROL_CODE_RESULT_TTL_MS)
-}
-
-fn valid_control_code_digits(value: &str) -> bool {
-    (2..=8).contains(&value.len()) && value.chars().all(|c| c.is_ascii_digit())
-}
-
-fn clean_control_code_result_proof(value: &str) -> String {
-    match value.trim() {
-        "phone_root" => "phone_root".into(),
-        "phone_visual" => "phone_visual".into(),
-        "phone_visual_root_confirmed" => "phone_visual_root_confirmed".into(),
-        "phone_visual_raw_ticket_after_submit" => "phone_visual_raw_ticket_after_submit".into(),
-        "phone_root_image" => "phone_root_image".into(),
-        "browser_frame" => "browser_frame".into(),
-        _ => String::new(),
-    }
-}
-
-fn bounded_frame_ordinal(value: &str) -> String {
-    let digits: String = value
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .take(24)
-        .collect();
-    non_empty(&digits, "0")
-}
-
-fn frame_ordinal_number(value: &str) -> i64 {
-    value.trim().parse::<i64>().unwrap_or(0)
-}
-
 fn compare_ordinal(left: &str, right: &str) -> i8 {
     let l = left.trim_start_matches('0');
     let r = right.trim_start_matches('0');
@@ -2024,114 +1792,24 @@ fn compare_ordinal(left: &str, right: &str) -> i8 {
     }
 }
 
-fn control_code_request_id(ticket_id: &str, session_id: &str, now: &str) -> String {
-    format!(
-        "{}:{}:{}:control_code",
-        clean_ticket_id(ticket_id),
-        session_id.trim(),
-        stable_stamp(now)
-    )
-}
-
-fn connection_session_id(ctx: &ReducerContext) -> String {
-    ctx.connection_id()
-        .map(|id| format!("{id:?}"))
-        .unwrap_or_else(|| ctx.sender().to_string())
-}
-
-fn jwt_payload(ctx: &ReducerContext) -> Result<serde_json::Value, String> {
-    let Some(jwt) = ctx.sender_auth().jwt() else {
-        return Err("auth required".into());
-    };
-    serde_json::from_str(jwt.raw_payload()).map_err(|_| "invalid auth payload".to_string())
-}
-
-fn jwt_audience_includes(payload: &serde_json::Value, expected: &str) -> bool {
-    let expected = expected.trim();
-    if expected.is_empty() {
-        return false;
-    }
-    match payload.get("aud") {
-        Some(serde_json::Value::String(value)) => value.trim() == expected,
-        Some(serde_json::Value::Array(values)) => values
-            .iter()
-            .any(|v| v.as_str().map(|s| s.trim() == expected).unwrap_or(false)),
-        _ => false,
-    }
-}
-
-fn jwt_roles_include(payload: &serde_json::Value, expected: &str) -> bool {
-    match payload.get("roles") {
-        Some(serde_json::Value::String(value)) => value.split(',').any(|v| v.trim() == expected),
-        Some(serde_json::Value::Array(values)) => values
-            .iter()
-            .any(|v| v.as_str().map(|s| s.trim() == expected).unwrap_or(false)),
-        _ => false,
-    }
-}
-
-fn service_claims_are_valid(payload: &serde_json::Value) -> bool {
-    payload
-        .get("iss")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        == Some(SERVICE_OIDC_ISSUER)
-        && jwt_audience_includes(payload, SERVICE_OIDC_AUDIENCE)
-        && payload
-            .get("sub")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            == Some(SERVICE_OIDC_SUBJECT)
-        && jwt_roles_include(payload, SERVICE_ROLE)
-}
-
-fn has_valid_service_identity(ctx: &ReducerContext) -> bool {
-    jwt_payload(ctx)
-        .map(|payload| service_claims_are_valid(&payload))
-        .unwrap_or(false)
-}
-
-fn operator_identity_is_valid(identity: &str) -> bool {
-    identity.trim() == OPERATOR_IDENTITY
-}
-
-fn require_service(ctx: &ReducerContext) -> Result<(), String> {
-    if has_valid_service_identity(ctx) {
-        Ok(())
-    } else {
-        Err("service role required".into())
-    }
-}
-
 fn register_service_identity(ctx: &ReducerContext, ticket_id: String, now: &str) {
     let id = ctx.sender().to_string();
-    if let Some(existing) = ctx.db.ticketremote_service_identity().id().find(&id) {
-        ctx.db
-            .ticketremote_service_identity()
-            .id()
-            .update(TicketremoteServiceIdentity {
-                ticketId: ticket_id,
-                updatedAt: now.into(),
-                ..existing
-            });
+    let table = ctx.db.ticketremote_service_identity();
+    if let Some(existing) = table.id().find(&id) {
+        table.id().update(TicketremoteServiceIdentity {
+            ticketId: ticket_id,
+            updatedAt: now.into(),
+            ..existing
+        });
     } else {
-        ctx.db
-            .ticketremote_service_identity()
-            .insert(TicketremoteServiceIdentity {
-                id,
-                identity: ctx.sender(),
-                ticketId: ticket_id,
-                createdAt: now.into(),
-                updatedAt: now.into(),
-            });
+        table.insert(TicketremoteServiceIdentity {
+            id,
+            identity: ctx.sender(),
+            ticketId: ticket_id,
+            createdAt: now.into(),
+            updatedAt: now.into(),
+        });
     }
-}
-
-fn auth_config(ctx: &ReducerContext, ticket_id: &str) -> Option<TicketremoteAuthConfig> {
-    ctx.db
-        .ticketremote_auth_config()
-        .ticketId()
-        .find(clean_ticket_id(ticket_id))
 }
 
 fn client_email_from_auth(ctx: &ReducerContext, ticket_id: &str) -> Result<String, String> {
@@ -2148,15 +1826,14 @@ fn client_email_from_auth(ctx: &ReducerContext, ticket_id: &str) -> Result<Strin
         .unwrap_or("")
         .trim()
         .trim_end_matches('/');
-    if issuer != config.issuer.trim().trim_end_matches('/') {
-        return Err("invalid auth issuer".into());
-    }
-    if !jwt_audience_includes(&payload, &config.audience) {
-        return Err("invalid auth audience".into());
-    }
     let email = clean_email(payload.get("email").and_then(|v| v.as_str()).unwrap_or(""));
     if email.is_empty() || payload.get("email_verified").and_then(|v| v.as_bool()) != Some(true) {
         return Err("verified email required".into());
+    }
+    let public_auth = issuer == config.issuer.trim().trim_end_matches('/')
+        && jwt_audience_includes(&payload, &config.audience);
+    if !public_auth && !member_proxy_claims_are_valid(&payload, &email) {
+        return Err("invalid member authentication".into());
     }
     if !is_member(ctx, ticket_id, &email) {
         return Err("ticket membership required".into());
@@ -2171,18 +1848,17 @@ fn ensure_ticket(
     now: &str,
 ) -> TicketremoteTicket {
     let id = clean_ticket_id(ticket_id);
-    if let Some(existing) = ctx.db.ticketremote_ticket().id().find(&id) {
+    let table = ctx.db.ticketremote_ticket();
+    if let Some(existing) = table.id().find(&id) {
         if !display_name.trim().is_empty() && existing.displayName != display_name.trim() {
             let updated = TicketremoteTicket {
                 displayName: display_name.trim().into(),
                 updatedAt: now.into(),
                 ..existing
             };
-            ctx.db.ticketremote_ticket().id().update(updated.clone());
-            upsert_service_ticket_projection(ctx, &updated);
+            table.id().update(updated.clone());
             return updated;
         }
-        upsert_service_ticket_projection(ctx, &existing);
         return existing;
     }
     let ticket = TicketremoteTicket {
@@ -2191,68 +1867,8 @@ fn ensure_ticket(
         createdAt: now.into(),
         updatedAt: now.into(),
     };
-    ctx.db.ticketremote_ticket().insert(ticket.clone());
-    upsert_service_ticket_projection(ctx, &ticket);
+    table.insert(ticket.clone());
     ticket
-}
-
-fn service_ticket_id_for_viewer(ctx: &ViewContext) -> Option<String> {
-    let identity = ctx.sender();
-    ctx.db
-        .ticketremote_service_identity()
-        .identity()
-        .filter(&identity)
-        .next()
-        .map(|row| clean_ticket_id(&row.ticketId))
-}
-
-fn service_ticket_from_row(ticket: &TicketremoteTicket) -> TicketremoteServiceTicket {
-    TicketremoteServiceTicket {
-        id: ticket.id.clone(),
-        displayName: ticket.displayName.clone(),
-        updatedAt: ticket.updatedAt.clone(),
-    }
-}
-
-fn service_member_from_row(row: &TicketremoteTicketMember) -> TicketremoteServiceMember {
-    let email = clean_email(&row.email);
-    TicketremoteServiceMember {
-        id: row.id.clone(),
-        ticketId: row.ticketId.clone(),
-        email: email.clone(),
-        publicId: account_public_id(&email),
-        role: clean_role(&row.role),
-        active: row.active,
-        updatedAt: row.updatedAt.clone(),
-    }
-}
-
-fn service_phone_from_row(row: &TicketremotePhoneBackend) -> TicketremoteServicePhone {
-    TicketremoteServicePhone {
-        id: row.id.clone(),
-        ticketId: row.ticketId.clone(),
-        backendId: row.backendId.clone(),
-        attachName: row.attachName.clone(),
-        baseUrl: row.baseUrl.clone(),
-        desiredState: row.desiredState.clone(),
-        streamState: row.streamState.clone(),
-        healthJson: row.healthJson.clone(),
-        lastError: row.lastError.clone(),
-        lastSeenAt: row.lastSeenAt.clone(),
-    }
-}
-
-fn public_hash(value: &str, len: usize) -> String {
-    let mut hash: u32 = 0x811c9dc5;
-    for byte in value.trim().as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    let mut out = to_base36(hash);
-    if out.len() < len {
-        out = format!("{:0>width$}", out, width = len);
-    }
-    out.chars().take(len).collect()
 }
 
 fn stream_viewer_focus_id(
@@ -2279,62 +1895,18 @@ fn stream_viewer_focus_id(
     )
 }
 
-fn service_stream_command_from_row(
-    row: &TicketremoteStreamCommand,
-) -> TicketremoteServiceStreamCommand {
-    TicketremoteServiceStreamCommand {
-        id: row.id.clone(),
-        ticketId: row.ticketId.clone(),
-        backendId: row.backendId.clone(),
-        commandType: row.commandType.clone(),
-        status: row.status.clone(),
-        revision: row.revision.clone(),
-        reason: row.reason.clone(),
-        payloadJson: row.payloadJson.clone(),
-        createdAt: row.createdAt.clone(),
-        updatedAt: row.updatedAt.clone(),
-        expiresAt: row.expiresAt.clone(),
-    }
-}
-
-fn upsert_service_ticket_projection(_ctx: &ReducerContext, _ticket: &TicketremoteTicket) {}
-fn upsert_service_member_projection(_ctx: &ReducerContext, _row: &TicketremoteTicketMember) {}
-fn upsert_service_phone_projection(_ctx: &ReducerContext, _row: &TicketremotePhoneBackend) {}
-fn upsert_service_command_projection(_ctx: &ReducerContext, _row: &TicketremoteStreamCommand) {}
-fn delete_service_command_projection(_ctx: &ReducerContext, _command_id: &str) {}
-fn sync_service_projections(_ctx: &ReducerContext, _ticket_id: &str) {}
-
-fn is_member(ctx: &ReducerContext, ticket_id: &str, email: &str) -> bool {
-    ctx.db
-        .ticketremote_ticket_member()
-        .id()
-        .find(member_id(ticket_id, email))
-        .map(|row| row.active)
-        .unwrap_or(false)
-}
-
-fn is_admin(ctx: &ReducerContext, ticket_id: &str, email: &str) -> bool {
-    ctx.db
-        .ticketremote_ticket_member()
-        .id()
-        .find(member_id(ticket_id, email))
-        .map(|row| row.active && (row.role == "owner" || row.role == "admin"))
-        .unwrap_or(false)
-}
-
 fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &str, now: &str) {
     let email = clean_email(email);
     if email.is_empty() {
         return;
     }
     let id = member_id(ticket_id, &email);
-    let created_at = ctx
-        .db
-        .ticketremote_ticket_member()
+    let table = ctx.db.ticketremote_ticket_member();
+    let created_at = table
         .id()
         .find(&id)
         .map(|row| {
-            ctx.db.ticketremote_ticket_member().id().delete(&id);
+            table.id().delete(&id);
             row.createdAt
         })
         .unwrap_or_else(|| now.into());
@@ -2347,53 +1919,41 @@ fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &
         createdAt: created_at,
         updatedAt: now.into(),
     };
-    ctx.db.ticketremote_ticket_member().insert(row.clone());
-    upsert_service_member_projection(ctx, &row);
+    table.insert(row);
 }
 
 fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
     let id = member_id(ticket_id, email);
-    if let Some(existing) = ctx.db.ticketremote_ticket_member().id().find(&id) {
-        let row = TicketremoteTicketMember {
+    let table = ctx.db.ticketremote_ticket_member();
+    if let Some(existing) = table.id().find(&id) {
+        table.id().update(TicketremoteTicketMember {
             active: false,
             updatedAt: now.into(),
             ..existing
-        };
-        ctx.db.ticketremote_ticket_member().id().update(row.clone());
-        upsert_service_member_projection(ctx, &row);
+        });
     }
 }
 
 fn ensure_cleanup_schedule(ctx: &ReducerContext, ticket_id: &str, now: &str) {
     let schedule =
         ScheduleAt::Interval(std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS).into());
-    if let Some(existing) = ctx
-        .db
-        .ticketremote_cleanup_schedule()
-        .ticketId()
-        .filter(ticket_id)
-        .next()
-    {
-        ctx.db
-            .ticketremote_cleanup_schedule()
-            .scheduled_id()
-            .update(TicketremoteCleanupSchedule {
-                scheduled_at: schedule,
-                batchSize: CLEANUP_BATCH_SIZE,
-                updatedAt: now.into(),
-                ..existing
-            });
+    let table = ctx.db.ticketremote_cleanup_schedule();
+    if let Some(existing) = table.ticketId().filter(ticket_id).next() {
+        table.scheduled_id().update(TicketremoteCleanupSchedule {
+            scheduled_at: schedule,
+            batchSize: CLEANUP_BATCH_SIZE,
+            updatedAt: now.into(),
+            ..existing
+        });
     } else {
-        ctx.db
-            .ticketremote_cleanup_schedule()
-            .insert(TicketremoteCleanupSchedule {
-                scheduled_id: 0,
-                scheduled_at: schedule,
-                ticketId: clean_ticket_id(ticket_id),
-                batchSize: CLEANUP_BATCH_SIZE,
-                createdAt: now.into(),
-                updatedAt: now.into(),
-            });
+        table.insert(TicketremoteCleanupSchedule {
+            scheduled_id: 0,
+            scheduled_at: schedule,
+            ticketId: clean_ticket_id(ticket_id),
+            batchSize: CLEANUP_BATCH_SIZE,
+            createdAt: now.into(),
+            updatedAt: now.into(),
+        });
     }
 }
 
@@ -2454,43 +2014,35 @@ fn apply_phone_update(
     let desired_state = non_empty(desired_state, "idle");
     let stream_state = compact_phone_stream_state(&desired_state, health_json);
     let id = phone_row_id(&ticket.id, &backend_id);
-    let existing = ctx.db.ticketremote_phone_backend().id().find(&id);
-    let keepalive_due = existing
-        .as_ref()
-        .map(|row| {
-            parse_time_ms(now).saturating_sub(parse_time_ms(&row.lastSeenAt)) >= PHONE_KEEPALIVE_MS
-        })
-        .unwrap_or(true);
-    let unchanged = existing
-        .as_ref()
-        .map(|row| {
-            row.attachName == attach_name
-                && row.baseUrl == base_url.trim()
-                && row.desiredState == desired_state
-                && row.streamState == stream_state
-                && row.healthJson == health_json
-                && row.lastError == last_error
-        })
-        .unwrap_or(false);
-    if !unchanged || keepalive_due {
-        if existing.is_some() {
-            ctx.db.ticketremote_phone_backend().id().delete(&id);
-        }
-        let row = TicketremotePhoneBackend {
-            id,
-            ticketId: ticket.id.clone(),
-            backendId: backend_id.clone(),
-            attachName: attach_name.clone(),
-            baseUrl: base_url.trim().into(),
-            desiredState: desired_state.clone(),
-            streamState: stream_state.clone(),
-            healthJson: health_json.into(),
-            lastError: last_error.into(),
-            lastSeenAt: now.into(),
-        };
-        ctx.db.ticketremote_phone_backend().insert(row.clone());
-        upsert_service_phone_projection(ctx, &row);
+    let table = ctx.db.ticketremote_phone_backend();
+    let existing = table.id().find(&id);
+    if existing.as_ref().is_some_and(|row| {
+        row.attachName == attach_name
+            && row.baseUrl == base_url.trim()
+            && row.desiredState == desired_state
+            && row.streamState == stream_state
+            && row.healthJson == health_json
+            && row.lastError == last_error
+            && parse_time_ms(now).saturating_sub(parse_time_ms(&row.lastSeenAt))
+                < PHONE_KEEPALIVE_MS
+    }) {
+        return;
     }
+    if existing.is_some() {
+        table.id().delete(&id);
+    }
+    table.insert(TicketremotePhoneBackend {
+        id,
+        ticketId: ticket.id,
+        backendId: backend_id,
+        attachName: attach_name,
+        baseUrl: base_url.trim().into(),
+        desiredState: desired_state,
+        streamState: stream_state,
+        healthJson: health_json.into(),
+        lastError: last_error.into(),
+        lastSeenAt: now.into(),
+    });
 }
 
 fn upsert_stream_viewer_focus(
@@ -2507,37 +2059,22 @@ fn upsert_stream_viewer_focus(
     let public_id = account_public_id(email);
     let id = stream_viewer_focus_id(&ticket_id, &backend_id, &public_id, session_id);
     if !active {
-        if ctx
-            .db
-            .ticketremote_stream_viewer_focus()
-            .id()
-            .find(&id)
-            .is_some()
-        {
-            ctx.db.ticketremote_stream_viewer_focus().id().delete(&id);
-        }
+        ctx.db.ticketremote_stream_viewer_focus().id().delete(&id);
         return;
     }
-    let row = TicketremoteStreamViewerFocus {
-        id: id.clone(),
-        ticketId: ticket_id,
-        backendId: backend_id,
-        publicId: public_id,
-        active: true,
-        lastSeenAt: now.into(),
-        expiresAt: stream_viewer_focus_expires_at(now),
-    };
-    if ctx
-        .db
-        .ticketremote_stream_viewer_focus()
-        .id()
-        .find(&id)
-        .is_some()
-    {
-        ctx.db.ticketremote_stream_viewer_focus().id().update(row);
-    } else {
-        ctx.db.ticketremote_stream_viewer_focus().insert(row);
-    }
+    upsert_row!(
+        ctx,
+        ticketremote_stream_viewer_focus,
+        TicketremoteStreamViewerFocus {
+            id,
+            ticketId: ticket_id,
+            backendId: backend_id,
+            publicId: public_id,
+            active: true,
+            lastSeenAt: now.into(),
+            expiresAt: stream_viewer_focus_expires_at(now),
+        }
+    );
 }
 
 fn active_stream_viewer_focus_count(
@@ -2579,7 +2116,7 @@ fn upsert_stream_desired_state(
         desiredActive: desired_active,
         viewerCount: viewer_count,
         reason: bounded_text(reason, 240),
-        revision: clean_token(revision, now),
+        revision: non_empty(revision, now),
         updatedBy: bounded_text(updated_by, 120),
         updatedAt: now.into(),
     };
@@ -2592,25 +2129,12 @@ fn upsert_stream_desired_state(
             now,
         );
     }
-    if let Some(existing) = ctx.db.ticketremote_stream_desired_state().id().find(&id) {
-        if existing.desiredActive == row.desiredActive
-            && existing.viewerCount == row.viewerCount
-            && existing.reason == row.reason
-            && existing.revision == row.revision
-            && existing.updatedBy == row.updatedBy
-        {
-            return existing;
-        }
-        ctx.db
-            .ticketremote_stream_desired_state()
-            .id()
-            .update(row.clone());
-        upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);
-        return row;
+    if let Some(existing) = ctx.db.ticketremote_stream_desired_state().id().find(&id)
+        && same_fields!(existing, row; desiredActive, viewerCount, reason, revision, updatedBy)
+    {
+        return existing;
     }
-    ctx.db
-        .ticketremote_stream_desired_state()
-        .insert(row.clone());
+    let row = upsert_row!(ctx, ticketremote_stream_desired_state, row);
     upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);
     row
 }
@@ -2629,14 +2153,6 @@ fn stream_desired_core_matches(
         .find(&id)
         .map(|row| stream_desired_core_equal(&row, desired_active, viewer_count))
         .unwrap_or(false)
-}
-
-fn stream_desired_core_equal(
-    row: &TicketremoteStreamDesiredState,
-    desired_active: bool,
-    viewer_count: u32,
-) -> bool {
-    row.desiredActive == desired_active && row.viewerCount == viewer_count
 }
 
 fn purge_pending_idle_background_commands(
@@ -2660,7 +2176,6 @@ fn purge_pending_idle_background_commands(
         .collect();
     for row in &rows {
         ctx.db.ticketremote_stream_command().id().delete(&row.id);
-        delete_service_command_projection(ctx, &row.id);
     }
     if !rows.is_empty() {
         upsert_stream_command_signal(ctx, &ticket_id, &backend_id, revision, now);
@@ -2684,7 +2199,7 @@ fn upsert_stream_command_signal(
         .filter((ticket_id, backend_id, "pending"))
         .filter(|row| parse_time_ms(&row.expiresAt) > now_ms)
         .count() as u32;
-    let clean_revision = clean_token(revision, now);
+    let clean_revision = non_empty(revision, now);
     let row = TicketremoteStreamCommandSignal {
         id: id.clone(),
         ticketId: clean_ticket_id(ticket_id),
@@ -2693,14 +2208,12 @@ fn upsert_stream_command_signal(
         pendingCount: pending_count,
         updatedAt: now.into(),
     };
-    if let Some(existing) = ctx.db.ticketremote_stream_command_signal().id().find(&id) {
-        if existing.pendingCount == row.pendingCount && existing.revision == row.revision {
-            return;
-        }
-        ctx.db.ticketremote_stream_command_signal().id().update(row);
+    if let Some(existing) = ctx.db.ticketremote_stream_command_signal().id().find(&id)
+        && same_fields!(existing, row; pendingCount, revision)
+    {
         return;
     }
-    ctx.db.ticketremote_stream_command_signal().insert(row);
+    upsert_row!(ctx, ticketremote_stream_command_signal, row);
 }
 
 fn insert_stream_command(
@@ -2717,18 +2230,14 @@ fn insert_stream_command(
 ) -> TicketremoteStreamCommand {
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
     let backend_id = clean_backend_id(backend_id);
-    let command_type = clean_token(command_type, "unknown").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
+    let command_type = safe_token(command_type, "unknown");
+    let table = ctx.db.ticketremote_stream_command();
     if matches!(
         command_type.as_str(),
         "start" | "keyframe" | "recover_stream" | "prepare_control_code"
     ) {
         let now_ms = parse_time_ms(now);
-        if let Some(existing) = ctx
-            .db
-            .ticketremote_stream_command()
+        if let Some(existing) = table
             .ticketBackendStatus()
             .filter((&ticket.id, &backend_id, "pending"))
             .find(|row| row.commandType == command_type && parse_time_ms(&row.expiresAt) > now_ms)
@@ -2736,12 +2245,12 @@ fn insert_stream_command(
             return existing;
         }
     }
-    let revision = clean_token(revision, now);
+    let revision = non_empty(revision, now);
     let id = non_empty(
         command_id,
         &format!("{}:{}:{}:{}", ticket.id, backend_id, revision, command_type),
     );
-    if let Some(existing) = ctx.db.ticketremote_stream_command().id().find(&id) {
+    if let Some(existing) = table.id().find(&id) {
         return existing;
     }
     let row = TicketremoteStreamCommand {
@@ -2757,8 +2266,7 @@ fn insert_stream_command(
         updatedAt: now.into(),
         expiresAt: command_expires_at(now, ttl_ms),
     };
-    ctx.db.ticketremote_stream_command().insert(row.clone());
-    upsert_service_command_projection(ctx, &row);
+    table.insert(row.clone());
     upsert_stream_command_signal(ctx, &ticket.id, &backend_id, &revision, now);
     row
 }
@@ -2771,19 +2279,13 @@ fn update_stream_command_status(
     now: &str,
 ) {
     let command_key = command_id.trim().to_string();
-    let Some(existing) = ctx.db.ticketremote_stream_command().id().find(&command_key) else {
+    let table = ctx.db.ticketremote_stream_command();
+    let Some(existing) = table.id().find(&command_key) else {
         return;
     };
-    let status = clean_token(status, "acknowledged").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
+    let status = safe_token(status, "acknowledged");
     if status == "acknowledged" || status == "dispatched" {
-        ctx.db
-            .ticketremote_stream_command()
-            .id()
-            .delete(&existing.id);
-        delete_service_command_projection(ctx, &existing.id);
+        table.id().delete(&existing.id);
         upsert_stream_command_signal(
             ctx,
             &existing.ticketId,
@@ -2807,11 +2309,7 @@ fn update_stream_command_status(
     {
         return;
     }
-    ctx.db
-        .ticketremote_stream_command()
-        .id()
-        .update(row.clone());
-    upsert_service_command_projection(ctx, &row);
+    table.id().update(row);
     upsert_stream_command_signal(
         ctx,
         &existing.ticketId,
@@ -2839,26 +2337,19 @@ fn upsert_phone_current_report(
         id: id.clone(),
         ticketId: ticket.id,
         backendId: backend_id,
-        streamState: clean_token(stream_state, "idle"),
+        streamState: non_empty(stream_state, "idle"),
         desiredActive: desired_active,
         lastCommandId: last_command_id.trim().into(),
         lastCommandRevision: last_command_revision.trim().into(),
         statusJson: safe_json_string(status_json, SAFE_JSON_MAX_BYTES),
         updatedAt: now.into(),
     };
-    if let Some(existing) = ctx.db.ticketremote_phone_current_report().id().find(&id) {
-        if existing.streamState == row.streamState
-            && existing.desiredActive == row.desiredActive
-            && existing.lastCommandId == row.lastCommandId
-            && existing.lastCommandRevision == row.lastCommandRevision
-            && existing.statusJson == row.statusJson
-        {
-            return;
-        }
-        ctx.db.ticketremote_phone_current_report().id().update(row);
+    if let Some(existing) = ctx.db.ticketremote_phone_current_report().id().find(&id)
+        && same_fields!(existing, row; streamState, desiredActive, lastCommandId, lastCommandRevision, statusJson)
+    {
         return;
     }
-    ctx.db.ticketremote_phone_current_report().insert(row);
+    upsert_row!(ctx, ticketremote_phone_current_report, row);
 }
 
 fn upsert_relay_current_report(
@@ -2880,66 +2371,25 @@ fn upsert_relay_current_report(
         ticketId: ticket.id,
         backendId: backend_id,
         videoClients: video_clients,
-        streamVerdict: clean_token(stream_verdict, "unknown").replace(
-            |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-            "_",
-        ),
+        streamVerdict: safe_token(stream_verdict, "unknown"),
         lastFrameAgoMillis: 0,
         framesForwarded: non_empty(frames_forwarded, "0"),
         statusJson: safe_json_string(status_json, SAFE_JSON_MAX_BYTES),
         updatedAt: now.into(),
         lastFrameAt: Some(bounded_text(last_frame_at.trim(), 80)),
     };
-    if let Some(existing) = ctx.db.ticketremote_relay_current_report().id().find(&id) {
-        if existing.videoClients == row.videoClients
-            && existing.streamVerdict == row.streamVerdict
-            && existing.lastFrameAgoMillis == row.lastFrameAgoMillis
-            && existing.lastFrameAt == row.lastFrameAt
-            && existing.framesForwarded == row.framesForwarded
-            && existing.statusJson == row.statusJson
-        {
-            return;
-        }
-        ctx.db.ticketremote_relay_current_report().id().update(row);
+    if let Some(existing) = ctx.db.ticketremote_relay_current_report().id().find(&id)
+        && same_fields!(existing, row; videoClients, streamVerdict, lastFrameAgoMillis, lastFrameAt, framesForwarded, statusJson)
+    {
         return;
     }
-    ctx.db.ticketremote_relay_current_report().insert(row);
+    upsert_row!(ctx, ticketremote_relay_current_report, row);
 }
 
 fn delete_control_code_request(ctx: &ReducerContext, request_id: &str) {
     let id = request_id.to_string();
     ctx.db.ticketremote_control_code_request().id().delete(&id);
     ctx.db.ticketremote_control_code_owner().id().delete(&id);
-}
-
-fn control_code_fast_state_id(ticket_id: &str, backend_id: &str) -> String {
-    format!(
-        "{}:{}",
-        clean_ticket_id(ticket_id),
-        clean_backend_id(backend_id)
-    )
-}
-
-fn control_code_fast_state_expires_at(status: &str, now: &str) -> String {
-    add_ms(
-        now,
-        if status == "fast_ready" {
-            CONTROL_CODE_FAST_READY_TTL_MS
-        } else {
-            CONTROL_CODE_FAST_STATE_TTL_MS
-        },
-    )
-}
-
-fn clean_control_code_fast_status(value: &str) -> String {
-    match clean_token(value, "stale").as_str() {
-        "fast_ready" => "fast_ready".into(),
-        "warming" => "warming".into(),
-        "cleanup" => "cleanup".into(),
-        "blocked" => "blocked".into(),
-        "stale" => "stale".into(),
-        _ => "blocked".into(),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2967,7 +2417,8 @@ fn upsert_control_code_fast_state(
     } else {
         status
     };
-    let existing = ctx.db.ticketremote_control_code_fast_state().id().find(&id);
+    let table = ctx.db.ticketremote_control_code_fast_state();
+    let existing = table.id().find(&id);
     let clean_revision = bounded_text(&non_empty(revision, now), 160);
     let row = TicketremoteControlCodeFastState {
         id: id.clone(),
@@ -3003,51 +2454,20 @@ fn upsert_control_code_fast_state(
             CONTROL_CODE_FAST_STATE_TTL_MS
         };
         let remaining_ms = parse_time_ms(&existing.expiresAt).saturating_sub(parse_time_ms(now));
-        if control_code_fast_state_same_payload(&existing, &row) && remaining_ms > ttl_ms / 2 {
+        if same_fields!(existing, row;
+            ticketId, backendId, status, revision, reason, preparedAt, streamEpoch,
+            frameSequence, rawTicketConfirmed, cleanupClear, streamLive
+        ) && remaining_ms > ttl_ms / 2
+        {
             return existing;
         }
-        ctx.db
-            .ticketremote_control_code_fast_state()
-            .id()
-            .update(row.clone());
+    }
+    if table.id().find(&id).is_some() {
+        table.id().update(row.clone());
     } else {
-        ctx.db
-            .ticketremote_control_code_fast_state()
-            .insert(row.clone());
+        table.insert(row.clone());
     }
     row
-}
-
-fn control_code_fast_state_same_payload(
-    left: &TicketremoteControlCodeFastState,
-    right: &TicketremoteControlCodeFastState,
-) -> bool {
-    left.ticketId == right.ticketId
-        && left.backendId == right.backendId
-        && left.status == right.status
-        && left.revision == right.revision
-        && left.reason == right.reason
-        && left.preparedAt == right.preparedAt
-        && left.streamEpoch == right.streamEpoch
-        && left.frameSequence == right.frameSequence
-        && left.rawTicketConfirmed == right.rawTicketConfirmed
-        && left.cleanupClear == right.cleanupClear
-        && left.streamLive == right.streamLive
-}
-
-fn control_code_fast_state_row_ready(
-    row: &TicketremoteControlCodeFastState,
-    expected_revision: &str,
-    now: &str,
-) -> bool {
-    let expected_revision = expected_revision.trim();
-    !expected_revision.is_empty()
-        && row.status == "fast_ready"
-        && row.revision == expected_revision
-        && row.rawTicketConfirmed
-        && row.cleanupClear
-        && row.streamLive
-        && parse_time_ms(&row.expiresAt) > parse_time_ms(now)
 }
 
 fn control_code_fast_state_current_ready(
@@ -3081,25 +2501,6 @@ fn active_control_code_owner_rows(
         .collect()
 }
 
-fn control_code_submit_mode(fast_state_ready: bool) -> &'static str {
-    if fast_state_ready {
-        "fast_ready"
-    } else {
-        "queued_warmup"
-    }
-}
-
-fn control_code_request_occupies_phone(row: &TicketremoteControlCodeRequest, now: &str) -> bool {
-    if parse_time_ms(&row.expiresAt) <= parse_time_ms(now) {
-        return false;
-    }
-    if matches!(row.status.as_str(), "queued" | "running") {
-        return true;
-    }
-    row.cleanupPending
-        || (row.status == "succeeded" && row.captureRequired && !row.captureAcknowledged)
-}
-
 fn ticket_has_control_code_request_in_progress(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -3111,6 +2512,24 @@ fn ticket_has_control_code_request_in_progress(
         .ticketId()
         .filter(&ticket_id)
         .any(|row| control_code_request_occupies_phone(&row, now))
+}
+
+fn ticket_has_control_code_phone_occupancy(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) -> bool {
+    if ticket_has_control_code_request_in_progress(ctx, ticket_id, now) {
+        return true;
+    }
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    ctx.db
+        .ticketremote_stream_command()
+        .ticketBackendStatus()
+        .filter((&ticket_id, &backend_id, "pending"))
+        .any(|row| control_code_stream_command_occupies_phone(&row, now))
 }
 
 fn insert_control_code_public_request(
@@ -3135,6 +2554,7 @@ fn insert_control_code_public_request(
         captureRequired: false,
         captureAcknowledged: false,
         cleanupPending: false,
+        expiresAt: control_code_request_expires_at(now),
         streamEpoch: "0".into(),
         frameSequence: "0".into(),
         minFrameSequence: "0".into(),
@@ -3142,7 +2562,6 @@ fn insert_control_code_public_request(
         resultMinFrameSequence: "0".into(),
         captureFrameEpoch: "0".into(),
         captureFrameSequence: "0".into(),
-        expiresAt: control_code_request_expires_at(now),
     };
     ctx.db
         .ticketremote_control_code_request()
@@ -3177,102 +2596,29 @@ fn update_control_code_public_request(
     changes: ControlCodeChanges,
     now: &str,
 ) {
-    let request_key = request_id.to_string();
-    let Some(existing) = ctx
-        .db
-        .ticketremote_control_code_request()
-        .id()
-        .find(&request_key)
-    else {
+    let table = ctx.db.ticketremote_control_code_request();
+    let Some(mut row) = table.id().find(request_id.to_string()) else {
         return;
     };
-    let row = TicketremoteControlCodeRequest {
-        status: changes.status.unwrap_or_else(|| existing.status.clone()),
-        reason: changes.reason.unwrap_or_else(|| existing.reason.clone()),
-        message: changes.message.unwrap_or_else(|| existing.message.clone()),
-        resultExpiresAt: changes
-            .resultExpiresAt
-            .unwrap_or_else(|| existing.resultExpiresAt.clone()),
-        resultProof: changes
-            .resultProof
-            .map(Some)
-            .unwrap_or_else(|| existing.resultProof.clone()),
-        resultProofAt: changes
-            .resultProofAt
-            .map(Some)
-            .unwrap_or_else(|| existing.resultProofAt.clone()),
-        captureRequired: changes.captureRequired.unwrap_or(existing.captureRequired),
-        captureAcknowledged: changes
-            .captureAcknowledged
-            .unwrap_or(existing.captureAcknowledged),
-        cleanupPending: changes.cleanupPending.unwrap_or(existing.cleanupPending),
-        streamEpoch: changes
-            .streamEpoch
-            .unwrap_or_else(|| existing.streamEpoch.clone()),
-        frameSequence: changes
-            .frameSequence
-            .unwrap_or_else(|| existing.frameSequence.clone()),
-        minFrameSequence: changes
-            .minFrameSequence
-            .unwrap_or_else(|| existing.minFrameSequence.clone()),
-        resultFrameEpoch: changes
-            .resultFrameEpoch
-            .unwrap_or_else(|| existing.resultFrameEpoch.clone()),
-        resultMinFrameSequence: changes
-            .resultMinFrameSequence
-            .unwrap_or_else(|| existing.resultMinFrameSequence.clone()),
-        captureFrameEpoch: changes
-            .captureFrameEpoch
-            .unwrap_or_else(|| existing.captureFrameEpoch.clone()),
-        captureFrameSequence: changes
-            .captureFrameSequence
-            .unwrap_or_else(|| existing.captureFrameSequence.clone()),
-        expiresAt: changes
-            .expiresAt
-            .unwrap_or_else(|| existing.expiresAt.clone()),
-        updatedAt: now.into(),
-        ..existing.clone()
-    };
+    let existing = row.clone();
+    apply_changes!(row, changes;
+        status, reason, message, resultExpiresAt, captureRequired, captureAcknowledged,
+        cleanupPending, streamEpoch, frameSequence, minFrameSequence, resultFrameEpoch,
+        resultMinFrameSequence, captureFrameEpoch, captureFrameSequence, expiresAt
+    );
+    if let Some(value) = changes.resultProof {
+        row.resultProof = Some(value);
+    }
+    if let Some(value) = changes.resultProofAt {
+        row.resultProofAt = Some(value);
+    }
+    row.updatedAt = now.into();
     if control_code_request_same_payload(&existing, &row)
         && control_code_request_ttl_is_healthy(&existing, now)
     {
         return;
     }
-    ctx.db.ticketremote_control_code_request().id().update(row);
-}
-
-fn control_code_request_same_payload(
-    left: &TicketremoteControlCodeRequest,
-    right: &TicketremoteControlCodeRequest,
-) -> bool {
-    left.status == right.status
-        && left.reason == right.reason
-        && left.message == right.message
-        && left.resultProof == right.resultProof
-        && left.resultProofAt == right.resultProofAt
-        && left.captureRequired == right.captureRequired
-        && left.captureAcknowledged == right.captureAcknowledged
-        && left.cleanupPending == right.cleanupPending
-        && left.streamEpoch == right.streamEpoch
-        && left.frameSequence == right.frameSequence
-        && left.minFrameSequence == right.minFrameSequence
-        && left.resultFrameEpoch == right.resultFrameEpoch
-        && left.resultMinFrameSequence == right.resultMinFrameSequence
-        && left.captureFrameEpoch == right.captureFrameEpoch
-        && left.captureFrameSequence == right.captureFrameSequence
-}
-
-fn control_code_request_ttl_is_healthy(row: &TicketremoteControlCodeRequest, now: &str) -> bool {
-    let now_ms = parse_time_ms(now);
-    let request_remaining_ms = parse_time_ms(&row.expiresAt).saturating_sub(now_ms);
-    if request_remaining_ms <= CONTROL_CODE_COMMAND_TTL_MS / 2 {
-        return false;
-    }
-    if row.status == "succeeded" {
-        return parse_time_ms(&row.resultExpiresAt).saturating_sub(now_ms)
-            > CONTROL_CODE_RESULT_TTL_MS / 2;
-    }
-    true
+    table.id().update(row);
 }
 
 fn insert_safe_operational_log(
@@ -3287,18 +2633,9 @@ fn insert_safe_operational_log(
     now: &str,
 ) {
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
-    let source = clean_token(source, "unknown").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
-    let event = clean_token(event, "event").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
-    let level = clean_token(level, "info").replace(
-        |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
-        "_",
-    );
+    let source = safe_token(source, "unknown");
+    let event = safe_token(event, "event");
+    let level = safe_token(level, "info");
     let correlation_id = bounded_text(correlation_id, 160);
     let row_id = safe_log_sample_interval_ms(&level, &event)
         .map(|interval_ms| sampled_safe_log_row_id(&ticket.id, &source, &event, now, interval_ms))
@@ -3313,46 +2650,40 @@ fn insert_safe_operational_log(
                 now,
             )
         });
-    if ctx
-        .db
-        .ticketremote_safe_operational_log()
-        .id()
-        .find(&row_id)
-        .is_some()
-    {
+    let table = ctx.db.ticketremote_safe_operational_log();
+    if table.id().find(&row_id).is_some() {
         return;
     }
-    ctx.db
-        .ticketremote_safe_operational_log()
-        .insert(TicketremoteSafeOperationalLog {
-            id: row_id,
-            ticketId: ticket.id,
-            source,
-            level,
-            event,
-            correlationId: correlation_id,
-            detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),
-            createdAt: now.into(),
-            expiresAt: history_expires_at(now),
-        });
+    table.insert(TicketremoteSafeOperationalLog {
+        id: row_id,
+        ticketId: ticket.id,
+        source,
+        level,
+        event,
+        correlationId: correlation_id,
+        detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),
+        createdAt: now.into(),
+        expiresAt: history_expires_at(now),
+    });
 }
 
 fn safe_log_sample_interval_ms(level: &str, event: &str) -> Option<i64> {
     if !matches!(level.trim(), "info" | "debug" | "trace") {
         return None;
     }
-    match event.trim() {
-        "command_queued"
-        | "keyframe_requested"
-        | "stream_stalled"
-        | "stream_recovery_requested"
-        | "public_open_grace_retained"
-        | "pixel_direct_phone_report_update"
-        | "pixel_ticket_control_code_fast_state"
-        | "pixel_direct_desired_state_observed"
-        | "pixel_direct_pending_command_hot_scan" => Some(60_000),
-        _ => None,
-    }
+    [
+        "command_queued",
+        "keyframe_requested",
+        "stream_stalled",
+        "stream_recovery_requested",
+        "public_open_grace_retained",
+        "pixel_direct_phone_report_update",
+        "pixel_ticket_control_code_fast_state",
+        "pixel_direct_desired_state_observed",
+        "pixel_direct_pending_command_hot_scan",
+    ]
+    .contains(&event.trim())
+    .then_some(60_000)
 }
 
 fn sampled_safe_log_row_id(
@@ -3397,27 +2728,6 @@ fn safe_log_row_id(
     )
 }
 
-fn fnv32(value: &str) -> u32 {
-    let mut hash: u32 = 0x811c9dc5;
-    for byte in value.as_bytes() {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    hash
-}
-
-fn cleanup_limit_reached(deleted: u32, limit: u32) -> bool {
-    limit > 0 && deleted >= limit
-}
-
-fn cleanup_remaining(limit: u32, deleted: u32) -> u32 {
-    if limit == 0 {
-        0
-    } else {
-        limit.saturating_sub(deleted)
-    }
-}
-
 fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size: u32) -> u32 {
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
     let expiry_bound = canonical_time(now);
@@ -3427,12 +2737,8 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
         batch_size.min(CLEANUP_BATCH_SIZE)
     };
     let mut deleted = 0u32;
-    let mut control_code_request_deleted = 0u32;
-    let mut control_code_owner_deleted = 0u32;
-    let mut control_code_fast_state_deleted = 0u32;
-    let mut safe_log_deleted = 0u32;
 
-    if !cleanup_limit_reached(deleted, limit) {
+    if deleted < limit {
         let stream_command_deleted = purge_expired_stream_commands_for_ticket(
             ctx,
             &ticket.id,
@@ -3441,7 +2747,7 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
         );
         deleted += stream_command_deleted;
     }
-    if !cleanup_limit_reached(deleted, limit) {
+    if deleted < limit {
         let viewer_focus_deleted = purge_expired_stream_viewer_focus_for_ticket(
             ctx,
             &ticket.id,
@@ -3450,145 +2756,22 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
         );
         deleted += viewer_focus_deleted;
     }
-    let request_rows: Vec<_> = ctx
-        .db
-        .ticketremote_control_code_request()
-        .ticketExpiresAt()
-        .filter((&ticket.id, ..=expiry_bound.as_str()))
-        .take(cleanup_remaining(limit, deleted) as usize)
-        .collect();
-    for row in request_rows {
-        if cleanup_limit_reached(deleted, limit) {
-            break;
-        }
-        let owner_present = ctx
-            .db
-            .ticketremote_control_code_owner()
-            .id()
-            .find(&row.id)
-            .is_some();
-        if owner_present && cleanup_remaining(limit, deleted) < 2 {
-            break;
-        }
-        delete_control_code_request(ctx, &row.id);
-        deleted += 1;
-        control_code_request_deleted += 1;
-        if owner_present {
-            deleted += 1;
-            control_code_owner_deleted += 1;
-        }
-    }
-    let owner_rows: Vec<_> = ctx
-        .db
-        .ticketremote_control_code_owner()
-        .ticketExpiresAt()
-        .filter((&ticket.id, ..=expiry_bound.as_str()))
-        .take(cleanup_remaining(limit, deleted) as usize)
-        .collect();
-    for row in owner_rows {
-        if cleanup_limit_reached(deleted, limit) {
-            break;
-        }
-        let request_present = ctx
-            .db
-            .ticketremote_control_code_request()
-            .id()
-            .find(&row.id)
-            .is_some();
-        if request_present && cleanup_remaining(limit, deleted) < 2 {
-            break;
-        }
-        delete_control_code_request(ctx, &row.id);
-        deleted += 1;
-        control_code_owner_deleted += 1;
-        if request_present {
-            deleted += 1;
-            control_code_request_deleted += 1;
-        }
-    }
-    let fast_state_rows: Vec<_> = ctx
-        .db
-        .ticketremote_control_code_fast_state()
-        .ticketExpiresAt()
-        .filter((&ticket.id, ..=expiry_bound.as_str()))
-        .take(cleanup_remaining(limit, deleted) as usize)
-        .collect();
-    for row in fast_state_rows {
-        if cleanup_limit_reached(deleted, limit) {
-            break;
-        }
-        ctx.db
-            .ticketremote_control_code_fast_state()
-            .id()
-            .delete(&row.id);
-        deleted += 1;
-        control_code_fast_state_deleted += 1;
-    }
-    let log_rows: Vec<_> = ctx
-        .db
-        .ticketremote_safe_operational_log()
-        .ticketExpiresAt()
-        .filter((&ticket.id, ..=expiry_bound.as_str()))
-        .take(cleanup_remaining(limit, deleted) as usize)
-        .collect();
-    for row in log_rows {
-        if cleanup_limit_reached(deleted, limit) {
-            break;
-        }
-        ctx.db
-            .ticketremote_safe_operational_log()
-            .id()
-            .delete(&row.id);
-        deleted += 1;
-        safe_log_deleted += 1;
-    }
-    let _ = control_code_request_deleted;
-    let _ = control_code_owner_deleted;
-    let _ = control_code_fast_state_deleted;
-    let _ = safe_log_deleted;
+    purge_ticket_history!(ctx, &ticket.id, expiry_bound.as_str(), limit, deleted);
     deleted
 }
 
-fn purge_expired_stream_viewer_focus_for_ticket(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    now: &str,
-    batch_size: u32,
-) -> u32 {
-    let ticket_id = clean_ticket_id(ticket_id);
-    let expiry_bound = canonical_time(now);
-    let rows: Vec<_> = ctx
-        .db
-        .ticketremote_stream_viewer_focus()
-        .ticketExpiresAt()
-        .filter((&ticket_id, ..=expiry_bound.as_str()))
-        .take(batch_size as usize)
-        .collect();
-    let mut deleted = 0u32;
-    let mut touched_backends: Vec<String> = Vec::new();
-    for row in rows {
-        if cleanup_limit_reached(deleted, batch_size) {
-            break;
+ticket_expiry_purgers! {
+    purge_expired_stream_viewer_focus_for_ticket(ticketremote_stream_viewer_focus)
+        |ctx, ticket, touched, now| {
+        for backend in &touched {
+            refresh_stream_desired_from_viewer_focus(ctx, &ticket, backend, now,
+                "viewer_focus_expired");
         }
-        if !touched_backends.iter().any(|id| id == &row.backendId) {
-            touched_backends.push(row.backendId.clone());
-        }
-        ctx.db
-            .ticketremote_stream_viewer_focus()
-            .id()
-            .delete(&row.id);
-        deleted += 1;
     }
-    for backend_id in touched_backends {
-        refresh_stream_desired_from_viewer_focus(
-            ctx,
-            &ticket_id,
-            &backend_id,
-            now,
-            "viewer_focus_expired",
-        );
+    purge_expired_stream_commands_for_ticket(ticketremote_stream_command)
+        |ctx, ticket, touched, now| {
+        refresh_touched_signals(ctx, &ticket, &touched, now);
     }
-    deleted
 }
 
 fn purge_expired_stream_viewer_focus_for_ticket_backend(
@@ -3605,21 +2788,16 @@ fn purge_expired_stream_viewer_focus_for_ticket_backend(
         .ticketremote_stream_viewer_focus()
         .ticketBackend()
         .filter((&ticket_id, &backend_id))
+        .filter(|row| stream_viewer_focus_expired(row, now))
+        .take(batch_size as usize)
         .collect();
-    let mut deleted = 0u32;
-    for row in rows {
-        if cleanup_limit_reached(deleted, batch_size) {
-            break;
-        }
-        if stream_viewer_focus_expired(&row, now) {
-            ctx.db
-                .ticketremote_stream_viewer_focus()
-                .id()
-                .delete(&row.id);
-            deleted += 1;
-        }
+    for row in &rows {
+        ctx.db
+            .ticketremote_stream_viewer_focus()
+            .id()
+            .delete(&row.id);
     }
-    deleted
+    rows.len().min(u32::MAX as usize) as u32
 }
 
 fn refresh_stream_desired_from_viewer_focus(
@@ -3644,53 +2822,6 @@ fn refresh_stream_desired_from_viewer_focus(
         "cleanup",
         now,
     );
-}
-
-fn stream_viewer_focus_expired(row: &TicketremoteStreamViewerFocus, now: &str) -> bool {
-    !row.active || parse_time_ms(&row.expiresAt) <= parse_time_ms(now)
-}
-
-fn purge_expired_stream_commands_for_ticket(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    now: &str,
-    batch_size: u32,
-) -> u32 {
-    let ticket_id = clean_ticket_id(ticket_id);
-    let expiry_bound = canonical_time(now);
-    let mut deleted = 0u32;
-    let mut touched: Vec<String> = Vec::new();
-    let rows: Vec<_> = ctx
-        .db
-        .ticketremote_stream_command()
-        .ticketExpiresAt()
-        .filter((&ticket_id, ..=expiry_bound.as_str()))
-        .take(batch_size as usize)
-        .collect();
-    for row in rows {
-        if cleanup_limit_reached(deleted, batch_size) {
-            break;
-        }
-        if !touched.iter().any(|id| id == &row.backendId) {
-            touched.push(row.backendId.clone());
-        }
-        ctx.db.ticketremote_stream_command().id().delete(&row.id);
-        delete_service_command_projection(ctx, &row.id);
-        deleted += 1;
-    }
-    refresh_touched_signals(ctx, &ticket_id, &touched, now);
-    deleted
-}
-
-fn refresh_touched_signals(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_ids: &[String],
-    now: &str,
-) {
-    for backend_id in backend_ids {
-        upsert_stream_command_signal(ctx, ticket_id, backend_id, now, now);
-    }
 }
 
 #[cfg(test)]
@@ -3743,6 +2874,22 @@ mod tests {
         }
     }
 
+    fn stream_command(command_type: &str, reason: &str) -> TicketremoteStreamCommand {
+        TicketremoteStreamCommand {
+            id: format!("command-{command_type}"),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            commandType: command_type.into(),
+            status: "pending".into(),
+            revision: "revision-1".into(),
+            reason: reason.into(),
+            payloadJson: "{}".into(),
+            createdAt: "2026-07-10T12:00:00Z".into(),
+            updatedAt: "2026-07-10T12:00:00Z".into(),
+            expiresAt: "2026-07-10T12:05:00Z".into(),
+        }
+    }
+
     fn valid_service_claims() -> serde_json::Value {
         serde_json::json!({
             "iss": SERVICE_OIDC_ISSUER,
@@ -3774,6 +2921,26 @@ mod tests {
         let mut claims = valid_service_claims();
         claims["roles"] = serde_json::json!(["member"]);
         assert!(!service_claims_are_valid(&claims));
+    }
+
+    #[test]
+    fn member_proxy_claims_pin_signer_role_subject_and_email() {
+        let email = "member@example.com";
+        let valid = serde_json::json!({
+            "iss": SERVICE_OIDC_ISSUER, "aud": [SERVICE_OIDC_AUDIENCE],
+            "sub": format!("member:{email}"), "roles": [MEMBER_PROXY_ROLE],
+            "email": email, "email_verified": true,
+        });
+        assert!(member_proxy_claims_are_valid(&valid, email));
+        for field in ["iss", "aud", "sub", "roles"] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!("wrong");
+            assert!(
+                !member_proxy_claims_are_valid(&invalid, email),
+                "trusted {field}"
+            );
+        }
+        assert!(!member_proxy_claims_are_valid(&valid, "other@example.com"));
     }
 
     #[test]
@@ -3897,6 +3064,80 @@ mod tests {
         request.status = "running".into();
         request.expiresAt = now.into();
         assert!(!control_code_request_occupies_phone(&request, now));
+    }
+
+    #[test]
+    fn pending_control_code_commands_block_prepare_until_they_settle() {
+        let now = "2026-07-10T12:00:01Z";
+        for command_type in [
+            "prepare_control_code",
+            "generate_control_code",
+            "control_code_browser_capture",
+        ] {
+            assert!(control_code_stream_command_occupies_phone(
+                &stream_command(command_type, "stream_command"),
+                now
+            ));
+        }
+
+        let mut cleanup = stream_command("cleanup", "control_code_cleanup");
+        assert!(control_code_stream_command_occupies_phone(&cleanup, now));
+        cleanup.status = "acknowledged".into();
+        assert!(!control_code_stream_command_occupies_phone(&cleanup, now));
+
+        let mut expired = stream_command("generate_control_code", "control_code_request");
+        expired.expiresAt = now.into();
+        assert!(!control_code_stream_command_occupies_phone(&expired, now));
+
+        assert!(!control_code_stream_command_occupies_phone(
+            &stream_command("keyframe", "browser_recovery"),
+            now
+        ));
+    }
+
+    #[test]
+    fn cleanup_keeps_the_original_terminal_failure_detail() {
+        let mut failed = control_request();
+        failed.status = "failed".into();
+        failed.reason = "control_code_submit_target_unproved".into();
+        failed.message = "The phone could not prove the submit target".into();
+
+        let preserve =
+            control_code_cleanup_preserves_terminal_failure(&failed, "failed", "ticket_detail");
+        assert!(preserve);
+        let (reason, message) =
+            control_code_update_text(&failed, "ticket_detail", "", false, preserve);
+        assert_eq!(reason, "control_code_submit_target_unproved");
+        assert_eq!(message, "The phone could not prove the submit target");
+
+        assert!(!control_code_cleanup_preserves_terminal_failure(
+            &failed,
+            "failed",
+            "control_code_submit_failed"
+        ));
+        assert!(!control_code_cleanup_preserves_terminal_failure(
+            &failed,
+            "running",
+            "ticket_detail"
+        ));
+    }
+
+    #[test]
+    fn close_is_idempotent_after_a_terminal_failure() {
+        assert!(control_code_close_is_idempotent(None));
+        for status in ["failed", "expired", "closed"] {
+            let mut request = control_request();
+            request.status = status.into();
+            assert!(control_code_close_is_idempotent(Some(&request)));
+        }
+
+        let mut request = control_request();
+        request.status = "succeeded".into();
+        assert!(!control_code_close_is_idempotent(Some(&request)));
+        request.captureAcknowledged = true;
+        assert!(control_code_close_is_idempotent(Some(&request)));
+        request.status = "running".into();
+        assert!(!control_code_close_is_idempotent(Some(&request)));
     }
 
     #[test]

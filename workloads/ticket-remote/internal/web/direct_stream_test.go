@@ -600,7 +600,7 @@ func putUint64(dst []byte, value uint64) {
 
 func newDirectTestServer(t *testing.T) http.Handler {
 	t.Helper()
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	backends := []config.PhoneBackend{
 		{ID: "lab-pixel", AttachName: "Lab Pixel", BaseURL: "http://lab.test"},
 		{ID: "pixel", AttachName: "Pixel", BaseURL: "http://phone.test"},

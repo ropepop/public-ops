@@ -151,7 +151,7 @@ func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, r
 func compactRelayCurrentReportStatus(status map[string]any) map[string]any {
 	compact := make(map[string]any, len(status))
 	for key, value := range status {
-		if strings.HasSuffix(key, "AgoMillis") {
+		if key == "startupTrace" || strings.HasSuffix(key, "AgoMillis") {
 			continue
 		}
 		compact[key] = value
@@ -178,7 +178,7 @@ func (s *Server) noteRelayProductState(status map[string]any, now time.Time, rea
 	s.relayProductMu.Unlock()
 	backend := s.activePhoneBackend()
 	if lastVerdict != "" && verdict != lastVerdict {
-		s.recordProductEventAsync(productEventInput{
+		go s.recordProductEvent(productEventInput{
 			Source:    "ticket_remote_relay",
 			Category:  "stream",
 			Action:    "verdict_changed",
@@ -195,7 +195,7 @@ func (s *Server) noteRelayProductState(status map[string]any, now time.Time, rea
 		})
 	}
 	if dropTotal > lastDropTotal && (lastDropTotal == 0 || dropTotal-lastDropTotal >= 20) {
-		s.recordProductEventAsync(productEventInput{
+		go s.recordProductEvent(productEventInput{
 			Source:    "ticket_remote_relay",
 			Category:  "stream",
 			Action:    "frame_drop_threshold",
@@ -392,37 +392,24 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 		TTL:         ttl,
 		Now:         now,
 	})
-	if err == nil {
-		s.recordProductEventAsync(productEventInput{
-			Source:        "ticket_remote_service",
-			Category:      "command",
-			Action:        "queued",
-			Status:        "ok",
-			Reason:        cleanStreamControlText(reason, "stream_command"),
-			CommandID:     commandID,
-			BackendID:     backend.ID,
-			CorrelationID: commandID,
-			SafeState: map[string]any{
-				"commandType": cleanStreamControlText(commandType, "command"),
-				"ttlMillis":   ttl.Milliseconds(),
-				"revision":    revision,
-			},
-		})
-	} else {
-		s.recordProductEventAsync(productEventInput{
-			Source:        "ticket_remote_service",
-			Category:      "command",
-			Action:        "queue_failed",
-			Status:        "failed",
-			Reason:        safeRuntimeLogError(err),
-			CommandID:     commandID,
-			BackendID:     backend.ID,
-			CorrelationID: commandID,
-			SafeState: map[string]any{
-				"commandType": cleanStreamControlText(commandType, "command"),
-			},
-		})
+	event := productEventInput{
+		Source:        "ticket_remote_service",
+		Category:      "command",
+		Action:        "queued",
+		Status:        "ok",
+		Reason:        cleanStreamControlText(reason, "stream_command"),
+		CommandID:     commandID,
+		BackendID:     backend.ID,
+		CorrelationID: commandID,
+		SafeState:     map[string]any{"commandType": cleanStreamControlText(commandType, "command")},
 	}
+	if err == nil {
+		event.SafeState["ttlMillis"] = ttl.Milliseconds()
+		event.SafeState["revision"] = revision
+	} else {
+		event.Action, event.Status, event.Reason = "queue_failed", "failed", safeRuntimeLogError(err)
+	}
+	go s.recordProductEvent(event)
 	if err == nil && (commandType == "start" || commandType == "keyframe" || commandType == "recover_stream") {
 		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
 	}
@@ -480,7 +467,7 @@ func (s *Server) noteStreamAutoRecoveryResult(result string, reason string, comm
 	}
 	s.lastStreamRecoveryFailure = failure
 	if commandID != "" {
-		s.lastStreamRecoveryCommandID = cleanRuntimeCorrelationID(commandID)
+		s.lastStreamRecoveryCommandID = cleanStreamControlText(commandID, "")
 	}
 	s.streamRecoveryMu.Unlock()
 	event := "stream_failed"
@@ -488,7 +475,7 @@ func (s *Server) noteStreamAutoRecoveryResult(result string, reason string, comm
 		event = "stream_recovered"
 	}
 	if result == "succeeded" {
-		s.recordRuntimeEventAsync("info", event, commandID, map[string]any{"reason": reason})
+		s.recordRuntimeEventForSourceAsync("ticket_remote", "info", event, commandID, map[string]any{"reason": reason})
 	} else if err != nil {
 		s.recordRuntimeErrorAsync(event, commandID, err, map[string]any{"reason": reason})
 	}
@@ -530,6 +517,8 @@ func (s *Server) streamAutoRecoveryStatus(now time.Time) map[string]any {
 
 func stringFromAny(value any) string {
 	switch typed := value.(type) {
+	case nil:
+		return ""
 	case string:
 		return typed
 	case fmt.Stringer:

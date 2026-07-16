@@ -34,30 +34,14 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
-import TicketremoteAckStreamCommandReducer from "./ticketremote_ack_stream_command_reducer";
-import TicketremoteAppendSafeOperationalLogReducer from "./ticketremote_append_safe_operational_log_reducer";
-import TicketremoteAppendStreamCommandReducer from "./ticketremote_append_stream_command_reducer";
-import TicketremoteCleanupExpiredReducer from "./ticketremote_cleanup_expired_reducer";
 import TicketremoteMemberAppendSafeOperationalLogReducer from "./ticketremote_member_append_safe_operational_log_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberPrepareControlCodeReducer from "./ticketremote_member_prepare_control_code_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
-import TicketremoteMemberRemoveMemberReducer from "./ticketremote_member_remove_member_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "./ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "./ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "./ticketremote_member_set_stream_focus_reducer";
-import TicketremoteMemberUpsertMemberReducer from "./ticketremote_member_upsert_member_reducer";
-import TicketremoteRegisterServiceIdentityReducer from "./ticketremote_register_service_identity_reducer";
-import TicketremoteRemoveMemberReducer from "./ticketremote_remove_member_reducer";
-import TicketremoteServiceBootstrapReducer from "./ticketremote_service_bootstrap_reducer";
-import TicketremoteSetStreamDesiredStateReducer from "./ticketremote_set_stream_desired_state_reducer";
-import TicketremoteUpdateControlCodeFastStateReducer from "./ticketremote_update_control_code_fast_state_reducer";
-import TicketremoteUpdateControlCodeRequestReducer from "./ticketremote_update_control_code_request_reducer";
-import TicketremoteUpdatePhoneReducer from "./ticketremote_update_phone_reducer";
-import TicketremoteUpdatePhoneCurrentReportReducer from "./ticketremote_update_phone_current_report_reducer";
-import TicketremoteUpdateRelayCurrentReportReducer from "./ticketremote_update_relay_current_report_reducer";
-import TicketremoteUpsertMemberReducer from "./ticketremote_upsert_member_reducer";
 
 // Import all procedure arg schemas
 
@@ -66,11 +50,6 @@ import TicketremoteControlCodeFastStateRow from "./ticketremote_control_code_fas
 import TicketremoteControlCodeRequestRow from "./ticketremote_control_code_request_table";
 import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_report_table";
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
-import TicketremoteServicePhoneBackendRow from "./ticketremote_service_phone_backend_table";
-import TicketremoteServiceStreamCommandRow from "./ticketremote_service_stream_command_table";
-import TicketremoteServiceTicketRow from "./ticketremote_service_ticket_table";
-import TicketremoteServiceTicketMemberRow from "./ticketremote_service_ticket_member_table";
-import TicketremoteStreamCommandSignalRow from "./ticketremote_stream_command_signal_table";
 import TicketremoteStreamDesiredStateRow from "./ticketremote_stream_desired_state_table";
 import TicketremoteStreamViewerFocusRow from "./ticketremote_stream_viewer_focus_table";
 
@@ -176,17 +155,6 @@ const tablesSchema = __schema({
       { name: 'ticketremote_relay_current_report_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteRelayCurrentReportRow),
-  ticketremote_stream_command_signal: __table({
-    name: 'ticketremote_stream_command_signal',
-    indexes: [
-      { accessor: 'id', name: 'ticketremote_stream_command_signal_id_idx_btree', algorithm: 'btree', columns: [
-        'id',
-      ] },
-    ],
-    constraints: [
-      { name: 'ticketremote_stream_command_signal_id_key', constraint: 'unique', columns: ['id'] },
-    ],
-  }, TicketremoteStreamCommandSignalRow),
   ticketremote_stream_desired_state: __table({
     name: 'ticketremote_stream_desired_state',
     indexes: [
@@ -230,62 +198,18 @@ const tablesSchema = __schema({
       { name: 'ticketremote_stream_viewer_focus_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteStreamViewerFocusRow),
-  ticketremote_service_phone_backend: __table({
-    name: 'ticketremote_service_phone_backend',
-    indexes: [
-    ],
-    constraints: [
-    ],
-  }, TicketremoteServicePhoneBackendRow),
-  ticketremote_service_stream_command: __table({
-    name: 'ticketremote_service_stream_command',
-    indexes: [
-    ],
-    constraints: [
-    ],
-  }, TicketremoteServiceStreamCommandRow),
-  ticketremote_service_ticket: __table({
-    name: 'ticketremote_service_ticket',
-    indexes: [
-    ],
-    constraints: [
-    ],
-  }, TicketremoteServiceTicketRow),
-  ticketremote_service_ticket_member: __table({
-    name: 'ticketremote_service_ticket_member',
-    indexes: [
-    ],
-    constraints: [
-    ],
-  }, TicketremoteServiceTicketMemberRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
-  __reducerSchema("ticketremote_ack_stream_command", TicketremoteAckStreamCommandReducer),
-  __reducerSchema("ticketremote_append_safe_operational_log", TicketremoteAppendSafeOperationalLogReducer),
-  __reducerSchema("ticketremote_append_stream_command", TicketremoteAppendStreamCommandReducer),
-  __reducerSchema("ticketremote_cleanup_expired", TicketremoteCleanupExpiredReducer),
   __reducerSchema("ticketremote_member_append_safe_operational_log", TicketremoteMemberAppendSafeOperationalLogReducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
   __reducerSchema("ticketremote_member_prepare_control_code", TicketremoteMemberPrepareControlCodeReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),
-  __reducerSchema("ticketremote_member_remove_member", TicketremoteMemberRemoveMemberReducer),
   __reducerSchema("ticketremote_member_request_control_code", TicketremoteMemberRequestControlCodeReducer),
   __reducerSchema("ticketremote_member_request_keyframe", TicketremoteMemberRequestKeyframeReducer),
   __reducerSchema("ticketremote_member_set_stream_focus", TicketremoteMemberSetStreamFocusReducer),
-  __reducerSchema("ticketremote_member_upsert_member", TicketremoteMemberUpsertMemberReducer),
-  __reducerSchema("ticketremote_register_service_identity", TicketremoteRegisterServiceIdentityReducer),
-  __reducerSchema("ticketremote_remove_member", TicketremoteRemoveMemberReducer),
-  __reducerSchema("ticketremote_service_bootstrap", TicketremoteServiceBootstrapReducer),
-  __reducerSchema("ticketremote_set_stream_desired_state", TicketremoteSetStreamDesiredStateReducer),
-  __reducerSchema("ticketremote_update_control_code_fast_state", TicketremoteUpdateControlCodeFastStateReducer),
-  __reducerSchema("ticketremote_update_control_code_request", TicketremoteUpdateControlCodeRequestReducer),
-  __reducerSchema("ticketremote_update_phone", TicketremoteUpdatePhoneReducer),
-  __reducerSchema("ticketremote_update_phone_current_report", TicketremoteUpdatePhoneCurrentReportReducer),
-  __reducerSchema("ticketremote_update_relay_current_report", TicketremoteUpdateRelayCurrentReportReducer),
-  __reducerSchema("ticketremote_upsert_member", TicketremoteUpsertMemberReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */

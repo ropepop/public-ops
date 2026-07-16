@@ -123,13 +123,6 @@ func Load() (Config, error) {
 			SpacetimeDatabase:              getenv("TICKET_REMOTE_SPACETIME_DATABASE", ""),
 			SpacetimeClientURL:             strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_CLIENT_URL", ""), "/"),
 			SpacetimeSidecarWriteTokenFile: getenv("TICKET_REMOTE_SPACETIME_SIDECAR_WRITE_TOKEN_FILE", ""),
-			SpacetimeBearerToken:           getenv("TICKET_REMOTE_SPACETIME_BEARER_TOKEN", ""),
-			SpacetimeIssuer:                getenv("TICKET_REMOTE_SPACETIME_OIDC_ISSUER", state.DefaultSpacetimeIssuer),
-			SpacetimeAudience:              getenv("TICKET_REMOTE_SPACETIME_OIDC_AUDIENCE", state.DefaultSpacetimeAudience),
-			SpacetimeKeyFile:               getenv("TICKET_REMOTE_SPACETIME_JWT_PRIVATE_KEY_FILE", ""),
-			ServiceSubject:                 getenv("TICKET_REMOTE_SPACETIME_SERVICE_SUBJECT", state.DefaultSpacetimeServiceSubject),
-			ServiceRoles:                   splitCSV(getenv("TICKET_REMOTE_SPACETIME_SERVICE_ROLES", state.DefaultSpacetimeServiceRole)),
-			TokenTTL:                       getenvDurationWithNever("TICKET_REMOTE_SPACETIME_TOKEN_TTL", state.DefaultSpacetimeTokenTTL),
 			HTTPTimeout:                    getenvDuration("TICKET_REMOTE_SPACETIME_HTTP_TIMEOUT", state.DefaultSpacetimeHTTPTimeout),
 			AuthIssuer:                     strings.TrimRight(getenv("TICKET_REMOTE_SPACETIME_AUTH_ISSUER", "https://auth.spacetimedb.com/oidc"), "/"),
 			AuthAudience:                   getenv("TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID", ""),
@@ -180,7 +173,7 @@ func Load() (Config, error) {
 		if cfg.Access.Audience == "" {
 			return Config{}, fmt.Errorf("TICKET_REMOTE_CF_ACCESS_AUDIENCE is required when Cloudflare Access auth is enabled")
 		}
-	case "dev", "development", "none":
+	case "dev", "development":
 	default:
 		return Config{}, fmt.Errorf("unsupported TICKET_REMOTE_AUTH_MODE %q", cfg.Access.Mode)
 	}
@@ -202,7 +195,7 @@ func validateProductionConfig(cfg Config) error {
 	mode := strings.ToLower(strings.TrimSpace(cfg.Access.Mode))
 	switch mode {
 	case "", "spacetime", "spacetimeauth", "oidc", "cloudflare", "cloudflare-access", "cf-access":
-	case "dev", "development", "none":
+	case "dev", "development":
 		return fmt.Errorf("production auth mode %q is not allowed", cfg.Access.Mode)
 	default:
 		return fmt.Errorf("unsupported production auth mode %q", cfg.Access.Mode)
@@ -357,27 +350,6 @@ func getenvDurationWithNever(key string, fallback time.Duration) time.Duration {
 	default:
 		return getenvDuration(key, fallback)
 	}
-}
-
-func getenvTime(key string) time.Time {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return time.Time{}
-	}
-	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-		return parsed
-	}
-	return time.Time{}
-}
-
-func splitCSV(value string) []string {
-	var out []string
-	for _, item := range strings.Split(value, ",") {
-		if clean := strings.TrimSpace(item); clean != "" {
-			out = append(out, clean)
-		}
-	}
-	return out
 }
 
 func normalizeEmail(value string) string {

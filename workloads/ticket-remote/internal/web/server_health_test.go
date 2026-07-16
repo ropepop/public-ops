@@ -17,7 +17,7 @@ import (
 )
 
 func TestHealthUsesFreshCachedStateWithoutStateLookup(t *testing.T) {
-	memoryStore := state.NewMemoryStore()
+	memoryStore := NewMemoryStore()
 	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
@@ -92,7 +92,7 @@ func TestHealthUsesFreshCachedStateWithoutStateLookup(t *testing.T) {
 }
 
 func TestMemberRouteRejectsStaleCachedStateWhenFreshLookupFails(t *testing.T) {
-	memoryStore := state.NewMemoryStore()
+	memoryStore := NewMemoryStore()
 	if err := memoryStore.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",

@@ -62,7 +62,7 @@ func (s *Server) addRelayViewer(sessionID string) {
 	s.mu.Unlock()
 	if previous == 0 {
 		s.relay.AddViewer()
-		s.direct.recordStartupPhase("relay_viewer_added", fmt.Sprintf("session=%s viewers=%d", sessionID, viewerCount))
+		s.direct.recordStartupPhase("relay_viewer_added", fmt.Sprintf("viewers=%d", viewerCount))
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "relay_viewer_added", safeRuntimeTraceID("browser", sessionID), map[string]any{
 			"viewerCount": viewerCount,
 			"session":     true,
@@ -81,7 +81,7 @@ func (s *Server) retainRelayViewerForPrewarm(sessionID string, hold time.Duratio
 		return
 	}
 	if s.retainRelaysForDuration(sessionID, hold, true, "prewarm") {
-		s.direct.recordStartupPhase("prewarm_lease_retained", fmt.Sprintf("session=%s hold_ms=%d", sessionID, durationMillis(hold)))
+		s.direct.recordStartupPhase("prewarm_lease_retained", fmt.Sprintf("hold_ms=%d", durationMillis(hold)))
 		s.addRelayViewer(sessionID)
 	}
 }
@@ -108,7 +108,7 @@ func (s *Server) retainRelayViewerForPublicOpenGrace(sessionID string, hold time
 	}
 	reason = cleanStreamControlText(reason, "public_open_grace")
 	added := s.retainRelaysForDuration(sessionID, hold, true, "public_open_grace")
-	s.direct.recordStartupPhase("public_open_grace_retained", fmt.Sprintf("session=%s reason=%s hold_ms=%d added=%t", sessionID, reason, durationMillis(hold), added))
+	s.direct.recordStartupPhase("public_open_grace_retained", fmt.Sprintf("reason=%s hold_ms=%d added=%t", reason, durationMillis(hold), added))
 	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "public_open_grace_retained", safeRuntimeTraceID("browser", sessionID), map[string]any{
 		"reason":     reason,
 		"holdMillis": durationMillis(hold),
@@ -126,7 +126,7 @@ func (s *Server) releaseRelayViewerPublicOpenGrace(sessionID string, reason stri
 	}
 	reason = cleanStreamControlText(reason, "public_open_grace_released")
 	if s.releaseRetainedRelayViewer(sessionID) {
-		s.direct.recordStartupPhase("public_open_grace_released", fmt.Sprintf("session=%s reason=%s", sessionID, reason))
+		s.direct.recordStartupPhase("public_open_grace_released", fmt.Sprintf("reason=%s", reason))
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "public_open_grace_released", safeRuntimeTraceID("browser", sessionID), map[string]any{
 			"reason": reason,
 		})
@@ -166,7 +166,7 @@ func (s *Server) retainRelaysForDuration(sessionID string, hold time.Duration, r
 			s.mu.Unlock()
 			if shouldRemoveViewer {
 				if reason == "public_open_grace" {
-					s.direct.recordStartupPhase("public_open_grace_expired", fmt.Sprintf("session=%s hold_ms=%d", sessionID, durationMillis(hold)))
+					s.direct.recordStartupPhase("public_open_grace_expired", fmt.Sprintf("hold_ms=%d", durationMillis(hold)))
 					s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "public_open_grace_expired", safeRuntimeTraceID("browser", sessionID), map[string]any{
 						"holdMillis": durationMillis(hold),
 					})

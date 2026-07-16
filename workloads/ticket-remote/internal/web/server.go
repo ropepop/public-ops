@@ -46,9 +46,6 @@ type Server struct {
 	relayViewerRefs     map[string]int
 	streamPrewarmTimers map[string]*time.Timer
 
-	gateMu sync.RWMutex
-	gate   *controlGate
-
 	stateMu       sync.RWMutex
 	cachedState   state.Snapshot
 	cachedStateAt time.Time
@@ -57,20 +54,10 @@ type Server struct {
 	lastPixelTicketEvent  pixelTicketEvent
 	lastPixelTicketHealth string
 
-	quickClaimMu   sync.RWMutex
-	lastQuickClaim quickClaimDiagnostic
-
 	phoneStartMu           sync.Mutex
 	lastPhoneStartAttempt  time.Time
 	phoneHTTPStartInFlight bool
 	lastPhoneHTTPStartAt   time.Time
-
-	controlCodeRelayPrepMu   sync.RWMutex
-	lastControlCodeRelayPrep controlCodeRelayPreparationHealth
-
-	streamRequestMu           sync.Mutex
-	lastGlobalKeyframeRequest time.Time
-	lastGlobalRecoveryRequest time.Time
 
 	streamRecoveryMu            sync.Mutex
 	lastStreamRecoveryAt        time.Time
@@ -93,12 +80,6 @@ type Server struct {
 	streamDesiredReleaseSeq   uint64
 	streamLifecycleMu         sync.RWMutex
 
-	codeMu       sync.Mutex
-	codeRequests map[string]*controlCodeRequest
-	codeQueue    []string
-	codeRunning  string
-	codeRate     map[string][]time.Time
-
 	backendMu sync.RWMutex
 }
 
@@ -108,13 +89,10 @@ var (
 )
 
 type client struct {
-	conn             *websocket.Conn
-	sessionID        string
-	email            string
-	page             string
-	video            bool
-	sendMu           sync.Mutex
-	presenceFallback bool
+	conn      *websocket.Conn
+	sessionID string
+	email     string
+	sendMu    sync.Mutex
 
 	videoMu              sync.Mutex
 	videoWriteActive     bool
@@ -124,26 +102,7 @@ type client struct {
 	videoReadyForDelta   bool
 	videoReadyEpoch      uint64
 
-	lastKeyframeRequest time.Time
-	lastRecoveryRequest time.Time
-
 	firstVideoFrameRendered bool
-}
-
-type controlGate struct {
-	sessionID string
-	email     string
-	expiresAt time.Time
-}
-
-type quickClaimDiagnostic struct {
-	At        string `json:"at,omitempty"`
-	SessionID string `json:"sessionId,omitempty"`
-	Email     string `json:"email,omitempty"`
-	InputID   string `json:"inputId,omitempty"`
-	Action    string `json:"action,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	Forwarded bool   `json:"forwarded"`
 }
 
 type apiResponse struct {
@@ -155,31 +114,24 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion         = "ticket-remote-2026-07-10-immediate-queued-browser-captured-control-code-v117"
-	stateLookupTimeout    = 1200 * time.Millisecond
-	presenceUpdateTimeout = 4 * time.Second
-	stateCacheMaxAge      = 30 * time.Second
-	idleStateRefresh      = 20 * time.Second
-	idleStateTimeout      = 8 * time.Second
+	serverVersion      = "ticket-remote-2026-07-11-painted-browser-captured-control-code-v120"
+	stateLookupTimeout = 1200 * time.Millisecond
+	stateCacheMaxAge   = 30 * time.Second
 
-	keyframeRequestPerClientInterval = 2 * time.Second
-	keyframeRequestGlobalInterval    = 500 * time.Millisecond
-	recoveryRequestPerClientInterval = 1500 * time.Millisecond
-	recoveryRequestGlobalInterval    = 1500 * time.Millisecond
-	streamRecoveryCommandCooldown    = 10 * time.Second
-	streamPrewarmHold                = 30 * time.Second
-	publicOpenGraceHold              = 30 * time.Second
-	streamDesiredIdleReleaseGrace    = 60 * time.Second
-	streamPrewarmHTTPStartTimeout    = 5 * time.Second
-	streamPrewarmHTTPStartDedupe     = 2 * time.Second
-	videoWriteTimeout                = 250 * time.Millisecond
-	videoPendingFrameMaxAge          = 250 * time.Millisecond
-	defaultFiniteCookieTTL           = auth.DefaultServerSessionTTL
-	relayReportHeartbeat             = 3 * time.Second
-	relayReportCoalesceWindow        = 75 * time.Millisecond
-	maxBrowserSocketConnections      = 64
-	maxBrowserSocketsPerIdentity     = 8
-	maxBrowserSocketsPerSession      = 4
+	streamRecoveryCommandCooldown = 10 * time.Second
+	streamPrewarmHold             = 30 * time.Second
+	publicOpenGraceHold           = 30 * time.Second
+	streamDesiredIdleReleaseGrace = 60 * time.Second
+	streamPrewarmHTTPStartTimeout = 5 * time.Second
+	streamPrewarmHTTPStartDedupe  = 2 * time.Second
+	videoWriteTimeout             = 250 * time.Millisecond
+	videoPendingFrameMaxAge       = 250 * time.Millisecond
+	defaultFiniteCookieTTL        = auth.DefaultServerSessionTTL
+	relayReportHeartbeat          = 3 * time.Second
+	relayReportCoalesceWindow     = 75 * time.Millisecond
+	maxBrowserSocketConnections   = 64
+	maxBrowserSocketsPerIdentity  = 8
+	maxBrowserSocketsPerSession   = 4
 )
 
 func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Server, error) {
@@ -204,15 +156,10 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		relayReportWake:     make(chan string, 1),
 		relayReportCancel:   relayReportCancel,
 		relayReportDone:     make(chan struct{}),
-		codeRequests:        map[string]*controlCodeRequest{},
-		codeRate:            map[string][]time.Time{},
 	}
 	relay.SetHandlers(s.handlePhoneMessage, s.handlePhoneDisconnect)
 	// Pixel owns Spacetime command execution. The server writes durable commands
 	// and uses the direct bridge relay only for video transport.
-	if !s.usesDirectSpacetimePresence() {
-		go s.stateTicker()
-	}
 	go s.relayReportLoop(relayReportCtx)
 	return s, nil
 }
@@ -266,44 +213,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeStaticAssetHeaders(w)
 		}
 		http.StripPrefix("/static/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
-	case path == "/api/v1/session":
-		if s.usesDirectSpacetimePresence() {
-			writeJSON(w, http.StatusGone, apiResponse{OK: false, Error: "control_socket_disabled", Message: "Ticket control now uses Spacetime. The socket is reserved for video only."})
-			return
-		}
-		s.handleBrowserSocket(w, r, false)
+	case retiredTicketRoute(path):
+		handleRetiredTicketRoute(w)
 	case path == "/api/v1/stream":
-		s.handleBrowserSocket(w, r, true)
+		s.handleBrowserSocket(w, r)
 	case path == "/api/v1/stream/prewarm":
 		s.withMember(w, r, s.handleStreamPrewarmHTTP)
-	case path == "/api/v1/me":
-		s.withMemberCachedFirst(w, r, s.handleMe)
-	case path == "/api/v1/state":
-		s.withMemberCachedFirst(w, r, s.handleState)
-	case path == "/api/v1/control-code/request":
-		s.withMember(w, r, s.handleControlCodeRequestHTTP)
-	case path == "/api/v1/control-code/prepare":
-		s.withMember(w, r, s.handleControlCodePrepareHTTP)
-	case path == "/api/v1/control-code/capture":
-		s.withMember(w, r, s.handleControlCodeCaptureHTTP)
-	case path == "/api/v1/control-code/close":
-		s.withMember(w, r, s.handleControlCodeCloseHTTP)
-	case path == "/api/v1/control/claim":
-		s.withMember(w, r, s.handleClaimControl)
-	case path == "/api/v1/control/extend":
-		s.withMember(w, r, s.handleExtendControl)
-	case path == "/api/v1/control/release":
-		s.withMember(w, r, s.handleReleaseControl)
-	case path == "/api/v1/client-log":
-		s.withMemberCachedFirst(w, r, s.handleClientLog)
 	case path == "/api/v1/internal/service-events":
 		s.handleServiceEvent(w, r)
 	case path == "/api/v1/admin/state":
 		s.withAdmin(w, r, s.handleAdminState)
 	case path == "/api/v1/admin/members":
 		s.withAdmin(w, r, s.handleAdminMembers)
-	case path == "/api/v1/admin/control/revoke":
-		s.withAdmin(w, r, s.handleAdminRevokeControl)
 	case path == "/api/v1/admin/phone/backends":
 		s.withAdmin(w, r, s.handleAdminPhoneBackends)
 	case path == "/api/v1/admin/phone/backend":
@@ -319,6 +240,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func retiredTicketRoute(path string) bool {
+	switch path {
+	case "/api/v1/session",
+		"/api/v1/me",
+		"/api/v1/state",
+		"/api/v1/client-log",
+		"/api/v1/control-code/request",
+		"/api/v1/control-code/prepare",
+		"/api/v1/control-code/capture",
+		"/api/v1/control-code/close",
+		"/api/v1/control/claim",
+		"/api/v1/control/extend",
+		"/api/v1/control/release",
+		"/api/v1/admin/control/revoke":
+		return true
+	default:
+		return false
+	}
+}
+
+func handleRetiredTicketRoute(w http.ResponseWriter) {
+	writeJSON(w, http.StatusGone, apiResponse{
+		OK:      false,
+		Error:   "route_retired",
+		Message: "This retired Ticket route has been replaced by the direct Spacetime flow.",
+	})
 }
 
 func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
@@ -394,18 +343,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot s
 	streamNow := time.Now()
 	healthSnapshot := redactSnapshotForHealth(snapshot)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                          ok,
-		"serverVersion":               serverVersion,
-		"reasons":                     reasons,
-		"stateBackendFresh":           stateBackendFresh,
-		"stateBackendWarning":         stateBackendWarning,
-		"state":                       healthSnapshot,
-		"phone":                       phoneHealth,
-		"activePhoneBackend":          s.activePhoneBackend(),
-		"directStream":                s.direct.snapshot(streamNow, phoneHealth),
-		"controlCodeRelayPreparation": s.controlCodeRelayPreparationSnapshot(streamNow),
-		"controlGate":                 s.controlGateSnapshot(streamNow),
-		"quickClaim":                  s.quickClaimSnapshot(),
+		"ok":                  ok,
+		"serverVersion":       serverVersion,
+		"reasons":             reasons,
+		"stateBackendFresh":   stateBackendFresh,
+		"stateBackendWarning": stateBackendWarning,
+		"state":               healthSnapshot,
+		"phone":               phoneHealth,
+		"activePhoneBackend":  s.activePhoneBackend(),
+		"directStream":        s.direct.snapshot(streamNow, phoneHealth),
 	})
 }
 
@@ -606,12 +552,31 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 	nonce := randomID()
 	s.writeHTMLHeaders(w, nonce)
 	member, _ := snapshot.Member(id.Email)
+	members := make([]state.Member, 0, len(snapshot.Members))
+	viewers := 0
+	for _, item := range snapshot.Members {
+		if item.Active {
+			members = append(members, item)
+		}
+	}
+	for _, viewer := range snapshot.Viewers {
+		if viewer.Connected {
+			viewers++
+		}
+	}
+	phoneHealth := s.relay.Snapshot()
+	activeBackend := s.activePhoneBackend()
 	_ = s.adminTmpl.Execute(w, map[string]any{
-		"AssetVersion": assetVersion(),
-		"Email":        id.Email,
-		"IsOwner":      member.Role == state.RoleOwner,
-		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(id, sessionID, snapshot, true))),
-		"Nonce":        nonce,
+		"AssetVersion":  assetVersion(),
+		"Email":         id.Email,
+		"IsOwner":       member.Role == state.RoleOwner,
+		"Members":       members,
+		"ViewerCount":   viewers,
+		"Phone":         phoneHealth,
+		"Backends":      s.configuredPhoneBackends(),
+		"ActiveBackend": activeBackend.ID,
+		"RawState":      mustJSON(map[string]any{"state": snapshot, "phone": phoneHealth}),
+		"Nonce":         nonce,
 	})
 }
 
@@ -700,7 +665,6 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setAuthCookie(w, sessionToken, s.authCookieMaxAge())
-	s.setDirectSpacetimeCookie(w, idToken)
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
@@ -765,13 +729,14 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		if sessionID == "" {
 			sessionID = s.sessionID(w, r)
 		}
+		s.setPrivateAuthCookie(w, "ticket_remote_direct_spacetime", "", -1)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":            true,
 			"authenticated": true,
 			"email":         id.Email,
 			"sessionId":     sessionID,
 			"state":         snapshot.PublicForMember(id.Email),
-			"spacetime":     s.directSpacetimeSessionFromRequest(r),
+			"spacetime":     s.directSpacetimeSessionFromRequest(r, id.Email),
 		})
 	case http.MethodPost:
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 32*1024))
@@ -813,7 +778,6 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.setAuthCookie(w, sessionToken, s.authCookieMaxAge())
-		s.setDirectSpacetimeCookie(w, token)
 		sessionID := s.sessionID(w, r)
 		session := map[string]any{
 			"expires": !sessionExpiresAt.IsZero(),
@@ -828,11 +792,7 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			"sessionId":     sessionID,
 			"state":         snapshot.PublicForMember(id.Email),
 			"session":       session,
-			"spacetime": map[string]any{
-				"host":     s.cfg.State.SpacetimeHost,
-				"database": s.cfg.State.SpacetimeDatabase,
-				"token":    token,
-			},
+			"spacetime":     s.directSpacetimeSessionFromRequest(r, id.Email),
 		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -845,66 +805,8 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setAuthCookie(w, "", -1)
-	s.setPrivateAuthCookie(w, directSpacetimeCookieName(), "", -1)
+	s.setPrivateAuthCookie(w, "ticket_remote_direct_spacetime", "", -1)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
-	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": snapshot.PublicForMember(id.Email), "phone": s.relay.Snapshot()})
-}
-
-func (s *Server) handleState(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
-	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": snapshot.PublicForMember(id.Email), "phone": s.relay.Snapshot()})
-}
-
-func (s *Server) handleClaimControl(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
-	s.handleRemovedControlMode(w, r)
-}
-
-func (s *Server) handleExtendControl(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
-	s.handleRemovedControlMode(w, r)
-}
-
-func (s *Server) handleReleaseControl(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
-	s.handleRemovedControlMode(w, r)
-}
-
-func (s *Server) handleRemovedControlMode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	writeJSON(w, http.StatusGone, apiResponse{
-		OK:      false,
-		Error:   "control_mode_removed",
-		Message: "Control mode has been replaced by code requests.",
-	})
-}
-
-func (s *Server) handleClientLog(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: "Client log was too large."})
-		return
-	}
-	var payload struct {
-		Event  string `json:"event"`
-		Detail string `json:"detail"`
-	}
-	if err := json.Unmarshal(body, &payload); err == nil {
-		s.direct.recordClientTelemetry(payload.Event, payload.Detail)
-		s.recordRuntimeEventAsync("info", "client_log", sessionID, map[string]any{
-			"event":  cleanStreamControlText(payload.Event, "client_log"),
-			"detail": payload.Detail,
-		})
-	}
-	writeJSON(w, http.StatusOK, apiResponse{OK: true})
 }
 
 func (s *Server) handleAdminState(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
@@ -916,11 +818,18 @@ func (s *Server) handleAdminState(w http.ResponseWriter, r *http.Request, id aut
 func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
 	switch r.Method {
 	case http.MethodPost:
+		if adminFormRequest(r) && r.FormValue("action") == "remove" {
+			snapshot, err := s.store.RemoveMember(r.Context(), s.cfg.TicketID, id.Email, r.FormValue("email"))
+			s.writeStateMutation(w, r, id.Email, "member_remove", snapshot, err, false)
+			return
+		}
 		var req struct {
 			Email string `json:"email"`
 			Role  string `json:"role"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if adminFormRequest(r) {
+			req.Email, req.Role = r.FormValue("email"), r.FormValue("role")
+		} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: err.Error()})
 			return
 		}
@@ -933,10 +842,6 @@ func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id a
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-}
-
-func (s *Server) handleAdminRevokeControl(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
-	s.handleRemovedControlMode(w, r)
 }
 
 func (s *Server) handleAdminPhoneBackends(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
@@ -991,7 +896,9 @@ func (s *Server) handleAdminPhoneBackend(w http.ResponseWriter, r *http.Request,
 	var req struct {
 		BackendID string `json:"backendId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if adminFormRequest(r) {
+		req.BackendID = r.FormValue("backendId")
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: err.Error()})
 		return
 	}
@@ -1002,24 +909,14 @@ func (s *Server) handleAdminPhoneBackend(w http.ResponseWriter, r *http.Request,
 	}
 	previous := s.activePhoneBackend()
 	now := time.Now()
-	hadControl := snapshot.ActiveControl != nil
-	snapshot, err := s.store.RevokeControl(r.Context(), s.cfg.TicketID, id.Email, "phone_backend_switched", now)
-	if err != nil {
-		s.writeStateMutation(w, r, id.Email, "phone_backend_switch", snapshot, err, false)
-		return
-	}
 	if err := config.WriteActivePhoneBackendID(s.cfg.Phone.ActiveBackendFile, backend.ID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: "persist_backend", Message: err.Error()})
 		return
 	}
-	if hadControl {
-		s.sendPhoneControlExit("phone_backend_switched")
-		s.clearControlGate()
-	}
 	s.setActivePhoneBackend(backend)
 	s.relay.SwitchBackend(phone.Backend{ID: backend.ID, AttachName: backend.AttachName, BaseURL: backend.BaseURL})
 	relayHealth := s.relay.Snapshot()
-	snapshot, err = s.store.UpdatePhone(r.Context(), state.PhoneInput{
+	snapshot, err := s.store.UpdatePhone(r.Context(), state.PhoneInput{
 		TicketID:     s.cfg.TicketID,
 		BackendID:    backend.ID,
 		AttachName:   backend.AttachName,
@@ -1040,9 +937,9 @@ func (s *Server) handleAdminPhoneBackend(w http.ResponseWriter, r *http.Request,
 		s.recordRuntimeErrorAsync("backend_switch_audit_failed", backend.ID, auditErr, map[string]any{"backendId": backend.ID})
 	}
 	s.cacheSnapshot(snapshot)
-	s.rememberControlGate(snapshot, now)
-	s.broadcastState()
-	s.broadcastPhoneStatus("reconnecting", "Phone backend switched")
+	if redirectAdminForm(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                 true,
 		"state":              snapshot,
@@ -1098,6 +995,9 @@ func (s *Server) handleAdminTicketReselectLatest(w http.ResponseWriter, r *http.
 	relayHealth := s.relay.Snapshot()
 	snapshot = s.withActivePhoneBackend(snapshot, relayHealth)
 	s.cacheSnapshot(snapshot)
+	if redirectAdminForm(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok":        true,
 		"commandId": commandID,
@@ -1106,14 +1006,10 @@ func (s *Server) handleAdminTicketReselectLatest(w http.ResponseWriter, r *http.
 	})
 }
 
-func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, video bool) {
-	if !video && s.usesDirectSpacetimePresence() {
-		writeJSON(w, http.StatusGone, apiResponse{OK: false, Error: "control_socket_disabled", Message: "Ticket control now uses Spacetime. The socket is reserved for video only."})
-		return
-	}
+func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	// A video connection wakes the phone, so it must use a current membership
 	// lookup rather than the short-lived page cache.
-	id, sessionID, snapshot, ok := s.identifyMember(w, r)
+	id, sessionID, _, ok := s.identifyMember(w, r)
 	if !ok {
 		return
 	}
@@ -1123,62 +1019,43 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 	if err != nil {
 		return
 	}
-	c := &client{conn: conn, sessionID: sessionID, email: id.Email, page: "ticket", video: video}
+	c := &client{conn: conn, sessionID: sessionID, email: id.Email}
 	if !s.tryAddClient(c) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "connection limit reached")
 		return
 	}
-	relayViewerAdded := false
-	if video {
-		traceID := safeRuntimeTraceID("browser", sessionID)
-		s.direct.beginStartupTrace(sessionID, "video_socket_open")
-		s.direct.recordStartupPhase("video_socket_accepted", fmt.Sprintf("session=%s", sessionID))
-		detail := map[string]any{
-			"video":   true,
-			"version": serverVersion,
-		}
-		for key, value := range browserVideoSocketContext(r) {
-			detail[key] = value
-		}
-		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_open", traceID, detail)
-		s.addRelayViewer(sessionID)
-		relayViewerAdded = true
-		s.retainRelayViewerForPublicOpenGrace(sessionID, publicOpenGraceHold, "video_socket_open")
-		s.cancelIdleStreamDesiredRelease()
-		s.direct.addVideoClient()
-		s.direct.recordStartupPhase("video_client_registered", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
-		s.wakePhoneStreamFromVideoSocketOpen("video_socket_open")
-		s.sendBrowserVideoWarmStart(c)
-		s.publishRelayCurrentReportAsync("video_socket_open")
+	traceID := safeRuntimeTraceID("browser", sessionID)
+	s.direct.beginStartupTrace(sessionID, "video_socket_open")
+	s.direct.recordStartupPhase("video_socket_accepted", "")
+	detail := map[string]any{
+		"video":   true,
+		"version": serverVersion,
 	}
-	relaySnapshot := s.relay.Snapshot()
-	snapshot = s.withActivePhoneBackend(snapshot, relaySnapshot)
-	if !video {
-		c.sendJSON(context.Background(), map[string]any{"type": "state", "state": snapshot.PublicForMember(c.email), "phone": relaySnapshot, "serverVersion": serverVersion})
+	for key, value := range browserVideoSocketContext(r) {
+		detail[key] = value
 	}
-	if !video {
-		s.sendLatestControlCodeRequest(context.Background(), c)
-	}
-	s.updatePresenceHeartbeatAsync(sessionID, id.Email)
+	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_open", traceID, detail)
+	s.addRelayViewer(sessionID)
+	s.retainRelayViewerForPublicOpenGrace(sessionID, publicOpenGraceHold, "video_socket_open")
+	s.cancelIdleStreamDesiredRelease()
+	s.direct.addVideoClient()
+	s.direct.recordStartupPhase("video_client_registered", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
+	s.wakePhoneStreamFromVideoSocketOpen("video_socket_open")
+	s.sendBrowserVideoWarmStart(c)
+	s.publishRelayCurrentReportAsync("video_socket_open")
 	defer func() {
 		s.removeClient(c)
-		if video {
-			traceID := safeRuntimeTraceID("browser", sessionID)
-			s.direct.removeVideoClient()
-			s.direct.recordStartupPhase("video_socket_closed", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
-			s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_closed", traceID, map[string]any{
-				"activeVideoClients": s.direct.activeVideoClientCount(),
-			})
-			if !c.firstVideoFrameRendered {
-				s.retainRelayViewerForPublicOpenGrace(sessionID, publicOpenGraceHold, "video_socket_closed_before_first_frame")
-			}
-			s.publishRelayCurrentReportAsync("video_socket_closed")
-			s.scheduleIdleStreamDesiredRelease("relay_no_video_clients")
+		s.direct.removeVideoClient()
+		s.direct.recordStartupPhase("video_socket_closed", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
+		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_closed", traceID, map[string]any{
+			"activeVideoClients": s.direct.activeVideoClientCount(),
+		})
+		if !c.firstVideoFrameRendered {
+			s.retainRelayViewerForPublicOpenGrace(sessionID, publicOpenGraceHold, "video_socket_closed_before_first_frame")
 		}
-		if relayViewerAdded {
-			s.removeRelayViewer(sessionID)
-		}
-		s.disconnectPresenceAsync(sessionID, c.email, c.presenceFallback)
+		s.publishRelayCurrentReportAsync("video_socket_closed")
+		s.scheduleIdleStreamDesiredRelease("relay_no_video_clients")
+		s.removeRelayViewer(sessionID)
 		_ = conn.Close(websocket.StatusNormalClosure, "closed")
 	}()
 	for {
@@ -1189,11 +1066,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request, vid
 		if typ != websocket.MessageText {
 			continue
 		}
-		if video {
-			s.handleVideoStreamMessage(r.Context(), c, data)
-			continue
-		}
-		s.handleClientMessage(r.Context(), c, data)
+		s.handleVideoStreamMessage(r.Context(), c, data)
 	}
 }
 
@@ -1221,53 +1094,6 @@ func browserVideoSocketContext(r *http.Request) map[string]any {
 	setText("configured", "configured")
 	setText("openSeq", "open_seq")
 	return out
-}
-
-func (s *Server) updatePresenceHeartbeatAsync(sessionID string, email string) {
-	if s.usesDirectSpacetimePresence() {
-		return
-	}
-	go func() {
-		now := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), presenceUpdateTimeout)
-		defer cancel()
-		heartbeat, err := s.store.HeartbeatPresence(ctx, state.PresenceInput{
-			TicketID:    s.cfg.TicketID,
-			SessionID:   sessionID,
-			Email:       email,
-			DisplayName: email,
-			Page:        "ticket",
-			Connected:   true,
-			Now:         now,
-		})
-		if err != nil {
-			s.recordRuntimeErrorAsync("presence_heartbeat_failed", sessionID, err, map[string]any{"sessionId": sessionID})
-			return
-		}
-		heartbeat = s.withActivePhoneBackend(heartbeat, s.relay.Snapshot())
-		s.cacheSnapshot(heartbeat)
-		s.rememberControlGate(heartbeat, time.Now())
-		s.broadcastState()
-	}()
-}
-
-func (s *Server) disconnectPresenceAsync(sessionID string, email string, force bool) {
-	if s.usesDirectSpacetimePresence() && !force {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), presenceUpdateTimeout)
-		defer cancel()
-		snapshot, err := s.store.DisconnectPresence(ctx, s.cfg.TicketID, sessionID, time.Now())
-		if err != nil {
-			s.recordRuntimeErrorAsync("presence_disconnect_failed", sessionID, err, map[string]any{"sessionId": sessionID})
-			return
-		}
-		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-		s.cacheSnapshot(snapshot)
-		s.rememberControlGate(snapshot, time.Now())
-		s.broadcastState()
-	}()
 }
 
 func (s *Server) sendBrowserVideoWarmStart(c *client) {
@@ -1321,136 +1147,6 @@ func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data [
 	}
 }
 
-func (s *Server) allowBrowserKeyframeRequest(c *client, now time.Time) bool {
-	s.streamRequestMu.Lock()
-	defer s.streamRequestMu.Unlock()
-	perClientInterval := keyframeRequestPerClientInterval
-	if s.direct.startupGraceActive(now) {
-		perClientInterval = keyframeRequestGlobalInterval
-	}
-	if !c.lastKeyframeRequest.IsZero() && now.Sub(c.lastKeyframeRequest) < perClientInterval {
-		return false
-	}
-	if !s.lastGlobalKeyframeRequest.IsZero() && now.Sub(s.lastGlobalKeyframeRequest) < keyframeRequestGlobalInterval {
-		return false
-	}
-	c.lastKeyframeRequest = now
-	s.lastGlobalKeyframeRequest = now
-	return true
-}
-
-func (s *Server) allowBrowserRecoveryRequest(c *client, now time.Time) bool {
-	s.streamRequestMu.Lock()
-	defer s.streamRequestMu.Unlock()
-	if !c.lastRecoveryRequest.IsZero() && now.Sub(c.lastRecoveryRequest) < recoveryRequestPerClientInterval {
-		return false
-	}
-	if !s.lastGlobalRecoveryRequest.IsZero() && now.Sub(s.lastGlobalRecoveryRequest) < recoveryRequestGlobalInterval {
-		return false
-	}
-	c.lastRecoveryRequest = now
-	s.lastGlobalRecoveryRequest = now
-	c.lastKeyframeRequest = now
-	s.lastGlobalKeyframeRequest = now
-	return true
-}
-
-func (s *Server) handleClientMessage(ctx context.Context, c *client, data []byte) {
-	var msg map[string]any
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return
-	}
-	msgType, _ := msg["type"].(string)
-	now := time.Now()
-	inputID, _ := msg["inputId"].(string)
-	switch msgType {
-	case "heartbeat":
-		presenceFallback, _ := msg["presenceFallback"].(bool)
-		if presenceFallback {
-			c.presenceFallback = true
-		}
-		relaySnapshot := s.relay.Snapshot()
-		if s.usesDirectSpacetimePresence() && !presenceFallback {
-			if cached, ok := s.cachedSnapshot(now); ok {
-				cached = s.withActivePhoneBackend(cached, relaySnapshot)
-				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached.PublicForMember(c.email), "phone": relaySnapshot})
-			}
-			return
-		}
-		snapshot, err := s.store.HeartbeatPresence(ctx, state.PresenceInput{
-			TicketID:    s.cfg.TicketID,
-			SessionID:   c.sessionID,
-			Email:       c.email,
-			DisplayName: c.email,
-			Page:        c.page,
-			Connected:   true,
-			Now:         now,
-		})
-		if err != nil {
-			s.recordRuntimeErrorAsync("presence_heartbeat_failed", c.sessionID, err, map[string]any{"sessionId": c.sessionID})
-			if cached, ok := s.cachedSnapshot(now); ok {
-				cached = s.withActivePhoneBackend(cached, relaySnapshot)
-				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached.PublicForMember(c.email), "phone": relaySnapshot})
-			}
-			return
-		}
-		snapshot = s.withActivePhoneBackend(snapshot, relaySnapshot)
-		s.cacheSnapshot(snapshot)
-		s.rememberControlGate(snapshot, now)
-		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot.PublicForMember(c.email), "phone": relaySnapshot})
-	case "state_refresh":
-		if s.usesDirectSpacetimePresence() {
-			if cached, ok := s.cachedSnapshot(now); ok {
-				cached = s.withActivePhoneBackend(cached, s.relay.Snapshot())
-				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached.PublicForMember(c.email), "phone": s.relay.Snapshot()})
-				return
-			}
-		}
-		snapshot, err := s.store.Snapshot(ctx, s.cfg.TicketID, now)
-		if err != nil {
-			if cached, ok := s.cachedSnapshot(now); ok {
-				c.sendJSON(ctx, map[string]any{"type": "state", "state": cached.PublicForMember(c.email), "phone": s.relay.Snapshot()})
-			}
-			return
-		}
-		snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-		s.cacheSnapshot(snapshot)
-		s.rememberControlGate(snapshot, now)
-		c.sendJSON(ctx, map[string]any{"type": "state", "state": snapshot.PublicForMember(c.email), "phone": s.relay.Snapshot()})
-	case "tap":
-		go func() {
-			_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "input_ignored", map[string]any{"reason": "control_mode_removed"}, time.Now())
-		}()
-		sendTapInputResult(ctx, c, inputID, false, "control_mode_removed")
-	case "quick_claim_tap":
-		go func() {
-			_ = s.store.Audit(context.Background(), s.cfg.TicketID, c.email, "quick_claim_ignored", map[string]any{"reason": "control_mode_removed"}, time.Now())
-		}()
-		s.rejectQuickClaim(ctx, c, inputID, "control_mode_removed", "control_mode_removed", now)
-	case "activity":
-		s.appendStreamCommandAsync("activity", "browser_activity", map[string]any{
-			"sessionId": c.sessionID,
-		}, streamKeyframeCommandTTL)
-	case "recover_stream":
-		reason, _ := msg["reason"].(string)
-		if !s.allowBrowserRecoveryRequest(c, now) {
-			s.direct.recordClientTelemetry("recovery_rate_limited", reason)
-			return
-		}
-		s.requestPhoneRecovery(reason)
-	case "keyframe":
-		if !s.allowBrowserKeyframeRequest(c, now) {
-			s.direct.recordClientTelemetry("keyframe_rate_limited", c.email)
-			return
-		}
-		s.requestPhoneKeyframe("browser_request")
-	case "swipe", "long_press", "longpress", "hold":
-		_ = s.store.Audit(ctx, s.cfg.TicketID, c.email, "input_ignored", map[string]any{"reason": msgType}, now)
-		c.sendJSON(ctx, map[string]any{"type": "input", "inputId": inputID, "accepted": false, "reason": "blocked_gesture"})
-	default:
-	}
-}
-
 func (s *Server) handlePhoneMessage(msg phone.Message) {
 	if len(msg.Text) > 0 {
 		if s.handlePhoneText(msg.Text) {
@@ -1489,7 +1185,6 @@ func (s *Server) handlePhoneDisconnect(err error) {
 	} else {
 		s.scheduleIdleStreamDesiredRelease("phone_stream_disconnected")
 	}
-	s.broadcastPhoneStatus("reconnecting", "Phone stream reconnecting")
 }
 
 func expectedPhoneDisconnect(err error) bool {
@@ -1500,39 +1195,6 @@ func expectedPhoneDisconnect(err error) bool {
 		return true
 	}
 	return websocket.CloseStatus(err) == websocket.StatusNormalClosure
-}
-
-func (s *Server) rejectQuickClaim(ctx context.Context, c *client, inputID string, reason string, action string, now time.Time) {
-	if reason == "" {
-		reason = "quick_claim_rejected"
-	}
-	s.recordQuickClaim(quickClaimDiagnostic{
-		At:        now.UTC().Format(time.RFC3339),
-		SessionID: c.sessionID,
-		Email:     c.email,
-		InputID:   inputID,
-		Action:    action,
-		Reason:    reason,
-		Forwarded: false,
-	})
-	sendTapInputResult(ctx, c, inputID, false, reason)
-}
-
-func sendTapInputResult(ctx context.Context, c *client, inputID string, accepted bool, reason string) {
-	if reason == "" {
-		if accepted {
-			reason = "forwarded"
-		} else {
-			reason = "rejected"
-		}
-	}
-	c.sendJSON(ctx, map[string]any{
-		"type":     "input_result",
-		"inputId":  inputID,
-		"kind":     "tap",
-		"accepted": accepted,
-		"reason":   reason,
-	})
 }
 
 func (s *Server) handlePhoneText(raw []byte) bool {
@@ -1555,9 +1217,6 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 		return true
 	}
 	if s.handlePixelTraceEvent(msg) {
-		return true
-	}
-	if s.handleControlCodePhoneResult(msg) {
 		return true
 	}
 	if msgType == "config" {
@@ -1596,16 +1255,7 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 		} else {
 			s.recordRuntimeErrorAsync("phone_state_update_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
 		}
-		streamActive, _ := data["streamActive"].(bool)
-		inactivityActive, _ := data["inactivityActive"].(bool)
 		s.maybeRequestPhoneStart(data, "phone_health")
-		if !streamActive && !inactivityActive {
-			snapshot, err := s.store.Snapshot(context.Background(), s.cfg.TicketID, now)
-			if err == nil && snapshot.ActiveControl != nil {
-				_, _ = s.store.ReleaseControl(context.Background(), s.cfg.TicketID, "", "", "phone_left_ticket", now)
-				s.broadcastState()
-			}
-		}
 	}
 	return false
 }
@@ -1639,7 +1289,6 @@ func pixelTicketEventFromMessage(msg map[string]any) (pixelTicketEvent, bool) {
 	}
 	reason, _ := msg["reason"].(string)
 	requestID, _ := msg["requestId"].(string)
-	value, _ := msg["value"].(string)
 	resultProof, _ := msg["resultProof"].(string)
 	resultProofAt, _ := msg["resultProofAt"].(string)
 	event := pixelTicketEvent{
@@ -1648,7 +1297,6 @@ func pixelTicketEventFromMessage(msg map[string]any) (pixelTicketEvent, bool) {
 		TicketState:            ticketState,
 		Reason:                 strings.TrimSpace(reason),
 		RequestID:              strings.TrimSpace(requestID),
-		Value:                  strings.TrimSpace(value),
 		StreamEpoch:            controlCodeInt64FromMessage(msg["streamEpoch"]),
 		FrameSequence:          controlCodeInt64FromMessage(msg["frameSequence"]),
 		MinFrameSequence:       controlCodeInt64FromMessage(msg["minFrameSequence"]),
@@ -1677,61 +1325,6 @@ func (s *Server) handlePixelTicketStateEvent(msg map[string]any) {
 	}
 	s.rememberPixelTicketEvent(event)
 	s.updateStoredPhoneTicketEvent(event)
-	if event.TicketState == "generated_result" && event.RequestID != "" {
-		reason := strings.TrimSpace(event.Reason)
-		if reason == "" || reason == "control_code_frame_ready" {
-			reason = "generated"
-		}
-		streamEpoch := event.StreamEpoch
-		if event.ResultFrameEpoch > 0 {
-			streamEpoch = event.ResultFrameEpoch
-		}
-		minFrameSequence := event.MinFrameSequence
-		if event.ResultMinFrameSequence > 0 {
-			minFrameSequence = event.ResultMinFrameSequence
-		}
-		if minFrameSequence == 0 {
-			minFrameSequence = event.FrameSequence
-		}
-		s.publishSpacetimeControlCodePhoneMarker(event.RequestID, streamEpoch, event.FrameSequence, minFrameSequence, event.ResultProof, event.ResultProofAt)
-		s.updateSpacetimeControlCodeRequestAsync(
-			event.RequestID,
-			controlCodeSucceeded,
-			reason,
-			"",
-			streamEpoch,
-			event.FrameSequence,
-			minFrameSequence,
-			streamEpoch,
-			minFrameSequence,
-			event.ResultProof,
-			event.ResultProofAt,
-			true,
-		)
-		s.completeControlCodeFromMarkerWithProof(event.RequestID, event.Value, reason, streamEpoch, event.FrameSequence, minFrameSequence, event.TotalDurationMillis, event.Phases, event.ResultProof, event.ResultProofAt)
-	}
-	if event.TicketState == "raw_ticket" && event.RequestID != "" && event.FrameSequence > 0 {
-		reason := strings.TrimSpace(event.Reason)
-		if reason == "" {
-			reason = "return_to_raw_complete"
-		}
-		minFrameSequence := event.MinFrameSequence
-		if minFrameSequence == 0 {
-			minFrameSequence = event.FrameSequence
-		}
-		s.completeControlCodeCleanupWithFrame(event.RequestID, true, reason, event.StreamEpoch, minFrameSequence)
-	}
-	publicEvent := event
-	if publicEvent.TicketState == "generated_result" {
-		publicEvent.RequestID = ""
-		publicEvent.Value = ""
-		publicEvent.TotalDurationMillis = 0
-		publicEvent.Phases = nil
-	}
-	payload, err := json.Marshal(publicEvent)
-	if err == nil {
-		s.broadcastText(payload)
-	}
 }
 
 func (s *Server) rememberPixelTicketEvent(event pixelTicketEvent) {
@@ -1770,7 +1363,6 @@ func (s *Server) mergePixelTicketEventIntoHealth(raw string, event pixelTicketEv
 		"ticketState":       event.TicketState,
 		"reason":            event.Reason,
 		"requestId":         event.RequestID,
-		"value":             event.Value,
 		"streamEpoch":       event.StreamEpoch,
 		"frameSequence":     event.FrameSequence,
 		"minFrameSequence":  event.MinFrameSequence,
@@ -1839,16 +1431,29 @@ func (s *Server) writeStateMutation(w http.ResponseWriter, r *http.Request, acto
 	}
 	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 	s.cacheSnapshot(snapshot)
-	s.rememberControlGate(snapshot, time.Now())
 	if err := s.store.Audit(r.Context(), s.cfg.TicketID, actor, event, nil, time.Now()); err != nil {
 		s.recordRuntimeErrorAsync("audit_failed", event, err, map[string]any{"event": event})
 	}
-	s.broadcastState()
+	if redirectAdminForm(w, r) {
+		return
+	}
 	if publicState {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": snapshot.PublicForMember(actor), "phone": s.relay.Snapshot()})
 		return
 	}
 	writeJSON(w, http.StatusOK, apiResponse{OK: true, State: snapshot, Phone: s.relay.Snapshot()})
+}
+
+func adminFormRequest(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/x-www-form-urlencoded")
+}
+
+func redirectAdminForm(w http.ResponseWriter, r *http.Request) bool {
+	if !adminFormRequest(r) {
+		return false
+	}
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	return true
 }
 
 func (s *Server) withMember(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request, auth.Identity, string, state.Snapshot)) {
@@ -1917,7 +1522,6 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 	now := time.Now()
 	if opts.cachedFirst {
 		if cachedSnapshot, ok := s.cachedSnapshot(now); ok {
-			s.rememberControlGate(cachedSnapshot, now)
 			if _, memberOK := cachedSnapshot.Member(id.Email); memberOK {
 				s.refreshServerSessionCookie(w, r, id, opts, now)
 				return id, sessionID, cachedSnapshot, true
@@ -1934,7 +1538,6 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 			return auth.Identity{}, "", state.Snapshot{}, false
 		}
 	}
-	s.rememberControlGate(snapshot, now)
 	if _, ok := snapshot.Member(id.Email); !ok {
 		if !opts.optional {
 			writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email))
@@ -2017,65 +1620,16 @@ func (s *Server) broadcastText(data []byte) {
 
 func (s *Server) broadcastFrame(data []byte) {
 	for _, c := range s.clientSnapshot() {
-		if !c.video {
-			continue
-		}
 		c.sendBinaryLatest(context.Background(), data)
 	}
 }
 
 func (s *Server) resetVideoDeltaReadiness() {
 	for _, c := range s.clientSnapshot() {
-		if !c.video {
-			continue
-		}
 		c.videoMu.Lock()
 		c.videoReadyForDelta = false
 		c.videoReadyEpoch = 0
 		c.videoMu.Unlock()
-	}
-}
-
-func (s *Server) broadcastState() {
-	now := time.Now()
-	relaySnapshot := s.relay.Snapshot()
-	if cached, ok := s.cachedSnapshot(now); ok {
-		cached = s.withActivePhoneBackend(cached, relaySnapshot)
-		s.rememberControlGate(cached, now)
-		s.broadcastStateToClients(cached, relaySnapshot)
-		return
-	}
-	snapshot, err := s.store.Snapshot(context.Background(), s.cfg.TicketID, now)
-	if err != nil {
-		s.recordRuntimeErrorAsync("ticket_state_broadcast_failed", "", err, nil)
-		return
-	}
-	snapshot = s.withActivePhoneBackend(snapshot, relaySnapshot)
-	s.cacheSnapshot(snapshot)
-	s.rememberControlGate(snapshot, now)
-	s.broadcastStateToClients(snapshot, relaySnapshot)
-}
-
-func (s *Server) broadcastSnapshot(snapshot state.Snapshot) {
-	if snapshot.Ticket.ID == "" {
-		return
-	}
-	s.broadcastStateToClients(snapshot, s.relay.Snapshot())
-}
-
-func (s *Server) broadcastCachedState(now time.Time) {
-	snapshot, ok := s.cachedSnapshot(now)
-	if !ok {
-		s.broadcastState()
-		return
-	}
-	s.rememberControlGate(snapshot, now)
-	s.broadcastStateToClients(snapshot, s.relay.Snapshot())
-}
-
-func (s *Server) broadcastStateToClients(snapshot state.Snapshot, relaySnapshot phone.Health) {
-	for _, c := range s.clientSnapshot() {
-		c.sendJSON(context.Background(), map[string]any{"type": "state", "state": snapshot.PublicForMember(c.email), "phone": relaySnapshot})
 	}
 }
 
@@ -2100,126 +1654,8 @@ func (s *Server) cachedSnapshot(now time.Time) (state.Snapshot, bool) {
 	if !cachedAt.IsZero() && now.Sub(cachedAt) > stateCacheMaxAge {
 		return state.Snapshot{}, false
 	}
-	if snapshot.ActiveControl != nil {
-		control := *snapshot.ActiveControl
-		snapshot.ActiveControl = &control
-	}
-	adjustSnapshotTime(&snapshot, now)
-	return snapshot, true
-}
-
-func (s *Server) recordQuickClaim(diag quickClaimDiagnostic) {
-	s.quickClaimMu.Lock()
-	s.lastQuickClaim = diag
-	s.quickClaimMu.Unlock()
-}
-
-func (s *Server) quickClaimSnapshot() quickClaimDiagnostic {
-	s.quickClaimMu.RLock()
-	diag := s.lastQuickClaim
-	s.quickClaimMu.RUnlock()
-	return diag
-}
-
-func adjustSnapshotTime(snapshot *state.Snapshot, now time.Time) {
 	snapshot.ServerTime = now.UTC().Format(time.RFC3339)
-	if snapshot.ActiveControl == nil {
-		return
-	}
-	expiresAt, err := time.Parse(time.RFC3339, snapshot.ActiveControl.ExpiresAt)
-	if err != nil || !now.Before(expiresAt) {
-		snapshot.ActiveControl = nil
-		return
-	}
-	snapshot.ActiveControl.RemainingMS = int64(expiresAt.Sub(now) / time.Millisecond)
-}
-
-func (s *Server) rememberControlGate(snapshot state.Snapshot, now time.Time) {
-	s.gateMu.Lock()
-	previous := s.gate
-	var next *controlGate
-	if snapshot.ActiveControl == nil {
-		s.gate = nil
-	} else if expiresAt, err := time.Parse(time.RFC3339, snapshot.ActiveControl.ExpiresAt); err == nil && now.Before(expiresAt) {
-		next = &controlGate{
-			sessionID: snapshot.ActiveControl.SessionID,
-			email:     strings.ToLower(strings.TrimSpace(snapshot.ActiveControl.Email)),
-			expiresAt: expiresAt,
-		}
-		s.gate = next
-	} else {
-		s.gate = nil
-	}
-	ended := previous != nil && next == nil
-	s.gateMu.Unlock()
-	if ended {
-		s.notifyPhoneControlExit("control_session_ended")
-	}
-}
-
-func (s *Server) clearControlGate() {
-	s.gateMu.Lock()
-	s.gate = nil
-	s.gateMu.Unlock()
-}
-
-func (s *Server) notifyPhoneControlExit(reason string) {
-	go s.sendPhoneControlExit(reason)
-}
-
-func (s *Server) sendPhoneControlExit(reason string) {
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "control_session_ended"
-	}
-	now := time.Now()
-	_ = s.store.Audit(context.Background(), s.cfg.TicketID, "ticket_remote", "phone_control_exit_requested", map[string]any{
-		"reason": reason,
-	}, now)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if _, err := s.appendStreamCommand(ctx, "control_exit", reason, map[string]any{
-		"source": "ticket_remote",
-	}, streamCommandTTL); err != nil {
-		s.recordRuntimeErrorAsync("phone_control_exit_command_publish_failed", reason, err, map[string]any{"reason": reason})
-		return
-	}
-	s.recordRuntimeEventAsync("info", "phone_control_exit_command_published", reason, map[string]any{"reason": reason})
-}
-
-func (s *Server) controlGateAllows(sessionID string, email string, now time.Time) bool {
-	s.gateMu.RLock()
-	gate := s.gate
-	s.gateMu.RUnlock()
-	if gate == nil || !now.Before(gate.expiresAt) {
-		return true
-	}
-	return strings.ToLower(strings.TrimSpace(gate.email)) == strings.ToLower(strings.TrimSpace(email))
-}
-
-func (s *Server) activeControlGateAllows(sessionID string, email string, now time.Time) (bool, bool) {
-	s.gateMu.RLock()
-	gate := s.gate
-	s.gateMu.RUnlock()
-	if gate == nil || !now.Before(gate.expiresAt) {
-		return false, false
-	}
-	return true, strings.ToLower(strings.TrimSpace(gate.email)) == strings.ToLower(strings.TrimSpace(email))
-}
-
-func (s *Server) controlGateSnapshot(now time.Time) map[string]any {
-	s.gateMu.RLock()
-	gate := s.gate
-	s.gateMu.RUnlock()
-	if gate == nil || !now.Before(gate.expiresAt) {
-		return map[string]any{"active": false}
-	}
-	return map[string]any{
-		"active":    true,
-		"sessionId": gate.sessionID,
-		"email":     gate.email,
-		"expiresAt": gate.expiresAt.UTC().Format(time.RFC3339),
-	}
+	return snapshot, true
 }
 
 func (s *Server) requestOriginAllowed(r *http.Request) bool {
@@ -2248,56 +1684,6 @@ func (s *Server) requestOriginAllowed(r *http.Request) bool {
 		}
 	}
 	return false
-}
-
-func (s *Server) stateTicker() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	var lastRefresh time.Time
-	for now := range ticker.C {
-		if len(s.clientSnapshot()) > 0 {
-			if lastRefresh.IsZero() || now.Sub(lastRefresh) >= 15*time.Second {
-				s.broadcastState()
-				if snapshot, ok := s.cachedSnapshot(now); ok {
-					s.maybeRequestPhoneStartFromSnapshot(snapshot)
-				}
-				lastRefresh = now
-				continue
-			}
-			if snapshot, ok := s.cachedSnapshot(now); ok {
-				s.broadcastCachedState(now)
-				s.maybeRequestPhoneStartFromSnapshot(snapshot)
-			} else {
-				s.broadcastState()
-			}
-			continue
-		}
-		if lastRefresh.IsZero() || now.Sub(lastRefresh) >= idleStateRefresh {
-			s.refreshStateCache(now)
-			lastRefresh = now
-		}
-	}
-}
-
-func (s *Server) refreshStateCache(now time.Time) {
-	ctx, cancel := context.WithTimeout(context.Background(), idleStateTimeout)
-	defer cancel()
-	snapshot, err := s.store.Snapshot(ctx, s.cfg.TicketID, now)
-	if err != nil {
-		s.recordRuntimeErrorAsync("idle_state_refresh_failed", "", err, nil)
-		return
-	}
-	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
-	s.cacheSnapshot(snapshot)
-	s.rememberControlGate(snapshot, now)
-}
-
-func (c *client) sendJSON(ctx context.Context, value any) {
-	body, err := json.Marshal(value)
-	if err != nil {
-		return
-	}
-	c.sendText(ctx, body)
 }
 
 func (c *client) sendText(ctx context.Context, value []byte) {
@@ -2444,14 +1830,6 @@ func errorCode(err error) string {
 		return "forbidden"
 	case errors.Is(err, state.ErrNotMember):
 		return "not_member"
-	case errors.Is(err, state.ErrControlClaimed):
-		return "control_claimed"
-	case errors.Is(err, state.ErrNoControl):
-		return "no_control"
-	case errors.Is(err, state.ErrNotController):
-		return "not_controller"
-	case errors.Is(err, state.ErrExtensionDisabled):
-		return "extension_disabled"
 	default:
 		return "error"
 	}

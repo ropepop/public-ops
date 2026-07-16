@@ -36,7 +36,7 @@ func TestAdminPhoneBackendSwitchPersistsAndUpdatesRelay(t *testing.T) {
 	defer pixelHealth.Close()
 
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	handler, relay := newBackendSwitchServer(t, store, activeFile, simHealth.URL, pixelHealth.URL)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/phone/backend", strings.NewReader(`{"backendId":"pixel"}`))
@@ -85,7 +85,7 @@ func TestAdminPhoneBackendSwitchPersistsAndUpdatesRelay(t *testing.T) {
 
 func TestAdminPhoneBackendSwitchRequiresAdmin(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
 	if _, err := store.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", "member@example.com", state.RoleMember); err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestAdminPhoneBackendsListsHealth(t *testing.T) {
 	}))
 	defer simHealth.Close()
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	handler, _ := newBackendSwitchServer(t, store, activeFile, simHealth.URL, "http://127.0.0.1:1")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/phone/backends", nil)
@@ -166,7 +166,7 @@ func TestAdminStateIncludesFreshActivePhoneHealth(t *testing.T) {
 	defer pixelHealth.Close()
 
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	handler, _ := newBackendSwitchServer(t, store, activeFile, activeHealth.URL, pixelHealth.URL)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/state", nil)
@@ -194,7 +194,7 @@ func TestAdminStateIncludesFreshActivePhoneHealth(t *testing.T) {
 
 func TestAdminTicketReselectLatestQueuesForceCommand(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	memory := state.NewMemoryStore()
+	memory := NewMemoryStore()
 	store := &capturingStreamCommandStore{Store: memory}
 	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
 
@@ -233,7 +233,7 @@ func TestAdminTicketReselectLatestQueuesForceCommand(t *testing.T) {
 
 func TestAdminTicketReselectLatestRequiresAdmin(t *testing.T) {
 	activeFile := filepath.Join(t.TempDir(), "active-phone-backend.json")
-	memory := state.NewMemoryStore()
+	memory := NewMemoryStore()
 	store := &capturingStreamCommandStore{Store: memory}
 	handler, _ := newBackendSwitchServer(t, store, activeFile, "http://lab.test", "http://pixel.test")
 	if _, err := memory.UpsertMember(context.Background(), "vivi-default", "ticket@jolkins.id.lv", "member@example.com", state.RoleMember); err != nil {
@@ -253,7 +253,7 @@ func TestAdminTicketReselectLatestRequiresAdmin(t *testing.T) {
 }
 
 func TestAdminTicketReselectLatestRequiresActiveBackend(t *testing.T) {
-	store := &capturingStreamCommandStore{Store: state.NewMemoryStore()}
+	store := &capturingStreamCommandStore{Store: NewMemoryStore()}
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:     "vivi-default",
 		DisplayName:  "ViVi timed ticket",
@@ -294,7 +294,7 @@ func TestAdminTicketReselectLatestRequiresActiveBackend(t *testing.T) {
 }
 
 func TestHealthReportsActiveBackendWhenStoredPhoneIsStale(t *testing.T) {
-	store := state.NewMemoryStore()
+	store := NewMemoryStore()
 	if err := store.Bootstrap(context.Background(), state.BootstrapInput{
 		TicketID:        "vivi-default",
 		DisplayName:     "ViVi timed ticket",
