@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"pixelops/shared/telegramweb"
+	"github.com/ropepop/ops/workloads/shared-go/telegramweb"
 	"satiksmebot/internal/config"
 	"satiksmebot/internal/model"
 	"satiksmebot/internal/reports"

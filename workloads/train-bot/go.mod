@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	modernc.org/sqlite v1.30.1
-	pixelops/shared v0.0.0
+	github.com/ropepop/ops/workloads/shared-go v0.0.0
 	rsc.io/pdf v0.1.1
 )
 
@@ -24,4 +24,4 @@ require (
 	modernc.org/token v1.1.0 // indirect
 )
 
-replace pixelops/shared => ../shared-go
+replace github.com/ropepop/ops/workloads/shared-go => ../shared-go

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"pixelops/shared/telegramweb"
+	"github.com/ropepop/ops/workloads/shared-go/telegramweb"
 	"telegramtrainapp/internal/config"
 )
 

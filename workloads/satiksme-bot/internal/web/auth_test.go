@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"pixelops/shared/telegramweb"
+	"github.com/ropepop/ops/workloads/shared-go/telegramweb"
 )
 
 func TestIssueAndParseLoginStateCookie(t *testing.T) {

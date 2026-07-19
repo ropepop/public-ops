@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"pixelops/shared/telegramweb"
+	"github.com/ropepop/ops/workloads/shared-go/telegramweb"
 	trainapp "telegramtrainapp/internal/app"
 	"telegramtrainapp/internal/config"
 	"telegramtrainapp/internal/domain"

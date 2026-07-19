@@ -1,4 +1,4 @@
-module pixel-ops/tools/arbuzas/portainerdb
+module github.com/ropepop/ops/tools/arbuzas/portainerdb
 
 go 1.26.0
 

@@ -5,7 +5,7 @@ go 1.22
 require (
 	github.com/gotd/td v0.115.0
 	modernc.org/sqlite v1.30.1
-	pixelops/shared v0.0.0
+	github.com/ropepop/ops/workloads/shared-go v0.0.0
 )
 
 require (
@@ -42,4 +42,4 @@ require (
 	rsc.io/qr v0.2.0 // indirect
 )
 
-replace pixelops/shared => ../shared-go
+replace github.com/ropepop/ops/workloads/shared-go => ../shared-go
