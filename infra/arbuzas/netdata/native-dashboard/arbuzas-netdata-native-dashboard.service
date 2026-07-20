@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply the kitty-gration mobile viewport to Netdata's native dashboard
+Before=netdata.service
+ConditionPathExists=/usr/share/netdata/web/index.html
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/arbuzas-netdata-native-dashboard.py apply --web-root /usr/share/netdata/web --manifest /usr/share/netdata/web/kitty-gration/build.json --best-effort
+ProtectSystem=strict
+ReadWritePaths=/usr/share/netdata/web
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

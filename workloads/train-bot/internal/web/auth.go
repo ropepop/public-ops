@@ -53,9 +53,18 @@ func validateTelegramInitData(initData string, botToken string, maxAge time.Dura
 }
 
 func issueSessionCookie(secret []byte, auth telegramAuth, now time.Time) (*http.Cookie, error) {
+	return issueSessionCookieWithSameSite(secret, auth, now, http.SameSiteLaxMode)
+}
+
+func issueMiniAppSessionCookie(secret []byte, auth telegramAuth, now time.Time) (*http.Cookie, error) {
+	return issueSessionCookieWithSameSite(secret, auth, now, http.SameSiteNoneMode)
+}
+
+func issueSessionCookieWithSameSite(secret []byte, auth telegramAuth, now time.Time, sameSite http.SameSite) (*http.Cookie, error) {
 	return telegramweb.IssueSessionCookie(secret, telegramweb.SessionConfig{
 		CookieName: sessionCookieName,
 		SessionTTL: sessionTTL,
+		SameSite:   sameSite,
 	}, auth, now)
 }
 

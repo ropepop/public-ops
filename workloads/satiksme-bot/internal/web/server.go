@@ -381,7 +381,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == basePath+"/-incidents":
 		s.serveShellPage(w, r, "public-incidents", false)
 	case path == basePath+"/app":
-		s.serveShellPage(w, r, "public", true)
+		mode := "public"
+		if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("view")), "incidents") {
+			mode = "public-incidents"
+		}
+		s.serveShellPage(w, r, mode, true)
 	case path == basePath+"/bundles/active.json":
 		s.serveBundleActive(w, r)
 	case strings.HasPrefix(path, basePath+"/bundles/"):
@@ -1324,6 +1328,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	initData := strings.TrimSpace(payload.InitData)
 	var auth telegramAuth
 	var err error
+	issueCookie := issueSessionCookie
 
 	switch {
 	case idToken != "":
@@ -1372,6 +1377,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
+		issueCookie = issueMiniAppSessionCookie
 	default:
 		writeError(w, http.StatusBadRequest, "missing Telegram login payload")
 		return
@@ -1381,7 +1387,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 		return
 	}
-	cookie, err := issueSessionCookie(s.sessionSecret, auth, now)
+	cookie, err := issueCookie(s.sessionSecret, auth, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2114,6 +2120,9 @@ func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 
 func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string, allowTelegramWebApp bool) {
 	s.setSecurityHeaders(w)
+	if allowTelegramWebApp {
+		w.Header().Del("X-Frame-Options")
+	}
 	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce, allowTelegramWebApp))
 }
 
@@ -2123,18 +2132,20 @@ func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramWebApp b
 		addCSPConnectSources(&connectSources, s.cfg.SatiksmeWebSpacetimeHost)
 	}
 	scriptSources := []string{"'self'"}
+	frameAncestors := []string{"'none'"}
 	if strings.TrimSpace(scriptNonce) != "" {
 		scriptSources = append(scriptSources, "'nonce-"+strings.TrimSpace(scriptNonce)+"'")
 	}
 	scriptSources = append(scriptSources, "https://oauth.telegram.org")
 	if allowTelegramWebApp {
 		scriptSources = append(scriptSources, "https://telegram.org")
+		frameAncestors = []string{"https://web.telegram.org"}
 	}
 	return strings.Join([]string{
 		"default-src 'self'",
 		"base-uri 'self'",
 		"object-src 'none'",
-		"frame-ancestors 'none'",
+		"frame-ancestors " + strings.Join(frameAncestors, " "),
 		"form-action 'self' https://oauth.telegram.org",
 		"script-src " + strings.Join(scriptSources, " "),
 		"style-src 'self'",

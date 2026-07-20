@@ -8875,8 +8875,9 @@
     }
   }
 
-  function publicStatusLink(href, label, className) {
-    return `<a class="${escapeAttr(className || "button ghost small")}" href="${escapeAttr(href)}">${escapeHtml(label)}</a>`;
+  function publicStatusLink(href, label, className, openInNewContext) {
+    const target = openInNewContext ? ' target="_blank" rel="noopener noreferrer"' : "";
+    return `<a class="${escapeAttr(className || "button ghost small")}" href="${escapeAttr(href)}"${target}>${escapeHtml(label)}</a>`;
   }
 
   function publicStatusButton(id, label, className, action) {
@@ -9239,6 +9240,8 @@
         publicStatusLink(publicNetworkMapRoot(), t("app_network_map_title")),
         publicStatusLink(pathFor(`/t/${encodeURIComponent(cfg.trainId || "")}`), t("btn_view_status")),
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
+        publicStatusLink(publicDashboardRoot(), t("app_open_departures")),
+        publicStatusLink(publicStationRoot(), t("app_open_station_search")),
         classicControlLink(),
       ],
     });
@@ -9429,6 +9432,8 @@
       ],
       menuActions: [
         publicStatusLink(publicIncidentsRoot(), t("app_public_incidents_title")),
+        publicStatusLink(publicDashboardRoot(), t("app_open_departures")),
+        publicStatusLink(publicStationRoot(), t("app_open_station_search")),
         classicControlLink(),
       ],
     });
@@ -9860,14 +9865,14 @@
 	          miniStatusTabButton("feed", t("app_section_incidents")),
 	          miniStatusTabButton("stations", t("app_open_station_search")),
 	          miniStatusTabButton("profile", t("app_section_settings")),
-	          publicStatusLink(publicRoot(), t("app_open_public")),
+	          publicStatusLink(publicRoot(), t("app_open_public"), "", true),
 	        ],
 	      });
 	    }
 	    return `
 	      <span id="mini-app-status-text">${escapeHtml(state.statusText || t("app_status_telegram"))}</span>
 	      <div class="button-row">
-	        <a class="button ghost small" href="${escapeAttr(publicRoot())}" target="_blank" rel="noreferrer">${escapeHtml(t("app_open_public"))}</a>
+	        <a class="button ghost small" href="${escapeAttr(publicRoot())}" target="_blank" rel="noopener noreferrer">${escapeHtml(t("app_open_public"))}</a>
 	        ${renderSiteLanguageControlHTML()}
 	        ${renderRouteCheckInControlsHTML()}
 	        ${retryCurrentViewAction("ghost small")}
@@ -12147,6 +12152,7 @@
         renderPublicStationStatusBar,
         renderPublicNetworkMapStatusBar,
         renderPublicIncidentsStatusBar,
+        renderMiniStatusBar,
         renderPublicIncidents,
         applyPublicDashboardPayload,
         applyPublicServiceDayTrainsPayload,

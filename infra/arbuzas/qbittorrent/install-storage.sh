@@ -230,10 +230,13 @@ create_image() {
 
 reapply_declared_docker_no_swap_limits() {
   command -v docker >/dev/null 2>&1 || return 0
+  command -v systemctl >/dev/null 2>&1 || fail "missing required command: systemctl"
 
-  local container_id memory_limit memory_swap_limit
+  local container_id memory_limit memory_swap_limit scope_unit control_group
+  local systemd_swap_limit cgroup_swap_file
   while IFS= read -r container_id; do
     [[ -n "${container_id}" ]] || continue
+    [[ "${container_id}" =~ ^[0-9a-f]{64}$ ]] || fail "Docker returned an invalid full container ID: ${container_id}"
     read -r memory_limit memory_swap_limit < <(
       docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' "${container_id}"
     )
@@ -243,6 +246,21 @@ reapply_declared_docker_no_swap_limits() {
       --memory "${memory_limit}" \
       --memory-swap "${memory_swap_limit}" \
       "${container_id}" >/dev/null
+
+    # runc writes a zero cgroup-v2 swap limit directly but omits the matching
+    # zero-valued systemd property. Persist it on the transient Docker scope so
+    # a later systemd daemon-reload cannot restore the default infinity value.
+    scope_unit="docker-${container_id}.scope"
+    systemctl is-active --quiet "${scope_unit}" || fail "missing active Docker systemd scope: ${scope_unit}"
+    systemctl set-property --runtime "${scope_unit}" MemorySwapMax=0 >/dev/null
+
+    systemd_swap_limit="$(systemctl show --property=MemorySwapMax --value "${scope_unit}")"
+    [[ "${systemd_swap_limit}" == "0" ]] || fail "${scope_unit} retained MemorySwapMax=${systemd_swap_limit}"
+    control_group="$(systemctl show --property=ControlGroup --value "${scope_unit}")"
+    [[ "${control_group}" == /*/"${scope_unit}" ]] || fail "unexpected control group for ${scope_unit}: ${control_group}"
+    cgroup_swap_file="/sys/fs/cgroup${control_group}/memory.swap.max"
+    [[ -r "${cgroup_swap_file}" ]] || fail "unreadable swap limit for ${scope_unit}: ${cgroup_swap_file}"
+    grep -Fx '0' "${cgroup_swap_file}" >/dev/null || fail "${scope_unit} did not retain a zero cgroup swap limit"
   done < <(docker ps -q --no-trunc)
 }
 
@@ -265,9 +283,9 @@ install_mount() {
     enablement_changed=1
   fi
   if (( unit_changed == 1 || enablement_changed == 1 )); then
-    # systemd on this host reapplies infinity to Docker's transient swap
-    # properties during a manager reload. Restore every container that already
-    # declares memory-swap equal to memory; docker update does not restart it.
+    # systemd on this host reapplies infinity when runc has not persisted a
+    # zero-valued transient scope property. Stabilize every running container
+    # that already declares memory-swap equal to memory without restarting it.
     reapply_declared_docker_no_swap_limits
   fi
 

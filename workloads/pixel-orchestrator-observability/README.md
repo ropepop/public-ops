@@ -23,8 +23,9 @@ addresses, UI text, account identifiers, prompts, ticket digits, or JSON fields.
 
 The accepted event types are app sessions, manual actions, component
 transitions, health changes, setting changes, cleanup results, scheduling
-failures, permission changes, and dropped-event summaries. Ticket and ChatGPT
-domain events remain in their existing databases.
+failures, permission changes, and dropped-event summaries. Ticket domain events
+remain in the Ticket database. Historical ChatGPT events stay preserved in the
+retired ChatGPT database; this module does not create new ChatGPT events.
 
 Cleanup-result events require one of these fixed categories:
 `ticket_hierarchy_xml`, `deployment_action_results`, `support_bundles`,

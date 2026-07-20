@@ -1280,6 +1280,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	}
 	var auth telegramAuth
 	var err error
+	issueCookie := issueSessionCookie
 	switch {
 	case strings.TrimSpace(body.IDToken) != "":
 		nonceCookie, cookieErr := r.Cookie(loginNonceCookieName)
@@ -1324,6 +1325,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 			s.writeError(w, http.StatusUnauthorized, "invalid Telegram login")
 			return
 		}
+		issueCookie = issueMiniAppSessionCookie
 	default:
 		s.writeError(w, http.StatusBadRequest, "missing Telegram login payload")
 		return
@@ -1334,7 +1336,7 @@ func (s *Server) handleAuthTelegramComplete(w http.ResponseWriter, r *http.Reque
 	}
 	resolvedLanguage := s.resolveSignedInLanguage(r.Context(), auth.User.ID, auth.User.LanguageCode)
 	auth.User.LanguageCode = string(resolvedLanguage)
-	cookie, err := issueSessionCookie(s.sessionSecret, auth, now)
+	cookie, err := issueCookie(s.sessionSecret, auth, now)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2366,12 +2368,16 @@ func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 
 func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string, allowTelegramScript bool) {
 	s.setSecurityHeaders(w)
+	if allowTelegramScript {
+		w.Header().Del("X-Frame-Options")
+	}
 	w.Header().Set("Content-Security-Policy", s.contentSecurityPolicy(scriptNonce, allowTelegramScript))
 }
 
 func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramScript bool) string {
 	scriptSources := []string{"'self'"}
 	frameSources := []string{"'none'"}
+	frameAncestors := []string{"'none'"}
 	connectSources := []string{"'self'"}
 	if s.cfg.ExternalTrainMapEnabled {
 		addCSPURLSource(&connectSources, s.cfg.ExternalTrainMapBaseURL)
@@ -2384,12 +2390,13 @@ func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramScript b
 	if allowTelegramScript {
 		scriptSources = append(scriptSources, "https://telegram.org")
 		frameSources = []string{"https://telegram.org"}
+		frameAncestors = []string{"https://web.telegram.org"}
 	}
 	return strings.Join([]string{
 		"default-src 'self'",
 		"base-uri 'self'",
 		"object-src 'none'",
-		"frame-ancestors 'none'",
+		"frame-ancestors " + strings.Join(frameAncestors, " "),
 		"form-action 'self'",
 		"script-src " + strings.Join(scriptSources, " "),
 		"style-src 'self'",

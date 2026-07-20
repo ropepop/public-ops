@@ -2979,17 +2979,47 @@
   }
 
   function mapRootPath() {
+    if (telegramMiniAppShell()) {
+      return telegramMiniAppViewPath("map", selectedIncidentIdFromURL());
+    }
     return pathFor("/");
+  }
+
+  function incidentRootPath() {
+    if (telegramMiniAppShell()) {
+      return telegramMiniAppViewPath("incidents", selectedIncidentIdFromURL());
+    }
+    return pathFor("/incidents");
+  }
+
+  function telegramMiniAppViewPath(view, incidentId) {
+    var current = currentURL();
+    var params = new root.URLSearchParams();
+    if (String(view || "").trim() === "incidents") {
+      params.set("view", "incidents");
+    }
+    if (current) {
+      current.searchParams.forEach(function (value, key) {
+        if (key !== "view" && key !== "incident") {
+          params.append(key, value);
+        }
+      });
+    }
+    if (String(incidentId || "").trim()) {
+      params.set("incident", String(incidentId).trim());
+    }
+    return pathFor("/app") + (params.toString() ? "?" + params.toString() : "");
   }
 
   function renderHeroMeta(mode) {
     var links = [];
+    var trainLinkAttributes = telegramMiniAppShell() ? ' target="_blank" rel="noopener"' : "";
     if (mode === "public-incidents") {
       links.push('<a class="pill pill-muted" href="' + escapeAttr(mapRootPath()) + '">Mape</a>');
     } else {
-      links.push('<a class="pill pill-muted" href="' + escapeAttr(pathFor("/incidents")) + '">Plūsma</a>');
+      links.push('<a class="pill pill-muted" href="' + escapeAttr(incidentRootPath()) + '">Plūsma</a>');
     }
-    links.push('<a class="pill pill-muted train-site-link" href="' + escapeAttr(trainSiteURL) + '">Vilciens</a>');
+    links.push('<a class="pill pill-muted train-site-link" href="' + escapeAttr(trainSiteURL) + '"' + trainLinkAttributes + '>Vilciens</a>');
     return '<div class="hero-meta">' + links.join("") + '<span id="status-pill" class="pill pill-muted">Ielādē…</span><span id="auth-controls" class="button-row hero-auth-controls"></span></div>';
   }
 
@@ -3188,10 +3218,16 @@
   }
 
   function incidentPageURL(incidentId) {
+    if (telegramMiniAppShell()) {
+      return telegramMiniAppViewPath("incidents", incidentId);
+    }
     return pathFor("/incidents?incident=" + encodeURIComponent(String(incidentId || "").trim()));
   }
 
   function incidentMapURL(incidentId) {
+    if (telegramMiniAppShell()) {
+      return telegramMiniAppViewPath("map", incidentId);
+    }
     return pathFor("/?incident=" + encodeURIComponent(String(incidentId || "").trim()));
   }
 
@@ -3710,6 +3746,7 @@
       if (!spacetimeEnabled() && !liveTransportSnapshotLookupEnabled()) {
         applyLiveMapPayload(results[1]);
       }
+      renderVisibleStops();
       setStatus(readyStatusText());
       return results[1];
     }).finally(function () {
@@ -6893,6 +6930,7 @@
       updatePendingAreaReportRadius: updatePendingAreaReportRadius,
       sameMaterialValue: sameMaterialValue,
 	      loadCatalog: loadCatalog,
+	      loadBootstrap: loadBootstrap,
 	      loadSharedMapStateDirect: loadSharedMapStateDirect,
 	      loadBackendSharedMapState: loadBackendSharedMapState,
 	      loadSnapshotBackedMapState: loadSnapshotBackedMapState,

@@ -612,8 +612,8 @@ func TestAuthTelegramSetsScopedSessionCookie(t *testing.T) {
 	if !sessionCookie.Secure {
 		t.Fatalf("expected secure cookie")
 	}
-	if sessionCookie.SameSite != http.SameSiteLaxMode {
-		t.Fatalf("unexpected SameSite: %v", sessionCookie.SameSite)
+	if sessionCookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("unexpected SameSite: %v, want None for Mini App", sessionCookie.SameSite)
 	}
 }
 
@@ -654,8 +654,8 @@ func TestAuthTelegramSetsRootScopedSessionCookieForHostRootDeployment(t *testing
 	if !sessionCookie.Secure {
 		t.Fatalf("expected secure cookie")
 	}
-	if sessionCookie.SameSite != http.SameSiteLaxMode {
-		t.Fatalf("unexpected SameSite: %v", sessionCookie.SameSite)
+	if sessionCookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("unexpected SameSite: %v, want None for Mini App", sessionCookie.SameSite)
 	}
 }
 
@@ -761,6 +761,9 @@ func TestTelegramBrowserAuthLifecycle(t *testing.T) {
 	sessionCookie := cookieByName(completeRes.Result().Cookies(), sessionCookieName)
 	if sessionCookie == nil {
 		t.Fatalf("missing %s cookie", sessionCookieName)
+	}
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("browser session cookie SameSite = %v, want Lax", sessionCookie.SameSite)
 	}
 	if cleared := cookieByName(completeRes.Result().Cookies(), loginNonceCookieName); cleared == nil || cleared.Value != "" {
 		t.Fatalf("expected cleared nonce cookie, got %#v", cleared)
@@ -1210,8 +1213,15 @@ func TestTelegramCompleteAcceptsMiniAppInitData(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("complete status: got %d body=%s", res.Code, res.Body.String())
 	}
-	if cookieByName(res.Result().Cookies(), sessionCookieName) == nil {
+	sessionCookie := cookieByName(res.Result().Cookies(), sessionCookieName)
+	if sessionCookie == nil {
 		t.Fatalf("missing %s cookie", sessionCookieName)
+	}
+	if sessionCookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("Mini App session cookie SameSite = %v, want None", sessionCookie.SameSite)
+	}
+	if !sessionCookie.Secure || !sessionCookie.HttpOnly {
+		t.Fatalf("Mini App session cookie Secure=%v HttpOnly=%v, want both true", sessionCookie.Secure, sessionCookie.HttpOnly)
 	}
 }
 
@@ -1571,7 +1581,6 @@ func TestServeHTTPShellAddsSecurityHeadersAndFingerprintedAssets(t *testing.T) {
 	for _, header := range []string{
 		"Strict-Transport-Security",
 		"Content-Security-Policy",
-		"X-Frame-Options",
 		"X-Content-Type-Options",
 		"Referrer-Policy",
 		"Permissions-Policy",
@@ -1581,6 +1590,12 @@ func TestServeHTTPShellAddsSecurityHeadersAndFingerprintedAssets(t *testing.T) {
 		}
 	}
 	csp := res.Header().Get("Content-Security-Policy")
+	if got := res.Header().Get("X-Frame-Options"); got != "" {
+		t.Fatalf("mini-app shell X-Frame-Options = %q, want empty for Telegram Web embedding", got)
+	}
+	if !strings.Contains(csp, "frame-ancestors https://web.telegram.org") {
+		t.Fatalf("mini-app shell CSP does not allow Telegram Web embedding: %q", csp)
+	}
 	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
 		t.Fatalf("Content-Security-Policy still allows inline scripts: %q", csp)
 	}

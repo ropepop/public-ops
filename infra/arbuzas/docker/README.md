@@ -4,7 +4,7 @@ This directory is the active production deployment layout for the single-host ki
 
 ## What Lives Here
 
-- `compose.yml`: the one active Docker Compose project for Portainer, apps, tunnels, the physical Pixel ticket bridge, the private qBittorrent slice, and its read-only Jellyfin media view.
+- `compose.yml`: the one active Docker Compose project for apps, tunnels, the physical Pixel ticket bridge, the private qBittorrent slice, and its read-only Jellyfin media view.
 - `env/arbuzas.example.env`: the operator template for hostnames, ports, and image pins.
 - `images/`: Dockerfiles and entrypoints for the kitty-gration workloads and DNS sidecars.
 
@@ -19,7 +19,9 @@ This directory is the active production deployment layout for the single-host ki
 
 - Active deploy flow: `tools/arbuzas/deploy.sh`
 
-Portainer runs directly against the local Docker socket on port `9443`. The live kitty-gration host must stay out of Docker Swarm, and the active repair flow now rewrites stale `tasks.agent` state in place before falling back to a clean first-run setup. The old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
+Use the deployment script for deploys, validation, rollback, cleanup, and routine service changes. For direct inspection, SSH to kitty-gration and run Docker Compose against `/etc/arbuzas/current/release.env` and `/etc/arbuzas/current/infra/arbuzas/docker/compose.yml`, always keeping the Compose project name `arbuzas`.
+
+Portainer was retired on 2026-07-20. There is no active Portainer container or listener on `9443`. Its former state is retained temporarily only as a restricted rollback archive matching `/srv/arbuzas/portainer-backups/portainer-retired-<timestamp>.tar.gz`; normal operations do not use it. Netdata runs separately as a host-native service with private Tailscale access. The live kitty-gration host must stay out of Docker Swarm, and the old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
 The ticket service talks privately and directly to `ticket_phone_bridge`, which owns the ADB connection to the physical Pixel. Stream desired state and commands are durable in SpacetimeDB; there is no ticket device lab or separate phone broker inside the production Compose project.
 
 qBittorrent uses VueTorrent at `https://arbuzas-vps.tail9345a.ts.net:24680/` over Tailscale with no application login. Its Web listener is loopback-only, its peer traffic uses TCP and UDP `45123`, and its configuration plus payload live inside a capped 25 GiB filesystem. See `docs/runbooks/QBITTORRENT_TAILSCALE.md` for retention and deployment details.

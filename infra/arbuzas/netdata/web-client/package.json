@@ -1,0 +1,16 @@
+{
+  "name": "kitty-gration-netdata-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node ./build.mjs",
+    "test": "node --test ./test/*.test.mjs"
+  },
+  "dependencies": {
+    "@arrow-js/core": "1.0.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

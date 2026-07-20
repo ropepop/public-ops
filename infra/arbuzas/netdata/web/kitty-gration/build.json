@@ -1,0 +1,17 @@
+{
+  "dashboard": "Kitty-gration Operations",
+  "ui": "arrow",
+  "api": "netdata-v3",
+  "buildId": "62283b2a0bf4b4f6",
+  "assets": [
+    "app.OSY3DQP7.js",
+    "app.FON5H446.css",
+    "native-mobile.5AFI63AE.js",
+    "native-mobile.5QBL5DY7.css"
+  ],
+  "nativeMobile": {
+    "script": "native-mobile.5AFI63AE.js",
+    "stylesheet": "native-mobile.5QBL5DY7.css",
+    "viewport": "width=device-width, initial-scale=1, viewport-fit=cover"
+  }
+}

@@ -11,12 +11,6 @@ HOST_MIRROR_ROOT="${ARBUZAS_HOST_MIRROR_ROOT:-${REPO_ROOT}/infra/arbuzas/host-mi
 HOST_MIRROR_PROFILE="${ARBUZAS_HOST_MIRROR_PROFILE:-arbuzas}"
 REMOTE_RELEASES_ROOT="/etc/arbuzas/releases"
 REMOTE_CURRENT_LINK="/etc/arbuzas/current"
-REMOTE_PORTAINER_DATA_DIR="/srv/arbuzas/portainer"
-REMOTE_PORTAINER_BACKUPS_DIR="/srv/arbuzas/portainer-backups"
-PORTAINER_AGENT_ENDPOINT="tcp://tasks.agent:9001"
-PORTAINER_LOCAL_ENDPOINT="unix:///var/run/docker.sock"
-PORTAINER_DB_TOOL_DIR="${SCRIPT_DIR}/portainerdb"
-PORTAINER_TOOLBOX_IMAGE="${PORTAINER_TOOLBOX_IMAGE:-busybox:1.36.1}"
 DOCKER_GC_SCRIPT="${SCRIPT_DIR}/docker_gc.py"
 LOCAL_RELEASE_GC_SCRIPT="${SCRIPT_DIR}/local_release_gc.py"
 MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"
@@ -36,6 +30,14 @@ NETDATA_REMOTE_CONFIG_DIR="/etc/netdata"
 NETDATA_REMOTE_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/netdata.conf"
 NETDATA_REMOTE_DOCKER_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/go.d/docker.conf"
 NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/go.d/sd/docker.conf"
+NETDATA_REMOTE_SYSTEMD_CONFIG_FILE="${NETDATA_REMOTE_CONFIG_DIR}/go.d/systemdunits.conf"
+NETDATA_DASHBOARD_WEB_ROOT="${NETDATA_CONFIG_ROOT}/web/kitty-gration"
+NETDATA_NATIVE_DASHBOARD_ROOT="${NETDATA_CONFIG_ROOT}/native-dashboard"
+NETDATA_REMOTE_WEB_ROOT="/usr/share/netdata/web"
+NETDATA_REMOTE_DASHBOARD_DIR="${NETDATA_REMOTE_WEB_ROOT}/kitty-gration"
+NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER="/usr/local/libexec/arbuzas-netdata-native-dashboard.py"
+NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE="/etc/systemd/system/arbuzas-netdata-native-dashboard.service"
+NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN="/etc/systemd/system/netdata.service.d/20-arbuzas-native-dashboard.conf"
 NETDATA_KICKSTART_URL="${NETDATA_KICKSTART_URL:-https://get.netdata.cloud/kickstart.sh}"
 MEMORY_REPORT_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/memory-report"
 MEMORY_REPORT_REMOTE_SERVICE_FILE="/etc/systemd/system/arbuzas-memory-report.service"
@@ -81,7 +83,6 @@ ARBUZAS_TRAIN_BOT_PORT="${ARBUZAS_TRAIN_BOT_PORT:-9317}"
 ARBUZAS_SATIKSME_BOT_PORT="${ARBUZAS_SATIKSME_BOT_PORT:-9318}"
 ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
-ARBUZAS_CHATGPT_BROKER_PORT="${ARBUZAS_CHATGPT_BROKER_PORT:-9348}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
 ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
 ARBUZAS_TICKET_TUNNEL_GID="${ARBUZAS_TICKET_TUNNEL_GID:-50}"
@@ -107,7 +108,6 @@ ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info
 ARBUZAS_SATIKSME_BOT_HOSTNAME="${ARBUZAS_SATIKSME_BOT_HOSTNAME:-kontrole.info}"
 ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME="${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME:-farel-subscription-bot.jolkins.id.lv}"
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
-ARBUZAS_PORTAINER_IMAGE="${ARBUZAS_PORTAINER_IMAGE:-portainer/portainer-ce:lts}"
 ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
 ARBUZAS_TICKET_CLOUDFLARED_IMAGE="${ARBUZAS_TICKET_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0}"
 
@@ -116,12 +116,10 @@ requested_release_id=""
 VALIDATION_PROFILE="${ARBUZAS_VALIDATION_PROFILE:-full}"
 VALIDATION_PROFILE_OPTION_SET=0
 TARGETED_MODE=0
-VALIDATE_PORTAINER=0
 VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
 VALIDATE_SUBSCRIPTION=0
 VALIDATE_TICKET_PHONE_BRIDGE=0
-VALIDATE_CHATGPT=0
 VALIDATE_TICKET_REMOTE=0
 VALIDATE_QBITTORRENT=0
 VALIDATE_JELLYFIN=0
@@ -145,13 +143,10 @@ JELLYFIN_SERVE_ADDED=0
 JELLYFIN_SECRET_CREATED=0
 
 ALL_SERVICES=(
-  portainer
   train_bot
   satiksme_bot
   subscription_bot
   ticket_phone_bridge
-  chatgpt_broker
-  chatgpt_bot
   ticket_remote_spacetime_sidecar
   ticket_remote
   train_tunnel
@@ -422,11 +417,16 @@ remote_inline_shell() {
 
 remote_root_command() {
   local script="$1"
+  local max_attempts="${2:-3}"
   local script_base64=""
   local attempt=0
 
+  [[ "${max_attempts}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "remote_root_command retry count must be a positive integer" >&2
+    return 2
+  }
   script_base64="$(printf '%s\n' 'set -euo pipefail' "${script}" | base64 | tr -d '\n')"
-  for attempt in 1 2 3; do
+  for (( attempt = 1; attempt <= max_attempts; attempt++ )); do
     if run_ssh \
       -o ConnectTimeout=15 \
       -o ServerAliveInterval=15 \
@@ -462,7 +462,7 @@ remote_root_command() {
     "; then
       return 0
     fi
-    if (( attempt < 3 )); then
+    if (( attempt < max_attempts )); then
       log "Remote root command attempt ${attempt} failed on ${ARBUZAS_HOST}; retrying"
       sleep 2
     fi
@@ -653,22 +653,42 @@ remote_run_host_cache_cleanup() {
 
 stage_netdata_config_to_remote() {
   local remote_tmp_dir="/tmp/arbuzas-netdata.$$"
-  local netdata_config_tree_base64=""
+  local remote_tarball="${remote_tmp_dir}.tar"
+  local local_tarball=""
   local attempt=0
 
   [[ -d "${NETDATA_CONFIG_ROOT}" ]] || {
     echo "missing Netdata config root: ${NETDATA_CONFIG_ROOT}" >&2
     return 1
   }
-  netdata_config_tree_base64="$(COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "${NETDATA_CONFIG_ROOT}" -cf - . | base64 | tr -d '\n')"
+  [[ -f "${NETDATA_DASHBOARD_WEB_ROOT}/index.html" && -f "${NETDATA_DASHBOARD_WEB_ROOT}/build.json" ]] || {
+    echo "missing built Kitty-gration dashboard under ${NETDATA_DASHBOARD_WEB_ROOT}" >&2
+    return 1
+  }
+  [[ -f "${NETDATA_NATIVE_DASHBOARD_ROOT}/arbuzas_netdata_native_dashboard.py" && \
+     -f "${NETDATA_NATIVE_DASHBOARD_ROOT}/arbuzas-netdata-native-dashboard.service" && \
+     -f "${NETDATA_NATIVE_DASHBOARD_ROOT}/netdata-native-dashboard.conf" ]] || {
+    echo "missing native Netdata dashboard mobile adaptation under ${NETDATA_NATIVE_DASHBOARD_ROOT}" >&2
+    return 1
+  }
+  local_tarball="$(mktemp "${TMPDIR:-/tmp}/arbuzas-netdata.XXXXXX.tar")"
+  trap "rm -f -- '${local_tarball}'; trap - RETURN" RETURN
+  (
+    cd "${NETDATA_CONFIG_ROOT}"
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+      -cf "${local_tarball}" \
+      netdata.conf go.d web/kitty-gration native-dashboard
+  )
 
   log "Staging Netdata config on ${ARBUZAS_HOST}:${remote_tmp_dir}"
   for attempt in 1 2 3; do
-    if remote_inline_shell "
-      rm -rf '${remote_tmp_dir}'
-      install -d '${remote_tmp_dir}'
-      printf '%s' '${netdata_config_tree_base64}' | base64 -d | tar -xf - -C '${remote_tmp_dir}'
-    "; then
+    if upload_remote_file "${local_tarball}" "${remote_tarball}" && \
+       remote_inline_shell "
+         trap 'rm -f -- \"${remote_tarball}\"' EXIT
+         rm -rf '${remote_tmp_dir}'
+         install -d '${remote_tmp_dir}'
+         tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
+       "; then
       printf '%s\n' "${remote_tmp_dir}"
       return 0
     fi
@@ -682,35 +702,433 @@ stage_netdata_config_to_remote() {
   return 1
 }
 
+prepare_remote_netdata_rollback() {
+  local remote_backup_root="$1"
+
+  remote_root_command "
+    rm -rf '${remote_backup_root}'
+    install -d -m 0700 '${remote_backup_root}'
+    if [[ -d '${NETDATA_REMOTE_CONFIG_DIR}' ]]; then
+      tar -C /etc -cpf '${remote_backup_root}/netdata-config.tar' netdata
+    fi
+    if [[ -d '${NETDATA_REMOTE_DASHBOARD_DIR}' ]]; then
+      touch '${remote_backup_root}/dashboard-present'
+      tar -C '${NETDATA_REMOTE_WEB_ROOT}' -cpf '${remote_backup_root}/dashboard.tar' kitty-gration
+    fi
+    native_entrypoints_ready=1
+    for native_entrypoint in \
+      '${NETDATA_REMOTE_WEB_ROOT}/index.html' \
+      '${NETDATA_REMOTE_WEB_ROOT}/v3/agent.html' \
+      '${NETDATA_REMOTE_WEB_ROOT}/v3/index.html' \
+      '${NETDATA_REMOTE_WEB_ROOT}/v3/local-agent.html'; do
+      if [[ ! -f \"\${native_entrypoint}\" || -L \"\${native_entrypoint}\" ]]; then
+        native_entrypoints_ready=0
+      fi
+    done
+    if [[ \"\${native_entrypoints_ready}\" == '1' ]]; then
+      tar -C '${NETDATA_REMOTE_WEB_ROOT}' -cpf '${remote_backup_root}/native-dashboard-entrypoints.tar' \
+        index.html v3/agent.html v3/index.html v3/local-agent.html
+    fi
+    if dpkg-query -W netdata-dashboard >/dev/null 2>&1; then
+      dpkg-query -W netdata-dashboard | awk '{print \$2}' > '${remote_backup_root}/netdata-dashboard-package-version'
+    fi
+    if [[ -e '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' || -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' ]]; then
+      touch '${remote_backup_root}/native-dashboard-patcher-present'
+      cp -a -- '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' '${remote_backup_root}/native-dashboard-patcher'
+    fi
+    if [[ -e '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}' || -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}' ]]; then
+      touch '${remote_backup_root}/native-dashboard-service-present'
+      cp -a -- '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}' '${remote_backup_root}/native-dashboard-service'
+    fi
+    if [[ -e '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}' || -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}' ]]; then
+      touch '${remote_backup_root}/native-dashboard-dropin-present'
+      cp -a -- '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}' '${remote_backup_root}/native-dashboard-dropin'
+    fi
+    if systemctl cat netdata.service >/dev/null 2>&1; then
+      touch '${remote_backup_root}/service-present'
+      if systemctl is-active --quiet netdata.service; then
+        touch '${remote_backup_root}/service-active'
+      fi
+      if systemctl is-enabled --quiet netdata.service; then
+        touch '${remote_backup_root}/service-enabled'
+      fi
+    fi
+    tailscale serve status --json > '${remote_backup_root}/tailscale-serve.json'
+  "
+}
+
+restore_remote_netdata_rollback() {
+  local remote_backup_root="$1"
+
+  log "Recovery: restoring the previous Netdata config, dashboards, service state, and private route"
+  remote_root_command "
+    [[ -d '${remote_backup_root}' ]] || {
+      echo 'missing Netdata rollback snapshot: ${remote_backup_root}' >&2
+      exit 1
+    }
+
+    if [[ -f '${remote_backup_root}/netdata-config.tar' ]]; then
+      rm -rf '${NETDATA_REMOTE_CONFIG_DIR}'
+      tar -C /etc -xpf '${remote_backup_root}/netdata-config.tar'
+    else
+      rm -rf '${NETDATA_REMOTE_CONFIG_DIR}'
+    fi
+
+    rm -rf '${NETDATA_REMOTE_DASHBOARD_DIR}'
+    if [[ -f '${remote_backup_root}/dashboard-present' ]]; then
+      [[ -f '${remote_backup_root}/dashboard.tar' ]] || {
+        echo 'missing Netdata dashboard rollback archive' >&2
+        exit 1
+      }
+      install -d -m 0755 '${NETDATA_REMOTE_WEB_ROOT}'
+      tar -C '${NETDATA_REMOTE_WEB_ROOT}' -xpf '${remote_backup_root}/dashboard.tar'
+    fi
+
+    if [[ -x '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' ]]; then
+      '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' remove \
+        --web-root '${NETDATA_REMOTE_WEB_ROOT}' \
+        --best-effort || true
+    fi
+
+    snapshot_dashboard_version=''
+    current_dashboard_version=''
+    if [[ -f '${remote_backup_root}/netdata-dashboard-package-version' ]]; then
+      snapshot_dashboard_version=\$(cat '${remote_backup_root}/netdata-dashboard-package-version')
+    fi
+    if dpkg-query -W netdata-dashboard >/dev/null 2>&1; then
+      current_dashboard_version=\$(dpkg-query -W netdata-dashboard | awk '{print \$2}')
+    fi
+    if [[ -f '${remote_backup_root}/native-dashboard-entrypoints.tar' && \
+          \"\${snapshot_dashboard_version}\" == \"\${current_dashboard_version}\" ]]; then
+      tar -C '${NETDATA_REMOTE_WEB_ROOT}' -xpf '${remote_backup_root}/native-dashboard-entrypoints.tar'
+    fi
+
+    rm -f '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}'
+    if [[ -f '${remote_backup_root}/native-dashboard-patcher-present' ]]; then
+      install -d -m 0755 \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}')\"
+      cp -a -- '${remote_backup_root}/native-dashboard-patcher' '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}'
+    fi
+    rm -f '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}'
+    if [[ -f '${remote_backup_root}/native-dashboard-service-present' ]]; then
+      install -d -m 0755 \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}')\"
+      cp -a -- '${remote_backup_root}/native-dashboard-service' '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}'
+    fi
+    rm -f '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}'
+    if [[ -f '${remote_backup_root}/native-dashboard-dropin-present' ]]; then
+      install -d -m 0755 \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}')\"
+      cp -a -- '${remote_backup_root}/native-dashboard-dropin' '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}'
+    else
+      rmdir \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}')\" >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f '${remote_backup_root}/native-dashboard-patcher-present' && \
+          -x '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' && \
+          \"\${snapshot_dashboard_version}\" != \"\${current_dashboard_version}\" ]]; then
+      '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' apply \
+        --web-root '${NETDATA_REMOTE_WEB_ROOT}' \
+        --best-effort || true
+    fi
+    systemctl daemon-reload
+
+    if [[ -f '${remote_backup_root}/service-present' ]]; then
+      if [[ -f '${remote_backup_root}/service-enabled' ]]; then
+        systemctl enable netdata.service >/dev/null
+      else
+        systemctl disable netdata.service >/dev/null 2>&1 || true
+      fi
+      if [[ -f '${remote_backup_root}/service-active' ]]; then
+        systemctl restart netdata.service
+      else
+        systemctl stop netdata.service >/dev/null 2>&1 || true
+      fi
+    else
+      systemctl disable --now netdata.service >/dev/null 2>&1 || true
+    fi
+
+    previous_route_state=\$(
+      NETDATA_SERVE_JSON=\"\$(cat '${remote_backup_root}/tailscale-serve.json')\" \
+      NETDATA_PORT='${ARBUZAS_NETDATA_PORT}' \
+      python3 - <<'PY'
+import json
+import os
+import subprocess
+
+payload = json.loads(os.environ['NETDATA_SERVE_JSON'])
+port = os.environ['NETDATA_PORT']
+target = '127.0.0.1:' + port
+proxy_target = 'http://' + target
+dns_name = json.loads(
+    subprocess.check_output(['tailscale', 'status', '--json'], text=True)
+).get('Self', {}).get('DNSName', '').rstrip('.')
+tcp = payload.get('TCP', {}).get(port)
+web = {
+    key: value for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+allow_funnel = payload.get('AllowFunnel') or {}
+funnel = {
+    str(key): value for key, value in allow_funnel.items()
+    if str(key).rsplit(':', 1)[-1] == port
+} if isinstance(allow_funnel, dict) else {'unexpected': allow_funnel}
+if funnel:
+    state = 'conflict'
+elif tcp is None and not web:
+    state = 'absent'
+elif tcp == {'TCPForward': target} and not web:
+    state = 'legacy_tcp'
+elif tcp == {'HTTPS': True} and web == {
+    dns_name + ':' + port: {'Handlers': {'/': {'Proxy': proxy_target}}}
+}:
+    state = 'exact'
+else:
+    state = 'conflict'
+print(state)
+PY
+    )
+
+    case \"\${previous_route_state}\" in
+      absent)
+        tailscale serve --yes --https ${ARBUZAS_NETDATA_PORT} off >/dev/null 2>&1 || true
+        tailscale serve --yes --tcp ${ARBUZAS_NETDATA_PORT} off >/dev/null 2>&1 || true
+        ;;
+      legacy_tcp)
+        tailscale serve --yes --https ${ARBUZAS_NETDATA_PORT} off >/dev/null 2>&1 || true
+        tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} tcp://127.0.0.1:${ARBUZAS_NETDATA_PORT}
+        ;;
+      exact)
+        tailscale serve --yes --tcp ${ARBUZAS_NETDATA_PORT} off >/dev/null 2>&1 || true
+        tailscale serve --bg --yes --https ${ARBUZAS_NETDATA_PORT} http://127.0.0.1:${ARBUZAS_NETDATA_PORT}
+        ;;
+      conflict)
+        echo 'Netdata rollback left the pre-existing conflicting Tailscale route untouched' >&2
+        ;;
+      *)
+        echo \"unexpected Netdata rollback route state: \${previous_route_state}\" >&2
+        exit 1
+        ;;
+    esac
+
+    rm -rf '${remote_backup_root}'
+  "
+}
+
+cleanup_remote_netdata_rollback() {
+  local remote_backup_root="$1"
+
+  remote_root_command "rm -rf '${remote_backup_root}'"
+}
+
 install_remote_netdata() {
   local remote_stage_root="$1"
 
   log "Maintenance: installing Netdata and host collectors on ${ARBUZAS_HOST}"
   remote_root_command "
-    command -v apt-get >/dev/null 2>&1 || {
-      echo 'apt-get is required for Arbuzas Netdata install' >&2
+    command -v tailscale >/dev/null 2>&1 || {
+      echo 'tailscale is required for private Arbuzas Netdata access' >&2
       exit 1
     }
 
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ca-certificates curl lm-sensors smartmontools
+    netdata_serve_json=\$(tailscale serve status --json)
+    netdata_serve_probe=\$(
+      NETDATA_SERVE_JSON=\"\${netdata_serve_json}\" \
+      NETDATA_PORT='${ARBUZAS_NETDATA_PORT}' \
+      python3 - <<'PY'
+import base64
+import json
+import os
+import subprocess
+
+payload = json.loads(os.environ['NETDATA_SERVE_JSON'])
+port = os.environ['NETDATA_PORT']
+target = '127.0.0.1:' + port
+proxy_target = 'http://' + target
+dns_name = json.loads(
+    subprocess.check_output(['tailscale', 'status', '--json'], text=True)
+).get('Self', {}).get('DNSName', '').rstrip('.')
+if not dns_name:
+    raise SystemExit('missing Tailscale DNS name for Netdata HTTPS')
+tcp = payload.get('TCP', {}).get(port)
+web = {
+    key: value for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+allow_funnel = payload.get('AllowFunnel') or {}
+if not isinstance(allow_funnel, dict):
+    raise SystemExit('unexpected Tailscale AllowFunnel shape')
+funnel = {
+    str(key): value for key, value in allow_funnel.items()
+    if str(key).rsplit(':', 1)[-1] == port
+}
+if funnel:
+    state = 'conflict'
+elif tcp is None and not web:
+    state = 'absent'
+elif (
+    tcp == {'HTTPS': True}
+    and web == {
+        dns_name + ':' + port: {
+            'Handlers': {'/': {'Proxy': proxy_target}}
+        }
+    }
+):
+    state = 'exact'
+elif tcp == {'TCPForward': target} and not web:
+    state = 'legacy_tcp'
+else:
+    state = 'conflict'
+encoded = base64.b64encode(
+    json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+).decode()
+print(state + '|' + encoded)
+PY
+    )
+    netdata_serve_state=\${netdata_serve_probe%%|*}
+    netdata_serve_before=\${netdata_serve_probe#*|}
+    case \"\${netdata_serve_state}\" in
+      absent|exact|legacy_tcp)
+        ;;
+      *)
+        echo 'Tailscale Serve port ${ARBUZAS_NETDATA_PORT} is already configured for another target; refusing to overwrite it' >&2
+        exit 1
+        ;;
+    esac
 
     tmpdir=\$(mktemp -d)
-    trap 'rm -rf \"\${tmpdir}\" \"${remote_stage_root}\"' EXIT
+    trap 'rm -rf \"\${tmpdir}\" \"\${dashboard_next:-}\" \"\${dashboard_previous:-}\" \"${remote_stage_root}\"' EXIT
 
-    curl -fsSL '${NETDATA_KICKSTART_URL}' -o \"\${tmpdir}/kickstart.sh\"
-    DISABLE_TELEMETRY=1 sh \"\${tmpdir}/kickstart.sh\" \
-      --stable-channel \
-      --native-only \
-      --non-interactive \
-      --no-updates \
-      --disable-telemetry
+    if command -v netdata >/dev/null 2>&1 && systemctl cat netdata.service >/dev/null 2>&1; then
+      echo 'Existing Netdata Agent detected; keeping its installed package version'
+    else
+      command -v apt-get >/dev/null 2>&1 || {
+        echo 'apt-get is required for the initial Arbuzas Netdata install' >&2
+        exit 1
+      }
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ca-certificates curl lm-sensors smartmontools
+      curl -fsSL '${NETDATA_KICKSTART_URL}' -o \"\${tmpdir}/kickstart.sh\"
+      printf 'Netdata kickstart sha256: '
+      sha256sum \"\${tmpdir}/kickstart.sh\" | awk '{print \$1}'
+      DISABLE_TELEMETRY=1 sh \"\${tmpdir}/kickstart.sh\" \
+        --stable-channel \
+        --native-only \
+        --non-interactive \
+        --no-updates \
+        --disable-telemetry
+    fi
 
-    install -d '${NETDATA_REMOTE_CONFIG_DIR}'
-    tar -C '${remote_stage_root}' -cf - . | tar -C '${NETDATA_REMOTE_CONFIG_DIR}' -xf -
+    [[ -f '${remote_stage_root}/web/kitty-gration/index.html' ]] || {
+      echo 'staged Kitty-gration dashboard is missing index.html' >&2
+      exit 1
+    }
+    [[ -f '${remote_stage_root}/web/kitty-gration/build.json' ]] || {
+      echo 'staged Kitty-gration dashboard is missing build.json' >&2
+      exit 1
+    }
+    [[ -f '${remote_stage_root}/native-dashboard/arbuzas_netdata_native_dashboard.py' ]] || {
+      echo 'staged native Netdata dashboard patcher is missing' >&2
+      exit 1
+    }
+    [[ -f '${remote_stage_root}/native-dashboard/arbuzas-netdata-native-dashboard.service' ]] || {
+      echo 'staged native Netdata dashboard systemd service is missing' >&2
+      exit 1
+    }
+    [[ -f '${remote_stage_root}/native-dashboard/netdata-native-dashboard.conf' ]] || {
+      echo 'staged native Netdata dashboard systemd drop-in is missing' >&2
+      exit 1
+    }
 
-    rm -f /var/lib/netdata/cloud.d/claim.conf
+    install -d -m 0755 \
+      '${NETDATA_REMOTE_CONFIG_DIR}' \
+      '${NETDATA_REMOTE_CONFIG_DIR}/go.d' \
+      '${NETDATA_REMOTE_CONFIG_DIR}/go.d/sd'
+    install -o root -g netdata -m 0644 \
+      '${remote_stage_root}/netdata.conf' \
+      '${NETDATA_REMOTE_CONFIG_FILE}'
+    install -o root -g netdata -m 0644 \
+      '${remote_stage_root}/go.d/docker.conf' \
+      '${NETDATA_REMOTE_DOCKER_CONFIG_FILE}'
+    install -o root -g netdata -m 0644 \
+      '${remote_stage_root}/go.d/sd/docker.conf' \
+      '${NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE}'
+    install -o root -g netdata -m 0644 \
+      '${remote_stage_root}/go.d/systemdunits.conf' \
+      '${NETDATA_REMOTE_SYSTEMD_CONFIG_FILE}'
+
+    install -d -o root -g root -m 0755 \
+      \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}')\" \
+      \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}')\" \
+      \"\$(dirname '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}')\"
+    install -o root -g root -m 0755 \
+      '${remote_stage_root}/native-dashboard/arbuzas_netdata_native_dashboard.py' \
+      '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}'
+    install -o root -g root -m 0644 \
+      '${remote_stage_root}/native-dashboard/arbuzas-netdata-native-dashboard.service' \
+      '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}'
+    install -o root -g root -m 0644 \
+      '${remote_stage_root}/native-dashboard/netdata-native-dashboard.conf' \
+      '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}'
+
+    dashboard_next='${NETDATA_REMOTE_DASHBOARD_DIR}.next.'\$\$
+    dashboard_previous='${NETDATA_REMOTE_DASHBOARD_DIR}.previous.'\$\$
+    rm -rf "\${dashboard_next}" "\${dashboard_previous}"
+    install -d -o root -g netdata -m 0755 "\${dashboard_next}"
+    tar -C '${remote_stage_root}/web/kitty-gration' -cf - . | \
+      tar --no-same-owner -C "\${dashboard_next}" -xf -
+    find "\${dashboard_next}" -type f -exec touch {} +
+    if [[ -d '${NETDATA_REMOTE_DASHBOARD_DIR}' && -f '${NETDATA_REMOTE_DASHBOARD_DIR}/build.json' ]]; then
+      previous_active_assets=\$(
+        python3 - '${NETDATA_REMOTE_DASHBOARD_DIR}/build.json' <<'PY'
+import json
+import re
+import sys
+
+assets = json.load(open(sys.argv[1], encoding='utf-8')).get('assets', [])
+for asset in assets:
+    if re.fullmatch(r'(?:app|native-mobile)\.[A-Z0-9]{8}\.(?:js|css)', str(asset)):
+        print(asset)
+PY
+      )
+      for previous_asset in \
+        '${NETDATA_REMOTE_DASHBOARD_DIR}'/app.*.js \
+        '${NETDATA_REMOTE_DASHBOARD_DIR}'/app.*.css \
+        '${NETDATA_REMOTE_DASHBOARD_DIR}'/native-mobile.*.js \
+        '${NETDATA_REMOTE_DASHBOARD_DIR}'/native-mobile.*.css; do
+        [[ -f "\${previous_asset}" && ! -L "\${previous_asset}" ]] || continue
+        previous_name=\${previous_asset##*/}
+        [[ "\${previous_name}" =~ ^(app|native-mobile)\.[A-Z0-9]{8}\.(js|css)$ ]] || continue
+        retain_previous=0
+        previous_was_active=0
+        if printf '%s\n' "\${previous_active_assets}" | grep -Fxq "\${previous_name}"; then
+          retain_previous=1
+          previous_was_active=1
+        elif [[ -n \$(find "\${previous_asset}" -mmin -1500 -print -quit) ]]; then
+          retain_previous=1
+        fi
+        if [[ "\${retain_previous}" == '1' && ! -e "\${dashboard_next}/\${previous_name}" ]]; then
+          if [[ "\${previous_was_active}" == '1' ]]; then
+            cp "\${previous_asset}" "\${dashboard_next}/\${previous_name}"
+          else
+            cp -p "\${previous_asset}" "\${dashboard_next}/\${previous_name}"
+          fi
+        fi
+      done
+    fi
+    chown -R root:netdata "\${dashboard_next}"
+    find "\${dashboard_next}" -type d -exec chmod 0755 {} +
+    find "\${dashboard_next}" -type f -exec chmod 0644 {} +
+    if [[ -d '${NETDATA_REMOTE_DASHBOARD_DIR}' ]]; then
+      mv '${NETDATA_REMOTE_DASHBOARD_DIR}' "\${dashboard_previous}"
+    fi
+    mv "\${dashboard_next}" '${NETDATA_REMOTE_DASHBOARD_DIR}'
+    rm -rf "\${dashboard_previous}"
+
+    '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' apply \
+      --web-root '${NETDATA_REMOTE_WEB_ROOT}' \
+      --manifest '${NETDATA_REMOTE_DASHBOARD_DIR}/build.json'
+    systemctl daemon-reload
+
+    rm -f /var/lib/netdata/cloud.d/claim.conf '${NETDATA_REMOTE_CONFIG_DIR}/claim.conf'
 
     systemctl enable netdata
     systemctl restart netdata
@@ -728,8 +1146,90 @@ install_remote_netdata() {
       sleep 5
     done
 
-    tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} 127.0.0.1:${ARBUZAS_NETDATA_PORT}
-  "
+    netdata_https_added=0
+    netdata_legacy_tcp_removed=0
+    if [[ \"\${netdata_serve_state}\" == 'legacy_tcp' ]]; then
+      tailscale serve --yes --tcp ${ARBUZAS_NETDATA_PORT} off
+      netdata_legacy_tcp_removed=1
+    fi
+    if [[ \"\${netdata_serve_state}\" != 'exact' ]]; then
+      if ! tailscale serve --bg --yes --https ${ARBUZAS_NETDATA_PORT} http://127.0.0.1:${ARBUZAS_NETDATA_PORT}; then
+        if [[ \"\${netdata_legacy_tcp_removed}\" == '1' ]]; then
+          tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} tcp://127.0.0.1:${ARBUZAS_NETDATA_PORT} || true
+        fi
+        echo 'failed to publish Netdata through private Tailscale HTTPS' >&2
+        exit 1
+      fi
+      netdata_https_added=1
+    fi
+
+    netdata_serve_after=\$(tailscale serve status --json | base64 | tr -d '\\n')
+    if ! NETDATA_SERVE_BEFORE=\"\${netdata_serve_before}\" \
+         NETDATA_SERVE_AFTER=\"\${netdata_serve_after}\" \
+         NETDATA_PORT='${ARBUZAS_NETDATA_PORT}' \
+         python3 - <<'PY'
+import base64
+import copy
+import json
+import os
+import subprocess
+
+port = os.environ['NETDATA_PORT']
+target = '127.0.0.1:' + port
+proxy_target = 'http://' + target
+before = json.loads(base64.b64decode(os.environ['NETDATA_SERVE_BEFORE']))
+after = json.loads(base64.b64decode(os.environ['NETDATA_SERVE_AFTER']))
+dns_name = json.loads(
+    subprocess.check_output(['tailscale', 'status', '--json'], text=True)
+).get('Self', {}).get('DNSName', '').rstrip('.')
+if not dns_name:
+    raise SystemExit('missing Tailscale DNS name for Netdata HTTPS')
+tcp = after.get('TCP', {}).get(port)
+web = {
+    key: value for key, value in after.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+allow_funnel = after.get('AllowFunnel') or {}
+if not isinstance(allow_funnel, dict):
+    raise SystemExit('unexpected Tailscale AllowFunnel shape')
+funnel = {
+    str(key): value for key, value in allow_funnel.items()
+    if str(key).rsplit(':', 1)[-1] == port
+}
+expected_web = {
+    dns_name + ':' + port: {
+        'Handlers': {'/': {'Proxy': proxy_target}}
+    }
+}
+if tcp != {'HTTPS': True} or web != expected_web or funnel:
+    raise SystemExit(
+        'unexpected Netdata Serve route: tcp={!r}, web={!r}, funnel={!r}'.format(
+            tcp, web, funnel
+        )
+    )
+
+def without_netdata_route(payload):
+    result = copy.deepcopy(payload)
+    result.get('TCP', {}).pop(port, None)
+    for key in list(result.get('Web', {})):
+        if key.rsplit(':', 1)[-1] == port:
+            result['Web'].pop(key, None)
+    return result
+
+if without_netdata_route(before) != without_netdata_route(after):
+    raise SystemExit('unrelated Tailscale Serve routes changed while adding Netdata')
+PY
+    then
+      if [[ \"\${netdata_https_added}\" == '1' ]]; then
+        tailscale serve --yes --https ${ARBUZAS_NETDATA_PORT} off || true
+      fi
+      if [[ \"\${netdata_legacy_tcp_removed}\" == '1' ]]; then
+        tailscale serve --bg --yes --tcp ${ARBUZAS_NETDATA_PORT} tcp://127.0.0.1:${ARBUZAS_NETDATA_PORT} || true
+      fi
+      echo 'failed to add the Netdata Tailscale route without changing unrelated routes' >&2
+      exit 1
+    fi
+  " 1
 }
 
 stage_memory_report_config_to_remote() {
@@ -908,28 +1408,6 @@ run_automatic_remote_docker_gc() {
   log "Cleanup warning: Docker/release cleanup failed on ${ARBUZAS_HOST}, but the release remains successful"
 }
 
-run_portainer_db_tool() {
-  (
-    cd "${PORTAINER_DB_TOOL_DIR}"
-    go run . "$@"
-  )
-}
-
-download_remote_portainer_db() {
-  local local_db_path="$1"
-  remote_shell "
-    portainer_container_id=\$(docker ps -a \
-      --filter 'label=com.docker.compose.project=arbuzas' \
-      --filter 'label=com.docker.compose.service=portainer' \
-      --format '{{.ID}}' | head -n 1)
-    [[ -n \"\${portainer_container_id}\" ]] || { echo 'Portainer container not found' >&2; exit 1; }
-    tmpfile=\$(mktemp /tmp/portainer.db.XXXXXX)
-    trap 'rm -f \"\${tmpfile}\"' EXIT
-    docker cp \"\${portainer_container_id}:/data/portainer.db\" \"\${tmpfile}\" >/dev/null
-    cat \"\${tmpfile}\"
-  " > "${local_db_path}"
-}
-
 upload_remote_file() {
   local local_path="$1"
   local remote_path="$2"
@@ -955,34 +1433,6 @@ upload_remote_file() {
     < "${local_path}"
 }
 
-backup_remote_portainer_data() {
-  local backup_path="$1"
-  local backup_filename="${backup_path##*/}"
-  remote_shell "
-    docker run --rm \
-      -v '${REMOTE_PORTAINER_DATA_DIR}:/from:ro' \
-      -v '${REMOTE_PORTAINER_BACKUPS_DIR}:/backup' \
-      '${PORTAINER_TOOLBOX_IMAGE}' \
-      sh -lc 'tar -C /from -czf \"/backup/${backup_filename}\" .'
-  "
-}
-
-install_remote_portainer_db() {
-  local local_db_path="$1"
-  local remote_tmp_path="$2"
-
-  upload_remote_file "${local_db_path}" "${remote_tmp_path}"
-  remote_shell "
-    portainer_container_id=\$(docker ps -a \
-      --filter 'label=com.docker.compose.project=arbuzas' \
-      --filter 'label=com.docker.compose.service=portainer' \
-      --format '{{.ID}}' | head -n 1)
-    [[ -n \"\${portainer_container_id}\" ]] || { echo 'Portainer container not found' >&2; exit 1; }
-    docker cp '${remote_tmp_path}' \"\${portainer_container_id}:/data/portainer.db\" >/dev/null
-    rm -f '${remote_tmp_path}'
-  "
-}
-
 usage() {
   cat <<'EOF'
 Usage: deploy.sh ACTION [options]
@@ -996,10 +1446,9 @@ Actions:
   install-memory-report   Install the corrected host memory report service and timer on the live host
   validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot
   install-netdata   Install Netdata plus hardware monitoring packages on the live host and publish it privately over Tailscale
-  validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected Arbuzas hardware charts
+  validate-netdata  Validate the live Netdata host install, private Tailscale access, and expected host charts
   install-thinkpad-fan   Install the Arbuzas ThinkPad fan controller on the live host
   validate-thinkpad-fan  Validate the live ThinkPad fan controller and current control mode
-  repair-portainer  Backup and repair Portainer state in place, disable Docker Swarm, and restart Portainer on the standalone Docker socket
   mirror-pull       Pull deployment variables and secrets from the host into the local plaintext mirror
   mirror-audit      Compare the local host mirror with the host and report drift before deploy
   mirror-push       Push local host mirror changes to the host when the host has not drifted
@@ -1016,10 +1465,10 @@ Options:
   --env-file PATH
 
 Services:
-  portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
-  subscription_bot, subscription_tunnel, ticket_phone_bridge,
-  chatgpt_broker, chatgpt_bot, ticket_remote_spacetime_sidecar,
-  ticket_remote, ticket_remote_tunnel, qbittorrent, qbittorrent_housekeeper,
+  train_bot, train_tunnel, satiksme_bot, satiksme_tunnel, subscription_bot,
+  subscription_tunnel, ticket_phone_bridge,
+  ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel,
+  qbittorrent, qbittorrent_housekeeper,
   jellyfin
 EOF
 }
@@ -1126,10 +1575,6 @@ is_known_service() {
 mark_validation_group() {
   local group_name="$1"
   case "${group_name}" in
-    portainer)
-      VALIDATE_PORTAINER=1
-      append_unique DIAGNOSTIC_SERVICES portainer
-      ;;
     train)
       VALIDATE_TRAIN=1
       append_unique DIAGNOSTIC_SERVICES train_bot
@@ -1148,11 +1593,6 @@ mark_validation_group() {
     ticket_phone_bridge)
       VALIDATE_TICKET_PHONE_BRIDGE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
-      ;;
-    chatgpt)
-      VALIDATE_CHATGPT=1
-      append_unique DIAGNOSTIC_SERVICES chatgpt_broker
-      append_unique DIAGNOSTIC_SERVICES chatgpt_bot
       ;;
     ticket_remote)
       VALIDATE_TICKET_REMOTE=1
@@ -1188,10 +1628,6 @@ resolve_requested_services() {
 
   for service_name in "${REQUESTED_SERVICES[@]}"; do
     case "${service_name}" in
-      portainer)
-        append_unique COMPOSE_TARGET_SERVICES portainer
-        mark_validation_group portainer
-        ;;
       train_bot)
         append_unique COMPOSE_TARGET_SERVICES train_bot
         append_unique COMPOSE_TARGET_SERVICES train_tunnel
@@ -1223,16 +1659,6 @@ resolve_requested_services() {
       ticket_phone_bridge)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
         mark_validation_group ticket_phone_bridge
-        ;;
-      chatgpt_broker)
-        append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
-        append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
-        mark_validation_group chatgpt
-        ;;
-      chatgpt_bot)
-        append_unique COMPOSE_TARGET_SERVICES chatgpt_broker
-        append_unique COMPOSE_TARGET_SERVICES chatgpt_bot
-        mark_validation_group chatgpt
         ;;
       ticket_remote)
         if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
@@ -1324,13 +1750,10 @@ compose_all_service_args() {
   local service_args=""
   local service_name
   local all_services=(
-    portainer
     train_bot
     satiksme_bot
     subscription_bot
     ticket_phone_bridge
-    chatgpt_broker
-    chatgpt_bot
     ticket_remote_spacetime_sidecar
     ticket_remote
     qbittorrent
@@ -1531,7 +1954,7 @@ resolve_remote_tailscale_ipv6() {
 }
 
 
-resolve_remote_tailscale_hostname() {
+resolve_remote_tailnet_self_name() {
   local hostname=""
 
   hostname="$(
@@ -1541,9 +1964,9 @@ import json
 import subprocess
 
 payload = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
-hostname = payload.get('Self', {}).get('HostName', '').strip()
+hostname = payload.get('Self', {}).get('DNSName', '').strip().rstrip('.')
 if not hostname:
-    raise SystemExit('missing Arbuzas Tailscale hostname')
+    raise SystemExit('missing Arbuzas Tailscale DNS name')
 print(hostname)
 PY
     " 2>/dev/null | tail -n 1 | tr -d '\r\n[:space:]'
@@ -1554,7 +1977,7 @@ PY
 }
 
 validate_remote_netdata() {
-  local tailnet_ipv4=""
+  local tailnet_dns_name=""
 
   log "Validate: netdata service active"
   remote_root_command "
@@ -1586,12 +2009,109 @@ validate_remote_netdata() {
     done
   "
 
-  log "Validate: Netdata stays unclaimed on the live host"
+  log "Validate: the shared dashboard API contract returns current data"
   remote_root_command "
-    [[ ! -f /var/lib/netdata/cloud.d/claim.conf ]]
+    NETDATA_DASHBOARD_API_ROOT='http://127.0.0.1:${ARBUZAS_NETDATA_PORT}' \
+    python3 - <<'PY'
+import json
+import math
+import os
+import time
+import urllib.request
+
+base = os.environ['NETDATA_DASHBOARD_API_ROOT']
+queries = {
+    'cpu': (
+        '/api/v3/data?contexts=system.cpu&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'user', 'system'},
+    ),
+    'memory': (
+        '/api/v3/data?contexts=system.ram&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'free', 'used', 'cached', 'buffers'},
+    ),
+    'load': (
+        '/api/v3/data?contexts=system.load&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'load1'},
+    ),
+    'network': (
+        '/api/v3/data?contexts=system.net&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'received', 'sent'},
+    ),
+    'disk I/O': (
+        '/api/v3/data?contexts=disk.io&instances=disk.sda&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'reads', 'writes'},
+    ),
+    'disk utilization': (
+        '/api/v3/data?contexts=disk.util&instances=disk_util.sda&after=-900&points=60&time_group=avg&group_by=dimension',
+        {'utilization'},
+    ),
+    'disk space': (
+        '/api/v3/data?contexts=disk.space&instances=disk_space.%2F&after=-60&points=1&time_group=avg&group_by=dimension',
+        {'avail', 'used', 'reserved for root'},
+    ),
+    'uptime': (
+        '/api/v3/data?contexts=system.uptime&after=-60&points=1&time_group=avg&group_by=dimension',
+        {'uptime'},
+    ),
+    'services': (
+        '/api/v3/data?contexts=systemd.service_unit_state&after=-60&points=1&time_group=avg&group_by=instance,dimension',
+        set(),
+    ),
+    'container CPU': (
+        '/api/v3/data?contexts=cgroup.cpu&after=-60&points=1&time_group=avg&group_by=instance',
+        set(),
+    ),
+    'container memory': (
+        '/api/v3/data?contexts=cgroup.mem_usage&after=-60&points=1&time_group=avg&group_by=instance',
+        set(),
+    ),
+}
+
+def fetch(path):
+    request = urllib.request.Request(base + path, headers={'Accept': 'application/json'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+nodes = fetch('/api/v3/nodes').get('nodes')
+if not isinstance(nodes, list) or not nodes or not nodes[0].get('v'):
+    raise SystemExit('dashboard nodes endpoint did not return the Netdata node and version')
+
+alarms = fetch('/api/v1/alarms?active').get('alarms')
+if not isinstance(alarms, dict):
+    raise SystemExit('dashboard alarms endpoint did not return an alarms object')
+
+for name, (path, required_labels) in queries.items():
+    result = fetch(path).get('result', {})
+    labels = result.get('labels')
+    rows = result.get('data')
+    if not isinstance(labels, list) or labels[:1] != ['time'] or not isinstance(rows, list) or not rows:
+        raise SystemExit(f'dashboard {name} query returned no labeled data rows')
+    missing = required_labels.difference(labels)
+    if missing:
+        raise SystemExit(f'dashboard {name} query is missing labels: {sorted(missing)}')
+    timestamps = [float(row[0]) for row in rows if isinstance(row, list) and row and math.isfinite(float(row[0]))]
+    if not timestamps or time.time() - max(timestamps) > 120:
+        raise SystemExit(f'dashboard {name} query returned delayed metric samples')
+
+    if name == 'services':
+        for service in ('containerd', 'docker', 'netdata', 'ssh', 'tailscaled'):
+            if not any(f'unit_{service}_service_state@' in str(label) for label in labels):
+                raise SystemExit(f'dashboard services query is missing {service}.service')
+    elif name == 'container CPU' and not any('.cpu@' in str(label) for label in labels):
+        raise SystemExit('dashboard container CPU query returned no container instances')
+    elif name == 'container memory' and not any('.mem_usage@' in str(label) for label in labels):
+        raise SystemExit('dashboard container memory query returned no container instances')
+PY
   "
 
-  log "Validate: Netdata keeps Docker polling disabled on the live host"
+  log "Validate: Netdata stays private, unclaimed, and opted out of telemetry"
+  remote_root_command "
+    [[ ! -f /var/lib/netdata/cloud.d/claim.conf ]]
+    [[ ! -f '${NETDATA_REMOTE_CONFIG_DIR}/claim.conf' ]]
+    [[ -f '${NETDATA_REMOTE_CONFIG_DIR}/.opt-out-from-anonymous-statistics' ]]
+  "
+
+  log "Validate: Netdata keeps focused host-service collection and Docker polling disabled"
   remote_root_command "
     [[ -f '${NETDATA_REMOTE_DOCKER_CONFIG_FILE}' ]] || {
       echo 'missing Netdata Docker override: ${NETDATA_REMOTE_DOCKER_CONFIG_FILE}' >&2
@@ -1601,71 +2121,399 @@ validate_remote_netdata() {
       echo 'missing Netdata Docker service-discovery override: ${NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE}' >&2
       exit 1
     }
+    [[ -f '${NETDATA_REMOTE_SYSTEMD_CONFIG_FILE}' ]] || {
+      echo 'missing Netdata systemd units config: ${NETDATA_REMOTE_SYSTEMD_CONFIG_FILE}' >&2
+      exit 1
+    }
     grep -F 'disabled: yes' '${NETDATA_REMOTE_DOCKER_CONFIG_FILE}' >/dev/null
     grep -F 'disabled: yes' '${NETDATA_REMOTE_DOCKER_SD_CONFIG_FILE}' >/dev/null
+    grep -F 'name: kitty-gration-core' '${NETDATA_REMOTE_SYSTEMD_CONFIG_FILE}' >/dev/null
+  "
+
+  log "Validate: the native Netdata dashboard is responsive and package-update resilient"
+  remote_root_command "
+    [[ -x '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' && \
+       ! -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' ]] || {
+      echo 'missing safe native Netdata dashboard patcher' >&2
+      exit 1
+    }
+    [[ -f '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}' && \
+       ! -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}' ]] || {
+      echo 'missing native Netdata dashboard systemd service' >&2
+      exit 1
+    }
+    [[ -f '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}' && \
+       ! -L '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}' ]] || {
+      echo 'missing native Netdata dashboard systemd drop-in' >&2
+      exit 1
+    }
+    [[ \$(stat -c '%u:%g:%a' '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}') == '0:0:755' ]]
+    [[ \$(stat -c '%u:%g:%a' '${NETDATA_REMOTE_NATIVE_DASHBOARD_SERVICE}') == '0:0:644' ]]
+    [[ \$(stat -c '%u:%g:%a' '${NETDATA_REMOTE_NATIVE_DASHBOARD_DROPIN}') == '0:0:644' ]]
+    systemctl show --value --property=Wants netdata.service | tr ' ' '\n' | \
+      grep -Fx 'arbuzas-netdata-native-dashboard.service' >/dev/null
+    systemctl show --value --property=After netdata.service | tr ' ' '\n' | \
+      grep -Fx 'arbuzas-netdata-native-dashboard.service' >/dev/null
+    '${NETDATA_REMOTE_NATIVE_DASHBOARD_PATCHER}' check \
+      --web-root '${NETDATA_REMOTE_WEB_ROOT}'
+
+    netdata_package_verify=\$(mktemp)
+    trap 'rm -f \"\${netdata_package_verify}\"' EXIT
+    dpkg --verify netdata-dashboard > \"\${netdata_package_verify}\" || true
+    NETDATA_NATIVE_WEB_ROOT='${NETDATA_REMOTE_WEB_ROOT}' \
+    NETDATA_NATIVE_BASE='http://127.0.0.1:${ARBUZAS_NETDATA_PORT}' \
+    NETDATA_PACKAGE_VERIFY=\"\${netdata_package_verify}\" \
+    python3 - <<'PY'
+import json
+import os
+import re
+import stat
+import urllib.request
+from pathlib import Path
+
+root = Path(os.environ['NETDATA_NATIVE_WEB_ROOT'])
+entrypoints = [
+    root / 'index.html',
+    root / 'v3/agent.html',
+    root / 'v3/index.html',
+    root / 'v3/local-agent.html',
+]
+marker = '<!-- arbuzas-native-mobile:start -->'
+manifest = json.loads((root / 'kitty-gration/build.json').read_text(encoding='utf-8'))
+native = manifest.get('nativeMobile', {})
+script_name = native.get('script')
+stylesheet_name = native.get('stylesheet')
+if not isinstance(script_name, str) or not isinstance(stylesheet_name, str):
+    raise SystemExit('native mobile manifest is missing its script or stylesheet')
+quote = chr(34)
+stylesheet_tag = (
+    f'<link rel={quote}stylesheet{quote} href={quote}/kitty-gration/{stylesheet_name}{quote} '
+    f'data-kitty-netdata-mobile={quote}stylesheet{quote}>'
+)
+script_tag = (
+    f'<script defer src={quote}/kitty-gration/{script_name}{quote} '
+    f'data-kitty-netdata-mobile={quote}script{quote}></script>'
+)
+viewport = re.compile(
+    r'<meta\b[^>]*\bname\s*=\s*(?:\x22|\x27)viewport(?:\x22|\x27)[^>]*>',
+    re.IGNORECASE,
+)
+device_width = re.compile(r'\bwidth\s*=\s*device-width\b', re.IGNORECASE)
+managed = set()
+for path in entrypoints:
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f'native Netdata entrypoint is missing or unsafe: {path}')
+    details = path.stat()
+    if details.st_uid != 0 or details.st_gid != 0:
+        raise SystemExit(f'native Netdata entrypoint is not root-owned: {path}')
+    if stat.S_IMODE(details.st_mode) != 0o644:
+        raise SystemExit(f'native Netdata entrypoint mode is not 0644: {path}')
+    document = path.read_text(encoding='utf-8')
+    matches = list(viewport.finditer(document))
+    if len(matches) != 1 or not device_width.search(matches[0].group(0)):
+        raise SystemExit(f'native Netdata entrypoint has no unique responsive viewport: {path}')
+    if document.count(marker) != 1:
+        raise SystemExit(f'native Netdata entrypoint has no unique managed block: {path}')
+    if document.count(stylesheet_tag) != 1 or document.count(script_tag) != 1:
+        raise SystemExit(f'native Netdata entrypoint does not reference the current mobile assets: {path}')
+    if marker in document:
+        managed.add(str(path))
+
+reported = set()
+verify_path = Path(os.environ['NETDATA_PACKAGE_VERIFY'])
+for line in verify_path.read_text(encoding='utf-8').splitlines():
+    fields = line.split()
+    if fields:
+        reported.add(fields[-1])
+unexpected = reported.difference(managed)
+missing = managed.difference(reported)
+if unexpected:
+    raise SystemExit(f'unexpected modified netdata-dashboard package files: {sorted(unexpected)!r}')
+if missing:
+    raise SystemExit(f'dpkg did not report the managed native HTML changes: {sorted(missing)!r}')
+
+base = os.environ['NETDATA_NATIVE_BASE']
+for path in ('/', '/v3/agent.html', '/v3/', '/v3/local-agent.html'):
+    with urllib.request.urlopen(base + path, timeout=30) as response:
+        served = response.read().decode('utf-8')
+    if served.count(stylesheet_tag) != 1 or served.count(script_tag) != 1:
+        raise SystemExit(f'Netdata did not serve the current native mobile assets at {path}')
+PY
+  "
+
+  log "Validate: the shared Kitty-gration dashboard is installed and served"
+  remote_root_command "
+    NETDATA_DASHBOARD_DIR='${NETDATA_REMOTE_DASHBOARD_DIR}' \
+    NETDATA_DASHBOARD_URL='http://127.0.0.1:${ARBUZAS_NETDATA_PORT}/kitty-gration/' \
+    python3 - <<'PY'
+import json
+import os
+import re
+import stat
+import urllib.request
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+root = Path(os.environ['NETDATA_DASHBOARD_DIR'])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit('managed Kitty-gration dashboard directory is missing or unsafe')
+
+manifest_path = root / 'build.json'
+manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+if manifest.get('dashboard') != 'Kitty-gration Operations':
+    raise SystemExit('unexpected Kitty-gration dashboard manifest name')
+if manifest.get('ui') != 'arrow' or manifest.get('api') != 'netdata-v3':
+    raise SystemExit('Kitty-gration dashboard manifest is missing its UI or API contract')
+
+assets = manifest.get('assets')
+if not isinstance(assets, list) or len(assets) != 4:
+    raise SystemExit('Kitty-gration dashboard manifest must list four hashed assets')
+native_mobile = manifest.get('nativeMobile')
+if not isinstance(native_mobile, dict) or set(native_mobile) != {'script', 'stylesheet', 'viewport'}:
+    raise SystemExit('Kitty-gration dashboard manifest is missing its exact nativeMobile contract')
+native_script_name = native_mobile.get('script')
+native_style_name = native_mobile.get('stylesheet')
+if not re.fullmatch(r'native-mobile\.[A-Z0-9]{8}\.js', str(native_script_name)):
+    raise SystemExit('native Netdata mobile JavaScript is not safely content-hashed')
+if not re.fullmatch(r'native-mobile\.[A-Z0-9]{8}\.css', str(native_style_name)):
+    raise SystemExit('native Netdata mobile stylesheet is not safely content-hashed')
+if native_mobile.get('viewport') != 'width=device-width, initial-scale=1, viewport-fit=cover':
+    raise SystemExit('native Netdata mobile viewport is unexpected')
+if native_script_name not in assets or native_style_name not in assets:
+    raise SystemExit('native Netdata mobile assets are absent from the manifest asset list')
+if len(set(assets)) != len(assets):
+    raise SystemExit('Kitty-gration dashboard manifest repeats an asset')
+expected_files = {'index.html', 'build.json', *assets}
+entries = list(root.iterdir())
+if any(path.is_symlink() or not path.is_file() for path in entries):
+    raise SystemExit('dashboard directory contains a symlink or non-file entry')
+actual_files = {path.name for path in entries}
+missing_files = expected_files.difference(actual_files)
+if missing_files:
+    raise SystemExit(
+        'Kitty-gration dashboard is missing current files: {!r}'.format(sorted(missing_files))
+    )
+retained_assets = actual_files.difference(expected_files)
+invalid_retained = sorted(
+    name for name in retained_assets
+    if not re.fullmatch(r'(?:app|native-mobile)\.[A-Z0-9]{8}\.(?:js|css)', name)
+)
+if invalid_retained:
+    raise SystemExit(f'dashboard contains invalid retained assets: {invalid_retained!r}')
+
+for path in [root, *entries]:
+    details = path.stat()
+    if details.st_uid != 0:
+        raise SystemExit(f'dashboard path is not root-owned: {path}')
+    if path.is_dir():
+        if stat.S_IMODE(details.st_mode) != 0o755:
+            raise SystemExit(f'dashboard directory mode is not 0755: {path}')
+    elif stat.S_IMODE(details.st_mode) != 0o644:
+        raise SystemExit(f'dashboard file mode is not 0644: {path}')
+    if path.is_symlink():
+        raise SystemExit(f'dashboard path must not be a symlink: {path}')
+
+index = (root / 'index.html').read_text(encoding='utf-8')
+if 'Kitty-gration Operations' not in index or 'data-dashboard-build=' not in index:
+    raise SystemExit('Kitty-gration dashboard index is missing its visible title or build marker')
+for asset in assets:
+    if asset.startswith('app.') and './' + asset not in index:
+        raise SystemExit(f'dashboard index does not reference {asset}')
+    if not re.fullmatch(r'(?:app|native-mobile)\.[A-Z0-9]{8}\.(?:js|css)', str(asset)):
+        raise SystemExit(f'unsafe dashboard asset name: {asset}')
+
+script_name = next((asset for asset in assets if asset.startswith('app.') and asset.endswith('.js')), None)
+style_name = next((asset for asset in assets if asset.startswith('app.') and asset.endswith('.css')), None)
+if script_name is None or style_name is None:
+    raise SystemExit('dashboard manifest is missing its app JavaScript or CSS')
+script = (root / script_name).read_text(encoding='utf-8')
+stylesheet = (root / style_name).read_text(encoding='utf-8')
+for marker in (
+    'netdataDashboardUi',
+    '/api/v3/data?contexts=system.cpu',
+    '/api/v3/data?contexts=cgroup.cpu',
+    'Containers by memory',
+    'Core control plane',
+):
+    if marker not in script:
+        raise SystemExit(f'dashboard JavaScript is missing marker: {marker}')
+if '.summary-grid' not in stylesheet or '@media(max-width:720px)' not in stylesheet:
+    raise SystemExit('dashboard stylesheet is missing desktop or phone layout rules')
+
+native_script = (root / native_script_name).read_text(encoding='utf-8')
+native_stylesheet = (root / native_style_name).read_text(encoding='utf-8')
+selector_quote = chr(34)
+for marker in (
+    f'#main > [data-testid={selector_quote}collapsible{selector_quote}]',
+    f'[data-testid={selector_quote}sidebar-tabs{selector_quote}]',
+    f'[data-testid={selector_quote}sidebarHeader-icon{selector_quote}]',
+    'requestAnimationFrame',
+    'MutationObserver',
+    'kittyNetdataMobileShim',
+):
+    if marker not in native_script:
+        raise SystemExit(f'native Netdata mobile JavaScript is missing marker: {marker}')
+for marker in (
+    '@media(max-width:700px)',
+    '[data-testid=dashboard-list]',
+    '[data-menuid]',
+    'scroll-snap-type:x mandatory',
+    '[data-testid=chart][data-chartid]',
+):
+    if marker not in native_stylesheet:
+        raise SystemExit(f'native Netdata mobile stylesheet is missing marker: {marker}')
+
+with urllib.request.urlopen(os.environ['NETDATA_DASHBOARD_URL'], timeout=30) as response:
+    served_index = response.read().decode('utf-8')
+    cache_control = response.headers.get('Cache-Control', '').strip().lower()
+    expires = response.headers.get('Expires', '').strip()
+if 'Kitty-gration Operations' not in served_index:
+    raise SystemExit('Netdata did not serve the managed Kitty-gration dashboard')
+if cache_control == 'public':
+    if not expires:
+        raise SystemExit('cacheable dashboard index is missing an Expires header')
+    cache_seconds = (parsedate_to_datetime(expires).timestamp() - __import__('time').time())
+    if not 82_000 <= cache_seconds <= 88_000:
+        raise SystemExit(f'unexpected dashboard index cache lifetime: {cache_seconds:.0f} seconds')
+for asset in assets:
+    with urllib.request.urlopen(os.environ['NETDATA_DASHBOARD_URL'] + asset, timeout=30) as response:
+        if not response.read(1):
+            raise SystemExit(f'Netdata served an empty dashboard asset: {asset}')
+PY
   "
 
   log "Validate: netdata binds only to loopback"
   remote_root_command "
-    listeners=\$(ss -ltn sport = :${ARBUZAS_NETDATA_PORT} | tail -n +2 || true)
-    [[ -n \"\${listeners}\" ]] || {
+    netdata_pid=\$(systemctl show --value --property=MainPID netdata)
+    [[ \"\${netdata_pid}\" =~ ^[1-9][0-9]*$ ]] || {
+      echo 'Netdata has no active main process' >&2
+      exit 1
+    }
+    netdata_listeners=\$(ss -ltnpH 'sport = :${ARBUZAS_NETDATA_PORT}' | grep -F \"pid=\${netdata_pid},\" || true)
+    [[ -n \"\${netdata_listeners}\" ]] || {
       echo 'Netdata is not listening on port ${ARBUZAS_NETDATA_PORT}' >&2
       exit 1
     }
-    if printf '%s\n' \"\${listeners}\" | grep -E '(^|[[:space:]])0\\.0\\.0\\.0:${ARBUZAS_NETDATA_PORT}([[:space:]]|$)|\\[::\\]:${ARBUZAS_NETDATA_PORT}([[:space:]]|$)' >/dev/null; then
-      echo 'Netdata is listening publicly on port ${ARBUZAS_NETDATA_PORT}' >&2
+    unexpected_netdata_listeners=\$(
+      printf '%s\n' \"\${netdata_listeners}\" |
+        awk '{print \$4}' |
+        grep -Ev '^(127\\.0\\.0\\.1|\\[::1\\]):${ARBUZAS_NETDATA_PORT}$' || true
+    )
+    if [[ -n \"\${unexpected_netdata_listeners}\" ]]; then
+      printf 'Netdata has non-loopback listeners:\n%s\n' \"\${unexpected_netdata_listeners}\" >&2
       exit 1
     fi
   "
 
-  log "Validate: Netdata charts cover host, disk, container, and ThinkPad hardware metrics"
+  log "Validate: Netdata charts cover the host, disks, containers, and core services"
   remote_root_command "
     NETDATA_CHARTS_URL='http://127.0.0.1:${ARBUZAS_NETDATA_PORT}/api/v1/charts' \
+    NETDATA_INFO_URL='http://127.0.0.1:${ARBUZAS_NETDATA_PORT}/api/v1/info' \
+    NETDATA_EXPECTED_CONTAINERS=\"\$(docker ps --filter 'label=com.docker.compose.project=arbuzas' --format '{{.Names}}' | sort | tr '\\n' ',')\" \
     python3 - <<'PY'
 import json
 import os
 import sys
+import time
 import urllib.request
 
-with urllib.request.urlopen(os.environ['NETDATA_CHARTS_URL'], timeout=30) as response:
-    payload = json.load(response)
+with urllib.request.urlopen(os.environ['NETDATA_INFO_URL'], timeout=30) as response:
+    info = json.load(response)
 
-charts = payload.get('charts', {})
-descriptors = []
-for chart_id, chart in charts.items():
-    descriptor = ' '.join(
-        str(value)
-        for value in (
-            chart_id,
-            chart.get('name', ''),
-            chart.get('family', ''),
-            chart.get('context', ''),
-            chart.get('title', ''),
-            chart.get('type', ''),
-        )
-    ).lower()
-    descriptors.append(descriptor)
+reported_hostname = info.get('host_labels', {}).get('_hostname')
+if reported_hostname != 'kitty-gration':
+    print('unexpected Netdata hostname: {!r}'.format(reported_hostname), file=sys.stderr)
+    sys.exit(1)
 
-def has(predicate):
-    return any(predicate(descriptor) for descriptor in descriptors)
+expected_labels = {
+    'environment': 'production',
+    'role': 'application-host',
+    'stack': 'arbuzas',
+    'access': 'tailscale-private',
+}
+labels = info.get('host_labels', {})
+missing_labels = {
+    key: value for key, value in expected_labels.items()
+    if labels.get(key) != value
+}
+if missing_labels:
+    print(f'missing expected Netdata host labels: {missing_labels}', file=sys.stderr)
+    sys.exit(1)
 
-checks = {
-    'cpu': has(lambda descriptor: 'system.cpu' in descriptor or 'cpu utilization' in descriptor),
-    'memory': has(lambda descriptor: 'system.ram' in descriptor or 'ram utilization' in descriptor),
-    'filesystem': has(lambda descriptor: 'disk_space' in descriptor or 'disk space' in descriptor),
-    'disk_io': has(lambda descriptor: descriptor.startswith('disk.') or 'disk i/o' in descriptor or 'disk throughput' in descriptor),
-    'containers': has(
-        lambda descriptor: 'cgroup' in descriptor
-        or 'app.arbuzas-' in descriptor
-        or 'app.cloudflared' in descriptor
-    ),
-    'temperature': has(lambda descriptor: 'temperature' in descriptor and ('thinkpad' in descriptor or 'coretemp' in descriptor or 'cpu' in descriptor)),
-    'fan': has(lambda descriptor: 'fan' in descriptor and 'thinkpad' in descriptor),
+expected_containers = [
+    name for name in os.environ.get('NETDATA_EXPECTED_CONTAINERS', '').split(',')
+    if name
+]
+if not expected_containers:
+    print('no running Arbuzas containers were available for Netdata validation', file=sys.stderr)
+    sys.exit(1)
+
+expected_service_charts = {
+    'systemdunits_kitty-gration-core.unit_containerd_service_state',
+    'systemdunits_kitty-gration-core.unit_docker_service_state',
+    'systemdunits_kitty-gration-core.unit_netdata_service_state',
+    'systemdunits_kitty-gration-core.unit_ssh_service_state',
+    'systemdunits_kitty-gration-core.unit_tailscaled_service_state',
 }
 
-missing = [name for name, present in checks.items() if not present]
-if missing:
-    print('missing expected Netdata charts: ' + ', '.join(missing), file=sys.stderr)
+deadline = time.monotonic() + 90
+last_missing = []
+missing_container_charts = []
+missing_service_charts = []
+charts = {}
+while time.monotonic() < deadline:
+    with urllib.request.urlopen(os.environ['NETDATA_CHARTS_URL'], timeout=30) as response:
+        payload = json.load(response)
+
+    charts = payload.get('charts', {})
+    descriptors = []
+    for chart_id, chart in charts.items():
+        descriptor = ' '.join(
+            str(value)
+            for value in (
+                chart_id,
+                chart.get('name', ''),
+                chart.get('family', ''),
+                chart.get('context', ''),
+                chart.get('title', ''),
+                chart.get('type', ''),
+            )
+        ).lower()
+        descriptors.append(descriptor)
+
+    def has(predicate):
+        return any(predicate(descriptor) for descriptor in descriptors)
+
+    missing_container_charts = [
+        name for name in expected_containers
+        if 'cgroup_' + name + '.cpu' not in charts
+    ]
+    missing_service_charts = sorted(expected_service_charts.difference(charts))
+
+    checks = {
+        'cpu': has(lambda descriptor: 'system.cpu' in descriptor or 'cpu utilization' in descriptor),
+        'memory': has(lambda descriptor: 'system.ram' in descriptor or 'ram utilization' in descriptor),
+        'filesystem': has(lambda descriptor: 'disk_space' in descriptor or 'disk space' in descriptor),
+        'disk_io': has(lambda descriptor: descriptor.startswith('disk.') or 'disk i/o' in descriptor or 'disk throughput' in descriptor),
+        'containers': not missing_container_charts,
+        'core_services': not missing_service_charts,
+    }
+    last_missing = [name for name, present in checks.items() if not present]
+    if not last_missing:
+        break
+    time.sleep(5)
+else:
+    print('missing expected Netdata charts: ' + ', '.join(last_missing), file=sys.stderr)
+    if missing_container_charts:
+        print(
+            'missing Arbuzas container CPU charts: ' + ', '.join(missing_container_charts),
+            file=sys.stderr,
+        )
+    if missing_service_charts:
+        print(
+            'missing core service charts: ' + ', '.join(missing_service_charts),
+            file=sys.stderr,
+        )
     preview = '\n'.join(sorted(charts.keys())[:80])
     if preview:
         print(preview, file=sys.stderr)
@@ -1679,6 +2527,18 @@ docker_charts = sorted(
 if docker_charts:
     print('unexpected Docker charts still enabled: ' + ', '.join(docker_charts[:20]), file=sys.stderr)
     sys.exit(1)
+
+sensor_charts = sorted(
+    chart_id for chart_id, chart in charts.items()
+    if 'temperature' in chart_id.lower()
+    or 'fan' in chart_id.lower()
+    or 'temperature' in str(chart.get('context', '')).lower()
+    or 'fan' in str(chart.get('context', '')).lower()
+)
+if sensor_charts:
+    print('optional hardware sensor charts: ' + ', '.join(sensor_charts[:20]))
+else:
+    print('optional hardware sensor charts unavailable on this VPS')
 PY
   "
 
@@ -1697,21 +2557,73 @@ PY
     fi
   "
 
-  log "Validate: Tailscale serve publishes the Netdata TCP forwarder"
+  log "Validate: Tailscale Serve publishes the exact private Netdata HTTPS proxy"
   remote_root_command "
-    serve_status=\$(tailscale serve status 2>&1)
-    printf '%s\n' \"\${serve_status}\" >&2
-    printf '%s' \"\${serve_status}\" | grep -F '${ARBUZAS_NETDATA_PORT}' >/dev/null
+    netdata_serve_json=\$(tailscale serve status --json)
+    NETDATA_SERVE_JSON=\"\${netdata_serve_json}\" \
+    NETDATA_PORT='${ARBUZAS_NETDATA_PORT}' \
+    python3 - <<'PY'
+import json
+import os
+import subprocess
+
+payload = json.loads(os.environ['NETDATA_SERVE_JSON'])
+port = os.environ['NETDATA_PORT']
+target = '127.0.0.1:' + port
+proxy_target = 'http://' + target
+dns_name = json.loads(
+    subprocess.check_output(['tailscale', 'status', '--json'], text=True)
+).get('Self', {}).get('DNSName', '').rstrip('.')
+if not dns_name:
+    raise SystemExit('missing Tailscale DNS name for Netdata HTTPS')
+tcp = payload.get('TCP', {}).get(port)
+web = {
+    key: value for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+allow_funnel = payload.get('AllowFunnel') or {}
+if not isinstance(allow_funnel, dict):
+    raise SystemExit('unexpected Tailscale AllowFunnel shape')
+funnel = {
+    str(key): value for key, value in allow_funnel.items()
+    if str(key).rsplit(':', 1)[-1] == port
+}
+expected_web = {
+    dns_name + ':' + port: {
+        'Handlers': {'/': {'Proxy': proxy_target}}
+    }
+}
+if tcp != {'HTTPS': True} or web != expected_web or funnel:
+    raise SystemExit(
+        'unexpected Netdata Serve route: tcp={!r}, web={!r}, funnel={!r}'.format(
+            tcp, web, funnel
+        )
+    )
+PY
   "
 
-  tailnet_ipv4="$(resolve_remote_tailscale_ipv4)" || {
-    echo "failed to resolve the Arbuzas Tailscale IPv4 address" >&2
+  tailnet_dns_name="$(resolve_remote_tailnet_self_name)" || {
+    echo "failed to resolve the Arbuzas Tailscale DNS name" >&2
     exit 1
   }
 
-  log "Validate: netdata is reachable from this operator machine at http://${tailnet_ipv4}:${ARBUZAS_NETDATA_PORT}"
-  if ! wait_until_local_ok curl -fsS "http://${tailnet_ipv4}:${ARBUZAS_NETDATA_PORT}/api/v1/info" >/dev/null 2>&1; then
-    echo "Netdata did not answer over Tailscale at http://${tailnet_ipv4}:${ARBUZAS_NETDATA_PORT}/api/v1/info" >&2
+  log "Validate: netdata is reachable from this operator machine at https://${tailnet_dns_name}:${ARBUZAS_NETDATA_PORT}"
+  if ! wait_until_local_ok curl -fsS "https://${tailnet_dns_name}:${ARBUZAS_NETDATA_PORT}/api/v1/info" >/dev/null 2>&1; then
+    echo "Netdata did not answer over Tailscale at https://${tailnet_dns_name}:${ARBUZAS_NETDATA_PORT}/api/v1/info" >&2
+    exit 1
+  fi
+  native_netdata_html="$(curl -fsS "https://${tailnet_dns_name}:${ARBUZAS_NETDATA_PORT}/")" || {
+    echo "Native Netdata dashboard did not answer over Tailscale HTTPS" >&2
+    exit 1
+  }
+  if ! grep -F 'width=device-width' <<< "${native_netdata_html}" >/dev/null || \
+     ! grep -F 'data-kitty-netdata-mobile="stylesheet"' <<< "${native_netdata_html}" >/dev/null || \
+     ! grep -F 'data-kitty-netdata-mobile="script"' <<< "${native_netdata_html}" >/dev/null; then
+    echo "Native Netdata dashboard did not serve its responsive viewport over Tailscale HTTPS" >&2
+    exit 1
+  fi
+  if ! curl -fsS "https://${tailnet_dns_name}:${ARBUZAS_NETDATA_PORT}/kitty-gration/" | grep -F 'Kitty-gration Operations' >/dev/null; then
+    echo "Kitty-gration dashboard did not render its server-owned shell over Tailscale HTTPS" >&2
     exit 1
   fi
 }
@@ -1915,7 +2827,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -1957,7 +2869,6 @@ included_roots = [
     pathlib.Path("workloads/train-bot"),
     pathlib.Path("workloads/satiksme-bot"),
     pathlib.Path("workloads/subscription-bot"),
-    pathlib.Path("workloads/chatgpt-broker"),
     pathlib.Path("workloads/ticket-remote"),
     pathlib.Path("workloads/qbittorrent-housekeeper"),
 ]
@@ -2014,7 +2925,6 @@ ARBUZAS_TRAIN_BOT_PORT=${ARBUZAS_TRAIN_BOT_PORT}
 ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
 ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
-ARBUZAS_CHATGPT_BROKER_PORT=${ARBUZAS_CHATGPT_BROKER_PORT}
 ARBUZAS_QBITTORRENT_WEBUI_PORT=${ARBUZAS_QBITTORRENT_WEBUI_PORT}
 ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT=${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}
 ARBUZAS_QBITTORRENT_PEER_PORT=${ARBUZAS_QBITTORRENT_PEER_PORT}
@@ -2041,7 +2951,6 @@ ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIE
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}
 ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN=${ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN:-}
-ARBUZAS_PORTAINER_IMAGE=${ARBUZAS_PORTAINER_IMAGE}
 ARBUZAS_CLOUDFLARED_IMAGE=${ARBUZAS_CLOUDFLARED_IMAGE}
 ARBUZAS_TICKET_CLOUDFLARED_IMAGE=${ARBUZAS_TICKET_CLOUDFLARED_IMAGE}
 EOF
@@ -2059,7 +2968,6 @@ prepare_local_release_bundle() {
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
   copy_tree_into_release "workloads/subscription-bot"
-  copy_tree_into_release "workloads/chatgpt-broker"
   copy_tree_into_release "workloads/ticket-remote"
   copy_tree_into_release "workloads/qbittorrent-housekeeper"
 
@@ -2078,6 +2986,9 @@ copy_tree_into_fast_release_overlay() {
 
 prepare_local_fast_release_overlay() {
   local service_name
+  local fast_runtime_ids=""
+  local fast_runtime_uid=""
+  local fast_runtime_gid=""
 
   log "Preparing selected-service release overlay ${ARBUZAS_RELEASE_ID}"
   rm -rf "${ARBUZAS_RELEASE_DIR}"
@@ -2098,9 +3009,6 @@ prepare_local_fast_release_overlay() {
       subscription_bot)
         copy_tree_into_fast_release_overlay "workloads/subscription-bot"
         ;;
-      chatgpt_broker|chatgpt_bot)
-        copy_tree_into_fast_release_overlay "workloads/chatgpt-broker"
-        ;;
       ticket_remote_spacetime_sidecar|ticket_remote)
         copy_tree_into_fast_release_overlay "workloads/ticket-remote"
         ;;
@@ -2112,7 +3020,7 @@ prepare_local_fast_release_overlay() {
         copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
         copy_tree_into_fast_release_overlay "infra/arbuzas/jellyfin"
         ;;
-      portainer|train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
         ;;
       *)
         echo "No fast release overlay mapping for service: ${service_name}" >&2
@@ -2120,6 +3028,21 @@ prepare_local_fast_release_overlay() {
         ;;
     esac
   done
+
+  fast_runtime_ids="$(remote_inline_shell "printf '%s:%s\\n' \"\$(id -u)\" \"\$(id -g)\"")"
+  IFS=: read -r fast_runtime_uid fast_runtime_gid <<< "${fast_runtime_ids}"
+  [[ "${fast_runtime_uid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive fast-release runtime UID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+  [[ "${fast_runtime_gid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive fast-release runtime GID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+  ARBUZAS_QBITTORRENT_PUID="${fast_runtime_uid}"
+  ARBUZAS_QBITTORRENT_PGID="${fast_runtime_gid}"
+  ARBUZAS_JELLYFIN_PUID="${fast_runtime_uid}"
+  ARBUZAS_JELLYFIN_PGID="${fast_runtime_gid}"
 
   prepare_local_release_metadata
   append_unique FAST_RELEASE_OVERLAY_PATHS "tools/arbuzas"
@@ -2185,8 +3108,6 @@ prepare_remote_host_layout() {
     docker compose version >/dev/null 2>&1 || { echo 'docker compose is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     command -v python3 >/dev/null 2>&1 || { echo 'python3 is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     mkdir -p \
-      '/srv/arbuzas/portainer' \
-      '/srv/arbuzas/portainer-backups' \
       '/srv/arbuzas/train-bot/run' \
       '/srv/arbuzas/train-bot/state' \
       '/srv/arbuzas/train-bot/data/schedules' \
@@ -2221,6 +3142,58 @@ qbittorrent_deployment_selected() {
   targeted_service_selected qbittorrent || targeted_service_selected qbittorrent_housekeeper
 }
 
+stabilize_remote_declared_docker_no_swap_limits() {
+  remote_root_command "
+    command -v docker >/dev/null 2>&1 || { echo 'docker is required to stabilize declared no-swap limits' >&2; exit 1; }
+    command -v systemctl >/dev/null 2>&1 || { echo 'systemctl is required to stabilize declared no-swap limits' >&2; exit 1; }
+
+    while IFS= read -r container_id; do
+      [[ -n \"\${container_id}\" ]] || continue
+      [[ \"\${container_id}\" =~ ^[0-9a-f]{64}$ ]] || {
+        echo \"Docker returned an invalid full container ID: \${container_id}\" >&2
+        exit 1
+      }
+      read -r memory_limit memory_swap_limit < <(
+        docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' \"\${container_id}\"
+      )
+      [[ \"\${memory_limit}\" =~ ^[1-9][0-9]*$ ]] || continue
+      [[ \"\${memory_swap_limit}\" == \"\${memory_limit}\" ]] || continue
+
+      docker update \
+        --memory \"\${memory_limit}\" \
+        --memory-swap \"\${memory_swap_limit}\" \
+        \"\${container_id}\" >/dev/null
+
+      scope_unit=\"docker-\${container_id}.scope\"
+      systemctl is-active --quiet \"\${scope_unit}\" || {
+        echo \"Missing active Docker systemd scope: \${scope_unit}\" >&2
+        exit 1
+      }
+      systemctl set-property --runtime \"\${scope_unit}\" MemorySwapMax=0 >/dev/null
+
+      systemd_swap_limit=\$(systemctl show --property=MemorySwapMax --value \"\${scope_unit}\")
+      [[ \"\${systemd_swap_limit}\" == '0' ]] || {
+        echo \"\${scope_unit} retained MemorySwapMax=\${systemd_swap_limit}\" >&2
+        exit 1
+      }
+      control_group=\$(systemctl show --property=ControlGroup --value \"\${scope_unit}\")
+      [[ \"\${control_group}\" == /*/\"\${scope_unit}\" ]] || {
+        echo \"Unexpected control group for \${scope_unit}: \${control_group}\" >&2
+        exit 1
+      }
+      cgroup_swap_file=\"/sys/fs/cgroup\${control_group}/memory.swap.max\"
+      [[ -r \"\${cgroup_swap_file}\" ]] || {
+        echo \"Unreadable swap limit for \${scope_unit}: \${cgroup_swap_file}\" >&2
+        exit 1
+      }
+      grep -Fx '0' \"\${cgroup_swap_file}\" >/dev/null || {
+        echo \"\${scope_unit} did not retain a zero cgroup swap limit\" >&2
+        exit 1
+      }
+    done < <(docker ps -q --no-trunc)
+  "
+}
+
 restart_existing_qbittorrent_slice() {
   remote_shell "
     for service_name in qbittorrent qbittorrent_housekeeper; do
@@ -2232,7 +3205,8 @@ restart_existing_qbittorrent_slice() {
         docker start \"\${container_id}\" >/dev/null
       fi
     done
-  "
+  " || return $?
+  stabilize_remote_declared_docker_no_swap_limits
 }
 
 prepare_remote_qbittorrent_runtime() {
@@ -2311,6 +3285,8 @@ if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
 managed = {
     'ARBUZAS_QBITTORRENT_PUID': uid,
     'ARBUZAS_QBITTORRENT_PGID': gid,
+    'ARBUZAS_JELLYFIN_PUID': uid,
+    'ARBUZAS_JELLYFIN_PGID': gid,
 }
 lines = []
 for line in path.read_text(encoding='utf-8').splitlines():
@@ -2618,7 +3594,6 @@ if existing_tcp is not None or existing_web:
         raise SystemExit(f'refusing to overwrite existing Tailscale Serve :{port}: tcp={existing_tcp!r} web={existing_web!r}')
 PY
 
-    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
     panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
       'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
     [[ "\${panel_code}" != '000' ]] || { echo 'existing Tailscale Serve :10000 did not answer before qBittorrent publish' >&2; exit 1; }
@@ -2674,7 +3649,6 @@ proxy = handler.get('Proxy')
 if proxy != target:
     raise SystemExit(f'Tailscale Serve {hostname}:{port} points to {proxy!r}, expected {target!r}')
 PY
-    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
     panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
       'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
     [[ "\${panel_code}" != '000' ]] || { echo 'existing Tailscale Serve :10000 stopped answering after qBittorrent publish' >&2; exit 1; }
@@ -2765,7 +3739,6 @@ if view['tcp'] is not None or view['web']:
     if view['tcp'] != {'HTTPS': True} or handler.get('Proxy') != target or len(view['web']) != 1:
         raise SystemExit(f'refusing to overwrite Tailscale Serve :{port}: {view!r}')
 PY
-    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
     test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
       'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
     tailscale serve --bg --yes \
@@ -2823,7 +3796,6 @@ handler = web.get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
 if tcp != {'HTTPS': True} or handler.get('Proxy') != target or len(web) != 1:
     raise SystemExit(f'Jellyfin Tailscale Serve :{port} is not the exact managed HTTPS route')
 PY
-    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
     test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
       'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
     curl -fsS --connect-timeout 3 --max-time 8 \
@@ -2868,11 +3840,18 @@ rollback_release_before_qbittorrent() {
     [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas \
+    compose_args=(docker compose --project-name arbuzas \
       --env-file '${REMOTE_CURRENT_LINK}/release.env' \
-      -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' \
-      up -d --remove-orphans
+      -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
+    retired_service_args=()
+    for retired_service in portainer chatgpt_broker chatgpt_bot; do
+      if \"\${compose_args[@]}\" config --services | grep -Fxq \"\${retired_service}\"; then
+        retired_service_args+=(--scale \"\${retired_service}=0\")
+      fi
+    done
+    \"\${compose_args[@]}\" up -d --remove-orphans \"\${retired_service_args[@]}\"
   " || return 1
+  stabilize_remote_declared_docker_no_swap_limits || return 1
 
   # Automatic recovery removes only a route added by this invocation. An
   # explicit manual rollback forces removal of the exact managed route. Both
@@ -2968,7 +3947,7 @@ validate_release_before_qbittorrent_recovery() {
   validate_remote_host_probe "${remote_release_dir}" "pre-qBittorrent release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
-      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services)
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot)$')
       deadline=\$((SECONDS + 180))
       while (( SECONDS < deadline )); do
         running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
@@ -2983,14 +3962,15 @@ validate_release_before_qbittorrent_recovery() {
       (( missing == 0 ))
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=qbittorrent')\"
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=qbittorrent_housekeeper')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=portainer')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_broker')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_bot')\"
       if [[ '${require_route_absent}' == '1' ]]; then
         tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
       fi
-      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
       panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
         'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
-      [[ \"\${panel_code}\" != '000' ]]" \
-    portainer
+      [[ \"\${panel_code}\" != '000' ]]"
 }
 
 previous_release_has_jellyfin() {
@@ -3099,7 +4079,6 @@ if '${remove_managed_route}' == '1':
 elif target_view(before) != target_view(after):
     raise SystemExit(f'Tailscale Serve :{port} changed during ownership-preserving Jellyfin rollback')
 PY
-    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
     test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
       'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
   "
@@ -3132,13 +4111,20 @@ rollback_release_before_jellyfin() {
       [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
-      docker compose --project-name arbuzas \
+      compose_args=(docker compose --project-name arbuzas \
         --env-file '${REMOTE_CURRENT_LINK}/release.env' \
-        -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' \
-        up -d --remove-orphans
+        -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
+      retired_service_args=()
+      for retired_service in portainer chatgpt_broker chatgpt_bot; do
+        if \"\${compose_args[@]}\" config --services | grep -Fxq \"\${retired_service}\"; then
+          retired_service_args+=(--scale \"\${retired_service}=0\")
+        fi
+      done
+      \"\${compose_args[@]}\" up -d --remove-orphans \"\${retired_service_args[@]}\"
     " || return 1
   fi
 
+  stabilize_remote_declared_docker_no_swap_limits || return 1
   remove_remote_jellyfin_tailscale_route "${cleanup_mode}"
 }
 
@@ -3155,7 +4141,7 @@ validate_release_before_jellyfin_recovery() {
   validate_remote_host_probe "${remote_release_dir}" "pre-Jellyfin release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
-      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services)
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot)$')
       deadline=\$((SECONDS + 180))
       while (( SECONDS < deadline )); do
         running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
@@ -3169,13 +4155,15 @@ validate_release_before_jellyfin_recovery() {
       done
       (( missing == 0 ))
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=jellyfin')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=portainer')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_broker')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_bot')\"
       if [[ '${require_route_absent}' == '1' ]]; then
         tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
       fi
-      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
       test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
         'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3" \
-    portainer qbittorrent qbittorrent_housekeeper
+    qbittorrent qbittorrent_housekeeper
 }
 
 copy_release_to_remote() {
@@ -3250,12 +4238,15 @@ copy_fast_release_overlay_to_remote() {
     for overlay_path in${overlay_path_args}; do
       sudo -n rm -rf '${remote_tmp_dir}/'\"\${overlay_path}\"
     done
+    if [[ -d '${remote_tmp_dir}/workloads/chatgpt-broker' ]]; then
+      sudo -n find '${remote_tmp_dir}/workloads/chatgpt-broker' -depth -delete
+    fi
     sudo -n tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
     sudo -n rm -f '${remote_tarball}'
     [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete fast overlay: missing release.env' >&2; exit 1; }
     [[ -f '${remote_tmp_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'incomplete fast overlay: missing compose.yml' >&2; exit 1; }
     [[ -f '${remote_tmp_dir}/tools/arbuzas/render_cloudflared_config.py' ]] || { echo 'incomplete fast overlay: missing tunnel renderer' >&2; exit 1; }
-    for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote; do
+    for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote; do
       [[ -d '${remote_tmp_dir}/'\"\${required_root}\" ]] || {
         echo \"incomplete fast overlay: missing \${required_root}\" >&2
         exit 1
@@ -3361,8 +4352,6 @@ remote_compose_up() {
           satiksme_bot=arbuzas/satiksme-bot \
           subscription_bot=arbuzas/subscription-bot \
           ticket_phone_bridge=arbuzas/ticket-phone-bridge \
-          chatgpt_broker=arbuzas/chatgpt-broker \
-          chatgpt_bot=arbuzas/chatgpt-bot \
           ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
           ticket_remote=arbuzas/ticket-remote \
           qbittorrent=arbuzas/qbittorrent \
@@ -3391,7 +4380,8 @@ remote_compose_up() {
       if [[ -n '${tunnel_service_args}' ]]; then
         docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
       fi
-    "
+    " || return $?
+    stabilize_remote_declared_docker_no_swap_limits
     return
   fi
 
@@ -3403,7 +4393,8 @@ remote_compose_up() {
     if [[ -n '${tunnel_service_args}' ]]; then
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
     fi
-  "
+  " || return $?
+  stabilize_remote_declared_docker_no_swap_limits
 }
 
 cleanup_remote_public_bundle_versions() {
@@ -3528,15 +4519,6 @@ validate_remote_running_services() {
     "${services[@]}"
 }
 
-validate_remote_portainer_health() {
-  local remote_release_dir="$1"
-
-  validate_remote_running_services "${remote_release_dir}" "expected services running" portainer
-  validate_remote_probe "${remote_release_dir}" "portainer responds" \
-    "wait_until_ok sh -lc 'curl -skf https://127.0.0.1:9443 >/dev/null 2>/dev/null'" \
-    portainer
-}
-
 validate_remote_train_public_hardening() {
   local remote_release_dir="$1"
 
@@ -3570,9 +4552,17 @@ def request(path, method='GET', body=None, headers=None, follow_redirects=True):
     opener = urllib.request.build_opener() if follow_redirects else urllib.request.build_opener(NoRedirect)
     try:
         with opener.open(req, timeout=10) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read().decode('utf-8', 'replace')
+            response_headers = {k.lower(): v for k, v in response.headers.items()}
+            csp_headers = response.headers.get_all('Content-Security-Policy') or []
+            if csp_headers:
+                response_headers['content-security-policy'] = '\n'.join(csp_headers)
+            return response.status, response_headers, response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as error:
-        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read().decode('utf-8', 'replace')
+        error_headers = {k.lower(): v for k, v in error.headers.items()}
+        csp_headers = error.headers.get_all('Content-Security-Policy') or []
+        if csp_headers:
+            error_headers['content-security-policy'] = '\n'.join(csp_headers)
+        return error.code, error_headers, error.read().decode('utf-8', 'replace')
 
 def strip_named_js_function(source, name):
     marker = '\n  function ' + name + '('
@@ -3733,6 +4723,35 @@ def assert_public_json_cache_not_long_immutable(path, headers):
     if int(match.group(1)) > 60:
         raise SystemExit(f'{path} public JSON max-age too large: {value}')
 
+def frame_ancestors_directives(csp):
+    directives = []
+    for policy in re.split(r'[,\n]+', csp):
+        for directive in policy.split(';'):
+            parts = directive.strip().split()
+            if parts and parts[0].lower() == 'frame-ancestors':
+                directives.append(parts[1:])
+    return directives
+
+def assert_shell_framing(path, headers, allow_telegram_webapp):
+    csp = headers.get('content-security-policy', '')
+    x_frame_options = headers.get('x-frame-options', '')
+    frame_ancestors = frame_ancestors_directives(csp)
+    telegram_origin = 'https://web.telegram.org'
+    none_source = chr(39) + 'none' + chr(39)
+    if allow_telegram_webapp:
+        if x_frame_options:
+            raise SystemExit(f'{path} blocks Telegram Web with X-Frame-Options: {x_frame_options}')
+        if not frame_ancestors:
+            raise SystemExit(f'{path} CSP does not allow Telegram Web framing: {csp}')
+        for sources in frame_ancestors:
+            if telegram_origin not in sources or none_source in sources:
+                raise SystemExit(f'{path} has a conflicting frame-ancestors policy: {csp}')
+        return
+    if x_frame_options.lower() != 'deny':
+        raise SystemExit(f'{path} unexpected X-Frame-Options: {x_frame_options}')
+    if [none_source] not in frame_ancestors:
+        raise SystemExit(f'{path} CSP does not deny framing: {csp}')
+
 def assert_shell_route(path, expected_mode, allow_telegram_webapp=False):
     status, route_headers, route_body = request(path)
     if status != 200:
@@ -3744,6 +4763,8 @@ def assert_shell_route(path, expected_mode, allow_telegram_webapp=False):
         raise SystemExit(f'HEAD {path} shell status {head_status}')
     assert_no_store(path, head_headers)
     assert_noindex(path, head_headers)
+    assert_shell_framing(path, route_headers, allow_telegram_webapp)
+    assert_shell_framing('HEAD ' + path, head_headers, allow_telegram_webapp)
     route_csp = route_headers.get('content-security-policy', '')
     if unsafe_inline in route_csp:
         raise SystemExit(f'{path} CSP still allows inline code: {route_csp}')
@@ -4366,12 +5387,18 @@ def request(path, method='GET', body=None, headers=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             response_headers = {k.lower(): v for k, v in response.headers.items()}
+            csp_headers = response.headers.get_all('Content-Security-Policy') or []
+            if csp_headers:
+                response_headers['content-security-policy'] = '\n'.join(csp_headers)
             set_cookies = response.headers.get_all('Set-Cookie') or []
             if set_cookies:
                 response_headers['set-cookie'] = '\n'.join(set_cookies)
             return response.status, response_headers, response.read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as error:
         error_headers = {k.lower(): v for k, v in error.headers.items()}
+        csp_headers = error.headers.get_all('Content-Security-Policy') or []
+        if csp_headers:
+            error_headers['content-security-policy'] = '\n'.join(csp_headers)
         set_cookies = error.headers.get_all('Set-Cookie') or []
         if set_cookies:
             error_headers['set-cookie'] = '\n'.join(set_cookies)
@@ -4513,6 +5540,35 @@ def assert_public_json_cache_not_long_immutable(path, headers):
     if int(match.group(1)) > 60:
         raise SystemExit(f'{path} public JSON max-age too large: {value}')
 
+def frame_ancestors_directives(csp):
+    directives = []
+    for policy in re.split(r'[,\n]+', csp):
+        for directive in policy.split(';'):
+            parts = directive.strip().split()
+            if parts and parts[0].lower() == 'frame-ancestors':
+                directives.append(parts[1:])
+    return directives
+
+def assert_shell_framing(path, headers, allow_telegram_webapp):
+    csp = headers.get('content-security-policy', '')
+    x_frame_options = headers.get('x-frame-options', '')
+    frame_ancestors = frame_ancestors_directives(csp)
+    telegram_origin = 'https://web.telegram.org'
+    none_source = chr(39) + 'none' + chr(39)
+    if allow_telegram_webapp:
+        if x_frame_options:
+            raise SystemExit(f'{path} blocks Telegram Web with X-Frame-Options: {x_frame_options}')
+        if not frame_ancestors:
+            raise SystemExit(f'{path} CSP does not allow Telegram Web framing: {csp}')
+        for sources in frame_ancestors:
+            if telegram_origin not in sources or none_source in sources:
+                raise SystemExit(f'{path} has a conflicting frame-ancestors policy: {csp}')
+        return
+    if x_frame_options.lower() != 'deny':
+        raise SystemExit(f'{path} unexpected X-Frame-Options: {x_frame_options}')
+    if [none_source] not in frame_ancestors:
+        raise SystemExit(f'{path} CSP does not deny framing: {csp}')
+
 def walk_json(value, callback, trail='$'):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -4548,6 +5604,8 @@ def assert_shell_route(path, expected_mode, expect_leaflet=True, expect_telegram
     assert_no_store(path, head_headers)
     assert_noindex(path, head_headers)
     assert_no_satiksme_headers(path, route_headers)
+    assert_shell_framing(path, route_headers, expect_telegram_webapp)
+    assert_shell_framing('HEAD ' + path, head_headers, expect_telegram_webapp)
     route_csp = route_headers.get('content-security-policy', '')
     if unsafe_inline in route_csp:
         raise SystemExit(f'{path} CSP still allows inline code: {route_csp}')
@@ -4692,6 +5750,7 @@ else:
 
 for path, mode, expect_leaflet, expect_telegram_webapp in [
     ('/app', 'public', True, True),
+    ('/app?view=incidents', 'public-incidents', False, True),
     ('/incidents', 'public-incidents', False, False),
     ('/-incidents', 'public-incidents', False, False),
 ]:
@@ -5223,6 +6282,9 @@ validate_remote_train_workload_health() {
   validate_remote_probe "${remote_release_dir}" "train public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
+  validate_remote_probe "${remote_release_dir}" "train Telegram Mini App embeds in Telegram Web" \
+    "wait_until_ok sh -lc 'headers=\$(curl -fsSI https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/app | tr -d \"\\r\"); printf \"%s\\n\" \"\${headers}\" | grep -Fi \"content-security-policy:\" | grep -F \"frame-ancestors https://web.telegram.org\" >/dev/null && ! printf \"%s\\n\" \"\${headers}\" | grep -Fi \"x-frame-options:\" >/dev/null'" \
+    train_bot train_tunnel
   validate_remote_probe "${remote_release_dir}" "train public OIDC metadata" \
     "wait_until_ok sh -lc 'body=\$(curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc/.well-known/openid-configuration) && printf %s \"\${body}\" | grep -F \"\\\"issuer\\\":\\\"https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc\\\"\" >/dev/null && printf %s \"\${body}\" | grep -F \"\\\"jwks_uri\\\":\\\"https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/oidc/jwks.json\\\"\" >/dev/null'" \
     train_bot train_tunnel
@@ -5352,6 +6414,9 @@ validate_remote_satiksme_workload_health() {
   validate_remote_probe "${remote_release_dir}" "satiksme public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
     satiksme_bot satiksme_tunnel
+  validate_remote_probe "${remote_release_dir}" "satiksme Telegram Mini App embeds in Telegram Web" \
+    "wait_until_ok sh -lc 'headers=\$(curl -fsSI https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/app | tr -d \"\\r\"); printf \"%s\\n\" \"\${headers}\" | grep -Fi \"content-security-policy:\" | grep -F \"frame-ancestors https://web.telegram.org\" >/dev/null && ! printf \"%s\\n\" \"\${headers}\" | grep -Fi \"x-frame-options:\" >/dev/null'" \
+    satiksme_bot satiksme_tunnel
   validate_remote_probe "${remote_release_dir}" "satiksme local internal health is detailed" \
     "wait_until_ok compose exec -T satiksme_bot sh -lc 'body=\$(curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/internal/health) && printf %s \"\${body}\" | grep -F runtime >/dev/null && printf %s \"\${body}\" | grep -F assets >/dev/null && printf %s \"\${body}\" | grep -F catalog >/dev/null'" \
     satiksme_bot satiksme_tunnel
@@ -5436,15 +6501,6 @@ validate_remote_ticket_phone_bridge_workload_health() {
   validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
     "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
     ticket_phone_bridge
-}
-
-validate_remote_chatgpt_workload_health() {
-  local remote_release_dir="$1"
-
-  validate_remote_running_services "${remote_release_dir}" "expected services running" chatgpt_broker chatgpt_bot
-  validate_remote_probe "${remote_release_dir}" "chatgpt broker local health" \
-    "wait_until_ok compose exec -T chatgpt_broker sh -lc 'curl -fsS \"http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz\" >/dev/null 2>/dev/null'" \
-    chatgpt_broker chatgpt_bot
 }
 
 validate_remote_qbittorrent_workload_health() {
@@ -5657,8 +6713,7 @@ for key, expected in expected_environment.items():
         raise SystemExit(f'housekeeper {key}={actual!r}, expected {expected!r}')
 if 'QBITTORRENT_USERNAME' in environment or 'QBITTORRENT_PASSWORD_FILE' in environment:
     raise SystemExit('housekeeper unexpectedly has qBittorrent login credentials')
-PY
-      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null" \
+PY" \
     qbittorrent qbittorrent_housekeeper
   validate_remote_host_probe "${remote_release_dir}" "qBittorrent Tailscale route preserves HTTPS :10000" \
     "tmp=\$(mktemp)
@@ -5774,8 +6829,9 @@ if host_config.get('Tmpfs') not in ({}, None):
     raise SystemExit(f'Jellyfin unexpectedly uses RAM-backed tmpfs: {host_config.get("Tmpfs")!r}')
 if state.get('OOMKilled') is not False:
     raise SystemExit('Jellyfin has recorded an out-of-memory kill')
-if config.get('User') != expected_user:
-    raise SystemExit(f'Jellyfin runs as {config.get("User")!r}, expected {expected_user!r}')
+actual_user = config.get('User')
+if actual_user != expected_user:
+    raise SystemExit(f'Jellyfin runs as {actual_user!r}, expected {expected_user!r}')
 
 web = ports.get('${ARBUZAS_JELLYFIN_INTERNAL_PORT}/tcp') or []
 if web != [{'HostIp': '127.0.0.1', 'HostPort': '${ARBUZAS_JELLYFIN_HOST_PORT}'}]:
@@ -6069,10 +7125,6 @@ validate_remote_selected_smoke_health() {
         esac
       done
 
-      if [[ '${VALIDATE_PORTAINER}' == '1' ]]; then
-        case \" \${running} \" in *' portainer '*) ;; *) return 1 ;; esac
-        curl -skf --connect-timeout 2 --max-time 4 https://127.0.0.1:9443/ >/dev/null 2>&1 || return 1
-      fi
       if [[ '${VALIDATE_TRAIN}' == '1' ]]; then
         compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
         curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
@@ -6088,11 +7140,6 @@ validate_remote_selected_smoke_health() {
       if [[ '${VALIDATE_TICKET_PHONE_BRIDGE}' == '1' ]]; then
         case \" \${running} \" in *' ticket_phone_bridge '*) ;; *) return 1 ;; esac
         compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null' >/dev/null 2>&1 || return 1
-      fi
-      if [[ '${VALIDATE_CHATGPT}' == '1' ]]; then
-        case \" \${running} \" in *' chatgpt_broker '*) ;; *) return 1 ;; esac
-        case \" \${running} \" in *' chatgpt_bot '*) ;; *) return 1 ;; esac
-        compose exec -T chatgpt_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz >/dev/null' >/dev/null 2>&1 || return 1
       fi
       if [[ '${VALIDATE_QBITTORRENT}' == '1' ]]; then
         for service_name in qbittorrent qbittorrent_housekeeper; do
@@ -6150,12 +7197,10 @@ validate_remote_selected_smoke_health() {
 validate_remote_workload_health() {
   local remote_release_dir="$1"
 
-  validate_remote_portainer_health "${remote_release_dir}"
   validate_remote_train_workload_health "${remote_release_dir}"
   validate_remote_satiksme_workload_health "${remote_release_dir}"
   validate_remote_subscription_workload_health "${remote_release_dir}"
   validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
-  validate_remote_chatgpt_workload_health "${remote_release_dir}"
   validate_remote_qbittorrent_workload_health "${remote_release_dir}"
   validate_remote_jellyfin_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
@@ -6164,9 +7209,6 @@ validate_remote_workload_health() {
 validate_remote_selected_workload_health() {
   local remote_release_dir="$1"
 
-  if (( VALIDATE_PORTAINER == 1 )); then
-    validate_remote_portainer_health "${remote_release_dir}"
-  fi
   if (( VALIDATE_TRAIN == 1 )); then
     validate_remote_train_workload_health "${remote_release_dir}"
   fi
@@ -6178,9 +7220,6 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_TICKET_PHONE_BRIDGE == 1 )); then
     validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
-  fi
-  if (( VALIDATE_CHATGPT == 1 )); then
-    validate_remote_chatgpt_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_QBITTORRENT == 1 )); then
     validate_remote_qbittorrent_workload_health "${remote_release_dir}"
@@ -6249,36 +7288,60 @@ validate_remote_host_baseline() {
   local remote_release_dir="$1"
 
   validate_remote_swarm_baseline "${remote_release_dir}"
-  validate_remote_portainer_state "${remote_release_dir}"
+  validate_remote_retired_portainer_absence "${remote_release_dir}"
+  validate_remote_retired_chatgpt_absence "${remote_release_dir}"
 }
 
-validate_remote_portainer_state() {
+validate_remote_retired_portainer_absence() {
   local remote_release_dir="$1"
-  local tmpdir
-  local local_db_path
   local diagnostics_services=()
 
   populate_current_diagnostic_services diagnostics_services
 
-  log "Validate: Portainer state uses ${PORTAINER_LOCAL_ENDPOINT} and no longer stores ${PORTAINER_AGENT_ENDPOINT}"
-  tmpdir="$(mktemp -d)"
-  local_db_path="${tmpdir}/portainer.db"
+  validate_remote_host_probe "${remote_release_dir}" \
+    "retired Portainer container and port stay absent" \
+    "
+      container_ids=\$(docker ps -aq \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter 'label=com.docker.compose.service=portainer')
+      [[ -z \"\${container_ids}\" ]] || {
+        echo \"retired Portainer containers remain: \${container_ids}\" >&2
+        exit 1
+      }
+      listeners=\$(ss -ltnH 'sport = :9443' || true)
+      [[ -z \"\${listeners}\" ]] || {
+        echo \"retired Portainer port 9443 is still listening: \${listeners}\" >&2
+        exit 1
+      }
+    " \
+    "${diagnostics_services[@]}"
+}
 
-  if ! download_remote_portainer_db "${local_db_path}"; then
-    rm -rf "${tmpdir}"
-    log "Validation failed: unable to download Portainer state from ${ARBUZAS_HOST}"
-    collect_remote_validation_diagnostics "${remote_release_dir}" "${diagnostics_services[@]}"
-    exit 1
-  fi
+validate_remote_retired_chatgpt_absence() {
+  local remote_release_dir="$1"
+  local diagnostics_services=()
 
-  if ! run_portainer_db_tool check "${local_db_path}" >&2; then
-    rm -rf "${tmpdir}"
-    log "Validation failed: Portainer still carries stale endpoint state"
-    collect_remote_validation_diagnostics "${remote_release_dir}" "${diagnostics_services[@]}"
-    exit 1
-  fi
+  populate_current_diagnostic_services diagnostics_services
 
-  rm -rf "${tmpdir}"
+  validate_remote_host_probe "${remote_release_dir}" \
+    "retired ChatGPT containers and broker port stay absent" \
+    "
+      for service_name in chatgpt_broker chatgpt_bot; do
+        container_ids=\$(docker ps -aq \\
+          --filter 'label=com.docker.compose.project=arbuzas' \\
+          --filter \"label=com.docker.compose.service=\${service_name}\")
+        [[ -z \"\${container_ids}\" ]] || {
+          echo \"retired ChatGPT containers remain for \${service_name}: \${container_ids}\" >&2
+          exit 1
+        }
+      done
+      listeners=\$(ss -ltnH 'sport = :9348' || true)
+      [[ -z \"\${listeners}\" ]] || {
+        echo \"retired ChatGPT broker port 9348 is still listening: \${listeners}\" >&2
+        exit 1
+      }
+    " \
+    "${diagnostics_services[@]}"
 }
 
 validate_remote_release() {
@@ -6303,10 +7366,7 @@ validate_remote_release() {
   if (( TARGETED_MODE == 1 )); then
     validate_remote_selected_workload_health "${remote_release_dir}"
     if [[ "${VALIDATION_PROFILE}" == "full" ]]; then
-      validate_remote_swarm_baseline "${remote_release_dir}"
-      if (( VALIDATE_PORTAINER == 1 )); then
-        validate_remote_portainer_state "${remote_release_dir}"
-      fi
+      validate_remote_host_baseline "${remote_release_dir}"
     fi
     return_remote_validation_status
     return
@@ -6341,116 +7401,6 @@ run_post_deploy_maintenance() {
   run_automatic_remote_docker_gc
 }
 
-repair_remote_portainer() {
-  local remote_release_dir="${REMOTE_CURRENT_LINK}"
-  local backup_timestamp
-  local backup_path
-  local tmpdir
-  local local_db_path
-  local repaired_db_path
-  local remote_upload_path
-  local has_portainer_db=0
-
-  validate_remote_probe "${remote_release_dir}" \
-    "release bundle exists" \
-    "[[ -f '${remote_release_dir}/release.env' ]]" \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
-  validate_remote_workload_health "${remote_release_dir}"
-
-  validate_remote_host_probe "${remote_release_dir}" \
-    "no active Swarm workloads remain" \
-    "
-      services=\$(docker service ls --format '{{.Name}}' 2>/dev/null || true)
-      stacks=\$(docker stack ls --format '{{.Name}}' 2>/dev/null || true)
-      if [[ -n \"\$(printf '%s' \"\${services}\" | awk 'NF')\" ]]; then
-        echo \"active Docker Swarm services detected: \${services}\" >&2
-        exit 1
-      fi
-      if [[ -n \"\$(printf '%s' \"\${stacks}\" | awk 'NF')\" ]]; then
-        echo \"active Docker Swarm stacks detected: \${stacks}\" >&2
-        exit 1
-      fi
-    " \
-    portainer train_bot satiksme_bot subscription_bot ticket_phone_bridge chatgpt_broker chatgpt_bot ticket_remote_spacetime_sidecar ticket_remote train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel
-
-  backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  backup_path="${REMOTE_PORTAINER_BACKUPS_DIR}/portainer-${backup_timestamp}.tar.gz"
-  remote_upload_path="/tmp/portainer.db.${backup_timestamp}"
-  tmpdir="$(mktemp -d)"
-  local_db_path="${tmpdir}/portainer.db"
-  repaired_db_path="${tmpdir}/portainer.repaired.db"
-
-  log "Repair: stopping Portainer and backing up ${REMOTE_PORTAINER_DATA_DIR} to ${backup_path}"
-  remote_compose_shell "${remote_release_dir}" "
-    compose stop portainer
-  "
-  if ! backup_remote_portainer_data "${backup_path}"; then
-    rm -rf "${tmpdir}"
-    remote_compose_shell "${remote_release_dir}" "compose up -d portainer"
-    echo "failed to back up Portainer data to ${backup_path}" >&2
-    exit 1
-  fi
-
-  if download_remote_portainer_db "${local_db_path}"; then
-    has_portainer_db=1
-    log "Repair: downloaded Portainer state for in-place repair"
-
-    log "Repair: rewriting stale Portainer endpoint state while preserving existing users and settings"
-    if ! run_portainer_db_tool repair "${local_db_path}" "${repaired_db_path}" >&2; then
-      rm -rf "${tmpdir}"
-      remote_compose_shell "${remote_release_dir}" "compose up -d portainer"
-      echo "failed to repair Portainer state in place" >&2
-      exit 1
-    fi
-
-    log "Repair: uploading repaired Portainer database"
-    if ! install_remote_portainer_db "${repaired_db_path}" "${remote_upload_path}"; then
-      rm -rf "${tmpdir}"
-      remote_compose_shell "${remote_release_dir}" "compose up -d portainer"
-      echo "failed to install repaired Portainer database" >&2
-      exit 1
-    fi
-  else
-    log "Repair: no existing Portainer database found, keeping the backup and continuing with a clean standalone restart"
-  fi
-
-  log "Repair: disabling Docker Swarm on ${ARBUZAS_HOST}"
-  if ! remote_shell "
-    swarm_state=\$(docker info --format '{{.Swarm.LocalNodeState}}')
-    case \"\${swarm_state}\" in
-      active)
-        docker swarm leave --force
-        ;;
-      inactive)
-        ;;
-      *)
-        echo \"unexpected Docker Swarm state: \${swarm_state}\" >&2
-        exit 1
-        ;;
-    esac
-  "; then
-    rm -rf "${tmpdir}"
-    remote_compose_shell "${remote_release_dir}" "compose up -d portainer"
-    echo "failed to disable Docker Swarm during Portainer repair" >&2
-    exit 1
-  fi
-
-  log "Repair: restarting Portainer on the standalone Docker socket"
-  remote_compose_shell "${remote_release_dir}" "
-    mkdir -p '${REMOTE_PORTAINER_DATA_DIR}'
-    compose up -d portainer
-  "
-
-  rm -rf "${tmpdir}"
-  validate_remote_release
-  log "Repair complete. Portainer backup saved at ${backup_path}"
-  if (( has_portainer_db == 1 )); then
-    log "Existing Portainer users and settings were preserved in place."
-  else
-    log "Manual action required: open https://${ARBUZAS_HOST}:9443 and complete the first-run Portainer setup to recreate the admin user."
-  fi
-}
-
 rollback_remote_release() {
   if [[ -z "${requested_release_id}" ]]; then
     echo "--release-id is required for rollback" >&2
@@ -6471,17 +7421,31 @@ rollback_remote_release() {
     cd '${remote_release_dir}'
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
+    compose_args=(docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
+    for retired_service in portainer chatgpt_broker chatgpt_bot; do
+      retired_container_ids=\$(docker ps -aq \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter \"label=com.docker.compose.service=\${retired_service}\")
+      if [[ -n \"\${retired_container_ids}\" ]]; then
+        if \"\${compose_args[@]}\" config --services | grep -Fxq \"\${retired_service}\"; then
+          \"\${compose_args[@]}\" rm -s -f \"\${retired_service}\"
+        else
+          docker rm -f \${retired_container_ids}
+        fi
+      fi
+    done
     if [[ '${TARGETED_MODE}' == '1' ]]; then
       if [[ -n '${rollback_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${rollback_service_args}
+        \"\${compose_args[@]}\" up -d --build --force-recreate --no-deps${rollback_service_args}
       fi
       if [[ -n '${rollback_tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${rollback_tunnel_service_args}
+        \"\${compose_args[@]}\" up -d --force-recreate --no-deps${rollback_tunnel_service_args}
       fi
     else
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --remove-orphans${rollback_service_args}
+      \"\${compose_args[@]}\" up -d --remove-orphans${rollback_service_args}
     fi
-  "
+  " || return $?
+  stabilize_remote_declared_docker_no_swap_limits
 }
 
 run_host_mirror() {
@@ -6571,11 +7535,12 @@ deploy_config_from_mirror() {
     cd '${REMOTE_CURRENT_LINK}'
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
   " || return $?
+  stabilize_remote_declared_docker_no_swap_limits
 }
 
 while (( $# > 0 )); do
   case "$1" in
-    deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|repair-portainer|mirror-pull|mirror-audit|mirror-push|deploy-config)
+    deploy|validate|rollback|cleanup-docker|memory-report|install-memory-report|validate-memory-report|install-netdata|validate-netdata|install-thinkpad-fan|validate-thinkpad-fan|mirror-pull|mirror-audit|mirror-push|deploy-config)
       if [[ -n "${action}" ]]; then
         echo "Only one action is allowed" >&2
         exit 2
@@ -6909,8 +7874,20 @@ case "${action}" in
     fi
     require_cmd base64
     remote_stage_root="$(stage_netdata_config_to_remote)"
+    netdata_rollback_root="/tmp/arbuzas-netdata-rollback.$$"
+    prepare_remote_netdata_rollback "${netdata_rollback_root}"
+    set -E
+    trap '
+      netdata_install_status=$?
+      trap - ERR
+      restore_remote_netdata_rollback "${netdata_rollback_root}" || true
+      exit "${netdata_install_status}"
+    ' ERR
     install_remote_netdata "${remote_stage_root}"
     validate_remote_netdata
+    trap - ERR
+    set +E
+    cleanup_remote_netdata_rollback "${netdata_rollback_root}"
     ;;
   validate-netdata)
     if [[ -n "${requested_release_id}" ]]; then
@@ -6935,12 +7912,5 @@ case "${action}" in
       exit 2
     fi
     validate_remote_thinkpad_fan
-    ;;
-  repair-portainer)
-    if [[ -n "${requested_release_id}" ]]; then
-      echo "--release-id is not supported for repair-portainer" >&2
-      exit 2
-    fi
-    repair_remote_portainer
     ;;
 esac

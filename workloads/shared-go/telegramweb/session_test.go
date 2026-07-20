@@ -26,6 +26,28 @@ func TestIssueSessionCookieUsesLaxSameSite(t *testing.T) {
 	}
 }
 
+func TestIssueSessionCookieUsesConfiguredSameSite(t *testing.T) {
+	t.Parallel()
+
+	cookie, err := IssueSessionCookie([]byte("0123456789abcdef0123456789abcdef"), SessionConfig{
+		CookieName: "test_session",
+		SessionTTL: time.Hour,
+		SameSite:   http.SameSiteNoneMode,
+	}, Auth{User: User{ID: 77}}, time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("IssueSessionCookie() error = %v", err)
+	}
+	if cookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("cookie.SameSite = %v, want None", cookie.SameSite)
+	}
+	if !cookie.Secure {
+		t.Fatal("cookie.Secure = false, want true")
+	}
+	if !cookie.HttpOnly {
+		t.Fatal("cookie.HttpOnly = false, want true")
+	}
+}
+
 func TestValidateInitDataAcceptsOptionalThirdPartySignature(t *testing.T) {
 	t.Parallel()
 

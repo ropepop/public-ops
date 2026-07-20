@@ -44,6 +44,7 @@ type SessionConfig struct {
 	CookieName       string
 	SessionTTL       time.Duration
 	Path             string
+	SameSite         http.SameSite
 	LanguageResolver func(string) string
 }
 
@@ -145,6 +146,10 @@ func IssueSessionCookie(secret []byte, cfg SessionConfig, auth Auth, now time.Ti
 	if path == "" {
 		path = "/"
 	}
+	sameSite := cfg.SameSite
+	if sameSite == 0 {
+		sameSite = http.SameSiteLaxMode
+	}
 	language := strings.TrimSpace(auth.User.LanguageCode)
 	if cfg.LanguageResolver != nil {
 		language = cfg.LanguageResolver(language)
@@ -166,7 +171,7 @@ func IssueSessionCookie(secret []byte, cfg SessionConfig, auth Auth, now time.Ti
 		HttpOnly: true,
 		MaxAge:   int(sessionTTL.Seconds()),
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: sameSite,
 	}, nil
 }
 

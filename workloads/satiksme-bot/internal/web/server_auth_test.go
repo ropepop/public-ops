@@ -130,6 +130,9 @@ func TestTelegramAuthLifecycle(t *testing.T) {
 	if sessionCookie == nil {
 		t.Fatalf("missing %s cookie", sessionCookieName)
 	}
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("browser session cookie SameSite = %v, want Lax", sessionCookie.SameSite)
+	}
 	clearedNonceCookie := cookieByName(completeResp.Cookies(), loginNonceCookieName)
 	if clearedNonceCookie == nil || clearedNonceCookie.Value != "" {
 		t.Fatalf("expected cleared login nonce cookie, got %#v", clearedNonceCookie)
@@ -609,8 +612,12 @@ func TestTelegramCompleteAcceptsSignedWidgetAuthResult(t *testing.T) {
 	if completeResp.StatusCode != http.StatusOK {
 		t.Fatalf("complete status = %d, want 200; body = %s", completeResp.StatusCode, mustReadBody(t, completeResp))
 	}
-	if sessionCookie := cookieByName(completeResp.Cookies(), sessionCookieName); sessionCookie == nil || sessionCookie.Value == "" {
+	sessionCookie := cookieByName(completeResp.Cookies(), sessionCookieName)
+	if sessionCookie == nil || sessionCookie.Value == "" {
 		t.Fatalf("missing session cookie after widget auth")
+	}
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("widget session cookie SameSite = %v, want Lax", sessionCookie.SameSite)
 	}
 	var payload map[string]any
 	if err := json.NewDecoder(completeResp.Body).Decode(&payload); err != nil {
@@ -670,6 +677,12 @@ func TestTelegramCompleteAcceptsMiniAppInitData(t *testing.T) {
 	sessionCookie := cookieByName(completeResp.Cookies(), sessionCookieName)
 	if sessionCookie == nil {
 		t.Fatalf("missing %s cookie", sessionCookieName)
+	}
+	if sessionCookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("Mini App session cookie SameSite = %v, want None", sessionCookie.SameSite)
+	}
+	if !sessionCookie.Secure || !sessionCookie.HttpOnly {
+		t.Fatalf("Mini App session cookie Secure=%v HttpOnly=%v, want both true", sessionCookie.Secure, sessionCookie.HttpOnly)
 	}
 
 	meReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/me", nil)
@@ -845,6 +858,15 @@ func TestAppRouteLoadsTelegramMiniAppBridgeBeforeWebsiteApp(t *testing.T) {
 		t.Fatalf("/app body missing Telegram Mini App shell flag: %s", body)
 	}
 	csp := rec.Header().Get("Content-Security-Policy")
+	if got := rec.Header().Get("X-Frame-Options"); got != "" {
+		t.Fatalf("/app X-Frame-Options = %q, want empty for Telegram Web embedding", got)
+	}
+	if !strings.Contains(csp, "frame-ancestors https://web.telegram.org") {
+		t.Fatalf("/app CSP does not allow Telegram Web embedding: %q", csp)
+	}
+	if strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("/app CSP still denies Telegram Web embedding: %q", csp)
+	}
 	if !strings.Contains(csp, "script-src ") || !strings.Contains(csp, "https://telegram.org") {
 		t.Fatalf("/app CSP missing Telegram script source: %q", csp)
 	}
@@ -852,6 +874,41 @@ func TestAppRouteLoadsTelegramMiniAppBridgeBeforeWebsiteApp(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("/app body unexpectedly exposes public write/direct config %s", forbidden)
 		}
+	}
+}
+
+func TestAppIncidentsViewKeepsTelegramMiniAppShell(t *testing.T) {
+	now := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
+	server, _ := newTelegramAuthTestServer(t, now)
+
+	req := httptest.NewRequest(http.MethodGet, "/app?view=incidents&incident=stop%3A3012", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/app?view=incidents status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"mode":"public-incidents"`) {
+		t.Fatalf("/app?view=incidents body missing public-incidents mode: %s", body)
+	}
+	if !strings.Contains(body, `"telegramMiniApp":true`) {
+		t.Fatalf("/app?view=incidents body missing Telegram Mini App shell flag: %s", body)
+	}
+	if strings.Contains(body, "/assets/leaflet/leaflet.js") {
+		t.Fatalf("/app?view=incidents body should not load Leaflet: %s", body)
+	}
+	bridgeIndex := strings.Index(body, "https://telegram.org/js/telegram-web-app.js")
+	appIndex := strings.Index(body, "/assets/app.js")
+	if bridgeIndex < 0 || appIndex < 0 || bridgeIndex > appIndex {
+		t.Fatalf("/app?view=incidents should load Telegram WebApp bridge before app.js: %s", body)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "" {
+		t.Fatalf("/app?view=incidents X-Frame-Options = %q, want empty for Telegram Web embedding", got)
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "frame-ancestors https://web.telegram.org") || strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("/app?view=incidents CSP does not preserve Telegram Web embedding: %q", csp)
 	}
 }
 

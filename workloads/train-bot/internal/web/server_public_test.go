@@ -388,6 +388,15 @@ func TestMiniAppShellLoadsOnlyTelegramWebAppScript(t *testing.T) {
 		t.Fatalf("mini-app shell should not preload Telegram login script: %s", body)
 	}
 	csp := res.Header().Get("Content-Security-Policy")
+	if got := res.Header().Get("X-Frame-Options"); got != "" {
+		t.Fatalf("mini-app shell X-Frame-Options = %q, want empty for Telegram Web embedding", got)
+	}
+	if !strings.Contains(csp, "frame-ancestors https://web.telegram.org") {
+		t.Fatalf("mini-app shell CSP does not allow Telegram Web embedding: %q", csp)
+	}
+	if strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("mini-app shell CSP still denies Telegram Web embedding: %q", csp)
+	}
 	if !strings.Contains(csp, "https://telegram.org") {
 		t.Fatalf("mini-app shell CSP missing Telegram WebApp script source: %q", csp)
 	}

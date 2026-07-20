@@ -1,0 +1,1036 @@
+{
+  "name": "Kitty-gration Operations",
+  "respectNodesScope": true,
+  "cards": {
+    "b1f969e4-8238-4887-a8f9-51c70f27deb8": {
+      "id": "b1f969e4-8238-4887-a8f9-51c70f27deb8",
+      "type": "text",
+      "text": "Kitty-gration Health",
+      "textType": "title"
+    },
+    "5d48fa47-3eee-468f-979e-b86214ac50fe": {
+      "id": "5d48fa47-3eee-468f-979e-b86214ac50fe",
+      "type": "stat",
+      "hideTitle": false,
+      "customTitle": "Online",
+      "icon": null,
+      "source": {
+        "kind": "nodes",
+        "scope": "all",
+        "groupBy": "nodeStatus"
+      },
+      "value": {
+        "kind": "value",
+        "select": [
+          "Live"
+        ]
+      },
+      "valueColor": "live",
+      "subvalue": null,
+      "compare": null,
+      "hideUnits": false,
+      "valueMode": "latest"
+    },
+    "efc1e6f1-18dd-4dce-89ad-e71c4f73ad87": {
+      "id": "efc1e6f1-18dd-4dce-89ad-e71c4f73ad87",
+      "type": "stat",
+      "hideTitle": false,
+      "customTitle": "Offline",
+      "icon": null,
+      "source": {
+        "kind": "nodes",
+        "scope": "all",
+        "groupBy": "nodeStatus"
+      },
+      "value": {
+        "kind": "value",
+        "select": [
+          "Offline"
+        ]
+      },
+      "valueColor": "offline",
+      "subvalue": null,
+      "compare": null,
+      "hideUnits": false,
+      "valueMode": "latest"
+    },
+    "4b4b3fd9-1776-4668-bf59-797872de77a9": {
+      "id": "4b4b3fd9-1776-4668-bf59-797872de77a9",
+      "type": "stat",
+      "hideTitle": false,
+      "customTitle": "Critical Alerts",
+      "icon": null,
+      "source": {
+        "kind": "nodes",
+        "scope": "all",
+        "groupBy": "alertStatus"
+      },
+      "value": {
+        "kind": "value",
+        "select": [
+          "critical"
+        ]
+      },
+      "valueColor": "critical",
+      "subvalue": null,
+      "compare": null,
+      "hideUnits": false,
+      "valueMode": "latest"
+    },
+    "8e0c5acf-4e75-435b-a073-210f3292e706": {
+      "id": "8e0c5acf-4e75-435b-a073-210f3292e706",
+      "type": "stat",
+      "hideTitle": false,
+      "customTitle": "Warning Alerts",
+      "icon": null,
+      "source": {
+        "kind": "nodes",
+        "scope": "all",
+        "groupBy": "alertStatus"
+      },
+      "value": {
+        "kind": "value",
+        "select": [
+          "warning"
+        ]
+      },
+      "valueColor": "warning",
+      "subvalue": null,
+      "compare": null,
+      "hideUnits": false,
+      "valueMode": "latest"
+    },
+    "aaccb7a8-19af-49c0-b585-530630133b41": {
+      "id": "aaccb7a8-19af-49c0-b585-530630133b41",
+      "type": "nodeGrid",
+      "hideTitle": false,
+      "customTitle": "Device Status Heatmap",
+      "selectedNodeIds": [],
+      "groupBy": null,
+      "colorBy": "status"
+    },
+    "5d4af823-0869-4e44-abe5-cfeda0575bff": {
+      "id": "5d4af823-0869-4e44-abe5-cfeda0575bff",
+      "type": "nodeBreakdown",
+      "hideTitle": false,
+      "customTitle": "Status Breakdown",
+      "source": {
+        "kind": "nodes",
+        "scope": "all",
+        "groupBy": "nodeStatus"
+      },
+      "display": "donut",
+      "labels": {},
+      "showTotal": false,
+      "labelHeader": "",
+      "maxSlices": 6
+    },
+    "98b7531d-b178-4aff-a6db-baa5e5d8e3e0": {
+      "id": "98b7531d-b178-4aff-a6db-baa5e5d8e3e0",
+      "type": "function",
+      "flavour": "feed",
+      "selectedFn": "feed",
+      "displayName": "Live Alert Stream",
+      "selectedNodeIds": [],
+      "visibleItems": [
+        "charts",
+        "table"
+      ],
+      "fnType": "table",
+      "flowView": "",
+      "defaultCharts": [],
+      "acceptedParams": [],
+      "columnVisibility": {},
+      "sortColumn": "",
+      "sortDirection": "descending",
+      "sortedColumns": [],
+      "pinnedColumns": [],
+      "groupByColumns": null,
+      "functionParamsFilters": {},
+      "pollingInterval": null,
+      "slice": true,
+      "hideTitle": false,
+      "customTitle": "Live Alert Stream",
+      "histogramId": null,
+      "alphabetical": [
+        "Alert Name",
+        "Description",
+        "Instance",
+        "json",
+        "source",
+        "Status",
+        "Tags",
+        "Timestamp"
+      ]
+    },
+    "04e7b58c-d377-44f3-9c18-1750186eb372": {
+      "id": "04e7b58c-d377-44f3-9c18-1750186eb372",
+      "type": "nodeInventory",
+      "hideTitle": false,
+      "customTitle": "Fleet Inventory",
+      "scope": "all",
+      "rowCap": 100
+    },
+    "d43a06a9-b645-45e2-a040-a62a39715751": {
+      "id": "d43a06a9-b645-45e2-a040-a62a39715751",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "system.cpu"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "stacked",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Total CPU utilization",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        0,
+        100
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "2e6be043-f06a-4aaa-a8a1-11e4c581adab": {
+      "id": "2e6be043-f06a-4aaa-a8a1-11e4c581adab",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "system.ram"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "stacked",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "System RAM",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "424dad91-3045-4f8d-97ea-b8261541ea03": {
+      "id": "424dad91-3045-4f8d-97ea-b8261541ea03",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "system.net"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "area",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Physical Network Interfaces Aggregated Bandwidth",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "79fb3808-2e9f-46d1-8f34-d70bdd60f131": {
+      "id": "79fb3808-2e9f-46d1-8f34-d70bdd60f131",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "system.load"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "line",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "System Load Average",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "d32fc37b-9368-4a46-aed0-f5d67e7101c1": {
+      "id": "d32fc37b-9368-4a46-aed0-f5d67e7101c1",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "disk.io"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "area",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Disk I/O Bandwidth",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "be8f6cc3-c528-4561-9911-234d65dd14a6": {
+      "id": "be8f6cc3-c528-4561-9911-234d65dd14a6",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "disk.util"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "area",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Disk Utilization Time",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "700a7e52-8eae-4ae0-a098-d6e7bb6a401d": {
+      "id": "700a7e52-8eae-4ae0-a098-d6e7bb6a401d",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "disk.space"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "stacked",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Disk Space Usage",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    },
+    "5b693b69-81d3-499e-86af-8bd1c336c530": {
+      "id": "5b693b69-81d3-499e-86af-8bd1c336c530",
+      "type": "chart",
+      "hideTitle": false,
+      "hideName": false,
+      "hideUnits": false,
+      "customTitle": "",
+      "contextScope": [
+        "systemd.service_unit_state"
+      ],
+      "nodesScope": [],
+      "nodeFilters": {},
+      "spreadGroupId": null,
+      "spreadAxis": null,
+      "spreadLabelKey": null,
+      "spreadKey": null,
+      "aggregationMethod": "avg",
+      "groupBy": [
+        "dimension"
+      ],
+      "groupByLabel": [],
+      "postAggregationMethod": "avg",
+      "postGroupBy": [
+        "selected"
+      ],
+      "postGroupByLabel": [],
+      "groupingMethod": "average",
+      "groupingTime": 0,
+      "chartType": "line",
+      "chartLibrary": "dygraph",
+      "selectedDimensions": [],
+      "selectedLabels": [],
+      "selectedNodes": [],
+      "selectedInstances": [],
+      "sparkline": false,
+      "selectedLegendDimensions": [],
+      "showingInfo": false,
+      "dimensionsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "instancesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "nodesSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "groupBySortBy": [],
+      "labelsSortBy": [
+        {
+          "id": "contribution",
+          "desc": true
+        }
+      ],
+      "dimensionsSort": "default",
+      "nodesExpanded": {},
+      "groupByExpanded": {},
+      "labelsExpanded": {},
+      "expanded": false,
+      "expandedHeight": 300,
+      "overlays": {},
+      "title": "Service Unit State",
+      "description": null,
+      "showPostAggregations": false,
+      "desiredUnits": [
+        "auto"
+      ],
+      "valueRange": [
+        null,
+        null
+      ],
+      "staticValueRange": null,
+      "enabledYAxis": true,
+      "enabledXAxis": true,
+      "legend": true,
+      "staticFractionDigits": null,
+      "selectedNodeLabelsFilter": [],
+      "points": null
+    }
+  },
+  "layout": {
+    "A": [
+      {
+        "id": "b1f969e4-8238-4887-a8f9-51c70f27deb8",
+        "left": 0,
+        "top": 0,
+        "width": 12,
+        "height": 1,
+        "minWidth": 1,
+        "minHeight": 0.5
+      },
+      {
+        "id": "5d48fa47-3eee-468f-979e-b86214ac50fe",
+        "left": 0,
+        "top": 1,
+        "width": 3,
+        "height": 3,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "efc1e6f1-18dd-4dce-89ad-e71c4f73ad87",
+        "left": 3,
+        "top": 1,
+        "width": 3,
+        "height": 3,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "4b4b3fd9-1776-4668-bf59-797872de77a9",
+        "left": 6,
+        "top": 1,
+        "width": 3,
+        "height": 3,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "8e0c5acf-4e75-435b-a073-210f3292e706",
+        "left": 9,
+        "top": 1,
+        "width": 3,
+        "height": 3,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "aaccb7a8-19af-49c0-b585-530630133b41",
+        "left": 0,
+        "top": 4,
+        "width": 8,
+        "height": 7,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "5d4af823-0869-4e44-abe5-cfeda0575bff",
+        "left": 8,
+        "top": 4,
+        "width": 4,
+        "height": 7,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "98b7531d-b178-4aff-a6db-baa5e5d8e3e0",
+        "left": 0,
+        "top": 17,
+        "width": 12,
+        "height": 6,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "04e7b58c-d377-44f3-9c18-1750186eb372",
+        "left": 0,
+        "top": 23,
+        "width": 12,
+        "height": 6,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "d43a06a9-b645-45e2-a040-a62a39715751",
+        "left": 0,
+        "top": 29,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "2e6be043-f06a-4aaa-a8a1-11e4c581adab",
+        "left": 6,
+        "top": 29,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "424dad91-3045-4f8d-97ea-b8261541ea03",
+        "left": 0,
+        "top": 38,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "79fb3808-2e9f-46d1-8f34-d70bdd60f131",
+        "left": 6,
+        "top": 38,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "d32fc37b-9368-4a46-aed0-f5d67e7101c1",
+        "left": 0,
+        "top": 47,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "be8f6cc3-c528-4561-9911-234d65dd14a6",
+        "left": 6,
+        "top": 47,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "700a7e52-8eae-4ae0-a098-d6e7bb6a401d",
+        "left": 0,
+        "top": 56,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      },
+      {
+        "id": "5b693b69-81d3-499e-86af-8bd1c336c530",
+        "left": 6,
+        "top": 56,
+        "width": 6,
+        "height": 9,
+        "minWidth": 1,
+        "minHeight": 1
+      }
+    ]
+  },
+  "containerIds": [
+    "A"
+  ],
+  "containers": {
+    "A": {
+      "name": "A"
+    }
+  }
+}

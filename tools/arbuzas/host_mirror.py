@@ -65,7 +65,6 @@ EXCLUDES: dict[str, tuple[str, ...]] = {
 }
 
 SERVICE_ORDER = [
-    "portainer",
     "train_bot",
     "train_tunnel",
     "satiksme_bot",
@@ -73,8 +72,6 @@ SERVICE_ORDER = [
     "subscription_bot",
     "subscription_tunnel",
     "ticket_phone_bridge",
-    "chatgpt_broker",
-    "chatgpt_bot",
     "ticket_remote_spacetime_sidecar",
     "ticket_remote",
     "ticket_remote_tunnel",
@@ -509,19 +506,14 @@ def affected_services_for_path(rel: str) -> set[str]:
     elif rel == "etc/arbuzas/env/ticket-remote.env":
         add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
-    elif rel == "etc/arbuzas/env/chatgpt-broker.env":
-        add_service(services, "chatgpt_broker")
-        add_service(services, "chatgpt_bot")
     elif rel == "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret":
         add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
     elif rel == "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem":
         add_service(services, "ticket_remote_spacetime_sidecar")
-        add_service(services, "chatgpt_broker")
     elif rel.startswith("etc/arbuzas/secrets/ticket-remote/"):
         add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
-        add_service(services, "chatgpt_broker")
     elif rel.startswith("etc/arbuzas/secrets/android-adb/"):
         add_service(services, "ticket_phone_bridge")
     elif rel.startswith("etc/arbuzas/secrets/"):
