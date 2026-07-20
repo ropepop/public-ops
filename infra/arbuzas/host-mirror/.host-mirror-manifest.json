@@ -35,6 +35,11 @@
       "sha256": "9de4a7e12ff5ef2430c7364dc25f1c0386fe9f76c7fd758aee7bcd06478b79be",
       "size": 214
     },
+    "etc/arbuzas/current/release.env": {
+      "mode": 420,
+      "sha256": "31b9ea08e747620e08b842a4c96f5d99bea198c931088667f01d2aac3fc2fd3b",
+      "size": 1868
+    },
     "etc/arbuzas/env/chatgpt-broker.env": {
       "mode": 420,
       "sha256": "fee572c47bfb070f599e2108bfbe6878097635ba7ce76b62c9c0e54766db6607",
@@ -170,6 +175,11 @@
       "sha256": "f1dc35abb4eb3dbeab003be702fd01fb4fe1a338de2684f453499325bff959c5",
       "size": 755
     },
+    "etc/arbuzas/secrets/jellyfin/admin-password.secret": {
+      "mode": 384,
+      "sha256": "01492b54effc5a8a3531a02abfbda456d53aa8374d484714b79194c654504fa6",
+      "size": 65
+    },
     "etc/arbuzas/secrets/satiksme-bot-spacetime.key": {
       "mode": 384,
       "sha256": "25847acb7e6d737a6546a320f56edfc397389d9bad897e3999377cda2aa9474f",
@@ -217,5 +227,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1783899809
+  "updatedEpochSeconds": 1784492852
 }

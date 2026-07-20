@@ -26,6 +26,7 @@ MANIFEST_NAME = ".host-mirror-manifest.json"
 class Entry:
     kind: str
     rel: str
+    pushable: bool = True
 
 
 PROFILES: dict[str, list[Entry]] = {
@@ -33,6 +34,7 @@ PROFILES: dict[str, list[Entry]] = {
         Entry("tree", "etc/arbuzas/env"),
         Entry("tree", "etc/arbuzas/secrets"),
         Entry("tree", "etc/arbuzas/cloudflared"),
+        Entry("file", "etc/arbuzas/current/release.env", pushable=False),
     ],
     "pixel": [
         Entry("tree", "data/local/pixel-stack/conf"),
@@ -103,16 +105,26 @@ def is_excluded(profile: str, rel: str) -> bool:
     return False
 
 
-def is_allowed(profile: str, rel: str) -> bool:
+def matching_entry(profile: str, rel: str) -> Entry | None:
     rel = rel.strip("/")
     if rel == MANIFEST_NAME or is_excluded(profile, rel):
-        return False
+        return None
     for entry in PROFILES[profile]:
         if entry.kind == "file" and rel == entry.rel:
-            return True
+            return entry
         if entry.kind == "tree" and (rel == entry.rel or rel.startswith(entry.rel + "/")):
-            return True
-    return False
+            return entry
+    return None
+
+
+def is_allowed(profile: str, rel: str, *, pushable_only: bool = False) -> bool:
+    entry = matching_entry(profile, rel)
+    return entry is not None and (entry.pushable or not pushable_only)
+
+
+def is_pull_only(profile: str, rel: str) -> bool:
+    entry = matching_entry(profile, rel)
+    return entry is not None and not entry.pushable
 
 
 def clean_empty_dirs(root: pathlib.Path) -> None:
@@ -126,7 +138,12 @@ def clean_empty_dirs(root: pathlib.Path) -> None:
             pass
 
 
-def scan_files(root: pathlib.Path, profile: str) -> dict[str, dict[str, object]]:
+def scan_files(
+    root: pathlib.Path,
+    profile: str,
+    *,
+    pushable_only: bool = False,
+) -> dict[str, dict[str, object]]:
     files: dict[str, dict[str, object]] = {}
     if not root.exists():
         return files
@@ -142,7 +159,7 @@ def scan_files(root: pathlib.Path, profile: str) -> dict[str, dict[str, object]]
             if not path.exists() or not path.is_file():
                 continue
             rel = path.relative_to(root).as_posix()
-            if not is_allowed(profile, rel):
+            if not is_allowed(profile, rel, pushable_only=pushable_only):
                 continue
             st = path.stat()
             files[rel] = {
@@ -431,11 +448,30 @@ def command_push(args: argparse.Namespace) -> int:
     if manifest is None:
         eprint("local mirror has no manifest; run mirror-pull first")
         return 3
+    baseline_all = manifest.get("files") or {}
+    local_files_all = scan_files(mirror_root, profile)
+    locally_changed_pull_only = sorted(
+        rel
+        for rel in set(baseline_all) | set(local_files_all)
+        if is_pull_only(profile, rel)
+        and (baseline_all.get(rel) or {}).get("sha256")
+        != (local_files_all.get(rel) or {}).get("sha256")
+    )
+    if locally_changed_pull_only:
+        for rel in locally_changed_pull_only:
+            eprint(f"pull-only local changed: {rel}")
+        eprint("push blocked because pull-only migration snapshots cannot be written to the host")
+        return 3
     with tempfile.TemporaryDirectory() as tmp:
         remote_snapshot = fetch_remote_tree(args, profile, pathlib.Path(tmp) / "remote")
-        local_files = scan_files(mirror_root, profile)
-        remote_files = scan_files(remote_snapshot, profile)
-        local_changed, remote_changed, conflicts = classify(manifest.get("files") or {}, local_files, remote_files)  # type: ignore[arg-type]
+        local_files = scan_files(mirror_root, profile, pushable_only=True)
+        remote_files = scan_files(remote_snapshot, profile, pushable_only=True)
+        baseline = {
+            rel: metadata
+            for rel, metadata in baseline_all.items()
+            if is_allowed(profile, rel, pushable_only=True)
+        }
+        local_changed, remote_changed, conflicts = classify(baseline, local_files, remote_files)  # type: ignore[arg-type]
     for rel in conflicts:
         eprint(f"conflict: {rel}")
     for rel in remote_changed:
@@ -451,7 +487,7 @@ def command_push(args: argparse.Namespace) -> int:
         update_remote_root_local(pathlib.Path(args.remote_root), mirror_root, local_changed, local_files)
     else:
         push_remote_ssh(args, mirror_root, local_changed, local_files)
-    write_manifest(mirror_root, profile, local_files)
+    write_manifest(mirror_root, profile, local_files_all)
     write_changed_paths(args.changed_paths_file, local_changed)
     for rel in local_changed:
         print(f"pushed: {rel}")

@@ -3186,11 +3186,44 @@ import { html, reactive } from '@arrow-js/core';
     });
   }
 
+  function revealControlCodeResultImageAtomically(requestID) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let frameID = 0;
+      let timer = null;
+      const finish = (revealed) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (!revealed && frameID) cancelAnimationFrame(frameID);
+        resolve(Boolean(revealed));
+      };
+      timer = setTimeout(() => finish(false), controlCodeResultPaintFrameTimeoutMs);
+      frameID = requestAnimationFrame(() => {
+        if (document.visibilityState !== 'visible' ||
+            locallyClosedControlCodeRequestIDs.has(requestID) ||
+            !codeRequest ||
+            String(codeRequest.requestId || '').trim() !== requestID ||
+            codeRequest.status !== 'succeeded' ||
+            !codeResultImage.complete ||
+            codeResultImage.naturalWidth <= 0 ||
+            codeResultImage.naturalHeight <= 0) {
+          finish(false);
+          return;
+        }
+        codeResultImage.hidden = false;
+        setControlCodeResultVisible(true);
+        finish(true);
+      });
+    });
+  }
+
   async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {
     if (!requestID || !capturedImage) return false;
+    setControlCodeResultVisible(false);
+    codeResultImage.hidden = true;
+    codeResultImage.removeAttribute('src');
     codeResultImage.src = capturedImage;
-    setControlCodeResultVisible(true);
-    codeResultImage.hidden = false;
     codeResultStatus.textContent = '';
     codeResultStatus.hidden = true;
     codeResultValue.hidden = true;
@@ -3203,6 +3236,7 @@ import { html, reactive } from '@arrow-js/core';
     let painted = false;
     try {
       if (!await waitForControlCodeResultImageReady(codeResultImage)) return false;
+      if (!await revealControlCodeResultImageAtomically(requestID)) return false;
       if (!controlCodeResultPaintReady(requestID)) return false;
       if (!await waitForControlCodePaintFrame()) return false;
       if (!await waitForControlCodePaintFrame()) return false;

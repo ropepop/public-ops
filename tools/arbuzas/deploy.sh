@@ -54,6 +54,12 @@ THINKPAD_FAN_REMOTE_SCRIPT_FILE="/usr/local/libexec/arbuzas-thinkpad-fan.py"
 THINKPAD_FAN_REMOTE_PROC_FILE="/proc/acpi/ibm/fan"
 THINKPAD_FAN_REMOTE_PARAM_FILE="/sys/module/thinkpad_acpi/parameters/fan_control"
 THINKPAD_FAN_REMOTE_TEMP_GLOB="/sys/devices/platform/thinkpad_hwmon/hwmon/hwmon*/temp1_input"
+QBITTORRENT_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/qbittorrent"
+QBITTORRENT_REMOTE_ROOT="/srv/arbuzas/qbittorrent"
+QBITTORRENT_REMOTE_CONFIG_FILE="${QBITTORRENT_REMOTE_ROOT}/storage/config/qBittorrent/qBittorrent.conf"
+JELLYFIN_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/jellyfin"
+JELLYFIN_REMOTE_ROOT="/srv/arbuzas/jellyfin"
+JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE="/etc/arbuzas/secrets/jellyfin/admin-password.secret"
 ROOT_FALLBACK_IMAGE="${ROOT_FALLBACK_IMAGE:-debian:13-slim}"
 
 if [[ -f "${DOCKER_DEFAULT_ENV_FILE}" ]]; then
@@ -80,6 +86,19 @@ ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43
 ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
 ARBUZAS_TICKET_TUNNEL_GID="${ARBUZAS_TICKET_TUNNEL_GID:-50}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
+ARBUZAS_QBITTORRENT_WEBUI_PORT="${ARBUZAS_QBITTORRENT_WEBUI_PORT:-18080}"
+ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT="${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT:-24680}"
+ARBUZAS_QBITTORRENT_PEER_PORT="${ARBUZAS_QBITTORRENT_PEER_PORT:-45123}"
+ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT="${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT:-24680}"
+ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME="${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME:-arbuzas-vps.tail9345a.ts.net}"
+ARBUZAS_QBITTORRENT_PUID="${ARBUZAS_QBITTORRENT_PUID:-1000}"
+ARBUZAS_QBITTORRENT_PGID="${ARBUZAS_QBITTORRENT_PGID:-1000}"
+ARBUZAS_JELLYFIN_HOST_PORT="${ARBUZAS_JELLYFIN_HOST_PORT:-18096}"
+ARBUZAS_JELLYFIN_INTERNAL_PORT="${ARBUZAS_JELLYFIN_INTERNAL_PORT:-8096}"
+ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT="${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT:-29096}"
+ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME="${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME:-arbuzas-vps.tail9345a.ts.net}"
+ARBUZAS_JELLYFIN_PUID="${ARBUZAS_JELLYFIN_PUID:-1000}"
+ARBUZAS_JELLYFIN_PGID="${ARBUZAS_JELLYFIN_PGID:-1000}"
 ARBUZAS_TAILSCALE_IPV4="${ARBUZAS_TAILSCALE_IPV4:-}"
 ARBUZAS_FAN_ENTER_AUTO_C="${ARBUZAS_FAN_ENTER_AUTO_C:-89}"
 ARBUZAS_FAN_EXIT_AUTO_C="${ARBUZAS_FAN_EXIT_AUTO_C:-89}"
@@ -104,6 +123,8 @@ VALIDATE_SUBSCRIPTION=0
 VALIDATE_TICKET_PHONE_BRIDGE=0
 VALIDATE_CHATGPT=0
 VALIDATE_TICKET_REMOTE=0
+VALIDATE_QBITTORRENT=0
+VALIDATE_JELLYFIN=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
@@ -119,6 +140,9 @@ DEPLOYMENT_TIMING_PROFILE="none"
 DEPLOYMENT_TIMING_TARGET="none"
 DEPLOYMENT_TIMING_PHASE_BUNDLE="-"
 DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH=""
+QBITTORRENT_SERVE_ADDED=0
+JELLYFIN_SERVE_ADDED=0
+JELLYFIN_SECRET_CREATED=0
 
 ALL_SERVICES=(
   portainer
@@ -134,6 +158,9 @@ ALL_SERVICES=(
   satiksme_tunnel
   subscription_tunnel
   ticket_remote_tunnel
+  qbittorrent
+  qbittorrent_housekeeper
+  jellyfin
 )
 
 log() {
@@ -992,7 +1019,8 @@ Services:
   portainer, train_bot, train_tunnel, satiksme_bot, satiksme_tunnel,
   subscription_bot, subscription_tunnel, ticket_phone_bridge,
   chatgpt_broker, chatgpt_bot, ticket_remote_spacetime_sidecar,
-  ticket_remote, ticket_remote_tunnel
+  ticket_remote, ticket_remote_tunnel, qbittorrent, qbittorrent_housekeeper,
+  jellyfin
 EOF
 }
 
@@ -1042,6 +1070,54 @@ validate_validation_profile() {
   esac
 }
 
+validate_qbittorrent_fixed_parameters() {
+  local actual=""
+  local expected=""
+  local name=""
+  for name in \
+    ARBUZAS_QBITTORRENT_WEBUI_PORT \
+    ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT \
+    ARBUZAS_QBITTORRENT_PEER_PORT \
+    ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT \
+    ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME; do
+    case "${name}" in
+      ARBUZAS_QBITTORRENT_WEBUI_PORT) expected=18080 ;;
+      ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT) expected=24680 ;;
+      ARBUZAS_QBITTORRENT_PEER_PORT) expected=45123 ;;
+      ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT) expected=24680 ;;
+      ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME) expected=arbuzas-vps.tail9345a.ts.net ;;
+    esac
+    eval "actual=\${${name}}"
+    if [[ "${actual}" != "${expected}" ]]; then
+      echo "${name} is fixed at ${expected} for the managed qBittorrent config (found: ${actual})" >&2
+      exit 2
+    fi
+  done
+}
+
+validate_jellyfin_fixed_parameters() {
+  local actual=""
+  local expected=""
+  local name=""
+  for name in \
+    ARBUZAS_JELLYFIN_HOST_PORT \
+    ARBUZAS_JELLYFIN_INTERNAL_PORT \
+    ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT \
+    ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME; do
+    case "${name}" in
+      ARBUZAS_JELLYFIN_HOST_PORT) expected=18096 ;;
+      ARBUZAS_JELLYFIN_INTERNAL_PORT) expected=8096 ;;
+      ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT) expected=29096 ;;
+      ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME) expected=arbuzas-vps.tail9345a.ts.net ;;
+    esac
+    eval "actual=\${${name}}"
+    if [[ "${actual}" != "${expected}" ]]; then
+      echo "${name} is fixed at ${expected} for the managed Jellyfin service (found: ${actual})" >&2
+      exit 2
+    fi
+  done
+}
+
 is_known_service() {
   local service_name="$1"
   array_contains "${service_name}" "${ALL_SERVICES[@]}"
@@ -1084,6 +1160,15 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES ticket_remote_spacetime_sidecar
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
+      ;;
+    qbittorrent)
+      VALIDATE_QBITTORRENT=1
+      append_unique DIAGNOSTIC_SERVICES qbittorrent
+      append_unique DIAGNOSTIC_SERVICES qbittorrent_housekeeper
+      ;;
+    jellyfin)
+      VALIDATE_JELLYFIN=1
+      append_unique DIAGNOSTIC_SERVICES jellyfin
       ;;
     *)
       echo "Unknown validation group: ${group_name}" >&2
@@ -1171,6 +1256,15 @@ resolve_requested_services() {
         append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
         mark_validation_group ticket_remote
         ;;
+      qbittorrent|qbittorrent_housekeeper)
+        append_unique COMPOSE_TARGET_SERVICES qbittorrent
+        append_unique COMPOSE_TARGET_SERVICES qbittorrent_housekeeper
+        mark_validation_group qbittorrent
+        ;;
+      jellyfin)
+        append_unique COMPOSE_TARGET_SERVICES jellyfin
+        mark_validation_group jellyfin
+        ;;
       *)
         echo "Unknown service: ${service_name}" >&2
         exit 2
@@ -1239,6 +1333,9 @@ compose_all_service_args() {
     chatgpt_bot
     ticket_remote_spacetime_sidecar
     ticket_remote
+    qbittorrent
+    qbittorrent_housekeeper
+    jellyfin
   )
   for service_name in "${all_services[@]}"; do
     service_args+=" ${service_name}"
@@ -1818,7 +1915,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/chatgpt-broker workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -1853,6 +1950,8 @@ import sys
 root = pathlib.Path(sys.argv[1])
 included_roots = [
     pathlib.Path("infra/arbuzas/docker"),
+    pathlib.Path("infra/arbuzas/qbittorrent"),
+    pathlib.Path("infra/arbuzas/jellyfin"),
     pathlib.Path("tools/arbuzas"),
     pathlib.Path("workloads/shared-go"),
     pathlib.Path("workloads/train-bot"),
@@ -1860,6 +1959,7 @@ included_roots = [
     pathlib.Path("workloads/subscription-bot"),
     pathlib.Path("workloads/chatgpt-broker"),
     pathlib.Path("workloads/ticket-remote"),
+    pathlib.Path("workloads/qbittorrent-housekeeper"),
 ]
 entries = []
 for included in included_roots:
@@ -1915,6 +2015,19 @@ ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
 ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
 ARBUZAS_CHATGPT_BROKER_PORT=${ARBUZAS_CHATGPT_BROKER_PORT}
+ARBUZAS_QBITTORRENT_WEBUI_PORT=${ARBUZAS_QBITTORRENT_WEBUI_PORT}
+ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT=${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}
+ARBUZAS_QBITTORRENT_PEER_PORT=${ARBUZAS_QBITTORRENT_PEER_PORT}
+ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT=${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}
+ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME=${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}
+ARBUZAS_QBITTORRENT_PUID=${ARBUZAS_QBITTORRENT_PUID}
+ARBUZAS_QBITTORRENT_PGID=${ARBUZAS_QBITTORRENT_PGID}
+ARBUZAS_JELLYFIN_HOST_PORT=${ARBUZAS_JELLYFIN_HOST_PORT}
+ARBUZAS_JELLYFIN_INTERNAL_PORT=${ARBUZAS_JELLYFIN_INTERNAL_PORT}
+ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT=${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}
+ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME=${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}
+ARBUZAS_JELLYFIN_PUID=${ARBUZAS_JELLYFIN_PUID}
+ARBUZAS_JELLYFIN_PGID=${ARBUZAS_JELLYFIN_PGID}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
 ARBUZAS_TICKET_TUNNEL_UID=${ARBUZAS_TICKET_TUNNEL_UID}
 ARBUZAS_TICKET_TUNNEL_GID=${ARBUZAS_TICKET_TUNNEL_GID}
@@ -1940,12 +2053,15 @@ prepare_local_release_bundle() {
   mkdir -p "${ARBUZAS_RELEASE_DIR}/generated/cloudflared"
 
   copy_tree_into_release "infra/arbuzas/docker"
+  copy_tree_into_release "infra/arbuzas/qbittorrent"
+  copy_tree_into_release "infra/arbuzas/jellyfin"
   copy_tree_into_release "workloads/shared-go"
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
   copy_tree_into_release "workloads/subscription-bot"
   copy_tree_into_release "workloads/chatgpt-broker"
   copy_tree_into_release "workloads/ticket-remote"
+  copy_tree_into_release "workloads/qbittorrent-housekeeper"
 
   prepare_local_release_metadata
 }
@@ -1987,6 +2103,14 @@ prepare_local_fast_release_overlay() {
         ;;
       ticket_remote_spacetime_sidecar|ticket_remote)
         copy_tree_into_fast_release_overlay "workloads/ticket-remote"
+        ;;
+      qbittorrent|qbittorrent_housekeeper)
+        copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
+        copy_tree_into_fast_release_overlay "workloads/qbittorrent-housekeeper"
+        ;;
+      jellyfin)
+        copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
+        copy_tree_into_fast_release_overlay "infra/arbuzas/jellyfin"
         ;;
       portainer|train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
         ;;
@@ -2091,6 +2215,967 @@ prepare_remote_host_layout() {
       '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
   "
   prepare_remote_ticket_runtime_permissions
+}
+
+qbittorrent_deployment_selected() {
+  targeted_service_selected qbittorrent || targeted_service_selected qbittorrent_housekeeper
+}
+
+restart_existing_qbittorrent_slice() {
+  remote_shell "
+    for service_name in qbittorrent qbittorrent_housekeeper; do
+      container_id=\$(docker ps -aq \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter \"label=com.docker.compose.service=\${service_name}\" \
+        | head -n 1)
+      if [[ -n \"\${container_id}\" ]]; then
+        docker start \"\${container_id}\" >/dev/null
+      fi
+    done
+  "
+}
+
+prepare_remote_qbittorrent_runtime() {
+  local release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+  local force_prepare="${2:-0}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+  local remote_ids=""
+  local qbittorrent_uid=""
+  local qbittorrent_gid=""
+
+  if [[ "${force_prepare}" != "1" ]] && ! qbittorrent_deployment_selected; then
+    return 0
+  fi
+
+  remote_ids="$(remote_inline_shell "printf '%s:%s\\n' \"\$(id -u)\" \"\$(id -g)\"")"
+  IFS=: read -r qbittorrent_uid qbittorrent_gid <<< "${remote_ids}"
+  [[ "${qbittorrent_uid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive qBittorrent PUID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+  [[ "${qbittorrent_gid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive qBittorrent PGID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+
+  # qBittorrent rewrites its preferences while stopping. Stop both members of
+  # this isolated slice before reconciling the deployment-owned preferences.
+  if ! remote_shell "
+    for service_name in qbittorrent_housekeeper qbittorrent; do
+      container_id=\$(docker ps -q \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter \"label=com.docker.compose.service=\${service_name}\" \
+        | head -n 1)
+      if [[ -n \"\${container_id}\" ]]; then
+        docker stop --time 30 \"\${container_id}\" >/dev/null
+      fi
+    done
+  "; then
+    log "qBittorrent stop failed; restarting any previously active slice members"
+    restart_existing_qbittorrent_slice || log "Warning: the previous qBittorrent slice could not be restarted automatically"
+    return 1
+  fi
+
+  if ! remote_root_command "
+    storage_installer='${remote_release_dir}/infra/arbuzas/qbittorrent/install-storage.sh'
+    config_reconciler='${remote_release_dir}/infra/arbuzas/qbittorrent/reconcile-config.py'
+    release_env='${remote_release_dir}/release.env'
+    [[ -f \"\${storage_installer}\" ]] || { echo \"missing qBittorrent storage installer: \${storage_installer}\" >&2; exit 1; }
+    [[ -f \"\${config_reconciler}\" ]] || { echo \"missing qBittorrent config reconciler: \${config_reconciler}\" >&2; exit 1; }
+    [[ -f \"\${release_env}\" && ! -L \"\${release_env}\" ]] || { echo \"invalid release env: \${release_env}\" >&2; exit 1; }
+
+    bash \"\${storage_installer}\" install --uid '${qbittorrent_uid}' --gid '${qbittorrent_gid}'
+    python3 \"\${config_reconciler}\" \
+      --path '${QBITTORRENT_REMOTE_CONFIG_FILE}' \
+      --uid '${qbittorrent_uid}' \
+      --gid '${qbittorrent_gid}'
+    python3 \"\${config_reconciler}\" \
+      --path '${QBITTORRENT_REMOTE_CONFIG_FILE}' \
+      --uid '${qbittorrent_uid}' \
+      --gid '${qbittorrent_gid}' \
+      --check
+
+    python3 - \"\${release_env}\" '${qbittorrent_uid}' '${qbittorrent_gid}' <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+uid, gid = sys.argv[2:4]
+mode = path.lstat().st_mode
+if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+    raise SystemExit(f'refusing non-regular release env: {path}')
+
+managed = {
+    'ARBUZAS_QBITTORRENT_PUID': uid,
+    'ARBUZAS_QBITTORRENT_PGID': gid,
+}
+lines = []
+for line in path.read_text(encoding='utf-8').splitlines():
+    key = line.split('=', 1)[0]
+    if key not in managed:
+        lines.append(line)
+lines.extend(f'{key}={value}' for key, value in managed.items())
+
+fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent, text=True)
+tmp_path = Path(tmp_name)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        handle.write('\\n'.join(lines) + '\\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_path, stat.S_IMODE(mode))
+    os.chown(tmp_path, path.stat().st_uid, path.stat().st_gid)
+    os.replace(tmp_path, path)
+finally:
+    try:
+        tmp_path.unlink()
+    except FileNotFoundError:
+        pass
+PY
+  "; then
+    log "qBittorrent preparation failed; restarting the previously active slice"
+    restart_existing_qbittorrent_slice || log "Warning: the previous qBittorrent slice could not be restarted automatically"
+    return 1
+  fi
+}
+
+jellyfin_deployment_selected() {
+  targeted_service_selected jellyfin
+}
+
+jellyfin_only_deployment_selected() {
+  (( TARGETED_MODE == 1 )) || return 1
+  (( ${#COMPOSE_TARGET_SERVICES[@]} == 1 )) || return 1
+  [[ "${COMPOSE_TARGET_SERVICES[0]}" == jellyfin ]]
+}
+
+prepare_remote_jellyfin_runtime() {
+  local release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+  local force_prepare="${2:-0}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+  local remote_ids=""
+  local jellyfin_uid=""
+  local jellyfin_gid=""
+  local prepare_output=""
+
+  if [[ "${force_prepare}" != "1" ]] && ! jellyfin_deployment_selected; then
+    return 0
+  fi
+
+  remote_ids="$(remote_inline_shell "printf '%s:%s\\n' \"\$(id -u)\" \"\$(id -g)\"")"
+  IFS=: read -r jellyfin_uid jellyfin_gid <<< "${remote_ids}"
+  [[ "${jellyfin_uid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive Jellyfin PUID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+  [[ "${jellyfin_gid}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Unable to resolve a positive Jellyfin PGID for ${ARBUZAS_USER} on ${ARBUZAS_HOST}" >&2
+    return 1
+  }
+
+  # This intentionally leaves the running qBittorrent containers and their
+  # systemd cgroups alone. The media-only storage action verifies the live
+  # capped filesystem and installs .ignore without reloading systemd.
+  if ! prepare_output="$(remote_root_command "
+    storage_installer='${remote_release_dir}/infra/arbuzas/qbittorrent/install-storage.sh'
+    release_env='${remote_release_dir}/release.env'
+    [[ -f \"\${storage_installer}\" && ! -L \"\${storage_installer}\" ]] || { echo \"missing qBittorrent storage installer: \${storage_installer}\" >&2; exit 1; }
+    [[ -f \"\${release_env}\" && ! -L \"\${release_env}\" ]] || { echo \"invalid release env: \${release_env}\" >&2; exit 1; }
+
+    bash \"\${storage_installer}\" prepare-media --uid '${jellyfin_uid}' --gid '${jellyfin_gid}'
+
+    secret_dir=\$(dirname '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}')
+    secret_created=0
+    if [[ -e \"\${secret_dir}\" || -L \"\${secret_dir}\" ]]; then
+      [[ -d \"\${secret_dir}\" && ! -L \"\${secret_dir}\" ]] || {
+        echo \"refusing unsafe Jellyfin secret directory: \${secret_dir}\" >&2
+        exit 1
+      }
+    else
+      install -d -m 0700 -o root -g root \"\${secret_dir}\"
+    fi
+    chown root:root \"\${secret_dir}\"
+    chmod 0700 \"\${secret_dir}\"
+    if [[ -e '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' || -L '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' ]]; then
+      [[ -f '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' && ! -L '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' ]] || {
+        echo 'refusing unsafe Jellyfin admin password file' >&2
+        exit 1
+      }
+    else
+      python3 - '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' <<'PY'
+import os
+import secrets
+import sys
+
+path = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(path, flags, 0o600)
+with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+    handle.write(secrets.token_urlsafe(48) + '\\n')
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+      secret_created=1
+    fi
+    [[ \"\$(stat -c '%u:%g:%a' '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}')\" == '0:0:600' ]] || {
+      echo 'Jellyfin admin password file must be owned by root with mode 0600' >&2
+      exit 1
+    }
+    python3 - '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' <<'PY'
+from pathlib import Path
+import sys
+
+value = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+if len(value) < 32 or any(char.isspace() for char in value):
+    raise SystemExit('Jellyfin admin password file is empty, short, or malformed')
+PY
+
+    for path in \
+      '${JELLYFIN_REMOTE_ROOT}' \
+      '${JELLYFIN_REMOTE_ROOT}/config' \
+      '${JELLYFIN_REMOTE_ROOT}/cache' \
+      '${JELLYFIN_REMOTE_ROOT}/tmp' \
+      '${JELLYFIN_REMOTE_ROOT}/transcodes'; do
+      if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+        [[ -d \"\${path}\" && ! -L \"\${path}\" ]] || {
+          echo \"refusing unsafe Jellyfin runtime path: \${path}\" >&2
+          exit 1
+        }
+      else
+        install -d -m 0750 \"\${path}\"
+      fi
+      chown '${jellyfin_uid}:${jellyfin_gid}' \"\${path}\"
+      chmod 0750 \"\${path}\"
+    done
+
+    python3 - \"\${release_env}\" '${jellyfin_uid}' '${jellyfin_gid}' <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+uid, gid = sys.argv[2:4]
+mode = path.lstat().st_mode
+if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+    raise SystemExit(f'refusing non-regular release env: {path}')
+
+managed = {
+    'ARBUZAS_QBITTORRENT_PUID': uid,
+    'ARBUZAS_QBITTORRENT_PGID': gid,
+    'ARBUZAS_JELLYFIN_PUID': uid,
+    'ARBUZAS_JELLYFIN_PGID': gid,
+}
+lines = []
+for line in path.read_text(encoding='utf-8').splitlines():
+    key = line.split('=', 1)[0]
+    if key not in managed:
+        lines.append(line)
+lines.extend(f'{key}={value}' for key, value in managed.items())
+
+fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent, text=True)
+tmp_path = Path(tmp_name)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        handle.write('\\n'.join(lines) + '\\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp_path, stat.S_IMODE(mode))
+    os.chown(tmp_path, path.stat().st_uid, path.stat().st_gid)
+    os.replace(tmp_path, path)
+finally:
+    try:
+        tmp_path.unlink()
+    except FileNotFoundError:
+        pass
+PY
+    printf 'ARBUZAS_JELLYFIN_SECRET_CREATED=%s\\n' \"\${secret_created}\"
+  ")"; then
+    return 1
+  fi
+
+  if grep -Fx 'ARBUZAS_JELLYFIN_SECRET_CREATED=1' <<< "${prepare_output}" >/dev/null; then
+    JELLYFIN_SECRET_CREATED=1
+    log "Jellyfin admin password created; refreshing the local-first host mirror"
+    run_host_mirror pull
+  fi
+}
+
+bootstrap_remote_jellyfin() {
+  local release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+  local force_bootstrap="${2:-0}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+
+  if [[ "${force_bootstrap}" != "1" ]] && ! jellyfin_deployment_selected; then
+    return 0
+  fi
+
+  remote_root_command "
+    bootstrap='${remote_release_dir}/infra/arbuzas/jellyfin/bootstrap.py'
+    [[ -f \"\${bootstrap}\" && ! -L \"\${bootstrap}\" ]] || { echo \"missing Jellyfin bootstrap helper: \${bootstrap}\" >&2; exit 1; }
+    deadline=\$((SECONDS + 180))
+    until curl -fsS --connect-timeout 2 --max-time 5 \
+      'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}/health' | grep -Fx Healthy >/dev/null; do
+      if (( SECONDS >= deadline )); then
+        echo 'Jellyfin loopback health did not become ready before bootstrap' >&2
+        exit 1
+      fi
+      sleep 5
+    done
+    python3 \"\${bootstrap}\" bootstrap \
+      --url 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}' \
+      --admin-password-file '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}'
+    python3 \"\${bootstrap}\" check \
+      --url 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}' \
+      --admin-password-file '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}'
+  "
+}
+
+publish_remote_qbittorrent_tailscale() {
+  local preflight=""
+  local existing_state=""
+  local before_status_base64=""
+  local serve_was_absent=0
+  if ! qbittorrent_deployment_selected; then
+    return 0
+  fi
+
+  if ! preflight="$(remote_inline_shell "
+    tailscale serve status --json | python3 -c 'import base64,json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}\"; hostname=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}\"; target=\"http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}\"; tcp=payload.get(\"TCP\", {}).get(port); web={key:value for key,value in payload.get(\"Web\", {}).items() if key.rsplit(\":\",1)[-1] == port}; handler=web.get(f\"{hostname}:{port}\", {}).get(\"Handlers\", {}).get(\"/\", {}); state=\"absent\" if tcp is None and not web else \"exact\" if tcp == {\"HTTPS\": True} and handler.get(\"Proxy\") == target and len(web) == 1 else \"conflict\"; encoded=base64.b64encode(json.dumps(payload,sort_keys=True,separators=(\",\",\":\")).encode()).decode(); print(state+\"|\"+encoded)'
+  " | tail -n 1 | tr -d '\r\n[:space:]')"; then
+    return 1
+  fi
+  IFS='|' read -r existing_state before_status_base64 <<< "${preflight}"
+  [[ "${before_status_base64}" =~ ^[A-Za-z0-9+/=]+$ ]] || {
+    echo "Unable to snapshot existing Tailscale Serve state" >&2
+    return 1
+  }
+  case "${existing_state}" in
+    absent)
+      serve_was_absent=1
+      ;;
+    exact)
+      ;;
+    *)
+      echo "Refusing to overwrite existing Tailscale Serve :${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT} state: ${existing_state:-unknown}" >&2
+      return 1
+      ;;
+  esac
+
+  if ! remote_root_command "
+    command -v tailscale >/dev/null 2>&1 || { echo 'tailscale is required for the private qBittorrent route' >&2; exit 1; }
+    before=\$(mktemp)
+    current=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${current}\"' EXIT
+    printf '%s' '${before_status_base64}' | base64 -d > \"\${before}\"
+    tailscale serve status --json > \"\${current}\"
+
+    python3 - \"\${before}\" \"\${current}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+payload = json.load(open(sys.argv[2], encoding='utf-8'))
+
+def port_view(document, port):
+    return {
+        'tcp': document.get('TCP', {}).get(str(port)),
+        'web': {
+            key: value
+            for key, value in document.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] == str(port)
+        },
+    }
+
+if port_view(before, 10000) != port_view(payload, 10000):
+    raise SystemExit('Tailscale Serve :10000 changed during qBittorrent publish preflight')
+tcp = payload.get('TCP', {}).get('10000')
+web = {key: value for key, value in payload.get('Web', {}).items() if key.rsplit(':', 1)[-1] == '10000'}
+if tcp is None and not web:
+    raise SystemExit('refusing to change Tailscale Serve: the existing HTTPS :10000 service is missing')
+
+port = '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}'
+if port_view(before, port) != port_view(payload, port):
+    raise SystemExit(f'Tailscale Serve :{port} changed during qBittorrent publish preflight')
+existing_tcp = payload.get('TCP', {}).get(port)
+existing_web = {
+    key: value
+    for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+
+if existing_tcp is not None or existing_web:
+    handler = existing_web.get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+    if existing_tcp != {'HTTPS': True} or handler.get('Proxy') != target or len(existing_web) != 1:
+        raise SystemExit(f'refusing to overwrite existing Tailscale Serve :{port}: tcp={existing_tcp!r} web={existing_web!r}')
+PY
+
+    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+    panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
+    [[ "\${panel_code}" != '000' ]] || { echo 'existing Tailscale Serve :10000 did not answer before qBittorrent publish' >&2; exit 1; }
+    tailscale serve --bg --yes \
+      --https '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}' \
+      'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}'
+  "; then
+    if (( serve_was_absent == 1 )) && remote_inline_shell "
+      tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}\"; hostname=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}\"; target=\"http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}\"; tcp=payload.get(\"TCP\", {}).get(port); web={key:value for key,value in payload.get(\"Web\", {}).items() if key.rsplit(\":\",1)[-1] == port}; handler=web.get(f\"{hostname}:{port}\", {}).get(\"Handlers\", {}).get(\"/\", {}); assert tcp == {\"HTTPS\": True} and handler.get(\"Proxy\") == target and len(web) == 1'
+    " >/dev/null 2>&1; then
+      QBITTORRENT_SERVE_ADDED=1
+    fi
+    return 1
+  fi
+
+  # Mark ownership immediately after Serve succeeds, before post-checks.
+  QBITTORRENT_SERVE_ADDED="${serve_was_absent}"
+
+  if ! remote_root_command "
+    before=\$(mktemp)
+    after=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${after}\"' EXIT
+    printf '%s' '${before_status_base64}' | base64 -d > \"\${before}\"
+    tailscale serve status --json > \"\${after}\"
+
+    python3 - \"\${before}\" \"\${after}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+after = json.load(open(sys.argv[2], encoding='utf-8'))
+
+def port_view(payload, port):
+    return {
+        'tcp': payload.get('TCP', {}).get(str(port)),
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] == str(port)
+        },
+    }
+
+if port_view(before, 10000) != port_view(after, 10000):
+    raise SystemExit('Tailscale Serve :10000 changed while adding qBittorrent')
+
+port = '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}'
+if after.get('TCP', {}).get(port, {}).get('HTTPS') is not True:
+    raise SystemExit(f'Tailscale Serve HTTPS :{port} is not enabled')
+handler = after.get('Web', {}).get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+proxy = handler.get('Proxy')
+if proxy != target:
+    raise SystemExit(f'Tailscale Serve {hostname}:{port} points to {proxy!r}, expected {target!r}')
+PY
+    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+    panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
+    [[ "\${panel_code}" != '000' ]] || { echo 'existing Tailscale Serve :10000 stopped answering after qBittorrent publish' >&2; exit 1; }
+  "; then
+    return 1
+  fi
+}
+
+publish_remote_jellyfin_tailscale() {
+  local preflight=""
+  local existing_state=""
+  local before_status_base64=""
+  local serve_was_absent=0
+
+  if ! jellyfin_deployment_selected; then
+    return 0
+  fi
+
+  if ! preflight="$(remote_inline_shell "
+    command -v tailscale >/dev/null 2>&1 || { echo 'tailscale is required for the private Jellyfin route' >&2; exit 1; }
+    tailscale serve status --json | python3 -c 'import base64,json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}\"; hostname=\"${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}\"; target=\"http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}\"; tcp=payload.get(\"TCP\", {}).get(port); web={key:value for key,value in payload.get(\"Web\", {}).items() if key.rsplit(\":\",1)[-1] == port}; handler=web.get(f\"{hostname}:{port}\", {}).get(\"Handlers\", {}).get(\"/\", {}); state=\"absent\" if tcp is None and not web else \"exact\" if tcp == {\"HTTPS\": True} and handler.get(\"Proxy\") == target and len(web) == 1 else \"conflict\"; encoded=base64.b64encode(json.dumps(payload,sort_keys=True,separators=(\",\",\":\")).encode()).decode(); print(state+\"|\"+encoded)'
+  " | tail -n 1 | tr -d '\r\n[:space:]')"; then
+    return 1
+  fi
+  IFS='|' read -r existing_state before_status_base64 <<< "${preflight}"
+  [[ "${before_status_base64}" =~ ^[A-Za-z0-9+/=]+$ ]] || {
+    echo "Unable to snapshot existing Tailscale Serve state before Jellyfin publish" >&2
+    return 1
+  }
+  case "${existing_state}" in
+    absent)
+      serve_was_absent=1
+      ;;
+    exact)
+      ;;
+    *)
+      echo "Refusing to overwrite existing Tailscale Serve :${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT} state: ${existing_state:-unknown}" >&2
+      return 1
+      ;;
+  esac
+
+  if ! remote_root_command "
+    command -v tailscale >/dev/null 2>&1 || { echo 'tailscale is required for the private Jellyfin route' >&2; exit 1; }
+    before=\$(mktemp)
+    current=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${current}\"' EXIT
+    printf '%s' '${before_status_base64}' | base64 -d > \"\${before}\"
+    tailscale serve status --json > \"\${current}\"
+    python3 - \"\${before}\" \"\${current}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+current = json.load(open(sys.argv[2], encoding='utf-8'))
+port = '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}'
+
+def target_view(payload):
+    return {
+        'tcp': payload.get('TCP', {}).get(port),
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] == port
+        },
+    }
+
+def non_target_view(payload):
+    return {
+        'other': {key: value for key, value in payload.items() if key not in ('TCP', 'Web')},
+        'tcp': {key: value for key, value in payload.get('TCP', {}).items() if key != port},
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] != port
+        },
+    }
+
+if non_target_view(before) != non_target_view(current):
+    raise SystemExit('refusing Jellyfin publish because a non-target Tailscale Serve route changed during preflight')
+if target_view(before) != target_view(current):
+    raise SystemExit(f'refusing Jellyfin publish because Tailscale Serve :{port} changed during preflight')
+
+view = target_view(current)
+handler = view['web'].get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+if view['tcp'] is not None or view['web']:
+    if view['tcp'] != {'HTTPS': True} or handler.get('Proxy') != target or len(view['web']) != 1:
+        raise SystemExit(f'refusing to overwrite Tailscale Serve :{port}: {view!r}')
+PY
+    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+    test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
+    tailscale serve --bg --yes \
+      --https '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}' \
+      'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}'
+  "; then
+    if (( serve_was_absent == 1 )) && remote_inline_shell "
+      tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}\"; hostname=\"${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}\"; target=\"http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}\"; tcp=payload.get(\"TCP\", {}).get(port); web={key:value for key,value in payload.get(\"Web\", {}).items() if key.rsplit(\":\",1)[-1] == port}; handler=web.get(f\"{hostname}:{port}\", {}).get(\"Handlers\", {}).get(\"/\", {}); assert tcp == {\"HTTPS\": True} and handler.get(\"Proxy\") == target and len(web) == 1'
+    " >/dev/null 2>&1; then
+      JELLYFIN_SERVE_ADDED=1
+    fi
+    return 1
+  fi
+
+  # Record route ownership as soon as Serve succeeds so an ensuing failed
+  # post-check can remove only what this deployment added.
+  JELLYFIN_SERVE_ADDED="${serve_was_absent}"
+
+  remote_root_command "
+    before=\$(mktemp)
+    after=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${after}\"' EXIT
+    printf '%s' '${before_status_base64}' | base64 -d > \"\${before}\"
+    tailscale serve status --json > \"\${after}\"
+    python3 - \"\${before}\" \"\${after}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+after = json.load(open(sys.argv[2], encoding='utf-8'))
+port = '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}'
+
+def non_target_view(payload):
+    return {
+        'other': {key: value for key, value in payload.items() if key not in ('TCP', 'Web')},
+        'tcp': {key: value for key, value in payload.get('TCP', {}).items() if key != port},
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] != port
+        },
+    }
+
+if non_target_view(before) != non_target_view(after):
+    raise SystemExit('a non-target Tailscale Serve route changed while adding Jellyfin')
+tcp = after.get('TCP', {}).get(port)
+web = {
+    key: value
+    for key, value in after.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+handler = web.get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+if tcp != {'HTTPS': True} or handler.get('Proxy') != target or len(web) != 1:
+    raise SystemExit(f'Jellyfin Tailscale Serve :{port} is not the exact managed HTTPS route')
+PY
+    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+    test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
+    curl -fsS --connect-timeout 3 --max-time 8 \
+      'https://${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}:${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}/health' \
+      | grep -Fx Healthy >/dev/null
+  "
+}
+
+previous_release_has_qbittorrent() {
+  local release_id="$1"
+  remote_inline_shell "
+    compose_file='${REMOTE_RELEASES_ROOT}/${release_id}/infra/arbuzas/docker/compose.yml'
+    [[ -f \"\${compose_file}\" ]] || exit 1
+    grep -Eq '^  qbittorrent:' \"\${compose_file}\"
+  " >/dev/null 2>&1
+}
+
+rollback_release_before_qbittorrent() {
+  local release_id="$1"
+  local cleanup_mode="${2:-owned-only}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+  local remove_managed_route=0
+
+  case "${cleanup_mode}" in
+    owned-only)
+      remove_managed_route="${QBITTORRENT_SERVE_ADDED}"
+      ;;
+    force-managed)
+      remove_managed_route=1
+      ;;
+    *)
+      echo "unknown qBittorrent rollback cleanup mode: ${cleanup_mode}" >&2
+      return 2
+      ;;
+  esac
+
+  # Recover the prior application release before changing ingress. A route
+  # cleanup failure must never prevent the known-good Compose stack from
+  # coming back.
+  remote_shell "
+    [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing rollback release: ${remote_release_dir}' >&2; exit 1; }
+    [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
+    sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+    cd '${REMOTE_CURRENT_LINK}'
+    docker compose --project-name arbuzas \
+      --env-file '${REMOTE_CURRENT_LINK}/release.env' \
+      -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' \
+      up -d --remove-orphans
+  " || return 1
+
+  # Automatic recovery removes only a route added by this invocation. An
+  # explicit manual rollback forces removal of the exact managed route. Both
+  # modes tolerate absence; automatic recovery preserves all preexisting
+  # state, while manual cleanup refuses a conflicting route.
+  remote_root_command "
+    command -v tailscale >/dev/null 2>&1 || { echo 'tailscale is required to clean up the qBittorrent route' >&2; exit 1; }
+    before=\$(mktemp)
+    after=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${after}\"' EXIT
+    tailscale serve status --json > \"\${before}\"
+    route_state=\$(python3 - \"\${before}\" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+port = '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}'
+tcp = payload.get('TCP', {}).get(port)
+web = {
+    key: value
+    for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+handler = web.get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+if tcp is None and not web:
+    print('absent')
+elif tcp == {'HTTPS': True} and handler.get('Proxy') == target and len(web) == 1:
+    print('exact')
+else:
+    print('conflict')
+PY
+    )
+    if [[ '${remove_managed_route}' == '1' ]]; then
+      case \"\${route_state}\" in
+        absent)
+          ;;
+        exact)
+          tailscale serve --yes --https='${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}' off
+          ;;
+        *)
+          echo 'refusing to remove conflicting Tailscale Serve :${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT} during rollback' >&2
+          exit 1
+          ;;
+      esac
+    fi
+    tailscale serve status --json > \"\${after}\"
+    python3 - \"\${before}\" \"\${after}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+after = json.load(open(sys.argv[2], encoding='utf-8'))
+
+def port_view(payload, port):
+    return {
+        'tcp': payload.get('TCP', {}).get(str(port)),
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] == str(port)
+        },
+    }
+
+if port_view(before, 10000) != port_view(after, 10000):
+    raise SystemExit('Tailscale Serve :10000 changed while removing qBittorrent')
+port = '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+if '${remove_managed_route}' == '1':
+    if after.get('TCP', {}).get(port) is not None:
+        raise SystemExit(f'Tailscale Serve TCP :{port} remained after qBittorrent rollback')
+    if any(key.rsplit(':', 1)[-1] == port for key in after.get('Web', {})):
+        raise SystemExit(f'Tailscale Serve Web :{port} remained after qBittorrent rollback')
+elif port_view(before, port) != port_view(after, port):
+    raise SystemExit(f'Tailscale Serve :{port} changed during ownership-preserving rollback')
+PY
+    panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
+    [[ \"\${panel_code}\" != '000' ]] || { echo 'Tailscale Serve :10000 did not survive qBittorrent rollback' >&2; exit 1; }
+  " || return 1
+}
+
+validate_release_before_qbittorrent_recovery() {
+  local release_id="$1"
+  local cleanup_mode="${2:-owned-only}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+  local require_route_absent=0
+
+  if [[ "${cleanup_mode}" == "force-managed" || "${QBITTORRENT_SERVE_ADDED}" == "1" ]]; then
+    require_route_absent=1
+  fi
+
+  validate_remote_host_probe "${remote_release_dir}" "pre-qBittorrent release recovered" \
+    "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
+      cd '${remote_release_dir}'
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services)
+      deadline=\$((SECONDS + 180))
+      while (( SECONDS < deadline )); do
+        running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
+        missing=0
+        while IFS= read -r service_name; do
+          [[ -n \"\${service_name}\" ]] || continue
+          grep -Fx \"\${service_name}\" <<< \"\${running}\" >/dev/null || missing=1
+        done <<< \"\${expected}\"
+        (( missing == 0 )) && break
+        sleep 5
+      done
+      (( missing == 0 ))
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=qbittorrent')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=qbittorrent_housekeeper')\"
+      if [[ '${require_route_absent}' == '1' ]]; then
+        tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
+      fi
+      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+      panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+        'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:10000/' || true)
+      [[ \"\${panel_code}\" != '000' ]]" \
+    portainer
+}
+
+previous_release_has_jellyfin() {
+  local release_id="$1"
+  remote_inline_shell "
+    compose_file='${REMOTE_RELEASES_ROOT}/${release_id}/infra/arbuzas/docker/compose.yml'
+    [[ -f \"\${compose_file}\" ]] || exit 1
+    grep -Eq '^  jellyfin:' \"\${compose_file}\"
+  " >/dev/null 2>&1
+}
+
+remove_remote_jellyfin_tailscale_route() {
+  local cleanup_mode="${1:-owned-only}"
+  local remove_managed_route=0
+
+  case "${cleanup_mode}" in
+    owned-only)
+      remove_managed_route="${JELLYFIN_SERVE_ADDED}"
+      ;;
+    force-managed)
+      remove_managed_route=1
+      ;;
+    *)
+      echo "unknown Jellyfin rollback cleanup mode: ${cleanup_mode}" >&2
+      return 2
+      ;;
+  esac
+
+  remote_root_command "
+    command -v tailscale >/dev/null 2>&1 || { echo 'tailscale is required to clean up the Jellyfin route' >&2; exit 1; }
+    before=\$(mktemp)
+    after=\$(mktemp)
+    trap 'rm -f \"\${before}\" \"\${after}\"' EXIT
+    tailscale serve status --json > \"\${before}\"
+    route_state=\$(python3 - \"\${before}\" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+port = '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+hostname = '${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}'
+target = 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}'
+tcp = payload.get('TCP', {}).get(port)
+web = {
+    key: value
+    for key, value in payload.get('Web', {}).items()
+    if key.rsplit(':', 1)[-1] == port
+}
+handler = web.get(f'{hostname}:{port}', {}).get('Handlers', {}).get('/', {})
+if tcp is None and not web:
+    print('absent')
+elif tcp == {'HTTPS': True} and handler.get('Proxy') == target and len(web) == 1:
+    print('exact')
+else:
+    print('conflict')
+PY
+    )
+    if [[ '${remove_managed_route}' == '1' ]]; then
+      case \"\${route_state}\" in
+        absent)
+          ;;
+        exact)
+          tailscale serve --yes --https='${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}' off
+          ;;
+        *)
+          echo 'refusing to remove conflicting Tailscale Serve :${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT} during Jellyfin rollback' >&2
+          exit 1
+          ;;
+      esac
+    fi
+    tailscale serve status --json > \"\${after}\"
+    python3 - \"\${before}\" \"\${after}\" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding='utf-8'))
+after = json.load(open(sys.argv[2], encoding='utf-8'))
+port = '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+
+def target_view(payload):
+    return {
+        'tcp': payload.get('TCP', {}).get(port),
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] == port
+        },
+    }
+
+def non_target_view(payload):
+    return {
+        'other': {key: value for key, value in payload.items() if key not in ('TCP', 'Web')},
+        'tcp': {key: value for key, value in payload.get('TCP', {}).items() if key != port},
+        'web': {
+            key: value
+            for key, value in payload.get('Web', {}).items()
+            if key.rsplit(':', 1)[-1] != port
+        },
+    }
+
+if non_target_view(before) != non_target_view(after):
+    raise SystemExit('a non-target Tailscale Serve route changed during Jellyfin rollback')
+if '${remove_managed_route}' == '1':
+    if target_view(after) != {'tcp': None, 'web': {}}:
+        raise SystemExit(f'Tailscale Serve :{port} remained after Jellyfin rollback')
+elif target_view(before) != target_view(after):
+    raise SystemExit(f'Tailscale Serve :{port} changed during ownership-preserving Jellyfin rollback')
+PY
+    curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+    test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
+      'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
+  "
+}
+
+rollback_release_before_jellyfin() {
+  local release_id="$1"
+  local cleanup_mode="${2:-owned-only}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+
+  if jellyfin_only_deployment_selected; then
+    # A Jellyfin-only rollback to a pre-Jellyfin release must not recreate or
+    # stop unrelated Compose services. Remove only Jellyfin, then restore the
+    # release pointer; the already-running services retain their state.
+    remote_shell "
+      [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing rollback release: ${remote_release_dir}' >&2; exit 1; }
+      [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
+      while IFS= read -r container_id; do
+        [[ -n \"\${container_id}\" ]] || continue
+        docker rm -f \"\${container_id}\"
+      done < <(docker ps -aq \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter 'label=com.docker.compose.service=jellyfin')
+      sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+    " || return 1
+  else
+    # Full or multi-service rollback restores the complete known-good project.
+    remote_shell "
+      [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing rollback release: ${remote_release_dir}' >&2; exit 1; }
+      [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
+      sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
+      cd '${REMOTE_CURRENT_LINK}'
+      docker compose --project-name arbuzas \
+        --env-file '${REMOTE_CURRENT_LINK}/release.env' \
+        -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' \
+        up -d --remove-orphans
+    " || return 1
+  fi
+
+  remove_remote_jellyfin_tailscale_route "${cleanup_mode}"
+}
+
+validate_release_before_jellyfin_recovery() {
+  local release_id="$1"
+  local cleanup_mode="${2:-owned-only}"
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${release_id}"
+  local require_route_absent=0
+
+  if [[ "${cleanup_mode}" == "force-managed" || "${JELLYFIN_SERVE_ADDED}" == "1" ]]; then
+    require_route_absent=1
+  fi
+
+  validate_remote_host_probe "${remote_release_dir}" "pre-Jellyfin release recovered" \
+    "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
+      cd '${remote_release_dir}'
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services)
+      deadline=\$((SECONDS + 180))
+      while (( SECONDS < deadline )); do
+        running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
+        missing=0
+        while IFS= read -r service_name; do
+          [[ -n \"\${service_name}\" ]] || continue
+          grep -Fx \"\${service_name}\" <<< \"\${running}\" >/dev/null || missing=1
+        done <<< \"\${expected}\"
+        (( missing == 0 )) && break
+        sleep 5
+      done
+      (( missing == 0 ))
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=jellyfin')\"
+      if [[ '${require_route_absent}' == '1' ]]; then
+        tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
+      fi
+      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null
+      test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
+        'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3" \
+    portainer qbittorrent qbittorrent_housekeeper
 }
 
 copy_release_to_remote() {
@@ -2279,7 +3364,9 @@ remote_compose_up() {
           chatgpt_broker=arbuzas/chatgpt-broker \
           chatgpt_bot=arbuzas/chatgpt-bot \
           ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
-          ticket_remote=arbuzas/ticket-remote; do
+          ticket_remote=arbuzas/ticket-remote \
+          qbittorrent=arbuzas/qbittorrent \
+          qbittorrent_housekeeper=arbuzas/qbittorrent-housekeeper; do
           service_name=\${service_image%%=*}
           image_repository=\${service_image#*=}
           case ' ${non_tunnel_service_args} ' in
@@ -2299,10 +3386,10 @@ remote_compose_up() {
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
       if [[ -n '${non_tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps --remove-orphans${non_tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_tunnel_service_args}
       fi
       if [[ -n '${tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps --remove-orphans${tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
       fi
     "
     return
@@ -4360,6 +5447,419 @@ validate_remote_chatgpt_workload_health() {
     chatgpt_broker chatgpt_bot
 }
 
+validate_remote_qbittorrent_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" qbittorrent qbittorrent_housekeeper
+  validate_remote_probe "${remote_release_dir}" "qBittorrent containers are healthy" \
+    "deadline=\$((SECONDS + 180))
+      all_healthy=0
+      while (( SECONDS < deadline )); do
+        all_healthy=1
+        for service_name in qbittorrent qbittorrent_housekeeper; do
+          container_id=\$(compose ps -q \"\${service_name}\" 2>/dev/null || true)
+          health_status=''
+          if [[ -n \"\${container_id}\" ]]; then
+            health_status=\$(docker inspect --format \"{{.State.Health.Status}}\" \"\${container_id}\" 2>/dev/null || true)
+          fi
+          if [[ \"\${health_status}\" != healthy ]]; then
+            all_healthy=0
+            break
+          fi
+        done
+        (( all_healthy == 1 )) && break
+        sleep 5
+      done
+      (( all_healthy == 1 ))" \
+    qbittorrent qbittorrent_housekeeper
+  validate_remote_host_probe "${remote_release_dir}" "qBittorrent capped storage and managed preferences" \
+    "set -a
+      . '${remote_release_dir}/release.env'
+      set +a
+      test \"\${ARBUZAS_QBITTORRENT_PUID}\" = \"\$(id -u)\"
+      test \"\${ARBUZAS_QBITTORRENT_PGID}\" = \"\$(id -g)\"
+      sudo -n bash '${remote_release_dir}/infra/arbuzas/qbittorrent/install-storage.sh' check
+      sudo -n python3 '${remote_release_dir}/infra/arbuzas/qbittorrent/reconcile-config.py' \
+        --path '${QBITTORRENT_REMOTE_CONFIG_FILE}' \
+        --uid \"\${ARBUZAS_QBITTORRENT_PUID}\" \
+        --gid \"\${ARBUZAS_QBITTORRENT_PGID}\" \
+        --check" \
+    qbittorrent qbittorrent_housekeeper
+  validate_remote_probe "${remote_release_dir}" "qBittorrent loopback WebUI and public peer bindings" \
+    "inspect_json=\$(mktemp)
+      housekeeper_inspect_json=\$(mktemp)
+      trap 'rm -f \"\${inspect_json}\" \"\${housekeeper_inspect_json}\"' EXIT
+      container_id=\$(compose ps -q qbittorrent)
+      housekeeper_container_id=\$(compose ps -q qbittorrent_housekeeper)
+      docker inspect \"\${container_id}\" > \"\${inspect_json}\"
+      docker inspect \"\${housekeeper_container_id}\" > \"\${housekeeper_inspect_json}\"
+      python3 - \"\${inspect_json}\" \"\${housekeeper_inspect_json}\" <<'PY'
+import json
+import sys
+
+container = json.load(open(sys.argv[1], encoding='utf-8'))[0]
+housekeeper = json.load(open(sys.argv[2], encoding='utf-8'))[0]
+ports = container.get('NetworkSettings', {}).get('Ports', {})
+host_config = container.get('HostConfig', {})
+housekeeper_host_config = housekeeper.get('HostConfig', {})
+
+if host_config.get('Memory') != 805306368:
+    raise SystemExit(f'unexpected qBittorrent memory limit: {host_config.get("Memory")!r}')
+if not 0 < host_config.get('Memory', 0) < 1073741824:
+    raise SystemExit(f'qBittorrent memory limit is not below 1 GiB: {host_config.get("Memory")!r}')
+if host_config.get('MemoryReservation') != 402653184:
+    raise SystemExit(f'unexpected qBittorrent memory reservation: {host_config.get("MemoryReservation")!r}')
+if host_config.get('MemorySwap') != 805306368:
+    raise SystemExit(f'unexpected qBittorrent memory+swap limit: {host_config.get("MemorySwap")!r}')
+if container.get('State', {}).get('OOMKilled') is not False:
+    raise SystemExit('qBittorrent has recorded an out-of-memory kill')
+if housekeeper_host_config.get('Memory') != 134217728:
+    raise SystemExit(f'unexpected qBittorrent housekeeper memory limit: {housekeeper_host_config.get("Memory")!r}')
+if housekeeper_host_config.get('MemorySwap') != 134217728:
+    raise SystemExit(f'unexpected qBittorrent housekeeper memory+swap limit: {housekeeper_host_config.get("MemorySwap")!r}')
+if housekeeper.get('State', {}).get('OOMKilled') is not False:
+    raise SystemExit('qBittorrent housekeeper has recorded an out-of-memory kill')
+
+web = ports.get('${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}/tcp') or []
+if web != [{'HostIp': '127.0.0.1', 'HostPort': '${ARBUZAS_QBITTORRENT_WEBUI_PORT}'}]:
+    raise SystemExit(f'unexpected qBittorrent WebUI publishing: {web!r}')
+
+for protocol in ('tcp', 'udp'):
+    bindings = ports.get('${ARBUZAS_QBITTORRENT_PEER_PORT}/' + protocol) or []
+    if not bindings:
+        raise SystemExit(f'missing public peer {protocol} binding')
+    for binding in bindings:
+        if binding.get('HostPort') != '${ARBUZAS_QBITTORRENT_PEER_PORT}':
+            raise SystemExit(f'wrong public peer {protocol} port: {bindings!r}')
+        if binding.get('HostIp') in ('127.0.0.1', '::1'):
+            raise SystemExit(f'peer {protocol} is loopback-only: {bindings!r}')
+PY
+      docker exec \"\${container_id}\" /usr/local/bin/qbittorrent-memory-health
+      docker exec \"\${housekeeper_container_id}\" grep -Fx '134217728' /sys/fs/cgroup/memory.max >/dev/null
+      docker exec \"\${housekeeper_container_id}\" grep -Fx '0' /sys/fs/cgroup/memory.swap.max >/dev/null
+      docker exec \"\${housekeeper_container_id}\" grep -Fx 'oom 0' /sys/fs/cgroup/memory.events >/dev/null
+      docker exec \"\${housekeeper_container_id}\" grep -Fx 'oom_kill 0' /sys/fs/cgroup/memory.events >/dev/null
+      network_json=\$(docker network inspect arbuzas_qbittorrent_private)
+      printf '%s' \"\${network_json}\" | python3 -c 'import json,sys; payload=json.load(sys.stdin)[0]; configs=payload.get(\"IPAM\", {}).get(\"Config\", []); assert configs == [{\"Subnet\": \"172.29.246.0/28\", \"Gateway\": \"172.29.246.1\"}], configs; names={item.get(\"Name\") for item in payload.get(\"Containers\", {}).values()}; assert any(name.endswith(\"-qbittorrent-1\") for name in names), names; assert any(name.endswith(\"-qbittorrent_housekeeper-1\") for name in names), names'
+      wait_until_ok curl -fsS \
+        -H 'Host: ${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}' \
+        'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}/api/v2/app/version' \
+        | grep -Fx 'v5.2.3' >/dev/null" \
+    qbittorrent qbittorrent_housekeeper
+  validate_remote_probe "${remote_release_dir}" "qBittorrent private Tailscale VueTorrent page needs no login" \
+    "root='https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+      wait_until_ok sh -lc 'test \"\$(curl -fsS https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version)\" = v5.2.3'
+      tmpdir=\$(mktemp -d)
+      trap 'rm -rf \"\${tmpdir}\"' EXIT
+      curl -fsS \"\${root}/api/v2/app/preferences\" > \"\${tmpdir}/preferences.json\"
+      curl -fsS \"\${root}/api/v2/app/buildInfo\" > \"\${tmpdir}/build-info.json\"
+      curl -fsS \"\${root}/\" > \"\${tmpdir}/index.html\"
+      headers=\$(curl -fsSI \"\${root}/\" | tr -d \"\\r\")
+      printf '%s\\n' \"\${headers}\" | grep -Fi 'x-frame-options:' >/dev/null
+      printf '%s\\n' \"\${headers}\" | grep -Fi 'content-security-policy:' >/dev/null
+      grep -Fi 'VueTorrent' \"\${tmpdir}/index.html\" >/dev/null
+      compose exec -T qbittorrent_housekeeper wget -q -T 3 -O - http://127.0.0.1:9091/status > \"\${tmpdir}/housekeeper-status.json\"
+      compose exec -T qbittorrent_housekeeper env > \"\${tmpdir}/housekeeper.env\"
+      python3 - \"\${tmpdir}/preferences.json\" \"\${tmpdir}/housekeeper-status.json\" \"\${tmpdir}/housekeeper.env\" \"\${tmpdir}/build-info.json\" <<'PY'
+import json
+import sys
+
+preferences = json.load(open(sys.argv[1], encoding='utf-8'))
+status = json.load(open(sys.argv[2], encoding='utf-8'))
+environment = {}
+for line in open(sys.argv[3], encoding='utf-8'):
+    key, separator, value = line.rstrip('\n').partition('=')
+    if separator:
+        environment[key] = value
+
+build_info = json.load(open(sys.argv[4], encoding='utf-8'))
+if not str(build_info.get('libtorrent', '')).startswith('2.'):
+    raise SystemExit(f'unexpected qBittorrent libtorrent build: {build_info!r}')
+
+expected_preferences = {
+    'async_io_threads': 2,
+    'checking_memory_use': 8,
+    'connection_speed': 10,
+    'disk_io_type': 3,
+    'disk_io_read_mode': 0,
+    'disk_io_write_mode': 0,
+    'disk_queue_size': 1048576,
+    'file_pool_size': 32,
+    'hashing_threads': 1,
+    'max_active_checking_torrents': 1,
+    'max_concurrent_http_announces': 10,
+    'max_connec': 80,
+    'max_connec_per_torrent': 20,
+    'max_uploads': 12,
+    'max_uploads_per_torrent': 4,
+    'queueing_enabled': False,
+    'request_queue_size': 50,
+    'save_resume_data_interval': 1,
+    'send_buffer_low_watermark': 16,
+    'send_buffer_watermark': 128,
+    'send_buffer_watermark_factor': 25,
+    'socket_receive_buffer_size': 65536,
+    'socket_send_buffer_size': 65536,
+    'torrent_stop_condition': 'MetadataReceived',
+    'bypass_local_auth': True,
+    'bypass_auth_subnet_whitelist_enabled': True,
+    'web_ui_reverse_proxy_enabled': True,
+    'web_ui_reverse_proxies_list': '172.29.246.1',
+    'web_ui_domain_list': '${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME};localhost;127.0.0.1;qbittorrent',
+    'alternative_webui_enabled': True,
+    'alternative_webui_path': '/vuetorrent',
+    'web_ui_port': ${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT},
+    'web_ui_clickjacking_protection_enabled': True,
+    'web_ui_csrf_protection_enabled': True,
+    'web_ui_secure_cookie_enabled': True,
+    'web_ui_host_header_validation_enabled': True,
+    'web_ui_upnp': False,
+    'use_https': False,
+    'listen_port': ${ARBUZAS_QBITTORRENT_PEER_PORT},
+    'temp_path_enabled': True,
+    'max_ratio_enabled': False,
+    'max_ratio_act': 0,
+    'max_seeding_time_enabled': False,
+    'max_inactive_seeding_time_enabled': False,
+}
+for key, expected in expected_preferences.items():
+    actual = preferences.get(key)
+    if actual != expected:
+        raise SystemExit(f'qBittorrent preference {key}={actual!r}, expected {expected!r}')
+for key, expected in {'save_path': '/downloads', 'temp_path': '/downloads/.incomplete'}.items():
+    actual = str(preferences.get(key, '')).rstrip('/')
+    if actual != expected:
+        raise SystemExit(f'qBittorrent preference {key}={actual!r}, expected {expected!r}')
+
+expected_subnets = {
+    '127.0.0.1/32',
+    '::1/128',
+    '172.29.246.0/28',
+    '100.64.0.0/10',
+    'fd7a:115c:a1e0::/48',
+}
+actual_subnets = {value.strip() for value in preferences.get('bypass_auth_subnet_whitelist', '').replace(',', '\n').splitlines() if value.strip()}
+if actual_subnets != expected_subnets:
+    raise SystemExit(f'qBittorrent auth bypass subnets={actual_subnets!r}, expected {expected_subnets!r}')
+
+if status.get('healthy') is not True or status.get('soft_cap_bytes') != 25769803776:
+    raise SystemExit(f'unexpected housekeeper status: {status!r}')
+expected_environment = {
+    'QBITTORRENT_URL': 'http://qbittorrent:${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}',
+    'DOWNLOAD_PATH': '/downloads',
+    'SOFT_CAP_BYTES': '25769803776',
+    'MIN_COMPLETED_AGE': '24h',
+    'MIN_RATIO': '1.0',
+}
+for key, expected in expected_environment.items():
+    if environment.get(key) != expected:
+        actual = environment.get(key)
+        raise SystemExit(f'housekeeper {key}={actual!r}, expected {expected!r}')
+if 'QBITTORRENT_USERNAME' in environment or 'QBITTORRENT_PASSWORD_FILE' in environment:
+    raise SystemExit('housekeeper unexpectedly has qBittorrent login credentials')
+PY
+      curl -skf --connect-timeout 2 --max-time 5 https://127.0.0.1:9443/ >/dev/null" \
+    qbittorrent qbittorrent_housekeeper
+  validate_remote_host_probe "${remote_release_dir}" "qBittorrent Tailscale route preserves HTTPS :10000" \
+    "tmp=\$(mktemp)
+      trap 'rm -f \"\${tmp}\"' EXIT
+      tailscale serve status --json > \"\${tmp}\"
+      python3 - \"\${tmp}\" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+tcp = payload.get('TCP', {})
+web = payload.get('Web', {})
+if tcp.get('10000') is None and not any(key.rsplit(':', 1)[-1] == '10000' for key in web):
+    raise SystemExit('existing Tailscale Serve HTTPS :10000 is missing')
+port = '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'
+if tcp.get(port, {}).get('HTTPS') is not True:
+    raise SystemExit(f'qBittorrent Tailscale Serve :{port} is not HTTPS')
+handler = web.get('${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:' + port, {}).get('Handlers', {}).get('/', {})
+expected = 'http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}'
+if handler.get('Proxy') != expected:
+    raise SystemExit(f'qBittorrent Tailscale handler is {handler!r}, expected proxy {expected!r}')
+PY" \
+    qbittorrent qbittorrent_housekeeper
+}
+
+validate_remote_jellyfin_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" jellyfin
+  validate_remote_probe "${remote_release_dir}" "Jellyfin container is healthy" \
+    "deadline=\$((SECONDS + 180))
+      healthy=0
+      while (( SECONDS < deadline )); do
+        container_id=\$(compose ps -q jellyfin 2>/dev/null || true)
+        if [[ -n \"\${container_id}\" ]] &&
+           [[ \"\$(docker inspect --format '{{.State.Health.Status}}' \"\${container_id}\" 2>/dev/null || true)\" == healthy ]]; then
+          healthy=1
+          break
+        fi
+        sleep 5
+      done
+      (( healthy == 1 ))" \
+    jellyfin
+
+  validate_remote_host_probe "${remote_release_dir}" "Jellyfin state, media, and admin secret are safe" \
+    "set -a
+      . '${remote_release_dir}/release.env'
+      set +a
+      test \"\${ARBUZAS_JELLYFIN_PUID}\" = \"\$(id -u)\"
+      test \"\${ARBUZAS_JELLYFIN_PGID}\" = \"\$(id -g)\"
+      sudo -n bash '${remote_release_dir}/infra/arbuzas/qbittorrent/install-storage.sh' check
+      for path in \
+        '${JELLYFIN_REMOTE_ROOT}' \
+        '${JELLYFIN_REMOTE_ROOT}/config' \
+        '${JELLYFIN_REMOTE_ROOT}/cache' \
+        '${JELLYFIN_REMOTE_ROOT}/tmp' \
+        '${JELLYFIN_REMOTE_ROOT}/transcodes'; do
+        test -d \"\${path}\"
+        test ! -L \"\${path}\"
+        test \"\$(stat -c '%u:%g:%a' \"\${path}\")\" = \"\${ARBUZAS_JELLYFIN_PUID}:\${ARBUZAS_JELLYFIN_PGID}:750\"
+      done
+      sudo -n test -f '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}'
+      sudo -n test ! -L '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}'
+      test \"\$(sudo -n stat -c '%u:%g:%a' '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}')\" = '0:0:600'
+      sudo -n python3 - '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' <<'PY'
+from pathlib import Path
+import sys
+
+value = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+if len(value) < 32 or any(char.isspace() for char in value):
+    raise SystemExit('Jellyfin admin password file is empty, short, or malformed')
+PY" \
+    jellyfin
+
+  validate_remote_probe "${remote_release_dir}" "Jellyfin limits and loopback-only read-only media mount" \
+    "inspect_json=\$(mktemp)
+      trap 'rm -f \"\${inspect_json}\"' EXIT
+      container_id=\$(compose ps -q jellyfin)
+      docker inspect \"\${container_id}\" > \"\${inspect_json}\"
+      set -a
+      . '${remote_release_dir}/release.env'
+      set +a
+      python3 - \"\${inspect_json}\" \"\${ARBUZAS_JELLYFIN_PUID}:\${ARBUZAS_JELLYFIN_PGID}\" <<'PY'
+import json
+import sys
+
+container = json.load(open(sys.argv[1], encoding='utf-8'))[0]
+expected_user = sys.argv[2]
+host_config = container.get('HostConfig', {})
+config = container.get('Config', {})
+state = container.get('State', {})
+ports = container.get('NetworkSettings', {}).get('Ports', {})
+
+if host_config.get('Memory') != 536870912:
+    raise SystemExit(f'unexpected Jellyfin memory limit: {host_config.get("Memory")!r}')
+if host_config.get('MemoryReservation') != 134217728:
+    raise SystemExit(f'unexpected Jellyfin memory reservation: {host_config.get("MemoryReservation")!r}')
+if host_config.get('MemorySwap') != 536870912:
+    raise SystemExit(f'unexpected Jellyfin memory plus swap limit: {host_config.get("MemorySwap")!r}')
+if host_config.get('NanoCpus') != 750000000:
+    raise SystemExit(f'unexpected Jellyfin CPU limit: {host_config.get("NanoCpus")!r}')
+if host_config.get('PidsLimit') != 256:
+    raise SystemExit(f'unexpected Jellyfin process limit: {host_config.get("PidsLimit")!r}')
+if host_config.get('ReadonlyRootfs') is not True:
+    raise SystemExit('Jellyfin root filesystem is not read-only')
+if host_config.get('Privileged') is not False:
+    raise SystemExit('Jellyfin is unexpectedly privileged')
+if host_config.get('CapDrop') != ['ALL']:
+    raise SystemExit(f'unexpected Jellyfin capability policy: {host_config.get("CapDrop")!r}')
+if 'no-new-privileges:true' not in (host_config.get('SecurityOpt') or []):
+    raise SystemExit(f'Jellyfin no-new-privileges is missing: {host_config.get("SecurityOpt")!r}')
+if host_config.get('Tmpfs') not in ({}, None):
+    raise SystemExit(f'Jellyfin unexpectedly uses RAM-backed tmpfs: {host_config.get("Tmpfs")!r}')
+if state.get('OOMKilled') is not False:
+    raise SystemExit('Jellyfin has recorded an out-of-memory kill')
+if config.get('User') != expected_user:
+    raise SystemExit(f'Jellyfin runs as {config.get("User")!r}, expected {expected_user!r}')
+
+web = ports.get('${ARBUZAS_JELLYFIN_INTERNAL_PORT}/tcp') or []
+if web != [{'HostIp': '127.0.0.1', 'HostPort': '${ARBUZAS_JELLYFIN_HOST_PORT}'}]:
+    raise SystemExit(f'unexpected Jellyfin Web publishing: {web!r}')
+for exposed_port, bindings in ports.items():
+    if exposed_port != '${ARBUZAS_JELLYFIN_INTERNAL_PORT}/tcp' and bindings:
+        raise SystemExit(f'unexpected published Jellyfin port {exposed_port}: {bindings!r}')
+
+expected_mounts = {
+    '/config': ('/srv/arbuzas/jellyfin/config', True),
+    '/cache': ('/srv/arbuzas/jellyfin/cache', True),
+    '/tmp': ('/srv/arbuzas/jellyfin/tmp', True),
+    '/transcodes': ('/srv/arbuzas/jellyfin/transcodes', True),
+    '/media': ('/srv/arbuzas/qbittorrent/storage/payload', False),
+}
+actual_mounts = {
+    item.get('Destination'): (item.get('Source'), item.get('RW'))
+    for item in container.get('Mounts', [])
+}
+if actual_mounts != expected_mounts:
+    raise SystemExit(f'unexpected Jellyfin mounts: {actual_mounts!r}')
+if any('/etc/arbuzas/secrets' in str(source) for source, _writable in actual_mounts.values()):
+    raise SystemExit('Jellyfin admin secret is unexpectedly mounted into the container')
+
+networks = container.get('NetworkSettings', {}).get('Networks', {})
+if set(networks) != {'arbuzas_jellyfin_private'}:
+    raise SystemExit(f'unexpected Jellyfin Docker networks: {sorted(networks)!r}')
+PY
+      grep -Fx '536870912' /sys/fs/cgroup/system.slice/docker-\${container_id}.scope/memory.max >/dev/null 2>&1 || \
+        docker exec \"\${container_id}\" grep -Fx '536870912' /sys/fs/cgroup/memory.max >/dev/null
+      docker exec \"\${container_id}\" grep -Fx '0' /sys/fs/cgroup/memory.swap.max >/dev/null
+      docker exec \"\${container_id}\" grep -Fx 'oom 0' /sys/fs/cgroup/memory.events >/dev/null
+      docker exec \"\${container_id}\" grep -Fx 'oom_kill 0' /sys/fs/cgroup/memory.events >/dev/null
+      network_json=\$(docker network inspect arbuzas_jellyfin_private)
+      printf '%s' \"\${network_json}\" | python3 -c 'import json,sys; payload=json.load(sys.stdin)[0]; configs=payload.get(\"IPAM\", {}).get(\"Config\", []); assert configs == [{\"Subnet\": \"172.29.247.0/28\", \"Gateway\": \"172.29.247.1\"}], configs; containers=payload.get(\"Containers\", {}); members=[item for item in containers.values() if item.get(\"Name\", \"\").endswith(\"-jellyfin-1\")]; assert len(members) == 1, members; assert members[0].get(\"IPv4Address\") == \"172.29.247.2/28\", members; assert payload.get(\"Options\", {}).get(\"com.docker.network.bridge.enable_icc\") == \"false\", payload.get(\"Options\")'
+      curl -fsS --connect-timeout 2 --max-time 5 \
+        'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}/health' | grep -Fx Healthy >/dev/null" \
+    jellyfin
+
+  validate_remote_host_probe "${remote_release_dir}" "Jellyfin passwordless profile, library, and direct-play policy" \
+    "sudo -n python3 '${remote_release_dir}/infra/arbuzas/jellyfin/bootstrap.py' check \
+      --url 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}' \
+      --admin-password-file '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}'" \
+    jellyfin
+
+  validate_remote_probe "${remote_release_dir}" "Jellyfin private Tailscale interface" \
+    "root='https://${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}:${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+      wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}:${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}/health | grep -Fx Healthy >/dev/null'
+      curl -fsSL \"\${root}/web/\" | grep -Fi Jellyfin >/dev/null
+      test \"\$(curl -fsS --connect-timeout 3 --max-time 8 \
+        'https://${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}/api/v2/app/version')\" = v5.2.3
+      panel_code=\$(curl -skS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+        'https://${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}:10000/' || true)
+      [[ \"\${panel_code}\" != 000 ]]" \
+    jellyfin
+
+  validate_remote_host_probe "${remote_release_dir}" "Jellyfin exact Tailscale route and existing routes" \
+    "tmp=\$(mktemp)
+      trap 'rm -f \"\${tmp}\"' EXIT
+      tailscale serve status --json > \"\${tmp}\"
+      python3 - \"\${tmp}\" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+tcp = payload.get('TCP', {})
+web = payload.get('Web', {})
+for existing_port in ('10000', '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'):
+    if tcp.get(existing_port) is None and not any(key.rsplit(':', 1)[-1] == existing_port for key in web):
+        raise SystemExit(f'existing Tailscale Serve :{existing_port} is missing')
+port = '${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}'
+if port in ('443', '10000', '${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}'):
+    raise SystemExit(f'Jellyfin uses a forbidden or occupied Tailscale port: {port}')
+if tcp.get(port) != {'HTTPS': True}:
+    raise SystemExit(f'Jellyfin Tailscale Serve :{port} is not exact HTTPS: {tcp.get(port)!r}')
+target_web = {key: value for key, value in web.items() if key.rsplit(':', 1)[-1] == port}
+handler = target_web.get('${ARBUZAS_JELLYFIN_TAILSCALE_HOSTNAME}:' + port, {}).get('Handlers', {}).get('/', {})
+expected = 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}'
+if len(target_web) != 1 or handler.get('Proxy') != expected:
+    raise SystemExit(f'Jellyfin Tailscale route is {target_web!r}, expected only {expected!r}')
+PY" \
+    jellyfin
+}
+
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
 
@@ -4594,6 +6094,30 @@ validate_remote_selected_smoke_health() {
         case \" \${running} \" in *' chatgpt_bot '*) ;; *) return 1 ;; esac
         compose exec -T chatgpt_broker sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_CHATGPT_BROKER_PORT}/healthz >/dev/null' >/dev/null 2>&1 || return 1
       fi
+      if [[ '${VALIDATE_QBITTORRENT}' == '1' ]]; then
+        for service_name in qbittorrent qbittorrent_housekeeper; do
+          case \" \${running} \" in *\" \${service_name} \"*) ;; *) return 1 ;; esac
+          container_id=\$(compose ps -q \"\${service_name}\")
+          [[ \"\$(docker inspect --format '{{.State.Health.Status}}' \"\${container_id}\")\" == healthy ]] || return 1
+        done
+        curl -fsS --connect-timeout 2 --max-time 4 \
+          -H 'Host: ${ARBUZAS_QBITTORRENT_TAILSCALE_HOSTNAME}:${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}' \
+          http://127.0.0.1:${ARBUZAS_QBITTORRENT_WEBUI_PORT}/api/v2/app/version \
+          | grep -Fx v5.2.3 >/dev/null || return 1
+      fi
+      if [[ '${VALIDATE_JELLYFIN}' == '1' ]]; then
+        case \" \${running} \" in *' jellyfin '*) ;; *) return 1 ;; esac
+        container_id=\$(compose ps -q jellyfin)
+        [[ -n \"\${container_id}\" ]] || return 1
+        health_status=\$(docker inspect --format '{{.State.Health.Status}}' \"\${container_id}\" 2>/dev/null || true)
+        [[ \"\${health_status}\" == healthy ]] || return 1
+        curl -fsS --connect-timeout 2 --max-time 4 \
+          'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}/health' \
+          | grep -Fx Healthy >/dev/null || return 1
+        sudo -n python3 '${remote_release_dir}/infra/arbuzas/jellyfin/bootstrap.py' check \
+          --url 'http://127.0.0.1:${ARBUZAS_JELLYFIN_HOST_PORT}' \
+          --admin-password-file '${JELLYFIN_REMOTE_ADMIN_PASSWORD_FILE}' >/dev/null || return 1
+      fi
       if [[ '${VALIDATE_TICKET_REMOTE}' == '1' ]]; then
         for service_name in ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel; do
           case \" \${running} \" in
@@ -4632,6 +6156,8 @@ validate_remote_workload_health() {
   validate_remote_subscription_workload_health "${remote_release_dir}"
   validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
   validate_remote_chatgpt_workload_health "${remote_release_dir}"
+  validate_remote_qbittorrent_workload_health "${remote_release_dir}"
+  validate_remote_jellyfin_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
 }
 
@@ -4655,6 +6181,12 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_CHATGPT == 1 )); then
     validate_remote_chatgpt_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_QBITTORRENT == 1 )); then
+    validate_remote_qbittorrent_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_JELLYFIN == 1 )); then
+    validate_remote_jellyfin_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
@@ -5037,7 +6569,7 @@ deploy_config_from_mirror() {
   done
   remote_shell "
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps --remove-orphans${service_args}
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
   " || return $?
 }
 
@@ -5142,6 +6674,8 @@ if [[ -n "${ARBUZAS_SSH_KNOWN_HOSTS_FILE}" ]]; then
 fi
 
 validate_validation_profile
+validate_qbittorrent_fixed_parameters
+validate_jellyfin_fixed_parameters
 
 if (( VALIDATION_PROFILE_OPTION_SET == 1 )); then
   case "${action}" in
@@ -5235,9 +6769,26 @@ case "${action}" in
       run_timed_phase prepare_host prepare_remote_host_layout
     fi
     run_timed_phase upload_release copy_deploy_release_payload
-    run_timed_phase render_tunnels render_deploy_cloudflared_configs
+    if ! run_timed_phase render_tunnels render_deploy_cloudflared_configs; then
+      exit 1
+    fi
+    if ! run_timed_phase prepare_qbittorrent prepare_remote_qbittorrent_runtime; then
+      exit 1
+    fi
+    if ! run_timed_phase prepare_jellyfin prepare_remote_jellyfin_runtime; then
+      exit 1
+    fi
     deploy_ready_for_validation=1
     if ! run_timed_phase restart_services remote_compose_up; then
+      deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )) && ! run_timed_phase bootstrap_jellyfin bootstrap_remote_jellyfin; then
+      deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )) && ! run_timed_phase publish_qbittorrent publish_remote_qbittorrent_tailscale; then
+      deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )) && ! run_timed_phase publish_jellyfin publish_remote_jellyfin_tailscale; then
       deploy_ready_for_validation=0
     fi
     if (( deploy_ready_for_validation == 1 )) && run_timed_phase validate_release validate_deployed_release; then
@@ -5247,12 +6798,31 @@ case "${action}" in
     if [[ -n "${previous_release_id}" && "${previous_release_id}" != "${ARBUZAS_RELEASE_ID}" ]]; then
       log "Deploy validation failed; rolling back to ${previous_release_id}"
       requested_release_id="${previous_release_id}"
-      run_timed_phase rollback_release rollback_remote_release
-      if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
-        run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${previous_release_id}" 1
+      if qbittorrent_deployment_selected && ! previous_release_has_qbittorrent "${previous_release_id}"; then
+        run_timed_phase rollback_release rollback_release_before_qbittorrent "${previous_release_id}" owned-only
+        if jellyfin_deployment_selected && ! previous_release_has_jellyfin "${previous_release_id}"; then
+          run_timed_phase rollback_jellyfin_route remove_remote_jellyfin_tailscale_route owned-only
+        fi
+        run_timed_phase validate_rollback validate_release_before_qbittorrent_recovery "${previous_release_id}" owned-only
       else
-        run_timed_phase validate_rollback validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
-        run_timed_phase validate_rollback_services validate_remote_release "${previous_release_id}"
+        if qbittorrent_deployment_selected && previous_release_has_qbittorrent "${previous_release_id}"; then
+          run_timed_phase prepare_rollback_qbittorrent prepare_remote_qbittorrent_runtime "${previous_release_id}" 1
+        fi
+        if jellyfin_deployment_selected && previous_release_has_jellyfin "${previous_release_id}"; then
+          run_timed_phase prepare_rollback_jellyfin prepare_remote_jellyfin_runtime "${previous_release_id}" 1
+        fi
+        if jellyfin_deployment_selected && ! previous_release_has_jellyfin "${previous_release_id}"; then
+          run_timed_phase rollback_release rollback_release_before_jellyfin "${previous_release_id}" owned-only
+          run_timed_phase validate_rollback validate_release_before_jellyfin_recovery "${previous_release_id}" owned-only
+        else
+          run_timed_phase rollback_release rollback_remote_release
+          if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+            run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${previous_release_id}" 1
+          else
+            run_timed_phase validate_rollback validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${previous_release_id}"
+            run_timed_phase validate_rollback_services validate_remote_release "${previous_release_id}"
+          fi
+        fi
       fi
     fi
     exit 1
@@ -5264,12 +6834,39 @@ case "${action}" in
     run_timed_phase validate_release validate_remote_release "${requested_release_id}"
     ;;
   rollback)
-    run_timed_phase rollback_release rollback_remote_release
-    if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
-      run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${requested_release_id}" 1
+    if [[ -z "${requested_release_id}" ]]; then
+      echo "--release-id is required for rollback" >&2
+      exit 2
+    fi
+    if qbittorrent_deployment_selected && ! previous_release_has_qbittorrent "${requested_release_id}"; then
+      run_timed_phase rollback_release rollback_release_before_qbittorrent "${requested_release_id}" force-managed
+      if jellyfin_deployment_selected && ! previous_release_has_jellyfin "${requested_release_id}"; then
+        run_timed_phase rollback_jellyfin_route remove_remote_jellyfin_tailscale_route force-managed
+      fi
+      run_timed_phase validate_rollback validate_release_before_qbittorrent_recovery "${requested_release_id}" force-managed
     else
-      run_timed_phase validate_rollback_link validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
-      run_timed_phase validate_rollback_services validate_remote_release "${requested_release_id}"
+      if qbittorrent_deployment_selected && previous_release_has_qbittorrent "${requested_release_id}"; then
+        run_timed_phase prepare_rollback_qbittorrent prepare_remote_qbittorrent_runtime "${requested_release_id}" 1
+      fi
+      if jellyfin_deployment_selected && ! previous_release_has_jellyfin "${requested_release_id}"; then
+        run_timed_phase rollback_release rollback_release_before_jellyfin "${requested_release_id}" force-managed
+        run_timed_phase validate_rollback validate_release_before_jellyfin_recovery "${requested_release_id}" force-managed
+      else
+        if jellyfin_deployment_selected && previous_release_has_jellyfin "${requested_release_id}"; then
+          run_timed_phase prepare_rollback_jellyfin prepare_remote_jellyfin_runtime "${requested_release_id}" 1
+        fi
+        run_timed_phase rollback_release rollback_remote_release
+        if jellyfin_deployment_selected && previous_release_has_jellyfin "${requested_release_id}"; then
+          run_timed_phase bootstrap_rollback_jellyfin bootstrap_remote_jellyfin "${requested_release_id}" 1
+          run_timed_phase publish_rollback_jellyfin publish_remote_jellyfin_tailscale
+        fi
+        if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+          run_timed_phase validate_rollback validate_remote_selected_smoke_health "${REMOTE_RELEASES_ROOT}/${requested_release_id}" 1
+        else
+          run_timed_phase validate_rollback_link validate_remote_current_release_link "${REMOTE_RELEASES_ROOT}/${requested_release_id}"
+          run_timed_phase validate_rollback_services validate_remote_release "${requested_release_id}"
+        fi
+      fi
     fi
     run_timed_phase post_rollback_maintenance run_post_deploy_maintenance "${requested_release_id}"
     ;;

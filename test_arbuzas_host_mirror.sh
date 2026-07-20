@@ -36,15 +36,29 @@ python3 "${SCRIPT}" pull --profile arbuzas --remote-root "${remote_root}" --mirr
 test -f "${mirror_root}/etc/arbuzas/env/train-bot.env"
 test -f "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey"
 test -f "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json"
-test ! -f "${mirror_root}/etc/arbuzas/current/release.env"
+grep -F 'ARBUZAS_RELEASE_ID=initial' "${mirror_root}/etc/arbuzas/current/release.env" >/dev/null
 
 cat > "${mirror_root}/etc/arbuzas/env/train-bot.env" <<'EOF'
 BOT_TOKEN=local-change
 EOF
+cat > "${remote_root}/etc/arbuzas/current/release.env" <<'EOF'
+ARBUZAS_RELEASE_ID=remote-advanced
+EOF
 python3 "${SCRIPT}" push --profile arbuzas --remote-root "${remote_root}" --mirror-root "${mirror_root}" --changed-paths-file "${changed_paths}"
 
 grep -F 'BOT_TOKEN=local-change' "${remote_root}/etc/arbuzas/env/train-bot.env" >/dev/null
+grep -F 'ARBUZAS_RELEASE_ID=remote-advanced' "${remote_root}/etc/arbuzas/current/release.env" >/dev/null
 grep -Fx 'etc/arbuzas/env/train-bot.env' "${changed_paths}" >/dev/null
+
+cp "${mirror_root}/etc/arbuzas/current/release.env" "${tmpdir}/release.env.snapshot"
+printf 'ARBUZAS_RELEASE_ID=must-not-push\n' > "${mirror_root}/etc/arbuzas/current/release.env"
+if python3 "${SCRIPT}" push --profile arbuzas --remote-root "${remote_root}" --mirror-root "${mirror_root}" >"${tmpdir}/pull-only-push.out" 2>&1; then
+  echo "FAIL: pull-only active release snapshot must not be pushable" >&2
+  exit 1
+fi
+grep -F 'pull-only local changed: etc/arbuzas/current/release.env' "${tmpdir}/pull-only-push.out" >/dev/null
+grep -F 'ARBUZAS_RELEASE_ID=remote-advanced' "${remote_root}/etc/arbuzas/current/release.env" >/dev/null
+cp "${tmpdir}/release.env.snapshot" "${mirror_root}/etc/arbuzas/current/release.env"
 
 python3 "${SCRIPT}" pull --profile arbuzas --remote-root "${remote_root}" --mirror-root "${mirror_root}"
 cat > "${remote_root}/etc/arbuzas/env/satiksme-bot.env" <<'EOF'
@@ -136,4 +150,4 @@ if python3 "${SCRIPT}" audit --profile ticket-recovery --remote-root "${narrow_r
 fi
 grep -Fq 'remote changed: etc/arbuzas/env/ticket-remote.env' "${tmpdir}/narrow-audit.out"
 
-echo "PASS: Arbuzas host mirror pulls, audits, pushes, detects conflicts, and maps affected services"
+echo "PASS: Arbuzas host mirror preserves pull-only migration state, syncs config, detects conflicts, and maps affected services"

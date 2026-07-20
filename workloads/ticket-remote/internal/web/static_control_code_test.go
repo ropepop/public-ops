@@ -83,6 +83,9 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	displayBody := substringBetween(t, source,
 		"async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {",
 		"  function controlCodeResultDisplayedForRequest(requestID) {")
+	revealBody := substringBetween(t, source,
+		"function revealControlCodeResultImageAtomically(requestID) {",
+		"  async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {")
 	captureBody := substringBetween(t, source,
 		"async function captureControlCodeResultScreenshot(request, proof) {",
 		"  function failControlCodeResultScreenshotWait() {")
@@ -118,8 +121,12 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 		}
 	}
 
+	hideAreaIndex := strings.Index(displayBody, "setControlCodeResultVisible(false);")
+	hideImageIndex := strings.Index(displayBody, "codeResultImage.hidden = true;")
+	clearSourceIndex := strings.Index(displayBody, "codeResultImage.removeAttribute('src');")
 	srcIndex := strings.Index(displayBody, "codeResultImage.src = capturedImage;")
 	decodeIndex := strings.Index(displayBody, "await waitForControlCodeResultImageReady(codeResultImage)")
+	revealIndex := strings.Index(displayBody, "await revealControlCodeResultImageAtomically(requestID)")
 	firstPaintIndex := strings.Index(displayBody, "await waitForControlCodePaintFrame()")
 	secondPaintRelative := -1
 	if firstPaintIndex >= 0 {
@@ -132,11 +139,34 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	reverifyIndex := strings.LastIndex(displayBody, "if (!controlCodeResultPaintReady(requestID)) return false;")
 	paintedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_painted'")
 	displayedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_displayed'")
-	if srcIndex < 0 || decodeIndex < 0 || firstPaintIndex < 0 || secondPaintIndex < 0 || reverifyIndex < 0 || paintedEventIndex < 0 || displayedEventIndex < 0 {
+	if hideAreaIndex < 0 || hideImageIndex < 0 || clearSourceIndex < 0 || srcIndex < 0 || decodeIndex < 0 || revealIndex < 0 || firstPaintIndex < 0 || secondPaintIndex < 0 || reverifyIndex < 0 || paintedEventIndex < 0 || displayedEventIndex < 0 {
 		t.Fatal("control-code display path is missing a complete paint handshake")
 	}
-	if !(srcIndex < decodeIndex && decodeIndex < firstPaintIndex && firstPaintIndex < secondPaintIndex && secondPaintIndex < reverifyIndex && reverifyIndex < paintedEventIndex && paintedEventIndex < displayedEventIndex) {
-		t.Fatal("image must decode, survive two paints, and be reverified before painted/displayed events")
+	if !(hideAreaIndex < srcIndex && hideImageIndex < srcIndex && clearSourceIndex < srcIndex && srcIndex < decodeIndex && decodeIndex < revealIndex && revealIndex < firstPaintIndex && firstPaintIndex < secondPaintIndex && secondPaintIndex < reverifyIndex && reverifyIndex < paintedEventIndex && paintedEventIndex < displayedEventIndex) {
+		t.Fatal("image must stay hidden through decode, reveal atomically, survive two paints, and be reverified before painted/displayed events")
+	}
+	for _, needle := range []string{
+		"requestAnimationFrame(() => {",
+		"document.visibilityState !== 'visible'",
+		"locallyClosedControlCodeRequestIDs.has(requestID)",
+		"!codeRequest",
+		"String(codeRequest.requestId || '').trim() !== requestID",
+		"codeRequest.status !== 'succeeded'",
+		"!codeResultImage.complete",
+		"codeResultImage.naturalWidth <= 0",
+		"codeResultImage.naturalHeight <= 0",
+		"codeResultImage.hidden = false;",
+		"setControlCodeResultVisible(true);",
+	} {
+		if !strings.Contains(revealBody, needle) {
+			t.Fatalf("atomic control-code reveal missing %q", needle)
+		}
+	}
+	imageRevealIndex := strings.Index(revealBody, "codeResultImage.hidden = false;")
+	areaRevealIndex := strings.Index(revealBody, "setControlCodeResultVisible(true);")
+	frameRevealIndex := strings.Index(revealBody, "frameID = requestAnimationFrame(() => {")
+	if frameRevealIndex < 0 || imageRevealIndex < frameRevealIndex || areaRevealIndex < imageRevealIndex {
+		t.Fatal("result image and containing layer must reveal together inside one animation frame")
 	}
 	if strings.Contains(displayBody[:paintedEventIndex], "confirmControlCodeBrowserCapture(") {
 		t.Fatal("display helper must never acknowledge before its painted event")
