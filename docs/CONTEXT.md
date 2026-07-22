@@ -16,6 +16,8 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `../workloads/train-bot/AGENTS.md`: train app verification and public-cache cautions.
 - `../workloads/ticket-remote/README.md`: public ViVi ticket viewer runtime model.
 - `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
+- `../workloads/operational-logging/README.md`: the one-database private logging
+  schema, writer boundaries, retention, and migration contract.
 - `../workloads/subscription-bot/README.md` and `../workloads/subscription-bot/AGENTS.md`: subscription bot and mini app overview plus web UI checks.
 - For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
 
@@ -23,6 +25,8 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 
 - `architecture/`: stable system design, boundaries, endpoints, state ownership, and runtime paths.
 - `architecture/WEB_UI_GUIDANCE.md`: required ArrowJS policy for active interactive browser UI.
+- `runbooks/OPERATIONAL_LOGGING.md`: publication, writer enrollment, retained
+  history migration, privacy checks, and legacy logging retirement.
 - `runbooks/`: operator procedures that should remain valid across sessions.
 - `reference/` if present: exhaustive command/config/API detail.
 - `../infra/arbuzas/docker/README.md`: active Docker layout and Compose details.

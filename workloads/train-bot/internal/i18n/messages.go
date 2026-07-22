@@ -11,7 +11,11 @@ type Catalog struct {
 }
 
 const reportsChannelURL = "https://t.me/vivi_kontrole_reports"
-const miniAppDeepLinkURL = "https://t.me/vivi_kontrole_bot/app"
+
+// The bot exposes a Main Mini App. Main Mini Apps use the startapp query
+// form; a /<short-name> path is reserved for separately registered direct-link
+// apps and Telegram Web rejects an unregistered short name.
+const miniAppDeepLinkURL = "https://t.me/vivi_kontrole_bot?startapp"
 
 func NewCatalog() *Catalog {
 	return &Catalog{

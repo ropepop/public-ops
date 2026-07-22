@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "classifications": [
+    {
+      "database": "operational-logging-prod",
+      "table": "operationallog_event",
+      "kind": "canonical_log",
+      "expectedAccess": "private",
+      "note": "the sole active operational log-data table"
+    },
+    {
+      "database": "deployment-timing-prod",
+      "table": "deploymenttiming_run",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "deleted 2026-07-22 after retained deployment run parity"
+    },
+    {
+      "database": "deployment-timing-prod",
+      "table": "deploymenttiming_phase",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "deleted 2026-07-22 after retained deployment phase parity"
+    },
+    {
+      "database": "pixel-orchestrator-observability-prod",
+      "table": "pixelorchestrator_event",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "deleted 2026-07-22 after retained Pixel event parity"
+    },
+    {
+      "database": "ticket-remote-prod-v3",
+      "table": "ticketremote_safe_operational_log",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "retained Ticket safe operational event source"
+    },
+    {
+      "database": "chatgpt-broker-prod",
+      "table": "chatgptbroker_event",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "selected zero-expiry retired broker archive source"
+    },
+    {
+      "database": "chatgpt-broker-prod",
+      "table": "chatgptbroker_attempt",
+      "kind": "legacy_log_source",
+      "expectedAccess": "private",
+      "note": "selected zero-expiry retired broker attempt archive source"
+    },
+    {
+      "database": "satiksme-bot-7r016",
+      "table": "satiksmebot_chat_analyzer_batch",
+      "kind": "application_state",
+      "note": "sensitive analyzer workflow state, not runtime logging"
+    },
+    {
+      "database": "satiksme-bot-7r016",
+      "table": "satiksmebot_chat_analyzer_batch_message",
+      "kind": "application_state",
+      "note": "sensitive analyzer message linkage, not runtime logging"
+    },
+    {
+      "database": "satiksme-bot-7r016",
+      "table": "satiksmebot_incident_vote_event",
+      "kind": "application_state",
+      "note": "incident product history, not runtime logging"
+    },
+    {
+      "database": "satiksme-bot-7r016",
+      "table": "satiksmebot_public_incident_event",
+      "kind": "application_state",
+      "note": "public incident product history, not runtime logging"
+    },
+    {
+      "database": "train-bot",
+      "table": "trainbot_feed_event",
+      "kind": "application_state",
+      "note": "train feed product state, not runtime logging"
+    },
+    {
+      "database": "train-bot",
+      "table": "trainbot_activity",
+      "kind": "application_state",
+      "note": "incident, comment, vote, and train/station activity product state, not runtime logging"
+    },
+    {
+      "database": "train-bot",
+      "table": "trainbot_incident_event",
+      "kind": "application_state",
+      "note": "train incident product history, not runtime logging"
+    }
+  ]
+}

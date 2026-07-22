@@ -61,6 +61,11 @@ security-audits/
 /ops/reports/*.log
 /*.png
 
-# Keep evidence tracked by default under ops/evidence
-# Keep secrets tracked by explicit user decision.
+# Keep evidence tracked by default under ops/evidence.
+# The active private host mirror remains tracked by explicit user decision, but
+# ad hoc history copies and newly split analyzer credentials must never be added.
+infra/arbuzas/host-mirror/etc/arbuzas/env/*.bak*
+infra/arbuzas/host-mirror/etc/arbuzas/env/*.before-*
+infra/arbuzas/host-mirror/etc/arbuzas/env/*.retired-*
+infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/
 workloads/subscription-bot/.env

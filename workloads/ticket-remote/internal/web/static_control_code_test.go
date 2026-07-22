@@ -1200,8 +1200,6 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, needle := range []string{
-		"const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);",
-		"correlationId: typeof browserTraceId === 'string' ? browserTraceId : ''",
 		"clientLog('page_boot'",
 		"clientLog('video_socket_connect_attempt'",
 		"clientLog('video_socket_opened'",
@@ -1216,25 +1214,29 @@ func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
 	}
 }
 
-func TestTicketBrowserRuntimeLogRetriesReuseTheOriginalRowID(t *testing.T) {
+func TestTicketBrowserRuntimeLogsUseAuthenticatedVideoSocketQueue(t *testing.T) {
 	source := ticketAppSource(t)
 	clientSource := readTicketWebClientSource(t, "src/index.ts")
 	for _, needle := range []string{
-		"function newClientLogRowID(entry) {",
-		"if (!compacted.rowId) compacted.rowId = newClientLogRowID(compacted);",
-		"pendingClientLogs.unshift(entry);",
-		"entry.correlationId || '', entry.rowId || ''",
+		"if (!videoWs || videoWs.readyState !== WebSocket.OPEN || !pendingClientLogs.length) return;",
+		"const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));",
+		"videoWs.send(JSON.stringify({",
+		"type: 'client_log'",
+		"event: String(entry.event || 'client_event').slice(0, 80)",
+		"detail: detailJson",
+		"pendingClientLogs.unshift(...batch.slice(index));",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("browser safe-log retry must preserve its enqueue-time row ID, missing %q", needle)
+			t.Fatalf("browser safe-log video queue missing %q", needle)
 		}
 	}
 	for _, needle := range []string{
-		`appendSafeLog(level: string, event: string, detailJson: string, correlationId = "", rowId = "")`,
-		`id: rowId || this.logRowId("browser", event, correlationId)`,
+		"memberAppendSafeOperationalLog",
+		"appendSafeLog(",
+		"logRowId(",
 	} {
-		if !strings.Contains(clientSource, needle) {
-			t.Fatalf("Spacetime browser client must accept a retry-stable safe-log row ID, missing %q", needle)
+		if strings.Contains(clientSource, needle) {
+			t.Fatalf("Spacetime browser client still contains retired direct logging marker %q", needle)
 		}
 	}
 }
@@ -1255,6 +1257,8 @@ func TestTicketBrowserDeduplicatesResumeOutcomesAndHiddenDecoderNoise(t *testing
 		"  window.addEventListener('pageshow'")
 
 	for _, needle := range []string{
+		"activation_visibility_hidden|activation_pagehide/.test(event)) return 'stream_closed';",
+		"activation_resume_(start|finish)/.test(event)) return 'stream_started';",
 		"if (/activation_resume_fresh_frame/.test(event)) return 'stream_recovered';",
 		"if (/recover|recovery/.test(event)) return /failed|exhausted/.test(event) ? 'stream_failed' : 'stream_recovery_requested';",
 	} {
@@ -1265,7 +1269,6 @@ func TestTicketBrowserDeduplicatesResumeOutcomesAndHiddenDecoderNoise(t *testing
 	for _, needle := range []string{
 		"if (!target || target.done || target.logs >= 6) return;",
 		"target.logs += 1;",
-		"correlationId: target.id",
 	} {
 		if !strings.Contains(resumeQueue, needle) {
 			t.Fatalf("resume safe-log path must allow at most one failure and one recovery per flow, missing %q", needle)
@@ -1672,7 +1675,7 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"startActivationResumeFlow('initial_load', 'initial_load');",
 		"startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });",
 		"recoverAfterVisibilityResume('visibility_resume');",
-		"spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '', entry.rowId || '')",
+		"if (!videoWs || videoWs.readyState !== WebSocket.OPEN || !pendingClientLogs.length) return;",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("explicit bounded stream lifecycle missing %q", needle)
@@ -1831,9 +1834,11 @@ func TestFirstRenderedFrameIsSentOverVideoSocket(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, needle := range []string{
 		"function sendVideoSocketClientLog(event, detail) {",
+		"clientLog(event, safeDetail);",
+		"function flushClientLogs() {",
 		"videoWs.send(JSON.stringify({",
 		"type: 'client_log'",
-		"event: String(event || 'client_log').slice(0, 96)",
+		"event: String(entry.event || 'client_event').slice(0, 80)",
 		"sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);",
 	} {
 		if !strings.Contains(source, needle) {

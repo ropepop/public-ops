@@ -39,6 +39,19 @@ func TestSpacetimePayloadsExposeStableTelegramIdentity(t *testing.T) {
 	assertIdentityJSON(t, vote)
 }
 
+func TestSpacetimeChatAnalyzerUsesProductionBaselineProceduresOnly(t *testing.T) {
+	var chatStore ChatAnalyzerStore = (*SpacetimeStore)(nil)
+	if _, ok := chatStore.(ChatAnalyzerMessageExpiryStore); ok {
+		t.Fatal("SpacetimeStore must not require the unpublished bulk message-expiry procedure")
+	}
+	if _, ok := chatStore.(ChatAnalyzerBatchRecoveryStore); ok {
+		t.Fatal("SpacetimeStore must not require the unpublished stale-batch procedure")
+	}
+	if _, ok := chatStore.(ChatAnalyzerBatchFinalizer); ok {
+		t.Fatal("SpacetimeStore must not require an unpublished atomic batch-finalizer procedure")
+	}
+}
+
 func TestSpacetimeCommentCountFallsBackWhenProcedureMissing(t *testing.T) {
 	t.Parallel()
 

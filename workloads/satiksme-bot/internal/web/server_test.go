@@ -888,6 +888,9 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	runtimeState.UpdateCatalog(catalogReader.status)
 	runtimeState.RecordTelegramError(now.Add(-30*time.Second), "telegram timeout")
 	runtimeState.RecordDumpError(now.Add(-20*time.Second), "send failed", 3)
+	runtimeState.ConfigureChatAnalyzer(true, true)
+	runtimeState.RecordChatAnalyzerCollection(now.Add(-10*time.Second), 0, 0, "unauthorized", "session_unauthorized")
+	runtimeState.RecordChatAnalyzerMaintenance(now.Add(-5*time.Second), "stale_batch_recovery_failed")
 	runtimeState.SetWebListening(true)
 
 	cfg := config.Config{
@@ -940,7 +943,7 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	if health["degraded"] != true {
 		t.Fatalf("health degraded = %#v, want true", health["degraded"])
 	}
-	for _, key := range []string{"runtime", "assets", "catalog", "telegram", "reportDump", "db", "web", "bundle", "liveSnapshot", "version", "catalogStops"} {
+	for _, key := range []string{"runtime", "assets", "catalog", "telegram", "reportDump", "chatAnalyzer", "db", "web", "bundle", "liveSnapshot", "version", "catalogStops"} {
 		if _, ok := health[key]; ok {
 			t.Fatalf("public health unexpectedly exposes %q: %#v", key, health[key])
 		}
@@ -1009,6 +1012,16 @@ func TestPublicHealthIsMinimalAndDetailedHealthIsLocalOnly(t *testing.T) {
 	dumpPayload := internalHealth["reportDump"].(map[string]any)
 	if dumpPayload["pending"] != float64(3) {
 		t.Fatalf("reportDump.pending = %#v, want 3", dumpPayload["pending"])
+	}
+	chatAnalyzerPayload := internalHealth["chatAnalyzer"].(map[string]any)
+	if chatAnalyzerPayload["sessionState"] != "unauthorized" || chatAnalyzerPayload["lastErrorCode"] != "session_unauthorized" {
+		t.Fatalf("chatAnalyzer health = %#v", chatAnalyzerPayload)
+	}
+	if chatAnalyzerPayload["lastMaintenanceErrorCode"] != "stale_batch_recovery_failed" || chatAnalyzerPayload["consecutiveMaintenanceErrors"] != float64(1) {
+		t.Fatalf("chatAnalyzer maintenance health = %#v", chatAnalyzerPayload)
+	}
+	if _, exposed := chatAnalyzerPayload["lastError"]; exposed {
+		t.Fatalf("chatAnalyzer health exposed an unsanitized error: %#v", chatAnalyzerPayload)
 	}
 
 	publicInternalReq := httptest.NewRequest(http.MethodGet, "/api/v1/internal/health", nil)

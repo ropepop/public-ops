@@ -148,7 +148,39 @@
   const arrow = window.ArrowJS || null;
   const arrowHTML = arrow && typeof arrow.html === "function" ? arrow.html : null;
   const arrowReactive = arrow && typeof arrow.reactive === "function" ? arrow.reactive : null;
-  const arrowPublicIncidentSlots = arrowReactive ? arrowReactive({ listHTML: "", detailHTML: "" }) : null;
+  const arrowNextTick = arrow && typeof arrow.nextTick === "function" ? arrow.nextTick : null;
+  const arrowPageSlots = arrowReactive ? arrowReactive({
+    publicDashboardHeroHTML: "",
+    publicDashboardStatusHTML: "",
+    publicDashboardControlsHTML: "",
+    publicDashboardListHTML: "",
+    publicDashboardToastHTML: "",
+    publicTrainHeroHTML: "",
+    publicTrainStatusHTML: "",
+    publicTrainDetailHTML: "",
+    publicTrainToastHTML: "",
+    publicMapStatusHTML: "",
+    publicMapDetailHTML: "",
+    publicMapToastHTML: "",
+    publicNetworkMapStatusHTML: "",
+    publicNetworkMapSightingsHTML: "",
+    publicNetworkMapToastHTML: "",
+    publicStationsHeroHTML: "",
+    publicStationsStatusHTML: "",
+    publicStationsSearchHTML: "",
+    publicStationsDeparturesHTML: "",
+    publicStationsToastHTML: "",
+    publicIncidentStatusHTML: "",
+    publicIncidentListHTML: "",
+    publicIncidentDetailHTML: "",
+    publicIncidentToastHTML: "",
+    miniHeroHTML: "",
+    miniStatusHTML: "",
+    miniNavHTML: "",
+    miniMainHTML: "",
+    miniSidebarHTML: "",
+    miniToastHTML: "",
+  }) : null;
   restoreSpacetimeSession();
   const mapController = createMapController();
   const MAP_MARKER_ANIMATION_DEFAULT_MS = 900;
@@ -5465,6 +5497,16 @@
     appEl.innerHTML = html;
   }
 
+  function ensurePageShell(requiredElementIds, html) {
+    const ids = Array.isArray(requiredElementIds) ? requiredElementIds : [];
+    const ready = ids.length > 0 && ids.every((id) => document.getElementById(id));
+    if (ready) {
+      return false;
+    }
+    setAppHTML(html);
+    return true;
+  }
+
   function syncMapFromDOM(containerId, mapModel) {
     mapController.sync(containerId, mapModel);
   }
@@ -9076,28 +9118,51 @@
       return route.includes(filter) || String(item.train.departureAt).toLowerCase().includes(filter);
     });
     const emptyDashboardText = scheduleUnavailable() ? scheduleUnavailableMessage() : t("app_public_dashboard_empty");
-    setAppHTML(`
+    ensurePageShell([
+      "public-dashboard-hero-slot",
+      "public-dashboard-status-slot",
+      "public-dashboard-controls-slot",
+      "public-dashboard-list-slot",
+      "public-dashboard-toast-root",
+    ], `
       <div class="shell">
-        ${renderHero(t("app_public_dashboard_eyebrow"), t("app_public_dashboard_title"), t("app_public_dashboard_note"))}
-        <section class="status-bar">${renderPublicDashboardStatusBar()}</section>
+        <div id="public-dashboard-hero-slot"></div>
+        <section class="status-bar" id="public-dashboard-status-slot"></section>
         <section class="panel" id="public-dashboard-list-panel">
-          <div class="form-grid">
-            <div class="field">
-              <label>${escapeHtml(t("app_dashboard_filter"))}</label>
-              <input id="public-filter" type="text" value="${escapeAttr(state.publicFilterDraft)}" placeholder="${escapeAttr(t("app_dashboard_filter"))}">
-            </div>
-            <div class="button-row">
-              <button class="secondary" id="public-search">${escapeHtml(t("app_search"))}</button>
-              <button class="primary" id="public-refresh">${escapeHtml(t("app_refresh"))}</button>
-            </div>
-          </div>
+          <div id="public-dashboard-controls-slot"></div>
           <div class="divider"></div>
-          <div class="card-list">${items.length ? items.map(renderPublicCard).join("") : `<div class="empty">${escapeHtml(emptyDashboardText)}</div>`}</div>
+          <div class="card-list" id="public-dashboard-list-slot"></div>
         </section>
       </div>
-      ${renderToast()}`);
-    bindPublicDashboardEvents(document.getElementById("public-dashboard-list-panel") || appEl);
-    restoreFocusedInput(inputFocus);
+      <div id="public-dashboard-toast-root"></div>`);
+    updatePageSlot(
+      document.getElementById("public-dashboard-hero-slot"),
+      "publicDashboardHeroHTML",
+      renderHero(t("app_public_dashboard_eyebrow"), t("app_public_dashboard_title"), t("app_public_dashboard_note"))
+    );
+    updatePageSlot(document.getElementById("public-dashboard-status-slot"), "publicDashboardStatusHTML", renderPublicDashboardStatusBar());
+    updatePageSlot(document.getElementById("public-dashboard-controls-slot"), "publicDashboardControlsHTML", `
+      <div class="form-grid">
+        <div class="field">
+          <label>${escapeHtml(t("app_dashboard_filter"))}</label>
+          <input id="public-filter" type="text" value="${escapeAttr(state.publicFilterDraft)}" placeholder="${escapeAttr(t("app_dashboard_filter"))}">
+        </div>
+        <div class="button-row">
+          <button class="secondary" id="public-search">${escapeHtml(t("app_search"))}</button>
+          <button class="primary" id="public-refresh">${escapeHtml(t("app_refresh"))}</button>
+        </div>
+      </div>
+    `);
+    updatePageSlot(
+      document.getElementById("public-dashboard-list-slot"),
+      "publicDashboardListHTML",
+      items.length ? items.map(renderPublicCard).join("") : `<div class="empty">${escapeHtml(emptyDashboardText)}</div>`
+    );
+    updatePageSlot(document.getElementById("public-dashboard-toast-root"), "publicDashboardToastHTML", renderToast());
+    afterPageSlotUpdate(() => {
+      bindPublicDashboardEvents(document.getElementById("public-dashboard-list-panel") || appEl);
+      restoreFocusedInput(inputFocus);
+    });
   }
 
   function renderPublicTrainSidebarPanel(item) {
@@ -9106,13 +9171,26 @@
 
   function renderPublicTrain() {
     const item = state.publicTrain;
-    setAppHTML(`
+    ensurePageShell([
+      "public-train-hero-slot",
+      "public-train-status-slot",
+      "public-train-status-panel",
+      "public-train-toast-root",
+    ], `
       <div class="shell">
-        ${renderHero(t("app_public_train_eyebrow"), t("app_public_train_title"), t("app_public_train_note"))}
-        <section class="status-bar">${renderPublicTrainStatusBar()}</section>
-        <section class="panel" id="public-train-status-panel">${renderPublicTrainSidebarPanel(item)}</section>
+        <div id="public-train-hero-slot"></div>
+        <section class="status-bar" id="public-train-status-slot"></section>
+        <section class="panel" id="public-train-status-panel"></section>
       </div>
-      ${renderToast()}`);
+      <div id="public-train-toast-root"></div>`);
+    updatePageSlot(
+      document.getElementById("public-train-hero-slot"),
+      "publicTrainHeroHTML",
+      renderHero(t("app_public_train_eyebrow"), t("app_public_train_title"), t("app_public_train_note"))
+    );
+    updatePageSlot(document.getElementById("public-train-status-slot"), "publicTrainStatusHTML", renderPublicTrainStatusBar());
+    updatePageSlot(document.getElementById("public-train-status-panel"), "publicTrainDetailHTML", renderPublicTrainSidebarPanel(item));
+    updatePageSlot(document.getElementById("public-train-toast-root"), "publicTrainToastHTML", renderToast());
   }
 
   function renderToastRoot(rootId) {
@@ -9263,9 +9341,6 @@
 
   function renderPublicMapMainPanel() {
     const shellState = trainMapShellState("public-train-map", state.mapData, false);
-    if (!shellState.hasTrain) {
-      return shellState.html;
-    }
     return `
       <div class="stack">
         <div id="public-map-shell-slot">${shellState.html}</div>
@@ -9303,19 +9378,25 @@
         mapController.detach();
         clearPublicMapPopupSelection();
       }
+      const emptySlotEl = document.getElementById("public-map-shell-slot");
+      const emptyLiveStatusEl = document.getElementById("public-map-live-status");
+      if (!emptySlotEl || !emptyLiveStatusEl) {
+        return false;
+      }
+      syncPublicMapShellSlot(emptySlotEl, "public-train-map", shellState);
+      emptyLiveStatusEl.textContent = externalFeedStatusText();
       if (!renderOptions.mapOnly) {
-        mainPanel.innerHTML = renderPublicMapMainPanel();
+        patchPublicMapDetailsPanel();
       }
       return true;
     }
     const slotEl = document.getElementById("public-map-shell-slot");
     const liveStatusEl = document.getElementById("public-map-live-status");
     if (!slotEl || !liveStatusEl) {
-      mainPanel.innerHTML = renderPublicMapMainPanel();
-    } else {
-      syncPublicMapShellSlot(slotEl, "public-train-map", shellState);
-      liveStatusEl.textContent = externalFeedStatusText();
+      return false;
     }
+    syncPublicMapShellSlot(slotEl, "public-train-map", shellState);
+    liveStatusEl.textContent = externalFeedStatusText();
     if (!renderOptions.mapOnly) {
       patchPublicMapDetailsPanel();
     }
@@ -9329,8 +9410,7 @@
     if (!detailsPanel) {
       return false;
     }
-    detailsPanel.innerHTML = renderPublicMapDetailsPanel();
-    return true;
+    return updatePageSlot(detailsPanel, "publicMapDetailHTML", renderPublicMapDetailsPanel());
   }
 
   function renderPublicMap() {
@@ -9339,18 +9419,21 @@
     const detailsPanel = document.getElementById("public-map-details-panel");
     const toastRoot = document.getElementById("public-map-toast-root");
     if (statusBar && mainPanel && detailsPanel && toastRoot) {
-      statusBar.innerHTML = renderPublicMapStatusBar();
+      updatePageSlot(statusBar, "publicMapStatusHTML", renderPublicMapStatusBar());
       patchPublicMapMainPanel();
-      toastRoot.innerHTML = renderToast();
+      updatePageSlot(toastRoot, "publicMapToastHTML", renderToast());
       return;
     }
     setAppHTML(`
       <div class="shell map-first-shell">
-        <section class="status-bar map-top-bar" id="public-map-status-bar">${renderPublicMapStatusBar()}</section>
+        <section class="status-bar map-top-bar" id="public-map-status-bar"></section>
         <section class="panel map-workspace" id="public-map-main-panel" aria-label="${escapeAttr(t("app_public_map_title"))}">${renderPublicMapMainPanel()}</section>
-        <section class="panel" id="public-map-details-panel">${renderPublicMapDetailsPanel()}</section>
+        <section class="panel" id="public-map-details-panel"></section>
       </div>
-      ${renderToastRoot("public-map-toast-root")}`);
+      <div id="public-map-toast-root"></div>`);
+    updatePageSlot(document.getElementById("public-map-status-bar"), "publicMapStatusHTML", renderPublicMapStatusBar());
+    patchPublicMapDetailsPanel();
+    updatePageSlot(document.getElementById("public-map-toast-root"), "publicMapToastHTML", renderToast());
     patchPublicMapMainPanel();
   }
 
@@ -9487,7 +9570,7 @@
       <div class="stack">
         <div id="public-network-map-shell-slot">${shellState.html}</div>
         <p class="panel-subtitle map-live-status" id="public-network-map-live-status">${escapeHtml(externalFeedStatusText())}</p>
-        ${sightingsCard}
+        <div id="public-network-map-sightings-slot">${sightingsCard}</div>
       </div>
     `;
   }
@@ -9499,25 +9582,20 @@
     }
     const slotEl = document.getElementById("public-network-map-shell-slot");
     const liveStatusEl = document.getElementById("public-network-map-live-status");
-    const sightingsCardEl = document.getElementById("public-network-map-sightings-card");
+    const sightingsSlotEl = document.getElementById("public-network-map-sightings-slot");
     const shellState = networkMapShellState("public-network-map", state.networkMapData);
-    const nextSightingsCardHTML = networkMapHasStationContext(state.networkMapData)
-      ? renderPublicNetworkMapSightingsCard()
+    const nextSightingsHTML = networkMapHasStationContext(state.networkMapData)
+      ? `<section class="detail-card" id="public-network-map-sightings-card">${renderPublicNetworkMapSightingsCard()}</section>`
       : "";
-    if (!slotEl || !liveStatusEl) {
-      mapPanel.innerHTML = renderPublicNetworkMapPanel();
-    } else {
-      syncPublicMapShellSlot(slotEl, "public-network-map", shellState);
-      liveStatusEl.textContent = externalFeedStatusText();
-      if (nextSightingsCardHTML && sightingsCardEl) {
-        sightingsCardEl.innerHTML = nextSightingsCardHTML;
-      } else if (Boolean(nextSightingsCardHTML) !== Boolean(sightingsCardEl)) {
-        mapPanel.innerHTML = renderPublicNetworkMapPanel();
-      }
+    if (!slotEl || !liveStatusEl || !sightingsSlotEl) {
+      return false;
     }
+    syncPublicMapShellSlot(slotEl, "public-network-map", shellState);
+    liveStatusEl.textContent = externalFeedStatusText();
+    updatePageSlot(sightingsSlotEl, "publicNetworkMapSightingsHTML", nextSightingsHTML);
     syncActivePublicMap();
     focusRequestedIncidentFromURL({ animate: false });
-    bindPublicNetworkMapEvents(mapPanel);
+    afterPageSlotUpdate(() => bindPublicNetworkMapEvents(mapPanel));
     return true;
   }
 
@@ -9526,19 +9604,20 @@
     const mapPanel = document.getElementById("public-network-map-panel");
     const toastRoot = document.getElementById("public-network-map-toast-root");
     if (statusBar && mapPanel && toastRoot) {
-      statusBar.innerHTML = renderPublicNetworkMapStatusBar();
+      updatePageSlot(statusBar, "publicNetworkMapStatusHTML", renderPublicNetworkMapStatusBar());
       patchPublicNetworkMapPanel();
-      toastRoot.innerHTML = renderToast();
+      updatePageSlot(toastRoot, "publicNetworkMapToastHTML", renderToast());
       return;
     }
     setAppHTML(`
       <div class="shell map-first-shell">
-        <section class="status-bar map-top-bar" id="public-network-map-status-bar">${renderPublicNetworkMapStatusBar()}</section>
+        <section class="status-bar map-top-bar" id="public-network-map-status-bar"></section>
         <section class="panel map-workspace" id="public-network-map-panel" aria-label="${escapeAttr(t("app_public_network_map_title"))}">${renderPublicNetworkMapPanel()}</section>
       </div>
-      ${renderToastRoot("public-network-map-toast-root")}`);
+      <div id="public-network-map-toast-root"></div>`);
+    updatePageSlot(document.getElementById("public-network-map-status-bar"), "publicNetworkMapStatusHTML", renderPublicNetworkMapStatusBar());
+    updatePageSlot(document.getElementById("public-network-map-toast-root"), "publicNetworkMapToastHTML", renderToast());
     patchPublicNetworkMapPanel();
-    bindPublicNetworkMapEvents();
   }
 
   function loadingBarHTML() {
@@ -9733,21 +9812,42 @@
     if (!node || !arrowHTML || !slots || !property) {
       return false;
     }
-    if (!node.__trainArrowSlot) {
+    if (node.__trainArrowSlot !== property) {
       node.innerHTML = "";
-      arrowHTML`<div .innerHTML="${() => slots[property] || ""}"></div>`(node);
-      node.__trainArrowSlot = true;
+      arrowHTML`<div style="display: contents" data-train-arrow-island="${property}" .innerHTML="${() => slots[property] || ""}"></div>`(node);
+      node.__trainArrowSlot = property;
     }
     markArrowUIActive();
     return true;
   }
 
-  function renderArrowPublicIncidentSlot(node, property, html) {
-    if (!arrowPublicIncidentSlots) {
+  function renderArrowPageSlot(node, property, html) {
+    if (!arrowPageSlots || !Object.prototype.hasOwnProperty.call(arrowPageSlots, property)) {
       return false;
     }
-    arrowPublicIncidentSlots[property] = html;
-    return mountArrowHTMLSlot(node, arrowPublicIncidentSlots, property);
+    arrowPageSlots[property] = html;
+    return mountArrowHTMLSlot(node, arrowPageSlots, property);
+  }
+
+  function updatePageSlot(node, property, html) {
+    if (!node) {
+      return false;
+    }
+    if (!renderArrowPageSlot(node, property, html) && node.innerHTML !== html) {
+      node.innerHTML = html;
+    }
+    return true;
+  }
+
+  function afterPageSlotUpdate(callback) {
+    if (typeof callback !== "function") {
+      return;
+    }
+    if (arrowPageSlots && arrowNextTick) {
+      void arrowNextTick(callback);
+      return;
+    }
+    callback();
   }
 
   function patchPublicIncidentPanels(incidentListHTML, detailPanelHTML, detailVisible, detailPanelClasses) {
@@ -9759,18 +9859,18 @@
     if (!statusBar || !listSlot || !detailPanel || !detailSlot || !toastRoot) {
       return false;
     }
-    statusBar.innerHTML = renderPublicIncidentsStatusBar();
+    updatePageSlot(statusBar, "publicIncidentStatusHTML", renderPublicIncidentsStatusBar());
     detailPanel.className = detailPanelClasses;
     detailPanel.hidden = !detailVisible;
     detailPanel.setAttribute("aria-hidden", detailVisible ? "false" : "true");
-    if (!renderArrowPublicIncidentSlot(listSlot, "listHTML", incidentListHTML)) {
+    if (!renderArrowPageSlot(listSlot, "publicIncidentListHTML", incidentListHTML)) {
       listSlot.innerHTML = incidentListHTML;
     }
-    if (!renderArrowPublicIncidentSlot(detailSlot, "detailHTML", detailPanelHTML)) {
+    if (!renderArrowPageSlot(detailSlot, "publicIncidentDetailHTML", detailPanelHTML)) {
       detailSlot.innerHTML = detailPanelHTML;
     }
-    toastRoot.innerHTML = renderToast();
-    bindPublicIncidentEvents(appEl);
+    updatePageSlot(toastRoot, "publicIncidentToastHTML", renderToast());
+    afterPageSlotUpdate(() => bindPublicIncidentEvents(appEl));
     return true;
   }
 
@@ -9789,10 +9889,10 @@
         <section class="status-bar" id="public-incidents-status-bar">${renderPublicIncidentsStatusBar()}</section>
         <div class="split incident-layout">
           <section class="panel" id="incident-list-panel">
-            <div class="card-list" id="public-incidents-list-slot">${arrowPublicIncidentSlots ? "" : incidentListHTML}</div>
+            <div class="card-list" id="public-incidents-list-slot">${arrowPageSlots ? "" : incidentListHTML}</div>
           </section>
           <section class="${escapeAttr(detailPanelClasses)}" id="incident-detail-panel" ${detailVisible ? "" : "hidden"} aria-hidden="${detailVisible ? "false" : "true"}">
-            <div id="public-incidents-detail-slot">${arrowPublicIncidentSlots ? "" : detailPanelHTML}</div>
+            <div id="public-incidents-detail-slot">${arrowPageSlots ? "" : detailPanelHTML}</div>
           </section>
         </div>
       </div>
@@ -9835,18 +9935,35 @@
 
   function renderPublicStationSearch(options) {
     const inputFocus = snapshotFocusedInput("public-station-query");
-    setAppHTML(`
+    ensurePageShell([
+      "public-stations-hero-slot",
+      "public-stations-status-bar",
+      "public-stations-search-panel",
+      "public-stations-departures-panel",
+      "public-stations-toast-root",
+    ], `
       <div class="shell">
-        ${renderHero(t("app_public_station_eyebrow"), t("app_public_station_title"), t("app_public_station_note"))}
-        <section class="status-bar" id="public-stations-status-bar">${renderPublicStationStatusBar()}</section>
+        <div id="public-stations-hero-slot"></div>
+        <section class="status-bar" id="public-stations-status-bar"></section>
         <div class="stack">
-          <section class="panel" id="public-stations-search-panel">${renderPublicStationSearchPanel()}</section>
-          <section class="panel" id="public-stations-departures-panel">${renderPublicStationDeparturesPanel()}</section>
+          <section class="panel" id="public-stations-search-panel"></section>
+          <section class="panel" id="public-stations-departures-panel"></section>
         </div>
       </div>
-      ${renderToastRoot("public-stations-toast-root")}`);
-    bindPublicStationEvents(appEl);
-    restoreFocusedInput(inputFocus);
+      <div id="public-stations-toast-root"></div>`);
+    updatePageSlot(
+      document.getElementById("public-stations-hero-slot"),
+      "publicStationsHeroHTML",
+      renderHero(t("app_public_station_eyebrow"), t("app_public_station_title"), t("app_public_station_note"))
+    );
+    updatePageSlot(document.getElementById("public-stations-status-bar"), "publicStationsStatusHTML", renderPublicStationStatusBar());
+    updatePageSlot(document.getElementById("public-stations-search-panel"), "publicStationsSearchHTML", renderPublicStationSearchPanel());
+    updatePageSlot(document.getElementById("public-stations-departures-panel"), "publicStationsDeparturesHTML", renderPublicStationDeparturesPanel());
+    updatePageSlot(document.getElementById("public-stations-toast-root"), "publicStationsToastHTML", renderToast());
+    afterPageSlotUpdate(() => {
+      bindPublicStationEvents(appEl);
+      restoreFocusedInput(inputFocus);
+    });
   }
 
 	  function miniStatusTabButton(tab, label) {
@@ -9979,20 +10096,39 @@
       return;
     }
     const miniStatusBarClass = state.tab === "map" ? "status-bar map-top-bar" : "status-bar";
-    setAppHTML(`
+    ensurePageShell([
+      "mini-app-hero-slot",
+      "mini-app-status-bar",
+      "mini-app-nav-panel",
+      "mini-app-main-panel",
+      "mini-app-sidebar-panel",
+      "mini-app-toast-root",
+    ], `
       <div class="shell">
-        ${renderHero("", t("app_title"), "")}
-        <section class="${miniStatusBarClass}" id="mini-app-status-bar">${renderMiniStatusBar()}</section>
-        <section class="panel" id="mini-app-nav-panel">${renderMiniNavTabs()}</section>
+        <div id="mini-app-hero-slot"></div>
+        <section class="${miniStatusBarClass}" id="mini-app-status-bar"></section>
+        <section class="panel" id="mini-app-nav-panel"></section>
         <div class="layout">
-          <section class="panel" id="mini-app-main-panel">${renderMiniMain(settings)}</section>
-          <section class="panel" id="mini-app-sidebar-panel">${renderMiniSidebar()}</section>
+          <section class="panel" id="mini-app-main-panel"></section>
+          <section class="panel" id="mini-app-sidebar-panel"></section>
         </div>
       </div>
-      ${renderToast()}`);
+      <div id="mini-app-toast-root"></div>`);
+    const statusBar = document.getElementById("mini-app-status-bar");
+    if (statusBar) {
+      statusBar.classList.toggle("map-top-bar", state.tab === "map");
+    }
+    updatePageSlot(document.getElementById("mini-app-hero-slot"), "miniHeroHTML", renderHero("", t("app_title"), ""));
+    updatePageSlot(statusBar, "miniStatusHTML", renderMiniStatusBar());
+    updatePageSlot(document.getElementById("mini-app-nav-panel"), "miniNavHTML", renderMiniNavTabs());
+    updatePageSlot(document.getElementById("mini-app-main-panel"), "miniMainHTML", renderMiniMain(settings));
+    updatePageSlot(document.getElementById("mini-app-sidebar-panel"), "miniSidebarHTML", renderMiniSidebar());
+    updatePageSlot(document.getElementById("mini-app-toast-root"), "miniToastHTML", renderToast());
     syncSelectedDetailSnapshot();
-    syncActiveMiniMap();
-    bindMiniAppEvents(appEl);
+    afterPageSlotUpdate(() => {
+      syncActiveMiniMap();
+      bindMiniAppEvents(appEl);
+    });
   }
 
   function renderMiniAppPreservingDetail(options, settings) {
@@ -10000,19 +10136,23 @@
     const navPanel = document.getElementById("mini-app-nav-panel");
     const mainPanel = document.getElementById("mini-app-main-panel");
     const sidebarPanel = document.getElementById("mini-app-sidebar-panel");
-    if (!statusBar || !navPanel || !mainPanel || !sidebarPanel) {
+    const heroSlot = document.getElementById("mini-app-hero-slot");
+    const toastRoot = document.getElementById("mini-app-toast-root");
+    if (!heroSlot || !statusBar || !navPanel || !mainPanel || !sidebarPanel || !toastRoot) {
       return false;
     }
 
     statusBar.classList.toggle("map-top-bar", state.tab === "map");
-    statusBar.innerHTML = renderMiniStatusBar();
-    navPanel.innerHTML = renderMiniNavTabs();
+    updatePageSlot(heroSlot, "miniHeroHTML", renderHero("", t("app_title"), ""));
+    updatePageSlot(statusBar, "miniStatusHTML", renderMiniStatusBar());
+    updatePageSlot(navPanel, "miniNavHTML", renderMiniNavTabs());
     const mainPanelPatched = state.tab === "map" && patchMiniMapPanel(mainPanel);
     if (!mainPanelPatched) {
-      mainPanel.innerHTML = renderMiniMain(settings);
+      updatePageSlot(mainPanel, "miniMainHTML", renderMiniMain(settings));
     }
 
     const currentPinnedTrainId = detailTargetTrainId();
+    let sidebarPanelReplaced = false;
     if (
       state.selectedTrain
       && currentPinnedTrainId
@@ -10021,17 +10161,23 @@
     ) {
       patchMiniSidebarDetail(sidebarPanel);
     } else {
-      sidebarPanel.innerHTML = renderMiniSidebar();
+      updatePageSlot(sidebarPanel, "miniSidebarHTML", renderMiniSidebar());
       syncSelectedDetailSnapshot();
-      bindMiniAppEvents(sidebarPanel);
+      sidebarPanelReplaced = true;
     }
+    updatePageSlot(toastRoot, "miniToastHTML", renderToast());
 
-    bindMiniAppEvents(statusBar);
-    bindMiniAppEvents(navPanel);
-    if (!mainPanelPatched) {
-      bindMiniAppEvents(mainPanel);
-    }
-    syncActiveMiniMap();
+    afterPageSlotUpdate(() => {
+      bindMiniAppEvents(statusBar);
+      bindMiniAppEvents(navPanel);
+      if (!mainPanelPatched) {
+        bindMiniAppEvents(mainPanel);
+      }
+      if (sidebarPanelReplaced) {
+        bindMiniAppEvents(sidebarPanel);
+      }
+      syncActiveMiniMap();
+    });
     return true;
   }
 
@@ -10129,6 +10275,15 @@
     `;
   }
 
+  function replaceMiniMapPanel(mainPanel) {
+    updatePageSlot(mainPanel, "miniMainHTML", renderMapTab());
+    afterPageSlotUpdate(() => {
+      bindMiniAppEvents(mainPanel);
+      syncActiveMiniMap();
+    });
+    return true;
+  }
+
   function patchMiniMapPanel(mainPanel) {
     if (!mainPanel || state.tab !== "map") {
       return false;
@@ -10139,28 +10294,20 @@
     }
     const expectedMode = state.mapTrainId ? "train" : "network";
     if (tabRoot.getAttribute("data-map-mode") !== expectedMode) {
-      mainPanel.innerHTML = renderMapTab();
-      bindMiniAppEvents(mainPanel);
-      syncActiveMiniMap();
-      return true;
+      return replaceMiniMapPanel(mainPanel);
     }
 
     if (expectedMode === "train") {
       const shellState = trainMapShellState("mini-train-map", state.mapData, true);
       if (!shellState.hasTrain) {
-        mainPanel.innerHTML = renderMapTab();
-        bindMiniAppEvents(mainPanel);
-        return true;
+        return replaceMiniMapPanel(mainPanel);
       }
       const summaryEl = mainPanel.querySelector("#mini-map-summary");
       const trainActionsEl = mainPanel.querySelector("#mini-map-train-actions");
       const slotEl = mainPanel.querySelector("#mini-map-shell-slot");
       const liveStatusEl = mainPanel.querySelector("#mini-map-live-status");
       if (!summaryEl || !trainActionsEl || !slotEl || !liveStatusEl) {
-        mainPanel.innerHTML = renderMapTab();
-        bindMiniAppEvents(mainPanel);
-        syncActiveMiniMap();
-        return true;
+        return replaceMiniMapPanel(mainPanel);
       }
       syncPublicMapShellSlot(slotEl, "mini-train-map", shellState);
       liveStatusEl.textContent = externalFeedStatusText();
@@ -10183,10 +10330,7 @@
       ? renderMiniNetworkMapSightingsCard()
       : "";
     if (!noteEl || !slotEl || !liveStatusEl) {
-      mainPanel.innerHTML = renderMapTab();
-      bindMiniAppEvents(mainPanel);
-      syncActiveMiniMap();
-      return true;
+      return replaceMiniMapPanel(mainPanel);
     }
     noteEl.textContent = t("app_network_map_note");
     syncPublicMapShellSlot(slotEl, "mini-network-map", shellState);
@@ -10195,10 +10339,7 @@
       sightingsCardEl.innerHTML = nextSightingsCardHTML;
       bindMiniAppEvents(sightingsCardEl);
     } else if (Boolean(nextSightingsCardHTML) !== Boolean(sightingsCardEl)) {
-      mainPanel.innerHTML = renderMapTab();
-      bindMiniAppEvents(mainPanel);
-      syncActiveMiniMap();
-      return true;
+      return replaceMiniMapPanel(mainPanel);
     }
     syncActiveMiniMap();
     return true;
@@ -11307,9 +11448,9 @@
     const cardEl = sidebarPanel.querySelector("[data-role='status-detail']");
     const nextSnapshot = buildStatusDetailSnapshot(state.selectedTrain, selectedTrainSidebarIncludesActions(), false);
     if (!cardEl || !selectedDetailSnapshot || selectedDetailSnapshot.trainId !== nextSnapshot.trainId) {
-      sidebarPanel.innerHTML = renderMiniSidebar();
+      updatePageSlot(sidebarPanel, "miniSidebarHTML", renderMiniSidebar());
       syncSelectedDetailSnapshot();
-      bindMiniAppEvents(sidebarPanel);
+      afterPageSlotUpdate(() => bindMiniAppEvents(sidebarPanel));
       return;
     }
     patchStatusDetailCard(cardEl, selectedDetailSnapshot, nextSnapshot);
@@ -11319,10 +11460,10 @@
   function bindPublicDashboardEvents() {
     const input = document.getElementById("public-filter");
     if (input) {
-      input.addEventListener("input", (event) => {
+      bindEventOnce(input, "__trainPublicFilterInputBound", "input", (event) => {
         state.publicFilterDraft = event.target.value;
       });
-      input.addEventListener("keydown", (event) => {
+      bindEventOnce(input, "__trainPublicFilterEnterBound", "keydown", (event) => {
         if (event.key === "Enter") {
           event.preventDefault();
           applyPublicFilter();
@@ -11331,13 +11472,13 @@
     }
     const search = document.getElementById("public-search");
     if (search) {
-      search.addEventListener("click", () => {
+      bindEventOnce(search, "__trainPublicSearchBound", "click", () => {
         applyPublicFilter();
       });
     }
     const refresh = document.getElementById("public-refresh");
     if (refresh) {
-      refresh.addEventListener("click", () => {
+      bindEventOnce(refresh, "__trainPublicRefreshBound", "click", () => {
         runUserAction(async () => {
           await Promise.all([refreshPublicDashboard(), restartExternalFeedIfNeeded()]);
           renderPublicDashboard({ preserveInputFocus: true });
@@ -11351,7 +11492,7 @@
     const stationSearch = scope.querySelector("#public-station-search");
     const stationQueryInput = scope.querySelector("#public-station-query");
     if (stationQueryInput) {
-      stationQueryInput.addEventListener("input", (event) => {
+      bindEventOnce(stationQueryInput, "__trainPublicStationInputBound", "input", (event) => {
         state.publicStationQuery = event.target.value;
       });
     }
@@ -11359,11 +11500,11 @@
       await searchPublicStations(state.publicStationQuery);
     }, t("app_public_station_search_success"), { button: stationSearch });
     if (stationSearch) {
-      stationSearch.addEventListener("click", searchAction);
+      bindEventOnce(stationSearch, "__trainPublicStationSearchBound", "click", searchAction);
     }
     bindEnterAction("public-station-query", searchAction, scope);
     scope.querySelectorAll("[data-action='public-station-departures']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainPublicStationDeparturesBound", "click", () => {
         runUserAction(async () => {
           await refreshPublicStationDepartures(el.getAttribute("data-station-id"));
           renderPublicStationSearch({ preserveInputFocus: true });
@@ -11372,7 +11513,7 @@
     });
     const refresh = scope.querySelector("#public-station-refresh");
     if (refresh) {
-      refresh.addEventListener("click", () => {
+      bindEventOnce(refresh, "__trainPublicStationRefreshBound", "click", () => {
         runUserAction(async () => {
           if (state.publicStationSelected) {
             await refreshPublicStationDepartures(state.publicStationSelected.id);
@@ -11463,7 +11604,7 @@
     const scope = root || document;
     const input = scope.querySelector(`#${inputId}`);
     if (!input) return;
-    input.addEventListener("keydown", (event) => {
+    bindEventOnce(input, "__trainEnterActionBound", "keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
       action();
@@ -11476,7 +11617,7 @@
       return;
     }
     scope.querySelectorAll("[data-action='tab']").forEach((el) => {
-      el.addEventListener("click", async () => {
+      bindEventOnce(el, "__trainMiniTabBound", "click", async () => {
         const previousSelectedTrainId = detailTargetTrainId();
         setMiniAppTab(el.getAttribute("data-tab"), "nav-tab");
         if (state.tab === "stations" && state.selectedStation) {
@@ -11501,7 +11642,7 @@
     });
     const globalRefresh = scope.querySelector("#global-refresh");
     if (globalRefresh) {
-      globalRefresh.addEventListener("click", () => {
+      bindEventOnce(globalRefresh, "__trainMiniGlobalRefreshBound", "click", () => {
         runUserAction(async () => {
           await Promise.all([refreshMe(), refreshWindowTrains(), refreshPublicIncidents()]);
           if (state.tab === "stations" && state.selectedStation) {
@@ -11512,7 +11653,7 @@
       });
     }
     scope.querySelectorAll("[data-action='window']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniWindowBound", "click", () => {
         state.window = el.getAttribute("data-window");
         runUserAction(async () => {
           await refreshWindowTrains();
@@ -11521,22 +11662,22 @@
       });
     });
     scope.querySelectorAll("[data-action='open-status']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(() => openStatus(el.getAttribute("data-train-id")), t("app_status_loaded")));
+      bindEventOnce(el, "__trainMiniOpenStatusBound", "click", () => runUserAction(() => openStatus(el.getAttribute("data-train-id")), t("app_status_loaded")));
     });
     scope.querySelectorAll("[data-action='open-map']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(() => openMap(el.getAttribute("data-train-id")), t("app_map_loaded")));
+      bindEventOnce(el, "__trainMiniOpenMapBound", "click", () => runUserAction(() => openMap(el.getAttribute("data-train-id")), t("app_map_loaded")));
     });
     scope.querySelectorAll("[data-action='show-all-trains-map']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(() => showAllTrainsMap()));
+      bindEventOnce(el, "__trainMiniShowAllTrainsBound", "click", () => runUserAction(() => showAllTrainsMap()));
     });
     scope.querySelectorAll("[data-action='toggle-network-map-history'][data-mode='mini']").forEach((el) => {
-      el.addEventListener("change", (event) => {
+      bindEventOnce(el, "__trainMiniMapHistoryBound", "change", (event) => {
         state.miniNetworkMapShowAllSightings = Boolean(event.target.checked);
         renderMiniApp({ preserveDetail: true, previousSelectedTrainId: detailTargetTrainId() });
       });
     });
     scope.querySelectorAll("[data-action='toggle-checkin-dropdown']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniCheckinToggleBound", "click", () => {
         if (!state.stationDepartures.length) {
           return;
         }
@@ -11545,57 +11686,57 @@
       });
     });
     scope.querySelectorAll("[data-action='choose-checkin-train']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniChooseCheckinBound", "click", () => {
         state.selectedCheckInTrainId = el.getAttribute("data-train-id") || "";
         state.checkInDropdownOpen = false;
         renderMiniApp();
       });
     });
     scope.querySelectorAll("[data-action='selected-checkin']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(
+      bindEventOnce(el, "__trainMiniSelectedCheckinBound", "click", () => runUserAction(
         () => checkIn(el.getAttribute("data-train-id"), el.getAttribute("data-station-id")),
         (result) => result,
         { button: el }
       ));
     });
     scope.querySelectorAll("[data-action='selected-checkin-map']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(() => openMap(el.getAttribute("data-train-id")), t("app_map_loaded")));
+      bindEventOnce(el, "__trainMiniSelectedCheckinMapBound", "click", () => runUserAction(() => openMap(el.getAttribute("data-train-id")), t("app_map_loaded")));
     });
     scope.querySelectorAll("[data-action='checkin']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(
+      bindEventOnce(el, "__trainMiniCheckinBound", "click", () => runUserAction(
         () => checkIn(el.getAttribute("data-train-id"), el.getAttribute("data-station-id")),
         (result) => result,
         { button: el }
       ));
     });
     scope.querySelectorAll("[data-action='mute-train']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(
+      bindEventOnce(el, "__trainMiniMuteTrainBound", "click", () => runUserAction(
         () => muteTrain(el.getAttribute("data-train-id")),
         (result) => result,
         { button: el }
       ));
     });
     scope.querySelectorAll("[data-action='station-departures']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(async () => {
+      bindEventOnce(el, "__trainMiniStationDeparturesBound", "click", () => runUserAction(async () => {
         await fetchStationDepartures(el.getAttribute("data-station-id"));
       }, t("app_search_complete")));
     });
     scope.querySelectorAll("[data-action='select-sighting-train']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniSelectSightingTrainBound", "click", () => {
         state.selectedSightingTrainId = el.getAttribute("data-train-id") || "";
         state.expandedStationContextTrainId = state.selectedSightingTrainId;
         renderMiniApp();
       });
     });
     scope.querySelectorAll("[data-action='toggle-station-context']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniStationContextBound", "click", () => {
         const trainId = el.getAttribute("data-train-id") || "";
         state.expandedStationContextTrainId = state.expandedStationContextTrainId === trainId ? "" : trainId;
         renderMiniApp();
       });
     });
     scope.querySelectorAll("[data-action='open-sightings-train']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniOpenSightingsTrainBound", "click", () => {
         state.stationSightingDestinationId = "";
         state.selectedSightingTrainId = el.getAttribute("data-train-id") || "";
         state.expandedStationContextTrainId = state.selectedSightingTrainId;
@@ -11604,14 +11745,14 @@
       });
     });
     scope.querySelectorAll("[data-action='toggle-stop-context']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniStopContextBound", "click", () => {
         const key = el.getAttribute("data-stop-key") || "";
         state.expandedStopContextKey = state.expandedStopContextKey === key ? "" : key;
         renderMiniApp();
       });
     });
     scope.querySelectorAll("[data-action='open-sightings-stop']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniOpenSightingsStopBound", "click", () => {
         const stationId = el.getAttribute("data-station-id");
         const trainId = el.getAttribute("data-train-id") || "";
         if (!stationId) {
@@ -11628,7 +11769,7 @@
       });
     });
     scope.querySelectorAll("[data-action='tab-sightings']").forEach((el) => {
-      el.addEventListener("click", () => {
+      bindEventOnce(el, "__trainMiniSightingsTabBound", "click", () => {
         if (!state.selectedStation) {
           return;
         }
@@ -11638,7 +11779,7 @@
     });
     const stationSightingDestination = scope.querySelector("#station-sighting-destination");
     if (stationSightingDestination) {
-      stationSightingDestination.addEventListener("change", (event) => {
+      bindEventOnce(stationSightingDestination, "__trainMiniSightingDestinationBound", "change", (event) => {
         state.stationSightingDestinationId = event.target.value;
         state.selectedSightingTrainId = "";
         state.expandedStationContextTrainId = "";
@@ -11647,7 +11788,7 @@
     }
     const stationSightingSubmit = scope.querySelector("#station-sighting-submit");
     if (stationSightingSubmit) {
-      stationSightingSubmit.addEventListener("click", () => {
+      bindEventOnce(stationSightingSubmit, "__trainMiniSightingSubmitBound", "click", () => {
         if (!state.selectedSightingTrainId) {
           showToast(t("app_station_sighting_select_departure_toast"), "info");
           return;
@@ -11656,7 +11797,7 @@
       });
     }
     scope.querySelectorAll("[data-action='report']").forEach((el) => {
-      el.addEventListener("click", () => runUserAction(
+      bindEventOnce(el, "__trainMiniReportBound", "click", () => runUserAction(
         () => submitReport(el.getAttribute("data-signal"), el.getAttribute("data-train-id")),
         (result) => result,
         { button: el }
@@ -11665,7 +11806,7 @@
     const stationSearch = scope.querySelector("#station-search");
     const stationQueryInput = scope.querySelector("#station-query");
     if (stationQueryInput) {
-      stationQueryInput.addEventListener("input", (event) => {
+      bindEventOnce(stationQueryInput, "__trainMiniStationInputBound", "input", (event) => {
         state.stationQuery = event.target.value;
       });
     }
@@ -11673,12 +11814,12 @@
       await fetchStationMatches(state.stationQuery);
     }, t("app_search_complete"), { button: stationSearch });
     if (stationSearch) {
-      stationSearch.addEventListener("click", stationSearchAction);
+      bindEventOnce(stationSearch, "__trainMiniStationSearchBound", "click", stationSearchAction);
     }
     bindEnterAction("station-query", stationSearchAction, scope);
     const saveSettingsButton = scope.querySelector("#save-settings");
     if (saveSettingsButton) {
-      saveSettingsButton.addEventListener("click", () => runUserAction(
+      bindEventOnce(saveSettingsButton, "__trainMiniSaveSettingsBound", "click", () => runUserAction(
         () => saveSettings(),
         (result) => result,
         { button: saveSettingsButton }
@@ -12153,6 +12294,15 @@
         renderPublicNetworkMapStatusBar,
         renderPublicIncidentsStatusBar,
         renderMiniStatusBar,
+        markArrowUIActive,
+        mountArrowHTMLSlot,
+        renderArrowPageSlot,
+        updatePageSlot,
+        bindEventOnce,
+        bindPublicDashboardEvents,
+        bindPublicStationEvents,
+        bindMiniAppEvents,
+        syncPublicMapShellSlot,
         renderPublicIncidents,
         applyPublicDashboardPayload,
         applyPublicServiceDayTrainsPayload,

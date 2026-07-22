@@ -2,14 +2,13 @@ package chatanalyzer
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 
@@ -17,24 +16,28 @@ import (
 	"satiksmebot/internal/store"
 )
 
+var ErrMTProtoSessionUnauthorized = errors.New("Telegram account session is not authorized")
+
 type MTProtoCollectorConfig struct {
-	APIID       int
-	APIHash     string
-	SessionFile string
-	ChatID      string
-	Store       store.ChatAnalyzerStore
-	BatchLimit  int
-	Now         func() time.Time
+	APIID         int
+	APIHash       string
+	SessionFile   string
+	ChatID        string
+	Store         store.ChatAnalyzerStore
+	BatchLimit    int
+	MaxMessageAge time.Duration
+	Now           func() time.Time
 }
 
 type MTProtoCollector struct {
-	apiID       int
-	apiHash     string
-	sessionFile string
-	chatID      string
-	store       store.ChatAnalyzerStore
-	batchLimit  int
-	now         func() time.Time
+	apiID         int
+	apiHash       string
+	sessionFile   string
+	chatID        string
+	store         store.ChatAnalyzerStore
+	batchLimit    int
+	maxMessageAge time.Duration
+	now           func() time.Time
 }
 
 func NewMTProtoCollector(cfg MTProtoCollectorConfig) *MTProtoCollector {
@@ -46,24 +49,29 @@ func NewMTProtoCollector(cfg MTProtoCollectorConfig) *MTProtoCollector {
 	if limit <= 0 {
 		limit = 25
 	}
+	maxMessageAge := cfg.MaxMessageAge
+	if maxMessageAge <= 0 {
+		maxMessageAge = 24 * time.Hour
+	}
 	return &MTProtoCollector{
-		apiID:       cfg.APIID,
-		apiHash:     strings.TrimSpace(cfg.APIHash),
-		sessionFile: strings.TrimSpace(cfg.SessionFile),
-		chatID:      strings.TrimSpace(cfg.ChatID),
-		store:       cfg.Store,
-		batchLimit:  limit,
-		now:         now,
+		apiID:         cfg.APIID,
+		apiHash:       strings.TrimSpace(cfg.APIHash),
+		sessionFile:   strings.TrimSpace(cfg.SessionFile),
+		chatID:        strings.TrimSpace(cfg.ChatID),
+		store:         cfg.Store,
+		batchLimit:    limit,
+		maxMessageAge: maxMessageAge,
+		now:           now,
 	}
 }
 
-func (c *MTProtoCollector) Collect(ctx context.Context) ([]model.ChatAnalyzerMessage, error) {
+func (c *MTProtoCollector) Collect(ctx context.Context) (CollectionResult, error) {
 	if c == nil || c.apiID <= 0 || c.apiHash == "" || c.sessionFile == "" || c.chatID == "" || c.store == nil {
-		return nil, fmt.Errorf("telegram chat collector is not configured")
+		return CollectionResult{}, fmt.Errorf("telegram chat collector is not configured")
 	}
-	var out []model.ChatAnalyzerMessage
+	result := CollectionResult{}
 	client := telegram.NewClient(c.apiID, c.apiHash, telegram.Options{
-		SessionStorage: &session.FileStorage{Path: filepath.Clean(c.sessionFile)},
+		SessionStorage: NewAtomicSessionStorage(c.sessionFile),
 		NoUpdates:      true,
 	})
 	err := client.Run(ctx, func(ctx context.Context) error {
@@ -72,7 +80,7 @@ func (c *MTProtoCollector) Collect(ctx context.Context) ([]model.ChatAnalyzerMes
 			return err
 		}
 		if status == nil || !status.Authorized {
-			return fmt.Errorf("telegram account session is not authorized; run chat-analyzer-session first")
+			return fmt.Errorf("%w; run chat-analyzer-session first", ErrMTProtoSessionUnauthorized)
 		}
 		peer, checkpointKey, err := c.resolvePeer(ctx, client.API())
 		if err != nil {
@@ -88,7 +96,7 @@ func (c *MTProtoCollector) Collect(ctx context.Context) ([]model.ChatAnalyzerMes
 				return err
 			}
 			if maxID := maxTelegramMessageID(latest); maxID > 0 {
-				return c.store.SetChatAnalyzerCheckpoint(ctx, checkpointKey, maxID, c.now())
+				result.CheckpointMessageIDs = map[string]int64{checkpointKey: maxID}
 			}
 			return nil
 		}
@@ -96,33 +104,72 @@ func (c *MTProtoCollector) Collect(ctx context.Context) ([]model.ChatAnalyzerMes
 		if err != nil {
 			return err
 		}
-		now := c.now().UTC()
-		out = make([]model.ChatAnalyzerMessage, 0, len(messages))
-		for _, msg := range messages {
-			if int64(msg.ID) <= lastID || strings.TrimSpace(msg.Message) == "" {
-				continue
-			}
-			item := telegramMessageToAnalyzerMessage(checkpointKey, msg, now)
-			out = append(out, item)
-		}
-		sort.SliceStable(out, func(i, j int) bool {
-			return out[i].MessageID < out[j].MessageID
-		})
+		result = filterCollectedMessages(checkpointKey, messages, lastID, c.now().UTC(), c.maxMessageAge)
 		return nil
 	})
-	return out, err
+	return result, err
+}
+
+func filterCollectedMessages(checkpointKey string, messages []*tg.Message, lastID int64, now time.Time, maxMessageAge time.Duration) CollectionResult {
+	result := CollectionResult{
+		Messages:             make([]model.ChatAnalyzerMessage, 0, len(messages)),
+		CheckpointMessageIDs: make(map[string]int64, 1),
+	}
+	cutoff := now.Add(-maxMessageAge)
+	maxSeenID := lastID
+	for _, msg := range messages {
+		if msg == nil || int64(msg.ID) <= lastID {
+			continue
+		}
+		if int64(msg.ID) > maxSeenID {
+			maxSeenID = int64(msg.ID)
+		}
+		if strings.TrimSpace(msg.Message) == "" {
+			continue
+		}
+		item := telegramMessageToAnalyzerMessage(checkpointKey, msg, now)
+		if item.MessageDate.Before(cutoff) {
+			result.SkippedStale++
+			continue
+		}
+		result.Messages = append(result.Messages, item)
+	}
+	if maxSeenID > lastID {
+		result.CheckpointMessageIDs[checkpointKey] = maxSeenID
+	}
+	sort.SliceStable(result.Messages, func(i, j int) bool {
+		return result.Messages[i].MessageID < result.Messages[j].MessageID
+	})
+	return result
 }
 
 func (c *MTProtoCollector) fetchMessages(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, minID, limit int) ([]*tg.Message, error) {
-	result, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-		Peer:  peer,
-		MinID: minID,
-		Limit: limit,
-	})
+	result, err := api.MessagesGetHistory(ctx, telegramHistoryRequest(peer, minID, limit))
 	if err != nil {
 		return nil, err
 	}
 	return messagesFromHistory(result), nil
+}
+
+func telegramHistoryRequest(peer tg.InputPeerClass, minID, limit int) *tg.MessagesGetHistoryRequest {
+	if limit <= 0 {
+		limit = 25
+	}
+	// Telegram history limits are normally capped at 100. When a checkpoint is
+	// present, a negative add_offset asks for the first page newer than that ID,
+	// rather than the newest page in the chat. Advancing the checkpoint from
+	// this bounded forward page prevents bursts larger than one page from being
+	// silently skipped.
+	if limit > 100 {
+		limit = 100
+	}
+	request := &tg.MessagesGetHistoryRequest{Peer: peer, Limit: limit}
+	if minID > 0 {
+		request.OffsetID = minID
+		request.AddOffset = -limit
+		request.MinID = minID
+	}
+	return request
 }
 
 func messagesFromHistory(result tg.MessagesMessagesClass) []*tg.Message {
@@ -141,6 +188,13 @@ func messagesFromHistory(result tg.MessagesMessagesClass) []*tg.Message {
 	for _, item := range raw {
 		if msg, ok := item.(*tg.Message); ok {
 			out = append(out, msg)
+			continue
+		}
+		// Service and empty constructors still consume a Telegram message ID.
+		// Preserve that ID with a textless placeholder so the forward checkpoint
+		// cannot become stuck behind a page containing only non-text events.
+		if withID, ok := item.(interface{ GetID() int }); ok && withID.GetID() > 0 {
+			out = append(out, &tg.Message{ID: withID.GetID()})
 		}
 	}
 	return out
@@ -163,7 +217,7 @@ func telegramMessageToAnalyzerMessage(chatID string, msg *tg.Message, receivedAt
 		replyToID = int64(reply.ReplyToMsgID)
 	}
 	messageDate := time.Unix(int64(msg.Date), 0).UTC()
-	if messageDate.IsZero() {
+	if msg.Date <= 0 {
 		messageDate = receivedAt
 	}
 	return model.ChatAnalyzerMessage{
@@ -197,7 +251,7 @@ func (c *MTProtoCollector) resolvePeer(ctx context.Context, api *tg.Client) (tg.
 	case strings.HasPrefix(lower, "chat:"):
 		id, err := strconv.ParseInt(strings.TrimSpace(raw[len("chat:"):]), 10, 64)
 		if err != nil || id == 0 {
-			return nil, "", fmt.Errorf("invalid telegram chat descriptor %q", raw)
+			return nil, "", fmt.Errorf("invalid Telegram chat descriptor")
 		}
 		return &tg.InputPeerChat{ChatID: absInt64(id)}, "chat:" + strconv.FormatInt(absInt64(id), 10), nil
 	case strings.HasPrefix(lower, "channel:"):
@@ -207,11 +261,11 @@ func (c *MTProtoCollector) resolvePeer(ctx context.Context, api *tg.Client) (tg.
 		}
 		id, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
 		if err != nil || id == 0 {
-			return nil, "", fmt.Errorf("invalid channel id in %q", raw)
+			return nil, "", fmt.Errorf("invalid Telegram channel id")
 		}
 		hash, err := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
 		if err != nil || hash == 0 {
-			return nil, "", fmt.Errorf("invalid channel access hash in %q", raw)
+			return nil, "", fmt.Errorf("invalid Telegram channel access hash")
 		}
 		id = absInt64(id)
 		return &tg.InputPeerChannel{ChannelID: id, AccessHash: hash}, "channel:" + strconv.FormatInt(id, 10), nil
@@ -220,7 +274,7 @@ func (c *MTProtoCollector) resolvePeer(ctx context.Context, api *tg.Client) (tg.
 	default:
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || id == 0 {
-			return nil, "", fmt.Errorf("unsupported telegram chat descriptor %q", raw)
+			return nil, "", fmt.Errorf("unsupported Telegram chat descriptor")
 		}
 		if id < -1000000000000 {
 			return nil, "", fmt.Errorf("telegram supergroup/channel numeric ids need channel:<id>:<accessHash> from the session setup command")
@@ -255,9 +309,9 @@ func resolveUsernamePeer(ctx context.Context, api *tg.Client, raw string) (tg.In
 			}
 			return &tg.InputPeerChannel{ChannelID: channel.ID, AccessHash: channel.AccessHash}, "channel:" + strconv.FormatInt(channel.ID, 10), nil
 		}
-		return nil, "", fmt.Errorf("resolved channel %q without access hash", username)
+		return nil, "", fmt.Errorf("resolved Telegram channel without an access hash")
 	default:
-		return nil, "", fmt.Errorf("telegram descriptor %q did not resolve to a group or channel", raw)
+		return nil, "", fmt.Errorf("Telegram descriptor did not resolve to a group or channel")
 	}
 }
 

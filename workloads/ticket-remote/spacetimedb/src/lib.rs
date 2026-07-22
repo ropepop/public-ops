@@ -40,7 +40,6 @@ const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
 const STREAM_VIEWER_FOCUS_TTL_MS: i64 = 90_000;
 const SAFE_JSON_MAX_BYTES: usize = 4096;
-const SAFE_LOG_DETAIL_MAX_BYTES: usize = 1024;
 const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 2_500;
 const STREAM_BACKGROUND_REPORT_MAX_AGE_MS: i64 = 5_000;
 
@@ -507,6 +506,9 @@ pub struct TicketremoteControlCodeOwner {
     index(accessor = ticketCreatedAt, btree(columns = [ticketId, createdAt]))
 )]
 #[derive(Clone)]
+// Legacy compatibility state. New operational events are written to the
+// central operational-logging database; this table remains only so existing
+// rows can age out safely during the migration.
 pub struct TicketremoteSafeOperationalLog {
     #[primary_key]
     pub id: String,
@@ -943,13 +945,26 @@ member_reducers! {
     }
 }
 
+#[spacetimedb::reducer]
+pub fn ticketremote_member_append_safe_operational_log(
+    ctx: &ReducerContext,
+    id: String,
+    ticketId: String,
+    level: String,
+    event: String,
+    correlationId: String,
+    detailJson: String,
+) -> Result<(), String> {
+    // Explicit compatibility rejection for an older browser bundle. Keep the
+    // original membership gate, but never create a new legacy Ticket log row.
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let _ = (&id, &level, &event, &correlationId, &detailJson, &email);
+    Err("legacy_operational_log_writer_inactive".into())
+}
+
 member_reducers! {
-    ticketremote_member_append_safe_operational_log(ctx; id: String, ticketId: String,
-        level: String, event: String, correlationId: String, detailJson: String; ticket = ticketId)
-        |ticket, _email, now| {
-        insert_safe_operational_log(ctx, &ticket.id, "browser", &level, &event, &correlationId,
-            &detailJson, &id, &now)
-    }
     ticketremote_member_upsert_member(ctx; ticketId: String, email: String, role: String;
         ticket = ticketId)
         |ticket, actor, now| {
@@ -1351,12 +1366,35 @@ fn control_code_update_text(
     (reason, message)
 }
 
+#[spacetimedb::reducer]
+pub fn ticketremote_append_safe_operational_log(
+    ctx: &ReducerContext,
+    id: String,
+    ticketId: String,
+    source: String,
+    level: String,
+    event: String,
+    correlationId: String,
+    detailJson: String,
+    nowArg: String,
+) -> Result<(), String> {
+    // Explicit compatibility rejection for older sidecars. New writers use
+    // operationallog_append_ticket_event in operational-logging-prod.
+    require_service(ctx)?;
+    let _ = (
+        &id,
+        &ticketId,
+        &source,
+        &level,
+        &event,
+        &correlationId,
+        &detailJson,
+        &nowArg,
+    );
+    Err("legacy_operational_log_writer_inactive".into())
+}
+
 service_reducers! {
-    ticketremote_append_safe_operational_log(ctx; id: String, ticketId: String, source: String,
-        level: String, event: String, correlationId: String, detailJson: String, nowArg: String) {
-        insert_safe_operational_log(ctx, &clean_ticket_id(&ticketId), &source, &level, &event,
-            &correlationId, &detailJson, &id, &now_or(ctx, &nowArg))
-    }
     ticketremote_purge_sensitive_operational_logs(ctx; ticketId: String) {
         let ticket_id = clean_ticket_id(&ticketId);
         let table = ctx.db.ticketremote_safe_operational_log();
@@ -1384,7 +1422,6 @@ expression_functions! {
         format!("{}:{}", clean_ticket_id(ticket), clean_email(email));
     fn phone_row_id(ticket: &str, backend: &str) -> String =
         format!("{}:{}", clean_ticket_id(ticket), clean_backend_id(backend));
-    fn history_expires_at(clock: &str) -> String = add_ms(clock, HISTORY_TTL_MS);
     fn stream_viewer_focus_expires_at(clock: &str) -> String = add_ms(clock, STREAM_VIEWER_FOCUS_TTL_MS);
     fn control_code_request_expires_at(clock: &str) -> String = add_ms(clock, CONTROL_CODE_REQUEST_TTL_MS);
     fn control_code_result_expires_at(clock: &str) -> String = add_ms(clock, CONTROL_CODE_RESULT_TTL_MS);
@@ -2621,113 +2658,6 @@ fn update_control_code_public_request(
     table.id().update(row);
 }
 
-fn insert_safe_operational_log(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    source: &str,
-    level: &str,
-    event: &str,
-    correlation_id: &str,
-    detail_json: &str,
-    source_id: &str,
-    now: &str,
-) {
-    let ticket = ensure_ticket(ctx, ticket_id, "", now);
-    let source = safe_token(source, "unknown");
-    let event = safe_token(event, "event");
-    let level = safe_token(level, "info");
-    let correlation_id = bounded_text(correlation_id, 160);
-    let row_id = safe_log_sample_interval_ms(&level, &event)
-        .map(|interval_ms| sampled_safe_log_row_id(&ticket.id, &source, &event, now, interval_ms))
-        .unwrap_or_else(|| {
-            safe_log_row_id(
-                &ticket.id,
-                &source,
-                &event,
-                &correlation_id,
-                detail_json,
-                source_id,
-                now,
-            )
-        });
-    let table = ctx.db.ticketremote_safe_operational_log();
-    if table.id().find(&row_id).is_some() {
-        return;
-    }
-    table.insert(TicketremoteSafeOperationalLog {
-        id: row_id,
-        ticketId: ticket.id,
-        source,
-        level,
-        event,
-        correlationId: correlation_id,
-        detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),
-        createdAt: now.into(),
-        expiresAt: history_expires_at(now),
-    });
-}
-
-fn safe_log_sample_interval_ms(level: &str, event: &str) -> Option<i64> {
-    if !matches!(level.trim(), "info" | "debug" | "trace") {
-        return None;
-    }
-    [
-        "command_queued",
-        "keyframe_requested",
-        "stream_stalled",
-        "stream_recovery_requested",
-        "public_open_grace_retained",
-        "pixel_direct_phone_report_update",
-        "pixel_ticket_control_code_fast_state",
-        "pixel_direct_desired_state_observed",
-        "pixel_direct_pending_command_hot_scan",
-    ]
-    .contains(&event.trim())
-    .then_some(60_000)
-}
-
-fn sampled_safe_log_row_id(
-    ticket_id: &str,
-    source: &str,
-    event: &str,
-    now: &str,
-    interval_ms: i64,
-) -> String {
-    let interval_ms = interval_ms.max(1);
-    let bucket = parse_time_ms(now).div_euclid(interval_ms);
-    format!(
-        "{}:sample:{}:{}:{}",
-        clean_ticket_id(ticket_id),
-        to_base36(fnv32(source)),
-        to_base36(fnv32(event)),
-        bucket
-    )
-}
-
-fn safe_log_row_id(
-    ticket_id: &str,
-    source: &str,
-    event: &str,
-    correlation_id: &str,
-    detail_json: &str,
-    source_id: &str,
-    now: &str,
-) -> String {
-    let explicit = source_id.trim();
-    if !explicit.is_empty() {
-        return bounded_text(explicit, 220);
-    }
-    format!(
-        "{}:{}:{}:{}:{}:{}",
-        clean_ticket_id(ticket_id),
-        stable_stamp(now),
-        source,
-        event,
-        bounded_text(correlation_id, 40),
-        to_base36(fnv32(detail_json))
-    )
-}
-
 fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size: u32) -> u32 {
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
     let expiry_bound = canonical_time(now);
@@ -3138,45 +3068,6 @@ mod tests {
         assert!(control_code_close_is_idempotent(Some(&request)));
         request.status = "running".into();
         assert!(!control_code_close_is_idempotent(Some(&request)));
-    }
-
-    #[test]
-    fn routine_logs_are_sampled_but_failures_are_retained() {
-        assert_eq!(
-            safe_log_sample_interval_ms("info", "keyframe_requested"),
-            Some(60_000)
-        );
-        assert_eq!(
-            safe_log_sample_interval_ms("error", "keyframe_requested"),
-            None
-        );
-        assert_eq!(
-            safe_log_sample_interval_ms("info", "stream_recovery_failed"),
-            None
-        );
-        let first = sampled_safe_log_row_id(
-            "vivi-default",
-            "browser",
-            "keyframe_requested",
-            "2026-07-10T12:00:01Z",
-            60_000,
-        );
-        let same_bucket = sampled_safe_log_row_id(
-            "vivi-default",
-            "browser",
-            "keyframe_requested",
-            "2026-07-10T12:00:59Z",
-            60_000,
-        );
-        let next_bucket = sampled_safe_log_row_id(
-            "vivi-default",
-            "browser",
-            "keyframe_requested",
-            "2026-07-10T12:01:00Z",
-            60_000,
-        );
-        assert_eq!(first, same_bucket);
-        assert_ne!(first, next_bucket);
     }
 
     #[test]

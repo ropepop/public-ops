@@ -3,11 +3,9 @@ package chatanalyzer
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"time"
 
-	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 
@@ -60,7 +58,7 @@ func FetchHistory(ctx context.Context, cfg HistoryFetchConfig) ([]model.ChatAnal
 	}
 
 	client := telegram.NewClient(cfg.APIID, cfg.APIHash, telegram.Options{
-		SessionStorage: &session.FileStorage{Path: filepath.Clean(cfg.SessionFile)},
+		SessionStorage: NewAtomicSessionStorage(cfg.SessionFile),
 		NoUpdates:      true,
 	})
 	collected := make([]model.ChatAnalyzerMessage, 0, limit)
@@ -71,7 +69,7 @@ func FetchHistory(ctx context.Context, cfg HistoryFetchConfig) ([]model.ChatAnal
 			return err
 		}
 		if status == nil || !status.Authorized {
-			return fmt.Errorf("telegram account session is not authorized; run chat-analyzer-session first")
+			return fmt.Errorf("%w; run chat-analyzer-session first", ErrMTProtoSessionUnauthorized)
 		}
 		resolver := &MTProtoCollector{chatID: cfg.ChatID}
 		peer, checkpointKey, err := resolver.resolvePeer(ctx, client.API())

@@ -24,23 +24,13 @@ import { html, reactive } from '@arrow-js/core';
   const sampledClientLogIntervalMs = 60000;
   const controlCodeAutoPrepareMinIntervalMs = 5000;
   let spacetimeClient = null;
-  let clientLogSequence = 0;
-
-  function newClientLogRowID(entry) {
-    clientLogSequence = (clientLogSequence + 1) % 1679616;
-    const clean = (value, fallback) => String(value || fallback).replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 48) || fallback;
-    const nonce = window.crypto && typeof window.crypto.randomUUID === 'function'
-      ? window.crypto.randomUUID().slice(0, 12)
-      : Math.random().toString(36).slice(2, 14);
-    return [clean(cfg.ticketId, 'ticket'), Date.now().toString(36), clean(entry && entry.event, 'event'), clientLogSequence.toString(36), nonce].join(':');
-  }
 
   function compactClientEventName(value) {
     const event = String(value || 'client_event').replace(/[^0-9A-Za-z_-]/g, '_').slice(0, 80) || 'client_event';
     if (event === 'page_boot') return 'browser_opened';
     if (/video_socket.*open/.test(event)) return 'stream_opened';
-    if (/video_socket.*closed|viewer_idle_disconnected|video_stream_paused_hidden/.test(event)) return 'stream_closed';
-    if (/video_socket_connect_attempt|video_stream_restart|fresh_video_resume|cached_video_resume|viewer_idle_resumed/.test(event)) return 'stream_started';
+    if (/video_socket.*closed|viewer_idle_disconnected|video_stream_paused_hidden|activation_visibility_hidden|activation_pagehide/.test(event)) return 'stream_closed';
+    if (/video_socket_connect_attempt|video_stream_restart|fresh_video_resume|cached_video_resume|viewer_idle_resumed|activation_resume_(start|finish)/.test(event)) return 'stream_started';
     if (/keyframe/.test(event)) return /failed/.test(event) ? 'keyframe_failed' : 'keyframe_requested';
     if (/activation_resume_fresh_frame/.test(event)) return 'stream_recovered';
     if (/recover|recovery/.test(event)) return /failed|exhausted/.test(event) ? 'stream_failed' : 'stream_recovery_requested';
@@ -85,7 +75,6 @@ import { html, reactive } from '@arrow-js/core';
 
   function enqueueClientLog(entry) {
     const compacted = compactClientLogEntry(entry);
-    if (!compacted.rowId) compacted.rowId = newClientLogRowID(compacted);
     pendingClientLogs.push(compacted);
     if (pendingClientLogs.length > 100) pendingClientLogs.splice(0, pendingClientLogs.length - 100);
     if (typeof queueMicrotask === 'function') queueMicrotask(flushClientLogs);
@@ -105,7 +94,6 @@ import { html, reactive } from '@arrow-js/core';
         visibility: document.visibilityState,
         webCodecs: 'VideoDecoder' in window
       }).slice(0, 1000),
-      correlationId: typeof browserTraceId === 'string' ? browserTraceId : '',
       at: Date.now()
     });
   }
@@ -308,7 +296,6 @@ import { html, reactive } from '@arrow-js/core';
   let lastRenderedControlCodeRequestSignature = '';
   const localSessionID = String(cfg.sessionId || '').trim();
   const localPublicID = accountPublicId(cfg.email || '');
-  const browserTraceId = accountPublicId(localSessionID || localPublicID || pageVersion);
   const ownedControlCodeRequestIDs = new Set();
   const locallyClosedControlCodeRequestIDs = new Set();
   let codeDialogOpen = false;
@@ -925,22 +912,29 @@ import { html, reactive } from '@arrow-js/core';
     webCodecs: 'VideoDecoder' in window
   }));
 
-	  function flushClientLogs() {
-	    if (!spacetimeClient || typeof spacetimeClient.appendSafeLog !== 'function') return;
-	    if (!pendingClientLogs.length) return;
-	    const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));
-	    batch.forEach((entry) => {
-	      const detailJson = entry.detailJson || safeString({
-	        pageVersion,
-	        detail: entry.detail,
-	        queuedAt: entry.at
-	      }).slice(0, 1000);
-	      spacetimeClient.appendSafeLog(entry.level || 'info', entry.event || 'client_event', detailJson, entry.correlationId || '', entry.rowId || '')
-	        .catch(() => {
-	          if (pendingClientLogs.length < 100) pendingClientLogs.unshift(entry);
-	        });
-	    });
-	  }
+  function flushClientLogs() {
+    if (!videoWs || videoWs.readyState !== WebSocket.OPEN || !pendingClientLogs.length) return;
+    const batch = pendingClientLogs.splice(0, Math.min(20, pendingClientLogs.length));
+    for (let index = 0; index < batch.length; index += 1) {
+      const entry = batch[index];
+      const detailJson = (entry.detailJson || safeString({
+        pageVersion,
+        detail: entry.detail,
+        queuedAt: entry.at
+      })).slice(0, 1000);
+      try {
+        videoWs.send(JSON.stringify({
+          type: 'client_log',
+          event: String(entry.event || 'client_event').slice(0, 80),
+          detail: detailJson
+        }));
+      } catch (_) {
+        pendingClientLogs.unshift(...batch.slice(index));
+        if (pendingClientLogs.length > 100) pendingClientLogs.splice(100);
+        return;
+      }
+    }
+  }
 
   function showStreamResumeSpinner() {
     if (!streamResumeSpinner || !streamResumeSpinner.hidden) return;
@@ -1134,8 +1128,7 @@ import { html, reactive } from '@arrow-js/core';
     enqueueClientLog({
       level: 'info',
       event: compactClientEventName(event),
-      detailJson: safeString(resumeDiagnosticSnapshot(detail)).slice(0, 600),
-      correlationId: target.id
+      detailJson: safeString(resumeDiagnosticSnapshot(detail)).slice(0, 600)
     });
   }
 
@@ -1492,6 +1485,7 @@ import { html, reactive } from '@arrow-js/core';
       readyState: socket.readyState,
       visibility: document.visibilityState
     }));
+	  flushClientLogs();
 	    resetFirstFrameServerRecovery();
 	    showStreamWaiting('Saņem video konfigurāciju...');
 	    requestKeyframe(reason || 'video_socket_open');
@@ -1585,15 +1579,6 @@ import { html, reactive } from '@arrow-js/core';
 
   function sendVideoSocketClientLog(event, detail) {
     const safeDetail = safeString(detail).slice(0, 500);
-    if (videoWs && videoWs.readyState === WebSocket.OPEN) {
-      try {
-        videoWs.send(JSON.stringify({
-          type: 'client_log',
-          event: String(event || 'client_log').slice(0, 96),
-          detail: safeDetail
-        }));
-      } catch (_) {}
-    }
     clientLog(event, safeDetail);
   }
 
@@ -1657,8 +1642,7 @@ import { html, reactive } from '@arrow-js/core';
       detailJson: safeString({
         phase: safeResumeLabel(phase, 'first_frame_pending'),
         result: 'exhausted'
-      }).slice(0, 600),
-      correlationId: activeResumeFlow ? activeResumeFlow.id : ''
+      }).slice(0, 600)
     });
   }
 
@@ -2341,7 +2325,7 @@ import { html, reactive } from '@arrow-js/core';
           if (client !== spacetimeClient) return;
           publishSpacetimeClientStatus(status);
           if (status === 'live') {
-            flushClientLogs();
+    flushClientLogs();
           }
           updateControlCodeSubmitAvailability();
           if (detail) clientLog('spacetime_client_status', `${status}:${detail}`);

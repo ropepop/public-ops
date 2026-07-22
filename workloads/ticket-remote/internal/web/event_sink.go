@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,12 +23,96 @@ const (
 	serviceEventBodyLimitBytes = 16 * 1024
 	safeEventTextMaxBytes      = 240
 	safeEventMaxFields         = 32
+	browserClientLogBodyBytes  = 4 * 1024
+	auditWriteTimeout          = 750 * time.Millisecond
 	streamStartupTraceTarget   = 5 * time.Second
 	streamStartupTraceMaxAge   = 2 * time.Minute
 	streamStartupTraceMaxSteps = 32
 )
 
-var sensitiveEventText = regexp.MustCompile(`\b\d{2,8}\b|https?://[^\s"']+`)
+var (
+	sensitiveEventText   = regexp.MustCompile(`(?i)https?://[^\s"']+|\b(?:bearer|token|password|secret|cookie|authorization|prompt)\b|\b\d{2,}\b`)
+	sensitiveClientToken = regexp.MustCompile(`[A-Za-z0-9+/=_-]{32,}`)
+	sensitiveEmail       = regexp.MustCompile(`(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}`)
+	sensitiveIPAddress   = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
+	sensitivePrivatePath = regexp.MustCompile(`(?i)(?:/Users/|/home/|/root/|[A-Z]:\\Users\\)[^\s"']*`)
+
+	// The browser compacts its raw diagnostics to this fixed vocabulary before
+	// sending. Exact admission prevents a client from minting unique event names
+	// to evade central minute-bucket sampling.
+	browserClientLogEvents = map[string]struct{}{
+		"blocked_gesture":                       {},
+		"browser_opened":                        {},
+		"canvas_context_unavailable":            {},
+		"control_code_browser_capture_ack_sent": {},
+		"control_code_candidate_accepted":       {},
+		"control_code_candidate_rejected":       {},
+		"control_code_capturing":                {},
+		"control_code_close_local_only":         {},
+		"control_code_decoder_backlog_reset":    {},
+		"control_code_failed":                   {},
+		"control_code_frame_displayed":          {},
+		"control_code_frame_frozen":             {},
+		"control_code_frame_painted":            {},
+		"control_code_frame_retry_requested":    {},
+		"control_code_ignored":                  {},
+		"control_code_marker_frame_waiting":     {},
+		"control_code_marker_received":          {},
+		"control_code_requested":                {},
+		"control_code_sent":                     {},
+		"decoded_frame_render_failed":           {},
+		"decoder_decode_failed":                 {},
+		"decoder_error":                         {},
+		"decoder_transient_hidden":              {},
+		"direct_video_websocket_error":          {},
+		"early_video_connecting_grace":          {},
+		"early_video_connecting_grace_skipped":  {},
+		"fullscreen_failed":                     {},
+		"fullscreen_requested":                  {},
+		"fullscreen_unavailable":                {},
+		"h264_avc_adapter_empty_frame":          {},
+		"h264_avc_config_failed":                {},
+		"h264_decoder_mode":                     {},
+		"h264_unsupported":                      {},
+		"invalid_tsf2_frame":                    {},
+		"keyframe_failed":                       {},
+		"keyframe_requested":                    {},
+		"missing_ticket_dom":                    {},
+		"runtime_error":                         {},
+		"screen_engaged":                        {},
+		"state_changed":                         {},
+		"state_failed":                          {},
+		"stream_closed":                         {},
+		"stream_failed":                         {},
+		"stream_first_rendered_frame":           {},
+		"stream_focus_failed":                   {},
+		"stream_frame_preserve_failed":          {},
+		"stream_frame_restore_failed":           {},
+		"stream_opened":                         {},
+		"stream_recovery_requested":             {},
+		"stream_recovered":                      {},
+		"stream_stalled":                        {},
+		"stream_started":                        {},
+		"stream_vertical_scroll":                {},
+		"unhandled_rejection":                   {},
+		"video_message_failed":                  {},
+		"video_socket_create_failed":            {},
+		"viewer_idle_visible_keepalive":         {},
+		"wake_lock_acquired":                    {},
+		"wake_lock_failed":                      {},
+		"wake_lock_release_failed":              {},
+		"wake_lock_released":                    {},
+		"wake_lock_unavailable":                 {},
+		"websocket_create_failed":               {},
+		"websocket_unavailable":                 {},
+	}
+)
+
+type browserClientLogInput struct {
+	Type   string `json:"type"`
+	Event  string `json:"event"`
+	Detail string `json:"detail"`
+}
 
 type productEventInput struct {
 	Source        string         `json:"source"`
@@ -70,6 +157,23 @@ func (s *Server) recordRuntimeErrorAsync(event, id string, err error, detail map
 	s.recordRuntimeEventForSourceAsync("ticket_remote", "warn", event, id, detail)
 }
 
+func (s *Server) recordAuditAsync(ticketID, actor, event string, payload map[string]any, now time.Time) {
+	if s == nil || s.store == nil {
+		return
+	}
+	// Sanitize and copy before handing the payload to a goroutine. This both
+	// avoids caller mutation races and keeps Audit on the same privacy contract
+	// as every other central operational event.
+	safePayload := safeRuntimeLogDetail(payload)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
+		defer cancel()
+		if err := s.store.Audit(ctx, ticketID, actor, event, safePayload, now); err != nil {
+			s.recordRuntimeErrorAsync("audit_failed", event, err, map[string]any{"event": event})
+		}
+	}()
+}
+
 func (s *Server) recordRuntimeEventForSource(source, level, event, id string, detail map[string]any) {
 	if s == nil || s.store == nil {
 		return
@@ -98,7 +202,7 @@ func (s *Server) recordProductEvent(input productEventInput) {
 		detail["state_"+cleanStreamControlText(key, "field")] = value
 	}
 	detail["reason"], detail["backendId"], detail["count"] =
-		sensitiveEventText.ReplaceAllString(safeRuntimeLogText(input.Reason), "[redacted]"),
+		redactOperationalLogText(input.Reason),
 		cleanStreamControlText(input.BackendID, ""), input.Count
 	level := "info"
 	if eventFailed(action, status) {
@@ -193,16 +297,19 @@ func safeRuntimeLogDetail(input map[string]any) map[string]any {
 		if len(out) == safeEventMaxFields {
 			break
 		}
-		key = cleanStreamControlText(key, "field")
-		switch key {
-		case "token", "password", "digits", "value", "image", "image_base64", "payload_json", "detail_json", "row":
+		key = safeRuntimeLogKey(key)
+		if runtimeLogDetailKeyIsSensitive(key) {
 			continue
 		}
 		switch typed := value.(type) {
 		case nil, bool, int, int32, int64, uint, uint32, uint64, float32, float64, json.Number:
 			out[key] = typed
 		case string:
-			out[key] = safeRuntimeLogText(typed)
+			if metric, ok := safeRuntimeNumericMetric(key, typed); ok {
+				out[key] = metric
+			} else {
+				out[key] = redactOperationalLogText(typed)
+			}
 		case error:
 			out[key] = safeRuntimeLogError(typed)
 		default:
@@ -212,7 +319,217 @@ func safeRuntimeLogDetail(input map[string]any) map[string]any {
 	return out
 }
 
-func safeRuntimeLogError(err error) string { return safeRuntimeLogText(publicHealthError(err)) }
+func safeRuntimeNumericMetric(key, value string) (int64, bool) {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+	metricKey := false
+	for _, suffix := range []string{
+		"age", "agemillis", "bytes", "clients", "count", "duration", "durationmillis",
+		"epoch", "frames", "height", "length", "millis", "restarts", "sequence", "timestamp",
+		"timestampmillis", "width",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			metricKey = true
+			break
+		}
+	}
+	if !metricKey || value == "" || len(value) > 16 {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 || parsed > 9_999_999_999_999_999 {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func decodeBrowserClientLog(data []byte) (string, map[string]any, string, bool) {
+	if len(data) == 0 || len(data) > browserClientLogBodyBytes {
+		return "", nil, "", false
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	var input browserClientLogInput
+	if err := decoder.Decode(&input); err != nil || input.Type != "client_log" {
+		return "", nil, "", false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return "", nil, "", false
+	}
+	event := strings.TrimSpace(input.Event)
+	if _, allowed := browserClientLogEvents[event]; !allowed || len(input.Detail) > state.SafeOperationalLogDetailMaxBytes {
+		return "", nil, "", false
+	}
+	detail := safeBrowserClientLogDetail(input.Detail)
+	body, err := json.Marshal(detail)
+	if err != nil {
+		return "", nil, "", false
+	}
+	return event, detail, safeRuntimeLogText(string(body)), true
+}
+
+func safeBrowserClientLogDetail(raw string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]any{}
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil || input == nil {
+		return map[string]any{"detail": redactBrowserClientText(raw)}
+	}
+	out := make(map[string]any, min(len(input), 16))
+	for key, value := range input {
+		if len(out) == 16 || key == "detail" || browserClientDetailKeyIsSensitive(key) {
+			continue
+		}
+		cleanKey := safeRuntimeLogKey(key)
+		switch typed := value.(type) {
+		case nil, bool, float64, json.Number:
+			out[cleanKey] = typed
+		case string:
+			out[cleanKey] = redactBrowserClientText(typed)
+		default:
+			out[cleanKey] = "present"
+		}
+	}
+	if value, ok := input["detail"]; ok {
+		switch typed := value.(type) {
+		case string:
+			out["detail"] = sanitizeBrowserClientDetailString(typed)
+		case nil, bool, float64, json.Number:
+			out["detail"] = typed
+		default:
+			out["detail"] = "present"
+		}
+	}
+	return out
+}
+
+func sanitizeBrowserClientDetailString(raw string) string {
+	var nested map[string]any
+	if err := json.Unmarshal([]byte(raw), &nested); err == nil && nested != nil {
+		safe := make(map[string]any, min(len(nested), 16))
+		for key, value := range nested {
+			if len(safe) == 16 || browserClientDetailKeyIsSensitive(key) {
+				continue
+			}
+			cleanKey := safeRuntimeLogKey(key)
+			switch typed := value.(type) {
+			case nil, bool, float64, json.Number:
+				safe[cleanKey] = typed
+			case string:
+				safe[cleanKey] = redactBrowserClientText(typed)
+			default:
+				safe[cleanKey] = "present"
+			}
+		}
+		if body, err := json.Marshal(safe); err == nil {
+			raw = string(body)
+		}
+	}
+	return redactBrowserClientText(raw)
+}
+
+func browserClientDetailKeyIsSensitive(key string) bool {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.TrimSpace(key)))
+	if key == "webcodecs" {
+		return false
+	}
+	if key == "code" || key == "image" || key == "payload" || key == "raw" {
+		return true
+	}
+	return operationalLogDetailKeyIsSensitive(key)
+}
+
+func runtimeLogDetailKeyIsSensitive(key string) bool {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(strings.TrimSpace(key)))
+	if key == "code" || key == "value" || key == "image" || key == "payload" || key == "raw" || key == "detailjson" || key == "row" {
+		return true
+	}
+	return operationalLogDetailKeyIsSensitive(key)
+}
+
+func operationalLogDetailKeyIsSensitive(key string) bool {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(strings.TrimSpace(key)))
+	for _, marker := range []string{
+		"token", "password", "secret", "authorization", "cookie", "digits", "controlcode",
+		"imagebase64", "payloadjson", "prompt", "telegram", "userid", "chatid", "email",
+		"session", "jwt", "credential", "privatekey", "apikey", "resulttext", "ocr", "rawpayload",
+	} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func safeRuntimeLogKey(value string) string {
+	value = cleanStreamControlText(value, "field")
+	value = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, value)
+	if len(value) > 64 {
+		return value[:64]
+	}
+	return value
+}
+
+func redactBrowserClientText(value string) string {
+	return redactOperationalLogText(value)
+}
+
+func redactOperationalLogText(value string) string {
+	value = safeRuntimeLogText(value)
+	for _, pattern := range []*regexp.Regexp{
+		sensitiveEventText,
+		sensitiveClientToken,
+		sensitiveEmail,
+		sensitiveIPAddress,
+		sensitivePrivatePath,
+	} {
+		value = pattern.ReplaceAllString(value, "[redacted]")
+	}
+	return value
+}
+
+func safeRuntimeLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		if networkError.Timeout() {
+			return "timeout"
+		}
+		return "network_error"
+	}
+
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "rate limit"), strings.Contains(text, "too many requests"):
+		return "rate_limited"
+	case strings.Contains(text, "unauthorized"), strings.Contains(text, "forbidden"), strings.Contains(text, "permission denied"), strings.Contains(text, "authentication"):
+		return "authorization_failed"
+	case strings.Contains(text, "not found"):
+		return "not_found"
+	case strings.Contains(text, "conflict"), strings.Contains(text, "already exists"):
+		return "conflict"
+	case strings.Contains(text, "invalid"), strings.Contains(text, "bad request"), strings.Contains(text, "validation"):
+		return "invalid_request"
+	case strings.Contains(text, "connection refused"), strings.Contains(text, "no such host"), strings.Contains(text, "unreachable"), strings.Contains(text, "tls"), strings.Contains(text, "x509"):
+		return "network_error"
+	default:
+		return "operation_failed"
+	}
+}
 
 func safeRuntimeLogText(value string) string {
 	return trimLogField(strings.Join(strings.Fields(value), " "), safeEventTextMaxBytes)

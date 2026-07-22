@@ -42,7 +42,7 @@ web-client-build:
 	./scripts/build_web_client.sh
 
 web-static-test:
-	node --test ./internal/web/static/app.test.js ./internal/web/static/external-feed.test.js
+	node --test ./internal/web/static/app.test.js ./internal/web/static/arrow-ui.test.js ./internal/web/static/external-feed.test.js
 
 clean-local:
 	rm -rf ./.artifacts ./output ./bin ./tmp ./node_modules ./web-client/node_modules ./spacetimedb/node_modules ./spacetimedb/dist

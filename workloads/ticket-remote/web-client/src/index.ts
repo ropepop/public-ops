@@ -282,17 +282,6 @@ class TicketSpacetimeClient {
     });
   }
 
-  appendSafeLog(level: string, event: string, detailJson: string, correlationId = "", rowId = ""): Promise<void> {
-    return this.callReducer("memberAppendSafeOperationalLog", {
-      id: rowId || this.logRowId("browser", event, correlationId),
-      ticketId: this.cfg.ticketId,
-      level,
-      event,
-      correlationId,
-      detailJson,
-    });
-  }
-
   private websocketURL(): URL {
     const base = new URL(this.cfg.host);
     base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
@@ -479,16 +468,6 @@ class TicketSpacetimeClient {
 
   private backendId(): string {
     return "pixel";
-  }
-
-  private logRowId(source: string, event: string, correlationId: string): string {
-    const clean = (value: string, fallback: string) => String(value || fallback)
-      .trim()
-      .replace(/[^a-zA-Z0-9_-]/g, "_")
-      .slice(0, 80) || fallback;
-    const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
-    const nonce = Math.random().toString(36).slice(2, 10);
-    return `${this.cfg.ticketId}:${stamp}:${clean(source, "browser")}:${clean(event, "event")}:${clean(correlationId, "none")}:${nonce}`;
   }
 
   private reducer(name: string): any {

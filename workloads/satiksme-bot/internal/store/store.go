@@ -66,3 +66,35 @@ type ChatAnalyzerStore interface {
 	CountChatAnalyzerMessagesBySenderSince(ctx context.Context, chatID string, senderID int64, since time.Time) (int, error)
 	CountChatAnalyzerAppliedByTargetSince(ctx context.Context, targetKey string, since time.Time) (int, error)
 }
+
+// ChatAnalyzerMessageExpiryStore is an optional optimized maintenance path.
+// Stores without it are maintained through the portable list/mark operations
+// already present in the production Spacetime module.
+type ChatAnalyzerMessageExpiryStore interface {
+	ExpireStaleChatAnalyzerMessages(ctx context.Context, messageDateBefore, processedAt time.Time, analysisJSON string) (int, error)
+}
+
+// ChatAnalyzerBatchRecoveryStore marks persisted running batches as failed
+// after an interrupted process. A store that does not expose this operation
+// must not persist a non-terminal batch record.
+type ChatAnalyzerBatchRecoveryStore interface {
+	FailStaleChatAnalyzerBatches(ctx context.Context, startedBefore, finishedAt time.Time, reason string) (int, error)
+}
+
+type ChatAnalyzerMessageOutcome struct {
+	ID               string                          `json:"id"`
+	Status           model.ChatAnalyzerMessageStatus `json:"status"`
+	AnalysisJSON     string                          `json:"analysisJson"`
+	AppliedActionID  string                          `json:"appliedActionId"`
+	AppliedTargetKey string                          `json:"appliedTargetKey"`
+	BatchID          string                          `json:"batchId"`
+	LastError        string                          `json:"lastError"`
+	ProcessedAt      time.Time                       `json:"processedAt"`
+}
+
+// ChatAnalyzerBatchFinalizer persists a terminal batch and all of its message
+// outcomes in one transaction, so a completed batch can never leave pending
+// messages behind.
+type ChatAnalyzerBatchFinalizer interface {
+	FinalizeChatAnalyzerBatch(ctx context.Context, batch model.ChatAnalyzerBatch, outcomes []ChatAnalyzerMessageOutcome) error
+}

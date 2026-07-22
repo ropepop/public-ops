@@ -33,7 +33,7 @@ execFileSync(
 const keptBindings = new Set([
   ...["control_code_fast_state", "control_code_request", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus"]
     .map((name) => `ticketremote_${name}_table`),
-  ...["append_safe_operational_log", "close_control_code", "confirm_control_code_browser_capture", "prepare_control_code", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus"]
+  ...["close_control_code", "confirm_control_code_browser_capture", "prepare_control_code", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus"]
     .map((name) => `ticketremote_member_${name}_reducer`),
 ]);
 const allowedGeneratedFiles = new Set([
@@ -64,8 +64,6 @@ pruneBindings(path.join("types", "reducers.ts"), /^import\s+(\w+)\s+from\s+"\.\.
   (symbol) => new RegExp(`^export type \\w+ = __Infer<typeof ${symbol}>;\\n`, "gm"));
 rewrite("types.ts", (source) => source.replace(/\nexport const (Ticketremote\w+) = __t\.object\("\1", \{[\s\S]*?\n\}\);\nexport type \1 = __Infer<typeof \1>;\n/g,
   (block, name) => keepsType(name) ? block : ""));
-rewrite("ticketremote_member_append_safe_operational_log_reducer.ts", (source) => source.includes("id: __t.string()")
-  ? source : source.replace("export default {\n", "export default {\n  id: __t.string(),\n"));
 for (const relativeFile of readdirSync(generatedDir, { recursive: true })) {
   const file = path.join(generatedDir, relativeFile);
   if (statSync(file).isFile() && !allowedGeneratedFiles.has(relativeFile)) rmSync(file, { force: true });

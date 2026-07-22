@@ -34,7 +34,6 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
-import TicketremoteMemberAppendSafeOperationalLogReducer from "./ticketremote_member_append_safe_operational_log_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberPrepareControlCodeReducer from "./ticketremote_member_prepare_control_code_reducer";
@@ -202,7 +201,6 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
-  __reducerSchema("ticketremote_member_append_safe_operational_log", TicketremoteMemberAppendSafeOperationalLogReducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
   __reducerSchema("ticketremote_member_prepare_control_code", TicketremoteMemberPrepareControlCodeReducer),

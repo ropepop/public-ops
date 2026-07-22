@@ -27,6 +27,30 @@ This is the detailed operator runbook for the active kitty-gration runtime.
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
 6. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
 
+### Private configuration rules
+
+- Host environment, secret, tunnel-credential, and release environment files must be mode `0600`. Every mirror action repairs checkout-default local modes; normal deploy and config-only deploy repair the host modes before restarting services; full validation rejects unsafe modes.
+- Do not create `.bak`, `.before-*`, `.retired-*`, or editor backup copies under `/etc/arbuzas/env` or its local mirror. Mirror operations ignore these files, deploy removes old copies from the host, and full validation rejects any that remain.
+- Satiksme chat-analyzer Telegram and Google credentials belong under `infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/`, not inline in `satiksme-bot.env`. The directory is intentionally ignored by Git. The service environment contains only the matching `*_FILE` paths.
+
+Migrate an existing local Satiksme environment without displaying its values:
+
+```bash
+python3 tools/arbuzas/migrate_satiksme_analyzer_secrets.py \
+  --env-file infra/arbuzas/host-mirror/etc/arbuzas/env/satiksme-bot.env \
+  --secrets-dir infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer
+```
+
+Replace a copied Google key without placing it in shell history or command arguments:
+
+```bash
+pbpaste | python3 tools/arbuzas/migrate_satiksme_analyzer_secrets.py \
+  --secrets-dir infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer \
+  --set-google-key-stdin
+```
+
+The replacement command writes both Google/model key files atomically as `0600` and prints only a generic confirmation. Follow either change with `mirror-audit`, then `deploy-config` or the normal deploy flow. Never copy the secret value into a report, terminal command, or tracked file.
+
 ## Normal Release Flow
 
 Deploy the current repo state:
@@ -58,6 +82,8 @@ Notes for targeted updates:
 - `fast` is the inner iteration lane. It requires `--services`, reuses the unchanged release content, restarts only the selected slice, runs bounded readiness probes concurrently, and defers remote Docker/release cleanup. It still prunes expired local release artifacts after successful validation.
 - `standard` is the targeted confidence lane. It validates the selected workload more deeply while still avoiding unrelated full-stack checks.
 - `full` is the release lane and remains the default for unscoped deploys. It validates the complete host and performs release and image cleanup.
+- Full validation refuses releases marked dirty or unknown. A temporary dirty fast release cannot be used as final production proof.
+- Direct Spacetime privacy probes retry for up to four minutes so brief upstream interruptions do not incorrectly fail an otherwise healthy release.
 - Finish a sequence of fast iterations with an unscoped full deploy and validation. A fast release deliberately preserves unchanged service images and is not a replacement for the canonical full release.
 
 Validate an existing release:

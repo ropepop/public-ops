@@ -127,8 +127,8 @@ REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
 FAST_RELEASE_OVERLAY_PATHS=()
-RUN_STARTED_SECONDS="${SECONDS}"
-DEPLOYMENT_TIMING_REPORTER="${REPO_ROOT}/workloads/deployment-timing/scripts/report.sh"
+RUN_STARTED_MILLIS=""
+DEPLOYMENT_TIMING_REPORTER="${REPO_ROOT}/workloads/operational-logging/scripts/report-deployment.sh"
 DEPLOYMENT_TIMING_ACTIVE=0
 DEPLOYMENT_TIMING_FINALIZED=0
 DEPLOYMENT_TIMING_RUN_ID=""
@@ -162,9 +162,10 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2
 }
 
-# Deployment timing is intentionally detached from the deploy path. The
-# reporter only receives compact identifiers and durations, and a missing or
-# failed reporter must never alter the command's exit status.
+# Deployment timing is sent to the canonical private operational log and stays
+# detached from the deploy path. The reporter only receives compact identifiers
+# and durations, and a missing or failed reporter never alters the command's
+# exit status.
 deployment_timing_safe_token_or_none() {
   local value="${1:-}"
   local max_length="$2"
@@ -176,14 +177,60 @@ deployment_timing_safe_token_or_none() {
   fi
 }
 
+deployment_timing_now_millis() {
+  local realtime="${EPOCHREALTIME:-}"
+  local realtime_seconds=""
+  local realtime_fraction=""
+  local python_bin="${DEPLOYMENT_TIMING_CLOCK_PYTHON_BIN:-/usr/bin/python3}"
+  local python_value=""
+
+  if [[ ! -x "${python_bin}" ]]; then
+    python_bin="$(command -v python3 || true)"
+  fi
+  if [[ -n "${python_bin}" ]]; then
+    python_value="$("${python_bin}" -c 'import time; clock = getattr(time, "CLOCK_MONOTONIC", None); now = time.clock_gettime_ns(clock) if clock is not None and hasattr(time, "clock_gettime_ns") else time.monotonic_ns(); print(now // 1_000_000)' 2>/dev/null || true)"
+    if [[ "${python_value}" =~ ^[0-9]+$ ]]; then
+      printf '%s' "${python_value}"
+      return 0
+    fi
+  fi
+
+  if [[ "${realtime}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    realtime_seconds="${BASH_REMATCH[1]}"
+    realtime_fraction="${BASH_REMATCH[2]}000"
+    realtime_fraction="${realtime_fraction:0:3}"
+    printf '%s' "$(( 10#${realtime_seconds} * 1000 + 10#${realtime_fraction} ))"
+    return 0
+  fi
+
+  printf '%s' "$(( SECONDS * 1000 ))"
+}
+
+deployment_timing_elapsed_millis() {
+  local started_millis="$1"
+  local finished_millis="$2"
+  if (( finished_millis >= started_millis )); then
+    printf '%s' "$(( finished_millis - started_millis ))"
+  else
+    printf '0'
+  fi
+}
+
 deployment_timing_total_millis() {
-  printf '%s' "$(( (SECONDS - RUN_STARTED_SECONDS) * 1000 ))"
+  local finished_millis=""
+  local started_millis="${RUN_STARTED_MILLIS:-}"
+
+  finished_millis="$(deployment_timing_now_millis)"
+  if [[ -z "${started_millis}" ]]; then
+    started_millis="${finished_millis}"
+  fi
+  deployment_timing_elapsed_millis "${started_millis}" "${finished_millis}"
 }
 
 deployment_timing_report() {
   local python_bin=""
   [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" && -x "${DEPLOYMENT_TIMING_REPORTER}" ]] || return 0
-  python_bin="${DEPLOY_TIMING_PYTHON_BIN:-/usr/bin/python3}"
+  python_bin="${OPERATIONAL_LOGGING_PYTHON_BIN:-/usr/bin/python3}"
   if [[ ! -x "${python_bin}" ]]; then
     python_bin="$(command -v python3 || true)"
   fi
@@ -218,9 +265,14 @@ deployment_timing_finish() {
 
   [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" && "${DEPLOYMENT_TIMING_FINALIZED}" == "0" ]] || return 0
   DEPLOYMENT_TIMING_FINALIZED=1
-  if [[ "${exit_code}" == "0" ]]; then
-    status="ok"
-  fi
+  case "${exit_code}" in
+    0)
+      status="ok"
+      ;;
+    130|143)
+      status="cancelled"
+      ;;
+  esac
 
   deployment_timing_report run-complete \
     --run-id "${DEPLOYMENT_TIMING_RUN_ID}" \
@@ -236,7 +288,7 @@ deployment_timing_finish() {
 
 deployment_timing_on_exit() {
   local exit_code="$1"
-  trap - EXIT
+  trap - EXIT INT TERM
 
   if [[ -n "${DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH}" ]]; then
     rm -f -- "${DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH}" || true
@@ -245,9 +297,23 @@ deployment_timing_on_exit() {
   exit "${exit_code}"
 }
 
+deployment_timing_on_signal() {
+  local signal_name="$1"
+
+  trap - INT TERM
+  case "${signal_name}" in
+    INT)
+      exit 130
+      ;;
+    TERM)
+      exit 143
+      ;;
+  esac
+}
+
 start_deployment_timing_reporting() {
   case "${action}" in
-    deploy|validate|deploy-config)
+    deploy|validate|rollback|deploy-config)
       ;;
     *)
       return 0
@@ -256,9 +322,18 @@ start_deployment_timing_reporting() {
   [[ -x "${DEPLOYMENT_TIMING_REPORTER}" ]] || return 0
 
   DEPLOYMENT_TIMING_ACTIVE=1
+  RUN_STARTED_MILLIS="$(deployment_timing_now_millis)"
   DEPLOYMENT_TIMING_ACTION="${action}"
   DEPLOYMENT_TIMING_RUN_ID="ops-${action}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  DEPLOYMENT_TIMING_RELEASE_ID="$(deployment_timing_safe_token_or_none "${requested_release_id:-${ARBUZAS_RELEASE_ID}}" 160)"
+  if [[ -n "${requested_release_id}" ]]; then
+    DEPLOYMENT_TIMING_RELEASE_ID="$(deployment_timing_safe_token_or_none "${requested_release_id}" 160)"
+  elif [[ "${action}" == "validate" || "${action}" == "deploy-config" ]]; then
+    DEPLOYMENT_TIMING_RELEASE_ID="current"
+  elif [[ "${action}" == "rollback" ]]; then
+    DEPLOYMENT_TIMING_RELEASE_ID="none"
+  else
+    DEPLOYMENT_TIMING_RELEASE_ID="$(deployment_timing_safe_token_or_none "${ARBUZAS_RELEASE_ID}" 160)"
+  fi
   DEPLOYMENT_TIMING_TARGET="$(deployment_timing_safe_token_or_none "${ARBUZAS_HOST}" 160)"
   if [[ "${action}" == "deploy-config" ]]; then
     DEPLOYMENT_TIMING_PROFILE="none"
@@ -267,6 +342,8 @@ start_deployment_timing_reporting() {
   fi
 
   trap 'deployment_timing_on_exit "$?"' EXIT
+  trap 'deployment_timing_on_signal INT' INT
+  trap 'deployment_timing_on_signal TERM' TERM
   deployment_timing_report run-start \
     --run-id "${DEPLOYMENT_TIMING_RUN_ID}" \
     --source ops \
@@ -279,12 +356,14 @@ start_deployment_timing_reporting() {
 run_timed_phase() {
   local phase_name="$1"
   shift
-  local phase_started_seconds="${SECONDS}"
+  local phase_started_millis=""
+  local phase_finished_millis=""
   local phase_status="ok"
   local phase_exit_code=0
   local phase_duration_millis=0
   local phase_total_duration_millis=0
 
+  phase_started_millis="$(deployment_timing_now_millis)"
   log "Phase start: ${phase_name} profile=${VALIDATION_PROFILE}"
   if "$@"; then
     phase_exit_code=0
@@ -292,9 +371,10 @@ run_timed_phase() {
     phase_exit_code=$?
     phase_status="failed"
   fi
-  phase_duration_millis="$(( (SECONDS - phase_started_seconds) * 1000 ))"
+  phase_finished_millis="$(deployment_timing_now_millis)"
+  phase_duration_millis="$(deployment_timing_elapsed_millis "${phase_started_millis}" "${phase_finished_millis}")"
   phase_total_duration_millis="$(deployment_timing_total_millis)"
-  log "Phase timing: phase=${phase_name} status=${phase_status} duration_seconds=$((SECONDS - phase_started_seconds)) total_seconds=$((SECONDS - RUN_STARTED_SECONDS)) profile=${VALIDATION_PROFILE}"
+  log "Phase timing: phase=${phase_name} status=${phase_status} duration_millis=${phase_duration_millis} total_millis=${phase_total_duration_millis} profile=${VALIDATION_PROFILE}"
   if [[ "${DEPLOYMENT_TIMING_ACTIVE}" == "1" ]]; then
     deployment_timing_append_phase "${phase_name}" "${phase_status}" "${phase_duration_millis}" "${phase_total_duration_millis}"
   fi
@@ -480,7 +560,13 @@ remote_compose_shell() {
     }
 
     wait_until_ok() {
-      local deadline=\$((SECONDS + 90))
+      wait_until_ok_for 90 \"\$@\"
+    }
+
+    wait_until_ok_for() {
+      local timeout_seconds=\"\$1\"
+      shift
+      local deadline=\$((SECONDS + timeout_seconds))
       while true; do
         if \"\$@\"; then
           return 0
@@ -1411,12 +1497,9 @@ run_automatic_remote_docker_gc() {
 upload_remote_file() {
   local local_path="$1"
   local remote_path="$2"
-  local remote_tmp_path="${remote_path}.uploading.$$"
   local remote_path_q=""
-  local remote_tmp_path_q=""
 
   remote_path_q="$(shell_quote "${remote_path}")"
-  remote_tmp_path_q="$(shell_quote "${remote_tmp_path}")"
 
   run_ssh \
     -o ConnectTimeout=15 \
@@ -1424,12 +1507,60 @@ upload_remote_file() {
     -o ServerAliveCountMax=3 \
     "$(remote_target)" \
     "set -euo pipefail;
+     umask 077;
      remote_path=${remote_path_q};
-     remote_tmp_path=${remote_tmp_path_q};
-     mkdir -p \"\$(dirname -- \"\${remote_path}\")\";
-     trap 'rm -f -- \"\${remote_tmp_path}\"' EXIT;
-     cat > \"\${remote_tmp_path}\";
-     mv -f -- \"\${remote_tmp_path}\" \"\${remote_path}\"" \
+     remote_dir=\$(dirname -- \"\${remote_path}\");
+     mkdir -p \"\${remote_dir}\";
+     [[ -d \"\${remote_dir}\" && ! -L \"\${remote_dir}\" ]] || {
+       echo \"refusing unsafe remote upload directory: \${remote_dir}\" >&2;
+       exit 1;
+     };
+     if [[ -e \"\${remote_path}\" || -L \"\${remote_path}\" ]]; then
+       [[ -f \"\${remote_path}\" && ! -L \"\${remote_path}\" ]] || {
+         echo \"refusing unsafe remote upload target: \${remote_path}\" >&2;
+         exit 1;
+       };
+     fi;
+     staging_dir=\$(mktemp -d \"\${remote_dir}/.arbuzas-upload.XXXXXXXX\");
+     chmod 0700 \"\${staging_dir}\";
+     staged_path=\"\${staging_dir}/payload\";
+     cleanup_upload() {
+       rm -f -- \"\${staged_path}\";
+       rmdir -- \"\${staging_dir}\" 2>/dev/null || true;
+     };
+     trap cleanup_upload EXIT;
+     trap 'exit 1' HUP INT TERM;
+     : > \"\${staged_path}\";
+     chmod 0600 \"\${staged_path}\";
+     cat > \"\${staged_path}\";
+     python3 - \"\${staging_dir}\" \"\${staged_path}\" \"\${remote_path}\" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+directory = pathlib.Path(sys.argv[1])
+source = pathlib.Path(sys.argv[2])
+destination = pathlib.Path(sys.argv[3])
+directory_stat = directory.lstat()
+source_stat = source.lstat()
+if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_IMODE(directory_stat.st_mode) != 0o700:
+    raise SystemExit('refusing unsafe remote upload staging directory')
+if not stat.S_ISREG(source_stat.st_mode) or stat.S_IMODE(source_stat.st_mode) != 0o600:
+    raise SystemExit('refusing unsafe remote upload staging file')
+try:
+    destination_stat = destination.lstat()
+except FileNotFoundError:
+    pass
+else:
+    if not stat.S_ISREG(destination_stat.st_mode):
+        raise SystemExit('refusing unsafe remote upload target')
+os.replace(source, destination)
+os.chmod(destination, 0o600)
+destination_stat = destination.lstat()
+if not stat.S_ISREG(destination_stat.st_mode) or stat.S_IMODE(destination_stat.st_mode) != 0o600:
+    raise SystemExit('remote upload target is not a private regular file')
+PY" \
     < "${local_path}"
 }
 
@@ -2915,7 +3046,9 @@ prepare_local_release_metadata() {
   ARBUZAS_RELEASE_SOURCE_SHA256="$(compute_release_source_sha256)"
   validate_release_identity_values
 
-  cat > "${ARBUZAS_RELEASE_DIR}/release.env" <<EOF
+  (
+    umask 077
+    cat > "${ARBUZAS_RELEASE_DIR}/release.env" <<EOF
 ARBUZAS_RELEASE_ID=${ARBUZAS_RELEASE_ID}
 ARBUZAS_RELEASE_SOURCE_COMMIT=${ARBUZAS_RELEASE_SOURCE_COMMIT}
 ARBUZAS_RELEASE_SOURCE_DIRTY=${ARBUZAS_RELEASE_SOURCE_DIRTY}
@@ -2951,9 +3084,13 @@ ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIENCE=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_AUDIE
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_ISSUER:-https://auth.spacetimedb.com/oidc}
 ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID=${ARBUZAS_TICKET_REMOTE_SPACETIME_AUTH_CLIENT_ID:-}
 ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN=${ARBUZAS_TICKET_REMOTE_SERVICE_EVENT_TOKEN:-}
+OPERATIONAL_LOGGING_HOST=${OPERATIONAL_LOGGING_HOST:-https://maincloud.spacetimedb.com}
+OPERATIONAL_LOGGING_DATABASE=${OPERATIONAL_LOGGING_DATABASE:-operational-logging-prod}
 ARBUZAS_CLOUDFLARED_IMAGE=${ARBUZAS_CLOUDFLARED_IMAGE}
 ARBUZAS_TICKET_CLOUDFLARED_IMAGE=${ARBUZAS_TICKET_CLOUDFLARED_IMAGE}
 EOF
+  )
+  chmod 0600 "${ARBUZAS_RELEASE_DIR}/release.env"
 }
 
 prepare_local_release_bundle() {
@@ -3079,26 +3216,59 @@ append_csv_unique() {
 
 prepare_remote_ticket_runtime_permissions() {
   remote_root_command "
+    secure_private_file() {
+      local path=\"\$1\"
+      local owner=\"\$2\"
+      if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+        [[ -f \"\${path}\" && ! -L \"\${path}\" ]] || {
+          echo \"refusing unsafe private deployment file: \${path}\" >&2
+          exit 1
+        }
+        chown \"\${owner}\" \"\${path}\"
+        chmod 0600 \"\${path}\"
+      fi
+    }
+
+    find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
+      \( -type f -o -type l \) \
+      \( -name '*.bak*' -o -name '*.before-*' -o -name '*.retired-*' -o -name '*~' \) \
+      -delete
+
+    install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/satiksme-chat-analyzer'
+    for path in \
+      '/etc/arbuzas/env/train-bot.env' \
+      '/etc/arbuzas/env/satiksme-bot.env' \
+      '/etc/arbuzas/env/subscription-bot.env' \
+      '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
+      '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
+      '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
+      '/etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret' \
+      '/etc/arbuzas/secrets/satiksme-bot-spacetime.key' \
+      '/etc/arbuzas/secrets/satiksme-bot-web-session-secret' \
+      '/etc/arbuzas/secrets/satiksme-telegram-client.secret' \
+      '/etc/arbuzas/secrets/train-bot-spacetime.key' \
+      '/etc/arbuzas/secrets/train-bot-web-session-secret' \
+      '/etc/arbuzas/secrets/train-bot-test-ticket.secret' \
+      '/etc/arbuzas/cloudflared/train-bot.json' \
+      '/etc/arbuzas/cloudflared/satiksme-bot.json' \
+      '/etc/arbuzas/cloudflared/subscription-bot.json' \
+      '/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'; do
+      secure_private_file \"\${path}\" 'root:root'
+    done
+
     install -d -o 1001 -g 1001 -m 0750 '/srv/arbuzas/ticket-remote/state'
     for path in \
       '/etc/arbuzas/env/ticket-remote.env' \
       '/etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem' \
       '/etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret'; do
-      if [[ -f \"\${path}\" ]]; then
-        chown 1001:1001 \"\${path}\"
-        chmod 0600 \"\${path}\"
-      fi
+      secure_private_file \"\${path}\" '1001:1001'
     done
     for path in '/etc/arbuzas/secrets/android-adb/adbkey' '/etc/arbuzas/secrets/android-adb/adbkey.pub' '/etc/arbuzas/secrets/android-adb/adb_known_hosts.pb'; do
-      if [[ -f \"\${path}\" ]]; then
-        chown 1002:1002 \"\${path}\"
-        chmod 0600 \"\${path}\"
-      fi
+      secure_private_file \"\${path}\" '1002:1002'
     done
-    if [[ -f '/etc/arbuzas/cloudflared/ticket-remote.json' ]]; then
-      chown '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}' '/etc/arbuzas/cloudflared/ticket-remote.json'
-      chmod 0600 '/etc/arbuzas/cloudflared/ticket-remote.json'
-    fi
+    secure_private_file \
+      '/etc/arbuzas/cloudflared/ticket-remote.json' \
+      '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}'
   "
 }
 
@@ -4166,6 +4336,18 @@ validate_release_before_jellyfin_recovery() {
     qbittorrent qbittorrent_housekeeper
 }
 
+harden_remote_release_env_permissions() {
+  remote_shell "
+    if [[ -d '${REMOTE_RELEASES_ROOT}' ]]; then
+      remote_owner=\"\$(id -u):\$(id -g)\"
+      sudo -n find '${REMOTE_RELEASES_ROOT}' \
+        -mindepth 2 -maxdepth 2 -type f -name release.env \
+        -exec chown \"\${remote_owner}\" {} + \
+        -exec chmod 0600 {} +
+    fi
+  "
+}
+
 copy_release_to_remote() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
   local remote_tmp_dir="${remote_release_dir}.uploading.$$"
@@ -4181,6 +4363,7 @@ copy_release_to_remote() {
     COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "${local_tarball}" .
   )
 
+  harden_remote_release_env_permissions || return $?
   log "Uploading release bundle to ${ARBUZAS_HOST}:${remote_tarball}"
   upload_remote_file "${local_tarball}" "${remote_tarball}"
 
@@ -4193,6 +4376,8 @@ copy_release_to_remote() {
 
   remote_shell "
     [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete upload: missing release.env in ${remote_tmp_dir}' >&2; exit 1; }
+    sudo -n chown \"\$(id -u):\$(id -g)\" '${remote_tmp_dir}/release.env'
+    sudo -n chmod 0600 '${remote_tmp_dir}/release.env'
     sudo -n rm -rf '${remote_release_dir}'
     sudo -n mv '${remote_tmp_dir}' '${remote_release_dir}'
   "
@@ -4223,6 +4408,7 @@ copy_fast_release_overlay_to_remote() {
     COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "${local_tarball}" .
   )
 
+  harden_remote_release_env_permissions || return $?
   log "Uploading selected-service release overlay to ${ARBUZAS_HOST}:${remote_tarball}"
   upload_remote_file "${local_tarball}" "${remote_tarball}"
 
@@ -4244,6 +4430,8 @@ copy_fast_release_overlay_to_remote() {
     sudo -n tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
     sudo -n rm -f '${remote_tarball}'
     [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete fast overlay: missing release.env' >&2; exit 1; }
+    sudo -n chown \"\$(id -u):\$(id -g)\" '${remote_tmp_dir}/release.env'
+    sudo -n chmod 0600 '${remote_tmp_dir}/release.env'
     [[ -f '${remote_tmp_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'incomplete fast overlay: missing compose.yml' >&2; exit 1; }
     [[ -f '${remote_tmp_dir}/tools/arbuzas/render_cloudflared_config.py' ]] || { echo 'incomplete fast overlay: missing tunnel renderer' >&2; exit 1; }
     for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote; do
@@ -4322,12 +4510,21 @@ render_remote_cloudflared_configs() {
 }
 
 resolve_remote_current_release_id() {
-  remote_inline_shell "
+  local output_variable="${1:-}"
+  local resolved_release_id=""
+
+  resolved_release_id="$(remote_inline_shell "
     current_target=\$(readlink '${REMOTE_CURRENT_LINK}' 2>/dev/null || true)
     if [[ -n \"\${current_target}\" ]]; then
       basename \"\${current_target}\"
     fi
-  " 2>/dev/null | tail -n 1 | tr -d '\r\n[:space:]'
+  " 2>/dev/null | tail -n 1 | tr -d '\r\n[:space:]')"
+
+  if [[ -n "${output_variable}" ]]; then
+    printf -v "${output_variable}" '%s' "${resolved_release_id}"
+  else
+    printf '%s' "${resolved_release_id}"
+  fi
 }
 
 remote_compose_up() {
@@ -5356,7 +5553,7 @@ for name, args in [
         if forbidden in body:
             raise SystemExit(f'anonymous train call reached application logic before auth denial: {name} {status} {body[:200]}')
 PY
-wait_until_ok env TRAIN_PAGE_HTML_FILE=\"\${html_tmp}\" TRAIN_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
+wait_until_ok_for 240 env TRAIN_PAGE_HTML_FILE=\"\${html_tmp}\" TRAIN_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
     train_bot train_tunnel
 }
 
@@ -6235,7 +6432,7 @@ for name, args in [
         if forbidden in body:
             raise SystemExit(f'anonymous call reached application logic before auth denial: {name} {status} {body[:200]}')
 PY
-wait_until_ok env SATIKSME_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
+wait_until_ok_for 240 env SATIKSME_SPACETIME_CONFIG_FILE=\"\${config_tmp}\" python3 \"\${tmp}\"" \
     satiksme_bot satiksme_tunnel
 }
 
@@ -6355,6 +6552,10 @@ validate_remote_release_identity() {
           -z "\${ARBUZAS_RELEASE_SOURCE_SHA256:-}" ]]; then
       echo 'legacy release identity proof skipped for ${service_name}: release.env has no source identity fields'
       exit 0
+    fi
+    if [[ '${VALIDATION_PROFILE}' == 'full' && "\${ARBUZAS_RELEASE_SOURCE_DIRTY}" != 'clean' ]]; then
+      echo 'full validation refuses a dirty or unknown release snapshot' >&2
+      exit 1
     fi
 
     tmp=\$(mktemp)
@@ -7287,9 +7488,85 @@ validate_remote_swarm_baseline() {
 validate_remote_host_baseline() {
   local remote_release_dir="$1"
 
+  validate_remote_private_configuration_permissions "${remote_release_dir}"
   validate_remote_swarm_baseline "${remote_release_dir}"
   validate_remote_retired_portainer_absence "${remote_release_dir}"
   validate_remote_retired_chatgpt_absence "${remote_release_dir}"
+}
+
+validate_remote_private_configuration_permissions() {
+  local remote_release_dir="$1"
+  local diagnostics_services=()
+
+  populate_current_diagnostic_services diagnostics_services
+  validate_remote_host_probe "${remote_release_dir}" \
+    "private deployment configuration permissions" \
+    "
+      assert_private_file() {
+        local path=\"\$1\"
+        local expected=\"\$2\"
+        [[ -f \"\${path}\" && ! -L \"\${path}\" ]] || {
+          echo \"missing or unsafe private deployment file: \${path}\" >&2
+          return 1
+        }
+        [[ \"\$(stat -c '%u:%g:%a' \"\${path}\")\" == \"\${expected}\" ]] || {
+          echo \"private deployment file has unsafe ownership or mode: \${path}\" >&2
+          return 1
+        }
+      }
+
+      for path in \
+        '/etc/arbuzas/env/train-bot.env' \
+        '/etc/arbuzas/env/satiksme-bot.env' \
+        '/etc/arbuzas/env/subscription-bot.env'; do
+        assert_private_file \"\${path}\" '0:0:600'
+      done
+      assert_private_file '/etc/arbuzas/env/ticket-remote.env' '1001:1001:600'
+
+      if grep -Eq '^SATIKSME_CHAT_ANALYZER_(API_ID|API_HASH|GOOGLE_API_KEY|MODEL_API_KEY)=.+' \
+          '/etc/arbuzas/env/satiksme-bot.env'; then
+        echo 'Satiksme analyzer credentials remain inline in the host env' >&2
+        exit 1
+      fi
+      for file_key in API_ID API_HASH GOOGLE_API_KEY MODEL_API_KEY; do
+        grep -Eq \"^SATIKSME_CHAT_ANALYZER_\${file_key}_FILE=.+\" \
+          '/etc/arbuzas/env/satiksme-bot.env' || {
+          echo \"Satiksme analyzer file-backed credential is missing: \${file_key}\" >&2
+          exit 1
+        }
+      done
+
+      for path in \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret'; do
+        assert_private_file \"\${path}\" '0:0:600'
+        [[ -s \"\${path}\" ]] || {
+          echo \"required Satiksme analyzer credential is empty: \${path}\" >&2
+          exit 1
+        }
+      done
+
+      analyzer_enabled=\$(sed -n 's/^SATIKSME_CHAT_ANALYZER_ENABLED=//p' \
+        '/etc/arbuzas/env/satiksme-bot.env' | tail -1)
+      if [[ \"\${analyzer_enabled}\" == 'true' ]]; then
+        path='/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'
+        assert_private_file \"\${path}\" '0:0:600'
+        [[ -s \"\${path}\" ]] || {
+          echo \"required Satiksme analyzer session is empty: \${path}\" >&2
+          exit 1
+        }
+      fi
+
+      if find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
+          \( -name '*.bak*' -o -name '*.before-*' -o -name '*.retired-*' -o -name '*~' \) \
+          -print -quit | grep -q .; then
+        echo 'unmanaged host environment history remains under /etc/arbuzas/env' >&2
+        exit 1
+      fi
+    " \
+    "${diagnostics_services[@]}"
 }
 
 validate_remote_retired_portainer_absence() {
@@ -7505,6 +7782,7 @@ deploy_config_from_mirror() {
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
   trap "rm -f '${changed_paths_file}'; trap - RETURN" RETURN
 
+  harden_remote_release_env_permissions || return $?
   run_host_mirror_push "${changed_paths_file}" || return $?
   prepare_remote_ticket_runtime_permissions || return $?
   if affected_output="$(host_mirror_affected_services "${changed_paths_file}")"; then
@@ -7719,7 +7997,8 @@ case "${action}" in
     ARBUZAS_RELEASE_ID="${requested_release_id:-${ARBUZAS_RELEASE_ID}}"
     ARBUZAS_RELEASE_DIR="${LOCAL_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
     enforce_release_source_policy
-    previous_release_id="$(run_timed_phase resolve_current_release resolve_remote_current_release_id || true)"
+    previous_release_id=""
+    run_timed_phase resolve_current_release resolve_remote_current_release_id previous_release_id || true
     if (( TARGETED_MODE == 1 )); then
       log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
     fi
@@ -7803,6 +8082,7 @@ case "${action}" in
       echo "--release-id is required for rollback" >&2
       exit 2
     fi
+    run_timed_phase harden_release_env_permissions harden_remote_release_env_permissions
     if qbittorrent_deployment_selected && ! previous_release_has_qbittorrent "${requested_release_id}"; then
       run_timed_phase rollback_release rollback_release_before_qbittorrent "${requested_release_id}" force-managed
       if jellyfin_deployment_selected && ! previous_release_has_jellyfin "${requested_release_id}"; then

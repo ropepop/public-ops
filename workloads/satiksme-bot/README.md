@@ -32,6 +32,30 @@ The active production runtime is Docker on kitty-gration. Local workload command
 - Public bundles: `/srv/arbuzas/satiksme-bot/data/public-bundles`
 - State: `/srv/arbuzas/satiksme-bot/state`
 
+## Private Telegram Analyzer Operations
+
+Authorize or replace the personal-account session with the interactive helper. It writes to a private staging file and only replaces the current session after Telegram confirms authorization:
+
+```bash
+go run ./cmd/chat-analyzer-session -list-dialogs=false
+```
+
+Validate the current session without starting login or writing anything back to the session file:
+
+```bash
+go run ./cmd/chat-analyzer-session -validate-only -list-dialogs=false
+```
+
+Analyzer credentials may be loaded from private files with `SATIKSME_CHAT_ANALYZER_API_ID_FILE`, `SATIKSME_CHAT_ANALYZER_API_HASH_FILE`, `SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE`, and `SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE`. A direct environment value takes precedence when both forms are present.
+
+The loopback-only `/api/v1/internal/health` response includes a sanitized `chatAnalyzer` section with session state, collection and processing timestamps, the selected model, circuit state, and interrupted-batch recovery count. It never includes chat text or credentials.
+
+Google auto-selection defaults to the `gemma_parameter` policy. It selects compatible Gemma text models by capability and size but does not label them free-tier models; `verified_free` policies require explicit eligibility metadata from the model endpoint.
+
+Collection accepts only messages no older than `SATIKSME_CHAT_ANALYZER_MAX_MESSAGE_AGE` (24 hours by default). Older messages are skipped before storage or model processing, while the Telegram checkpoint still advances. Pending messages that have aged beyond the same limit are expired without model processing. The sanitized internal health response reports both skipped collection and expired pending counts. Model calls are paced by `SATIKSME_CHAT_ANALYZER_MODEL_CALL_DELAY` (5 seconds by default).
+
+Telegram history is read forward from the saved checkpoint so a burst larger than one API page is not silently skipped. Source chat text remains private analyzer input; public area incidents use only a derived location label, never the source message text.
+
 ## Notes
 
 - Anonymous visitors can browse the map and incidents; Telegram login unlocks reporting, voting, and commenting.

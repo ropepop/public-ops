@@ -304,8 +304,11 @@ func TestOpenAppPromptAndHelpMentionTelegramDeepLink(t *testing.T) {
 
 	for i, request := range sendMessages {
 		text, _ := request.payload["text"].(string)
-		if !strings.Contains(text, "https://t.me/vivi_kontrole_bot/app") {
+		if !strings.Contains(text, "https://t.me/vivi_kontrole_bot?startapp") {
 			t.Fatalf("message[%d] missing Telegram deep link: %q", i, text)
+		}
+		if strings.Contains(text, "https://t.me/vivi_kontrole_bot/app") {
+			t.Fatalf("message[%d] still contains the unregistered direct-app short name: %q", i, text)
 		}
 	}
 }

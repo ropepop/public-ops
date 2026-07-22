@@ -409,6 +409,146 @@ func TestSQLiteStoreChatAnalyzerQueueLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQLiteFailStaleChatAnalyzerBatchesOnlyClosesOldRunningRows(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	for _, batch := range []model.ChatAnalyzerBatch{
+		{ID: "stale", Status: model.ChatAnalyzerBatchRunning, StartedAt: now.Add(-time.Hour), MessageCount: 3},
+		{ID: "fresh", Status: model.ChatAnalyzerBatchRunning, StartedAt: now.Add(-time.Minute), MessageCount: 2},
+		{ID: "complete", Status: model.ChatAnalyzerBatchCompleted, StartedAt: now.Add(-time.Hour), FinishedAt: now.Add(-50 * time.Minute), MessageCount: 1},
+	} {
+		if err := st.SaveChatAnalyzerBatch(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, err := st.FailStaleChatAnalyzerBatches(ctx, now.Add(-15*time.Minute), now, "interrupted before completion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+	var status, finishedAt, lastError string
+	var errorCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT status, finished_at, error_count, last_error FROM chat_analyzer_batches WHERE id = 'stale'`).Scan(&status, &finishedAt, &errorCount, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(model.ChatAnalyzerBatchFailed) || finishedAt == "" || errorCount != 3 || lastError != "interrupted before completion" {
+		t.Fatalf("stale batch = status=%q finished=%q errors=%d lastError=%q", status, finishedAt, errorCount, lastError)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT status FROM chat_analyzer_batches WHERE id = 'fresh'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(model.ChatAnalyzerBatchRunning) {
+		t.Fatalf("fresh status = %q, want running", status)
+	}
+}
+
+func TestSQLiteExpireStaleChatAnalyzerMessagesOnlyClosesOldPendingRows(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	for _, item := range []model.ChatAnalyzerMessage{
+		{ID: "stale", ChatID: "chat:1", MessageID: 1, Text: "old", MessageDate: now.Add(-48 * time.Hour), ReceivedAt: now.Add(-48 * time.Hour), Status: model.ChatAnalyzerMessagePending},
+		{ID: "fresh", ChatID: "chat:1", MessageID: 2, Text: "new", MessageDate: now.Add(-time.Hour), ReceivedAt: now.Add(-time.Hour), Status: model.ChatAnalyzerMessagePending},
+		{ID: "done", ChatID: "chat:1", MessageID: 3, Text: "old done", MessageDate: now.Add(-48 * time.Hour), ReceivedAt: now.Add(-48 * time.Hour), Status: model.ChatAnalyzerMessageIgnored},
+	} {
+		if _, err := st.EnqueueChatAnalyzerMessage(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, err := st.ExpireStaleChatAnalyzerMessages(ctx, now.Add(-24*time.Hour), now, `{"kind":"ignored"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated = %d, want 1", updated)
+	}
+	pending, err := st.ListPendingChatAnalyzerMessages(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != "fresh" {
+		t.Fatalf("pending = %+v, want only fresh", pending)
+	}
+	var status, analysisJSON string
+	if err := st.db.QueryRowContext(ctx, `SELECT status, analysis_json FROM chat_analyzer_messages WHERE id = 'stale'`).Scan(&status, &analysisJSON); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(model.ChatAnalyzerMessageIgnored) || analysisJSON != `{"kind":"ignored"}` {
+		t.Fatalf("stale row = status=%q analysis=%q", status, analysisJSON)
+	}
+}
+
+func TestSQLiteFinalizeChatAnalyzerBatchIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	item := model.ChatAnalyzerMessage{ID: "message-1", ChatID: "chat:1", MessageID: 1, Text: "test", MessageDate: now, ReceivedAt: now, Status: model.ChatAnalyzerMessagePending}
+	if _, err := st.EnqueueChatAnalyzerMessage(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	batch := model.ChatAnalyzerBatch{ID: "batch-1", Status: model.ChatAnalyzerBatchCompleted, StartedAt: now, FinishedAt: now.Add(time.Minute), MessageCount: 2}
+	outcomes := []ChatAnalyzerMessageOutcome{
+		{ID: item.ID, Status: model.ChatAnalyzerMessageIgnored, BatchID: batch.ID, ProcessedAt: batch.FinishedAt},
+		{ID: "missing", Status: model.ChatAnalyzerMessageIgnored, BatchID: batch.ID, ProcessedAt: batch.FinishedAt},
+	}
+	if err := st.FinalizeChatAnalyzerBatch(ctx, batch, outcomes); err == nil {
+		t.Fatal("FinalizeChatAnalyzerBatch() error = nil, want missing-message rollback")
+	}
+	var status string
+	if err := st.db.QueryRowContext(ctx, `SELECT status FROM chat_analyzer_messages WHERE id = ?`, item.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(model.ChatAnalyzerMessagePending) {
+		t.Fatalf("message status after rollback = %q, want pending", status)
+	}
+	var batches int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_analyzer_batches WHERE id = ?`, batch.ID).Scan(&batches); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 0 {
+		t.Fatalf("batch count after rollback = %d, want 0", batches)
+	}
+
+	batch.MessageCount = 1
+	if err := st.FinalizeChatAnalyzerBatch(ctx, batch, outcomes[:1]); err != nil {
+		t.Fatal(err)
+	}
+	var batchStatus, batchID string
+	if err := st.db.QueryRowContext(ctx, `SELECT status, batch_id FROM chat_analyzer_messages WHERE id = ?`, item.ID).Scan(&status, &batchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT status FROM chat_analyzer_batches WHERE id = ?`, batch.ID).Scan(&batchStatus); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(model.ChatAnalyzerMessageIgnored) || batchID != batch.ID || batchStatus != string(model.ChatAnalyzerBatchCompleted) {
+		t.Fatalf("final state = message %q batchId %q batch %q", status, batchID, batchStatus)
+	}
+}
+
 func testIncidentVoteAction(id string, incidentID string, userID int64, at time.Time) (model.IncidentVote, model.IncidentVoteEvent) {
 	return model.IncidentVote{
 			IncidentID: incidentID,

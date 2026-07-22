@@ -20,6 +20,9 @@ mkdir -p \
 cat > "${remote_root}/etc/arbuzas/env/train-bot.env" <<'EOF'
 BOT_TOKEN=initial-train
 EOF
+cat > "${remote_root}/etc/arbuzas/env/train-bot.env.bak-google-ai" <<'EOF'
+BOT_TOKEN=historical-copy-must-not-be-mirrored
+EOF
 cat > "${remote_root}/etc/arbuzas/secrets/android-adb/adbkey" <<'EOF'
 adb-private-key
 EOF
@@ -36,7 +39,24 @@ python3 "${SCRIPT}" pull --profile arbuzas --remote-root "${remote_root}" --mirr
 test -f "${mirror_root}/etc/arbuzas/env/train-bot.env"
 test -f "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey"
 test -f "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json"
+test ! -e "${mirror_root}/etc/arbuzas/env/train-bot.env.bak-google-ai"
 grep -F 'ARBUZAS_RELEASE_ID=initial' "${mirror_root}/etc/arbuzas/current/release.env" >/dev/null
+for private_path in \
+  "${mirror_root}/etc/arbuzas/env/train-bot.env" \
+  "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey" \
+  "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json" \
+  "${mirror_root}/etc/arbuzas/current/release.env"; do
+  if [[ "$(stat -f '%Lp' "${private_path}" 2>/dev/null || stat -c '%a' "${private_path}")" != 600 ]]; then
+    echo "FAIL: private mirror file was not hardened to 0600: ${private_path}" >&2
+    exit 1
+  fi
+done
+chmod 0644 "${mirror_root}/etc/arbuzas/env/train-bot.env"
+python3 "${SCRIPT}" audit --profile arbuzas --remote-root "${remote_root}" --mirror-root "${mirror_root}" >/dev/null
+if [[ "$(stat -f '%Lp' "${mirror_root}/etc/arbuzas/env/train-bot.env" 2>/dev/null || stat -c '%a' "${mirror_root}/etc/arbuzas/env/train-bot.env")" != 600 ]]; then
+  echo "FAIL: host mirror audit did not repair a checkout-default private mode" >&2
+  exit 1
+fi
 
 cat > "${mirror_root}/etc/arbuzas/env/train-bot.env" <<'EOF'
 BOT_TOKEN=local-change
@@ -49,6 +69,10 @@ python3 "${SCRIPT}" push --profile arbuzas --remote-root "${remote_root}" --mirr
 grep -F 'BOT_TOKEN=local-change' "${remote_root}/etc/arbuzas/env/train-bot.env" >/dev/null
 grep -F 'ARBUZAS_RELEASE_ID=remote-advanced' "${remote_root}/etc/arbuzas/current/release.env" >/dev/null
 grep -Fx 'etc/arbuzas/env/train-bot.env' "${changed_paths}" >/dev/null
+if [[ "$(stat -f '%Lp' "${remote_root}/etc/arbuzas/env/train-bot.env" 2>/dev/null || stat -c '%a' "${remote_root}/etc/arbuzas/env/train-bot.env")" != 600 ]]; then
+  echo "FAIL: permission-only mirror push did not harden the remote env" >&2
+  exit 1
+fi
 
 cp "${mirror_root}/etc/arbuzas/current/release.env" "${tmpdir}/release.env.snapshot"
 printf 'ARBUZAS_RELEASE_ID=must-not-push\n' > "${mirror_root}/etc/arbuzas/current/release.env"
@@ -92,6 +116,15 @@ printf '%s\n' "${affected}" | grep -Fx 'ticket_remote_tunnel' >/dev/null
 printf '%s\n' "${affected}" | grep -Fx 'train_bot' >/dev/null
 if printf '%s\n' "${affected}" | grep -Fx 'satiksme_bot' >/dev/null; then
   echo "FAIL: unrelated services should not be affected" >&2
+  exit 1
+fi
+
+cat > "${changed_paths}" <<'EOF'
+etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret
+EOF
+affected="$(python3 "${SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths}")"
+if [[ "${affected}" != satiksme_bot ]]; then
+  echo "FAIL: analyzer secret change should restart only satiksme_bot" >&2
   exit 1
 fi
 
@@ -149,5 +182,61 @@ if python3 "${SCRIPT}" audit --profile ticket-recovery --remote-root "${narrow_r
   exit 1
 fi
 grep -Fq 'remote changed: etc/arbuzas/env/ticket-remote.env' "${tmpdir}/narrow-audit.out"
+
+python3 - "${SCRIPT}" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+spec = importlib.util.spec_from_file_location("host_mirror", sys.argv[1])
+host_mirror = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = host_mirror
+spec.loader.exec_module(host_mirror)
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+upload_block = source.split("def push_remote_ssh(", 1)[1].split("def write_changed_paths(", 1)[0]
+for required_guard in (
+    "secrets.token_hex(16)",
+    "mkdir -m 0700",
+    "chmod 0600",
+    "stat.S_IMODE(staging_stat.st_mode) != 0o700",
+    "stat.S_IMODE(tar_stat.st_mode) != 0o600",
+    "finally:",
+    "rmdir --",
+):
+    if required_guard not in upload_block:
+        raise SystemExit(f"host-mirror secure remote staging is missing: {required_guard}")
+if "scp_base_args(args)" in upload_block:
+    raise SystemExit("host-mirror secret archive still crosses scp without private remote staging")
+
+path = "etc/arbuzas/env/satiksme-bot.env"
+baseline = {path: {"sha256": "old-content", "mode": 0o644}}
+local = {path: {"sha256": "new-content", "mode": 0o600}}
+remote = {path: {"sha256": "old-content", "mode": 0o600}}
+
+local_changed, remote_changed, conflicts = host_mirror.classify(baseline, local, remote)
+if local_changed != [path] or remote_changed or conflicts:
+    raise SystemExit(
+        "matched remote permission hardening did not allow the local content migration: "
+        f"local={local_changed} remote={remote_changed} conflicts={conflicts}"
+    )
+
+remote[path] = {"sha256": "different-remote-content", "mode": 0o600}
+local_changed, remote_changed, conflicts = host_mirror.classify(baseline, local, remote)
+if conflicts != [path] or local_changed or remote_changed:
+    raise SystemExit("genuinely different remote content was not rejected as a conflict")
+
+remote[path] = {"sha256": "old-content", "mode": 0o640}
+local_changed, remote_changed, conflicts = host_mirror.classify(baseline, local, remote)
+if conflicts != [path] or local_changed or remote_changed:
+    raise SystemExit("genuinely different remote mode was not rejected as a conflict")
+
+local[path] = {"sha256": "old-content", "mode": 0o600}
+remote[path] = {"sha256": "old-content", "mode": 0o600}
+local_changed, remote_changed, conflicts = host_mirror.classify(baseline, local, remote)
+if local_changed or remote_changed or conflicts:
+    raise SystemExit("identical local/remote permission hardening was not treated as converged")
+PY
 
 echo "PASS: Arbuzas host mirror preserves pull-only migration state, syncs config, detects conflicts, and maps affected services"

@@ -79,6 +79,9 @@ type Server struct {
 	streamDesiredReleaseTimer *time.Timer
 	streamDesiredReleaseSeq   uint64
 	streamLifecycleMu         sync.RWMutex
+	browserClientLogMu        sync.Mutex
+	browserClientLogWindow    time.Time
+	browserClientLogCount     int
 
 	backendMu sync.RWMutex
 }
@@ -93,6 +96,10 @@ type client struct {
 	sessionID string
 	email     string
 	sendMu    sync.Mutex
+
+	clientLogMu          sync.Mutex
+	clientLogWindowStart time.Time
+	clientLogCount       int
 
 	videoMu              sync.Mutex
 	videoWriteActive     bool
@@ -114,9 +121,10 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion      = "ticket-remote-2026-07-11-painted-browser-captured-control-code-v120"
-	stateLookupTimeout = 1200 * time.Millisecond
-	stateCacheMaxAge   = 30 * time.Second
+	serverVersion                 = "ticket-remote-2026-07-11-painted-browser-captured-control-code-v120"
+	stateLookupTimeout            = 1200 * time.Millisecond
+	stateCacheMaxAge              = 30 * time.Second
+	maxBrowserClientLogsPerMinute = 60
 
 	streamRecoveryCommandCooldown = 10 * time.Second
 	streamPrewarmHold             = 30 * time.Second
@@ -930,12 +938,10 @@ func (s *Server) handleAdminPhoneBackend(w http.ResponseWriter, r *http.Request,
 		s.recordRuntimeErrorAsync("backend_switch_phone_state_update_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
 	}
 	snapshot = s.withActivePhoneBackend(snapshot, relayHealth)
-	if auditErr := s.store.Audit(r.Context(), s.cfg.TicketID, id.Email, "phone_backend_switched", map[string]any{
+	s.recordAuditAsync(s.cfg.TicketID, id.Email, "phone_backend_switched", map[string]any{
 		"from": previous.ID,
 		"to":   backend.ID,
-	}, now); auditErr != nil {
-		s.recordRuntimeErrorAsync("backend_switch_audit_failed", backend.ID, auditErr, map[string]any{"backendId": backend.ID})
-	}
+	}, now)
 	s.cacheSnapshot(snapshot)
 	if redirectAdminForm(w, r) {
 		return
@@ -982,12 +988,10 @@ func (s *Server) handleAdminTicketReselectLatest(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: "command_failed", Message: "Latest ticket reselect could not be requested."})
 		return
 	}
-	if auditErr := s.store.Audit(r.Context(), s.cfg.TicketID, id.Email, "latest_ticket_reselect_requested", map[string]any{
+	s.recordAuditAsync(s.cfg.TicketID, id.Email, "latest_ticket_reselect_requested", map[string]any{
 		"commandId": commandID,
 		"backendId": backend.ID,
-	}, now); auditErr != nil {
-		s.recordRuntimeErrorAsync("latest_ticket_reselect_audit_failed", backend.ID, auditErr, map[string]any{"backendId": backend.ID})
-	}
+	}, now)
 	s.recordRuntimeEventForSourceAsync("ticket_remote_admin", "info", "latest_ticket_reselect_requested", commandID, map[string]any{
 		"commandId": commandID,
 		"backendId": backend.ID,
@@ -1124,27 +1128,58 @@ func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data [
 	msgType, _ := msg["type"].(string)
 	switch msgType {
 	case "client_log":
-		event, _ := msg["event"].(string)
-		event = cleanStreamControlText(event, "client_log")
-		if event != "stream_first_rendered_frame" {
+		event, detail, detailText, ok := decodeBrowserClientLog(data)
+		if !ok {
 			return
 		}
-		detail, _ := msg["detail"].(string)
-		detail = safeRuntimeLogText(detail)
-		s.direct.recordClientTelemetry(event, detail)
-		c.firstVideoFrameRendered = true
-		s.direct.completeStartupTrace("browser_first_rendered_frame", detail)
-		s.releaseRelayViewerPublicOpenGrace(c.sessionID, "stream_first_rendered_frame")
-		s.recordRuntimeEventForSourceAsync("ticket_remote_browser", "info", event, safeRuntimeTraceID("browser", c.sessionID), map[string]any{
-			"detail": detail,
-			"video":  true,
-		})
+		// This message is both a lifecycle acknowledgement and a diagnostic.
+		// Stream readiness must not depend on diagnostic persistence capacity.
+		if event == "stream_first_rendered_frame" && !c.firstVideoFrameRendered {
+			c.firstVideoFrameRendered = true
+			s.direct.completeStartupTrace("browser_first_rendered_frame", detailText)
+			s.releaseRelayViewerPublicOpenGrace(c.sessionID, "stream_first_rendered_frame")
+		}
+		now := time.Now()
+		if !c.allowClientLog(now) || !s.allowBrowserClientLog(now) {
+			return
+		}
+		s.direct.recordClientTelemetry(event, detailText)
+		detail["video"] = true
+		s.recordRuntimeEventForSourceAsync("ticket_remote_browser", "info", event, safeRuntimeTraceID("browser", c.sessionID), detail)
 		return
 	case "keyframe", "recover_stream":
 		return
 	default:
 		return
 	}
+}
+
+func (c *client) allowClientLog(now time.Time) bool {
+	c.clientLogMu.Lock()
+	defer c.clientLogMu.Unlock()
+	if c.clientLogWindowStart.IsZero() || now.Sub(c.clientLogWindowStart) >= time.Minute || now.Before(c.clientLogWindowStart) {
+		c.clientLogWindowStart = now
+		c.clientLogCount = 0
+	}
+	if c.clientLogCount >= maxBrowserClientLogsPerMinute {
+		return false
+	}
+	c.clientLogCount++
+	return true
+}
+
+func (s *Server) allowBrowserClientLog(now time.Time) bool {
+	s.browserClientLogMu.Lock()
+	defer s.browserClientLogMu.Unlock()
+	if s.browserClientLogWindow.IsZero() || now.Sub(s.browserClientLogWindow) >= time.Minute || now.Before(s.browserClientLogWindow) {
+		s.browserClientLogWindow = now
+		s.browserClientLogCount = 0
+	}
+	if s.browserClientLogCount >= maxBrowserClientLogsPerMinute {
+		return false
+	}
+	s.browserClientLogCount++
+	return true
 }
 
 func (s *Server) handlePhoneMessage(msg phone.Message) {
@@ -1431,9 +1466,7 @@ func (s *Server) writeStateMutation(w http.ResponseWriter, r *http.Request, acto
 	}
 	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 	s.cacheSnapshot(snapshot)
-	if err := s.store.Audit(r.Context(), s.cfg.TicketID, actor, event, nil, time.Now()); err != nil {
-		s.recordRuntimeErrorAsync("audit_failed", event, err, map[string]any{"event": event})
-	}
+	s.recordAuditAsync(s.cfg.TicketID, actor, event, nil, time.Now())
 	if redirectAdminForm(w, r) {
 		return
 	}

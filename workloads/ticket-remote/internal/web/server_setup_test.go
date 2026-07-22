@@ -83,8 +83,6 @@ func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 		"ticketremote_relay_current_report",
 		"ticketremote_stream_viewer_focus",
 		"ticketremote_control_code_request",
-		"memberAppendSafeOperationalLog",
-		"logRowId(\"browser\",event,correlationId)",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("Spacetime client must use current product table marker %q", snippet)
@@ -96,6 +94,8 @@ func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 		"ticketremote_phone_status",
 		"ticketremote_service_safe_operational_log",
 		"memberAppendDevPerfMetric",
+		"memberAppendSafeOperationalLog",
+		"logRowId(\"browser\",event,correlationId)",
 	} {
 		if staticContains(js, forbidden) {
 			t.Fatalf("Spacetime client still contains removed marker %q", forbidden)
@@ -224,6 +224,29 @@ func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
 	server.removeRelayViewer("session-a")
 	if got := server.relay.Snapshot().Viewers; got != 0 {
 		t.Fatalf("relay viewers after rendered socket closes = %d, want 0", got)
+	}
+}
+
+func TestFirstRenderedFrameReleasesPublicOpenGraceWhenDiagnosticLimitIsFull(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	client := &client{sessionID: "session-a"}
+	now := time.Now()
+	for index := 0; index < maxBrowserClientLogsPerMinute; index++ {
+		if !client.allowClientLog(now) || !server.allowBrowserClientLog(now) {
+			t.Fatalf("could not fill diagnostic limit at event %d", index+1)
+		}
+	}
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
+	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameSequence\":1}"}`))
+
+	if !client.firstVideoFrameRendered {
+		t.Fatal("first rendered frame lifecycle acknowledgement was blocked by diagnostic rate limiting")
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after rate-limited rendered socket closes = %d, want 0", got)
 	}
 }
 

@@ -28,8 +28,14 @@ type CatalogProvider interface {
 	Current() *model.Catalog
 }
 
+type CollectionResult struct {
+	Messages             []model.ChatAnalyzerMessage
+	CheckpointMessageIDs map[string]int64
+	SkippedStale         int
+}
+
 type Collector interface {
-	Collect(ctx context.Context) ([]model.ChatAnalyzerMessage, error)
+	Collect(ctx context.Context) (CollectionResult, error)
 }
 
 type Analyzer interface {
@@ -165,6 +171,7 @@ type Settings struct {
 	DryRun                  bool
 	PollInterval            time.Duration
 	BatchLimit              int
+	MaxMessageAge           time.Duration
 	MinConfidence           float64
 	ProcessStartMinute      int
 	ProcessEndMinute        int
@@ -180,6 +187,7 @@ type Settings struct {
 	RetryMaxDelay           time.Duration
 	ModelFailureLimit       int
 	ModelCircuitOpen        time.Duration
+	BatchStaleAfter         time.Duration
 }
 
 func (s Settings) withDefaults() Settings {
@@ -233,6 +241,9 @@ func (s Settings) withDefaults() Settings {
 	}
 	if s.ModelCircuitOpen <= 0 {
 		s.ModelCircuitOpen = 10 * time.Minute
+	}
+	if s.BatchStaleAfter <= 0 {
+		s.BatchStaleAfter = 15 * time.Minute
 	}
 	return s
 }

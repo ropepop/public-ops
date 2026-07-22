@@ -791,6 +791,7 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time, options heal
 	}
 	var telegramStatus runtime.TelegramStatus
 	var dumpStatus runtime.DumpStatus
+	var chatAnalyzerStatus runtime.ChatAnalyzerStatus
 	startedAt := time.Time{}
 	lastFatalError := ""
 	webEnabled := s.cfg.SatiksmeWebEnabled
@@ -799,6 +800,7 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time, options heal
 	if s.runtimeState != nil {
 		telegramStatus = s.runtimeState.TelegramStatus()
 		dumpStatus = s.runtimeState.DumpStatus()
+		chatAnalyzerStatus = s.runtimeState.ChatAnalyzerStatus()
 		startedAt = s.runtimeState.StartedAt()
 		lastFatalError = s.runtimeState.LastFatalError()
 		webEnabled, webListening, webBindAddr = s.runtimeState.WebStatus()
@@ -839,6 +841,23 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time, options heal
 	}
 	if dumpStatus.Pending > 0 {
 		reasons = append(reasons, "report_dump_pending")
+	}
+	if chatAnalyzerStatus.Enabled {
+		if chatAnalyzerStatus.SessionState == "unchecked" {
+			reasons = append(reasons, "chat_analyzer_unchecked")
+		}
+		if chatAnalyzerStatus.SessionState == "unauthorized" || chatAnalyzerStatus.SessionState == "error" || chatAnalyzerStatus.ConsecutiveCollectErrors > 0 {
+			reasons = append(reasons, "chat_analyzer_collect_error")
+		}
+		if chatAnalyzerStatus.ConsecutiveMaintenanceErrors > 0 {
+			reasons = append(reasons, "chat_analyzer_maintenance_error")
+		}
+		if chatAnalyzerStatus.ConsecutiveProcessErrors > 0 || chatAnalyzerStatus.LastBatchStatus == "failed" {
+			reasons = append(reasons, "chat_analyzer_process_error")
+		}
+		if chatAnalyzerStatus.ModelCircuitOpenUntil.After(now) {
+			reasons = append(reasons, "chat_analyzer_model_circuit_open")
+		}
 	}
 
 	uptimeSeconds := int64(0)
@@ -905,6 +924,35 @@ func (s *Server) healthSnapshot(ctx context.Context, now time.Time, options heal
 			"lastSuccessAt": optionalTimeValue(dumpStatus.LastSuccessAt),
 			"lastAttemptAt": optionalTimeValue(dumpStatus.LastAttemptAt),
 			"lastError":     emptyToNil(dumpStatus.LastError),
+		},
+		"chatAnalyzer": map[string]any{
+			"enabled":                      chatAnalyzerStatus.Enabled,
+			"dryRun":                       chatAnalyzerStatus.DryRun,
+			"sessionState":                 chatAnalyzerStatus.SessionState,
+			"lastCollectAttempt":           optionalTimeValue(chatAnalyzerStatus.LastCollectAttempt),
+			"lastCollectSuccess":           optionalTimeValue(chatAnalyzerStatus.LastCollectSuccess),
+			"lastCollectErrorAt":           optionalTimeValue(chatAnalyzerStatus.LastCollectErrorAt),
+			"consecutiveCollectErrors":     chatAnalyzerStatus.ConsecutiveCollectErrors,
+			"lastCollectedCount":           chatAnalyzerStatus.LastCollectedCount,
+			"lastSkippedStale":             chatAnalyzerStatus.LastSkippedStale,
+			"skippedStaleTotal":            chatAnalyzerStatus.SkippedStaleTotal,
+			"lastExpiredPending":           chatAnalyzerStatus.LastExpiredPending,
+			"expiredPendingTotal":          chatAnalyzerStatus.ExpiredPendingTotal,
+			"lastMaintenanceAttempt":       optionalTimeValue(chatAnalyzerStatus.LastMaintenanceAttempt),
+			"lastMaintenanceSuccess":       optionalTimeValue(chatAnalyzerStatus.LastMaintenanceSuccess),
+			"lastMaintenanceErrorAt":       optionalTimeValue(chatAnalyzerStatus.LastMaintenanceErrorAt),
+			"consecutiveMaintenanceErrors": chatAnalyzerStatus.ConsecutiveMaintenanceErrors,
+			"lastMaintenanceErrorCode":     emptyToNil(chatAnalyzerStatus.LastMaintenanceErrorCode),
+			"lastProcessAttempt":           optionalTimeValue(chatAnalyzerStatus.LastProcessAttempt),
+			"lastProcessSuccess":           optionalTimeValue(chatAnalyzerStatus.LastProcessSuccess),
+			"lastProcessErrorAt":           optionalTimeValue(chatAnalyzerStatus.LastProcessErrorAt),
+			"consecutiveProcessErrors":     chatAnalyzerStatus.ConsecutiveProcessErrors,
+			"lastBatchId":                  emptyToNil(chatAnalyzerStatus.LastBatchID),
+			"lastBatchStatus":              emptyToNil(chatAnalyzerStatus.LastBatchStatus),
+			"selectedModel":                emptyToNil(chatAnalyzerStatus.SelectedModel),
+			"lastErrorCode":                emptyToNil(chatAnalyzerStatus.LastErrorCode),
+			"modelCircuitOpenUntil":        optionalTimeValue(chatAnalyzerStatus.ModelCircuitOpenUntil),
+			"staleBatchesRecovered":        chatAnalyzerStatus.StaleBatchesRecovered,
 		},
 		"db": map[string]any{
 			"writable": dbWritable,

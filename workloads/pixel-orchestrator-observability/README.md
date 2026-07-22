@@ -1,5 +1,12 @@
 # Pixel Orchestrator Observability
 
+> **Deleted legacy source:** the Pixel orchestrator now writes general
+> operational events to the unified `operational-logging-prod` database. The
+> standalone production database was deleted on 2026-07-22 after retained-row
+> parity. Keep this module only for historical regression tests. Do not publish
+> it, enroll writers, or recreate the old destination. New logging work belongs in
+> [`../operational-logging`](../operational-logging/).
+
 This standalone private SpacetimeDB module stores only short-lived, general
 operational events from the Pixel orchestrator. It does not control the phone,
 read Ticket or ChatGPT data, or accept logs, commands, output, paths, network
@@ -21,11 +28,13 @@ addresses, UI text, account identifiers, prompts, ticket digits, or JSON fields.
 - Event rows do not store the authenticated writer identity or another stable
   phone identifier.
 
-The accepted event types are app sessions, manual actions, component
+The retained schema accepts app sessions, manual actions, component
 transitions, health changes, setting changes, cleanup results, scheduling
 failures, permission changes, and dropped-event summaries. Ticket domain events
-remain in the Ticket database. Historical ChatGPT events stay preserved in the
-retired ChatGPT database; this module does not create new ChatGPT events.
+now use the same unified operational event table while Ticket application state
+remains in the Ticket database. Selected retained ChatGPT logging history is
+also archived in the unified event table; this module does not create new
+ChatGPT events.
 
 Cleanup-result events require one of these fixed categories:
 `ticket_hierarchy_xml`, `deployment_action_results`, `support_bundles`,
@@ -45,25 +54,20 @@ make build
 
 `make build` compiles the module without publishing it.
 
-## Intended production setup
+## Retired production setup
 
-The intended private database name is
-`pixel-orchestrator-observability-prod`. Publishing and identity enrollment are
-explicit operator actions:
+The deleted legacy private database name was
+`pixel-orchestrator-observability-prod`. Historical publish and enrollment
+commands are intentionally omitted so this directory cannot be mistaken for a
+recovery instruction. Restore retained rows from the canonical table rather
+than recreating the old logging database.
 
-```bash
-spacetime publish pixel-orchestrator-observability-prod --yes
-spacetime call pixel-orchestrator-observability-prod \
-  pixelorchestrator_set_reporter '"<64-character-phone-identity>"' true
-```
+The Android app now receives `OPERATIONAL_LOGGING_HOST`,
+`OPERATIONAL_LOGGING_DATABASE`, and its authenticated bearer-token path through
+the local-first Pixel configuration workflow. The token must not be written
+into app logs, telemetry, support bundles, or tracked files.
 
-Before publishing under a different Spacetime owner, replace
-`OPERATOR_IDENTITY` in the module and rerun both local checks. The Android app
-must receive the database URL/name and an authenticated phone bearer token
-through the local-first Pixel configuration workflow. The token must not be
-written into app logs, telemetry, support bundles, or tracked files.
-
-## Android reducer call
+## Historical Android reducer call
 
 `pixelorchestrator_append_event` accepts arguments in this order:
 
@@ -72,5 +76,6 @@ correlationId, eventType, component, cleanupCategory, status, result, priority,
 buildId, durationMillis, count, byteCount
 ```
 
-The matching Android client uses this exact ordering and measures its 4 MiB
-in-memory queue from the UTF-8 bytes of the reducer request bodies.
+This ordering is retained only to interpret or verify legacy rows. The active
+Android client uses `operationallog_append_pixel_event` in
+`operational-logging-prod` with the same bounded field order.

@@ -53,7 +53,6 @@ func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 	for _, required := range []string{
 		"const HISTORY_TTL_MS: i64 = 6 * 60 * 60 * 1000;",
 		"const CLEANUP_BATCH_SIZE: u32 = 500;",
-		"const SAFE_LOG_DETAIL_MAX_BYTES: usize = 1024;",
 		"ticketremote_ticket",
 		"ticketremote_ticket_member",
 		"ticketremote_phone_backend",
@@ -76,6 +75,7 @@ func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 		"ticketremote_member_request_control_code",
 		"ticketremote_member_append_safe_operational_log",
 		"ticketremote_append_safe_operational_log",
+		"legacy_operational_log_writer_inactive",
 		"ticketremote_cleanup_expired",
 	} {
 		if !strings.Contains(source, required) {
@@ -90,42 +90,38 @@ func TestSpacetimeBareBonesSchemaKeepsOnlyCurrentProductSurfaces(t *testing.T) {
 	}
 }
 
-func TestSafeOperationalLogsUseBoundedSamplingAndOneRowLookup(t *testing.T) {
+func TestLegacySafeOperationalLogSurfaceCannotWriteAndStillDrains(t *testing.T) {
 	source := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	sidecar := ticketRemoteSourceFile(t, "spacetime-sidecar", "src", "main.rs")
 
 	for _, required := range []string{
-		"ticketremote_append_safe_operational_log(ctx; id: String, ticketId: String, source: String,",
-		"ticketremote_member_append_safe_operational_log(ctx; id: String, ticketId: String,",
-		"detailJson: safe_json_string(detail_json, SAFE_LOG_DETAIL_MAX_BYTES),",
-		"let row_id = safe_log_sample_interval_ms(&level, &event)",
-		"sampled_safe_log_row_id(&ticket.id, &source, &event, now, interval_ms)",
-		"table.id().find(&row_id)",
-		"id: row_id,",
-		"table.insert(TicketremoteSafeOperationalLog",
+		"pub fn ticketremote_append_safe_operational_log(",
+		"pub fn ticketremote_member_append_safe_operational_log(",
+		"legacy_operational_log_writer_inactive",
+		"Legacy compatibility state.",
 	} {
 		if !strings.Contains(source, required) {
-			t.Fatalf("safe log path missing cheap-row marker %q", required)
+			t.Fatalf("legacy safe-log migration surface missing %q", required)
 		}
 	}
-
-	logBody := sourceBetween(t, source, "fn insert_safe_operational_log(", "fn safe_log_row_id(")
 	for _, forbidden := range []string{
-		"next_audit_ordinal",
-		"coalesced_safe_log_detail",
-		".update(",
+		"fn insert_safe_operational_log(",
+		"table.insert(TicketremoteSafeOperationalLog",
+		"fn safe_log_sample_interval_ms(",
 	} {
-		if strings.Contains(logBody, forbidden) {
-			t.Fatalf("safe log insert path must not read/coalesce/update rows: %q", forbidden)
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("Ticket module must not retain a legacy safe-log writer %q", forbidden)
 		}
 	}
 	for _, required := range []string{
-		"fn safe_log_sample_interval_ms(",
-		`"command_queued"`,
-		`"keyframe_requested"`,
-		"Some(60_000)",
+		"const MAX_SAFE_OPERATIONAL_LOG_DETAIL_BYTES: usize = 1024;",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_HOST",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_DATABASE",
+		"operationallog_append_ticket_event",
+		"append_safe_operational_log(app, request)",
 	} {
-		if !strings.Contains(source, required) {
-			t.Fatalf("safe log sampling policy missing %q", required)
+		if !strings.Contains(sidecar, required) {
+			t.Fatalf("central Ticket logging path missing %q", required)
 		}
 	}
 
@@ -175,8 +171,6 @@ func TestSpacetimeBrowserClientSubscribesOnlyCurrentProductTables(t *testing.T) 
 		"SELECT * FROM ticketremote_relay_current_report WHERE id =",
 		"SELECT * FROM ticketremote_control_code_request WHERE ticketId =",
 		"AND ownerPublicId =",
-		"memberAppendSafeOperationalLog",
-		"id: rowId || this.logRowId(\"browser\", event, correlationId)",
 		"publishFocusedState(",
 	} {
 		if !strings.Contains(source, required) {
@@ -193,6 +187,9 @@ func TestSpacetimeBrowserClientSubscribesOnlyCurrentProductTables(t *testing.T) 
 		"ticketremote_service_",
 		"appendDevMetric",
 		"memberAppendDevPerfMetric",
+		"memberAppendSafeOperationalLog",
+		"appendSafeLog(",
+		"logRowId(",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("browser Spacetime client still references removed surface %q", forbidden)
@@ -253,6 +250,30 @@ func TestSpacetimeBrowserInstallsCSPSafeCodecsBeforeBuildingConnection(t *testin
 	}
 }
 
+func TestTicketTraceReadsProductStateAndCentralOperationalRowsSeparately(t *testing.T) {
+	trace := ticketRemoteSourceFile(t, "scripts", "trace-spacetime.sh")
+	for _, required := range []string{
+		"TICKET_REMOTE_SPACETIME_DATABASE",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_HOST",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_DATABASE",
+		"operationallog_event",
+		"domain = 'ticket'",
+		"scopeId = '$ticket_sql'",
+		"LC_ALL=C sort -r",
+		`awk -v limit="$row_limit" 'NR <= limit'`,
+	} {
+		if !strings.Contains(trace, required) {
+			t.Fatalf("Ticket trace script missing central-log marker %q", required)
+		}
+	}
+	if strings.Contains(trace, "FROM ticketremote_safe_operational_log") {
+		t.Fatal("Ticket trace script still queries the legacy Ticket log table")
+	}
+	if strings.Contains(trace, "ORDER BY occurredAt") {
+		t.Fatal("Ticket trace script uses unsupported Maincloud ORDER BY instead of bounded client-side sorting")
+	}
+}
+
 func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 	sidecar := ticketRemoteSourceFile(t, "spacetime-sidecar", "src", "main.rs")
 	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
@@ -265,6 +286,10 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"SELECT * FROM ticketremote_service_ticket_member",
 		"SELECT * FROM ticketremote_service_phone_backend",
 		"SELECT * FROM ticketremote_phone_current_report WHERE id =",
+		"APPEND_TICKET_EVENT_REDUCER",
+		"operationallog_append_ticket_event",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_HOST",
+		"TICKET_REMOTE_OPERATIONAL_LOGGING_DATABASE",
 	} {
 		if !strings.Contains(sidecar, required) {
 			t.Fatalf("sidecar missing current subscription %q", required)
@@ -287,6 +312,7 @@ func TestSidecarAndAdminLogViewerRemoved(t *testing.T) {
 		"ticketremote_service_safe_operational_log",
 		"ticketremote_service_viewer_presence",
 		"ticketremote_service_control_session",
+		"ticketremote_append_safe_operational_log_then",
 	} {
 		if strings.Contains(sidecar, forbidden) {
 			t.Fatalf("sidecar still contains removed log/presence surface %q", forbidden)

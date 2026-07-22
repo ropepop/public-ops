@@ -35,6 +35,12 @@ Production normally uses SpacetimeAuth on the page. Cloudflare Access remains a 
 
 To confirm the newest page is live, compare the page's embedded version with `/api/v1/health` `serverVersion`, then check that response headers are no-store/dynamic instead of a stale cached response.
 
+The sidecar health response also reports the configured central logging host/database and the last central write attempt, success, and error. That section is informational: check it explicitly when validating logging instead of relying only on the top-level Ticket database status.
+
+```bash
+ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T ticket_remote_spacetime_sidecar curl -fsS http://127.0.0.1:9346/healthz' | jq '.operationalLogging'
+```
+
 For phone-stream failures, validate the private phone path before debugging the public page:
 
 ```bash
@@ -44,6 +50,27 @@ ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/rel
 ```
 
 `ticket_phone_bridge` has its own healthcheck and watchdog. It verifies the Pixel is connected over ADB, the exact ADB forward exists, and the forwarded Pixel health endpoint answers. If that check fails while `socat` is still listening, the bridge loop stops the listener, removes the stale ADB forward, reconnects to the Pixel, and starts a fresh listener. Deploy validation checks this bridge directly and also proves that `ticket_remote` can reach the Pixel health endpoint through the private Compose network.
+
+## Operational logging
+
+New Ticket diagnostics share one destination. The browser sends bounded `client_log` messages over its authenticated video WebSocket, `ticket_remote` validates and sanitizes them, `Store.AppendSafeOperationalLog` calls the private sidecar route, and the sidecar invokes `operationallog_append_ticket_event` in `operational-logging-prod`. Server, relay, and audit events use that Store/sidecar path. Pixel ticket diagnostics write the same central reducer directly from the verified Pixel runtime; they do not pass through the Ticket Store or sidecar.
+
+Browser event names come from a fixed 64-name list, per-socket and global admission are capped at 60 messages per minute, and every informational browser event is sampled into a shared minute bucket. Details remain capped at 1 KiB, private keys and private-looking values are removed, and central Ticket rows expire after six hours. Central cleanup removes up to 1,000 expired rows every five minutes, safely above bounded browser ingestion. Browser delivery is intentionally best-effort: the queue waits for an open authenticated video socket, then releases an event after WebSocket send acceptance rather than a database acknowledgement. The server ignores browser-supplied correlation and hashes the authenticated session instead. Audit writes use a separate short asynchronous deadline, so a logging delay cannot hold up a successful Ticket state change.
+
+Run the combined product-state and central-log trace locally with:
+
+```bash
+cd workloads/ticket-remote
+./scripts/trace-spacetime.sh
+```
+
+Maincloud does not support the previous SQL ordering clause. The script keeps
+the time-bounded result in memory, sorts timestamp-first rows locally, and
+prints only `TRACE_LIMIT` rows without creating a temporary file.
+
+The Ticket database's `ticketremote_safe_operational_log` table remains only so old rows can drain and its six-hour cleanup can remove them. Its append reducers explicitly reject old writers and must not be used as a logging fallback.
+
+For a production cutover, publish and verify the central logging module and enroll the sidecar and Pixel identities first. Deploy and verify the central-writing sidecar and rebuilt browser next. Then deploy the central-writer Pixel APK and prove a fresh Pixel Ticket row reached `operational-logging-prod`. Only after that Pixel proof may the Ticket module be published with rejecting legacy reducers. Wait more than six hours before considering removal of the legacy table or cleanup. Publishing the rejecting Ticket module before the Pixel central-writer APK is live creates a logging gap for the old Pixel worker.
 
 ## Cloudflare Access fallback
 

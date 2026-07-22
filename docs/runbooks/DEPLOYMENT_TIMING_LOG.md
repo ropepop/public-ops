@@ -1,96 +1,80 @@
 # Deployment Timing Log
 
-`workloads/deployment-timing` is a standalone SpacetimeDB module for bounded
-timing facts from the local ops and Pixel deployment scripts. It is deliberately
-separate from Ticket Remote so timing diagnostics cannot slow, expand, or
-couple to the live ticket-control path.
+Deployment timing now writes to the canonical private operational logging
+module under `workloads/operational-logging`. The production target is
+`operational-logging-prod`, and all timing rows live in the single private
+`operationallog_event` table alongside other bounded operational domains.
 
-## Publish once
+For module publication, reporter enrollment, privacy checks, migration, and
+legacy-database retirement, follow
+[`OPERATIONAL_LOGGING.md`](./OPERATIONAL_LOGGING.md).
 
-From `workloads/deployment-timing`, after normal source review and local tests:
+## Reporter
 
-```bash
-spacetime publish deployment-timing-prod --yes
-```
-
-This runbook does not authorize publishing as part of a code change. The
-configured ops owner (`OPERATOR_IDENTITY` in the module) is initially the only
-reporter. Before publishing under a different owner, replace that value and
-rerun the local checks. A separate CLI identity can be enrolled later with the
-configured owner identity:
+Use:
 
 ```bash
-spacetime call --server https://maincloud.spacetimedb.com deployment-timing-prod \
-  deploymenttiming_set_reporter '"<identity>"' '"<label>"' true
+workloads/operational-logging/scripts/report-deployment.sh run-start \
+  --run-id "ops-20260722T010203Z" --source ops --action deploy \
+  --release-id "20260722T010203Z" --profile fast --target kitty-gration
+
+workloads/operational-logging/scripts/report-deployment.sh run-complete \
+  --run-id "ops-20260722T010203Z" --source ops --action deploy \
+  --status ok --total-duration-ms 3214 \
+  --release-id "20260722T010203Z" --profile fast --target kitty-gration \
+  --phase-bundle "upload_release=ok=812=1654@health=ok=1560=3214"
 ```
 
-`<identity>` must be the 64-character Spacetime identity used by the deploy
-script's CLI root. Keep its authentication token in the CLI root or secret
-store, never in this module, a shell argument, or a timing row.
+The phase bundle contains at most 64 entries in this format:
 
-## Add reporting without changing deployment behavior
+```text
+phase=status=durationMillis=totalDurationMillis@...
+```
 
-The reporter is intentionally detached by default. It never receives command
-output, and callers should not wait for it on a normal deployment path. Use a
-detached `run-start` once, retain phase timings locally, then send one detached
-`run-complete` batch from the caller's exit path:
+Use `--phase-bundle -` when no phase completed. The completion reducer validates
+the full bundle, then atomically appends every phase row and the finished run.
+
+The repo deployment script measures phases with a monotonic millisecond clock
+when Python is available, then launches the reporter outside the deployment's
+critical path. Reporter failures never change deployment success or failure.
+The reporter never receives terminal output, command errors, credentials,
+control codes, or customer data.
+
+## Configuration
+
+- `OPERATIONAL_LOGGING_DATABASE` defaults to `operational-logging-prod`.
+- `OPERATIONAL_LOGGING_HOST` defaults to Maincloud.
+- `OPERATIONAL_LOGGING_SPACETIME_BIN` defaults to `spacetime`.
+- `OPERATIONAL_LOGGING_SPACETIME_ROOT` selects an optional isolated CLI root.
+- `OPERATIONAL_LOGGING_RETRY_ATTEMPTS` defaults to 7 and is bounded to 1–10.
+- `OPERATIONAL_LOGGING_RETRY_BASE_DELAY_SECONDS` defaults to 1 and is bounded to
+  0–30.
+- `OPERATIONAL_LOGGING_PYTHON_BIN` optionally selects the Python executable used by
+  the repo deploy wrapper.
+
+Use `--wait --strict` only for reporter diagnostics. Normal deployment remains
+best-effort and detached.
+
+## Query deployment rows
+
+The database owner can query the unified table:
 
 ```bash
-workloads/deployment-timing/scripts/report.sh run-start \
-  --run-id "$RUN_ID" --source ops --action deploy \
-  --release-id "$ARBUZAS_RELEASE_ID" --profile "$VALIDATION_PROFILE" \
-  --target kitty-gration
-
-workloads/deployment-timing/scripts/report.sh run-complete \
-  --run-id "$RUN_ID" --source ops --action deploy \
-  --status ok --total-duration-ms "$TOTAL_MS" \
-  --release-id "$ARBUZAS_RELEASE_ID" --profile "$VALIDATION_PROFILE" \
-  --target kitty-gration \
-  --phase-bundle "upload_release=ok=${PHASE_MS}=1654@health=ok=1560=${TOTAL_MS}"
+spacetime sql --server https://maincloud.spacetimedb.com operational-logging-prod \
+  "SELECT * FROM operationallog_event WHERE domain = 'deployment';"
 ```
 
-Each phase entry is `phase=status=durationMillis=totalDurationMillis`; join at
-most 64 entries with `@`, or use `--phase-bundle -` if no phase finished. The
-reducer validates the entire bundle and appends all missing private phase rows
-plus the `finished` run row in one transaction. A retry with the same run and
-phase totals is idempotent. `phase` and `run-finish` remain accepted for older
-callers, but new callers should not send their tail as separate asynchronous
-calls.
+Deployment rows use:
 
-Use the same command shape for Pixel, changing `--source pixel`, `--action`,
-and `--target`. Do not add reporting to a script until its timing identifiers
-are known to be non-secret.
+- `recordType = 'run'` with `event = 'started'` or `event = 'finished'`.
+- `recordType = 'phase'` with the phase name in `event`.
+- `correlationId` for the run ID.
+- `scopeId` for the release ID.
+- `component` for the target.
+- `operation` for `deploy`, `validate`, `deploy-config`, or `rollback`.
+- `durationMillis` and `totalDurationMillis` for timing measurements.
 
-The caller's reporting wrapper must preserve the deployment result: it sends a
-detached start and a detached completion batch for success, failure, or
-cancellation, while reporter errors never change the deployment command's
-result. The detached worker retries a failed idempotent call with bounded
-backoff, covering temporary throttling without adding to deployment time. The
-phase and total durations use the caller's existing clock, so they remain
-directly comparable with deployment log lines.
-
-For a reporter-only diagnostic, make the error visible without changing the
-normal default:
-
-```bash
-workloads/deployment-timing/scripts/report.sh run-start --wait --strict \
-  --run-id test-run-1 --source ops --action deploy --target kitty-gration
-```
-
-## Verify retention and rows
-
-The module writes private append-only tables. Query using the database owner or
-an authorized operational identity:
-
-```bash
-spacetime sql --server https://maincloud.spacetimedb.com deployment-timing-prod \
-  "SELECT id, runId, source, action, lifecycle, status, totalDurationMillis, occurredAt, expiresAt FROM deploymenttiming_run LIMIT 20;"
-
-spacetime sql --server https://maincloud.spacetimedb.com deployment-timing-prod \
-  "SELECT id, runId, phase, status, durationMillis, totalDurationMillis, occurredAt, expiresAt FROM deploymenttiming_phase LIMIT 50;"
-```
-
-`deploymenttiming_retention_schedule` runs once per hour and deletes at most
-1,000 expired rows across the two event tables per invocation. Each event has a
-30-day expiry calculated by the database clock. A temporary backlog therefore
-drains predictably without a large cleanup transaction.
+All deployment rows use retention class `deployment_30d`. Indexed cleanup runs
+every five minutes and removes up to 1,000 expired rows per run. With no
+backlog, final deletion can lag the 30-day timestamp by up to five minutes;
+larger backlogs drain over subsequent runs.

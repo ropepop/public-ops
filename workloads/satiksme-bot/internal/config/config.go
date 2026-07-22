@@ -61,6 +61,7 @@ type Config struct {
 	SatiksmeChatAnalyzerChatID                string
 	SatiksmeChatAnalyzerPollInterval          time.Duration
 	SatiksmeChatAnalyzerBatchLimit            int
+	SatiksmeChatAnalyzerMaxMessageAge         time.Duration
 	SatiksmeChatAnalyzerMinConfidence         float64
 	SatiksmeChatAnalyzerDryRun                bool
 	SatiksmeChatAnalyzerProcessStartMinute    int
@@ -225,7 +226,11 @@ func loadCommon() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	chatAnalyzerAPIID, err := envOrIntStrict("SATIKSME_CHAT_ANALYZER_API_ID", 0)
+	chatAnalyzerAPIID, err := envOrSecretIntStrict("SATIKSME_CHAT_ANALYZER_API_ID", "SATIKSME_CHAT_ANALYZER_API_ID_FILE", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	chatAnalyzerAPIHash, err := envOrSecretFile("SATIKSME_CHAT_ANALYZER_API_HASH", "SATIKSME_CHAT_ANALYZER_API_HASH_FILE", "")
 	if err != nil {
 		return Config{}, err
 	}
@@ -234,6 +239,10 @@ func loadCommon() (Config, error) {
 		return Config{}, err
 	}
 	chatAnalyzerBatchLimit, err := envOrIntStrict("SATIKSME_CHAT_ANALYZER_BATCH_LIMIT", 250)
+	if err != nil {
+		return Config{}, err
+	}
+	chatAnalyzerMaxMessageAge, err := envOrDurationStrict("SATIKSME_CHAT_ANALYZER_MAX_MESSAGE_AGE", 24*time.Hour)
 	if err != nil {
 		return Config{}, err
 	}
@@ -284,7 +293,7 @@ func loadCommon() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	chatAnalyzerModelCallDelay, err := envOrDurationStrict("SATIKSME_CHAT_ANALYZER_MODEL_CALL_DELAY", 0)
+	chatAnalyzerModelCallDelay, err := envOrDurationStrict("SATIKSME_CHAT_ANALYZER_MODEL_CALL_DELAY", 5*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -296,8 +305,14 @@ func loadCommon() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	chatAnalyzerGoogleAPIKey := strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY", ""))
-	chatAnalyzerModelAPIKey := strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_MODEL_API_KEY", ""))
+	chatAnalyzerGoogleAPIKey, err := envOrSecretFile("SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY", "SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE", "")
+	if err != nil {
+		return Config{}, err
+	}
+	chatAnalyzerModelAPIKey, err := envOrSecretFile("SATIKSME_CHAT_ANALYZER_MODEL_API_KEY", "SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE", "")
+	if err != nil {
+		return Config{}, err
+	}
 	if chatAnalyzerModelProvider == "google" && chatAnalyzerModelAPIKey == "" {
 		chatAnalyzerModelAPIKey = chatAnalyzerGoogleAPIKey
 	}
@@ -356,11 +371,12 @@ func loadCommon() (Config, error) {
 		SatiksmeLiveTransportPollMaxUnchangedSec:  liveTransportPollMaxUnchangedSec,
 		SatiksmeChatAnalyzerEnabled:               chatAnalyzerEnabled,
 		SatiksmeChatAnalyzerAPIID:                 chatAnalyzerAPIID,
-		SatiksmeChatAnalyzerAPIHash:               strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_API_HASH", "")),
+		SatiksmeChatAnalyzerAPIHash:               chatAnalyzerAPIHash,
 		SatiksmeChatAnalyzerSessionFile:           strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_SESSION_FILE", "./state/chat-analyzer.session")),
 		SatiksmeChatAnalyzerChatID:                strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_CHAT_ID", "")),
 		SatiksmeChatAnalyzerPollInterval:          chatAnalyzerPollInterval,
 		SatiksmeChatAnalyzerBatchLimit:            chatAnalyzerBatchLimit,
+		SatiksmeChatAnalyzerMaxMessageAge:         chatAnalyzerMaxMessageAge,
 		SatiksmeChatAnalyzerMinConfidence:         chatAnalyzerMinConfidence,
 		SatiksmeChatAnalyzerDryRun:                chatAnalyzerDryRun,
 		SatiksmeChatAnalyzerProcessStartMinute:    chatAnalyzerProcessStart,
@@ -373,7 +389,7 @@ func loadCommon() (Config, error) {
 		SatiksmeChatAnalyzerGoogleAPIKey:          chatAnalyzerGoogleAPIKey,
 		SatiksmeChatAnalyzerGoogleModelAuto:       chatAnalyzerGoogleModelAuto,
 		SatiksmeChatAnalyzerGoogleModelsURL:       strings.TrimRight(strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_GOOGLE_MODELS_URL", "https://generativelanguage.googleapis.com/v1beta/models")), "/"),
-		SatiksmeChatAnalyzerGoogleModelPolicy:     strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_GOOGLE_MODEL_POLICY", "free_rpd_parameter")),
+		SatiksmeChatAnalyzerGoogleModelPolicy:     strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_GOOGLE_MODEL_POLICY", "gemma_parameter")),
 		SatiksmeChatAnalyzerModelTimeout:          chatAnalyzerModelTimeout,
 		SatiksmeChatAnalyzerModelNativeOllama:     chatAnalyzerModelNativeOllama,
 		SatiksmeChatAnalyzerModelCallDelay:        chatAnalyzerModelCallDelay,
@@ -439,6 +455,9 @@ func loadCommon() (Config, error) {
 	if cfg.SatiksmeChatAnalyzerPollInterval <= 0 {
 		return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_POLL_INTERVAL must be positive")
 	}
+	if cfg.SatiksmeChatAnalyzerMaxMessageAge <= 0 {
+		return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_MAX_MESSAGE_AGE must be positive")
+	}
 	if cfg.SatiksmeChatAnalyzerProcessInterval <= 0 {
 		return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_PROCESS_INTERVAL must be positive")
 	}
@@ -480,10 +499,10 @@ func loadCommon() (Config, error) {
 	}
 	if cfg.SatiksmeChatAnalyzerEnabled {
 		if cfg.SatiksmeChatAnalyzerAPIID <= 0 {
-			return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_API_ID is required when SATIKSME_CHAT_ANALYZER_ENABLED=true")
+			return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_API_ID or SATIKSME_CHAT_ANALYZER_API_ID_FILE is required when SATIKSME_CHAT_ANALYZER_ENABLED=true")
 		}
 		if cfg.SatiksmeChatAnalyzerAPIHash == "" {
-			return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_API_HASH is required when SATIKSME_CHAT_ANALYZER_ENABLED=true")
+			return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_API_HASH or SATIKSME_CHAT_ANALYZER_API_HASH_FILE is required when SATIKSME_CHAT_ANALYZER_ENABLED=true")
 		}
 		if cfg.SatiksmeChatAnalyzerSessionFile == "" {
 			return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_SESSION_FILE is required when SATIKSME_CHAT_ANALYZER_ENABLED=true")
@@ -499,7 +518,7 @@ func loadCommon() (Config, error) {
 		}
 		if cfg.SatiksmeChatAnalyzerModelProvider == "google" {
 			if cfg.SatiksmeChatAnalyzerModelAPIKey == "" {
-				return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY or SATIKSME_CHAT_ANALYZER_MODEL_API_KEY is required when SATIKSME_CHAT_ANALYZER_ENABLED=true and provider is google")
+				return Config{}, fmt.Errorf("a Google analyzer API key environment value or private key file is required when SATIKSME_CHAT_ANALYZER_ENABLED=true and provider is google")
 			}
 			if cfg.SatiksmeChatAnalyzerGoogleModelAuto && cfg.SatiksmeChatAnalyzerGoogleModelsURL == "" {
 				return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_GOOGLE_MODELS_URL is required when Google model auto-selection is enabled")
@@ -622,6 +641,50 @@ func envOrIntStrict(key string, fallback int) (int, error) {
 		return n, nil
 	}
 	return fallback, nil
+}
+
+func envOrSecretFile(key, fileKey, fallback string) (string, error) {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value, nil
+	}
+	path := strings.TrimSpace(os.Getenv(fileKey))
+	if path == "" {
+		return fallback, nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileKey, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s must point to a regular file", fileKey)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("%s must not be readable or writable by group or others", fileKey)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileKey, err)
+	}
+	value := strings.TrimSpace(string(body))
+	if value == "" {
+		return "", fmt.Errorf("%s is empty", fileKey)
+	}
+	return value, nil
+}
+
+func envOrSecretIntStrict(key, fileKey string, fallback int) (int, error) {
+	value, err := envOrSecretFile(key, fileKey, "")
+	if err != nil {
+		return 0, err
+	}
+	if value == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s or %s must contain an integer", key, fileKey)
+	}
+	return n, nil
 }
 
 func envOrFloatStrict(key string, fallback float64) (float64, error) {

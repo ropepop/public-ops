@@ -920,6 +920,23 @@ func (s *SQLiteStore) MarkChatAnalyzerMessageProcessedInBatch(ctx context.Contex
 	return err
 }
 
+func (s *SQLiteStore) ExpireStaleChatAnalyzerMessages(ctx context.Context, messageDateBefore, processedAt time.Time, analysisJSON string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE chat_analyzer_messages
+		SET status = ?,
+		    attempts = attempts + 1,
+		    analysis_json = ?,
+		    last_error = '',
+		    processed_at = ?
+		WHERE status = ? AND message_date < ?
+	`, string(model.ChatAnalyzerMessageIgnored), strings.TrimSpace(analysisJSON), processedAt.UTC().Format(time.RFC3339), string(model.ChatAnalyzerMessagePending), messageDateBefore.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	updated, err := res.RowsAffected()
+	return int(updated), err
+}
+
 func (s *SQLiteStore) SaveChatAnalyzerBatch(ctx context.Context, batch model.ChatAnalyzerBatch) error {
 	status := strings.TrimSpace(string(batch.Status))
 	if status == "" {
@@ -949,6 +966,91 @@ func (s *SQLiteStore) SaveChatAnalyzerBatch(ctx context.Context, batch model.Cha
 			last_error = excluded.last_error
 	`, strings.TrimSpace(batch.ID), status, boolToInt(batch.DryRun), batch.StartedAt.UTC().Format(time.RFC3339), formatOptionalTime(batch.FinishedAt), batch.MessageCount, batch.ReportCount, batch.VoteCount, batch.IgnoredCount, batch.WouldApply, batch.AppliedCount, batch.ErrorCount, strings.TrimSpace(batch.Model), strings.TrimSpace(batch.SelectedModel), batch.ResultJSON, batch.Error)
 	return err
+}
+
+func (s *SQLiteStore) FinalizeChatAnalyzerBatch(ctx context.Context, batch model.ChatAnalyzerBatch, outcomes []ChatAnalyzerMessageOutcome) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	for _, outcome := range outcomes {
+		status := outcome.Status
+		if status == "" {
+			status = model.ChatAnalyzerMessageFailed
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE chat_analyzer_messages
+			SET status = ?,
+			    attempts = attempts + 1,
+			    analysis_json = ?,
+			    applied_action_id = ?,
+			    applied_target_key = ?,
+			    batch_id = ?,
+			    last_error = ?,
+			    processed_at = ?
+			WHERE id = ?
+		`, string(status), strings.TrimSpace(outcome.AnalysisJSON), strings.TrimSpace(outcome.AppliedActionID), strings.TrimSpace(outcome.AppliedTargetKey), strings.TrimSpace(outcome.BatchID), strings.TrimSpace(outcome.LastError), outcome.ProcessedAt.UTC().Format(time.RFC3339), strings.TrimSpace(outcome.ID))
+		if err != nil {
+			return rollback(err)
+		}
+		updated, err := res.RowsAffected()
+		if err != nil {
+			return rollback(err)
+		}
+		if updated != 1 {
+			return rollback(fmt.Errorf("chat analyzer message outcome target was not found"))
+		}
+	}
+	status := strings.TrimSpace(string(batch.Status))
+	if status == "" {
+		status = string(model.ChatAnalyzerBatchRunning)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO chat_analyzer_batches(
+			id, status, dry_run, started_at, finished_at, message_count, report_count, vote_count,
+			ignored_count, would_apply_count, applied_count, error_count, model, selected_model, result_json, last_error
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			dry_run = excluded.dry_run,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			message_count = excluded.message_count,
+			report_count = excluded.report_count,
+			vote_count = excluded.vote_count,
+			ignored_count = excluded.ignored_count,
+			would_apply_count = excluded.would_apply_count,
+			applied_count = excluded.applied_count,
+			error_count = excluded.error_count,
+			model = excluded.model,
+			selected_model = excluded.selected_model,
+			result_json = excluded.result_json,
+			last_error = excluded.last_error
+	`, strings.TrimSpace(batch.ID), status, boolToInt(batch.DryRun), batch.StartedAt.UTC().Format(time.RFC3339), formatOptionalTime(batch.FinishedAt), batch.MessageCount, batch.ReportCount, batch.VoteCount, batch.IgnoredCount, batch.WouldApply, batch.AppliedCount, batch.ErrorCount, strings.TrimSpace(batch.Model), strings.TrimSpace(batch.SelectedModel), batch.ResultJSON, batch.Error); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) FailStaleChatAnalyzerBatches(ctx context.Context, startedBefore, finishedAt time.Time, reason string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE chat_analyzer_batches
+		SET status = ?,
+		    finished_at = ?,
+		    error_count = CASE WHEN error_count > 0 THEN error_count ELSE message_count END,
+		    last_error = ?
+		WHERE status = ? AND started_at <= ?
+	`, string(model.ChatAnalyzerBatchFailed), finishedAt.UTC().Format(time.RFC3339), strings.TrimSpace(reason), string(model.ChatAnalyzerBatchRunning), startedBefore.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	updated, err := res.RowsAffected()
+	return int(updated), err
 }
 
 func (s *SQLiteStore) CountChatAnalyzerMessagesBySenderSince(ctx context.Context, chatID string, senderID int64, since time.Time) (int, error) {

@@ -3,6 +3,7 @@ package chatanalyzer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -10,36 +11,41 @@ import (
 
 	"satiksmebot/internal/model"
 	"satiksmebot/internal/reports"
+	"satiksmebot/internal/runtime"
 	"satiksmebot/internal/store"
 )
 
 type Service struct {
-	settings    Settings
-	store       store.ChatAnalyzerStore
-	collector   Collector
-	analyzer    BatchAnalyzer
-	catalog     CatalogProvider
-	reports     *reports.Service
-	dump        ReportDumper
-	liveFetcher LiveVehicleFetcher
-	incidents   ActiveIncidentFetcher
-	now         func() time.Time
+	settings     Settings
+	store        store.ChatAnalyzerStore
+	collector    Collector
+	analyzer     BatchAnalyzer
+	catalog      CatalogProvider
+	reports      *reports.Service
+	dump         ReportDumper
+	liveFetcher  LiveVehicleFetcher
+	incidents    ActiveIncidentFetcher
+	now          func() time.Time
+	runtimeState *runtime.State
 
 	consecutiveModelFailures int
 	modelCircuitOpenUntil    time.Time
+	lastStaleRecoveryAt      time.Time
+	staleBatchesRecovered    int
 }
 
 type ServiceOptions struct {
-	Settings    Settings
-	Store       store.ChatAnalyzerStore
-	Collector   Collector
-	Analyzer    BatchAnalyzer
-	Catalog     CatalogProvider
-	Reports     *reports.Service
-	Dump        ReportDumper
-	LiveFetcher LiveVehicleFetcher
-	Incidents   ActiveIncidentFetcher
-	Now         func() time.Time
+	Settings     Settings
+	Store        store.ChatAnalyzerStore
+	Collector    Collector
+	Analyzer     BatchAnalyzer
+	Catalog      CatalogProvider
+	Reports      *reports.Service
+	Dump         ReportDumper
+	LiveFetcher  LiveVehicleFetcher
+	Incidents    ActiveIncidentFetcher
+	Now          func() time.Time
+	RuntimeState *runtime.State
 }
 
 type RunOnceResult struct {
@@ -55,16 +61,17 @@ func NewService(opts ServiceOptions) *Service {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
-		settings:    opts.Settings.withDefaults(),
-		store:       opts.Store,
-		collector:   opts.Collector,
-		analyzer:    opts.Analyzer,
-		catalog:     opts.Catalog,
-		reports:     opts.Reports,
-		dump:        opts.Dump,
-		liveFetcher: opts.LiveFetcher,
-		incidents:   opts.Incidents,
-		now:         now,
+		settings:     opts.Settings.withDefaults(),
+		store:        opts.Store,
+		collector:    opts.Collector,
+		analyzer:     opts.Analyzer,
+		catalog:      opts.Catalog,
+		reports:      opts.Reports,
+		dump:         opts.Dump,
+		liveFetcher:  opts.LiveFetcher,
+		incidents:    opts.Incidents,
+		now:          now,
+		runtimeState: opts.RuntimeState,
 	}
 }
 
@@ -74,6 +81,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if s.store == nil || s.collector == nil || s.analyzer == nil || s.catalog == nil || s.reports == nil {
 		return fmt.Errorf("chat analyzer is enabled but not fully configured")
+	}
+	if err := s.recoverStaleBatches(ctx); err != nil {
+		log.Printf("satiksme chat analyzer initial stale batch recovery failed: %v", err)
 	}
 	nextCollect := time.Time{}
 	nextProcess := nextScheduledProcessAt(s.now().UTC(), s.settings)
@@ -86,6 +96,9 @@ func (s *Service) Run(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 			now := s.now().UTC()
+			if err := s.recoverStaleBatches(ctx); err != nil {
+				log.Printf("satiksme chat analyzer stale batch recovery failed: %v", err)
+			}
 			if !now.Before(nextCollect) {
 				collected, err := s.collectNewMessages(ctx)
 				if err != nil {
@@ -126,6 +139,9 @@ func (s *Service) RunOnce(ctx context.Context) error {
 }
 
 func (s *Service) RunOnceWithResult(ctx context.Context) (RunOnceResult, error) {
+	if err := s.recoverStaleBatches(ctx); err != nil {
+		return RunOnceResult{}, err
+	}
 	collected, err := s.collectNewMessages(ctx)
 	if err != nil {
 		return RunOnceResult{}, err
@@ -140,38 +156,76 @@ func (s *Service) RunOnceWithResult(ctx context.Context) (RunOnceResult, error) 
 }
 
 func (s *Service) collectNewMessages(ctx context.Context) (int, error) {
-	collected, err := s.collector.Collect(ctx)
+	attemptAt := s.now().UTC()
+	result, err := s.collector.Collect(ctx)
 	if err != nil {
+		if s.runtimeState != nil {
+			s.runtimeState.RecordChatAnalyzerCollection(attemptAt, 0, 0, collectorSessionState(err), analyzerErrorCode(err))
+		}
 		return 0, fmt.Errorf("collect telegram chat: %w", err)
 	}
-	collectedMax := make(map[string]int64)
-	for _, item := range collected {
+	checkpointMax := make(map[string]int64, len(result.CheckpointMessageIDs))
+	for chatID, messageID := range result.CheckpointMessageIDs {
+		if cleanChatID := strings.TrimSpace(chatID); cleanChatID != "" && messageID > 0 {
+			checkpointMax[cleanChatID] = messageID
+		}
+	}
+	for _, item := range result.Messages {
 		if _, err := s.store.EnqueueChatAnalyzerMessage(ctx, item); err != nil {
-			return 0, fmt.Errorf("enqueue telegram chat message %s: %w", item.ID, err)
+			if s.runtimeState != nil {
+				s.runtimeState.RecordChatAnalyzerCollection(attemptAt, 0, 0, "authorized", "storage_failed")
+			}
+			return 0, fmt.Errorf("enqueue Telegram chat message: %w", err)
 		}
-		if item.MessageID > collectedMax[item.ChatID] {
-			collectedMax[item.ChatID] = item.MessageID
+		if item.MessageID > checkpointMax[item.ChatID] {
+			checkpointMax[item.ChatID] = item.MessageID
 		}
 	}
-	for chatID, messageID := range collectedMax {
+	for chatID, messageID := range checkpointMax {
 		if err := s.store.SetChatAnalyzerCheckpoint(ctx, chatID, messageID, s.now().UTC()); err != nil {
-			return 0, fmt.Errorf("advance telegram chat checkpoint %s: %w", chatID, err)
+			if s.runtimeState != nil {
+				s.runtimeState.RecordChatAnalyzerCollection(attemptAt, 0, 0, "authorized", "storage_failed")
+			}
+			return 0, fmt.Errorf("advance Telegram chat checkpoint: %w", err)
 		}
 	}
-	return len(collected), nil
+	if result.SkippedStale > 0 {
+		log.Printf("satiksme chat analyzer skipped %d stale Telegram message(s)", result.SkippedStale)
+	}
+	if s.runtimeState != nil {
+		s.runtimeState.RecordChatAnalyzerCollection(attemptAt, len(result.Messages), result.SkippedStale, "authorized", "")
+	}
+	return len(result.Messages), nil
 }
 
 func (s *Service) processPendingBatch(ctx context.Context) (bool, time.Time, *model.ChatAnalyzerBatch, error) {
+	now := s.now().UTC()
+	if s.settings.MaxMessageAge > 0 {
+		analysisJSON := batchOutcomeJSON("", "ignored", "message exceeded processing age limit", nil)
+		expired, err := s.expireStalePendingMessages(ctx, now.Add(-s.settings.MaxMessageAge), now, analysisJSON)
+		if err != nil {
+			s.recordMaintenance(now, "pending_expiry_failed")
+			return false, time.Time{}, nil, fmt.Errorf("expire stale pending telegram chat messages: %w", err)
+		}
+		if s.runtimeState != nil {
+			s.runtimeState.RecordChatAnalyzerExpiredPending(expired)
+		}
+		if expired > 0 {
+			log.Printf("satiksme chat analyzer expired %d stale pending message(s)", expired)
+		}
+	}
 	pending, err := s.store.ListPendingChatAnalyzerMessages(ctx, s.settings.BatchLimit)
 	if err != nil {
+		s.recordMaintenance(now, "pending_list_failed")
 		return false, time.Time{}, nil, fmt.Errorf("list pending telegram chat messages: %w", err)
 	}
 	if len(pending) == 0 {
+		s.recordMaintenance(now, "")
 		return false, time.Time{}, nil, nil
 	}
 
-	now := s.now().UTC()
 	if s.modelCircuitOpenUntil.After(now) {
+		s.recordMaintenance(now, "")
 		return false, s.modelCircuitOpenUntil, nil, nil
 	}
 	ready := make([]model.ChatAnalyzerMessage, 0, len(pending))
@@ -188,6 +242,7 @@ func (s *Service) processPendingBatch(ctx context.Context) (bool, time.Time, *mo
 		}
 	}
 	if len(ready) == 0 {
+		s.recordMaintenance(now, "")
 		return false, nextRetry, nil, nil
 	}
 
@@ -195,11 +250,23 @@ func (s *Service) processPendingBatch(ctx context.Context) (bool, time.Time, *mo
 	vehicles := s.fetchLiveVehicles(ctx, catalog, now)
 	incidents, err := s.activeIncidents(ctx, catalog, now)
 	if err != nil {
+		s.recordMaintenance(now, "incident_load_failed")
 		return false, time.Time{}, nil, fmt.Errorf("load incident candidates: %w", err)
 	}
+	s.recordMaintenance(now, "")
 	batch, err := s.processBatch(ctx, catalog, vehicles, incidents, ready, now)
 	if err != nil {
+		if s.runtimeState != nil {
+			s.runtimeState.RecordChatAnalyzerProcess(s.now().UTC(), batch.ID, "failed", batch.SelectedModel, analyzerErrorCode(err), s.modelCircuitOpenUntil)
+		}
 		return false, time.Time{}, nil, err
+	}
+	if s.runtimeState != nil {
+		errorCode := ""
+		if batch.Status == model.ChatAnalyzerBatchFailed {
+			errorCode = analyzerErrorCodeText(batch.Error)
+		}
+		s.runtimeState.RecordChatAnalyzerProcess(batch.FinishedAt, batch.ID, string(batch.Status), batch.SelectedModel, errorCode, s.modelCircuitOpenUntil)
 	}
 	return true, time.Time{}, &batch, nil
 }
@@ -249,9 +316,29 @@ func (s *Service) processBatch(ctx context.Context, catalog *model.Catalog, vehi
 		MessageCount: len(messages),
 		Model:        s.modelName(),
 	}
-	if err := s.store.SaveChatAnalyzerBatch(ctx, batch); err != nil {
-		return model.ChatAnalyzerBatch{}, fmt.Errorf("save chat analyzer batch start: %w", err)
+	_, canRecoverRunningBatch := s.store.(store.ChatAnalyzerBatchRecoveryStore)
+	if canRecoverRunningBatch {
+		if err := s.store.SaveChatAnalyzerBatch(ctx, batch); err != nil {
+			return model.ChatAnalyzerBatch{}, fmt.Errorf("save chat analyzer batch start: %w", err)
+		}
 	}
+	terminalSaved := false
+	defer func() {
+		if terminalSaved {
+			return
+		}
+		batch.Status = model.ChatAnalyzerBatchFailed
+		batch.FinishedAt = s.now().UTC()
+		if batch.Error == "" {
+			batch.Error = "interrupted before completion"
+		}
+		if batch.ErrorCount == 0 {
+			batch.ErrorCount = len(messages)
+		}
+		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		_ = s.store.SaveChatAnalyzerBatch(saveCtx, batch)
+	}()
 
 	stopDirectory := BuildStopDirectory(catalog)
 	items := make([]BatchItem, 0, len(messages))
@@ -269,12 +356,20 @@ func (s *Service) processBatch(ctx context.Context, catalog *model.Catalog, vehi
 		batch.FinishedAt = s.now().UTC()
 		batch.Error = err.Error()
 		batch.ErrorCount = len(messages)
-		_ = s.store.SaveChatAnalyzerBatch(ctx, batch)
+		messageOutcomes := make([]store.ChatAnalyzerMessageOutcome, 0, len(messages))
 		for _, item := range messages {
-			if markErr := s.mark(ctx, item.ID, model.ChatAnalyzerMessagePending, "", "", "", batchID, err.Error(), batch.FinishedAt); markErr != nil {
-				log.Printf("satiksme chat analyzer mark failed after batch model error for %s: %v", item.ID, markErr)
-			}
+			messageOutcomes = append(messageOutcomes, store.ChatAnalyzerMessageOutcome{
+				ID:          item.ID,
+				Status:      model.ChatAnalyzerMessagePending,
+				BatchID:     batchID,
+				LastError:   err.Error(),
+				ProcessedAt: batch.FinishedAt,
+			})
 		}
+		if finalizeErr := s.finalizeBatch(ctx, batch, messageOutcomes); finalizeErr != nil {
+			return batch, fmt.Errorf("finalize failed chat analyzer batch: %w", finalizeErr)
+		}
+		terminalSaved = true
 		return batch, nil
 	}
 	s.resetModelFailures()
@@ -318,9 +413,7 @@ func (s *Service) processBatch(ctx context.Context, catalog *model.Catalog, vehi
 	batch.ErrorCount = stats.errors
 	batch.Status = model.ChatAnalyzerBatchCompleted
 	batch.FinishedAt = s.now().UTC()
-	if err := s.store.SaveChatAnalyzerBatch(ctx, batch); err != nil {
-		return model.ChatAnalyzerBatch{}, fmt.Errorf("save chat analyzer batch result: %w", err)
-	}
+	messageOutcomes := make([]store.ChatAnalyzerMessageOutcome, 0, len(messages))
 	for _, item := range messages {
 		outcome, ok := outcomes[item.MessageID]
 		if !ok {
@@ -330,11 +423,166 @@ func (s *Service) processBatch(ctx context.Context, catalog *model.Catalog, vehi
 				lastError:    "model returned no decision",
 			}
 		}
-		if err := s.mark(ctx, item.ID, outcome.status, outcome.analysisJSON, outcome.appliedActionID, outcome.appliedTargetKey, batchID, outcome.lastError, batch.FinishedAt); err != nil {
-			return model.ChatAnalyzerBatch{}, fmt.Errorf("mark chat analyzer message %s: %w", item.ID, err)
+		messageOutcomes = append(messageOutcomes, store.ChatAnalyzerMessageOutcome{
+			ID:               item.ID,
+			Status:           outcome.status,
+			AnalysisJSON:     outcome.analysisJSON,
+			AppliedActionID:  outcome.appliedActionID,
+			AppliedTargetKey: outcome.appliedTargetKey,
+			BatchID:          batchID,
+			LastError:        outcome.lastError,
+			ProcessedAt:      batch.FinishedAt,
+		})
+	}
+	if err := s.finalizeBatch(ctx, batch, messageOutcomes); err != nil {
+		return batch, fmt.Errorf("finalize completed chat analyzer batch: %w", err)
+	}
+	terminalSaved = true
+	return batch, nil
+}
+
+func (s *Service) finalizeBatch(ctx context.Context, batch model.ChatAnalyzerBatch, outcomes []store.ChatAnalyzerMessageOutcome) error {
+	if finalizer, ok := s.store.(store.ChatAnalyzerBatchFinalizer); ok {
+		return finalizer.FinalizeChatAnalyzerBatch(ctx, batch, outcomes)
+	}
+	// Older stores do not expose a multi-row transaction. Persist every message
+	// outcome first, then the terminal batch record. This ordering can leave a
+	// failed or absent batch after interruption, but never a completed batch
+	// that still advertises pending messages.
+	for _, outcome := range outcomes {
+		if err := s.mark(ctx, outcome.ID, outcome.Status, outcome.AnalysisJSON, outcome.AppliedActionID, outcome.AppliedTargetKey, outcome.BatchID, outcome.LastError, outcome.ProcessedAt); err != nil {
+			return err
 		}
 	}
-	return batch, nil
+	return s.store.SaveChatAnalyzerBatch(ctx, batch)
+}
+
+func (s *Service) recoverStaleBatches(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	now := s.now().UTC()
+	interval := s.settings.BatchStaleAfter / 2
+	if interval <= 0 || interval > 5*time.Minute {
+		interval = 5 * time.Minute
+	}
+	if !s.lastStaleRecoveryAt.IsZero() && now.Sub(s.lastStaleRecoveryAt) < interval {
+		return nil
+	}
+	recoveryStore, ok := s.store.(store.ChatAnalyzerBatchRecoveryStore)
+	if !ok {
+		// Spacetime production does not yet expose a batch-list or bulk-recovery
+		// procedure. processBatch therefore stores terminal records only, so a
+		// hard process interruption cannot create a new stale running record.
+		s.lastStaleRecoveryAt = now
+		s.recordMaintenance(now, "")
+		return nil
+	}
+	updated, err := recoveryStore.FailStaleChatAnalyzerBatches(ctx, now.Add(-s.settings.BatchStaleAfter), now, "interrupted before completion")
+	if err != nil {
+		s.recordMaintenance(now, "stale_batch_recovery_failed")
+		return fmt.Errorf("recover stale chat analyzer batches: %w", err)
+	}
+	s.recordMaintenance(now, "")
+	s.lastStaleRecoveryAt = now
+	s.staleBatchesRecovered += updated
+	if s.runtimeState != nil {
+		s.runtimeState.RecordChatAnalyzerStaleRecovery(updated)
+	}
+	if updated > 0 {
+		log.Printf("satiksme chat analyzer recovered %d interrupted batch record(s)", updated)
+	}
+	return nil
+}
+
+const portableExpiryLimit = 5000
+
+func (s *Service) expireStalePendingMessages(ctx context.Context, messageDateBefore, processedAt time.Time, analysisJSON string) (int, error) {
+	if expiryStore, ok := s.store.(store.ChatAnalyzerMessageExpiryStore); ok {
+		return expiryStore.ExpireStaleChatAnalyzerMessages(ctx, messageDateBefore, processedAt, analysisJSON)
+	}
+
+	// The deployed Spacetime module already provides these two operations. A
+	// generous bounded read avoids requiring a schema publish merely to expire
+	// old pending records. Any overflow remains pending and is revisited after
+	// normal queue progress exposes it in a later maintenance pass.
+	pending, err := s.store.ListPendingChatAnalyzerMessages(ctx, portableExpiryLimit)
+	if err != nil {
+		return 0, err
+	}
+	updated := 0
+	for _, item := range pending {
+		if item.MessageDate.IsZero() || !item.MessageDate.Before(messageDateBefore) {
+			continue
+		}
+		if err := s.store.MarkChatAnalyzerMessageProcessed(
+			ctx,
+			item.ID,
+			model.ChatAnalyzerMessageIgnored,
+			strings.TrimSpace(analysisJSON),
+			"",
+			"",
+			"",
+			processedAt,
+		); err != nil {
+			return updated, err
+		}
+		updated++
+	}
+	return updated, nil
+}
+
+func (s *Service) recordMaintenance(at time.Time, errorCode string) {
+	if s != nil && s.runtimeState != nil {
+		s.runtimeState.RecordChatAnalyzerMaintenance(at, errorCode)
+	}
+}
+
+func collectorSessionState(err error) string {
+	if errors.Is(err, ErrMTProtoSessionUnauthorized) {
+		return "unauthorized"
+	}
+	return "error"
+}
+
+func analyzerErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrMTProtoSessionUnauthorized) {
+		return "session_unauthorized"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	var statusErr *modelHTTPError
+	if errors.As(err, &statusErr) {
+		return fmt.Sprintf("model_http_%d", statusErr.StatusCode)
+	}
+	return analyzerErrorCodeText(err.Error())
+}
+
+func analyzerErrorCodeText(message string) string {
+	clean := strings.ToLower(strings.TrimSpace(message))
+	switch {
+	case strings.Contains(clean, "not authorized"):
+		return "session_unauthorized"
+	case strings.Contains(clean, "429"):
+		return "model_rate_limited"
+	case strings.Contains(clean, "model endpoint returned 5"):
+		return "model_unavailable"
+	case strings.Contains(clean, "deadline") || strings.Contains(clean, "timeout"):
+		return "timeout"
+	case strings.Contains(clean, "circuit"):
+		return "model_circuit_open"
+	case strings.Contains(clean, "model"):
+		return "model_request_failed"
+	default:
+		return "processing_failed"
+	}
 }
 
 func (s *Service) applyDecision(ctx context.Context, catalog *model.Catalog, item model.ChatAnalyzerMessage, decision Decision, target validatedTarget, now time.Time) (string, error) {
@@ -375,7 +623,7 @@ func (s *Service) applyDecision(ctx context.Context, catalog *model.Catalog, ite
 			Latitude:     target.area.Latitude,
 			Longitude:    target.area.Longitude,
 			RadiusMeters: areaRadiusForConfidence(target.area.RadiusMeters, decision.Confidence),
-			Description:  areaReportDescription(target.area.Description, item.Text),
+			Description:  areaPublicDescription(target.area),
 		}, now, reports.SubmitOptions{Source: model.IncidentVoteSourceTelegramChat})
 		if err != nil {
 			return "", err
@@ -466,6 +714,22 @@ func areaReportDescription(text, fallback string) string {
 		return clean
 	}
 	return string(runes[:157]) + "..."
+}
+
+func areaPublicDescription(area AreaCandidate) string {
+	label := strings.Join(strings.Fields(strings.TrimSpace(area.Label)), " ")
+	if label == "" && len(area.Anchors) > 0 {
+		anchors := make([]string, 0, len(area.Anchors))
+		for _, anchor := range area.Anchors {
+			if clean := strings.Join(strings.Fields(strings.TrimSpace(anchor)), " "); clean != "" {
+				anchors = append(anchors, clean)
+			}
+		}
+		if len(anchors) > 0 {
+			label = "near " + strings.Join(anchors, " / ")
+		}
+	}
+	return areaReportDescription(label, "approximate inspection area")
 }
 
 const clearActionMinConfidence = 0.94
@@ -1917,7 +2181,7 @@ func validateTarget(decision Decision, candidates CandidateContext) (validatedTa
 					Latitude:     area.Latitude,
 					Longitude:    area.Longitude,
 					RadiusMeters: area.RadiusMeters,
-					Description:  area.Description,
+					Description:  areaPublicDescription(area),
 				})
 				incidentID := reports.AreaIncidentID(scopeKey)
 				if decision.Action == ActionDenial || decision.Action == ActionCleared {

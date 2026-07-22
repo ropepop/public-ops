@@ -36,87 +36,17 @@
       "size": 214
     },
     "etc/arbuzas/current/release.env": {
-      "mode": 420,
-      "sha256": "17062e30bc91ccfc4f9ec9e3a1effc3b9074ac00c76d2197db6b4018044a0224",
-      "size": 1813
-    },
-    "etc/arbuzas/env/rigassatiksme-qr-bot.env.bak.20260518T122255Z.retired-20260618T215944Z": {
       "mode": 384,
-      "sha256": "9b322681333c809f914b355ee55a28a91532bd1b987770fe735b0935973659e4",
-      "size": 1157
-    },
-    "etc/arbuzas/env/rigassatiksme-qr-bot.env.retired-20260618T215944Z": {
-      "mode": 384,
-      "sha256": "3c7cc69f8a3655ae99e9cb9379b888178127a582117aa19f08d26f62a4bb776b",
-      "size": 1171
+      "sha256": "838669ea7cdeb045b83ae845c369467230e52e21fb126d58006c6960b36a2ae5",
+      "size": 1927
     },
     "etc/arbuzas/env/satiksme-bot.env": {
-      "mode": 420,
-      "sha256": "2a7fdba3d966cee347d482aa43776684bfc520236cfa730d5daf300ada803f98",
-      "size": 3779
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak-google-ai": {
       "mode": 384,
-      "sha256": "3ab195a0276487553de6a512831a62c68175c05392673d03e8d9fbcff443d807",
-      "size": 3341
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak-hermes-20260518T071515Z": {
-      "mode": 384,
-      "sha256": "ba06d742de4a5461ada93eeeaa092e3f40383457b3cea0c8f83522ead57dd567",
-      "size": 3651
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak-live-5m": {
-      "mode": 384,
-      "sha256": "6d5cd243ed194326ca44bf32b5e0eca61caadf55e2ff10db962f30041a1efa26",
-      "size": 3651
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260423T125101Z": {
-      "mode": 420,
-      "sha256": "5abd74b198b4511369202f3fbc36dbc0d2aa409d022b880004a361ba0771c96f",
-      "size": 2371
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260423T130050Z": {
-      "mode": 420,
-      "sha256": "f46da791529c746517eb7518bb5c560ae5300f1e95f2c5b21f74fc7382ae2aad",
-      "size": 2332
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260423T171908Z": {
-      "mode": 384,
-      "sha256": "77df5665c6d6f3493e2a2c6dcdde9838326c6deb804ed6ff91d0318fb54221a5",
-      "size": 2375
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260428T091814Z": {
-      "mode": 384,
-      "sha256": "4d1c1a6682f1ac87b78ba4e05dd7e07ca1d0fe9ccbc80629ceebc0113b819c36",
-      "size": 3650
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260428T091826Z": {
-      "mode": 384,
-      "sha256": "4d1c1a6682f1ac87b78ba4e05dd7e07ca1d0fe9ccbc80629ceebc0113b819c36",
-      "size": 3650
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.20260618T221750Z": {
-      "mode": 384,
-      "sha256": "5e5ff0bcb12be762eba18ceb8d247484f2b07e282bebddf1673ad04d05ac167c",
-      "size": 3999
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T043727Z": {
-      "mode": 384,
-      "sha256": "4bccbac8742324b52c69be558b92f248731e9afb5d29fec6abdb7dfbf763f41d",
-      "size": 3778
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T043931Z": {
-      "mode": 384,
-      "sha256": "2a7fdba3d966cee347d482aa43776684bfc520236cfa730d5daf300ada803f98",
-      "size": 3779
-    },
-    "etc/arbuzas/env/satiksme-bot.env.bak.codex-20260701T044137Z": {
-      "mode": 384,
-      "sha256": "664e49bbf4a2d6fb7b54b663ca985f02a069aa166e2f5c50599051838afdcf81",
-      "size": 3780
+      "sha256": "ce0ac65ecfd9c104b7adce1f96d429d17b6c3ac167b2043a3739a924d0c3ccb9",
+      "size": 4093
     },
     "etc/arbuzas/env/subscription-bot.env": {
-      "mode": 420,
+      "mode": 384,
       "sha256": "6ed9bf7b6f7ee22777de42dbcc399540c57685ba428dc5d578759404d45ed18b",
       "size": 1697
     },
@@ -125,35 +55,10 @@
       "sha256": "66deb4c4c30cc3f0c2f49ccaaac1435ee495d5fb85522da1975c0a8fa1c6fd39",
       "size": 1356
     },
-    "etc/arbuzas/env/ticket-remote.env.bak-20260509T0012": {
-      "mode": 384,
-      "sha256": "5125785128fee1dd37044b6f9b6c7658a7e7f4458acd36edda6c0bc06e91fae5",
-      "size": 1204
-    },
-    "etc/arbuzas/env/ticket-remote.env.bak.20260507T093247Z": {
-      "mode": 416,
-      "sha256": "8c4c4f0b7a20c172906c8bffba384a274ad9348c57a909a1127b4bf1d170b0c1",
-      "size": 1034
-    },
-    "etc/arbuzas/env/ticket-remote.env.bak.20260508T150631Z": {
-      "mode": 384,
-      "sha256": "04b2ff3931211ddeb84d42a13a96015ba3463fe53d6784736b5e24f31229dcc3",
-      "size": 1205
-    },
-    "etc/arbuzas/env/ticket-remote.env.before-spacetime-v2-20260524T175558Z": {
-      "mode": 384,
-      "sha256": "26d5cab75b5cf4d156212b88c04687228e8831732c4e6a62ad4daef24b73e8a3",
-      "size": 1216
-    },
     "etc/arbuzas/env/train-bot.env": {
-      "mode": 420,
+      "mode": 384,
       "sha256": "0a0c0b3739111e5febd9b1759f39190de2abb3af24c01dfca8472f41b0764b78",
       "size": 2059
-    },
-    "etc/arbuzas/env/train-bot.env.bak.20260508T150631Z": {
-      "mode": 384,
-      "sha256": "6dacf177a25a745a146ee533e4c8a6e7e81130854f1f342be305215fa4495d91",
-      "size": 2060
     },
     "etc/arbuzas/secrets/android-adb/adb_known_hosts.pb": {
       "mode": 384,
@@ -184,6 +89,26 @@
       "mode": 384,
       "sha256": "0dc4b4db0b26aa2afa95b3279aa681b6088c17f43cbe9da78a4c50d0b611dd46",
       "size": 64
+    },
+    "etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret": {
+      "mode": 384,
+      "sha256": "04182a1b3f33c950f437c8867848adddbdf753f1904a4c2e9fac0e2e7d1a29ee",
+      "size": 40
+    },
+    "etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret": {
+      "mode": 384,
+      "sha256": "04182a1b3f33c950f437c8867848adddbdf753f1904a4c2e9fac0e2e7d1a29ee",
+      "size": 40
+    },
+    "etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret": {
+      "mode": 384,
+      "sha256": "0b5fd4b1327072d953bbe62b88bc3c2e04c07d657eb9e32ef95e330c102a4585",
+      "size": 33
+    },
+    "etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret": {
+      "mode": 384,
+      "sha256": "487efba4d6dfa33116e4b643ee358bc7fcbb39ad111e820ddeb2eca3d3677298",
+      "size": 9
     },
     "etc/arbuzas/secrets/satiksme-telegram-client.secret": {
       "mode": 384,
@@ -222,5 +147,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1784524506
+  "updatedEpochSeconds": 1784686438
 }

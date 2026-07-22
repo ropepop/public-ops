@@ -1,0 +1,11 @@
+[package]
+name = "operational_logging_spacetimedb"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+spacetimedb = { version = "2.6.*" }

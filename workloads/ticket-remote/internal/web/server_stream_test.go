@@ -657,7 +657,7 @@ func TestProvisionalWarmConfigIsSentWithoutStaleKeyframeWhileRelayDisconnected(t
 	}
 }
 
-func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
+func TestVideoClientLogsAreAcceptedAndSanitizedOnAuthenticatedVideoSocket(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
@@ -670,15 +670,18 @@ func TestVideoClientLogsAreIgnoredOnVideoSocket(t *testing.T) {
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
 
 	_ = readNextTextMessageOfType(t, ctx, viewerConn, "config")
-	if err := viewerConn.Write(ctx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_first_packet_ms","detail":"123"}`)); err != nil {
+	if err := viewerConn.Write(ctx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_started","detail":"123"}`)); err != nil {
 		t.Fatalf("write client log: %v", err)
 	}
 
 	time.Sleep(100 * time.Millisecond)
 	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
 	event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent)
-	if ok && event.Event == "stream_first_packet_ms" {
-		t.Fatalf("video client log must not be accepted on the media socket after Spacetime safe-log cutover: %#v", snapshot["lastBrowserEvent"])
+	if !ok || event.Event != "stream_started" {
+		t.Fatalf("validated client log was not accepted on the authenticated media socket: %#v", snapshot["lastBrowserEvent"])
+	}
+	if !strings.Contains(event.Detail, "[redacted]") || strings.Contains(event.Detail, "123") {
+		t.Fatalf("client log detail was not sanitized: %#v", event)
 	}
 }
 
