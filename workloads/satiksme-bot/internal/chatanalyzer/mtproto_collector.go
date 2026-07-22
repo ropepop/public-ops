@@ -18,6 +18,8 @@ import (
 
 var ErrMTProtoSessionUnauthorized = errors.New("Telegram account session is not authorized")
 
+const maxStaleCatchUpPagesPerCollect = 4
+
 type MTProtoCollectorConfig struct {
 	APIID         int
 	APIHash       string
@@ -100,14 +102,98 @@ func (c *MTProtoCollector) Collect(ctx context.Context) (CollectionResult, error
 			}
 			return nil
 		}
-		messages, err := c.fetchMessages(ctx, client.API(), peer, int(lastID), c.batchLimit)
-		if err != nil {
-			return err
-		}
-		result = filterCollectedMessages(checkpointKey, messages, lastID, c.now().UTC(), c.maxMessageAge)
-		return nil
+		result, err = collectForwardMessages(
+			ctx,
+			checkpointKey,
+			lastID,
+			c.now().UTC(),
+			c.maxMessageAge,
+			c.batchLimit,
+			maxStaleCatchUpPagesPerCollect,
+			func(ctx context.Context, minID, limit int) ([]*tg.Message, error) {
+				return c.fetchMessages(ctx, client.API(), peer, minID, limit)
+			},
+		)
+		return err
 	})
-	return result, err
+	if err != nil {
+		// Discard partial catch-up progress on any request failure. The service
+		// persists checkpoints only after Collect returns successfully, so the
+		// next poll will safely retry the first uncommitted page.
+		return CollectionResult{}, err
+	}
+	return result, nil
+}
+
+type telegramHistoryFetcher func(context.Context, int, int) ([]*tg.Message, error)
+
+func collectForwardMessages(
+	ctx context.Context,
+	checkpointKey string,
+	lastID int64,
+	now time.Time,
+	maxMessageAge time.Duration,
+	limit int,
+	maxPages int,
+	fetch telegramHistoryFetcher,
+) (CollectionResult, error) {
+	result := CollectionResult{
+		Messages:             make([]model.ChatAnalyzerMessage, 0),
+		CheckpointMessageIDs: make(map[string]int64, 1),
+	}
+	if fetch == nil {
+		return CollectionResult{}, fmt.Errorf("telegram history fetcher is not configured")
+	}
+	if maxPages <= 0 {
+		maxPages = 1
+	}
+	pageLimit := boundedTelegramHistoryLimit(limit)
+	cursor := lastID
+	for page := 0; page < maxPages; page++ {
+		messages, err := fetch(ctx, int(cursor), pageLimit)
+		if err != nil {
+			return CollectionResult{}, err
+		}
+		pageResult := filterCollectedMessages(checkpointKey, messages, cursor, now, maxMessageAge)
+		result.Messages = append(result.Messages, pageResult.Messages...)
+		result.SkippedStale += pageResult.SkippedStale
+
+		nextID := pageResult.CheckpointMessageIDs[checkpointKey]
+		if nextID > cursor {
+			result.CheckpointMessageIDs[checkpointKey] = nextID
+		}
+
+		// Catch up immediately only through pages made entirely of stale
+		// history. Once current content appears, let the normal service path
+		// enqueue it and commit the checkpoint before another request.
+		if len(pageResult.Messages) > 0 || containsFreshTelegramMessage(messages, cursor, now, maxMessageAge) {
+			break
+		}
+		// A short page has reached the available edge. A non-advancing page is
+		// also terminal so an unexpected Telegram response cannot spin.
+		if len(messages) < pageLimit || nextID <= cursor {
+			break
+		}
+		cursor = nextID
+	}
+	return result, nil
+}
+
+func containsFreshTelegramMessage(messages []*tg.Message, lastID int64, now time.Time, maxMessageAge time.Duration) bool {
+	cutoff := now.Add(-maxMessageAge)
+	for _, msg := range messages {
+		if msg == nil || int64(msg.ID) <= lastID {
+			continue
+		}
+		messageDate := time.Unix(int64(msg.Date), 0).UTC()
+		if msg.Date <= 0 {
+			messageDate = now
+		}
+		if !messageDate.Before(cutoff) {
+			return true
+		}
+	}
+	return false
 }
 
 func filterCollectedMessages(checkpointKey string, messages []*tg.Message, lastID int64, now time.Time, maxMessageAge time.Duration) CollectionResult {
@@ -152,17 +238,12 @@ func (c *MTProtoCollector) fetchMessages(ctx context.Context, api *tg.Client, pe
 }
 
 func telegramHistoryRequest(peer tg.InputPeerClass, minID, limit int) *tg.MessagesGetHistoryRequest {
-	if limit <= 0 {
-		limit = 25
-	}
 	// Telegram history limits are normally capped at 100. When a checkpoint is
 	// present, a negative add_offset asks for the first page newer than that ID,
 	// rather than the newest page in the chat. Advancing the checkpoint from
 	// this bounded forward page prevents bursts larger than one page from being
 	// silently skipped.
-	if limit > 100 {
-		limit = 100
-	}
+	limit = boundedTelegramHistoryLimit(limit)
 	request := &tg.MessagesGetHistoryRequest{Peer: peer, Limit: limit}
 	if minID > 0 {
 		request.OffsetID = minID
@@ -170,6 +251,16 @@ func telegramHistoryRequest(peer tg.InputPeerClass, minID, limit int) *tg.Messag
 		request.MinID = minID
 	}
 	return request
+}
+
+func boundedTelegramHistoryLimit(limit int) int {
+	if limit <= 0 {
+		return 25
+	}
+	if limit > 100 {
+		return 100
+	}
+	return limit
 }
 
 func messagesFromHistory(result tg.MessagesMessagesClass) []*tg.Message {

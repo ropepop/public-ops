@@ -1,6 +1,8 @@
 package chatanalyzer
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -111,4 +113,150 @@ func TestTelegramMessageWithoutDateUsesCollectionTime(t *testing.T) {
 	if !item.MessageDate.Equal(now) {
 		t.Fatalf("message date = %s, want collection time %s", item.MessageDate, now)
 	}
+}
+
+func TestCollectForwardMessagesAdvancesAcrossBoundedStalePages(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	pages := [][]*tg.Message{
+		staleTelegramPage(now, 101, 3),
+		staleTelegramPage(now, 104, 3),
+		staleTelegramPage(now, 107, 3),
+		staleTelegramPage(now, 110, 2),
+	}
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 3, maxStaleCatchUpPagesPerCollect,
+		func(_ context.Context, minID, limit int) ([]*tg.Message, error) {
+			if limit != 3 {
+				t.Fatalf("fetch limit = %d, want 3", limit)
+			}
+			wantMinID := 100 + calls*3
+			if minID != wantMinID {
+				t.Fatalf("fetch %d min id = %d, want %d", calls+1, minID, wantMinID)
+			}
+			page := pages[calls]
+			calls++
+			return page, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("collect forward messages: %v", err)
+	}
+	if calls != 4 {
+		t.Fatalf("fetch calls = %d, want bounded catch-up of 4", calls)
+	}
+	if len(result.Messages) != 0 {
+		t.Fatalf("fresh messages = %+v, want none", result.Messages)
+	}
+	if result.SkippedStale != 11 {
+		t.Fatalf("skipped stale = %d, want 11", result.SkippedStale)
+	}
+	if got := result.CheckpointMessageIDs["channel:42"]; got != 111 {
+		t.Fatalf("checkpoint = %d, want 111", got)
+	}
+}
+
+func TestCollectForwardMessagesStopsOnFreshPage(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		func(_ context.Context, minID, _ int) ([]*tg.Message, error) {
+			calls++
+			switch calls {
+			case 1:
+				if minID != 100 {
+					t.Fatalf("first min id = %d, want 100", minID)
+				}
+				return staleTelegramPage(now, 101, 2), nil
+			case 2:
+				if minID != 102 {
+					t.Fatalf("second min id = %d, want 102", minID)
+				}
+				return []*tg.Message{
+					{ID: 103, Date: int(now.Add(-23 * time.Hour).Unix()), Message: "fresh report"},
+					{ID: 104, Date: int(now.Add(-25 * time.Hour).Unix()), Message: "old report"},
+				}, nil
+			default:
+				t.Fatalf("unexpected fetch call %d", calls)
+				return nil, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("collect forward messages: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want stop after fresh page", calls)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].MessageID != 103 {
+		t.Fatalf("fresh messages = %+v, want only message 103", result.Messages)
+	}
+	if result.SkippedStale != 3 {
+		t.Fatalf("skipped stale = %d, want 3", result.SkippedStale)
+	}
+	if got := result.CheckpointMessageIDs["channel:42"]; got != 104 {
+		t.Fatalf("checkpoint = %d, want 104", got)
+	}
+}
+
+func TestCollectForwardMessagesStopsWhenPageDoesNotAdvance(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		func(_ context.Context, _ int, _ int) ([]*tg.Message, error) {
+			calls++
+			return []*tg.Message{
+				{ID: 100, Date: int(now.Add(-25 * time.Hour).Unix()), Message: "already seen"},
+				{ID: 99, Date: int(now.Add(-25 * time.Hour).Unix()), Message: "already seen"},
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("collect forward messages: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 for non-advancing page", calls)
+	}
+	if len(result.Messages) != 0 || result.SkippedStale != 0 || len(result.CheckpointMessageIDs) != 0 {
+		t.Fatalf("non-progress result = %+v, want empty", result)
+	}
+}
+
+func TestCollectForwardMessagesDiscardsPartialProgressOnFailure(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	wantErr := errors.New("temporary Telegram failure")
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		func(_ context.Context, _ int, _ int) ([]*tg.Message, error) {
+			calls++
+			if calls == 1 {
+				return staleTelegramPage(now, 101, 2), nil
+			}
+			return nil, wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want 2", calls)
+	}
+	if len(result.Messages) != 0 || result.SkippedStale != 0 || len(result.CheckpointMessageIDs) != 0 {
+		t.Fatalf("partial failure result = %+v, want empty for at-least-once retry", result)
+	}
+}
+
+func staleTelegramPage(now time.Time, firstID, count int) []*tg.Message {
+	out := make([]*tg.Message, 0, count)
+	for offset := 0; offset < count; offset++ {
+		out = append(out, &tg.Message{
+			ID:      firstID + offset,
+			Date:    int(now.Add(-25 * time.Hour).Unix()),
+			Message: "old report",
+		})
+	}
+	return out
 }
