@@ -53,10 +53,11 @@ outside the normal cleanup range.
 
 ## Writer contracts
 
-The owner enrolls each authenticated identity for exactly one live domain:
-`deployment`, `pixel`, or `ticket`. Trying to enable a second domain for the
-same identity is rejected; disable the old assignment before enabling the new
-one. The database owner may write all domains.
+The owner enrolls each dedicated non-owner identity for exactly one live
+domain: `deployment`, `pixel`, or `ticket`. Trying to enable a second domain for
+the same identity is rejected; disable the old assignment before enabling the
+new one. The database owner may write all domains; production deployment
+reporting currently uses that owner path.
 
 Live reducers are domain-specific:
 
