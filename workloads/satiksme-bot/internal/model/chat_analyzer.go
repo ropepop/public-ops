@@ -25,7 +25,7 @@ type ChatAnalyzerMessage struct {
 	ReceivedAt       time.Time                 `json:"receivedAt"`
 	ReplyToMessageID int64                     `json:"replyToMessageId,omitempty"`
 	Status           ChatAnalyzerMessageStatus `json:"status"`
-	Attempts         int                       `json:"attempts"`
+	Attempts         int                       `json:"attempts"` // Durable state writes; logical retry attempts are carried in AnalysisJSON.
 	AnalysisJSON     string                    `json:"analysisJson,omitempty"`
 	AppliedActionID  string                    `json:"appliedActionId,omitempty"`
 	AppliedTargetKey string                    `json:"appliedTargetKey,omitempty"`

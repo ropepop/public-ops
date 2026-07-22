@@ -3,13 +3,15 @@ package reports
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf16"
 
 	"satiksmebot/internal/model"
 	"satiksmebot/internal/store"
@@ -20,11 +22,16 @@ type Service struct {
 	cooldown   time.Duration
 	dedupe     time.Duration
 	visibility time.Duration
+	vehicleMu  sync.Mutex
+	areaMu     sync.Mutex
 }
 
 type SubmitOptions struct {
-	Hidden bool
-	Source model.IncidentVoteSource
+	Hidden           bool
+	Source           model.IncidentVoteSource
+	IdempotencyID    string
+	IdempotencyKey   string
+	IdempotencySince time.Time
 }
 
 type stopSightingVoteStore interface {
@@ -59,6 +66,37 @@ func (s *Service) HealthCheck(ctx context.Context) error {
 	return s.store.HealthCheck(ctx)
 }
 
+// CommittedActionIDs returns Telegram analyzer action IDs whose report or vote
+// transaction is already durable. Report transactions use the report ID for
+// their incident-vote event too, so one bounded event scan covers every action
+// kind without requiring a new storage procedure.
+func (s *Service) CommittedActionIDs(ctx context.Context, actionIDs []string, since time.Time) (map[string]struct{}, error) {
+	wanted := make(map[string]struct{}, len(actionIDs))
+	for _, id := range actionIDs {
+		if clean := strings.TrimSpace(id); clean != "" {
+			wanted[clean] = struct{}{}
+		}
+	}
+	committed := make(map[string]struct{}, len(wanted))
+	if len(wanted) == 0 {
+		return committed, nil
+	}
+	if since.IsZero() {
+		since = time.Unix(0, 0).UTC()
+	}
+	events, err := s.store.ListIncidentVoteEvents(ctx, "", since.UTC(), 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range events {
+		id := strings.TrimSpace(event.ID)
+		if _, ok := wanted[id]; ok {
+			committed[id] = struct{}{}
+		}
+	}
+	return committed, nil
+}
+
 func (s *Service) SubmitStopSighting(ctx context.Context, userID int64, stopID string, now time.Time) (model.ReportResult, *model.StopSighting, error) {
 	return s.SubmitStopSightingWithOptions(ctx, userID, stopID, now, SubmitOptions{})
 }
@@ -66,6 +104,17 @@ func (s *Service) SubmitStopSighting(ctx context.Context, userID int64, stopID s
 func (s *Service) SubmitStopSightingWithOptions(ctx context.Context, userID int64, stopID string, now time.Time, options SubmitOptions) (model.ReportResult, *model.StopSighting, error) {
 	stopID = strings.TrimSpace(stopID)
 	incidentID := StopIncidentID(stopID)
+	reportID, idempotent := submissionReportID("stop", userID, options.IdempotencyID, options.IdempotencyKey)
+	lookupSince := submissionLookupSince(options.IdempotencySince, now)
+	if idempotent {
+		existing, err := s.findStopSightingByID(ctx, reportID, lookupSince)
+		if err != nil {
+			return model.ReportResult{}, nil, fmt.Errorf("look up idempotent stop report: %w", err)
+		}
+		if existing != nil {
+			return reconciledStopSighting(existing), existing, nil
+		}
+	}
 	source := options.Source
 	if source == "" {
 		source = model.IncidentVoteSourceMapReport
@@ -79,7 +128,7 @@ func (s *Service) SubmitStopSightingWithOptions(ctx context.Context, userID int6
 	}
 
 	item := &model.StopSighting{
-		ID:        generateID(),
+		ID:        reportID,
 		StopID:    stopID,
 		UserID:    userID,
 		Hidden:    options.Hidden,
@@ -91,17 +140,33 @@ func (s *Service) SubmitStopSightingWithOptions(ctx context.Context, userID int6
 			return model.ReportResult{}, nil, err
 		}
 		if combined, ok := s.store.(stopSightingVoteStore); ok {
-			if err := combined.InsertStopSightingWithVote(ctx, *item, vote, event, s.dedupe); errors.Is(err, store.ErrDuplicateReport) {
-				return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
-			} else if err != nil {
+			if err := combined.InsertStopSightingWithVote(ctx, *item, vote, event, s.dedupe); err != nil {
+				if idempotent {
+					if existing, lookupErr := s.findStopSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+						return reconciledStopSighting(existing), existing, nil
+					}
+				}
+				if errors.Is(err, store.ErrDuplicateReport) {
+					return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
+				}
 				return model.ReportResult{}, nil, err
 			}
 		} else if err := s.store.InsertStopSighting(ctx, *item); err != nil {
+			if idempotent {
+				if existing, lookupErr := s.findStopSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+					return reconciledStopSighting(existing), existing, nil
+				}
+			}
 			return model.ReportResult{}, nil, err
 		} else if err := s.store.RecordIncidentVote(ctx, vote, event); err != nil {
 			return model.ReportResult{}, nil, err
 		}
 	} else if err := s.store.InsertStopSighting(ctx, *item); err != nil {
+		if idempotent {
+			if existing, lookupErr := s.findStopSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+				return reconciledStopSighting(existing), existing, nil
+			}
+		}
 		return model.ReportResult{}, nil, err
 	}
 	return model.ReportResult{Accepted: true, IncidentID: incidentID}, item, nil
@@ -112,8 +177,25 @@ func (s *Service) SubmitVehicleSighting(ctx context.Context, userID int64, input
 }
 
 func (s *Service) SubmitVehicleSightingWithOptions(ctx context.Context, userID int64, input model.VehicleReportInput, now time.Time, options SubmitOptions) (model.ReportResult, *model.VehicleSighting, error) {
+	s.vehicleMu.Lock()
+	defer s.vehicleMu.Unlock()
+
 	scopeKey := VehicleScopeKey(input)
 	incidentID := VehicleIncidentID(scopeKey)
+	reportID, idempotent := submissionReportID("vehicle", userID, options.IdempotencyID, options.IdempotencyKey)
+	lookupSince := submissionLookupSince(options.IdempotencySince, now)
+	if idempotent {
+		existing, err := s.findVehicleSightingByID(ctx, reportID, lookupSince)
+		if err != nil {
+			return model.ReportResult{}, nil, fmt.Errorf("look up idempotent vehicle report: %w", err)
+		}
+		if existing != nil {
+			return reconciledVehicleSighting(existing), existing, nil
+		}
+	}
+	if err := s.ensureVehiclePublicIDAvailable(ctx, scopeKey, incidentID); err != nil {
+		return model.ReportResult{}, nil, err
+	}
 	source := options.Source
 	if source == "" {
 		source = model.IncidentVoteSourceMapReport
@@ -127,7 +209,7 @@ func (s *Service) SubmitVehicleSightingWithOptions(ctx context.Context, userID i
 	}
 
 	item := &model.VehicleSighting{
-		ID:               generateID(),
+		ID:               reportID,
 		StopID:           "",
 		UserID:           userID,
 		Mode:             strings.TrimSpace(input.Mode),
@@ -136,9 +218,12 @@ func (s *Service) SubmitVehicleSightingWithOptions(ctx context.Context, userID i
 		Destination:      strings.TrimSpace(input.Destination),
 		DepartureSeconds: input.DepartureSeconds,
 		LiveRowID:        strings.TrimSpace(input.LiveRowID),
-		ScopeKey:         scopeKey,
-		Hidden:           options.Hidden,
-		CreatedAt:        now.UTC(),
+		// v1 sanitizes this supplied scope directly when deriving its public
+		// incident ID. Store the opaque suffix while retaining the logical
+		// private identity in the fields above.
+		ScopeKey:  opaqueVehicleScopeKey(scopeKey),
+		Hidden:    options.Hidden,
+		CreatedAt: now.UTC(),
 	}
 	if !item.Hidden {
 		vote, event, err := s.incidentVoteAction(ctx, incidentID, userID, model.IncidentVoteOngoing, source, item.ID, now)
@@ -146,20 +231,54 @@ func (s *Service) SubmitVehicleSightingWithOptions(ctx context.Context, userID i
 			return model.ReportResult{}, nil, err
 		}
 		if combined, ok := s.store.(vehicleSightingVoteStore); ok {
-			if err := combined.InsertVehicleSightingWithVote(ctx, *item, vote, event, s.dedupe); errors.Is(err, store.ErrDuplicateReport) {
-				return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
-			} else if err != nil {
-				return model.ReportResult{}, nil, err
+			writeErr := combined.InsertVehicleSightingWithVote(ctx, *item, vote, event, s.dedupe)
+			if writeErr != nil {
+				if idempotent {
+					if existing, lookupErr := s.findVehicleSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+						reconciled := reconciledVehicleSighting(existing)
+						reconciled.IncidentID = incidentID
+						return reconciled, existing, nil
+					}
+				}
+				if errors.Is(writeErr, store.ErrDuplicateReport) {
+					return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
+				}
+				return model.ReportResult{}, nil, writeErr
 			}
 		} else if err := s.store.InsertVehicleSighting(ctx, *item); err != nil {
+			if idempotent {
+				if existing, lookupErr := s.findVehicleSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+					return reconciledVehicleSighting(existing), existing, nil
+				}
+			}
 			return model.ReportResult{}, nil, err
 		} else if err := s.store.RecordIncidentVote(ctx, vote, event); err != nil {
 			return model.ReportResult{}, nil, err
 		}
 	} else if err := s.store.InsertVehicleSighting(ctx, *item); err != nil {
+		if idempotent {
+			if existing, lookupErr := s.findVehicleSightingByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+				return reconciledVehicleSighting(existing), existing, nil
+			}
+		}
 		return model.ReportResult{}, nil, err
 	}
 	return model.ReportResult{Accepted: true, IncidentID: incidentID}, item, nil
+}
+
+func (s *Service) ensureVehiclePublicIDAvailable(ctx context.Context, privateScopeKey, publicIncidentID string) error {
+	vehicleSightings, err := s.store.ListVehicleSightingsSince(ctx, time.Unix(0, 0).UTC(), "", 0)
+	if err != nil {
+		return fmt.Errorf("check vehicle incident privacy: %w", err)
+	}
+	privateScopeKey = strings.TrimSpace(privateScopeKey)
+	for index := range vehicleSightings {
+		existingScopeKey := strings.TrimSpace(vehicleSightingScopeKey(&vehicleSightings[index]))
+		if VehicleIncidentID(existingScopeKey) == publicIncidentID && existingScopeKey != privateScopeKey {
+			return fmt.Errorf("opaque vehicle incident collision")
+		}
+	}
+	return nil
 }
 
 func (s *Service) SubmitAreaReport(ctx context.Context, userID int64, input model.AreaReportInput, now time.Time) (model.ReportResult, *model.AreaReport, error) {
@@ -167,12 +286,29 @@ func (s *Service) SubmitAreaReport(ctx context.Context, userID int64, input mode
 }
 
 func (s *Service) SubmitAreaReportWithOptions(ctx context.Context, userID int64, input model.AreaReportInput, now time.Time, options SubmitOptions) (model.ReportResult, *model.AreaReport, error) {
+	s.areaMu.Lock()
+	defer s.areaMu.Unlock()
+
 	normalized, err := NormalizeAreaReportInput(input)
 	if err != nil {
 		return model.ReportResult{}, nil, err
 	}
 	scopeKey := AreaScopeKey(normalized)
 	incidentID := AreaIncidentID(scopeKey)
+	reportID, idempotent := submissionReportID("area", userID, options.IdempotencyID, options.IdempotencyKey)
+	lookupSince := submissionLookupSince(options.IdempotencySince, now)
+	if idempotent {
+		existing, err := s.findAreaReportByID(ctx, reportID, lookupSince)
+		if err != nil {
+			return model.ReportResult{}, nil, fmt.Errorf("look up idempotent area report: %w", err)
+		}
+		if existing != nil {
+			return reconciledAreaReport(existing), existing, nil
+		}
+	}
+	if err := s.ensureAreaPublicIDAvailable(ctx, scopeKey, incidentID); err != nil {
+		return model.ReportResult{}, nil, err
+	}
 	source := options.Source
 	if source == "" {
 		source = model.IncidentVoteSourceMapReport
@@ -186,7 +322,7 @@ func (s *Service) SubmitAreaReportWithOptions(ctx context.Context, userID int64,
 	}
 
 	item := &model.AreaReport{
-		ID:           generateID(),
+		ID:           reportID,
 		UserID:       userID,
 		Latitude:     normalized.Latitude,
 		Longitude:    normalized.Longitude,
@@ -202,26 +338,84 @@ func (s *Service) SubmitAreaReportWithOptions(ctx context.Context, userID int64,
 			return model.ReportResult{}, nil, err
 		}
 		if combined, ok := s.store.(areaReportVoteStore); ok {
-			if err := combined.InsertAreaReportWithVote(ctx, *item, vote, event, s.dedupe); errors.Is(err, store.ErrDuplicateReport) {
-				return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
-			} else if err != nil {
-				return model.ReportResult{}, nil, err
+			writeErr := combined.InsertAreaReportWithVote(ctx, *item, vote, event, s.dedupe)
+			if errors.Is(writeErr, store.ErrReportVoteIncidentMismatch) {
+				// The currently published 2026-04-30 Spacetime module derives
+				// area incident IDs from the sanitized scope key. Store only the
+				// opaque public suffix as that compatibility scope, so the legacy
+				// reducer derives the same private-safe ID as newer source. The
+				// first transaction validates the pair before any mutation.
+				compatibilityScopeKey := opaqueAreaScopeKey(scopeKey)
+				if compatibilityScopeKey != scopeKey {
+					compatibilityItem := *item
+					compatibilityItem.ScopeKey = compatibilityScopeKey
+					writeErr = combined.InsertAreaReportWithVote(ctx, compatibilityItem, vote, event, s.dedupe)
+					if writeErr == nil {
+						item.ScopeKey = compatibilityScopeKey
+					}
+				}
+			}
+			if writeErr != nil {
+				if idempotent {
+					if existing, lookupErr := s.findAreaReportByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+						reconciled := reconciledAreaReport(existing)
+						reconciled.IncidentID = incidentID
+						return reconciled, existing, nil
+					}
+				}
+				if errors.Is(writeErr, store.ErrDuplicateReport) {
+					return model.ReportResult{Deduped: true, IncidentID: incidentID}, nil, nil
+				}
+				return model.ReportResult{}, nil, writeErr
 			}
 		} else if err := s.store.InsertAreaReport(ctx, *item); err != nil {
+			if idempotent {
+				if existing, lookupErr := s.findAreaReportByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+					return reconciledAreaReport(existing), existing, nil
+				}
+			}
 			return model.ReportResult{}, nil, err
 		} else if err := s.store.RecordIncidentVote(ctx, vote, event); err != nil {
 			return model.ReportResult{}, nil, err
 		}
 	} else if err := s.store.InsertAreaReport(ctx, *item); err != nil {
+		if idempotent {
+			if existing, lookupErr := s.findAreaReportByID(ctx, reportID, lookupSince); lookupErr == nil && existing != nil {
+				return reconciledAreaReport(existing), existing, nil
+			}
+		}
 		return model.ReportResult{}, nil, err
 	}
 	return model.ReportResult{Accepted: true, IncidentID: incidentID}, item, nil
 }
 
+func (s *Service) ensureAreaPublicIDAvailable(ctx context.Context, logicalScopeKey, publicIncidentID string) error {
+	areaReports, err := s.store.ListAreaReportsSince(ctx, time.Unix(0, 0).UTC(), 0)
+	if err != nil {
+		return fmt.Errorf("check area incident privacy: %w", err)
+	}
+	for _, item := range areaReports {
+		existingScopeKey := AreaScopeKey(model.AreaReportInput{
+			Latitude:     item.Latitude,
+			Longitude:    item.Longitude,
+			RadiusMeters: item.RadiusMeters,
+			Description:  item.Description,
+		})
+		if AreaIncidentID(existingScopeKey) == publicIncidentID && existingScopeKey != logicalScopeKey {
+			return fmt.Errorf("opaque area incident collision")
+		}
+	}
+	return nil
+}
+
 func (s *Service) VisibleSightings(ctx context.Context, catalog *model.Catalog, stopID string, now time.Time, limit int) (model.VisibleSightings, error) {
 	stopID = strings.TrimSpace(stopID)
 	if publicStore, ok := s.store.(publicSightingsStore); ok {
-		return publicStore.ListPublicSightings(ctx, stopID, limit)
+		visible, err := publicStore.ListPublicSightings(ctx, stopID, limit)
+		if err != nil {
+			return model.VisibleSightings{}, err
+		}
+		return sanitizePublicVisibleSightings(visible), nil
 	}
 	since := now.Add(-s.visibility)
 	stops, err := s.store.ListStopSightingsSince(ctx, since, stopID, 0)
@@ -332,18 +526,56 @@ func AreaScopeKey(input model.AreaReportInput) string {
 }
 
 func AreaIncidentID(scopeKey string) string {
+	if clean := strings.ToLower(strings.TrimSpace(scopeKey)); isOpaqueAreaScopeKey(clean) {
+		return "area:" + clean
+	}
 	return publicStableID("area:pub", scopeKey)
 }
 
+func opaqueVehicleScopeKey(scopeKey string) string {
+	return strings.TrimPrefix(VehicleIncidentID(scopeKey), "vehicle:")
+}
+
+func isOpaqueVehicleScopeKey(scopeKey string) bool {
+	clean := strings.ToLower(strings.TrimSpace(scopeKey))
+	return isHashedPublicID("vehicle:"+clean, "vehicle:pub")
+}
+
+func legacyAreaIncidentID(scopeKey string) string {
+	return "area:" + sanitizeIncidentKey(scopeKey)
+}
+
+func opaqueAreaScopeKey(scopeKey string) string {
+	return strings.TrimPrefix(AreaIncidentID(scopeKey), "area:")
+}
+
+func isOpaqueAreaScopeKey(scopeKey string) bool {
+	clean := strings.ToLower(strings.TrimSpace(scopeKey))
+	if len(clean) != len("pub-")+8 || !strings.HasPrefix(clean, "pub-") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(clean, "pub-"))
+	return err == nil
+}
+
 func publicAreaReportID(reportID string) string {
+	if clean := strings.ToLower(strings.TrimSpace(reportID)); isHashedPublicID(clean, "area-report:pub") {
+		return clean
+	}
 	return publicStableID("area-report:pub", reportID)
 }
 
 func publicStopSightingID(reportID string) string {
+	if clean := strings.ToLower(strings.TrimSpace(reportID)); isHashedPublicID(clean, "stop-report:pub") {
+		return clean
+	}
 	return publicStableID("stop-report:pub", reportID)
 }
 
 func publicVehicleSightingID(reportID string) string {
+	if clean := strings.ToLower(strings.TrimSpace(reportID)); isHashedPublicID(clean, "vehicle-report:pub") {
+		return clean
+	}
 	return publicStableID("vehicle-report:pub", reportID)
 }
 
@@ -352,9 +584,26 @@ func publicStableID(prefix string, value string) string {
 	if clean == "" {
 		clean = "unknown"
 	}
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(clean))
-	return fmt.Sprintf("%s-%08x", strings.TrimSpace(prefix), hash.Sum32())
+	// Spacetime's TypeScript module applies FNV-1a to JavaScript charCodeAt
+	// values. Those are UTF-16 code units, not UTF-8 bytes. Keep the service
+	// hash byte-for-byte compatible so a Unicode area scope produces the same
+	// incident ID in the report, vote, and vote event payloads.
+	hash := uint32(2166136261)
+	for _, unit := range utf16.Encode([]rune(clean)) {
+		hash ^= uint32(unit)
+		hash *= 16777619
+	}
+	return fmt.Sprintf("%s-%08x", strings.TrimSpace(prefix), hash)
+}
+
+func isHashedPublicID(value, prefix string) bool {
+	clean := strings.ToLower(strings.TrimSpace(value))
+	publicPrefix := strings.ToLower(strings.TrimSpace(prefix)) + "-"
+	if len(clean) != len(publicPrefix)+8 || !strings.HasPrefix(clean, publicPrefix) {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(clean, publicPrefix))
+	return err == nil
 }
 
 func validCoordinate(value, minValue, maxValue float64) bool {
@@ -394,16 +643,97 @@ func publicAreaContext(area *model.IncidentAreaContext) *model.IncidentAreaConte
 	return &out
 }
 
+func publicAreaIncidentIDFromPayload(currentID, scopeKey string, latitude, longitude float64, radiusMeters int, description string) string {
+	cleanID := strings.ToLower(strings.TrimSpace(currentID))
+	if strings.HasPrefix(cleanID, "area:") && isOpaqueAreaScopeKey(strings.TrimPrefix(cleanID, "area:")) {
+		return cleanID
+	}
+	cleanScopeKey := strings.ToLower(strings.TrimSpace(scopeKey))
+	if isOpaqueAreaScopeKey(cleanScopeKey) {
+		return AreaIncidentID(cleanScopeKey)
+	}
+	if validCoordinate(latitude, -90, 90) && validCoordinate(longitude, -180, 180) {
+		return AreaIncidentID(AreaScopeKey(model.AreaReportInput{
+			Latitude:     latitude,
+			Longitude:    longitude,
+			RadiusMeters: radiusMeters,
+			Description:  description,
+		}))
+	}
+	if cleanScopeKey != "" {
+		return AreaIncidentID(cleanScopeKey)
+	}
+	if cleanID != "" {
+		return publicStableID("area:pub", cleanID)
+	}
+	return publicStableID("area:pub", "unknown")
+}
+
+func publicAreaIncidentIDFromContext(currentID string, area *model.IncidentAreaContext) string {
+	if area == nil {
+		return publicAreaIncidentIDFromPayload(currentID, "", math.NaN(), math.NaN(), 0, "")
+	}
+	return publicAreaIncidentIDFromPayload(
+		currentID,
+		area.ScopeKey,
+		area.Latitude,
+		area.Longitude,
+		area.RadiusMeters,
+		area.Description,
+	)
+}
+
+func publicVehicleIncidentIDFromContext(currentID string, vehicle *model.IncidentVehicleContext) string {
+	cleanID := strings.ToLower(strings.TrimSpace(currentID))
+	if isHashedPublicID(cleanID, "vehicle:pub") {
+		return cleanID
+	}
+	if vehicle != nil {
+		if scopeKey := strings.TrimSpace(vehicle.ScopeKey); scopeKey != "" {
+			return VehicleIncidentID(scopeKey)
+		}
+		return VehicleIncidentID(VehicleScopeKey(model.VehicleReportInput{
+			Mode:             vehicle.Mode,
+			RouteLabel:       vehicle.RouteLabel,
+			Direction:        vehicle.Direction,
+			Destination:      vehicle.Destination,
+			DepartureSeconds: vehicle.DepartureSeconds,
+			LiveRowID:        vehicle.LiveRowID,
+		}))
+	}
+	if cleanID != "" {
+		return publicStableID("vehicle:pub", cleanID)
+	}
+	return publicStableID("vehicle:pub", "unknown")
+}
+
+func sanitizePublicAreaReport(item model.PublicAreaReport) model.PublicAreaReport {
+	item.ID = publicAreaReportID(item.ID)
+	item.IncidentID = publicAreaIncidentIDFromPayload(
+		item.IncidentID,
+		"",
+		item.Latitude,
+		item.Longitude,
+		item.RadiusMeters,
+		item.Description,
+	)
+	item.Latitude = publicAreaCoordinate(item.Latitude)
+	item.Longitude = publicAreaCoordinate(item.Longitude)
+	item.RadiusMeters = publicAreaRadius(item.RadiusMeters)
+	item.CreatedAt = publicIncidentTime(item.CreatedAt)
+	return item
+}
+
 func publicAreaReport(item model.AreaReport) model.PublicAreaReport {
-	return model.PublicAreaReport{
+	return sanitizePublicAreaReport(model.PublicAreaReport{
 		ID:           publicAreaReportID(item.ID),
-		IncidentID:   AreaIncidentID(item.ScopeKey),
-		Latitude:     publicAreaCoordinate(item.Latitude),
-		Longitude:    publicAreaCoordinate(item.Longitude),
-		RadiusMeters: publicAreaRadius(item.RadiusMeters),
+		IncidentID:   publicAreaIncidentIDFromPayload("", item.ScopeKey, item.Latitude, item.Longitude, item.RadiusMeters, item.Description),
+		Latitude:     item.Latitude,
+		Longitude:    item.Longitude,
+		RadiusMeters: item.RadiusMeters,
 		Description:  item.Description,
 		CreatedAt:    item.CreatedAt,
-	}
+	})
 }
 
 func trimIncidentKey(value string, maxRunes int) string {
@@ -427,6 +757,131 @@ func generateID() string {
 		return fmt.Sprintf("evt-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+func submissionReportID(kind string, userID int64, identifiers ...string) (string, bool) {
+	var exactID, key string
+	if len(identifiers) == 1 {
+		key = identifiers[0]
+	} else if len(identifiers) > 1 {
+		exactID = identifiers[0]
+		key = identifiers[1]
+	}
+	if exactID = strings.TrimSpace(exactID); exactID != "" {
+		return exactID, true
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return generateID(), false
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("satiksme-report-idempotency-v1\x00%s\x00%d\x00%s", strings.TrimSpace(kind), userID, key)))
+	return hex.EncodeToString(sum[:12]), true
+}
+
+func submissionLookupSince(since, now time.Time) time.Time {
+	since = since.UTC()
+	if since.IsZero() || since.After(now.UTC()) {
+		return time.Unix(0, 0).UTC()
+	}
+	return since
+}
+
+func reconciledStopSighting(existing *model.StopSighting) model.ReportResult {
+	incidentID := ""
+	if existing != nil {
+		incidentID = StopIncidentID(existing.StopID)
+	}
+	return model.ReportResult{Accepted: true, Reconciled: true, IncidentID: incidentID}
+}
+
+func reconciledVehicleSighting(existing *model.VehicleSighting) model.ReportResult {
+	incidentID := ""
+	if existing != nil {
+		incidentID = VehicleIncidentID(vehicleSightingScopeKey(existing))
+	}
+	return model.ReportResult{Accepted: true, Reconciled: true, IncidentID: incidentID}
+}
+
+func reconciledAreaReport(existing *model.AreaReport) model.ReportResult {
+	incidentID := ""
+	if existing != nil {
+		incidentID = AreaIncidentID(areaReportScopeKey(existing))
+	}
+	return model.ReportResult{Accepted: true, Reconciled: true, IncidentID: incidentID}
+}
+
+func vehicleSightingScopeKey(existing *model.VehicleSighting) string {
+	if existing == nil {
+		return ""
+	}
+	// Existing v1 rows retain their exact private scope identity. New rows use
+	// an opaque compatibility alias, so reconstruct only those from the private
+	// fields retained alongside it.
+	if scopeKey := strings.TrimSpace(existing.ScopeKey); scopeKey != "" && !isOpaqueVehicleScopeKey(scopeKey) {
+		return scopeKey
+	}
+	return VehicleScopeKey(model.VehicleReportInput{
+		Mode:             existing.Mode,
+		RouteLabel:       existing.RouteLabel,
+		Direction:        existing.Direction,
+		Destination:      existing.Destination,
+		DepartureSeconds: existing.DepartureSeconds,
+		LiveRowID:        existing.LiveRowID,
+	})
+}
+
+func areaReportScopeKey(existing *model.AreaReport) string {
+	if existing == nil {
+		return ""
+	}
+	if scopeKey := strings.TrimSpace(existing.ScopeKey); scopeKey != "" {
+		return scopeKey
+	}
+	return AreaScopeKey(model.AreaReportInput{
+		Latitude:     existing.Latitude,
+		Longitude:    existing.Longitude,
+		RadiusMeters: existing.RadiusMeters,
+		Description:  existing.Description,
+	})
+}
+
+func (s *Service) findStopSightingByID(ctx context.Context, id string, since time.Time) (*model.StopSighting, error) {
+	items, err := s.store.ListStopSightingsSince(ctx, since, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		if items[index].ID == id {
+			return &items[index], nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *Service) findVehicleSightingByID(ctx context.Context, id string, since time.Time) (*model.VehicleSighting, error) {
+	items, err := s.store.ListVehicleSightingsSince(ctx, since, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		if items[index].ID == id {
+			return &items[index], nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *Service) findAreaReportByID(ctx context.Context, id string, since time.Time) (*model.AreaReport, error) {
+	items, err := s.store.ListAreaReportsSince(ctx, since, 0)
+	if err != nil {
+		return nil, err
+	}
+	for index := range items {
+		if items[index].ID == id {
+			return &items[index], nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *Service) mapReportLimitResult(ctx context.Context, userID int64, incidentID string, now time.Time) (model.ReportResult, bool, error) {
@@ -492,7 +947,7 @@ func buildVisibleSightings(
 			ID:        publicStopSightingID(item.ID),
 			StopID:    item.StopID,
 			StopName:  stopNames[item.StopID],
-			CreatedAt: item.CreatedAt,
+			CreatedAt: publicIncidentTime(item.CreatedAt),
 		})
 	}
 	for _, item := range vehicles {
@@ -508,7 +963,7 @@ func buildVisibleSightings(
 			Direction:        item.Direction,
 			Destination:      item.Destination,
 			DepartureSeconds: item.DepartureSeconds,
-			CreatedAt:        item.CreatedAt,
+			CreatedAt:        publicIncidentTime(item.CreatedAt),
 		})
 	}
 	for _, item := range areaReports {
@@ -518,6 +973,37 @@ func buildVisibleSightings(
 		out.AreaReports = append(out.AreaReports, publicAreaReport(item))
 	}
 	return out
+}
+
+func sanitizePublicVisibleSightings(visible model.VisibleSightings) model.VisibleSightings {
+	if visible.StopSightings != nil {
+		cloned := make([]model.PublicStopSighting, len(visible.StopSightings))
+		copy(cloned, visible.StopSightings)
+		visible.StopSightings = cloned
+	}
+	if visible.VehicleSightings != nil {
+		cloned := make([]model.PublicVehicleSighting, len(visible.VehicleSightings))
+		copy(cloned, visible.VehicleSightings)
+		visible.VehicleSightings = cloned
+	}
+	if visible.AreaReports != nil {
+		cloned := make([]model.PublicAreaReport, len(visible.AreaReports))
+		copy(cloned, visible.AreaReports)
+		visible.AreaReports = cloned
+	}
+	for index := range visible.StopSightings {
+		visible.StopSightings[index].ID = publicStopSightingID(visible.StopSightings[index].ID)
+		visible.StopSightings[index].CreatedAt = publicIncidentTime(visible.StopSightings[index].CreatedAt)
+	}
+	for index := range visible.VehicleSightings {
+		visible.VehicleSightings[index].ID = publicVehicleSightingID(visible.VehicleSightings[index].ID)
+		visible.VehicleSightings[index].LiveRowID = ""
+		visible.VehicleSightings[index].CreatedAt = publicIncidentTime(visible.VehicleSightings[index].CreatedAt)
+	}
+	for index := range visible.AreaReports {
+		visible.AreaReports[index] = sanitizePublicAreaReport(visible.AreaReports[index])
+	}
+	return visible
 }
 
 func trimVisibleSightings(visible model.VisibleSightings, limit int) model.VisibleSightings {

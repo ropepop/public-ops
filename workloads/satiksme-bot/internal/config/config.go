@@ -60,6 +60,7 @@ type Config struct {
 	SatiksmeChatAnalyzerSessionFile           string
 	SatiksmeChatAnalyzerChatID                string
 	SatiksmeChatAnalyzerPollInterval          time.Duration
+	SatiksmeChatAnalyzerCollectionPageSize    int
 	SatiksmeChatAnalyzerBatchLimit            int
 	SatiksmeChatAnalyzerMaxMessageAge         time.Duration
 	SatiksmeChatAnalyzerMinConfidence         float64
@@ -238,7 +239,11 @@ func loadCommon() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	chatAnalyzerBatchLimit, err := envOrIntStrict("SATIKSME_CHAT_ANALYZER_BATCH_LIMIT", 250)
+	chatAnalyzerCollectionPageSize, err := envOrIntStrict("SATIKSME_CHAT_ANALYZER_COLLECTION_PAGE_SIZE", 25)
+	if err != nil {
+		return Config{}, err
+	}
+	chatAnalyzerBatchLimit, err := envOrIntStrict("SATIKSME_CHAT_ANALYZER_BATCH_LIMIT", 5)
 	if err != nil {
 		return Config{}, err
 	}
@@ -375,6 +380,7 @@ func loadCommon() (Config, error) {
 		SatiksmeChatAnalyzerSessionFile:           strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_SESSION_FILE", "./state/chat-analyzer.session")),
 		SatiksmeChatAnalyzerChatID:                strings.TrimSpace(envOr("SATIKSME_CHAT_ANALYZER_CHAT_ID", "")),
 		SatiksmeChatAnalyzerPollInterval:          chatAnalyzerPollInterval,
+		SatiksmeChatAnalyzerCollectionPageSize:    chatAnalyzerCollectionPageSize,
 		SatiksmeChatAnalyzerBatchLimit:            chatAnalyzerBatchLimit,
 		SatiksmeChatAnalyzerMaxMessageAge:         chatAnalyzerMaxMessageAge,
 		SatiksmeChatAnalyzerMinConfidence:         chatAnalyzerMinConfidence,
@@ -446,8 +452,11 @@ func loadCommon() (Config, error) {
 	if cfg.SatiksmeLiveTransportPollMaxUnchangedSec < cfg.SatiksmeLiveTransportPollBaseSec {
 		cfg.SatiksmeLiveTransportPollMaxUnchangedSec = cfg.SatiksmeLiveTransportPollBaseSec
 	}
+	if cfg.SatiksmeChatAnalyzerCollectionPageSize <= 0 {
+		cfg.SatiksmeChatAnalyzerCollectionPageSize = 25
+	}
 	if cfg.SatiksmeChatAnalyzerBatchLimit <= 0 {
-		cfg.SatiksmeChatAnalyzerBatchLimit = 25
+		cfg.SatiksmeChatAnalyzerBatchLimit = 5
 	}
 	if cfg.SatiksmeChatAnalyzerMinConfidence <= 0 || cfg.SatiksmeChatAnalyzerMinConfidence > 1 {
 		return Config{}, fmt.Errorf("SATIKSME_CHAT_ANALYZER_MIN_CONFIDENCE must be between 0 and 1")

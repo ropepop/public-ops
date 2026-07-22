@@ -18,7 +18,10 @@ import (
 
 var ErrMTProtoSessionUnauthorized = errors.New("Telegram account session is not authorized")
 
-const maxStaleCatchUpPagesPerCollect = 4
+const (
+	maxStaleCatchUpPagesPerCollect = 4
+	staleCatchUpPageDelay          = 250 * time.Millisecond
+)
 
 type MTProtoCollectorConfig struct {
 	APIID         int
@@ -26,7 +29,7 @@ type MTProtoCollectorConfig struct {
 	SessionFile   string
 	ChatID        string
 	Store         store.ChatAnalyzerStore
-	BatchLimit    int
+	PageSize      int
 	MaxMessageAge time.Duration
 	Now           func() time.Time
 }
@@ -37,7 +40,7 @@ type MTProtoCollector struct {
 	sessionFile   string
 	chatID        string
 	store         store.ChatAnalyzerStore
-	batchLimit    int
+	pageSize      int
 	maxMessageAge time.Duration
 	now           func() time.Time
 }
@@ -47,9 +50,9 @@ func NewMTProtoCollector(cfg MTProtoCollectorConfig) *MTProtoCollector {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	limit := cfg.BatchLimit
-	if limit <= 0 {
-		limit = 25
+	pageSize := cfg.PageSize
+	if pageSize <= 0 {
+		pageSize = 25
 	}
 	maxMessageAge := cfg.MaxMessageAge
 	if maxMessageAge <= 0 {
@@ -61,7 +64,7 @@ func NewMTProtoCollector(cfg MTProtoCollectorConfig) *MTProtoCollector {
 		sessionFile:   strings.TrimSpace(cfg.SessionFile),
 		chatID:        strings.TrimSpace(cfg.ChatID),
 		store:         cfg.Store,
-		batchLimit:    limit,
+		pageSize:      pageSize,
 		maxMessageAge: maxMessageAge,
 		now:           now,
 	}
@@ -108,8 +111,9 @@ func (c *MTProtoCollector) Collect(ctx context.Context) (CollectionResult, error
 			lastID,
 			c.now().UTC(),
 			c.maxMessageAge,
-			c.batchLimit,
+			c.pageSize,
 			maxStaleCatchUpPagesPerCollect,
+			staleCatchUpPageDelay,
 			func(ctx context.Context, minID, limit int) ([]*tg.Message, error) {
 				return c.fetchMessages(ctx, client.API(), peer, minID, limit)
 			},
@@ -135,6 +139,7 @@ func collectForwardMessages(
 	maxMessageAge time.Duration,
 	limit int,
 	maxPages int,
+	pageDelay time.Duration,
 	fetch telegramHistoryFetcher,
 ) (CollectionResult, error) {
 	result := CollectionResult{
@@ -175,6 +180,17 @@ func collectForwardMessages(
 			break
 		}
 		cursor = nextID
+		if page+1 < maxPages && pageDelay > 0 {
+			timer := time.NewTimer(pageDelay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return CollectionResult{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 	return result, nil
 }
@@ -182,7 +198,7 @@ func collectForwardMessages(
 func containsFreshTelegramMessage(messages []*tg.Message, lastID int64, now time.Time, maxMessageAge time.Duration) bool {
 	cutoff := now.Add(-maxMessageAge)
 	for _, msg := range messages {
-		if msg == nil || int64(msg.ID) <= lastID {
+		if msg == nil || int64(msg.ID) <= lastID || strings.TrimSpace(msg.Message) == "" {
 			continue
 		}
 		messageDate := time.Unix(int64(msg.Date), 0).UTC()

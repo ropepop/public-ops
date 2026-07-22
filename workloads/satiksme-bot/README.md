@@ -54,7 +54,11 @@ Google auto-selection defaults to the `gemma_parameter` policy. It selects compa
 
 Collection accepts only messages no older than `SATIKSME_CHAT_ANALYZER_MAX_MESSAGE_AGE` (24 hours by default). Older messages are skipped before storage or model processing, while the Telegram checkpoint still advances. Pending messages that have aged beyond the same limit are expired without model processing. The sanitized internal health response reports both skipped collection and expired pending counts. Model calls are paced by `SATIKSME_CHAT_ANALYZER_MODEL_CALL_DELAY` (5 seconds by default).
 
-Telegram history is read forward from the saved checkpoint so a burst larger than one API page is not silently skipped. Source chat text remains private analyzer input; public area incidents use only a derived location label, never the source message text.
+Telegram-derived report and vote writes are retry-safe across service restarts. Before a public write, every source message receives the same private action claim. After an interrupted finalization, the next pass reconciles that claim against the already committed event before any fresh model analysis, so regrouping or reclassification cannot publish the action again.
+
+Retry delays use the private `processingAttempt` value stored with each analysis outcome. This is the logical model/application attempt count; the storage-level `attempts` column counts durable message-state writes, including the separate safety claim and final outcome writes.
+
+Telegram history is read forward from the saved checkpoint so a burst larger than one API page is not silently skipped. Collection uses `SATIKSME_CHAT_ANALYZER_COLLECTION_PAGE_SIZE` (25 messages by default), independently of `SATIKSME_CHAT_ANALYZER_BATCH_LIMIT` (5 messages by default) used for each model request. Source chat text remains private analyzer input; public area incidents use only a derived location label, never the source message text.
 
 ## Notes
 

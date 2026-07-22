@@ -2,6 +2,8 @@ package chatanalyzer
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -308,5 +310,451 @@ func TestVerifiedFreePolicyRequiresExplicitMetadata(t *testing.T) {
 	selected, ok := SelectGoogleAIModel(models, "verified_free_parameter")
 	if !ok || selected.Name != "models/gemma-4-4b-it" {
 		t.Fatalf("verified-free selection = %+v/%v", selected, ok)
+	}
+}
+
+func TestGoogleAutoModelRateLimitFallsBackOnceAndCachesAlternative(t *testing.T) {
+	now := time.Date(2026, 7, 22, 2, 30, 0, 0, time.UTC)
+	var generationModels []string
+	modelListRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			modelListRequests++
+			fmt.Fprint(w, `{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`)
+		case "/v1/chat/completions":
+			var request openAIChatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, request.Model)
+			if request.Model == "gemma-4-31b-it" {
+				w.Header().Set("Retry-After", "1200")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": request.Model,
+				"choices": []any{map[string]any{"message": map[string]any{
+					"role":    "assistant",
+					"content": `{"reports":[],"votes":[],"ignored":[{"messageId":105,"reason":"not actionable"}]}`,
+				}}},
+			})
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:           modelProviderGoogle,
+		BaseURL:            server.URL + "/v1",
+		Model:              "auto",
+		GoogleAutoModel:    true,
+		GoogleModelsURL:    server.URL + "/models",
+		GoogleModelPolicy:  "gemma_parameter",
+		GoogleRateLimitTTL: 10 * time.Minute,
+		MaxAttempts:        1,
+		Now:                func() time.Time { return now },
+	})
+	items := []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}
+	decision, _, selected, err := analyzer.AnalyzeBatch(context.Background(), items, nil)
+	if err != nil {
+		t.Fatalf("AnalyzeBatch() error = %v", err)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models = %q, want %q", got, want)
+	}
+	if selected != "gemma-4-26b-a4b-it" || decision.ModelMeta.SelectedModel != selected {
+		t.Fatalf("selected model = %q meta=%+v", selected, decision.ModelMeta)
+	}
+	if modelListRequests != 2 {
+		t.Fatalf("model list requests = %d, want initial selection plus fallback selection", modelListRequests)
+	}
+	if got, want := analyzer.rejectedModels["gemma-4-31b-it"], now.Add(20*time.Minute); !got.Equal(want) {
+		t.Fatalf("31B cooldown = %s, want provider Retry-After through %s", got, want)
+	}
+
+	if _, _, selected, err = analyzer.AnalyzeBatch(context.Background(), items, nil); err != nil {
+		t.Fatalf("second AnalyzeBatch() error = %v", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" {
+		t.Fatalf("second selected model = %q, want cached fallback", selected)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models after cached call = %q, want %q", got, want)
+	}
+	if modelListRequests != 2 {
+		t.Fatalf("model list requests after cached call = %d, want 2", modelListRequests)
+	}
+
+	now = now.Add(20 * time.Minute)
+	if _, _, selected, err = analyzer.AnalyzeBatch(context.Background(), items, nil); err != nil {
+		t.Fatalf("post-cooldown AnalyzeBatch() error = %v", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" {
+		t.Fatalf("post-cooldown selected model = %q, want successful fallback", selected)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it,gemma-4-26b-a4b-it,gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models after cooldown = %q, want %q", got, want)
+	}
+	if modelListRequests != 4 {
+		t.Fatalf("model list requests after cooldown = %d, want preferred model reconsidered plus fallback", modelListRequests)
+	}
+}
+
+func TestGoogleAutoModelLongRetryAfterFallsBackBeforeContextDeadline(t *testing.T) {
+	var generationModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			fmt.Fprint(w, `{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`)
+		case "/v1/chat/completions":
+			var request openAIChatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, request.Model)
+			if request.Model == "gemma-4-31b-it" {
+				w.Header().Set("Retry-After", "3600")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": request.Model,
+				"choices": []any{map[string]any{"message": map[string]any{
+					"role":    "assistant",
+					"content": `{"reports":[],"votes":[],"ignored":[{"messageId":105,"reason":"not actionable"}]}`,
+				}}},
+			})
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           server.URL + "/v1",
+		Model:             "auto",
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   server.URL + "/models",
+		GoogleModelPolicy: "gemma_parameter",
+	})
+	if analyzer.maxAttempts != defaultModelMaxAttempts {
+		t.Fatalf("max attempts = %d, want production default %d", analyzer.maxAttempts, defaultModelMaxAttempts)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, selected, err := analyzer.AnalyzeBatch(ctx, []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if err != nil {
+		t.Fatalf("AnalyzeBatch() error = %v, want fallback before long Retry-After exhausts context", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" {
+		t.Fatalf("selected model = %q, want 26B fallback", selected)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models = %q, want %q", got, want)
+	}
+}
+
+func TestGoogleAutoModelTimeoutFallsBackWithFreshRequestDeadline(t *testing.T) {
+	now := time.Date(2026, 7, 22, 4, 0, 0, 0, time.UTC)
+	var generationModels []string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/models":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`,
+				)),
+			}, nil
+		case "/v1/chat/completions":
+			var payload openAIChatCompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, payload.Model)
+			if payload.Model == "gemma-4-31b-it" {
+				<-request.Context().Done()
+				return nil, request.Context().Err()
+			}
+			if err := request.Context().Err(); err != nil {
+				t.Fatalf("fallback request context is already done: %v", err)
+			}
+			if deadline, ok := request.Context().Deadline(); !ok || !deadline.After(time.Now()) {
+				t.Fatalf("fallback request deadline = %v ok=%t, want a live deadline", deadline, ok)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"model":"gemma-4-26b-a4b-it","choices":[{"message":{"role":"assistant","content":"{\"reports\":[],\"votes\":[],\"ignored\":[{\"messageId\":105,\"reason\":\"not actionable\"}]}"}}]}`,
+				)),
+			}, nil
+		default:
+			t.Fatalf("unexpected request path %q", request.URL.Path)
+			return nil, fmt.Errorf("unexpected request")
+		}
+	})}
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:           modelProviderGoogle,
+		BaseURL:            "https://model.invalid/v1",
+		Model:              "auto",
+		HTTPClient:         client,
+		Timeout:            20 * time.Millisecond,
+		GoogleAutoModel:    true,
+		GoogleModelsURL:    "https://model.invalid/models",
+		GoogleModelPolicy:  "gemma_parameter",
+		GoogleRateLimitTTL: 10 * time.Minute,
+		MaxAttempts:        1,
+		Now:                func() time.Time { return now },
+	})
+
+	decision, _, selected, err := analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if err != nil {
+		t.Fatalf("AnalyzeBatch() error = %v, want timeout fallback", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" || decision.ModelMeta.SelectedModel != selected {
+		t.Fatalf("selected model = %q meta=%+v, want 26B fallback", selected, decision.ModelMeta)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models = %q, want %q", got, want)
+	}
+	if got, want := analyzer.rejectedModels["gemma-4-31b-it"], now.Add(10*time.Minute); !got.Equal(want) {
+		t.Fatalf("timed-out model cooldown = %s, want %s", got, want)
+	}
+}
+
+func TestGoogleAutoModelDoesNotFallbackAfterCallerDeadline(t *testing.T) {
+	var generationModels []string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/models":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`,
+				)),
+			}, nil
+		case "/v1/chat/completions":
+			var payload openAIChatCompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, payload.Model)
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		default:
+			t.Fatalf("unexpected request path %q", request.URL.Path)
+			return nil, fmt.Errorf("unexpected request")
+		}
+	})}
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           "https://model.invalid/v1",
+		Model:             "auto",
+		HTTPClient:        client,
+		Timeout:           time.Second,
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   "https://model.invalid/models",
+		GoogleModelPolicy: "gemma_parameter",
+		MaxAttempts:       1,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, _, err := analyzer.AnalyzeBatch(ctx, []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AnalyzeBatch() error = %v, want caller deadline", err)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it"; got != want {
+		t.Fatalf("generation models = %q, want no work after caller deadline", got)
+	}
+}
+
+func TestGoogleAutoModelTimeoutFallbackIsBoundedAcrossBothModels(t *testing.T) {
+	var generationModels []string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/models":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`,
+				)),
+			}, nil
+		case "/v1/chat/completions":
+			var payload openAIChatCompletionRequest
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, payload.Model)
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		default:
+			t.Fatalf("unexpected request path %q", request.URL.Path)
+			return nil, fmt.Errorf("unexpected request")
+		}
+	})}
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           "https://model.invalid/v1",
+		Model:             "auto",
+		HTTPClient:        client,
+		Timeout:           15 * time.Millisecond,
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   "https://model.invalid/models",
+		GoogleModelPolicy: "gemma_parameter",
+		MaxAttempts:       1,
+	})
+	started := time.Now()
+	_, _, selected, err := analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AnalyzeBatch() error = %v, want final model deadline", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" {
+		t.Fatalf("selected model = %q, want final attempted model", selected)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("bounded generation models = %q, want %q", got, want)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded timeout fallback took %s", elapsed)
+	}
+}
+
+func TestGoogleAutoModelRateLimitFallbackIsBounded(t *testing.T) {
+	var generationModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			fmt.Fprint(w, `{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`)
+		case "/v1/chat/completions":
+			var request openAIChatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, request.Model)
+			w.WriteHeader(http.StatusTooManyRequests)
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           server.URL + "/v1",
+		Model:             "auto",
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   server.URL + "/models",
+		GoogleModelPolicy: "gemma_parameter",
+		MaxAttempts:       1,
+	})
+	_, _, _, err := analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	var statusErr *modelHTTPError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("AnalyzeBatch() error = %v, want final 429", err)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("bounded generation models = %q, want %q", got, want)
+	}
+}
+
+func TestGoogleAutoModelInvalidAcceptedResponseFallsBackOnce(t *testing.T) {
+	var generationModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			fmt.Fprint(w, `{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`)
+		case "/v1/chat/completions":
+			var request openAIChatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, request.Model)
+			content := `{"reports":[`
+			if request.Model == "gemma-4-26b-a4b-it" {
+				content = `{"reports":[],"votes":[],"ignored":[{"messageId":105,"reason":"not actionable"}]}`
+			}
+			fmt.Fprintf(w, `{"model":%q,"choices":[{"message":{"role":"assistant","content":%q}}]}`, request.Model, content)
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           server.URL + "/v1",
+		Model:             "auto",
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   server.URL + "/models",
+		GoogleModelPolicy: "gemma_parameter",
+		MaxAttempts:       1,
+	})
+	decision, _, selected, err := analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if err != nil {
+		t.Fatalf("AnalyzeBatch() error = %v, want structured-output fallback", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" || decision.ModelMeta.SelectedModel != selected {
+		t.Fatalf("selected model = %q meta=%+v, want 26B fallback", selected, decision.ModelMeta)
+	}
+	if _, _, selected, err = analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil); err != nil {
+		t.Fatalf("cached fallback AnalyzeBatch() error = %v", err)
+	}
+	if selected != "gemma-4-26b-a4b-it" {
+		t.Fatalf("cached selected model = %q, want 26B", selected)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("generation models = %q, want %q", got, want)
+	}
+}
+
+func TestAnalyzerErrorCodeClassifiesInvalidModelOutput(t *testing.T) {
+	validationErr := &modelOutputError{cause: errors.New("invalid batch decision JSON: unexpected end of JSON input")}
+	if got, want := analyzerErrorCode(validationErr), "model_output_invalid"; got != want {
+		t.Fatalf("analyzerErrorCode() = %q, want %q", got, want)
+	}
+	if got, want := analyzerErrorCodeText(validationErr.Error()), "model_output_invalid"; got != want {
+		t.Fatalf("analyzerErrorCodeText() = %q, want %q", got, want)
+	}
+}
+
+func TestGoogleAutoModelInvalidAcceptedResponseFallbackIsBounded(t *testing.T) {
+	var generationModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			fmt.Fprint(w, `{"models":[{"name":"models/gemma-4-31b-it","supportedGenerationMethods":["generateContent"]},{"name":"models/gemma-4-26b-a4b-it","supportedGenerationMethods":["generateContent"]}]}`)
+		case "/v1/chat/completions":
+			var request openAIChatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			generationModels = append(generationModels, request.Model)
+			fmt.Fprintf(w, `{"model":%q,"choices":[{"message":{"role":"assistant","content":"{\\\"reports\\\":["},"finish_reason":"length"}]}`, request.Model)
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	analyzer := NewOpenAIAnalyzer(OpenAIAnalyzerOptions{
+		Provider:          modelProviderGoogle,
+		BaseURL:           server.URL + "/v1",
+		Model:             "auto",
+		GoogleAutoModel:   true,
+		GoogleModelsURL:   server.URL + "/models",
+		GoogleModelPolicy: "gemma_parameter",
+		MaxAttempts:       1,
+	})
+	_, _, _, err := analyzer.AnalyzeBatch(context.Background(), []BatchItem{{Message: testMessage("chat:1", 105, 4, "test")}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid batch decision JSON") || !strings.Contains(err.Error(), "model output was truncated") {
+		t.Fatalf("AnalyzeBatch() error = %v, want final structured-output error", err)
+	}
+	if got, want := strings.Join(generationModels, ","), "gemma-4-31b-it,gemma-4-26b-a4b-it"; got != want {
+		t.Fatalf("bounded generation models = %q, want %q", got, want)
 	}
 }

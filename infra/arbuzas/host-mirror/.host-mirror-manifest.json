@@ -37,13 +37,13 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "838669ea7cdeb045b83ae845c369467230e52e21fb126d58006c6960b36a2ae5",
-      "size": 1927
+      "sha256": "b88325cfb9f6d4c5171f46508fcfc36cb5a9a945f6c5c22608abaebefc48e30d",
+      "size": 1897
     },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 384,
-      "sha256": "ce0ac65ecfd9c104b7adce1f96d429d17b6c3ac167b2043a3739a924d0c3ccb9",
-      "size": 4093
+      "sha256": "dd22c5476e5516803e33db10f029358420d0b99d8c4db937bf842b96275f4044",
+      "size": 4139
     },
     "etc/arbuzas/env/subscription-bot.env": {
       "mode": 384,
@@ -52,7 +52,7 @@
     },
     "etc/arbuzas/env/ticket-remote.env": {
       "mode": 384,
-      "sha256": "66deb4c4c30cc3f0c2f49ccaaac1435ee495d5fb85522da1975c0a8fa1c6fd39",
+      "sha256": "65d7ba374e9207ec291b00ceea3b9eb1939403fbdc052f49804e43973ac3a7fc",
       "size": 1356
     },
     "etc/arbuzas/env/train-bot.env": {
@@ -147,5 +147,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1784686438
+  "updatedEpochSeconds": 1784697552
 }

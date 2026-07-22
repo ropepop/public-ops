@@ -214,6 +214,18 @@ func (s *SQLiteStore) InsertVehicleSighting(ctx context.Context, sighting model.
 			departure_seconds, live_row_id, scope_key, is_hidden, created_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			stop_id = excluded.stop_id,
+			user_id = excluded.user_id,
+			mode = excluded.mode,
+			route_label = excluded.route_label,
+			direction = excluded.direction,
+			destination = excluded.destination,
+			departure_seconds = excluded.departure_seconds,
+			live_row_id = excluded.live_row_id,
+			scope_key = excluded.scope_key,
+			is_hidden = excluded.is_hidden,
+			created_at = excluded.created_at
 	`, sighting.ID, sighting.StopID, sighting.UserID, sighting.Mode, sighting.RouteLabel, sighting.Direction, sighting.Destination, sighting.DepartureSeconds, sighting.LiveRowID, sighting.ScopeKey, boolToInt(sighting.Hidden), sighting.CreatedAt.UTC().Format(time.RFC3339))
 	return err
 }
@@ -355,6 +367,15 @@ func (s *SQLiteStore) InsertAreaReport(ctx context.Context, report model.AreaRep
 			scope_key, is_hidden, created_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			user_id = excluded.user_id,
+			latitude = excluded.latitude,
+			longitude = excluded.longitude,
+			radius_meters = excluded.radius_meters,
+			description = excluded.description,
+			scope_key = excluded.scope_key,
+			is_hidden = excluded.is_hidden,
+			created_at = excluded.created_at
 	`, report.ID, report.UserID, report.Latitude, report.Longitude, report.RadiusMeters, strings.TrimSpace(report.Description), strings.TrimSpace(report.ScopeKey), boolToInt(report.Hidden), report.CreatedAt.UTC().Format(time.RFC3339))
 	return err
 }
@@ -478,6 +499,7 @@ func (s *SQLiteStore) UpsertIncidentVote(ctx context.Context, vote model.Inciden
 		ON CONFLICT(incident_id, user_id) DO UPDATE SET
 			nickname = excluded.nickname,
 			vote_value = excluded.vote_value,
+			created_at = excluded.created_at,
 			updated_at = excluded.updated_at
 	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.UTC().Format(time.RFC3339), updatedAt.UTC().Format(time.RFC3339))
 	return err
@@ -517,6 +539,7 @@ func recordIncidentVoteTx(ctx context.Context, tx *sql.Tx, vote model.IncidentVo
 		ON CONFLICT(incident_id, user_id) DO UPDATE SET
 			nickname = excluded.nickname,
 			vote_value = excluded.vote_value,
+			created_at = excluded.created_at,
 			updated_at = excluded.updated_at
 	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.UTC().Format(time.RFC3339), updatedAt.UTC().Format(time.RFC3339)); err != nil {
 		return err
@@ -524,6 +547,13 @@ func recordIncidentVoteTx(ctx context.Context, tx *sql.Tx, vote model.IncidentVo
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO incident_vote_events(id, incident_id, user_id, nickname, vote_value, source, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			incident_id = excluded.incident_id,
+			user_id = excluded.user_id,
+			nickname = excluded.nickname,
+			vote_value = excluded.vote_value,
+			source = excluded.source,
+			created_at = excluded.created_at
 	`, event.ID, event.IncidentID, event.UserID, strings.TrimSpace(event.Nickname), string(event.Value), string(event.Source), eventAt.UTC().Format(time.RFC3339)); err != nil {
 		return err
 	}
@@ -672,21 +702,29 @@ func (s *SQLiteStore) InsertIncidentComment(ctx context.Context, comment model.I
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO incident_comments(id, incident_id, user_id, nickname, body, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			incident_id = excluded.incident_id,
+			user_id = excluded.user_id,
+			nickname = excluded.nickname,
+			body = excluded.body,
+			created_at = excluded.created_at
 	`, comment.ID, comment.IncidentID, comment.UserID, strings.TrimSpace(comment.Nickname), strings.TrimSpace(comment.Body), comment.CreatedAt.UTC().Format(time.RFC3339))
 	return err
 }
 
 func (s *SQLiteStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]model.IncidentComment, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		SELECT id, incident_id, user_id, nickname, body, created_at
 		FROM incident_comments
 		WHERE incident_id = ?
 		ORDER BY created_at DESC, id DESC
-		LIMIT ?
-	`, strings.TrimSpace(incidentID), limit)
+	`
+	args := []any{strings.TrimSpace(incidentID)}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

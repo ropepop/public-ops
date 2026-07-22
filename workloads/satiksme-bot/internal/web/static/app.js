@@ -3883,7 +3883,7 @@
       setPublicIncidentDetailLoading(nextIncidentId, true);
       renderIncidentDetail();
     }
-    if (spacetimeEnabled()) {
+    if (spacetimeEnabled() && nextIncidentId.indexOf("area:") !== 0) {
       return ensureLiveTransportRealtimeStarted().then(function () {
         var snapshotDetail = currentSpacetimeIncidentDetail(nextIncidentId);
         if (snapshotDetail) {
@@ -3909,8 +3909,9 @@
       });
     }
     return fetchJSON(pathFor("/api/v1/public/incidents/" + encodeURIComponent(nextIncidentId))).then(function (payload) {
-      state.publicIncidentSelectedId = nextIncidentId;
-      syncIncidentURL(nextIncidentId);
+      var canonicalIncidentId = payload && payload.summary && String(payload.summary.id || "").trim() || nextIncidentId;
+      state.publicIncidentSelectedId = canonicalIncidentId;
+      syncIncidentURL(canonicalIncidentId);
       syncLiveTransportClientScope();
       var changed = !sameMaterialValue(state.publicIncidentDetail, payload);
       if (changed) {
@@ -6596,22 +6597,14 @@
 
   function submitAreaReport(payload) {
     var normalized = normalizeAreaReportPayload(payload);
-    var bundleIdentity = activeBundleIdentity();
-    var request = spacetimeEnabled()
-      ? callSpacetimeProcedure("satiksmebot_submit_area_report", [
-          Number(normalized.latitude),
-          Number(normalized.longitude),
-          Number(normalized.radiusMeters),
-          String(normalized.description || ""),
-          bundleIdentity.version,
-          bundleIdentity.generatedAt,
-        ], {})
-      : fetchJSON(pathFor("/api/v1/reports/area"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(normalized),
-          credentials: "same-origin",
-        });
+    // Keep area reports behind the Go compatibility boundary until the live
+    // Spacetime module has completed its non-destructive privacy migration.
+    var request = fetchJSON(pathFor("/api/v1/reports/area"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(normalized),
+      credentials: "same-origin",
+    });
     return request
       .then(function (result) {
         if (result.accepted) {
@@ -6629,7 +6622,7 @@
   }
 
   function submitIncidentVote(incidentId, value) {
-    var request = spacetimeEnabled()
+    var request = spacetimeEnabled() && String(incidentId || "").indexOf("area:") !== 0
       ? callSpacetimeProcedure("satiksmebot_vote_incident", [incidentId, value], {})
       : fetchJSON(pathFor("/api/v1/incidents/" + encodeURIComponent(incidentId) + "/votes"), {
           method: "POST",
@@ -6658,7 +6651,7 @@
   function submitIncidentComment(incidentId) {
     var input = document.getElementById("incident-comment-body");
     var body = input ? String(input.value || "") : "";
-    var request = spacetimeEnabled()
+    var request = spacetimeEnabled() && String(incidentId || "").indexOf("area:") !== 0
       ? callSpacetimeProcedure("satiksmebot_comment_incident", [incidentId, body], {})
       : fetchJSON(pathFor("/api/v1/incidents/" + encodeURIComponent(incidentId) + "/comments"), {
           method: "POST",
@@ -6942,6 +6935,7 @@
       submitAreaReport: submitAreaReport,
       normalizeAreaReportPayload: normalizeAreaReportPayload,
       submitIncidentVote: submitIncidentVote,
+      submitIncidentComment: submitIncidentComment,
       openIncidentDetailView: openIncidentDetailView,
       closeIncidentDetailOverlay: closeIncidentDetailOverlay,
       navigateToIncidentPage: navigateToIncidentPage,

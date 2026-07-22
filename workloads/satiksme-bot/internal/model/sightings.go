@@ -93,6 +93,7 @@ type VisibleSightings struct {
 type ReportResult struct {
 	Accepted          bool          `json:"accepted"`
 	Deduped           bool          `json:"deduped"`
+	Reconciled        bool          `json:"-"`
 	RateLimited       bool          `json:"rateLimited,omitempty"`
 	Reason            string        `json:"reason,omitempty"`
 	CooldownRemaining time.Duration `json:"-"`

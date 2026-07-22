@@ -169,7 +169,7 @@ func TestIncidentDetailIgnoresVotesAndCommentsOlderThan24Hours(t *testing.T) {
 	if detail.Summary.Resolved {
 		t.Fatalf("detail.Summary.Resolved = true, want false")
 	}
-	if len(detail.Comments) != 1 || detail.Comments[0].ID != "comment-recent" {
+	if len(detail.Comments) != 1 || detail.Comments[0].ID != publicIncidentCommentID(incidentID, "comment-recent", now.Add(-15*time.Minute)) {
 		t.Fatalf("detail.Comments = %#v", detail.Comments)
 	}
 }

@@ -35,6 +35,9 @@ function publicIncidentNickname(): string {
 }
 
 const vehicleContextDoc = t.object('SatiksmeVehicleContextDoc', {
+  // Retained for non-destructive upgrades from the v1 public schema. Public
+  // projections always write an empty value.
+  scopeKey: t.string(),
   stopId: t.string(),
   stopName: t.string(),
   mode: t.string(),
@@ -42,9 +45,13 @@ const vehicleContextDoc = t.object('SatiksmeVehicleContextDoc', {
   direction: t.string(),
   destination: t.string(),
   departureSeconds: t.u32(),
+  // Retained for v1 schema compatibility; never populated publicly.
+  liveRowId: t.string(),
 });
 
 const areaContextDoc = t.object('SatiksmeAreaContextDoc', {
+  // Retained for v1 schema compatibility; never populated publicly.
+  scopeKey: t.string(),
   latitude: t.number(),
   longitude: t.number(),
   radiusMeters: t.u32(),
@@ -67,11 +74,15 @@ const satiksmebot_stop_catalog = table(
   { name: named('stop_catalog'), public: true },
   {
     id: t.string().primaryKey(),
+    // Retained for v1 schema compatibility; always empty in public rows.
+    liveId: t.string(),
     name: t.string(),
     latitude: t.number(),
     longitude: t.number(),
     modes: t.array(t.string()),
     routeLabels: t.array(t.string()),
+    // Retained for v1 schema compatibility; always empty in public rows.
+    nearbyStopIds: t.array(t.string()),
   }
 );
 
@@ -313,6 +324,8 @@ const satiksmebot_public_vehicle_sighting = table(
     direction: t.string(),
     destination: t.string(),
     departureSeconds: t.u32(),
+    // Retained for v1 schema compatibility; never populated publicly.
+    liveRowId: t.string(),
     createdAt: t.string().index(),
   }
 );
@@ -348,6 +361,7 @@ const satiksmebot_public_incident = table(
     resolved: t.bool(),
     vehicle: t.option(vehicleContextDoc),
     area: t.option(areaContextDoc).default({
+      scopeKey: '',
       latitude: 0,
       longitude: 0,
       radiusMeters: 0,
@@ -385,12 +399,23 @@ const satiksmebot_public_live_snapshot_state = table(
     feed: t.string().primaryKey(),
     version: t.string(),
     path: t.string(),
+    // Retained v1 columns are deliberately inert on the public table.
+    hash: t.string(),
+    publishedAt: t.string(),
+    lastSuccessAt: t.string(),
+    lastAttemptAt: t.string(),
+    status: t.string(),
+    consecutiveFailures: t.u32(),
+    vehicleCount: t.u32(),
     updatedAt: t.string().index(),
   }
 );
 
 const satiksmebot_live_viewer_heartbeat = table(
-  { name: named('live_viewer_heartbeat') },
+  // The v1 table must remain public for a non-destructive schema update. It is
+  // an empty compatibility shell; current viewer state lives only in the
+  // private satiksmebot_live_viewer_state table.
+  { name: named('live_viewer_heartbeat'), public: true },
   {
     sessionId: t.string().primaryKey(),
     page: t.string().index(),
@@ -486,6 +511,16 @@ function parseISO(value: string | undefined | null): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function publicTimestamp(value: unknown): string {
+  const raw = asString(value).trim();
+  const parsed = parseISO(raw);
+  if (!parsed) {
+    return raw;
+  }
+  parsed.setUTCMilliseconds(0);
+  return parsed.toISOString().replace('.000Z', 'Z');
+}
+
 function compareTimeAscending(left: string | undefined, right: string | undefined): number {
   return (parseISO(left || '')?.getTime() || 0) - (parseISO(right || '')?.getTime() || 0);
 }
@@ -575,6 +610,10 @@ function stopIncidentID(stopId: string): string {
 }
 
 function vehicleIncidentID(scopeKey: string): string {
+  const clean = scopeKey.trim().toLowerCase();
+  if (/^pub-[0-9a-f]{8}$/.test(clean)) {
+    return `vehicle:${clean}`;
+  }
   return `vehicle:pub-${fnv1a32Hex(scopeKey)}`;
 }
 
@@ -589,6 +628,10 @@ function fnv1a32Hex(value: string): string {
 }
 
 function publicAreaIncidentID(scopeKey: string): string {
+  const clean = scopeKey.trim().toLowerCase();
+  if (/^pub-[0-9a-f]{8}$/.test(clean)) {
+    return `area:${clean}`;
+  }
   return `area:pub-${fnv1a32Hex(scopeKey)}`;
 }
 
@@ -633,9 +676,35 @@ function vehicleScopeKey(payload: any): string {
   const destination = asString(payload?.destination).trim().toLowerCase();
   const liveRowId = asString(payload?.liveRowId).trim();
   if (liveRowId) {
-    return `live:${mode}:${routeLabel}:${direction}:pub-${fnv1a32Hex(liveRowId)}`;
+    // This is private storage identity and must stay byte-for-byte compatible
+    // with the v1 module and the Go service. Only the incident ID derived from
+    // it is exposed, and that ID is opaque.
+    return `live:${mode}:${routeLabel}:${direction}:${liveRowId}`;
   }
   return `fallback:${mode}:${routeLabel}:${direction}:${destination}`;
+}
+
+function opaqueVehicleScopeKey(logicalScopeKey: string): string {
+  return vehicleIncidentID(logicalScopeKey).slice('vehicle:'.length);
+}
+
+function vehicleLogicalScopeKey(row: any): string {
+  const storedScopeKey = asString(row?.scopeKey).trim();
+  if (storedScopeKey && !/^pub-[0-9a-f]{8}$/i.test(storedScopeKey)) {
+    return storedScopeKey;
+  }
+  return vehicleScopeKey(row);
+}
+
+function ensureVehiclePublicIDAvailable(tx: any, logicalScopeKey: string): void {
+  const cleanLogicalScopeKey = asString(logicalScopeKey).trim();
+  const opaqueScopeKey = opaqueVehicleScopeKey(cleanLogicalScopeKey);
+  for (const row of rowsFrom(tx.db.satiksmebot_vehicle_sighting.iter())) {
+    const existingLogicalScopeKey = vehicleLogicalScopeKey(row);
+    if (opaqueVehicleScopeKey(existingLogicalScopeKey) === opaqueScopeKey && existingLogicalScopeKey !== cleanLogicalScopeKey) {
+      throw new SenderError('opaque vehicle incident collision');
+    }
+  }
 }
 
 function normalizeAreaRadius(value: unknown): number {
@@ -670,6 +739,7 @@ function publicAreaContext(row: any) {
     return undefined;
   }
   return {
+    scopeKey: '',
     latitude: publicAreaCoordinate(latitude),
     longitude: publicAreaCoordinate(longitude),
     radiusMeters,
@@ -679,13 +749,15 @@ function publicAreaContext(row: any) {
 
 function publicVehicleContext(row: any, stopName: string) {
   return {
+    scopeKey: '',
     stopId: asString(row.stopId).trim(),
     stopName,
     mode: asString(row.mode).trim(),
     routeLabel: asString(row.routeLabel).trim(),
-    direction: asString(row.direction).trim(),
+    direction: normalizeDirection(asString(row.direction)),
     destination: asString(row.destination).trim(),
     departureSeconds: Number(row.departureSeconds) || 0,
+    liveRowId: '',
   };
 }
 
@@ -698,7 +770,7 @@ function publicAreaReportPayload(row: any) {
     longitude: Number(area?.longitude) || 0,
     radiusMeters: Number(area?.radiusMeters) || 0,
     description: asString(area?.description).trim(),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 
@@ -931,11 +1003,13 @@ function sanitizeStopCatalogRow(item: any): any | null {
   }
   return {
     id,
+    liveId: '',
     name: asString(item?.name).trim(),
     latitude: Number(item?.latitude) || 0,
     longitude: Number(item?.longitude) || 0,
     modes: Array.isArray(item?.modes) ? item.modes.map((value: any) => asString(value).trim()).filter(Boolean) : [],
     routeLabels: Array.isArray(item?.routeLabels) ? item.routeLabels.map((value: any) => asString(value).trim()).filter(Boolean) : [],
+    nearbyStopIds: [],
   };
 }
 
@@ -1133,7 +1207,7 @@ function sanitizeVehicleSighting(tx: any, item: any): any {
     hidden: item?.hidden === true,
     createdAt: trimOptional(asString(item?.createdAt)) || new Date().toISOString(),
   };
-  payload.scopeKey = payload.liveRowId ? vehicleScopeKey(payload) : (payload.scopeKey || vehicleScopeKey(payload));
+  payload.scopeKey = payload.scopeKey || opaqueVehicleScopeKey(vehicleScopeKey(payload));
   return payload;
 }
 
@@ -1664,8 +1738,9 @@ function refreshPublicProjections(tx: any): void {
   const incidents = new Map<string, any>();
 
   for (const row of rowsFrom(tx.db.satiksmebot_stop_sighting.iter())) {
-    const createdAt = asString(row.createdAt).trim();
-    const createdMs = parseISO(createdAt)?.getTime() || 0;
+    const sourceCreatedAt = asString(row.createdAt).trim();
+    const createdAt = publicTimestamp(sourceCreatedAt);
+    const createdMs = parseISO(sourceCreatedAt)?.getTime() || 0;
     if (row.hidden === true || createdMs < incidentSinceMs) {
       continue;
     }
@@ -1713,16 +1788,17 @@ function refreshPublicProjections(tx: any): void {
   }
 
   for (const row of rowsFrom(tx.db.satiksmebot_vehicle_sighting.iter())) {
-    const createdAt = asString(row.createdAt).trim();
-    const createdMs = parseISO(createdAt)?.getTime() || 0;
+    const sourceCreatedAt = asString(row.createdAt).trim();
+    const createdAt = publicTimestamp(sourceCreatedAt);
+    const createdMs = parseISO(sourceCreatedAt)?.getTime() || 0;
     if (row.hidden === true || createdMs < incidentSinceMs) {
       continue;
     }
     const stopId = asString(row.stopId).trim();
     const stop = stopCatalogRow(tx, stopId);
     const stopName = asString(stop?.name).trim();
-    const publicScopeKey = vehicleScopeKey(row);
-    const incidentId = vehicleIncidentID(publicScopeKey);
+    const storedScopeKey = asString(row.scopeKey).trim() || vehicleScopeKey(row);
+    const incidentId = vehicleIncidentID(storedScopeKey);
     const event = {
       id: asString(row.id).trim(),
       kind: 'report',
@@ -1762,17 +1838,19 @@ function refreshPublicProjections(tx: any): void {
         stopName,
         mode: asString(row.mode).trim(),
         routeLabel: asString(row.routeLabel).trim(),
-        direction: asString(row.direction).trim(),
+        direction: normalizeDirection(asString(row.direction)),
         destination: asString(row.destination).trim(),
         departureSeconds: Number(row.departureSeconds) || 0,
+        liveRowId: '',
         createdAt,
       });
     }
   }
 
   for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter())) {
-    const createdAt = asString(row.createdAt).trim();
-    const createdMs = parseISO(createdAt)?.getTime() || 0;
+    const sourceCreatedAt = asString(row.createdAt).trim();
+    const createdAt = publicTimestamp(sourceCreatedAt);
+    const createdMs = parseISO(sourceCreatedAt)?.getTime() || 0;
     if (row.hidden === true || createdMs < incidentSinceMs) {
       continue;
     }
@@ -1838,7 +1916,7 @@ function refreshPublicProjections(tx: any): void {
         kind: asString(event.source).trim(),
         name: incidentVoteLabel(asString(event.value)),
         nickname: publicIncidentNickname(),
-        createdAt: asString(event.createdAt).trim(),
+        createdAt: publicTimestamp(event.createdAt),
       });
     }
     for (const event of incident.events) {
@@ -1866,7 +1944,7 @@ function refreshPublicProjections(tx: any): void {
     if (voteEvents.length > 0) {
       const latestEvent = voteEvents.slice().sort((left: any, right: any) => compareTimeDescending(asString(left.createdAt), asString(right.createdAt)))[0];
       incident.lastReportName = incidentVoteLabel(asString(latestEvent.value));
-      incident.lastReportAt = asString(latestEvent.createdAt).trim();
+      incident.lastReportAt = publicTimestamp(latestEvent.createdAt);
       incident.lastReporter = publicIncidentNickname();
     }
     tx.db.satiksmebot_public_incident.insert({
@@ -1876,7 +1954,7 @@ function refreshPublicProjections(tx: any): void {
       subjectName: incident.subjectName,
       stopId: incident.stopId,
       lastReportName: incident.lastReportName,
-      lastReportAt: incident.lastReportAt,
+      lastReportAt: publicTimestamp(incident.lastReportAt),
       lastReporter: publicIncidentNickname(),
       commentCount: comments.length,
       ongoingVotes,
@@ -1893,16 +1971,16 @@ function refreshPublicProjections(tx: any): void {
         kind: event.kind,
         name: event.name,
         nickname: publicIncidentNickname(),
-        createdAt: event.createdAt,
+        createdAt: publicTimestamp(event.createdAt),
       });
     }
     for (const comment of comments) {
       tx.db.satiksmebot_public_incident_comment.insert({
-        id: publicIncidentCommentID(incident.id, asString(comment.id).trim(), asString(comment.createdAt).trim()),
+        id: publicIncidentCommentID(incident.id, asString(comment.id).trim(), publicTimestamp(comment.createdAt)),
         incidentId: incident.id,
         nickname: publicIncidentNickname(),
         body: asString(comment.body).trim(),
-        createdAt: asString(comment.createdAt).trim(),
+        createdAt: publicTimestamp(comment.createdAt),
       });
     }
   }
@@ -1922,7 +2000,7 @@ function incidentSummaryPayload(tx: any, row: any, viewerStableId: string) {
     subjectName: asString(row.subjectName).trim(),
     stopId: asString(row.stopId).trim(),
     lastReportName: asString(row.lastReportName).trim(),
-    lastReportAt: asString(row.lastReportAt).trim(),
+    lastReportAt: publicTimestamp(row.lastReportAt),
     lastReporter: publicIncidentNickname(),
     commentCount: Number(row.commentCount) || 0,
     votes: {
@@ -1946,7 +2024,7 @@ function visibleSightingsPayload(tx: any, stopId: string, limit: number) {
       id: asString(row.id).trim(),
       stopId: asString(row.stopId).trim(),
       stopName: asString(row.stopName).trim(),
-      createdAt: asString(row.createdAt).trim(),
+      createdAt: publicTimestamp(row.createdAt),
     }));
   let vehicleSightings = rowsFrom(tx.db.satiksmebot_public_vehicle_sighting.iter())
     .filter((row) => !cleanStopId || asString(row.stopId).trim() === cleanStopId)
@@ -1960,7 +2038,7 @@ function visibleSightingsPayload(tx: any, stopId: string, limit: number) {
       direction: asString(row.direction).trim(),
       destination: asString(row.destination).trim(),
       departureSeconds: Number(row.departureSeconds) || 0,
-      createdAt: asString(row.createdAt).trim(),
+      createdAt: publicTimestamp(row.createdAt),
     }));
   let areaReports = cleanStopId ? [] : rowsFrom(tx.db.satiksmebot_public_area_report.iter())
     .sort((left, right) => compareTimeDescending(asString(left.createdAt), asString(right.createdAt)))
@@ -2111,7 +2189,9 @@ function submitVehicleReportImpl(tx: any, payload: any, bundleVersion: string, b
   if (stopId) {
     requireStopCatalogRow(tx, stopId);
   }
-  const scopeKey = vehicleScopeKey(payload);
+  const logicalScopeKey = vehicleScopeKey(payload);
+  ensureVehiclePublicIDAvailable(tx, logicalScopeKey);
+  const scopeKey = opaqueVehicleScopeKey(logicalScopeKey);
   const incidentId = vehicleIncidentID(scopeKey);
   const stableId = asString(reporter.stableId).trim();
   const createdAt = nowISO(tx);
@@ -2137,7 +2217,7 @@ function submitVehicleReportImpl(tx: any, payload: any, bundleVersion: string, b
     userId: asString(reporter.userId).trim(),
     mode: asString(payload?.mode).trim(),
     routeLabel: asString(payload?.routeLabel).trim(),
-    direction: normalizeDirection(asString(payload?.direction)),
+    direction: asString(payload?.direction).trim(),
     destination: asString(payload?.destination).trim(),
     departureSeconds: asInt(payload?.departureSeconds),
     liveRowId: asString(payload?.liveRowId).trim(),
@@ -2206,6 +2286,9 @@ function recordServiceStopSightingWithVotePayload(tx: any, sightingJson: string,
   const vote = sanitizeIncidentVote(tx, parseJSON(voteJson, 'invalid vote'));
   const event = sanitizeIncidentVoteEvent(tx, parseJSON(eventJson, 'invalid vote event'));
   validateServiceReportVotePair(sighting, vote, event, stopIncidentID(asString(sighting.stopId).trim()));
+  if (tx.db.satiksmebot_stop_sighting.id.find(sighting.id)) {
+    return { deduped: true, reason: 'idempotent_replay' };
+  }
   if (sighting.hidden !== true) {
     const stableId = asString(sighting.stableId).trim();
     const createdAt = asString(sighting.createdAt).trim();
@@ -2237,6 +2320,9 @@ function recordServiceVehicleSightingWithVotePayload(tx: any, sightingJson: stri
   const vote = sanitizeIncidentVote(tx, parseJSON(voteJson, 'invalid vote'));
   const event = sanitizeIncidentVoteEvent(tx, parseJSON(eventJson, 'invalid vote event'));
   validateServiceReportVotePair(sighting, vote, event, vehicleIncidentID(asString(sighting.scopeKey).trim()));
+  if (tx.db.satiksmebot_vehicle_sighting.id.find(sighting.id)) {
+    return { deduped: true, reason: 'idempotent_replay' };
+  }
   if (sighting.hidden !== true) {
     const stableId = asString(sighting.stableId).trim();
     const scopeKey = asString(sighting.scopeKey).trim();
@@ -2269,6 +2355,9 @@ function recordServiceAreaReportWithVotePayload(tx: any, reportJson: string, vot
   const vote = sanitizeIncidentVote(tx, parseJSON(voteJson, 'invalid vote'));
   const event = sanitizeIncidentVoteEvent(tx, parseJSON(eventJson, 'invalid vote event'));
   validateServiceReportVotePair(report, vote, event, areaIncidentID(asString(report.scopeKey).trim()));
+  if (tx.db.satiksmebot_area_report.id.find(report.id)) {
+    return { deduped: true, reason: 'idempotent_replay' };
+  }
   if (report.hidden !== true) {
     const stableId = asString(report.stableId).trim();
     const scopeKey = asString(report.scopeKey).trim();
@@ -2313,6 +2402,79 @@ function validateServiceReportVotePair(sighting: any, vote: any, event: any, inc
   }
 }
 
+function clearLegacyPublicViewerHeartbeats(tx: any): void {
+  for (const row of rowsFrom(tx.db.satiksmebot_live_viewer_heartbeat.iter())) {
+    tx.db.satiksmebot_live_viewer_heartbeat.sessionId.delete(asString(row.sessionId).trim());
+  }
+}
+
+function scrubLegacyPublicCompatibilityFields(tx: any): void {
+  clearLegacyPublicViewerHeartbeats(tx);
+  for (const row of rowsFrom(tx.db.satiksmebot_stop_catalog.iter())) {
+    if (asString(row.liveId) === '' && rowsFrom(row.nearbyStopIds || []).length === 0) {
+      continue;
+    }
+    tx.db.satiksmebot_stop_catalog.id.delete(asString(row.id).trim());
+    tx.db.satiksmebot_stop_catalog.insert({
+      ...row,
+      liveId: '',
+      nearbyStopIds: [],
+    });
+  }
+  for (const row of rowsFrom(tx.db.satiksmebot_public_vehicle_sighting.iter())) {
+    if (asString(row.liveRowId) === '') {
+      continue;
+    }
+    tx.db.satiksmebot_public_vehicle_sighting.id.delete(asString(row.id).trim());
+    tx.db.satiksmebot_public_vehicle_sighting.insert({
+      ...row,
+      liveRowId: '',
+    });
+  }
+  for (const row of rowsFrom(tx.db.satiksmebot_public_incident.iter())) {
+    const vehicle = row.vehicle
+      ? { ...row.vehicle, scopeKey: '', liveRowId: '' }
+      : undefined;
+    const area = row.area
+      ? { ...row.area, scopeKey: '' }
+      : undefined;
+    const dirtyVehicle = asString(row.vehicle?.scopeKey) !== '' || asString(row.vehicle?.liveRowId) !== '';
+    const dirtyArea = asString(row.area?.scopeKey) !== '';
+    if (!dirtyVehicle && !dirtyArea) {
+      continue;
+    }
+    tx.db.satiksmebot_public_incident.id.delete(asString(row.id).trim());
+    tx.db.satiksmebot_public_incident.insert({
+      ...row,
+      vehicle,
+      area,
+    });
+  }
+  for (const row of rowsFrom(tx.db.satiksmebot_public_live_snapshot_state.iter())) {
+    const dirty = asString(row.hash) !== ''
+      || asString(row.publishedAt) !== ''
+      || asString(row.lastSuccessAt) !== ''
+      || asString(row.lastAttemptAt) !== ''
+      || asString(row.status) !== ''
+      || Number(row.consecutiveFailures) !== 0
+      || Number(row.vehicleCount) !== 0;
+    if (!dirty) {
+      continue;
+    }
+    tx.db.satiksmebot_public_live_snapshot_state.feed.delete(asString(row.feed).trim());
+    tx.db.satiksmebot_public_live_snapshot_state.insert({
+      ...row,
+      hash: '',
+      publishedAt: '',
+      lastSuccessAt: '',
+      lastAttemptAt: '',
+      status: '',
+      consecutiveFailures: 0,
+      vehicleCount: 0,
+    });
+  }
+}
+
 function upsertLiveViewerPayload(tx: any, sessionId: string, page: string, visible: boolean) {
   const cleanSessionId = asString(sessionId).trim();
   if (!cleanSessionId) {
@@ -2320,13 +2482,7 @@ function upsertLiveViewerPayload(tx: any, sessionId: string, page: string, visib
   }
   const cleanPage = asString(page).trim() || 'map';
   const updatedAt = nowISO(tx);
-  const next = {
-    sessionId: cleanSessionId,
-    page: cleanPage,
-    lastSeenAt: updatedAt,
-  };
-  tx.db.satiksmebot_live_viewer_heartbeat.sessionId.delete(cleanSessionId);
-  tx.db.satiksmebot_live_viewer_heartbeat.insert(next);
+  clearLegacyPublicViewerHeartbeats(tx);
   tx.db.satiksmebot_live_viewer_state.sessionId.delete(cleanSessionId);
   tx.db.satiksmebot_live_viewer_state.insert({
     sessionId: cleanSessionId,
@@ -2335,7 +2491,9 @@ function upsertLiveViewerPayload(tx: any, sessionId: string, page: string, visib
     updatedAt,
   });
   return {
-    ...next,
+    sessionId: cleanSessionId,
+    page: cleanPage,
+    lastSeenAt: updatedAt,
     visible: visible === true,
     updatedAt,
   };
@@ -2380,7 +2538,7 @@ function publicIncidentDetailPayload(tx: any, incidentId: string) {
       kind: asString(item.kind).trim(),
       name: asString(item.name).trim(),
       nickname: publicIncidentNickname(),
-      createdAt: asString(item.createdAt).trim(),
+      createdAt: publicTimestamp(item.createdAt),
     }));
   const comments = rowsFrom(tx.db.satiksmebot_public_incident_comment.incidentId.filter(summary.id))
     .sort((left, right) => compareTimeAscending(asString(left.createdAt), asString(right.createdAt)))
@@ -2389,7 +2547,7 @@ function publicIncidentDetailPayload(tx: any, incidentId: string) {
       incidentId: summary.id,
       nickname: publicIncidentNickname(),
       body: asString(item.body).trim(),
-      createdAt: asString(item.createdAt).trim(),
+      createdAt: publicTimestamp(item.createdAt),
     }));
   return { summary, events, comments };
 }
@@ -2401,6 +2559,13 @@ function upsertLiveSnapshotStatePayload(tx: any, stateJson: string) {
     feed,
     version: asString(item?.version).trim(),
     path: asString(item?.path).trim(),
+    hash: '',
+    publishedAt: '',
+    lastSuccessAt: '',
+    lastAttemptAt: '',
+    status: '',
+    consecutiveFailures: 0,
+    vehicleCount: 0,
     updatedAt: nowISO(tx),
   };
   tx.db.satiksmebot_public_live_snapshot_state.feed.delete(feed);
@@ -2410,13 +2575,11 @@ function upsertLiveSnapshotStatePayload(tx: any, stateJson: string) {
 
 function countLiveViewersPayload(tx: any, activeSinceIso: string) {
   const cutoffMs = parseISO(activeSinceIso)?.getTime() || 0;
-  const count = rowsFrom(tx.db.satiksmebot_live_viewer_heartbeat.iter())
+  clearLegacyPublicViewerHeartbeats(tx);
+  const count = rowsFrom(tx.db.satiksmebot_live_viewer_state.iter())
     .filter((row) => {
-      const sessionId = asString(row.sessionId).trim();
-      if (!liveViewerVisible(tx, sessionId)) {
-        return false;
-      }
-      return (parseISO(asString(row.lastSeenAt))?.getTime() || 0) >= cutoffMs;
+      return row.visible === true
+        && (parseISO(asString(row.updatedAt))?.getTime() || 0) >= cutoffMs;
     })
     .length;
   return { count };
@@ -2586,9 +2749,15 @@ function incidentMustExist(tx: any, incidentId: string): any {
 export const schemaInfo = spacetimedb.procedure(
   { name: named('schema_info') },
   t.string(),
-  () => serialize({
-    module: SATIKSMEBOT_SCHEMA_MODULE,
-    schemaVersion: SATIKSMEBOT_SCHEMA_VERSION,
+  (ctx) => ctx.withTx((tx) => {
+    // The backend calls schema_info before accepting the module. Clear any
+    // retained rows from the formerly active v1 public heartbeat table before
+    // the updated service is considered ready.
+    scrubLegacyPublicCompatibilityFields(tx);
+    return serialize({
+      module: SATIKSMEBOT_SCHEMA_MODULE,
+      schemaVersion: SATIKSMEBOT_SCHEMA_VERSION,
+    });
   })
 );
 
@@ -2939,14 +3108,7 @@ export const serviceCleanupLiveViewers = spacetimedb.reducer(
     const tx = ctx;
     requireServiceRole(tx);
     const cutoffMs = parseISO(cutoffIso)?.getTime() || 0;
-    for (const row of rowsFrom(tx.db.satiksmebot_live_viewer_heartbeat.iter())) {
-      const lastSeenMs = parseISO(asString(row.lastSeenAt))?.getTime() || 0;
-      if (lastSeenMs < cutoffMs) {
-        const cleanSessionId = asString(row.sessionId).trim();
-        tx.db.satiksmebot_live_viewer_heartbeat.sessionId.delete(cleanSessionId);
-        tx.db.satiksmebot_live_viewer_state.sessionId.delete(cleanSessionId);
-      }
-    }
+    clearLegacyPublicViewerHeartbeats(tx);
     for (const row of rowsFrom(tx.db.satiksmebot_live_viewer_state.iter())) {
       const updatedMs = parseISO(asString(row.updatedAt))?.getTime() || 0;
       if (updatedMs < cutoffMs) {

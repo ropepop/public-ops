@@ -195,7 +195,7 @@ func (s Settings) withDefaults() Settings {
 		s.PollInterval = 30 * time.Second
 	}
 	if s.BatchLimit <= 0 {
-		s.BatchLimit = 250
+		s.BatchLimit = 5
 	}
 	if s.ProcessStartMinute < 0 || s.ProcessStartMinute >= 24*60 {
 		s.ProcessStartMinute = 8 * 60

@@ -5789,6 +5789,46 @@ def assert_satiksme_public_json(path, payload):
         if vehicle_id.count(':') >= 2:
             raise SystemExit(f'{path} liveVehicles[{index}].id looks like a raw feed id: {vehicle_id!r}')
 
+def assert_satiksme_map_area_ids(path, payload):
+    if not isinstance(payload, dict):
+        raise SystemExit(f'{path} payload is malformed')
+    area_incidents = payload.get('areaIncidents')
+    sightings = payload.get('sightings')
+    if not isinstance(area_incidents, list) or not isinstance(sightings, dict):
+        raise SystemExit(f'{path} is missing its area collections')
+    area_reports = sightings.get('areaReports', [])
+    if not isinstance(area_reports, list):
+        raise SystemExit(f'{path} is missing its area report list')
+    if len(area_reports) >= 500:
+        raise SystemExit(f'{path} reached the area validation limit and may be truncated')
+    for incident in area_incidents:
+        if not isinstance(incident, dict) or not re.fullmatch(r'area:pub-[0-9a-f]{8}', str(incident.get('id', '')).strip()):
+            raise SystemExit(f'{path} contains a non-opaque area incident id')
+    for report in area_reports:
+        if not isinstance(report, dict) or not re.fullmatch(r'area:pub-[0-9a-f]{8}', str(report.get('incidentId', '')).strip()):
+            raise SystemExit(f'{path} contains a non-opaque area sighting incident id')
+
+def assert_satiksme_sighting_ids(path, payload):
+    if not isinstance(payload, dict):
+        raise SystemExit(f'{path} sightings payload is malformed')
+    sightings = payload.get('sightings') if isinstance(payload.get('sightings'), dict) else payload
+    stop_rows = sightings.get('stopSightings')
+    vehicle_rows = sightings.get('vehicleSightings')
+    area_rows = sightings.get('areaReports', [])
+    if not isinstance(stop_rows, list) or not isinstance(vehicle_rows, list) or not isinstance(area_rows, list):
+        raise SystemExit(f'{path} is missing its sighting collections')
+    for row in stop_rows:
+        if not isinstance(row, dict) or not re.fullmatch(r'stop-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+            raise SystemExit(f'{path} contains a non-opaque stop sighting id')
+    for row in vehicle_rows:
+        if not isinstance(row, dict):
+            raise SystemExit(f'{path} contains a malformed vehicle sighting')
+        if not re.fullmatch(r'vehicle-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+            raise SystemExit(f'{path} contains a non-opaque vehicle sighting id')
+    for row in area_rows:
+        if not isinstance(row, dict) or not re.fullmatch(r'area-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+            raise SystemExit(f'{path} contains a non-opaque area sighting id')
+
 def assert_shell_route(path, expected_mode, expect_leaflet=True, expect_telegram_webapp=False):
     status, route_headers, route_body = request(path)
     if status != 200:
@@ -6098,32 +6138,67 @@ assert_public_json_cache_not_long_immutable('/api/v1/public/catalog', catalog_he
 catalog_payload = json.loads(catalog_body)
 assert_satiksme_public_json('/api/v1/public/catalog', catalog_payload)
 
-for path in ['/api/v1/public/live-vehicles?limit=1', '/api/v1/public/map-live?limit=1', '/api/v1/public/map?limit=1']:
+for path in ['/api/v1/public/live-vehicles?limit=1', '/api/v1/public/map-live?limit=500', '/api/v1/public/map?limit=500']:
     status, public_headers, public_body = request(path)
     if status != 200:
         raise SystemExit(f'{path} status {status}: {public_body[:200]}')
     assert_no_satiksme_headers(path, public_headers)
     assert_noindex(path, public_headers)
     assert_public_json_cache_not_long_immutable(path, public_headers)
-    assert_satiksme_public_json(path, json.loads(public_body))
+    public_payload = json.loads(public_body)
+    assert_satiksme_public_json(path, public_payload)
+    if '/public/map' in path:
+        assert_satiksme_map_area_ids(path, public_payload)
+        assert_satiksme_sighting_ids(path, public_payload)
 
-status, incidents_headers, incidents_body = request('/api/v1/public/incidents?limit=1')
+sightings_path = '/api/v1/public/sightings?limit=500'
+status, sightings_headers, sightings_body = request(sightings_path)
+if status != 200:
+    raise SystemExit(f'public sightings status {status}: {sightings_body[:200]}')
+assert_no_satiksme_headers(sightings_path, sightings_headers)
+assert_noindex(sightings_path, sightings_headers)
+assert_public_json_cache_not_long_immutable(sightings_path, sightings_headers)
+sightings_payload = json.loads(sightings_body)
+assert_satiksme_public_json(sightings_path, sightings_payload)
+assert_satiksme_sighting_ids(sightings_path, sightings_payload)
+area_reports = sightings_payload.get('areaReports', []) if isinstance(sightings_payload, dict) else None
+if not isinstance(area_reports, list):
+    raise SystemExit('public sightings is missing the area report list')
+if len(area_reports) >= 500:
+    raise SystemExit('public sightings reached the validation limit and may be truncated')
+for area_report in area_reports:
+    if not isinstance(area_report, dict):
+        raise SystemExit('public area sighting row is malformed')
+    current_id = str(area_report.get('incidentId', '')).strip()
+    if not re.fullmatch(r'area:pub-[0-9a-f]{8}', current_id):
+        raise SystemExit('public area sighting incident id is not opaque')
+
+status, incidents_headers, incidents_body = request('/api/v1/public/incidents')
 if status != 200:
     raise SystemExit(f'public incidents status {status}: {incidents_body[:200]}')
-assert_no_satiksme_headers('/api/v1/public/incidents?limit=1', incidents_headers)
-assert_noindex('/api/v1/public/incidents?limit=1', incidents_headers)
-assert_public_json_cache_not_long_immutable('/api/v1/public/incidents?limit=1', incidents_headers)
+assert_no_satiksme_headers('/api/v1/public/incidents', incidents_headers)
+assert_noindex('/api/v1/public/incidents', incidents_headers)
+assert_public_json_cache_not_long_immutable('/api/v1/public/incidents', incidents_headers)
 incidents_payload = json.loads(incidents_body)
-assert_satiksme_public_json('/api/v1/public/incidents?limit=1', incidents_payload)
-incident_id = ''
-for incident in incidents_payload.get('incidents', []) if isinstance(incidents_payload, dict) else []:
-    if isinstance(incident, dict) and str(incident.get('id', '')).strip():
-        current_id = str(incident.get('id')).strip()
-        if current_id.startswith('area:') and not re.fullmatch(r'area:pub-[0-9a-f]{8}', current_id):
-            raise SystemExit(f'public area incident id is not opaque: {current_id!r}')
-        incident_id = current_id
-        break
-if incident_id:
+assert_satiksme_public_json('/api/v1/public/incidents', incidents_payload)
+incident_rows = incidents_payload.get('incidents') if isinstance(incidents_payload, dict) else None
+if not isinstance(incident_rows, list):
+    raise SystemExit('public incidents is missing the incident list')
+incident_ids = []
+for incident in incident_rows:
+    if not isinstance(incident, dict):
+        raise SystemExit('public incident row is malformed')
+    current_id = str(incident.get('id', '')).strip()
+    if not current_id:
+        raise SystemExit('public incident row is missing its id')
+    if str(incident.get('scope', '')).strip() == 'area' or current_id.startswith('area:'):
+        if not re.fullmatch(r'area:pub-[0-9a-f]{8}', current_id):
+            raise SystemExit('public area incident id is not opaque')
+    if str(incident.get('scope', '')).strip() == 'vehicle' or current_id.startswith('vehicle:'):
+        if not re.fullmatch(r'vehicle:pub-[0-9a-f]{8}', current_id):
+            raise SystemExit('public vehicle incident id is not opaque')
+    incident_ids.append(current_id)
+for incident_index, incident_id in enumerate(incident_ids):
     detail_path = '/api/v1/public/incidents/' + urllib.parse.quote(incident_id, safe='')
     status, detail_headers, detail_body = request(detail_path)
     if status != 200:
@@ -6133,6 +6208,18 @@ if incident_id:
     assert_public_json_cache_not_long_immutable(detail_path, detail_headers)
     detail_payload = json.loads(detail_body)
     assert_satiksme_public_json(detail_path, detail_payload)
+    detail_summary = detail_payload.get('summary') if isinstance(detail_payload, dict) else None
+    if not isinstance(detail_summary, dict):
+        raise SystemExit('public incident detail is missing its summary')
+    detail_id = str(detail_summary.get('id', '')).strip()
+    if detail_id != incident_id:
+        raise SystemExit('public incident detail id does not match its list id')
+    if str(detail_summary.get('scope', '')).strip() == 'area' or incident_id.startswith('area:'):
+        if not re.fullmatch(r'area:pub-[0-9a-f]{8}', detail_id):
+            raise SystemExit('public area incident detail id is not opaque')
+    if str(detail_summary.get('scope', '')).strip() == 'vehicle' or incident_id.startswith('vehicle:'):
+        if not re.fullmatch(r'vehicle:pub-[0-9a-f]{8}', detail_id):
+            raise SystemExit('public vehicle incident detail id is not opaque')
     for event in detail_payload.get('events', []) if isinstance(detail_payload, dict) else []:
         if not isinstance(event, dict):
             continue
@@ -6142,17 +6229,25 @@ if incident_id:
         for raw_marker in ['channel:', 'stop:', 'vehicle:', 'area:', 'liveRowId', 'scopeKey']:
             if raw_marker in event_id:
                 raise SystemExit(f'public incident detail event id exposes raw marker {raw_marker}: {event_id!r}')
-    status, _, _ = request(detail_path, method='HEAD')
-    if status != 200:
-        raise SystemExit(f'HEAD {detail_path} returned {status}, want 200')
-    for method in ['POST', 'OPTIONS']:
-        status, detail_method_headers, detail_method_body = request(detail_path, method=method, body='' if method == 'POST' else None)
-        if status != 405:
-            raise SystemExit(f'{method} {detail_path} returned {status}, want 405: {detail_method_body[:200]}')
-        allow = detail_method_headers.get('allow')
-        if allow != 'GET, HEAD':
-            raise SystemExit(f'{method} {detail_path} Allow header {allow!r}, want GET, HEAD')
-        assert_no_cors(detail_path, detail_method_headers)
+    for comment in detail_payload.get('comments', []) if isinstance(detail_payload, dict) else []:
+        if not isinstance(comment, dict):
+            raise SystemExit('public incident detail contains a malformed comment')
+        if not re.fullmatch(r'incident-comment:pub-[0-9a-f]{8}', str(comment.get('id', '')).strip()):
+            raise SystemExit('public incident detail comment id is not opaque')
+        if str(comment.get('nickname', '')).strip() != 'anonīmi':
+            raise SystemExit('public incident detail comment exposes a reporter identity')
+    if incident_index == 0:
+        status, _, _ = request(detail_path, method='HEAD')
+        if status != 200:
+            raise SystemExit(f'HEAD {detail_path} returned {status}, want 200')
+        for method in ['POST', 'OPTIONS']:
+            status, detail_method_headers, detail_method_body = request(detail_path, method=method, body='' if method == 'POST' else None)
+            if status != 405:
+                raise SystemExit(f'{method} {detail_path} returned {status}, want 405: {detail_method_body[:200]}')
+            allow = detail_method_headers.get('allow')
+            if allow != 'GET, HEAD':
+                raise SystemExit(f'{method} {detail_path} Allow header {allow!r}, want GET, HEAD')
+            assert_no_cors(detail_path, detail_method_headers)
 
 status, bundle_headers, bundle_body = request('/bundles/active.json')
 if status != 200:
@@ -6346,7 +6441,9 @@ trap 'rm -f \"\${config_tmp}\" \"\${tmp}\"' EXIT
 wait_until_ok compose exec -T satiksme_bot sh -lc 'printf \"%s\n%s\n\" \"\${SATIKSME_RUNTIME_SPACETIME_HOST:-\${SATIKSME_WEB_SPACETIME_HOST}}\" \"\${SATIKSME_RUNTIME_SPACETIME_DATABASE:-\${SATIKSME_WEB_SPACETIME_DATABASE}}\"' > \"\${config_tmp}\"
 cat > \"\${tmp}\" <<'PY'
 import json
+import math
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -6373,6 +6470,42 @@ def anonymous_sql(query):
     except urllib.error.HTTPError as error:
         return error.code, error.read().decode('utf-8', 'replace')
 
+def anonymous_rows(query, label):
+    status, body = anonymous_sql(query)
+    if not (200 <= status < 300):
+        raise SystemExit(f'anonymous SQL could not inspect {label}: HTTP {status}')
+    try:
+        statements = json.loads(body)
+        rows = []
+        for statement in statements:
+            elements = statement.get('schema', {}).get('elements', [])
+            names = []
+            for element in elements:
+                raw_name = element.get('name', '') if isinstance(element, dict) else ''
+                if isinstance(raw_name, dict):
+                    raw_name = raw_name.get('some', raw_name.get('Some', ''))
+                names.append(str(raw_name))
+            for values in statement.get('rows', []):
+                if not isinstance(values, list) or len(values) != len(names):
+                    raise ValueError('row shape mismatch')
+                rows.append(dict(zip(names, values)))
+        return rows
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(f'anonymous SQL returned malformed {label} data')
+
+def neutral_compatibility_value(value):
+    return value in ('', None, 0, False) or value == [] or value == {}
+
+def assert_no_nonempty_internal_fields(value, label):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in ('liveId', 'nearbyStopIds', 'liveRowId', 'scopeKey') and not neutral_compatibility_value(child):
+                raise SystemExit(f'{label} exposes a non-empty internal compatibility field')
+            assert_no_nonempty_internal_fields(child, label)
+    elif isinstance(value, list):
+        for child in value:
+            assert_no_nonempty_internal_fields(child, label)
+
 def call(name, args):
     procedure = urllib.parse.quote(name, safe='')
     url = f'{spacetime_host}/v1/database/{database}/call/{procedure}'
@@ -6385,7 +6518,6 @@ def call(name, args):
         return error.code, error.read().decode('utf-8', 'replace')
 
 for table in [
-    'satiksmebot_live_viewer_heartbeat',
     'satiksmebot_live_viewer_state',
     'satiksmebot_reporter_identity',
     'satiksmebot_stop_sighting',
@@ -6406,12 +6538,77 @@ for table in [
     if 200 <= status < 300:
         raise SystemExit(f'anonymous SQL unexpectedly reached private table {table}: {status} {body[:200]}')
 
-status, body = anonymous_sql('SELECT * FROM satiksmebot_public_live_snapshot_state WHERE 1 = 0')
-if not (200 <= status < 300):
-    raise SystemExit(f'anonymous SQL could not inspect public live snapshot table layout: {status} {body[:200]}')
-for forbidden in ['hash', 'publishedAt', 'lastSuccessAt', 'lastAttemptAt', 'status', 'consecutiveFailures', 'vehicleCount']:
-    if forbidden in body:
-        raise SystemExit(f'public live snapshot table exposes {forbidden}: {body[:300]}')
+heartbeat_rows = anonymous_rows('SELECT * FROM satiksmebot_live_viewer_heartbeat', 'legacy public viewer heartbeat table')
+if heartbeat_rows:
+    raise SystemExit('legacy public viewer heartbeat table is not empty')
+
+catalog_rows = anonymous_rows('SELECT * FROM satiksmebot_stop_catalog', 'public stop catalog')
+for row in catalog_rows:
+    if not neutral_compatibility_value(row.get('liveId')) or not neutral_compatibility_value(row.get('nearbyStopIds')):
+        raise SystemExit('public stop catalog exposes internal compatibility data')
+
+snapshot_rows = anonymous_rows('SELECT * FROM satiksmebot_public_live_snapshot_state', 'public live snapshot state')
+for row in snapshot_rows:
+    for field in ['hash', 'publishedAt', 'lastSuccessAt', 'lastAttemptAt', 'status', 'consecutiveFailures', 'vehicleCount']:
+        if not neutral_compatibility_value(row.get(field)):
+            raise SystemExit('public live snapshot state exposes internal diagnostic data')
+
+stop_rows = anonymous_rows('SELECT * FROM satiksmebot_public_stop_sighting', 'public stop sightings')
+for row in stop_rows:
+    if not re.fullmatch(r'stop-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+        raise SystemExit('direct public stop sighting id is not opaque')
+
+vehicle_rows = anonymous_rows('SELECT * FROM satiksmebot_public_vehicle_sighting', 'public vehicle sightings')
+for row in vehicle_rows:
+    if not re.fullmatch(r'vehicle-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+        raise SystemExit('direct public vehicle sighting id is not opaque')
+    if not re.fullmatch(r'vehicle:pub-[0-9a-f]{8}', str(row.get('incidentId', '')).strip()):
+        raise SystemExit('direct public vehicle incident id is not opaque')
+    assert_no_nonempty_internal_fields(row, 'direct public vehicle sighting')
+
+area_rows = anonymous_rows('SELECT * FROM satiksmebot_public_area_report', 'public area reports')
+for row in area_rows:
+    if not re.fullmatch(r'area-report:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+        raise SystemExit('direct public area report id is not opaque')
+    if not re.fullmatch(r'area:pub-[0-9a-f]{8}', str(row.get('incidentId', '')).strip()):
+        raise SystemExit('direct public area incident id is not opaque')
+    for field in ['latitude', 'longitude']:
+        try:
+            coordinate = float(row.get(field))
+        except (TypeError, ValueError):
+            raise SystemExit('direct public area report coordinate is malformed')
+        if not math.isfinite(coordinate) or abs((coordinate * 1000) - round(coordinate * 1000)) > 1e-8:
+            raise SystemExit('direct public area report coordinate is too precise')
+    if int(row.get('radiusMeters') or 0) < 250:
+        raise SystemExit('direct public area report radius is too precise')
+
+incident_rows = anonymous_rows('SELECT * FROM satiksmebot_public_incident', 'public incidents')
+for row in incident_rows:
+    scope = str(row.get('scope', '')).strip()
+    incident_id = str(row.get('id', '')).strip()
+    if scope == 'area' and not re.fullmatch(r'area:pub-[0-9a-f]{8}', incident_id):
+        raise SystemExit('direct public area incident id is not opaque')
+    if scope == 'vehicle' and not re.fullmatch(r'vehicle:pub-[0-9a-f]{8}', incident_id):
+        raise SystemExit('direct public vehicle incident id is not opaque')
+    if scope in ('area', 'vehicle') and str(row.get('subjectId', '')).strip():
+        raise SystemExit('direct public incident exposes an internal subject id')
+    if str(row.get('lastReporter', '')).strip() != 'anonīmi':
+        raise SystemExit('direct public incident exposes a reporter identity')
+    assert_no_nonempty_internal_fields(row, 'direct public incident')
+
+event_rows = anonymous_rows('SELECT * FROM satiksmebot_public_incident_event', 'public incident events')
+for row in event_rows:
+    if not re.fullmatch(r'incident-event:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+        raise SystemExit('direct public incident event id is not opaque')
+    if str(row.get('nickname', '')).strip() != 'anonīmi':
+        raise SystemExit('direct public incident event exposes a reporter identity')
+
+comment_rows = anonymous_rows('SELECT * FROM satiksmebot_public_incident_comment', 'public incident comments')
+for row in comment_rows:
+    if not re.fullmatch(r'incident-comment:pub-[0-9a-f]{8}', str(row.get('id', '')).strip()):
+        raise SystemExit('direct public incident comment id is not opaque')
+    if str(row.get('nickname', '')).strip() != 'anonīmi':
+        raise SystemExit('direct public incident comment exposes a reporter identity')
 
 for name, args in [
     ('satiksmebot_bootstrap_me', []),

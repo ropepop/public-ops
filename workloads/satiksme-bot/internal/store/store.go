@@ -8,7 +8,10 @@ import (
 	"satiksmebot/internal/model"
 )
 
-var ErrDuplicateReport = errors.New("duplicate report")
+var (
+	ErrDuplicateReport            = errors.New("duplicate report")
+	ErrReportVoteIncidentMismatch = errors.New("report and vote incident mismatch")
+)
 
 type CleanupResult struct {
 	StopSightingsDeleted    int64

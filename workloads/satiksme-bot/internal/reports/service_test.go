@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -40,11 +41,169 @@ func TestSubmitVehicleSightingUsesFallbackScopeWithoutLiveID(t *testing.T) {
 	if !result.Accepted || item == nil {
 		t.Fatalf("expected accepted report, got %+v item=%v", result, item)
 	}
-	if want := "fallback:tram:1:b-a:imanta"; item.ScopeKey != want {
+	if want := opaqueVehicleScopeKey(VehicleScopeKey(input)); item.ScopeKey != want {
 		t.Fatalf("ScopeKey = %q, want %q", item.ScopeKey, want)
 	}
 	if item.StopID != "" {
 		t.Fatalf("StopID = %q, want empty", item.StopID)
+	}
+}
+
+func TestIdempotentSubmissionsReconcileBeforeRateLimitsOrOverwrite(t *testing.T) {
+	now := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Second)
+	options := SubmitOptions{
+		Source:           model.IncidentVoteSourceTelegramChat,
+		IdempotencyKey:   "private-chat:1001",
+		IdempotencySince: now.Add(-time.Minute),
+	}
+
+	t.Run("stop", func(t *testing.T) {
+		ctx, st, svc := newIncidentTestService(t)
+		firstResult, first, err := svc.SubmitStopSightingWithOptions(ctx, 701, "3012", now, options)
+		if err != nil || !firstResult.Accepted || first == nil {
+			t.Fatalf("first submission = %+v item=%v err=%v", firstResult, first, err)
+		}
+		secondResult, second, err := svc.SubmitStopSightingWithOptions(ctx, 701, "different-stop", retryAt, options)
+		if err != nil || !secondResult.Accepted || second == nil {
+			t.Fatalf("retry submission = %+v item=%v err=%v", secondResult, second, err)
+		}
+		if !secondResult.Reconciled || secondResult.IncidentID != StopIncidentID("3012") || second.StopID != "3012" {
+			t.Fatalf("retry reconciliation = %+v item=%+v, want original stop authoritative", secondResult, second)
+		}
+		if second.ID != first.ID {
+			t.Fatalf("retry report ID = %q, want %q", second.ID, first.ID)
+		}
+		if strings.Contains(first.ID, options.IdempotencyKey) {
+			t.Fatalf("private idempotency key leaked into report ID %q", first.ID)
+		}
+		sightings, err := st.ListStopSightingsSince(ctx, now.Add(-time.Hour), "", 0)
+		if err != nil || len(sightings) != 1 {
+			t.Fatalf("stop sightings = %+v err=%v, want one", sightings, err)
+		}
+		events, err := st.ListIncidentVoteEvents(ctx, StopIncidentID("3012"), now.Add(-time.Hour), 0)
+		if err != nil || len(events) != 1 {
+			t.Fatalf("stop vote events = %+v err=%v, want one", events, err)
+		}
+	})
+
+	t.Run("vehicle", func(t *testing.T) {
+		ctx, st, svc := newIncidentTestService(t)
+		input := model.VehicleReportInput{
+			Mode:             "bus",
+			RouteLabel:       "22",
+			Direction:        "a-b",
+			Destination:      "Lidosta",
+			DepartureSeconds: 360,
+			LiveRowID:        "live-22",
+		}
+		firstResult, first, err := svc.SubmitVehicleSightingWithOptions(ctx, 702, input, now, options)
+		if err != nil || !firstResult.Accepted || first == nil {
+			t.Fatalf("first submission = %+v item=%v err=%v", firstResult, first, err)
+		}
+		retryInput := input
+		retryInput.RouteLabel = "99"
+		retryInput.LiveRowID = "different-live-row"
+		secondResult, second, err := svc.SubmitVehicleSightingWithOptions(ctx, 702, retryInput, retryAt, options)
+		if err != nil || !secondResult.Accepted || second == nil || second.ID != first.ID {
+			t.Fatalf("retry submission = %+v item=%v err=%v, want ID %q", secondResult, second, err, first.ID)
+		}
+		if !secondResult.Reconciled || second.ScopeKey != first.ScopeKey {
+			t.Fatalf("retry reconciliation = %+v item=%+v, want original vehicle authoritative", secondResult, second)
+		}
+		sightings, err := st.ListVehicleSightingsSince(ctx, now.Add(-time.Hour), "", 0)
+		if err != nil || len(sightings) != 1 {
+			t.Fatalf("vehicle sightings = %+v err=%v, want one", sightings, err)
+		}
+		events, err := st.ListIncidentVoteEvents(ctx, VehicleIncidentID(VehicleScopeKey(input)), now.Add(-time.Hour), 0)
+		if err != nil || len(events) != 1 {
+			t.Fatalf("vehicle vote events = %+v err=%v, want one", events, err)
+		}
+	})
+
+	t.Run("area", func(t *testing.T) {
+		ctx, st, svc := newIncidentTestService(t)
+		input := model.AreaReportInput{
+			Latitude:     56.95,
+			Longitude:    24.11,
+			RadiusMeters: 250,
+			Description:  "Centraltirgus area",
+		}
+		firstResult, first, err := svc.SubmitAreaReportWithOptions(ctx, 703, input, now, options)
+		if err != nil || !firstResult.Accepted || first == nil {
+			t.Fatalf("first submission = %+v item=%v err=%v", firstResult, first, err)
+		}
+		retryInput := input
+		retryInput.Latitude = 57.05
+		retryInput.Longitude = 24.21
+		secondResult, second, err := svc.SubmitAreaReportWithOptions(ctx, 703, retryInput, retryAt, options)
+		if err != nil || !secondResult.Accepted || second == nil || second.ID != first.ID {
+			t.Fatalf("retry submission = %+v item=%v err=%v, want ID %q", secondResult, second, err, first.ID)
+		}
+		if !secondResult.Reconciled || second.ScopeKey != first.ScopeKey {
+			t.Fatalf("retry reconciliation = %+v item=%+v, want original area authoritative", secondResult, second)
+		}
+		reports, err := st.ListAreaReportsSince(ctx, now.Add(-time.Hour), 0)
+		if err != nil || len(reports) != 1 {
+			t.Fatalf("area reports = %+v err=%v, want one", reports, err)
+		}
+		events, err := st.ListIncidentVoteEvents(ctx, AreaIncidentID(AreaScopeKey(input)), now.Add(-time.Hour), 0)
+		if err != nil || len(events) != 1 {
+			t.Fatalf("area vote events = %+v err=%v, want one", events, err)
+		}
+	})
+}
+
+func TestIdempotentSubmissionReconcilesCommitThenTransportError(t *testing.T) {
+	ctx, base, _ := newIncidentTestService(t)
+	st := &commitThenErrorReportStore{SQLiteStore: base, failStopOnce: true}
+	svc := NewService(st, 3*time.Minute, 90*time.Second, 30*time.Minute)
+	now := time.Date(2026, 7, 22, 2, 0, 0, 0, time.UTC)
+	result, sighting, err := svc.SubmitStopSightingWithOptions(ctx, 804, "3012", now, SubmitOptions{
+		Source:           model.IncidentVoteSourceTelegramChat,
+		IdempotencyKey:   "channel:42:1777",
+		IdempotencySince: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("SubmitStopSightingWithOptions() error = %v", err)
+	}
+	if !result.Accepted || !result.Reconciled || result.IncidentID != StopIncidentID("3012") || sighting == nil {
+		t.Fatalf("commit reconciliation = %+v sighting=%+v", result, sighting)
+	}
+
+	sightings, err := base.ListStopSightingsSince(ctx, now.Add(-time.Hour), "", 0)
+	if err != nil || len(sightings) != 1 {
+		t.Fatalf("stop sightings = %+v err=%v, want one committed report", sightings, err)
+	}
+	events, err := base.ListIncidentVoteEvents(ctx, StopIncidentID("3012"), now.Add(-time.Hour), 0)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("vote events = %+v err=%v, want the one vote committed with the report", events, err)
+	}
+}
+
+func TestSubmissionReportIDSeparatesSourceKindAndUser(t *testing.T) {
+	base, idempotent := submissionReportID("stop", 701, "channel:42:1777")
+	if !idempotent || base == "" {
+		t.Fatalf("base report ID = %q idempotent=%v", base, idempotent)
+	}
+	retry, retryIdempotent := submissionReportID("stop", 701, "channel:42:1777")
+	if !retryIdempotent || retry != base {
+		t.Fatalf("same source retry ID = %q idempotent=%v, want %q", retry, retryIdempotent, base)
+	}
+	variants := []struct {
+		kind   string
+		userID int64
+		key    string
+	}{
+		{kind: "vehicle", userID: 701, key: "channel:42:1777"},
+		{kind: "stop", userID: 702, key: "channel:42:1777"},
+		{kind: "stop", userID: 701, key: "channel:99:1777"},
+	}
+	for _, variant := range variants {
+		got, ok := submissionReportID(variant.kind, variant.userID, variant.key)
+		if !ok || got == base {
+			t.Fatalf("variant kind=%q user=%d key=%q produced %q idempotent=%v, want a separate ID from %q", variant.kind, variant.userID, variant.key, got, ok, base)
+		}
 	}
 }
 
@@ -327,6 +486,9 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 	if result.IncidentID != AreaIncidentID(item.ScopeKey) {
 		t.Fatalf("IncidentID = %q, want %q", result.IncidentID, AreaIncidentID(item.ScopeKey))
 	}
+	if result.IncidentID != "area:pub-410b0f31" {
+		t.Fatalf("IncidentID = %q, want current-source Spacetime UTF-16 FNV ID", result.IncidentID)
+	}
 	for _, fragment := range []string{"56950", "24110", "kontrole"} {
 		if strings.Contains(result.IncidentID, fragment) {
 			t.Fatalf("IncidentID = %q exposes area fragment %q", result.IncidentID, fragment)
@@ -375,6 +537,114 @@ func TestSubmitAreaReportCapsRadiusAndBuildsAreaIncident(t *testing.T) {
 	}
 }
 
+func TestPublicStableIDMatchesSpacetimeUTF16FNV(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "ASCII", value: "ascii", want: "test-11f85eb0"},
+		{name: "Latvian", value: "56950:24110:500:starp-pieturām-pie-tuneļa", want: "test-8511d1d2"},
+		{name: "surrogate pair", value: "56950:24110:500:emoji-🚋", want: "test-99d1f6ce"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := publicStableID("test", test.value); got != test.want {
+				t.Fatalf("publicStableID(%q) = %q, want %q", test.value, got, test.want)
+			}
+		})
+	}
+}
+
+func TestLegacyAreaIncidentIDMatchesPublishedSchemaSanitizer(t *testing.T) {
+	if got, want := legacyAreaIncidentID("  56950::24110 / 500---tunelis  "), "area:56950-24110-500-tunelis"; got != want {
+		t.Fatalf("legacyAreaIncidentID() = %q, want %q", got, want)
+	}
+}
+
+func TestAreaIncidentIDPreservesOnlyValidatedOpaqueScope(t *testing.T) {
+	if got, want := AreaIncidentID("pub-410b0f31"), "area:pub-410b0f31"; got != want {
+		t.Fatalf("AreaIncidentID(opaque) = %q, want %q", got, want)
+	}
+	if got := AreaIncidentID("pub-nothex"); got == "area:pub-nothex" {
+		t.Fatalf("AreaIncidentID(invalid opaque) = %q, want a hashed public ID", got)
+	}
+}
+
+func TestSubmitAreaReportRetriesLegacyModuleWithOpaqueScopeAfterSafeMismatch(t *testing.T) {
+	ctx := context.Background()
+	base, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore() error = %v", err)
+	}
+	defer base.Close()
+	if err := base.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	compat := &legacyAreaCompatibilityStore{SQLiteStore: base, failAfterLegacyCommit: true}
+	svc := NewService(compat, 3*time.Minute, 90*time.Second, 30*time.Minute)
+	now := time.Date(2026, 7, 22, 3, 15, 0, 0, time.UTC)
+	input := model.AreaReportInput{
+		Latitude:     56.95,
+		Longitude:    24.11,
+		RadiusMeters: 500,
+		Description:  "starp pieturām pie tuneļa",
+	}
+	logicalScope := AreaScopeKey(input)
+	expectedID := AreaIncidentID(logicalScope)
+	expectedScope := opaqueAreaScopeKey(logicalScope)
+
+	result, item, err := svc.SubmitAreaReportWithOptions(ctx, 901, input, now, SubmitOptions{
+		Source:         model.IncidentVoteSourceTelegramChat,
+		IdempotencyKey: "channel:42:1901",
+	})
+	if err != nil {
+		t.Fatalf("SubmitAreaReportWithOptions() error = %v", err)
+	}
+	if !result.Accepted || item == nil {
+		t.Fatalf("submission = %+v item=%+v, want accepted", result, item)
+	}
+	if !result.Reconciled {
+		t.Fatalf("submission = %+v, want reconciliation after legacy commit transport error", result)
+	}
+	if got, want := len(compat.incidentIDs), 2; got != want {
+		t.Fatalf("combined write calls = %d, want %d", got, want)
+	}
+	if got, want := compat.incidentIDs[0], expectedID; got != want {
+		t.Fatalf("first incident ID = %q, want current %q", got, want)
+	}
+	if got := compat.incidentIDs[1]; got != expectedID {
+		t.Fatalf("retry incident ID = %q, want opaque %q", got, expectedID)
+	}
+	if result.IncidentID != expectedID {
+		t.Fatalf("result incident ID = %q, want %q", result.IncidentID, expectedID)
+	}
+	if item.ScopeKey != expectedScope {
+		t.Fatalf("stored scope = %q, want %q", item.ScopeKey, expectedScope)
+	}
+	if got, want := compat.scopeKeys, []string{logicalScope, expectedScope}; !slices.Equal(got, want) {
+		t.Fatalf("write scopes = %q, want %q", got, want)
+	}
+	for index := range compat.incidentIDs {
+		if compat.incidentIDs[index] != compat.eventIncidentIDs[index] {
+			t.Fatalf("call %d report/vote ID = %q, event ID = %q", index+1, compat.incidentIDs[index], compat.eventIncidentIDs[index])
+		}
+	}
+	reports, err := base.ListAreaReportsSince(ctx, now.Add(-time.Hour), 0)
+	if err != nil || len(reports) != 1 {
+		t.Fatalf("area reports = %+v err=%v, want one committed retry", reports, err)
+	}
+	events, err := base.ListIncidentVoteEvents(ctx, expectedID, now.Add(-time.Hour), 0)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("opaque vote events = %+v err=%v, want one", events, err)
+	}
+	currentEvents, err := base.ListIncidentVoteEvents(ctx, legacyAreaIncidentID(logicalScope), now.Add(-time.Hour), 0)
+	if err != nil || len(currentEvents) != 0 {
+		t.Fatalf("readable-ID vote events = %+v err=%v, want none", currentEvents, err)
+	}
+}
+
 func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 4, 30, 15, 0, 0, 123456789, time.UTC)
@@ -385,6 +655,14 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 				StopID:    "3012",
 				StopName:  "Centraltirgus",
 				CreatedAt: now.Add(-time.Minute),
+			}},
+			VehicleSightings: []model.PublicVehicleSighting{{
+				ID:        "vehicle-public",
+				CreatedAt: now.Add(-2 * time.Minute),
+			}},
+			AreaReports: []model.PublicAreaReport{{
+				ID:        "area-public",
+				CreatedAt: now.Add(-3 * time.Minute),
 			}},
 		},
 		incidents: []model.IncidentSummary{
@@ -443,8 +721,14 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	if st.sightingsStopID != "3012" || st.sightingsLimit != 7 {
 		t.Fatalf("ListPublicSightings args = (%q, %d), want (3012, 7)", st.sightingsStopID, st.sightingsLimit)
 	}
-	if len(visible.StopSightings) != 1 || visible.StopSightings[0].ID != "stop-public" {
+	if len(visible.StopSightings) != 1 || visible.StopSightings[0].ID != publicStopSightingID("stop-public") || visible.VehicleSightings[0].ID != publicVehicleSightingID("vehicle-public") || visible.VehicleSightings[0].LiveRowID != "" {
 		t.Fatalf("VisibleSightings() = %+v, want public read model payload", visible)
+	}
+	if visible.StopSightings[0].CreatedAt.Nanosecond() != 0 || visible.VehicleSightings[0].CreatedAt.Nanosecond() != 0 || visible.AreaReports[0].CreatedAt.Nanosecond() != 0 {
+		t.Fatalf("VisibleSightings() keeps subsecond public timestamps: %+v", visible)
+	}
+	if st.sightings.StopSightings[0].CreatedAt.Nanosecond() == 0 || st.sightings.VehicleSightings[0].CreatedAt.Nanosecond() == 0 || st.sightings.AreaReports[0].CreatedAt.Nanosecond() == 0 {
+		t.Fatalf("VisibleSightings() mutated the store's cached read model: %+v", st.sightings)
 	}
 
 	active, err := svc.ListActiveIncidents(ctx, &model.Catalog{}, now, 77, 5)
@@ -505,6 +789,166 @@ func TestPublicReadModelStoreShortCircuitsReportScans(t *testing.T) {
 	}
 	if detail.Comments[0].CreatedAt.Nanosecond() != 0 {
 		t.Fatalf("detail.Comments[0].CreatedAt = %s, want second-granularity public timestamp", detail.Comments[0].CreatedAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestPublicReadModelAreaPayloadIsSanitizedAtGoBoundary(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 15, 0, 0, 123456789, time.UTC)
+	input := model.AreaReportInput{
+		Latitude:     56.95012,
+		Longitude:    24.11034,
+		RadiusMeters: 100,
+		Description:  "fixture area",
+	}
+	logicalScopeKey := AreaScopeKey(input)
+	readableIncidentID := legacyAreaIncidentID(logicalScopeKey)
+	opaqueIncidentID := AreaIncidentID(logicalScopeKey)
+	rawReportID := "private-area-report-123"
+	area := &model.IncidentAreaContext{
+		ScopeKey:     logicalScopeKey,
+		Latitude:     input.Latitude,
+		Longitude:    input.Longitude,
+		RadiusMeters: input.RadiusMeters,
+		Description:  input.Description,
+	}
+	st := &publicReadModelStoreStub{
+		sightings: model.VisibleSightings{AreaReports: []model.PublicAreaReport{{
+			ID:           rawReportID,
+			IncidentID:   readableIncidentID,
+			Latitude:     input.Latitude,
+			Longitude:    input.Longitude,
+			RadiusMeters: input.RadiusMeters,
+			Description:  input.Description,
+			CreatedAt:    now.Add(-time.Minute),
+		}}},
+		incidents: []model.IncidentSummary{{
+			ID:           readableIncidentID,
+			Scope:        IncidentScopeArea,
+			SubjectID:    logicalScopeKey,
+			SubjectName:  input.Description,
+			LastReportAt: now.Add(-time.Minute),
+			LastReporter: "private reporter",
+			Active:       true,
+			Area:         area,
+		}},
+		detail: &model.IncidentDetail{
+			Summary: model.IncidentSummary{
+				ID:           readableIncidentID,
+				Scope:        IncidentScopeArea,
+				SubjectID:    logicalScopeKey,
+				SubjectName:  input.Description,
+				LastReportAt: now.Add(-time.Minute),
+				LastReporter: "private reporter",
+				Active:       true,
+				Area:         area,
+			},
+			Comments: []model.IncidentComment{{
+				ID:         "comment-fixture",
+				IncidentID: readableIncidentID,
+				Nickname:   "private reporter",
+				Body:       "fixture comment",
+				CreatedAt:  now.Add(-30 * time.Second),
+			}},
+		},
+	}
+	svc := NewService(st, 3*time.Minute, 90*time.Second, 30*time.Minute)
+
+	visible, err := svc.VisibleSightings(ctx, &model.Catalog{}, "", now, 20)
+	if err != nil {
+		t.Fatalf("VisibleSightings() error = %v", err)
+	}
+	if len(visible.AreaReports) != 1 {
+		t.Fatalf("VisibleSightings() area reports = %+v, want one", visible.AreaReports)
+	}
+	publicReport := visible.AreaReports[0]
+	if publicReport.ID != publicAreaReportID(rawReportID) || publicReport.ID == rawReportID {
+		t.Fatalf("public area report ID = %q, want stable opaque ID", publicReport.ID)
+	}
+	if publicReport.IncidentID != opaqueIncidentID {
+		t.Fatalf("public area incident ID = %q, want %q", publicReport.IncidentID, opaqueIncidentID)
+	}
+	if publicReport.Latitude != 56.95 || publicReport.Longitude != 24.11 || publicReport.RadiusMeters != publicAreaRadiusMeters {
+		t.Fatalf("public area location = (%f,%f,%d), want coarsened location", publicReport.Latitude, publicReport.Longitude, publicReport.RadiusMeters)
+	}
+	secondPass := sanitizePublicVisibleSightings(visible)
+	if secondPass.AreaReports[0].ID != publicReport.ID || secondPass.AreaReports[0].IncidentID != publicReport.IncidentID {
+		t.Fatalf("second public sanitization changed stable IDs: first=%+v second=%+v", publicReport, secondPass.AreaReports[0])
+	}
+	if st.sightings.AreaReports[0].ID != rawReportID || st.sightings.AreaReports[0].Latitude != input.Latitude || st.sightings.AreaReports[0].RadiusMeters != input.RadiusMeters {
+		t.Fatalf("VisibleSightings() mutated the store read model: %+v", st.sightings.AreaReports[0])
+	}
+
+	active, err := svc.ListActiveIncidents(ctx, &model.Catalog{}, now, 0, 20)
+	if err != nil {
+		t.Fatalf("ListActiveIncidents() error = %v", err)
+	}
+	if len(active) != 1 || active[0].ID != opaqueIncidentID || active[0].SubjectID != "" || active[0].Area == nil {
+		t.Fatalf("public area incident summary = %+v, want opaque redacted summary", active)
+	}
+	if active[0].Area.ScopeKey != "" || active[0].Area.Latitude != 56.95 || active[0].Area.Longitude != 24.11 || active[0].Area.RadiusMeters != publicAreaRadiusMeters {
+		t.Fatalf("public area incident context = %+v, want coarsened context", active[0].Area)
+	}
+
+	mapVisible, err := svc.ListMapVisibleIncidents(ctx, &model.Catalog{}, now, 0)
+	if err != nil {
+		t.Fatalf("ListMapVisibleIncidents() error = %v", err)
+	}
+	if len(mapVisible) != 1 || mapVisible[0].ID != opaqueIncidentID || mapVisible[0].Area == nil || mapVisible[0].Area.Latitude != 56.95 {
+		t.Fatalf("map-visible area incident = %+v, want opaque coarsened summary", mapVisible)
+	}
+
+	detail, err := svc.IncidentDetail(ctx, &model.Catalog{}, opaqueIncidentID, now, 0)
+	if err != nil {
+		t.Fatalf("IncidentDetail() error = %v", err)
+	}
+	if st.detailIncidentID != opaqueIncidentID {
+		t.Fatalf("GetPublicIncidentDetail incident ID = %q, want %q", st.detailIncidentID, opaqueIncidentID)
+	}
+	if detail.Summary.ID != opaqueIncidentID || detail.Summary.Area == nil || detail.Summary.Area.Latitude != 56.95 {
+		t.Fatalf("public area detail summary = %+v, want opaque coarsened summary", detail.Summary)
+	}
+	if len(detail.Comments) != 1 || detail.Comments[0].IncidentID != opaqueIncidentID {
+		t.Fatalf("public area detail comments = %+v, want canonical opaque incident ID", detail.Comments)
+	}
+	if st.incidents[0].ID != readableIncidentID || st.incidents[0].Area == nil || st.incidents[0].Area.ScopeKey != logicalScopeKey || st.incidents[0].Area.Latitude != input.Latitude {
+		t.Fatalf("incident sanitization mutated the store read model: %+v", st.incidents[0])
+	}
+}
+
+func TestSanitizePublicVisibleSightingsPreservesEmptyArrayShape(t *testing.T) {
+	visible := sanitizePublicVisibleSightings(model.VisibleSightings{
+		StopSightings:    []model.PublicStopSighting{},
+		VehicleSightings: []model.PublicVehicleSighting{},
+		AreaReports:      []model.PublicAreaReport{},
+	})
+	if visible.StopSightings == nil || visible.VehicleSightings == nil || visible.AreaReports == nil {
+		t.Fatalf("sanitizePublicVisibleSightings() changed empty arrays to nil: %+v", visible)
+	}
+}
+
+func TestSanitizePublicVisibleSightingsClosesLegacyRowIdentity(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 34, 56, 987000000, time.UTC)
+	raw := model.VisibleSightings{
+		StopSightings: []model.PublicStopSighting{{ID: "private-stop-row", StopID: "123", CreatedAt: now}},
+		VehicleSightings: []model.PublicVehicleSighting{{
+			ID: "private-vehicle-row", Mode: "bus", RouteLabel: "22",
+			LiveRowID: "private-live-row", CreatedAt: now,
+		}},
+	}
+	got := sanitizePublicVisibleSightings(raw)
+	if got.StopSightings[0].ID != publicStopSightingID("private-stop-row") || got.StopSightings[0].ID == "private-stop-row" {
+		t.Fatalf("legacy stop row ID was not made opaque: %+v", got.StopSightings[0])
+	}
+	if got.VehicleSightings[0].ID != publicVehicleSightingID("private-vehicle-row") || got.VehicleSightings[0].ID == "private-vehicle-row" || got.VehicleSightings[0].LiveRowID != "" {
+		t.Fatalf("legacy vehicle row identity was not redacted: %+v", got.VehicleSightings[0])
+	}
+	second := sanitizePublicVisibleSightings(got)
+	if second.StopSightings[0].ID != got.StopSightings[0].ID || second.VehicleSightings[0].ID != got.VehicleSightings[0].ID {
+		t.Fatalf("public row IDs were not idempotent: first=%+v second=%+v", got, second)
+	}
+	if raw.StopSightings[0].ID != "private-stop-row" || raw.VehicleSightings[0].ID != "private-vehicle-row" || raw.VehicleSightings[0].LiveRowID != "private-live-row" {
+		t.Fatalf("sanitization mutated the store read model: %+v", raw)
 	}
 }
 
@@ -796,6 +1240,47 @@ type publicReadModelStoreStub struct {
 	detail           *model.IncidentDetail
 	detailIncidentID string
 	detailViewerID   int64
+}
+
+type commitThenErrorReportStore struct {
+	*store.SQLiteStore
+	failStopOnce bool
+}
+
+type legacyAreaCompatibilityStore struct {
+	*store.SQLiteStore
+	incidentIDs           []string
+	eventIncidentIDs      []string
+	scopeKeys             []string
+	failAfterLegacyCommit bool
+}
+
+func (s *legacyAreaCompatibilityStore) InsertAreaReportWithVote(ctx context.Context, report model.AreaReport, vote model.IncidentVote, event model.IncidentVoteEvent, dedupeWindow time.Duration) error {
+	s.incidentIDs = append(s.incidentIDs, vote.IncidentID)
+	s.eventIncidentIDs = append(s.eventIncidentIDs, event.IncidentID)
+	s.scopeKeys = append(s.scopeKeys, report.ScopeKey)
+	if len(s.incidentIDs) == 1 {
+		return store.ErrReportVoteIncidentMismatch
+	}
+	if err := s.SQLiteStore.InsertAreaReportWithVote(ctx, report, vote, event, dedupeWindow); err != nil {
+		return err
+	}
+	if s.failAfterLegacyCommit {
+		s.failAfterLegacyCommit = false
+		return errors.New("simulated transport error after legacy commit")
+	}
+	return nil
+}
+
+func (s *commitThenErrorReportStore) InsertStopSightingWithVote(ctx context.Context, sighting model.StopSighting, vote model.IncidentVote, event model.IncidentVoteEvent, dedupeWindow time.Duration) error {
+	if err := s.SQLiteStore.InsertStopSightingWithVote(ctx, sighting, vote, event, dedupeWindow); err != nil {
+		return err
+	}
+	if s.failStopOnce {
+		s.failStopOnce = false
+		return errors.New("simulated transport error after commit")
+	}
+	return nil
 }
 
 func (s *publicReadModelStoreStub) ListPublicSightings(_ context.Context, stopID string, limit int) (model.VisibleSightings, error) {

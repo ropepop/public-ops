@@ -56,6 +56,15 @@ function parseTimeMs(value: unknown): number {
   return Number.isFinite(millis) ? millis : 0;
 }
 
+function publicTimestamp(value: unknown): string {
+  const raw = asString(value).trim();
+  const millis = new Date(raw).getTime();
+  if (!raw || !Number.isFinite(millis)) {
+    return raw;
+  }
+  return new Date(Math.floor(millis / 1000) * 1000).toISOString().replace(".000Z", "Z");
+}
+
 function sortByTimeAscending(left: any, right: any, field: string): number {
   return parseTimeMs(left?.[field]) - parseTimeMs(right?.[field]);
 }
@@ -129,7 +138,7 @@ function normalizeIncidentSummary(row: any, voteSelections: VoteSelectionMap = {
     subjectName: asString(row.subjectName).trim(),
     stopId: asString(row.stopId).trim(),
     lastReportName: asString(row.lastReportName).trim(),
-    lastReportAt: asString(row.lastReportAt).trim(),
+    lastReportAt: publicTimestamp(row.lastReportAt),
     lastReporter: asString(row.lastReporter).trim(),
     commentCount: asNumber(row.commentCount),
     votes: normalizeIncidentVotes(row, voteSelections),
@@ -150,7 +159,7 @@ function normalizeIncidentEvent(row: any) {
     kind: asString(row.kind).trim(),
     name: asString(row.name).trim(),
     nickname: asString(row.nickname).trim(),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 
@@ -163,7 +172,7 @@ function normalizeIncidentComment(row: any) {
     incidentId: asString(row.incidentId).trim(),
     nickname: asString(row.nickname).trim(),
     body: asString(row.body).trim(),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 
@@ -176,7 +185,7 @@ function normalizeStopSighting(row: any) {
     incidentId: asString(row.incidentId).trim(),
     stopId: asString(row.stopId).trim(),
     stopName: asString(row.stopName).trim(),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 
@@ -194,7 +203,7 @@ function normalizeVehicleSighting(row: any) {
     direction: asString(row.direction).trim(),
     destination: asString(row.destination).trim(),
     departureSeconds: asNumber(row.departureSeconds),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 
@@ -209,7 +218,7 @@ function normalizeAreaReport(row: any) {
     longitude: asNumber(row.longitude),
     radiusMeters: asNumber(row.radiusMeters),
     description: asString(row.description).trim(),
-    createdAt: asString(row.createdAt).trim(),
+    createdAt: publicTimestamp(row.createdAt),
   };
 }
 

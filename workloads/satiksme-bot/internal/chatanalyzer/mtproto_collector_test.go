@@ -89,6 +89,44 @@ func TestTelegramHistoryRequestFetchesOldestForwardPageAfterCheckpoint(t *testin
 	}
 }
 
+func TestMTProtoCollectorDefaultsToTwentyFiveMessageCollectionPages(t *testing.T) {
+	collector := NewMTProtoCollector(MTProtoCollectorConfig{})
+	if got, want := collector.pageSize, 25; got != want {
+		t.Fatalf("collection page size = %d, want %d", got, want)
+	}
+}
+
+func TestCollectForwardMessagesCatchesUpOneHundredStaleMessagesWithTwentyFiveMessagePages(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 25, maxStaleCatchUpPagesPerCollect, 0,
+		func(_ context.Context, minID, limit int) ([]*tg.Message, error) {
+			if got, want := limit, 25; got != want {
+				t.Fatalf("fetch limit = %d, want %d", got, want)
+			}
+			if got, want := minID, 100+calls*25; got != want {
+				t.Fatalf("fetch %d min id = %d, want %d", calls+1, got, want)
+			}
+			page := staleTelegramPage(now, minID+1, 25)
+			calls++
+			return page, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("collect forward messages: %v", err)
+	}
+	if got, want := calls, maxStaleCatchUpPagesPerCollect; got != want {
+		t.Fatalf("fetch calls = %d, want %d", got, want)
+	}
+	if got, want := result.SkippedStale, 100; got != want {
+		t.Fatalf("skipped stale = %d, want %d", got, want)
+	}
+	if got, want := result.CheckpointMessageIDs["channel:42"], int64(200); got != want {
+		t.Fatalf("checkpoint = %d, want %d", got, want)
+	}
+}
+
 func TestMessagesFromHistoryPreservesNonTextEventIDsForCheckpointing(t *testing.T) {
 	items := messagesFromHistory(&tg.MessagesMessages{Messages: []tg.MessageClass{
 		&tg.MessageService{ID: 106},
@@ -125,7 +163,7 @@ func TestCollectForwardMessagesAdvancesAcrossBoundedStalePages(t *testing.T) {
 	}
 	calls := 0
 	result, err := collectForwardMessages(
-		context.Background(), "channel:42", 100, now, 24*time.Hour, 3, maxStaleCatchUpPagesPerCollect,
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 3, maxStaleCatchUpPagesPerCollect, 0,
 		func(_ context.Context, minID, limit int) ([]*tg.Message, error) {
 			if limit != 3 {
 				t.Fatalf("fetch limit = %d, want 3", limit)
@@ -160,7 +198,7 @@ func TestCollectForwardMessagesStopsOnFreshPage(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	calls := 0
 	result, err := collectForwardMessages(
-		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect, 0,
 		func(_ context.Context, minID, _ int) ([]*tg.Message, error) {
 			calls++
 			switch calls {
@@ -200,11 +238,52 @@ func TestCollectForwardMessagesStopsOnFreshPage(t *testing.T) {
 	}
 }
 
+func TestCollectForwardMessagesIgnoresTextlessServicePlaceholdersForFreshness(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	result, err := collectForwardMessages(
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect, 0,
+		func(_ context.Context, minID, _ int) ([]*tg.Message, error) {
+			calls++
+			switch calls {
+			case 1:
+				if minID != 100 {
+					t.Fatalf("first min id = %d, want 100", minID)
+				}
+				return []*tg.Message{
+					{ID: 101, Date: int(now.Add(-25 * time.Hour).Unix()), Message: "old report"},
+					{ID: 102},
+				}, nil
+			case 2:
+				if minID != 102 {
+					t.Fatalf("second min id = %d, want 102", minID)
+				}
+				return staleTelegramPage(now, 103, 1), nil
+			default:
+				t.Fatalf("unexpected fetch call %d", calls)
+				return nil, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("collect forward messages: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want catch-up to continue past textless service event", calls)
+	}
+	if len(result.Messages) != 0 || result.SkippedStale != 2 {
+		t.Fatalf("catch-up result = %+v, want two stale text messages and no fresh messages", result)
+	}
+	if got := result.CheckpointMessageIDs["channel:42"]; got != 103 {
+		t.Fatalf("checkpoint = %d, want 103", got)
+	}
+}
+
 func TestCollectForwardMessagesStopsWhenPageDoesNotAdvance(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	calls := 0
 	result, err := collectForwardMessages(
-		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect, 0,
 		func(_ context.Context, _ int, _ int) ([]*tg.Message, error) {
 			calls++
 			return []*tg.Message{
@@ -229,7 +308,7 @@ func TestCollectForwardMessagesDiscardsPartialProgressOnFailure(t *testing.T) {
 	wantErr := errors.New("temporary Telegram failure")
 	calls := 0
 	result, err := collectForwardMessages(
-		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect,
+		context.Background(), "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect, 0,
 		func(_ context.Context, _ int, _ int) ([]*tg.Message, error) {
 			calls++
 			if calls == 1 {
@@ -246,6 +325,29 @@ func TestCollectForwardMessagesDiscardsPartialProgressOnFailure(t *testing.T) {
 	}
 	if len(result.Messages) != 0 || result.SkippedStale != 0 || len(result.CheckpointMessageIDs) != 0 {
 		t.Fatalf("partial failure result = %+v, want empty for at-least-once retry", result)
+	}
+}
+
+func TestCollectForwardMessagesCancelsDuringInterPageDelay(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	result, err := collectForwardMessages(
+		ctx, "channel:42", 100, now, 24*time.Hour, 2, maxStaleCatchUpPagesPerCollect, time.Hour,
+		func(_ context.Context, _ int, _ int) ([]*tg.Message, error) {
+			calls++
+			cancel()
+			return staleTelegramPage(now, 101, 2), nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 before canceled delay", calls)
+	}
+	if len(result.Messages) != 0 || result.SkippedStale != 0 || len(result.CheckpointMessageIDs) != 0 {
+		t.Fatalf("canceled result = %+v, want empty for at-least-once retry", result)
 	}
 }
 

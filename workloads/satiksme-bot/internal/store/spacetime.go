@@ -53,12 +53,12 @@ func (s *SpacetimeStore) GetLastStopSightingByUserScope(ctx context.Context, use
 		return nil, err
 	}
 	var raw struct {
-		Sighting *model.StopSighting `json:"sighting"`
+		Sighting *spacetimePrivateStopSightingJSON `json:"sighting"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Sighting, nil
+	return raw.Sighting.modelValue(), nil
 }
 
 func (s *SpacetimeStore) ListStopSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]model.StopSighting, error) {
@@ -67,12 +67,12 @@ func (s *SpacetimeStore) ListStopSightingsSince(ctx context.Context, since time.
 		return nil, err
 	}
 	var raw struct {
-		Sightings []model.StopSighting `json:"sightings"`
+		Sightings []spacetimePrivateStopSightingJSON `json:"sightings"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Sightings, nil
+	return privateStopSightingValues(raw.Sightings), nil
 }
 
 func (s *SpacetimeStore) ListPublicSightings(ctx context.Context, stopID string, limit int) (model.VisibleSightings, error) {
@@ -120,12 +120,12 @@ func (s *SpacetimeStore) GetLastVehicleSightingByUserScope(ctx context.Context, 
 		return nil, err
 	}
 	var raw struct {
-		Sighting *model.VehicleSighting `json:"sighting"`
+		Sighting *spacetimePrivateVehicleSightingJSON `json:"sighting"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Sighting, nil
+	return raw.Sighting.modelValue(), nil
 }
 
 func (s *SpacetimeStore) ListVehicleSightingsSince(ctx context.Context, since time.Time, stopID string, limit int) ([]model.VehicleSighting, error) {
@@ -134,12 +134,12 @@ func (s *SpacetimeStore) ListVehicleSightingsSince(ctx context.Context, since ti
 		return nil, err
 	}
 	var raw struct {
-		Sightings []model.VehicleSighting `json:"sightings"`
+		Sightings []spacetimePrivateVehicleSightingJSON `json:"sightings"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Sightings, nil
+	return privateVehicleSightingValues(raw.Sightings), nil
 }
 
 func (s *SpacetimeStore) InsertAreaReport(ctx context.Context, report model.AreaReport) error {
@@ -155,9 +155,19 @@ func (s *SpacetimeStore) InsertAreaReportWithVote(ctx context.Context, report mo
 		uint32(dedupeWindow.Seconds()),
 	})
 	if err != nil {
-		return err
+		return normalizeAreaReportVoteError(err)
 	}
 	return decodeDedupeResult(payload)
+}
+
+func normalizeAreaReportVoteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(err.Error()), ErrReportVoteIncidentMismatch.Error()) {
+		return fmt.Errorf("%w: %v", ErrReportVoteIncidentMismatch, err)
+	}
+	return err
 }
 
 func (s *SpacetimeStore) GetLastAreaReportByUserScope(ctx context.Context, userID int64, scopeKey string) (*model.AreaReport, error) {
@@ -166,12 +176,12 @@ func (s *SpacetimeStore) GetLastAreaReportByUserScope(ctx context.Context, userI
 		return nil, err
 	}
 	var raw struct {
-		Report *model.AreaReport `json:"report"`
+		Report *spacetimePrivateAreaReportJSON `json:"report"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Report, nil
+	return raw.Report.modelValue(), nil
 }
 
 func (s *SpacetimeStore) ListAreaReportsSince(ctx context.Context, since time.Time, limit int) ([]model.AreaReport, error) {
@@ -180,12 +190,12 @@ func (s *SpacetimeStore) ListAreaReportsSince(ctx context.Context, since time.Ti
 		return nil, err
 	}
 	var raw struct {
-		Reports []model.AreaReport `json:"reports"`
+		Reports []spacetimePrivateAreaReportJSON `json:"reports"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Reports, nil
+	return privateAreaReportValues(raw.Reports), nil
 }
 
 func (s *SpacetimeStore) UpsertIncidentVote(ctx context.Context, vote model.IncidentVote) error {
@@ -207,12 +217,12 @@ func (s *SpacetimeStore) ListIncidentVotes(ctx context.Context, incidentID strin
 		return nil, err
 	}
 	var raw struct {
-		Votes []model.IncidentVote `json:"votes"`
+		Votes []spacetimePrivateIncidentVoteJSON `json:"votes"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Votes, nil
+	return privateIncidentVoteValues(raw.Votes), nil
 }
 
 func (s *SpacetimeStore) ListPublicIncidents(ctx context.Context, viewerID int64, limit int) ([]model.IncidentSummary, error) {
@@ -247,12 +257,12 @@ func (s *SpacetimeStore) ListIncidentVoteEvents(ctx context.Context, incidentID 
 		return nil, err
 	}
 	var raw struct {
-		Events []model.IncidentVoteEvent `json:"events"`
+		Events []spacetimePrivateIncidentVoteEventJSON `json:"events"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Events, nil
+	return privateIncidentVoteEventValues(raw.Events), nil
 }
 
 func (s *SpacetimeStore) CountMapReportsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
@@ -351,12 +361,12 @@ func (s *SpacetimeStore) ListIncidentComments(ctx context.Context, incidentID st
 		return nil, err
 	}
 	var raw struct {
-		Comments []model.IncidentComment `json:"comments"`
+		Comments []spacetimePrivateIncidentCommentJSON `json:"comments"`
 	}
 	if err := decodePayload(payload, &raw); err != nil {
 		return nil, err
 	}
-	return raw.Comments, nil
+	return privateIncidentCommentValues(raw.Comments), nil
 }
 
 func (s *SpacetimeStore) EnqueueReportDump(ctx context.Context, item ReportDumpItem) error {
@@ -603,6 +613,184 @@ func spacetimeNickname(userID int64, nickname string) string {
 		return clean
 	}
 	return model.GenericNickname(userID)
+}
+
+// Private service procedures include fields deliberately omitted from the
+// public model JSON tags. Keep an explicit wire boundary here so private reads
+// retain those fields without making normal model serialization expose them.
+type spacetimePrivateStopSightingJSON struct {
+	ID        string    `json:"id"`
+	StopID    string    `json:"stopId"`
+	UserID    int64     `json:"userId"`
+	Hidden    bool      `json:"hidden"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (item *spacetimePrivateStopSightingJSON) modelValue() *model.StopSighting {
+	if item == nil {
+		return nil
+	}
+	return &model.StopSighting{
+		ID: item.ID, StopID: item.StopID, UserID: item.UserID,
+		Hidden: item.Hidden, CreatedAt: item.CreatedAt,
+	}
+}
+
+func privateStopSightingValues(items []spacetimePrivateStopSightingJSON) []model.StopSighting {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.StopSighting, len(items))
+	for index := range items {
+		out[index] = *items[index].modelValue()
+	}
+	return out
+}
+
+type spacetimePrivateVehicleSightingJSON struct {
+	ID               string    `json:"id"`
+	StopID           string    `json:"stopId"`
+	UserID           int64     `json:"userId"`
+	Mode             string    `json:"mode"`
+	RouteLabel       string    `json:"routeLabel"`
+	Direction        string    `json:"direction"`
+	Destination      string    `json:"destination"`
+	DepartureSeconds int       `json:"departureSeconds"`
+	LiveRowID        string    `json:"liveRowId"`
+	ScopeKey         string    `json:"scopeKey"`
+	Hidden           bool      `json:"hidden"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+
+func (item *spacetimePrivateVehicleSightingJSON) modelValue() *model.VehicleSighting {
+	if item == nil {
+		return nil
+	}
+	return &model.VehicleSighting{
+		ID: item.ID, StopID: item.StopID, UserID: item.UserID,
+		Mode: item.Mode, RouteLabel: item.RouteLabel, Direction: item.Direction,
+		Destination: item.Destination, DepartureSeconds: item.DepartureSeconds,
+		LiveRowID: item.LiveRowID, ScopeKey: item.ScopeKey, Hidden: item.Hidden,
+		CreatedAt: item.CreatedAt,
+	}
+}
+
+func privateVehicleSightingValues(items []spacetimePrivateVehicleSightingJSON) []model.VehicleSighting {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.VehicleSighting, len(items))
+	for index := range items {
+		out[index] = *items[index].modelValue()
+	}
+	return out
+}
+
+type spacetimePrivateAreaReportJSON struct {
+	ID           string    `json:"id"`
+	UserID       int64     `json:"userId"`
+	Latitude     float64   `json:"latitude"`
+	Longitude    float64   `json:"longitude"`
+	RadiusMeters int       `json:"radiusMeters"`
+	Description  string    `json:"description"`
+	ScopeKey     string    `json:"scopeKey"`
+	Hidden       bool      `json:"hidden"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+func (item *spacetimePrivateAreaReportJSON) modelValue() *model.AreaReport {
+	if item == nil {
+		return nil
+	}
+	return &model.AreaReport{
+		ID: item.ID, UserID: item.UserID, Latitude: item.Latitude,
+		Longitude: item.Longitude, RadiusMeters: item.RadiusMeters,
+		Description: item.Description, ScopeKey: item.ScopeKey,
+		Hidden: item.Hidden, CreatedAt: item.CreatedAt,
+	}
+}
+
+func privateAreaReportValues(items []spacetimePrivateAreaReportJSON) []model.AreaReport {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.AreaReport, len(items))
+	for index := range items {
+		out[index] = *items[index].modelValue()
+	}
+	return out
+}
+
+type spacetimePrivateIncidentVoteJSON struct {
+	IncidentID string                  `json:"incidentId"`
+	UserID     int64                   `json:"userId"`
+	Nickname   string                  `json:"nickname"`
+	Value      model.IncidentVoteValue `json:"value"`
+	CreatedAt  time.Time               `json:"createdAt"`
+	UpdatedAt  time.Time               `json:"updatedAt"`
+}
+
+func privateIncidentVoteValues(items []spacetimePrivateIncidentVoteJSON) []model.IncidentVote {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.IncidentVote, len(items))
+	for index, item := range items {
+		out[index] = model.IncidentVote{
+			IncidentID: item.IncidentID, UserID: item.UserID,
+			Nickname: item.Nickname, Value: item.Value,
+			CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		}
+	}
+	return out
+}
+
+type spacetimePrivateIncidentVoteEventJSON struct {
+	ID         string                   `json:"id"`
+	IncidentID string                   `json:"incidentId"`
+	UserID     int64                    `json:"userId"`
+	Nickname   string                   `json:"nickname"`
+	Value      model.IncidentVoteValue  `json:"value"`
+	Source     model.IncidentVoteSource `json:"source"`
+	CreatedAt  time.Time                `json:"createdAt"`
+}
+
+func privateIncidentVoteEventValues(items []spacetimePrivateIncidentVoteEventJSON) []model.IncidentVoteEvent {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.IncidentVoteEvent, len(items))
+	for index, item := range items {
+		out[index] = model.IncidentVoteEvent{
+			ID: item.ID, IncidentID: item.IncidentID, UserID: item.UserID,
+			Nickname: item.Nickname, Value: item.Value, Source: item.Source,
+			CreatedAt: item.CreatedAt,
+		}
+	}
+	return out
+}
+
+type spacetimePrivateIncidentCommentJSON struct {
+	ID         string    `json:"id"`
+	IncidentID string    `json:"incidentId"`
+	UserID     int64     `json:"userId"`
+	Nickname   string    `json:"nickname"`
+	Body       string    `json:"body"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+func privateIncidentCommentValues(items []spacetimePrivateIncidentCommentJSON) []model.IncidentComment {
+	if items == nil {
+		return nil
+	}
+	out := make([]model.IncidentComment, len(items))
+	for index, item := range items {
+		out[index] = model.IncidentComment{
+			ID: item.ID, IncidentID: item.IncidentID, UserID: item.UserID,
+			Nickname: item.Nickname, Body: item.Body, CreatedAt: item.CreatedAt,
+		}
+	}
+	return out
 }
 
 type spacetimeStopSightingJSON struct {

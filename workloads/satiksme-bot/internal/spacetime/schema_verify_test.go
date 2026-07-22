@@ -324,15 +324,28 @@ func TestPublicAreaIncidentsAreCoarsenedInSpacetimeModule(t *testing.T) {
 	if strings.Contains(source, "function areaIncidentID(scopeKey: string): string {\n  return `area:${sanitizeIncidentKey(scopeKey)}`;") {
 		t.Fatalf("areaIncidentID must not expose the raw location/description scope key")
 	}
+	areaIncidentIDBlock := sourceBlock(t, source, "function publicAreaIncidentID", "function publicStopSightingID")
+	for _, required := range []string{"/^pub-[0-9a-f]{8}$/.test(clean)", "return `area:${clean}`", "fnv1a32Hex(scopeKey)"} {
+		if !strings.Contains(areaIncidentIDBlock, required) {
+			t.Fatalf("publicAreaIncidentID must preserve validated compatibility aliases and hash every other scope with %q:\n%s", required, areaIncidentIDBlock)
+		}
+	}
 
 	areaDocBlock := sourceBlock(t, source, "const areaContextDoc = ", "const satiksmebot_active_bundle")
-	if strings.Contains(areaDocBlock, "scopeKey") {
-		t.Fatalf("public area context schema must not expose reusable area scope keys:\n%s", areaDocBlock)
+	if !strings.Contains(areaDocBlock, "scopeKey: t.string()") {
+		t.Fatalf("public area context schema must retain the v1 scopeKey column for non-destructive compatibility:\n%s", areaDocBlock)
 	}
 
 	publicAreaContextBlock := sourceBlock(t, source, "function publicAreaContext", "function publicVehicleContext")
-	if strings.Contains(publicAreaContextBlock, "scopeKey") {
-		t.Fatalf("publicAreaContext must not expose reusable area scope keys:\n%s", publicAreaContextBlock)
+	if !strings.Contains(publicAreaContextBlock, "scopeKey: ''") {
+		t.Fatalf("publicAreaContext must populate the retained v1 scopeKey with an empty value:\n%s", publicAreaContextBlock)
+	}
+	if strings.Contains(publicAreaContextBlock, "scopeKey: asString") {
+		t.Fatalf("publicAreaContext must not populate the compatibility scopeKey from private data:\n%s", publicAreaContextBlock)
+	}
+	scrubBlock := sourceBlock(t, source, "function scrubLegacyPublicCompatibilityFields", "function upsertLiveViewerPayload")
+	if !strings.Contains(scrubBlock, "? { ...row.area, scopeKey: '' }") {
+		t.Fatalf("startup compatibility scrub must clear retained public area scope keys:\n%s", scrubBlock)
 	}
 
 	refreshAreaBlock := sourceBlock(t, source, "for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter()))", "for (const incident of Array.from(incidents.values()))")
@@ -383,7 +396,7 @@ func TestPublicIncidentCommentsUseOpaquePublicIDs(t *testing.T) {
 	if strings.Contains(refreshBlock, "id: asString(comment.id).trim()") {
 		t.Fatalf("public incident comments expose raw private comment IDs:\n%s", refreshBlock)
 	}
-	required := "id: publicIncidentCommentID(incident.id, asString(comment.id).trim(), asString(comment.createdAt).trim())"
+	required := "id: publicIncidentCommentID(incident.id, asString(comment.id).trim(), publicTimestamp(comment.createdAt))"
 	if !strings.Contains(refreshBlock, required) {
 		t.Fatalf("public incident comments must derive opaque public IDs with %q:\n%s", required, refreshBlock)
 	}
@@ -405,20 +418,30 @@ func TestPublicVehicleIncidentsHideInternalLiveRowIDs(t *testing.T) {
 	}{
 		{name: "public vehicle context", start: "const vehicleContextDoc = ", end: "const areaContextDoc = "},
 		{name: "public vehicle sighting table", start: "const satiksmebot_public_vehicle_sighting = table", end: "const satiksmebot_public_area_report = table"},
-		{name: "public vehicle projection", start: "const publicScopeKey = vehicleScopeKey(row);", end: "for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter()))"},
+		{name: "public vehicle projection", start: "const storedScopeKey = asString(row.scopeKey).trim() || vehicleScopeKey(row);", end: "for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter()))"},
 		{name: "visible public vehicle sightings", start: "let vehicleSightings = rowsFrom(tx.db.satiksmebot_public_vehicle_sighting.iter())", end: "let areaReports = cleanStopId ? []"},
 	} {
 		block := sourceBlock(t, source, tc.start, tc.end)
-		if strings.Contains(block, "liveRowId") {
-			t.Fatalf("%s must not expose internal live row IDs:\n%s", tc.name, block)
-		}
-		if tc.name == "public vehicle context" && strings.Contains(block, "scopeKey") {
-			t.Fatalf("%s must not expose reusable vehicle scope keys:\n%s", tc.name, block)
-		}
-		if tc.name == "public vehicle projection" {
+		switch tc.name {
+		case "public vehicle context":
+			for _, compatibilityField := range []string{"scopeKey: t.string()", "liveRowId: t.string()"} {
+				if !strings.Contains(block, compatibilityField) {
+					t.Fatalf("%s must retain v1 compatibility field %q:\n%s", tc.name, compatibilityField, block)
+				}
+			}
+		case "public vehicle sighting table":
+			if !strings.Contains(block, "liveRowId: t.string()") {
+				t.Fatalf("%s must retain the v1 liveRowId compatibility field:\n%s", tc.name, block)
+			}
+		case "visible public vehicle sightings":
+			if strings.Contains(block, "liveRowId") {
+				t.Fatalf("%s must omit the inert compatibility field from procedure responses:\n%s", tc.name, block)
+			}
+		case "public vehicle projection":
 			for _, forbidden := range []string{
-				"subjectId: publicScopeKey",
-				"scopeKey: publicScopeKey",
+				"subjectId: storedScopeKey",
+				"scopeKey: storedScopeKey",
+				"liveRowId: asString(row.liveRowId)",
 			} {
 				if strings.Contains(block, forbidden) {
 					t.Fatalf("%s must not expose reusable vehicle scope keys with %q:\n%s", tc.name, forbidden, block)
@@ -427,19 +450,76 @@ func TestPublicVehicleIncidentsHideInternalLiveRowIDs(t *testing.T) {
 			if !strings.Contains(block, "subjectId: ''") {
 				t.Fatalf("%s must blank public vehicle subject IDs:\n%s", tc.name, block)
 			}
+			if !strings.Contains(block, "liveRowId: ''") {
+				t.Fatalf("%s must blank the retained public vehicle liveRowId:\n%s", tc.name, block)
+			}
+		}
+	}
+	publicContextBlock := sourceBlock(t, source, "function publicVehicleContext", "function publicAreaReportPayload")
+	for _, required := range []string{"scopeKey: ''", "liveRowId: ''"} {
+		if !strings.Contains(publicContextBlock, required) {
+			t.Fatalf("publicVehicleContext must blank compatibility field with %q:\n%s", required, publicContextBlock)
+		}
+	}
+	for _, forbidden := range []string{"scopeKey: asString", "liveRowId: asString"} {
+		if strings.Contains(publicContextBlock, forbidden) {
+			t.Fatalf("publicVehicleContext must not populate compatibility fields from private data with %q:\n%s", forbidden, publicContextBlock)
+		}
+	}
+	scrubBlock := sourceBlock(t, source, "function scrubLegacyPublicCompatibilityFields", "function upsertLiveViewerPayload")
+	for _, inertValue := range []string{"? { ...row.vehicle, scopeKey: '', liveRowId: '' }", "liveRowId: ''"} {
+		if !strings.Contains(scrubBlock, inertValue) {
+			t.Fatalf("startup compatibility scrub must clear retained public vehicle field with %q:\n%s", inertValue, scrubBlock)
 		}
 	}
 
 	scopeBlock := sourceBlock(t, source, "function vehicleScopeKey", "function normalizeAreaRadius")
-	if strings.Contains(scopeBlock, "return `live:${mode}:${routeLabel}:${direction}:${liveRowId}`") {
-		t.Fatalf("vehicleScopeKey must not embed raw live row IDs in public incident identity:\n%s", scopeBlock)
+	if !strings.Contains(scopeBlock, "return `live:${mode}:${routeLabel}:${direction}:${liveRowId}`") {
+		t.Fatalf("private vehicleScopeKey must stay compatible with v1 and the Go service:\n%s", scopeBlock)
 	}
-	if !strings.Contains(scopeBlock, "fnv1a32Hex(liveRowId)") {
-		t.Fatalf("vehicleScopeKey must derive an opaque public vehicle key from live row IDs:\n%s", scopeBlock)
+	if strings.Contains(scopeBlock, "fnv1a32Hex(liveRowId)") {
+		t.Fatalf("private vehicleScopeKey must not rewrite stored live row identity:\n%s", scopeBlock)
 	}
 	incidentIDBlock := sourceBlock(t, source, "function vehicleIncidentID", "function fnv1a32Hex")
-	if !strings.Contains(incidentIDBlock, "vehicle:pub-${fnv1a32Hex(scopeKey)}") {
-		t.Fatalf("vehicleIncidentID must publish only an opaque vehicle incident ID:\n%s", incidentIDBlock)
+	for _, required := range []string{"/^pub-[0-9a-f]{8}$/.test(clean)", "return `vehicle:${clean}`", "vehicle:pub-${fnv1a32Hex(scopeKey)}"} {
+		if !strings.Contains(incidentIDBlock, required) {
+			t.Fatalf("vehicleIncidentID must preserve validated opaque aliases and hash logical scopes with %q:\n%s", required, incidentIDBlock)
+		}
+	}
+	sanitizeBlock := sourceBlock(t, source, "function sanitizeVehicleSighting", "function sanitizeAreaReport")
+	if !strings.Contains(sanitizeBlock, "payload.scopeKey = payload.scopeKey || opaqueVehicleScopeKey(vehicleScopeKey(payload))") {
+		t.Fatalf("sanitizeVehicleSighting must preserve every supplied nonempty scope and derive an opaque fallback:\n%s", sanitizeBlock)
+	}
+	if strings.Contains(sanitizeBlock, "payload.liveRowId ? vehicleScopeKey(payload)") {
+		t.Fatalf("sanitizeVehicleSighting must not overwrite a supplied opaque scope when liveRowId is present:\n%s", sanitizeBlock)
+	}
+	projectionScopeBlock := sourceBlock(t, source, "const storedScopeKey = asString(row.scopeKey).trim() || vehicleScopeKey(row);", "const event = {")
+	if !strings.Contains(projectionScopeBlock, "vehicleIncidentID(storedScopeKey)") {
+		t.Fatalf("public vehicle projection must prefer stored scope identity and only recompute when it is missing:\n%s", projectionScopeBlock)
+	}
+	collisionBlock := sourceBlock(t, source, "function ensureVehiclePublicIDAvailable", "function normalizeAreaRadius")
+	for _, required := range []string{
+		"satiksmebot_vehicle_sighting.iter()",
+		"vehicleLogicalScopeKey(row)",
+		"opaqueVehicleScopeKey(existingLogicalScopeKey) === opaqueScopeKey",
+		"existingLogicalScopeKey !== cleanLogicalScopeKey",
+		"throw new SenderError('opaque vehicle incident collision')",
+	} {
+		if !strings.Contains(collisionBlock, required) {
+			t.Fatalf("vehicle opaque-ID collision guard must fail closed with %q:\n%s", required, collisionBlock)
+		}
+	}
+	directSubmitBlock := sourceBlock(t, source, "function submitVehicleReportImpl", "function submitAreaReportImpl")
+	for _, required := range []string{
+		"const logicalScopeKey = vehicleScopeKey(payload)",
+		"ensureVehiclePublicIDAvailable(tx, logicalScopeKey)",
+		"const scopeKey = opaqueVehicleScopeKey(logicalScopeKey)",
+		"const incidentId = vehicleIncidentID(scopeKey)",
+		"direction: asString(payload?.direction).trim()",
+	} {
+		if !strings.Contains(directSubmitBlock, required) {
+			t.Fatalf("direct vehicle submit must derive and store one opaque scope without direction drift; missing %q:\n%s", required, directSubmitBlock)
+		}
 	}
 }
 
@@ -470,13 +550,13 @@ func TestPublicStopAndVehicleSightingsUseOpaquePublicIDs(t *testing.T) {
 		{
 			name:     "public stop projection",
 			start:    "tx.db.satiksmebot_public_stop_sighting.insert({",
-			end:      "for (const row of rowsFrom(tx.db.satiksmebot_vehicle_sighting.iter())) {\n    const createdAt = asString(row.createdAt).trim();",
+			end:      "for (const row of rowsFrom(tx.db.satiksmebot_vehicle_sighting.iter())) {\n    const sourceCreatedAt = asString(row.createdAt).trim();",
 			required: "id: publicStopSightingID(asString(row.id).trim())",
 		},
 		{
 			name:     "public vehicle projection",
 			start:    "tx.db.satiksmebot_public_vehicle_sighting.insert({",
-			end:      "for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter())) {\n    const createdAt = asString(row.createdAt).trim();",
+			end:      "for (const row of rowsFrom(tx.db.satiksmebot_area_report.iter())) {\n    const sourceCreatedAt = asString(row.createdAt).trim();",
 			required: "id: publicVehicleSightingID(asString(row.id).trim())",
 		},
 	} {
@@ -490,7 +570,7 @@ func TestPublicStopAndVehicleSightingsUseOpaquePublicIDs(t *testing.T) {
 	}
 }
 
-func TestPublicStopCatalogHidesInternalCatalogFields(t *testing.T) {
+func TestPublicStopCatalogCompatibilityFieldsAreInert(t *testing.T) {
 	t.Parallel()
 
 	body, err := os.ReadFile(spacetimeModuleIndexPath(t))
@@ -498,19 +578,27 @@ func TestPublicStopCatalogHidesInternalCatalogFields(t *testing.T) {
 		t.Fatalf("read Spacetime module: %v", err)
 	}
 	source := string(body)
-	for _, block := range []struct {
-		name  string
-		start string
-		end   string
-	}{
-		{name: "public stop catalog table", start: "const satiksmebot_stop_catalog = table", end: "const satiksmebot_route_catalog = table"},
-		{name: "public stop catalog sanitizer", start: "function sanitizeStopCatalogRow", end: "function sanitizeRouteCatalogRow"},
-	} {
-		snippet := sourceBlock(t, source, block.start, block.end)
-		for _, forbidden := range []string{"liveId", "nearbyStopIds"} {
-			if strings.Contains(snippet, forbidden) {
-				t.Fatalf("%s must not expose %s:\n%s", block.name, forbidden, snippet)
-			}
+	tableBlock := sourceBlock(t, source, "const satiksmebot_stop_catalog = table", "const satiksmebot_route_catalog = table")
+	for _, compatibilityField := range []string{"liveId: t.string()", "nearbyStopIds: t.array(t.string())"} {
+		if !strings.Contains(tableBlock, compatibilityField) {
+			t.Fatalf("public stop catalog must retain v1 compatibility field %q:\n%s", compatibilityField, tableBlock)
+		}
+	}
+	sanitizerBlock := sourceBlock(t, source, "function sanitizeStopCatalogRow", "function sanitizeRouteCatalogRow")
+	for _, inertValue := range []string{"liveId: ''", "nearbyStopIds: []"} {
+		if !strings.Contains(sanitizerBlock, inertValue) {
+			t.Fatalf("public stop catalog sanitizer must write inert compatibility value %q:\n%s", inertValue, sanitizerBlock)
+		}
+	}
+	for _, forbidden := range []string{"item?.liveId", "item?.nearbyStopIds"} {
+		if strings.Contains(sanitizerBlock, forbidden) {
+			t.Fatalf("public stop catalog sanitizer must not copy private compatibility input %q:\n%s", forbidden, sanitizerBlock)
+		}
+	}
+	scrubBlock := sourceBlock(t, source, "function scrubLegacyPublicCompatibilityFields", "function upsertLiveViewerPayload")
+	for _, inertValue := range []string{"liveId: ''", "nearbyStopIds: []"} {
+		if !strings.Contains(scrubBlock, inertValue) {
+			t.Fatalf("startup compatibility scrub must clear retained stop catalog field with %q:\n%s", inertValue, scrubBlock)
 		}
 	}
 }
@@ -595,7 +683,78 @@ func TestPublicBrowserClientHidesInternalLiveRowIDs(t *testing.T) {
 	}
 }
 
-func TestLiveViewerHeartbeatIsPrivateAndServiceOnly(t *testing.T) {
+func TestPublicLiveSnapshotCompatibilityFieldsAreInert(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(spacetimeModuleIndexPath(t))
+	if err != nil {
+		t.Fatalf("read Spacetime module: %v", err)
+	}
+	source := string(body)
+	tableBlock := sourceBlock(t, source, "const satiksmebot_public_live_snapshot_state = table", "const satiksmebot_live_viewer_heartbeat = table")
+	for _, compatibilityField := range []string{
+		"hash: t.string()",
+		"publishedAt: t.string()",
+		"lastSuccessAt: t.string()",
+		"lastAttemptAt: t.string()",
+		"status: t.string()",
+		"consecutiveFailures: t.u32()",
+		"vehicleCount: t.u32()",
+	} {
+		if !strings.Contains(tableBlock, compatibilityField) {
+			t.Fatalf("public live snapshot table must retain v1 compatibility field %q:\n%s", compatibilityField, tableBlock)
+		}
+	}
+	upsertBlock := sourceBlock(t, source, "function upsertLiveSnapshotStatePayload", "function countLiveViewersPayload")
+	for _, inertValue := range []string{
+		"hash: ''",
+		"publishedAt: ''",
+		"lastSuccessAt: ''",
+		"lastAttemptAt: ''",
+		"status: ''",
+		"consecutiveFailures: 0",
+		"vehicleCount: 0",
+	} {
+		if !strings.Contains(upsertBlock, inertValue) {
+			t.Fatalf("public live snapshot upsert must write inert compatibility value %q:\n%s", inertValue, upsertBlock)
+		}
+	}
+	for _, forbidden := range []string{
+		"item?.hash",
+		"item?.publishedAt",
+		"item?.lastSuccessAt",
+		"item?.lastAttemptAt",
+		"item?.status",
+		"item?.consecutiveFailures",
+		"item?.vehicleCount",
+	} {
+		if strings.Contains(upsertBlock, forbidden) {
+			t.Fatalf("public live snapshot upsert must not copy private diagnostic input %q:\n%s", forbidden, upsertBlock)
+		}
+	}
+	responseBlock := sourceBlock(t, source, "function liveSnapshotStateRowToJSON", "function latestVoteMap")
+	for _, forbidden := range []string{"hash:", "publishedAt:", "lastSuccessAt:", "lastAttemptAt:", "status:", "consecutiveFailures:", "vehicleCount:"} {
+		if strings.Contains(responseBlock, forbidden) {
+			t.Fatalf("live snapshot procedure response must omit inert compatibility field %q:\n%s", forbidden, responseBlock)
+		}
+	}
+	scrubBlock := sourceBlock(t, source, "function scrubLegacyPublicCompatibilityFields", "function upsertLiveViewerPayload")
+	for _, inertValue := range []string{
+		"hash: ''",
+		"publishedAt: ''",
+		"lastSuccessAt: ''",
+		"lastAttemptAt: ''",
+		"status: ''",
+		"consecutiveFailures: 0",
+		"vehicleCount: 0",
+	} {
+		if !strings.Contains(scrubBlock, inertValue) {
+			t.Fatalf("startup compatibility scrub must clear retained live snapshot field with %q:\n%s", inertValue, scrubBlock)
+		}
+	}
+}
+
+func TestLegacyPublicLiveViewerHeartbeatIsEmptyAndServiceOnly(t *testing.T) {
 	t.Parallel()
 
 	body, err := os.ReadFile(spacetimeModuleIndexPath(t))
@@ -604,8 +763,52 @@ func TestLiveViewerHeartbeatIsPrivateAndServiceOnly(t *testing.T) {
 	}
 	source := string(body)
 	tableBlock := sourceBlock(t, source, "const satiksmebot_live_viewer_heartbeat = table(", "const satiksmebot_live_viewer_state = table(")
-	if strings.Contains(tableBlock, "public: true") {
-		t.Fatalf("live viewer heartbeat table must not be public")
+	if !strings.Contains(tableBlock, "public: true") {
+		t.Fatalf("legacy live viewer heartbeat table must retain the v1 public flag for non-destructive compatibility")
+	}
+	if strings.Contains(source, "satiksmebot_live_viewer_heartbeat.insert") {
+		t.Fatalf("legacy public heartbeat compatibility table must never receive new rows")
+	}
+	clearBlock := sourceBlock(t, source, "function clearLegacyPublicViewerHeartbeats", "function upsertLiveViewerPayload")
+	for _, required := range []string{
+		"satiksmebot_live_viewer_heartbeat.iter()",
+		"satiksmebot_live_viewer_heartbeat.sessionId.delete",
+	} {
+		if !strings.Contains(clearBlock, required) {
+			t.Fatalf("legacy heartbeat cleanup must contain %q:\n%s", required, clearBlock)
+		}
+	}
+	upsertBlock := sourceBlock(t, source, "function upsertLiveViewerPayload", "function heartbeatLiveViewerPayload")
+	for _, required := range []string{
+		"clearLegacyPublicViewerHeartbeats(tx)",
+		"satiksmebot_live_viewer_state.sessionId.delete",
+		"satiksmebot_live_viewer_state.insert",
+	} {
+		if !strings.Contains(upsertBlock, required) {
+			t.Fatalf("viewer updates must use private viewer state and clear the legacy table with %q:\n%s", required, upsertBlock)
+		}
+	}
+	countBlock := sourceBlock(t, source, "function countLiveViewersPayload", "function listStopSightingsSincePayload")
+	for _, required := range []string{
+		"clearLegacyPublicViewerHeartbeats(tx)",
+		"satiksmebot_live_viewer_state.iter()",
+		"row.visible === true",
+		"row.updatedAt",
+	} {
+		if !strings.Contains(countBlock, required) {
+			t.Fatalf("viewer counts must use only private viewer state with %q:\n%s", required, countBlock)
+		}
+	}
+	if strings.Contains(countBlock, "satiksmebot_live_viewer_heartbeat.iter()") {
+		t.Fatalf("viewer counts must not read the legacy public heartbeat table:\n%s", countBlock)
+	}
+	schemaInfoBlock := sourceBlock(t, source, "export const schemaInfo =", "export const bootstrapMe =")
+	if !strings.Contains(schemaInfoBlock, "scrubLegacyPublicCompatibilityFields(tx)") {
+		t.Fatalf("schema verification must scrub retained v1 public compatibility data before readiness:\n%s", schemaInfoBlock)
+	}
+	cleanupBlock := sourceBlock(t, source, "export const serviceCleanupLiveViewers =", "export const servicePutStopSighting =")
+	if !strings.Contains(cleanupBlock, "clearLegacyPublicViewerHeartbeats(tx)") || !strings.Contains(cleanupBlock, "satiksmebot_live_viewer_state.iter()") {
+		t.Fatalf("viewer cleanup must empty the legacy table and clean private viewer state:\n%s", cleanupBlock)
 	}
 	for _, tc := range []struct {
 		name  string
@@ -618,6 +821,57 @@ func TestLiveViewerHeartbeatIsPrivateAndServiceOnly(t *testing.T) {
 		block := sourceBlock(t, source, tc.start, tc.end)
 		if !strings.Contains(block, "requireServiceRole(tx)") {
 			t.Fatalf("%s must require the service role", tc.name)
+		}
+	}
+}
+
+func TestServiceReportProceduresRejectExistingIDsBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(spacetimeModuleIndexPath(t))
+	if err != nil {
+		t.Fatalf("read Spacetime module: %v", err)
+	}
+	source := string(body)
+	for _, tc := range []struct {
+		name  string
+		start string
+		end   string
+		table string
+		value string
+	}{
+		{
+			name:  "stop report",
+			start: "function recordServiceStopSightingWithVotePayload",
+			end:   "function recordServiceVehicleSightingWithVotePayload",
+			table: "satiksmebot_stop_sighting",
+			value: "sighting",
+		},
+		{
+			name:  "vehicle report",
+			start: "function recordServiceVehicleSightingWithVotePayload",
+			end:   "function recordServiceAreaReportWithVotePayload",
+			table: "satiksmebot_vehicle_sighting",
+			value: "sighting",
+		},
+		{
+			name:  "area report",
+			start: "function recordServiceAreaReportWithVotePayload",
+			end:   "function validateServiceReportVotePair",
+			table: "satiksmebot_area_report",
+			value: "report",
+		},
+	} {
+		block := sourceBlock(t, source, tc.start, tc.end)
+		find := fmt.Sprintf("tx.db.%s.id.find(%s.id)", tc.table, tc.value)
+		deleteCall := fmt.Sprintf("tx.db.%s.id.delete(%s.id)", tc.table, tc.value)
+		findAt := strings.Index(block, find)
+		deleteAt := strings.Index(block, deleteCall)
+		if findAt < 0 || deleteAt < 0 || findAt > deleteAt {
+			t.Fatalf("%s must reject an existing deterministic id before mutation", tc.name)
+		}
+		if !strings.Contains(block[findAt:deleteAt], "reason: 'idempotent_replay'") {
+			t.Fatalf("%s existing-id guard must return idempotent_replay", tc.name)
 		}
 	}
 }

@@ -67,6 +67,13 @@ func StopIncidentID(stopID string) string {
 }
 
 func VehicleIncidentID(scopeKey string) string {
+	if clean := strings.ToLower(strings.TrimSpace(scopeKey)); isOpaqueVehicleScopeKey(clean) {
+		return "vehicle:" + clean
+	}
+	return publicStableID("vehicle:pub", scopeKey)
+}
+
+func legacyVehicleIncidentID(scopeKey string) string {
 	return fmt.Sprintf("vehicle:%s", sanitizeIncidentKey(scopeKey))
 }
 
@@ -124,6 +131,11 @@ func (s *Service) IncidentDetail(ctx context.Context, catalog *model.Catalog, in
 	if incidentID == "" {
 		return nil, fmt.Errorf("incident id is required")
 	}
+	resolvedIncidentID, err := s.canonicalIncidentID(ctx, incidentID, incidentSince(now))
+	if err != nil {
+		return nil, err
+	}
+	incidentID = resolvedIncidentID
 	if publicStore, ok := s.store.(publicIncidentsStore); ok {
 		detail, err := publicStore.GetPublicIncidentDetail(ctx, incidentID, viewerID)
 		if err != nil {
@@ -163,6 +175,11 @@ func (s *Service) IncidentDetail(ctx context.Context, catalog *model.Catalog, in
 }
 
 func (s *Service) VoteIncident(ctx context.Context, catalog *model.Catalog, incidentID string, userID int64, value model.IncidentVoteValue, now time.Time) (model.IncidentVoteSummary, error) {
+	resolvedIncidentID, err := s.canonicalIncidentID(ctx, incidentID, incidentSince(now))
+	if err != nil {
+		return model.IncidentVoteSummary{}, err
+	}
+	incidentID = resolvedIncidentID
 	if _, err := s.IncidentDetail(ctx, catalog, incidentID, now, userID); err != nil {
 		return model.IncidentVoteSummary{}, err
 	}
@@ -179,6 +196,11 @@ func (s *Service) VoteIncident(ctx context.Context, catalog *model.Catalog, inci
 }
 
 func (s *Service) RecordIncidentVoteFromSource(ctx context.Context, catalog *model.Catalog, incidentID string, userID int64, value model.IncidentVoteValue, source model.IncidentVoteSource, eventID string, now time.Time) (model.IncidentVoteSummary, error) {
+	resolvedIncidentID, err := s.canonicalIncidentID(ctx, incidentID, incidentSince(now))
+	if err != nil {
+		return model.IncidentVoteSummary{}, err
+	}
+	incidentID = resolvedIncidentID
 	if source == "" {
 		source = model.IncidentVoteSourceVote
 	}
@@ -200,6 +222,11 @@ func (s *Service) RecordIncidentVoteFromSource(ctx context.Context, catalog *mod
 }
 
 func (s *Service) AddIncidentComment(ctx context.Context, catalog *model.Catalog, incidentID string, userID int64, body string, now time.Time) (*model.IncidentComment, error) {
+	resolvedIncidentID, err := s.canonicalIncidentID(ctx, incidentID, incidentSince(now))
+	if err != nil {
+		return nil, err
+	}
+	incidentID = resolvedIncidentID
 	if _, err := s.IncidentDetail(ctx, catalog, incidentID, now, userID); err != nil {
 		return nil, err
 	}
@@ -228,6 +255,77 @@ func (s *Service) AddIncidentComment(ctx context.Context, catalog *model.Catalog
 	return &comment, nil
 }
 
+// canonicalIncidentID keeps already-shared readable area and vehicle links
+// functional while all new list, detail, vote, and comment responses use only
+// opaque incident IDs. The lookup is bounded to the same active window.
+func (s *Service) canonicalIncidentID(ctx context.Context, incidentID string, since time.Time) (string, error) {
+	clean := strings.TrimSpace(incidentID)
+	switch {
+	case strings.HasPrefix(strings.ToLower(clean), "area:"):
+		suffix := strings.ToLower(strings.TrimSpace(clean[len("area:"):]))
+		if isOpaqueAreaScopeKey(suffix) {
+			return "area:" + suffix, nil
+		}
+		areaReports, err := s.store.ListAreaReportsSince(ctx, since.UTC(), 0)
+		if err != nil {
+			return "", fmt.Errorf("resolve area incident alias: %w", err)
+		}
+		legacyID := "area:" + suffix
+		resolved := ""
+		for index := range areaReports {
+			item := &areaReports[index]
+			logicalScopeKey := AreaScopeKey(model.AreaReportInput{
+				Latitude:     item.Latitude,
+				Longitude:    item.Longitude,
+				RadiusMeters: item.RadiusMeters,
+				Description:  item.Description,
+			})
+			storedScopeKey := areaReportScopeKey(item)
+			if legacyAreaIncidentID(logicalScopeKey) != legacyID && legacyAreaIncidentID(storedScopeKey) != legacyID {
+				continue
+			}
+			candidate := AreaIncidentID(logicalScopeKey)
+			if resolved != "" && resolved != candidate {
+				return "", fmt.Errorf("ambiguous area incident alias")
+			}
+			resolved = candidate
+		}
+		if resolved != "" {
+			return resolved, nil
+		}
+		return clean, nil
+	case strings.HasPrefix(strings.ToLower(clean), "vehicle:"):
+		lower := strings.ToLower(clean)
+		if isHashedPublicID(lower, "vehicle:pub") {
+			return lower, nil
+		}
+		vehicleSightings, err := s.store.ListVehicleSightingsSince(ctx, since.UTC(), "", 0)
+		if err != nil {
+			return "", fmt.Errorf("resolve vehicle incident alias: %w", err)
+		}
+		resolved := ""
+		for index := range vehicleSightings {
+			item := &vehicleSightings[index]
+			scopeKey := vehicleSightingScopeKey(item)
+			storedScopeKey := strings.TrimSpace(item.ScopeKey)
+			if legacyVehicleIncidentID(scopeKey) != lower && legacyVehicleIncidentID(storedScopeKey) != lower {
+				continue
+			}
+			candidate := VehicleIncidentID(scopeKey)
+			if resolved != "" && resolved != candidate {
+				return "", fmt.Errorf("ambiguous vehicle incident alias")
+			}
+			resolved = candidate
+		}
+		if resolved != "" {
+			return resolved, nil
+		}
+		return clean, nil
+	default:
+		return clean, nil
+	}
+}
+
 func redactPublicIncidentSummaries(summaries []model.IncidentSummary) []model.IncidentSummary {
 	out := make([]model.IncidentSummary, 0, len(summaries))
 	for _, summary := range summaries {
@@ -239,11 +337,14 @@ func redactPublicIncidentSummaries(summaries []model.IncidentSummary) []model.In
 func redactPublicIncidentSummary(summary model.IncidentSummary) model.IncidentSummary {
 	summary.LastReporter = publicIncidentActorLabel
 	summary.LastReportAt = publicIncidentTime(summary.LastReportAt)
-	if summary.Scope == IncidentScopeArea {
+	if strings.EqualFold(strings.TrimSpace(summary.Scope), IncidentScopeArea) {
+		summary.Scope = IncidentScopeArea
+		summary.ID = publicAreaIncidentIDFromContext(summary.ID, summary.Area)
 		summary.SubjectID = ""
 		summary.Area = publicAreaContext(summary.Area)
 	}
 	if summary.Scope == "vehicle" {
+		summary.ID = publicVehicleIncidentIDFromContext(summary.ID, summary.Vehicle)
 		summary.SubjectID = ""
 		if summary.Vehicle != nil {
 			vehicle := *summary.Vehicle
@@ -267,7 +368,11 @@ func redactPublicIncidentDetail(detail *model.IncidentDetail) *model.IncidentDet
 	}
 	out.Comments = make([]model.IncidentComment, 0, len(detail.Comments))
 	for _, comment := range detail.Comments {
-		out.Comments = append(out.Comments, redactPublicIncidentComment(comment))
+		if out.Summary.Scope == IncidentScopeArea || out.Summary.Scope == "vehicle" {
+			comment.IncidentID = out.Summary.ID
+		}
+		comment = redactPublicIncidentComment(comment)
+		out.Comments = append(out.Comments, comment)
 	}
 	return &out
 }
@@ -281,9 +386,27 @@ func redactPublicIncidentEvent(event model.IncidentEvent) model.IncidentEvent {
 }
 
 func redactPublicIncidentComment(comment model.IncidentComment) model.IncidentComment {
+	comment.ID = publicIncidentCommentID(comment.IncidentID, comment.ID, comment.CreatedAt)
 	comment.Nickname = publicIncidentActorLabel
 	comment.CreatedAt = publicIncidentTime(comment.CreatedAt)
 	return comment
+}
+
+func publicIncidentCommentID(incidentID, commentID string, createdAt time.Time) string {
+	if clean := strings.ToLower(strings.TrimSpace(commentID)); isHashedPublicID(clean, "incident-comment:pub") {
+		return clean
+	}
+	publicCreatedAt := publicIncidentTime(createdAt)
+	createdAtValue := ""
+	if !publicCreatedAt.IsZero() {
+		createdAtValue = publicCreatedAt.Format(time.RFC3339)
+	}
+	seed := strings.Join([]string{
+		strings.TrimSpace(incidentID),
+		strings.TrimSpace(commentID),
+		createdAtValue,
+	}, "|")
+	return publicStableID("incident-comment:pub", seed)
 }
 
 func publicIncidentTime(value time.Time) time.Time {
@@ -372,17 +495,18 @@ func (s *Service) collectIncidentBundles(ctx context.Context, catalog *model.Cat
 			Nickname:  model.GenericNickname(vehicleSighting.UserID),
 			CreatedAt: vehicleSighting.CreatedAt,
 		}
-		upsertIncidentBundle(bundlesByID, VehicleIncidentID(vehicleSighting.ScopeKey), model.IncidentSummary{
-			ID:             VehicleIncidentID(vehicleSighting.ScopeKey),
+		vehicleScopeKey := vehicleSightingScopeKey(&vehicleSighting)
+		upsertIncidentBundle(bundlesByID, VehicleIncidentID(vehicleScopeKey), model.IncidentSummary{
+			ID:             VehicleIncidentID(vehicleScopeKey),
 			Scope:          "vehicle",
-			SubjectID:      strings.TrimSpace(vehicleSighting.ScopeKey),
+			SubjectID:      vehicleScopeKey,
 			SubjectName:    vehicleIncidentSubjectName(vehicleSighting, stopName),
 			StopID:         stopID,
 			LastReportName: event.Name,
 			LastReportAt:   vehicleSighting.CreatedAt,
 			LastReporter:   event.Nickname,
 			Vehicle: &model.IncidentVehicleContext{
-				ScopeKey:         strings.TrimSpace(vehicleSighting.ScopeKey),
+				ScopeKey:         vehicleScopeKey,
 				StopID:           stopID,
 				StopName:         stopName,
 				Mode:             strings.TrimSpace(vehicleSighting.Mode),
@@ -740,6 +864,9 @@ func sanitizeIncidentKey(value string) string {
 	}
 	replacer := strings.NewReplacer(" ", "-", "/", "-", "\\", "-", ":", "-", "|", "-", ">", "-", "<", "-")
 	value = replacer.Replace(value)
+	for strings.Contains(value, "--") {
+		value = strings.ReplaceAll(value, "--", "-")
+	}
 	value = strings.Trim(value, "-")
 	if value == "" {
 		return "unknown"
