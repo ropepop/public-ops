@@ -40,6 +40,12 @@ critical path. Reporter failures never change deployment success or failure.
 The reporter never receives terminal output, command errors, credentials,
 control codes, or customer data.
 
+Normal completion records the finished run and all completed phases together.
+An interrupt or termination records `cancelled` when the process can still run
+its exit handler, while preserving the original signal exit code. A sudden
+machine or process loss can therefore leave only the bounded `started` row;
+that is an honest incomplete-run marker, not a successful deployment.
+
 ## Configuration
 
 - `OPERATIONAL_LOGGING_DATABASE` defaults to `operational-logging-prod`.
