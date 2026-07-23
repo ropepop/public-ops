@@ -823,12 +823,11 @@ func (s *Server) handleAdminState(w http.ResponseWriter, r *http.Request, id aut
 	writeJSON(w, http.StatusOK, apiResponse{OK: true, State: snapshot, Phone: relayHealth})
 }
 
-func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
+func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, current state.Snapshot) {
 	switch r.Method {
 	case http.MethodPost:
 		if adminFormRequest(r) && r.FormValue("action") == "remove" {
-			snapshot, err := s.store.RemoveMember(r.Context(), s.cfg.TicketID, id.Email, r.FormValue("email"))
-			s.writeStateMutation(w, r, id.Email, "member_remove", snapshot, err, false)
+			s.removeAdminMember(w, r, id.Email, current, r.FormValue("email"))
 			return
 		}
 		var req struct {
@@ -841,15 +840,54 @@ func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id a
 			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: err.Error()})
 			return
 		}
-		snapshot, err := s.store.UpsertMember(r.Context(), s.cfg.TicketID, id.Email, req.Email, req.Role)
+		role, ok := requestedAdminRole(req.Role)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_role", Message: "Role must be owner, admin, or member.", State: current})
+			return
+		}
+		if memberHasRole(current, req.Email, state.RoleOwner) && role != state.RoleOwner {
+			writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Owner access cannot be changed from the member editor.", State: current})
+			return
+		}
+		snapshot, err := s.store.UpsertMember(r.Context(), s.cfg.TicketID, id.Email, req.Email, role)
 		s.writeStateMutation(w, r, id.Email, "member_upsert", snapshot, err, false)
 	case http.MethodDelete:
-		email := strings.TrimSpace(r.URL.Query().Get("email"))
-		snapshot, err := s.store.RemoveMember(r.Context(), s.cfg.TicketID, id.Email, email)
-		s.writeStateMutation(w, r, id.Email, "member_remove", snapshot, err, false)
+		s.removeAdminMember(w, r, id.Email, current, r.URL.Query().Get("email"))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) removeAdminMember(w http.ResponseWriter, r *http.Request, actor string, current state.Snapshot, email string) {
+	if memberHasRole(current, email, state.RoleOwner) {
+		writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Owner access cannot be removed from the member editor.", State: current})
+		return
+	}
+	snapshot, err := s.store.RemoveMember(r.Context(), s.cfg.TicketID, actor, strings.TrimSpace(email))
+	s.writeStateMutation(w, r, actor, "member_remove", snapshot, err, false)
+}
+
+func requestedAdminRole(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case state.RoleOwner:
+		return state.RoleOwner, true
+	case state.RoleAdmin:
+		return state.RoleAdmin, true
+	case state.RoleMember:
+		return state.RoleMember, true
+	default:
+		return "", false
+	}
+}
+
+func memberHasRole(snapshot state.Snapshot, email string, role string) bool {
+	cleanEmail := strings.TrimSpace(email)
+	for _, member := range snapshot.Members {
+		if strings.EqualFold(strings.TrimSpace(member.Email), cleanEmail) && member.Role == role {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleAdminPhoneBackends(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
@@ -1701,22 +1739,37 @@ func (s *Server) requestOriginAllowed(r *http.Request) bool {
 		return true
 	}
 	originURL, err := url.Parse(origin)
-	if err != nil || originURL.Host == "" {
+	if err != nil || originURL.Scheme == "" || originURL.Host == "" || originURL.User != nil || originURL.Path != "" || originURL.RawQuery != "" || originURL.Fragment != "" {
 		return false
 	}
-	allowedHosts := []string{r.Host}
-	if forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
-		allowedHosts = append(allowedHosts, forwardedHost)
+	if !strings.EqualFold(originURL.Scheme, "http") && !strings.EqualFold(originURL.Scheme, "https") {
+		return false
 	}
-	if publicURL, err := url.Parse(s.cfg.PublicBaseURL); err == nil && publicURL.Host != "" {
-		allowedHosts = append(allowedHosts, publicURL.Host)
+	publicURL, err := url.Parse(strings.TrimSpace(s.cfg.PublicBaseURL))
+	return err == nil &&
+		publicURL.Scheme != "" &&
+		publicURL.Host != "" &&
+		sameSchemefulOrigin(originURL, publicURL)
+}
+
+func sameSchemefulOrigin(left *url.URL, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) &&
+		strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		effectiveOriginPort(left) == effectiveOriginPort(right)
+}
+
+func effectiveOriginPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
 	}
-	for _, host := range allowedHosts {
-		if strings.EqualFold(originURL.Host, strings.TrimSpace(host)) {
-			return true
-		}
+	switch strings.ToLower(value.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
 	}
-	return false
 }
 
 func (c *client) sendText(ctx context.Context, value []byte) {

@@ -343,7 +343,7 @@ func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
 		"Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
 		"X-Content-Type-Options":    "nosniff",
 		"X-Frame-Options":           "DENY",
-		"Referrer-Policy":           "no-referrer",
+		"Referrer-Policy":           "same-origin",
 		"Permissions-Policy":        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()",
 	}
 	for header, want := range required {
@@ -1426,6 +1426,146 @@ func TestAdminMembersRouteAddsAndRemovesMember(t *testing.T) {
 	}
 	if _, ok := removed.State.Member("new.member@example.com"); ok {
 		t.Fatalf("removed member still active in state: %#v", removed.State.Members)
+	}
+}
+
+func TestAdminMemberFormAllowsConfiguredSameOrigin(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader("email=form.member%40example.com&role=member"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://ticket.test")
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("same-origin form status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/admin" {
+		t.Fatalf("same-origin form redirect = %q, want /admin", got)
+	}
+	snapshot, err := server.store.Snapshot(context.Background(), "vivi-default", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snapshot.Member("form.member@example.com"); !ok {
+		t.Fatalf("same-origin form member missing from state: %#v", snapshot.Members)
+	}
+
+	defaultPortReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader("email=default.port%40example.com&role=member"))
+	defaultPortReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	defaultPortReq.Header.Set("Origin", "http://ticket.test:80")
+	defaultPortReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	defaultPortRec := httptest.NewRecorder()
+	server.ServeHTTP(defaultPortRec, defaultPortReq)
+	if defaultPortRec.Code != http.StatusSeeOther {
+		t.Fatalf("same-origin default-port form status = %d body = %s", defaultPortRec.Code, defaultPortRec.Body.String())
+	}
+}
+
+func TestAdminMemberFormRejectsOpaqueAndCrossOriginRequests(t *testing.T) {
+	tests := []struct {
+		name          string
+		origin        string
+		host          string
+		forwardedHost string
+	}{
+		{name: "opaque", origin: "null"},
+		{name: "cross origin", origin: "https://attacker.example"},
+		{name: "same host wrong scheme", origin: "https://ticket.test"},
+		{name: "same origin wrong port", origin: "http://ticket.test:81"},
+		{name: "non http scheme", origin: "ftp://ticket.test"},
+		{name: "origin with path", origin: "http://ticket.test/path"},
+		{name: "request host alias", origin: "https://alias.example", host: "alias.example", forwardedHost: "alias.example"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTicketSetupTestServer(t, "pixel")
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader("email=blocked%40example.com&role=member"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", tc.origin)
+			if tc.host != "" {
+				req.Host = tc.host
+			}
+			if tc.forwardedHost != "" {
+				req.Header.Set("X-Forwarded-Host", tc.forwardedHost)
+			}
+			req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("origin %q status = %d body = %s", tc.origin, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"error":"bad_origin"`) {
+				t.Fatalf("origin %q body = %s", tc.origin, rec.Body.String())
+			}
+			snapshot, err := server.store.Snapshot(context.Background(), "vivi-default", time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := snapshot.Member("blocked@example.com"); ok {
+				t.Fatalf("origin %q unexpectedly changed member state", tc.origin)
+			}
+		})
+	}
+}
+
+func TestAdminMemberMutationsProtectOwnerAndRejectInvalidRoles(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	tests := []struct {
+		name        string
+		method      string
+		target      string
+		contentType string
+		body        string
+		wantStatus  int
+		wantError   string
+	}{
+		{name: "form remove owner", method: http.MethodPost, target: "/api/v1/admin/members", contentType: "application/x-www-form-urlencoded", body: "action=remove&email=ticket%40jolkins.id.lv", wantStatus: http.StatusConflict, wantError: "owner_protected"},
+		{name: "delete owner", method: http.MethodDelete, target: "/api/v1/admin/members?email=ticket%40jolkins.id.lv", wantStatus: http.StatusConflict, wantError: "owner_protected"},
+		{name: "json demote owner", method: http.MethodPost, target: "/api/v1/admin/members", contentType: "application/json", body: `{"email":"ticket@jolkins.id.lv","role":"member"}`, wantStatus: http.StatusConflict, wantError: "owner_protected"},
+		{name: "form demote owner", method: http.MethodPost, target: "/api/v1/admin/members", contentType: "application/x-www-form-urlencoded", body: "email=ticket%40jolkins.id.lv&role=admin", wantStatus: http.StatusConflict, wantError: "owner_protected"},
+		{name: "invalid role", method: http.MethodPost, target: "/api/v1/admin/members", contentType: "application/json", body: `{"email":"invalid.role@example.com","role":"superuser"}`, wantStatus: http.StatusBadRequest, wantError: "bad_role"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.target, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"error":"`+tc.wantError+`"`) {
+				t.Fatalf("body = %s", rec.Body.String())
+			}
+		})
+	}
+
+	idempotentReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/members", strings.NewReader(`{"email":"ticket@jolkins.id.lv","role":"owner"}`))
+	idempotentReq.Header.Set("Content-Type", "application/json")
+	idempotentReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	idempotentRec := httptest.NewRecorder()
+	server.ServeHTTP(idempotentRec, idempotentReq)
+	if idempotentRec.Code != http.StatusOK {
+		t.Fatalf("idempotent owner update status = %d body = %s", idempotentRec.Code, idempotentRec.Body.String())
+	}
+
+	snapshot, err := server.store.Snapshot(context.Background(), "vivi-default", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := snapshot.Member("ticket@jolkins.id.lv")
+	if !ok || owner.Role != state.RoleOwner || !owner.Active {
+		t.Fatalf("owner changed after rejected mutations: %#v", owner)
+	}
+	if _, ok := snapshot.Member("invalid.role@example.com"); ok {
+		t.Fatalf("invalid role request created a member: %#v", snapshot.Members)
 	}
 }
 

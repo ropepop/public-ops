@@ -58,7 +58,10 @@ func writeSecurityHeadersWithConnect(w http.ResponseWriter, nonce string, connec
 	w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// The origin gate rejects opaque origins on state-changing requests. Keep
+	// referrers private outside this site while allowing same-origin form POSTs
+	// to carry their real Origin instead of the Fetch-standard "null" value.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()")
 	scriptSrc := "script-src 'self'"
 	styleSrc := "style-src 'self'"
