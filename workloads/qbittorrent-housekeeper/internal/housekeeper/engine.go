@@ -170,7 +170,29 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 				return err
 			}
 			admittedThisPoll++
+			continue
 		}
+
+		pressureEvictions, sufficient := e.pressureEvictions(items, candidate, usedBytes, started)
+		if sufficient {
+			for _, item := range pressureEvictions {
+				if err := e.api.Delete(ctx, item.torrent.Hash, true); err != nil {
+					err = fmt.Errorf("delete pressure-eviction torrent %s: %w", shortHash(item.torrent.Hash), err)
+					e.status.RecordFailure(started, err)
+					return err
+				}
+			}
+			snapshot := e.snapshot(started, items, usedBytes)
+			snapshot.DeletionsRequested = len(pressureEvictions)
+			snapshot.Message = "pressure evictions submitted; admission deferred for a fresh storage measurement"
+			e.status.RecordSuccess(snapshot)
+			return nil
+		}
+
+		// Candidates are handled oldest-first. If the oldest cannot fit and no
+		// safe admitted torrent can create enough predicted capacity, keep it
+		// waiting rather than admitting a newer torrent ahead of it.
+		break
 	}
 
 	snapshot := e.snapshot(started, items, usedBytes)
@@ -192,6 +214,7 @@ func (e *Engine) eligibleForDeletion(items []*managedTorrent, now time.Time) []*
 			!pathsInsideDownloadRoot(t, e.policy.DownloadRoot) ||
 			!currentlyComplete(t) ||
 			t.CompletionOn <= 0 ||
+			!validRatio(t.Ratio) ||
 			t.Ratio < e.policy.MinRatio {
 			continue
 		}
@@ -205,6 +228,40 @@ func (e *Engine) eligibleForDeletion(items []*managedTorrent, now time.Time) []*
 		return older(eligible[i].torrent, eligible[j].torrent)
 	})
 	return eligible
+}
+
+// pressureEvictions finds the smallest oldest-added-first set of admitted
+// torrents that is predicted to make candidate fit. Unlike routine retention,
+// this path intentionally does not require completion, a minimum age, or a
+// minimum ratio. It remains fail-closed on the identity, accounting fields,
+// ordering timestamp, managed paths, and protection tags. No admission happens
+// until a later poll observes the resulting filesystem usage.
+func (e *Engine) pressureEvictions(items []*managedTorrent, candidate *managedTorrent, usedBytes int64, now time.Time) ([]*managedTorrent, bool) {
+	eligible := make([]*managedTorrent, 0)
+	for _, item := range items {
+		t := item.torrent
+		if !item.has(e.policy.AdmittedTag) ||
+			item.has(e.policy.WaitingTag) ||
+			item.has(e.policy.RejectedTag) ||
+			item.has(e.policy.KeepTag) ||
+			!pathsInsideDownloadRoot(t, e.policy.DownloadRoot) ||
+			!validPressureEvictionMetadata(t, now) {
+			continue
+		}
+		eligible = append(eligible, item)
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		return olderByAddedTime(eligible[i].torrent, eligible[j].torrent)
+	})
+
+	selected := make([]*managedTorrent, 0, len(eligible))
+	for _, item := range eligible {
+		selected = append(selected, item)
+		if e.fitsAfterPressureEvictions(items, candidate, usedBytes, selected) {
+			return selected, true
+		}
+	}
+	return nil, false
 }
 
 func (e *Engine) normalize(ctx context.Context, items []*managedTorrent) error {
@@ -359,9 +416,28 @@ func (e *Engine) removeTags(ctx context.Context, item *managedTorrent, tags ...s
 }
 
 func (e *Engine) fits(items []*managedTorrent, candidate *managedTorrent, usedBytes int64) bool {
+	return e.fitsAfterPressureEvictions(items, candidate, usedBytes, nil)
+}
+
+func (e *Engine) fitsAfterPressureEvictions(items []*managedTorrent, candidate *managedTorrent, usedBytes int64, evicted []*managedTorrent) bool {
+	evictedSet := make(map[*managedTorrent]struct{}, len(evicted))
+	predictedUsedBytes := usedBytes
+	for _, item := range evicted {
+		evictedSet[item] = struct{}{}
+		reclaimed := materializedBytes(item.torrent)
+		if reclaimed >= predictedUsedBytes {
+			predictedUsedBytes = 0
+		} else {
+			predictedUsedBytes -= reclaimed
+		}
+	}
+
 	reserved, materialized := int64(0), int64(0)
 	for _, item := range items {
 		if item == candidate || !item.has(e.policy.AdmittedTag) || item.has(e.policy.RejectedTag) {
+			continue
+		}
+		if _, evicted := evictedSet[item]; evicted {
 			continue
 		}
 		reserved = saturatingAdd(reserved, item.torrent.Size)
@@ -369,10 +445,10 @@ func (e *Engine) fits(items []*managedTorrent, candidate *managedTorrent, usedBy
 	}
 	reserved = saturatingAdd(reserved, candidate.torrent.Size)
 	materialized = saturatingAdd(materialized, materializedBytes(candidate.torrent))
-	if reserved > e.policy.SoftCapBytes || usedBytes > e.policy.SoftCapBytes {
+	if reserved > e.policy.SoftCapBytes || predictedUsedBytes > e.policy.SoftCapBytes {
 		return false
 	}
-	untracked := usedBytes - materialized
+	untracked := predictedUsedBytes - materialized
 	if untracked < 0 {
 		untracked = 0
 	}
@@ -462,16 +538,60 @@ func metadataReady(t qbit.Torrent) bool {
 }
 
 func currentlyComplete(t qbit.Torrent) bool {
-	if t.AmountLeft != 0 || t.Progress < 1 {
+	trimmedHash := strings.TrimSpace(t.Hash)
+	if trimmedHash == "" || t.Hash != trimmedHash ||
+		t.Size <= 0 ||
+		t.Completed != t.Size ||
+		t.AmountLeft != 0 ||
+		math.IsNaN(t.Progress) ||
+		math.IsInf(t.Progress, 0) ||
+		t.Progress != 1 {
 		return false
 	}
-	state := strings.ToLower(t.State)
-	return state != "" &&
-		!strings.Contains(state, "check") &&
-		!strings.Contains(state, "error") &&
-		!strings.Contains(state, "missing") &&
-		!strings.Contains(state, "moving") &&
-		state != "metadl"
+	if t.State != strings.TrimSpace(t.State) {
+		return false
+	}
+	switch strings.ToLower(t.State) {
+	case "uploading", "pausedup", "queuedup", "stalledup", "forcedup", "stoppedup":
+		return true
+	default:
+		return false
+	}
+}
+
+func validRatio(ratio float64) bool {
+	return !math.IsNaN(ratio) && !math.IsInf(ratio, 0) && ratio >= 0
+}
+
+func validPressureEvictionMetadata(t qbit.Torrent, now time.Time) bool {
+	trimmedHash := strings.TrimSpace(t.Hash)
+	trimmedState := strings.TrimSpace(t.State)
+	if trimmedHash == "" || t.Hash != trimmedHash ||
+		trimmedState == "" || t.State != trimmedState ||
+		t.Size <= 0 ||
+		t.Completed < 0 || t.Completed > t.Size ||
+		t.AmountLeft < 0 || t.AmountLeft > t.Size ||
+		t.Completed != t.Size-t.AmountLeft ||
+		math.IsNaN(t.Progress) || math.IsInf(t.Progress, 0) ||
+		t.Progress < 0 || t.Progress > 1 ||
+		t.AddedOn <= 0 {
+		return false
+	}
+	expectedProgress := float64(t.Completed) / float64(t.Size)
+	if math.Abs(t.Progress-expectedProgress) > 0.000001 || !pressureEvictionStateAllowed(trimmedState) {
+		return false
+	}
+	return !time.Unix(t.AddedOn, 0).After(now)
+}
+
+func pressureEvictionStateAllowed(state string) bool {
+	switch strings.ToLower(state) {
+	case "downloading", "forceddl", "queueddl", "stalleddl", "pauseddl", "stoppeddl",
+		"uploading", "forcedup", "queuedup", "stalledup", "pausedup", "stoppedup":
+		return true
+	default:
+		return false
+	}
 }
 
 func pathsInsideDownloadRoot(t qbit.Torrent, root string) bool {
@@ -499,6 +619,13 @@ func older(a, b qbit.Torrent) bool {
 	bTime := sortTime(b)
 	if aTime != bTime {
 		return aTime < bTime
+	}
+	return a.Hash < b.Hash
+}
+
+func olderByAddedTime(a, b qbit.Torrent) bool {
+	if a.AddedOn != b.AddedOn {
+		return a.AddedOn < b.AddedOn
 	}
 	return a.Hash < b.Hash
 }

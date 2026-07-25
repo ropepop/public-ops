@@ -103,6 +103,41 @@ func TestDefaultPhoneNoViewerStopDelayCoversBrowserReload(t *testing.T) {
 	}
 }
 
+func TestLoadUsesEuropeRigaAsDefaultPhoneTimeZone(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_PHONE_TIME_ZONE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Phone.TimeZone != "Europe/Riga" {
+		t.Fatalf("phone time zone = %q, want Europe/Riga", cfg.Phone.TimeZone)
+	}
+}
+
+func TestLoadAcceptsConfiguredPhoneTimeZone(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_PHONE_TIME_ZONE", "Europe/Tallinn")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Phone.TimeZone != "Europe/Tallinn" {
+		t.Fatalf("phone time zone = %q", cfg.Phone.TimeZone)
+	}
+}
+
+func TestLoadRejectsInvalidPhoneTimeZone(t *testing.T) {
+	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
+	t.Setenv("TICKET_REMOTE_PHONE_TIME_ZONE", "Mars/Olympus")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TICKET_REMOTE_PHONE_TIME_ZONE") {
+		t.Fatalf("expected invalid phone time-zone error, got %v", err)
+	}
+}
+
 func TestCloudflareAccessAuthModeRequiresAccessConfig(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "cloudflare")
 

@@ -1,0 +1,73 @@
+.admin-phone-clock {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #1d2837;
+  border-radius: 8px;
+  padding: 12px;
+  background: #0b1119;
+}
+
+.admin-phone-clock strong,
+.admin-schedule-main strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.admin-schedule-form {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.admin-schedule-form label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: #9cabbc;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.admin-schedule-form button,
+.admin-schedule-form input {
+  min-height: 44px;
+  padding: 0 10px;
+}
+
+.admin-schedule-card {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #31548f;
+  border-radius: 8px;
+  padding: 12px;
+  background: #101a2f;
+}
+
+.admin-schedule-main {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.admin-schedule-result {
+  color: #dbe8ff;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 780px) {
+  .admin-schedule-form,
+  .admin-schedule-card {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-schedule-card button,
+  .admin-schedule-form button {
+    width: 100%;
+  }
+}

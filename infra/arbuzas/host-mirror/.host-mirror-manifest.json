@@ -52,8 +52,8 @@
     },
     "etc/arbuzas/env/ticket-remote.env": {
       "mode": 384,
-      "sha256": "65d7ba374e9207ec291b00ceea3b9eb1939403fbdc052f49804e43973ac3a7fc",
-      "size": 1356
+      "sha256": "11d8ce3f5a0fe385de7fe4f8a6439916107673dcc99299caf3899f85e1d677ea",
+      "size": 1398
     },
     "etc/arbuzas/env/train-bot.env": {
       "mode": 384,
@@ -147,5 +147,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1784697552
+  "updatedEpochSeconds": 1784796907
 }

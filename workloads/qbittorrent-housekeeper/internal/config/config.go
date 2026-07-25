@@ -34,7 +34,7 @@ func Load() (Config, error) {
 		PasswordFile:   strings.TrimSpace(os.Getenv("QBITTORRENT_PASSWORD_FILE")),
 		DownloadPath:   envOr("DOWNLOAD_PATH", "/downloads"),
 		SoftCapBytes:   defaultSoftCapBytes,
-		MinAge:         24 * time.Hour,
+		MinAge:         7 * 24 * time.Hour,
 		MinRatio:       1,
 		PollInterval:   30 * time.Second,
 		RequestTimeout: 10 * time.Second,

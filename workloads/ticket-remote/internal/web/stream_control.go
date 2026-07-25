@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	streamControlWriteTimeout = 2 * time.Second
-	streamCommandTTL          = 2 * time.Minute
-	streamKeyframeCommandTTL  = 30 * time.Second
+	streamControlWriteTimeout      = 2 * time.Second
+	streamCommandTTL               = 2 * time.Minute
+	streamKeyframeCommandTTL       = 30 * time.Second
+	latestTicketReselectCommandTTL = 10 * time.Minute
 )
 
 func (s *Server) publishStreamDesiredStateAsync(active bool, viewerCount int, reason string, source string) {

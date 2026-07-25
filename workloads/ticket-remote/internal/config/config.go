@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"ticketremote/internal/auth"
 	"ticketremote/internal/phone"
@@ -17,6 +18,7 @@ import (
 const defaultOIDCIssuer = "https://auth.spacetimedb.com/oidc"
 const defaultNoViewerStopDelay = 60 * time.Second
 const DurationNever time.Duration = -1
+const DefaultPhoneTimeZone = "Europe/Riga"
 
 type Config struct {
 	BindAddr            string
@@ -42,6 +44,7 @@ type PhoneConfig struct {
 	BackendID         string
 	AttachName        string
 	BaseURL           string
+	TimeZone          string
 	Backends          []PhoneBackend
 	DefaultBackendID  string
 	ActiveBackendFile string
@@ -131,6 +134,7 @@ func Load() (Config, error) {
 			BackendID:         activePhone.ID,
 			AttachName:        activePhone.AttachName,
 			BaseURL:           activePhone.BaseURL,
+			TimeZone:          getenv("TICKET_REMOTE_PHONE_TIME_ZONE", DefaultPhoneTimeZone),
 			Backends:          phoneBackends,
 			DefaultBackendID:  defaultPhoneID,
 			ActiveBackendFile: activeBackendFile,
@@ -179,6 +183,9 @@ func Load() (Config, error) {
 	}
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")
+	}
+	if _, err := time.LoadLocation(cfg.Phone.TimeZone); err != nil {
+		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_TIME_ZONE is invalid: %w", err)
 	}
 	if cfg.Production {
 		if err := validateProductionConfig(cfg); err != nil {

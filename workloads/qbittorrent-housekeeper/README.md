@@ -18,14 +18,20 @@ qBittorrent Web API and reads filesystem usage; it never removes files itself.
 - A torrent that fits is tagged `retention-admitted` and started once. If it is
   stopped later, the housekeeper treats that as a manual stop and does not
   restart it.
-- Normal deletion requires a valid qBittorrent completion time, at least 24
-  completed hours, and a local ratio of at least 1.0. The whole torrent and its
+- Normal deletion requires a valid qBittorrent completion time, at least seven
+  completed days, and a local ratio of at least 1.0. The whole torrent and its
   downloaded data are deleted.
-- `retention-keep` prevents automatic deletion but does not exempt the torrent
-  from the storage budget.
-- Eligible deletions are submitted oldest-first. Admission waits for a later
-  poll and a fresh filesystem measurement, so an asynchronous file deletion
-  cannot create imaginary free space.
+- When a waiting torrent cannot fit, storage pressure may remove the oldest
+  admitted torrent even while it is incomplete or actively downloading, and
+  regardless of age or ratio. The whole torrent and any partial payload are
+  removed. Only the minimum oldest-added set needed for admission is requested
+  for deletion, and admission still waits for a fresh filesystem measurement.
+- `retention-keep` prevents both normal and pressure-driven deletion but does
+  not exempt the torrent from the storage budget.
+- Normal deletions are submitted oldest-completion-first; pressure deletions
+  are submitted oldest-added-first across complete and incomplete torrents.
+  Admission waits for a later poll and a fresh filesystem measurement, so an
+  asynchronous file deletion cannot create imaginary free space.
 
 The qBittorrent add flow should use its **stop after metadata is received**
 condition. The controller also re-stops metadata-complete waiting or rejected
@@ -40,7 +46,7 @@ torrents if they are started manually.
 | `QBITTORRENT_PASSWORD_FILE` | empty | Optional file containing the API password |
 | `DOWNLOAD_PATH` | `/downloads` | Dedicated torrent filesystem mount |
 | `SOFT_CAP_BYTES` | `25769803776` | Admission cap (24 GiB) |
-| `MIN_COMPLETED_AGE` | `24h` | Minimum time since valid completion time |
+| `MIN_COMPLETED_AGE` | `168h` | Minimum time since valid completion time |
 | `MIN_RATIO` | `1.0` | Minimum local qBittorrent ratio |
 | `POLL_INTERVAL` | `30s` | Reconciliation interval |
 | `REQUEST_TIMEOUT` | `10s` | Timeout for one API operation |

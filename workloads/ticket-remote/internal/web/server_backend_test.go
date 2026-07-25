@@ -212,6 +212,9 @@ func TestAdminTicketReselectLatestQueuesForceCommand(t *testing.T) {
 	if command.CommandType != "force_ticket_reselect" || command.BackendID != "lab-pixel" {
 		t.Fatalf("command = %#v", command)
 	}
+	if command.TTL != 10*time.Minute {
+		t.Fatalf("command TTL = %s, want 10 minutes", command.TTL)
+	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(command.PayloadJSON), &payload); err != nil {
 		t.Fatal(err)

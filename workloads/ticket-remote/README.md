@@ -72,6 +72,7 @@ Production currently depends on one kitty-gration host and one physical Pixel. S
 - after login and a current membership check, the sidecar issues a five-minute member-proxy token using that key's real issuer and audience; the module separately pins its proxy role, `member:<email>` subject, verified email, and live membership, without granting service reducers
 - `TICKET_REMOTE_PHONE_BACKENDS`
 - `TICKET_REMOTE_PHONE_BASE_URL=http://ticket_phone_bridge:9388`
+- `TICKET_REMOTE_PHONE_TIME_ZONE=Europe/Riga` for the Pixel-local wall clock used by admin-scheduled latest-ticket re-detection
 - `TICKET_REMOTE_DEFAULT_PHONE_BACKEND_ID`
 - `TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE`
 

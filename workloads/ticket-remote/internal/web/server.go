@@ -239,6 +239,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.withAdmin(w, r, s.handleAdminPhoneBackend)
 	case path == "/api/v1/admin/ticket/reselect-latest":
 		s.withAdmin(w, r, s.handleAdminTicketReselectLatest)
+	case path == "/api/v1/admin/ticket/reselect-latest/schedule":
+		s.withAdmin(w, r, s.handleAdminTicketReselectLatestSchedule)
 	case path == "/admin":
 		s.handleAdminShell(w, r)
 	case path == "/auth/callback":
@@ -574,7 +576,7 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 	}
 	phoneHealth := s.relay.Snapshot()
 	activeBackend := s.activePhoneBackend()
-	_ = s.adminTmpl.Execute(w, map[string]any{
+	pageData := map[string]any{
 		"AssetVersion":  assetVersion(),
 		"Email":         id.Email,
 		"IsOwner":       member.Role == state.RoleOwner,
@@ -585,7 +587,11 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 		"ActiveBackend": activeBackend.ID,
 		"RawState":      mustJSON(map[string]any{"state": snapshot, "phone": phoneHealth}),
 		"Nonce":         nonce,
-	})
+	}
+	for key, value := range s.phoneSchedulePageData(snapshot, time.Now()) {
+		pageData[key] = value
+	}
+	_ = s.adminTmpl.Execute(w, pageData)
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
@@ -1020,7 +1026,7 @@ func (s *Server) handleAdminTicketReselectLatest(w http.ResponseWriter, r *http.
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), streamControlWriteTimeout)
 	defer cancel()
-	commandID, err := s.appendStreamCommand(ctx, "force_ticket_reselect", "admin_force_latest_ticket_reselect", payload, streamCommandTTL)
+	commandID, err := s.appendStreamCommand(ctx, "force_ticket_reselect", "admin_force_latest_ticket_reselect", payload, latestTicketReselectCommandTTL)
 	if err != nil {
 		s.recordRuntimeErrorAsync("latest_ticket_reselect_command_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
 		writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: "command_failed", Message: "Latest ticket reselect could not be requested."})

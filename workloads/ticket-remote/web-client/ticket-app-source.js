@@ -198,7 +198,8 @@ import { html, reactive } from '@arrow-js/core';
   if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
-  const presenceState = reactive({ viewers: [], visibleViewerCount: 0 });
+  const presenceListAnchorKey = 'viewer-list-anchor';
+  const presenceState = reactive({ viewers: [], visibleViewerCount: 0, hasVisibleRows: false });
   let presenceMounted = false;
 
   let videoWs = null;
@@ -4006,6 +4007,16 @@ import { html, reactive } from '@arrow-js/core';
         mark: 'gaida'
       });
     }
+    presenceState.hasVisibleRows = nextViewers.length > 0;
+    // Arrow 1.0.6 can race its deferred keyed-list cleanup when a live list
+    // briefly becomes empty and is repopulated during a reconnect. Keep one
+    // invisible keyed row mounted so the list always has a stable overlap.
+    nextViewers.push({
+      key: presenceListAnchorKey,
+      label: '',
+      mark: '',
+      hidden: true
+    });
     presenceState.viewers = nextViewers;
     if (presenceMounted) return;
     presence.textContent = '';
@@ -4015,9 +4026,9 @@ import { html, reactive } from '@arrow-js/core';
         <span>Skatītāji</span>
         <strong>${() => `${presenceState.visibleViewerCount} lapā`}</strong>
       </div>
-      <div class="presence-list" hidden="${() => presenceState.viewers.length === 0}">
+      <div class="presence-list" hidden="${() => !presenceState.hasVisibleRows}">
         ${() => presenceState.viewers.map((viewer) => html`
-          <div class="presence-item">
+          <div class="presence-item" hidden="${viewer.hidden === true}">
             <span class="presence-email">${viewer.label}</span>
             <span class="presence-mark">${viewer.mark}</span>
           </div>

@@ -23,6 +23,8 @@ Use an explicit `--release-id` for traceable deploys when cutting a known user-f
 
 Interactive browser UI must use ArrowJS for changing presence, status, stream, and control areas. Edit browser UI in `workloads/ticket-remote/web-client/`, rebuild with `make web-client-build`, and after deploy verify the authenticated page mounts the Arrow-backed path (`document.documentElement.dataset.ticketUi === "arrow"`) with no new browser console errors.
 
+The authenticated admin page also provides a durable one-time latest-ticket re-detection schedule. Its separate date and time fields use the browser's native selectors, but the submitted wall time is interpreted in `TICKET_REMOTE_PHONE_TIME_ZONE` (`Europe/Riga` in production), not the browser or container time zone. The private SpacetimeDB timer survives `ticket_remote` and sidecar restarts. A scheduled run is complete only when the admin status reaches a terminal result and Pixel health reports latest-ticket re-detection as `succeeded` with phase `ready`; command acceptance alone is not completion.
+
 ## Health Checks
 
 ```bash

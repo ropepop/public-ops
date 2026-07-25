@@ -32,7 +32,7 @@ func TestLoadDefaultsToNoAuthentication(t *testing.T) {
 	if cfg.Username != "" || cfg.PasswordFile != "" {
 		t.Fatalf("default authentication = %q/%q, want disabled", cfg.Username, cfg.PasswordFile)
 	}
-	if cfg.SoftCapBytes != 24*1024*1024*1024 || cfg.MinAge != 24*time.Hour || cfg.MinRatio != 1 {
+	if cfg.SoftCapBytes != 24*1024*1024*1024 || cfg.MinAge != 7*24*time.Hour || cfg.MinRatio != 1 {
 		t.Fatalf("unexpected policy defaults: %#v", cfg)
 	}
 }

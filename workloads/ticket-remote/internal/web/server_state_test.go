@@ -32,6 +32,17 @@ func TestMemberStateRedactionHidesAdminOnlyDetails(t *testing.T) {
 			LastError:    "internal",
 			LastSeenAt:   "2026-05-08T10:00:00Z",
 		},
+		LatestTicketReselectSchedules: []state.LatestTicketReselectSchedule{{
+			ID:             "private-schedule-id",
+			TicketID:       "vivi-default",
+			BackendID:      "pixel",
+			ScheduledAt:    "2026-05-08T11:00:00Z",
+			PhoneLocalTime: "2026-05-08T14:00",
+			PhoneTimeZone:  "Europe/Riga",
+			Status:         "failed",
+			ResultReason:   "private-schedule-reason",
+			RequestedBy:    "A1B2",
+		}},
 		ServerTime:   "2026-05-08T10:00:00Z",
 		StateBackend: "spacetime",
 	}
@@ -42,7 +53,7 @@ func TestMemberStateRedactionHidesAdminOnlyDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, forbidden := range []string{"secret-session", "secret-session-2", "secret-session-3", "secret-control", "owner@example.test", "viewer@example.test", "other@example.test", "gone@example.test", "ticket_phone_bridge", "healthJson", "lastError", `"members"`, `"viewers"`} {
+	for _, forbidden := range []string{"secret-session", "secret-session-2", "secret-session-3", "secret-control", "private-schedule-id", "private-schedule-reason", "latestTicketReselectSchedules", "owner@example.test", "viewer@example.test", "other@example.test", "gone@example.test", "ticket_phone_bridge", "healthJson", "lastError", `"members"`, `"viewers"`} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("public member state leaked %q in %s", forbidden, text)
 		}
@@ -78,6 +89,11 @@ func TestAdminPageRendersDashboardShell(t *testing.T) {
 	for _, expected := range []string{
 		`class="admin-status-grid"`,
 		`action="/api/v1/admin/ticket/reselect-latest"`,
+		`action="/api/v1/admin/ticket/reselect-latest/schedule"`,
+		`name="date" type="date"`,
+		`name="time" type="time" step="60"`,
+		`Europe/Riga`,
+		`/static/admin-schedule.css?v=`,
 		`action="/api/v1/admin/phone/backend"`,
 		`action="/api/v1/admin/members"`,
 		`class="admin-member-public-id"`,

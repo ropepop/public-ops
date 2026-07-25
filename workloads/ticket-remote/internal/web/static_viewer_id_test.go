@@ -27,21 +27,39 @@ func TestStaticClientKeepsArrowPresenceListMountedAcrossIdentifierRefresh(t *tes
 		"  codeDigits.addEventListener('focus', updateViewportVars);")
 
 	for _, required := range []string{
+		"const presenceListAnchorKey = 'viewer-list-anchor'",
+		"hasVisibleRows: false",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("presence UI missing keyed-list reconnect guard %q", required)
+		}
+	}
+	for _, required := range []string{
 		"const nextViewers = active.map",
 		"if (!nextViewers.length && countValue > 0)",
 		"key: 'viewer-identifiers-pending'",
 		"Identifikatori atjaunojas",
 		"mark: 'gaida'",
-		"<div class=\"presence-list\" hidden=\"${() => presenceState.viewers.length === 0}\">",
+		"presenceState.hasVisibleRows = nextViewers.length > 0",
+		"key: presenceListAnchorKey",
+		"hidden: true",
+		"<div class=\"presence-list\" hidden=\"${() => !presenceState.hasVisibleRows}\">",
 		"${() => presenceState.viewers.map((viewer) => html`",
+		"<div class=\"presence-item\" hidden=\"${viewer.hidden === true}\">",
 	} {
 		if !strings.Contains(presenceBody, required) {
 			t.Fatalf("presence UI missing stable identifier-refresh behavior %q", required)
 		}
 	}
+	anchorIndex := strings.Index(presenceBody, "key: presenceListAnchorKey")
+	assignmentIndex := strings.Index(presenceBody, "presenceState.viewers = nextViewers")
+	if anchorIndex < 0 || assignmentIndex < 0 || anchorIndex > assignmentIndex {
+		t.Fatal("presence UI must append its invisible keyed anchor before replacing the reactive list")
+	}
 	for _, forbidden := range []string{
 		"presenceState.viewers.length ?",
 		"identifiersPending",
+		"presenceState.viewers.length === 0",
 		"hidden=${() => presenceState.viewers.length === 0}",
 	} {
 		if strings.Contains(presenceBody, forbidden) {

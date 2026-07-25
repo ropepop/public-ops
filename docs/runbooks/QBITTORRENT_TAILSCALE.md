@@ -23,18 +23,23 @@ traffic, not the Web interface.
 
 The companion housekeeper applies these rules every 30 seconds:
 
-- A completed torrent is kept for at least 24 hours.
+- Under normal storage conditions, a completed torrent is kept for at least
+  seven days.
 - Normal automatic deletion also requires its local share ratio to be at least
   `1.0`. Both conditions must be true.
 - Eligible torrents and their payloads are deleted oldest-completion-first.
 - Adding a torrent first reserves its full selected size. If it would exceed
-  the 24 GiB working limit, the torrent remains stopped while the oldest
-  eligible torrents are removed. Admission waits for a fresh disk measurement.
-- If nothing is old enough and sufficiently seeded, the new torrent remains
-  waiting. The age and ratio promise is never bypassed merely to make space.
+  the 24 GiB working limit, the torrent remains stopped while the minimum
+  oldest-added set of admitted torrents is removed. Storage-pressure eviction
+  may remove an incomplete or actively downloading torrent and its partial
+  payload, bypassing completion, seven-day, and ratio requirements. Admission
+  waits for a fresh disk measurement.
+- Malformed, off-volume, rejected, unmanaged, waiting, or manually protected
+  torrents are never selected for pressure eviction. If no safe admitted
+  torrent can make enough room, the new torrent remains waiting.
 - A torrent larger than the whole working limit is rejected.
-- The `retention-keep` tag prevents automatic deletion, but it does not exempt
-  the data from the space calculation.
+- The `retention-keep` tag prevents both normal and pressure-driven deletion,
+  but it does not exempt the data from the space calculation.
 
 The entire qBittorrent storage area, including its configuration, lives inside
 a fully allocated 25 GiB ext4 image. This is the hard boundary. The 24 GiB
@@ -114,10 +119,11 @@ ssh kitty-gration 'docker exec arbuzas-qbittorrent-1 sh -c "for file in memory.c
 and `oom_kill` must remain `0`. The Compose health check enforces these values
 for the current container lifetime.
 
-If a torrent is waiting, first check whether enough space can be reclaimed
-without violating the 24-hour and ratio requirements. Removing the
-`retention-keep` tag only makes the torrent eligible once both normal deletion
-conditions are also satisfied.
+If a torrent is waiting, first check whether an older admitted torrent can be
+reclaimed. Under storage pressure, completion, age, and ratio do not block that
+oldest-added-first eviction: an active partial download can be removed.
+Removing `retention-keep` allows pressure eviction immediately, while normal
+deletion still requires completion, seven days, and ratio `1.0`.
 
 Only download and share material you are permitted to distribute. Tailscale
 protects the management page; it does not make torrent peer traffic private.

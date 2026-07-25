@@ -7102,7 +7102,7 @@ expected_environment = {
     'QBITTORRENT_URL': 'http://qbittorrent:${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}',
     'DOWNLOAD_PATH': '/downloads',
     'SOFT_CAP_BYTES': '25769803776',
-    'MIN_COMPLETED_AGE': '24h',
+    'MIN_COMPLETED_AGE': '168h',
     'MIN_RATIO': '1.0',
 }
 for key, expected in expected_environment.items():

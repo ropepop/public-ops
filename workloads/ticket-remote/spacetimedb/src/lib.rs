@@ -35,6 +35,8 @@ const CONTROL_CODE_RATE_WINDOW_MS: i64 = 60_000;
 const CONTROL_CODE_REQUEST_TTL_MS: i64 = 5 * 60_000;
 const CONTROL_CODE_RESULT_TTL_MS: i64 = 60_000;
 const CONTROL_CODE_COMMAND_TTL_MS: i64 = 2 * 60_000;
+const LATEST_TICKET_RESELECT_COMMAND_TTL_MS: i64 = 10 * 60_000;
+const LATEST_TICKET_RESELECT_MAX_HORIZON_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 const CONTROL_CODE_PHONE_TTL_MS: i64 = 105_000;
 const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
@@ -161,6 +163,14 @@ macro_rules! purge_ticket_history {
         purge_expired_rows!(
             $ctx,
             ticketremote_safe_operational_log,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_latest_ticket_reselect_schedule,
             $ticket,
             $bound,
             $limit,
@@ -366,6 +376,56 @@ pub struct TicketremoteStreamCommand {
     pub createdAt: String,
     pub updatedAt: String,
     pub expiresAt: String,
+}
+
+#[spacetimedb::table(accessor = ticketremote_latest_ticket_reselect_schedule,
+    index(accessor = ticketBackendStatus, btree(columns = [ticketId, backendId, status])),
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteLatestTicketReselectSchedule {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub backendId: String,
+    pub scheduledAt: String,
+    pub phoneLocalTime: String,
+    pub phoneTimeZone: String,
+    #[index(btree)]
+    pub status: String,
+    #[index(btree)]
+    pub commandId: String,
+    pub resultReason: String,
+    pub resultPhase: String,
+    pub proofSource: String,
+    pub requestedBy: String,
+    pub createdAt: String,
+    pub updatedAt: String,
+    pub triggeredAt: String,
+    pub completedAt: String,
+    pub expiresAt: String,
+}
+
+#[spacetimedb::table(
+    accessor = ticketremote_latest_ticket_reselect_timer,
+    scheduled(ticketremote_scheduled_latest_ticket_reselect),
+    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteLatestTicketReselectTimer {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub backendId: String,
+    #[index(btree)]
+    pub scheduleId: String,
+    pub createdAt: String,
 }
 
 #[spacetimedb::table(accessor = ticketremote_stream_command_signal, public)]
@@ -593,6 +653,17 @@ cloned_projection! {
     }
 }
 
+cloned_projection! {
+    TicketremoteServiceLatestTicketReselectSchedule from TicketremoteLatestTicketReselectSchedule
+        with service_latest_ticket_reselect_schedule_from_row {
+        id: String, ticketId: String, backendId: String, scheduledAt: String,
+        phoneLocalTime: String, phoneTimeZone: String, status: String, commandId: String,
+        resultReason: String, resultPhase: String, proofSource: String, requestedBy: String,
+        createdAt: String, updatedAt: String, triggeredAt: String, completedAt: String,
+        expiresAt: String
+    }
+}
+
 service_views! {
     ticketremote_service_ticket => ticketremote_service_ticket_view -> TicketremoteServiceTicket
     |ctx, ticket| {
@@ -614,6 +685,13 @@ service_views! {
         ctx.db.ticketremote_stream_command().ticketBackendStatus()
             .filter((&ticket, "pixel", "pending"))
             .map(|row| service_stream_command_from_row(&row)).collect()
+    }
+    ticketremote_service_latest_ticket_reselect_schedule =>
+        ticketremote_service_latest_ticket_reselect_schedule_view ->
+        TicketremoteServiceLatestTicketReselectSchedule
+    |ctx, ticket| {
+        ctx.db.ticketremote_latest_ticket_reselect_schedule().ticketId().filter(&ticket)
+            .map(|row| service_latest_ticket_reselect_schedule_from_row(&row)).collect()
     }
 }
 
@@ -1066,6 +1144,17 @@ pub fn ticketremote_scheduled_cleanup_expired(
     Ok(())
 }
 
+#[spacetimedb::reducer]
+pub fn ticketremote_scheduled_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    arg: TicketremoteLatestTicketReselectTimer,
+) -> Result<(), String> {
+    if !ctx.sender_auth().is_internal() {
+        return Err("internal role required".into());
+    }
+    trigger_scheduled_latest_ticket_reselect(ctx, &arg)
+}
+
 service_reducers! {
     ticketremote_upsert_member(ctx; ticketId: String, actorEmail: String, email: String,
         role: String, nowArg: String) {
@@ -1086,6 +1175,50 @@ service_reducers! {
         apply_phone_update(ctx, &ticketId, &backendId, &attachName, &baseUrl, &desiredState,
             &healthJson, &lastError, &now_or(ctx, &nowArg))
     }
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_schedule_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    scheduleId: String,
+    scheduledAtMicros: i64,
+    phoneLocalTime: String,
+    phoneTimeZone: String,
+    requestedBy: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    schedule_latest_ticket_reselect(
+        ctx,
+        &ticketId,
+        &backendId,
+        &scheduleId,
+        scheduledAtMicros,
+        &phoneLocalTime,
+        &phoneTimeZone,
+        &requestedBy,
+        &now_or(ctx, &nowArg),
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_cancel_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    scheduleId: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    cancel_latest_ticket_reselect(
+        ctx,
+        &ticketId,
+        &backendId,
+        &scheduleId,
+        &now_or(ctx, &nowArg),
+    )
 }
 
 #[spacetimedb::reducer]
@@ -1971,6 +2104,279 @@ fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now
     }
 }
 
+fn schedule_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    schedule_id: &str,
+    scheduled_at_micros: i64,
+    phone_local_time: &str,
+    phone_time_zone: &str,
+    requested_by: &str,
+    now: &str,
+) -> Result<(), String> {
+    let ticket = ensure_ticket(ctx, ticket_id, "", now);
+    let backend_id = clean_backend_id(backend_id);
+    let schedule_id = schedule_id.trim();
+    if !valid_schedule_identifier(schedule_id) {
+        return Err("invalid_schedule_id".into());
+    }
+    let requested_by = requested_by.trim();
+    if !valid_public_identifier(requested_by) {
+        return Err("invalid_requested_by".into());
+    }
+    let phone_local_time = bounded_text(phone_local_time.trim(), 80);
+    let phone_time_zone = bounded_text(phone_time_zone.trim(), 80);
+    if phone_local_time.is_empty() || phone_time_zone.is_empty() {
+        return Err("phone_local_time_required".into());
+    }
+    let scheduled_at = iso(Timestamp::from_micros_since_unix_epoch(scheduled_at_micros));
+    let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
+    if let Some(existing) = table.id().find(schedule_id.to_string()) {
+        if latest_ticket_reselect_submission_matches(
+            &existing,
+            &ticket.id,
+            &backend_id,
+            &scheduled_at,
+            &phone_local_time,
+            &phone_time_zone,
+            requested_by,
+        ) {
+            return if latest_ticket_reselect_idempotent_status(&existing.status) {
+                Ok(())
+            } else {
+                Err("schedule_id_not_reusable".into())
+            };
+        }
+        return Err("schedule_id_conflict".into());
+    }
+    if scheduled_at_micros <= ctx.timestamp.to_micros_since_unix_epoch() {
+        return Err("scheduled_time_must_be_future".into());
+    }
+    if scheduled_at_micros.saturating_sub(ctx.timestamp.to_micros_since_unix_epoch())
+        > LATEST_TICKET_RESELECT_MAX_HORIZON_MS.saturating_mul(1000)
+    {
+        return Err("scheduled_time_too_far".into());
+    }
+    if table
+        .ticketBackendStatus()
+        .filter((&ticket.id, &backend_id, "queued"))
+        .next()
+        .is_some()
+        || table
+            .ticketBackendStatus()
+            .filter((&ticket.id, &backend_id, "running"))
+            .next()
+            .is_some()
+    {
+        return Err("latest_ticket_reselect_already_in_progress".into());
+    }
+
+    let pending: Vec<_> = table
+        .ticketBackendStatus()
+        .filter((&ticket.id, &backend_id, "pending"))
+        .collect();
+    for existing in pending {
+        delete_latest_ticket_reselect_timers(ctx, &existing.id);
+        table.id().update(TicketremoteLatestTicketReselectSchedule {
+            status: "replaced".into(),
+            resultReason: "replaced_by_new_schedule".into(),
+            resultPhase: "replaced".into(),
+            proofSource: "admin".into(),
+            updatedAt: now.into(),
+            completedAt: now.into(),
+            expiresAt: add_ms(now, HISTORY_TTL_MS),
+            ..existing
+        });
+    }
+
+    table.insert(TicketremoteLatestTicketReselectSchedule {
+        id: schedule_id.into(),
+        ticketId: ticket.id.clone(),
+        backendId: backend_id.clone(),
+        scheduledAt: scheduled_at.clone(),
+        phoneLocalTime: phone_local_time,
+        phoneTimeZone: phone_time_zone,
+        status: "pending".into(),
+        commandId: String::new(),
+        resultReason: String::new(),
+        resultPhase: String::new(),
+        proofSource: String::new(),
+        requestedBy: requested_by.into(),
+        createdAt: now.into(),
+        updatedAt: now.into(),
+        triggeredAt: String::new(),
+        completedAt: String::new(),
+        expiresAt: add_ms(&scheduled_at, HISTORY_TTL_MS),
+    });
+    ctx.db.ticketremote_latest_ticket_reselect_timer().insert(
+        TicketremoteLatestTicketReselectTimer {
+            scheduled_id: 0,
+            scheduled_at: ScheduleAt::Time(Timestamp::from_micros_since_unix_epoch(
+                scheduled_at_micros,
+            )),
+            ticketId: ticket.id,
+            backendId: backend_id,
+            scheduleId: schedule_id.into(),
+            createdAt: now.into(),
+        },
+    );
+    Ok(())
+}
+
+fn cancel_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    schedule_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let schedule_id = schedule_id.trim();
+    if !valid_schedule_identifier(schedule_id) {
+        return Err("invalid_schedule_id".into());
+    }
+    let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
+    let Some(existing) = table.id().find(schedule_id.to_string()) else {
+        return Ok(());
+    };
+    if existing.ticketId != ticket_id || existing.backendId != backend_id {
+        return Err("schedule_mismatch".into());
+    }
+    if existing.status == "canceled" {
+        return Ok(());
+    }
+    if existing.status != "pending" {
+        return Err("schedule_not_pending".into());
+    }
+    delete_latest_ticket_reselect_timers(ctx, schedule_id);
+    table.id().update(TicketremoteLatestTicketReselectSchedule {
+        status: "canceled".into(),
+        resultReason: "canceled_by_admin".into(),
+        resultPhase: "canceled".into(),
+        proofSource: "admin".into(),
+        updatedAt: now.into(),
+        completedAt: now.into(),
+        expiresAt: add_ms(now, HISTORY_TTL_MS),
+        ..existing
+    });
+    Ok(())
+}
+
+fn trigger_scheduled_latest_ticket_reselect(
+    ctx: &ReducerContext,
+    timer: &TicketremoteLatestTicketReselectTimer,
+) -> Result<(), String> {
+    let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
+    let Some(existing) = table.id().find(&timer.scheduleId) else {
+        return Ok(());
+    };
+    if existing.status != "pending"
+        || existing.ticketId != timer.ticketId
+        || existing.backendId != timer.backendId
+        || !table
+            .ticketBackendStatus()
+            .filter((&timer.ticketId, &timer.backendId, "pending"))
+            .any(|row| row.id == timer.scheduleId)
+    {
+        return Ok(());
+    }
+    let now = now(ctx);
+    let command_id =
+        latest_ticket_reselect_command_id(&existing.ticketId, &existing.backendId, &existing.id);
+    let payload = serde_json::json!({
+        "type": "force_ticket_reselect",
+        "source": "ticket_remote_schedule",
+        "reason": "scheduled_latest_ticket_reselect",
+        "backendId": existing.backendId,
+        "scheduleId": existing.id,
+    })
+    .to_string();
+    let command = insert_stream_command(
+        ctx,
+        &existing.ticketId,
+        &existing.backendId,
+        &command_id,
+        "force_ticket_reselect",
+        &format!("schedule:{}", existing.id),
+        "scheduled_latest_ticket_reselect",
+        &payload,
+        LATEST_TICKET_RESELECT_COMMAND_TTL_MS,
+        &now,
+    );
+    table.id().update(TicketremoteLatestTicketReselectSchedule {
+        status: "queued".into(),
+        commandId: command.id,
+        resultReason: "scheduled_triggered".into(),
+        resultPhase: "queued".into(),
+        proofSource: "spacetimedb_scheduler".into(),
+        updatedAt: now.clone(),
+        triggeredAt: now.clone(),
+        expiresAt: add_ms(&now, HISTORY_TTL_MS),
+        ..existing
+    });
+    Ok(())
+}
+
+fn delete_latest_ticket_reselect_timers(ctx: &ReducerContext, schedule_id: &str) {
+    let table = ctx.db.ticketremote_latest_ticket_reselect_timer();
+    let rows: Vec<_> = table.scheduleId().filter(schedule_id).collect();
+    for row in rows {
+        table.scheduled_id().delete(row.scheduled_id);
+    }
+}
+
+fn latest_ticket_reselect_submission_matches(
+    row: &TicketremoteLatestTicketReselectSchedule,
+    ticket_id: &str,
+    backend_id: &str,
+    scheduled_at: &str,
+    phone_local_time: &str,
+    phone_time_zone: &str,
+    requested_by: &str,
+) -> bool {
+    row.ticketId == ticket_id
+        && row.backendId == backend_id
+        && row.scheduledAt == scheduled_at
+        && row.phoneLocalTime == phone_local_time
+        && row.phoneTimeZone == phone_time_zone
+        && row.requestedBy == requested_by
+}
+
+fn latest_ticket_reselect_idempotent_status(status: &str) -> bool {
+    !matches!(status, "canceled" | "replaced")
+}
+
+fn latest_ticket_reselect_command_id(
+    ticket_id: &str,
+    backend_id: &str,
+    schedule_id: &str,
+) -> String {
+    format!(
+        "{}:{}:scheduled_latest_ticket_reselect:{}",
+        clean_ticket_id(ticket_id),
+        clean_backend_id(backend_id),
+        schedule_id.trim()
+    )
+}
+
+fn valid_schedule_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
+}
+
+fn valid_public_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
 fn ensure_cleanup_schedule(ctx: &ReducerContext, ticket_id: &str, now: &str) {
     let schedule =
         ScheduleAt::Interval(std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS).into());
@@ -2321,7 +2727,20 @@ fn update_stream_command_status(
         return;
     };
     let status = safe_token(status, "acknowledged");
-    if status == "acknowledged" || status == "dispatched" {
+    let scheduled_reselect = latest_ticket_reselect_schedule_for_command(ctx, &existing.id);
+    if status == "acknowledged" {
+        if scheduled_reselect.is_some() {
+            update_latest_ticket_reselect_result(
+                ctx,
+                &existing.id,
+                "succeeded",
+                &bounded_text(&non_empty(reason, "ready"), 240),
+                "ready",
+                "phone_worker",
+                now,
+                true,
+            );
+        }
         table.id().delete(&existing.id);
         upsert_stream_command_signal(
             ctx,
@@ -2331,6 +2750,48 @@ fn update_stream_command_status(
             now,
         );
         return;
+    }
+    if status == "dispatched" {
+        if scheduled_reselect.is_some() {
+            update_latest_ticket_reselect_result(
+                ctx,
+                &existing.id,
+                "running",
+                &bounded_text(&non_empty(reason, "dispatched"), 240),
+                "running",
+                "phone_worker",
+                now,
+                false,
+            );
+            table.id().update(TicketremoteStreamCommand {
+                status,
+                reason: bounded_text(&non_empty(reason, &existing.reason), 240),
+                updatedAt: now.into(),
+                ..existing.clone()
+            });
+        } else {
+            table.id().delete(&existing.id);
+        }
+        upsert_stream_command_signal(
+            ctx,
+            &existing.ticketId,
+            &existing.backendId,
+            &existing.revision,
+            now,
+        );
+        return;
+    }
+    if status == "failed" && scheduled_reselect.is_some() {
+        update_latest_ticket_reselect_result(
+            ctx,
+            &existing.id,
+            "failed",
+            &bounded_text(&non_empty(reason, "failed"), 240),
+            "failed",
+            "phone_worker",
+            now,
+            true,
+        );
     }
     let row = TicketremoteStreamCommand {
         status,
@@ -2354,6 +2815,47 @@ fn update_stream_command_status(
         &existing.revision,
         now,
     );
+}
+
+fn latest_ticket_reselect_schedule_for_command(
+    ctx: &ReducerContext,
+    command_id: &str,
+) -> Option<TicketremoteLatestTicketReselectSchedule> {
+    ctx.db
+        .ticketremote_latest_ticket_reselect_schedule()
+        .commandId()
+        .filter(command_id)
+        .find(|row| matches!(row.status.as_str(), "queued" | "running"))
+}
+
+fn update_latest_ticket_reselect_result(
+    ctx: &ReducerContext,
+    command_id: &str,
+    status: &str,
+    result_reason: &str,
+    result_phase: &str,
+    proof_source: &str,
+    now: &str,
+    terminal: bool,
+) {
+    let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
+    let rows: Vec<_> = table
+        .commandId()
+        .filter(command_id)
+        .filter(|row| matches!(row.status.as_str(), "queued" | "running"))
+        .collect();
+    for existing in rows {
+        table.id().update(TicketremoteLatestTicketReselectSchedule {
+            status: status.into(),
+            resultReason: bounded_text(result_reason, 240),
+            resultPhase: safe_token(result_phase, status),
+            proofSource: safe_token(proof_source, ""),
+            updatedAt: now.into(),
+            completedAt: if terminal { now.into() } else { String::new() },
+            expiresAt: add_ms(now, HISTORY_TTL_MS),
+            ..existing
+        });
+    }
 }
 
 fn upsert_phone_current_report(
@@ -2698,10 +3200,41 @@ ticket_expiry_purgers! {
                 "viewer_focus_expired");
         }
     }
-    purge_expired_stream_commands_for_ticket(ticketremote_stream_command)
-        |ctx, ticket, touched, now| {
-        refresh_touched_signals(ctx, &ticket, &touched, now);
+}
+
+fn purge_expired_stream_commands_for_ticket(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    now: &str,
+    batch_size: u32,
+) -> u32 {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let expiry = canonical_time(now);
+    let table = ctx.db.ticketremote_stream_command();
+    let rows: Vec<_> = table
+        .ticketExpiresAt()
+        .filter((&ticket_id, ..=expiry.as_str()))
+        .take(batch_size as usize)
+        .collect();
+    let mut touched = Vec::<String>::new();
+    for row in &rows {
+        if !touched.contains(&row.backendId) {
+            touched.push(row.backendId.clone());
+        }
+        update_latest_ticket_reselect_result(
+            ctx,
+            &row.id,
+            "expired",
+            "command_expired",
+            "expired",
+            "spacetimedb_command_ttl",
+            now,
+            true,
+        );
+        table.id().delete(&row.id);
     }
+    refresh_touched_signals(ctx, &ticket_id, &touched, now);
+    rows.len().min(u32::MAX as usize) as u32
 }
 
 fn purge_expired_stream_viewer_focus_for_ticket_backend(
@@ -2820,6 +3353,28 @@ mod tests {
         }
     }
 
+    fn latest_ticket_reselect_schedule() -> TicketremoteLatestTicketReselectSchedule {
+        TicketremoteLatestTicketReselectSchedule {
+            id: "schedule-1".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            scheduledAt: "2026-07-23T15:00:00Z".into(),
+            phoneLocalTime: "2026-07-23T18:00".into(),
+            phoneTimeZone: "Europe/Riga".into(),
+            status: "pending".into(),
+            commandId: String::new(),
+            resultReason: String::new(),
+            resultPhase: String::new(),
+            proofSource: String::new(),
+            requestedBy: "1on9".into(),
+            createdAt: "2026-07-23T12:00:00Z".into(),
+            updatedAt: "2026-07-23T12:00:00Z".into(),
+            triggeredAt: String::new(),
+            completedAt: String::new(),
+            expiresAt: "2026-07-23T21:00:00Z".into(),
+        }
+    }
+
     fn valid_service_claims() -> serde_json::Value {
         serde_json::json!({
             "iss": SERVICE_OIDC_ISSUER,
@@ -2832,6 +3387,48 @@ mod tests {
     #[test]
     fn service_claims_accept_the_pinned_production_identity() {
         assert!(service_claims_are_valid(&valid_service_claims()));
+    }
+
+    #[test]
+    fn latest_ticket_reselect_submission_is_strictly_idempotent() {
+        let mut row = latest_ticket_reselect_schedule();
+        assert!(latest_ticket_reselect_submission_matches(
+            &row,
+            "vivi-default",
+            "pixel",
+            "2026-07-23T15:00:00Z",
+            "2026-07-23T18:00",
+            "Europe/Riga",
+            "1on9",
+        ));
+        assert!(!latest_ticket_reselect_submission_matches(
+            &row,
+            "vivi-default",
+            "pixel",
+            "2026-07-23T15:01:00Z",
+            "2026-07-23T18:01",
+            "Europe/Riga",
+            "1on9",
+        ));
+        assert!(latest_ticket_reselect_idempotent_status(&row.status));
+        row.status = "canceled".into();
+        assert!(!latest_ticket_reselect_idempotent_status(&row.status));
+        row.status = "replaced".into();
+        assert!(!latest_ticket_reselect_idempotent_status(&row.status));
+        row.status = "succeeded".into();
+        assert!(latest_ticket_reselect_idempotent_status(&row.status));
+    }
+
+    #[test]
+    fn latest_ticket_reselect_ids_are_private_safe_and_deterministic() {
+        assert!(valid_schedule_identifier("sched_20260723-abc:1"));
+        assert!(!valid_schedule_identifier("member@example.com"));
+        assert!(valid_public_identifier("1on9"));
+        assert!(!valid_public_identifier("member@example.com"));
+        assert_eq!(
+            latest_ticket_reselect_command_id("vivi-default", "pixel", "schedule-1"),
+            "vivi-default:pixel:scheduled_latest_ticket_reselect:schedule-1"
+        );
     }
 
     #[test]
