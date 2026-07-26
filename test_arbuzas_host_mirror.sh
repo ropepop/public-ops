@@ -14,6 +14,7 @@ changed_paths="${tmpdir}/changed.txt"
 mkdir -p \
   "${remote_root}/etc/arbuzas/env" \
   "${remote_root}/etc/arbuzas/secrets/android-adb" \
+  "${remote_root}/etc/arbuzas/secrets/tiny-vless" \
   "${remote_root}/etc/arbuzas/cloudflared" \
   "${remote_root}/etc/arbuzas/current"
 
@@ -26,6 +27,12 @@ EOF
 cat > "${remote_root}/etc/arbuzas/secrets/android-adb/adbkey" <<'EOF'
 adb-private-key
 EOF
+cat > "${remote_root}/etc/arbuzas/env/tiny-vless.env" <<'EOF'
+TINY_VLESS_SETTING=initial
+EOF
+cat > "${remote_root}/etc/arbuzas/secrets/tiny-vless/capability.secret" <<'EOF'
+test-only-capability
+EOF
 cat > "${remote_root}/etc/arbuzas/cloudflared/train-bot.json" <<'EOF'
 {"AccountTag":"initial"}
 EOF
@@ -37,13 +44,17 @@ EOF
 python3 "${SCRIPT}" pull --profile arbuzas --remote-root "${remote_root}" --mirror-root "${mirror_root}"
 
 test -f "${mirror_root}/etc/arbuzas/env/train-bot.env"
+test -f "${mirror_root}/etc/arbuzas/env/tiny-vless.env"
 test -f "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey"
+test -f "${mirror_root}/etc/arbuzas/secrets/tiny-vless/capability.secret"
 test -f "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json"
 test ! -e "${mirror_root}/etc/arbuzas/env/train-bot.env.bak-google-ai"
 grep -F 'ARBUZAS_RELEASE_ID=initial' "${mirror_root}/etc/arbuzas/current/release.env" >/dev/null
 for private_path in \
   "${mirror_root}/etc/arbuzas/env/train-bot.env" \
+  "${mirror_root}/etc/arbuzas/env/tiny-vless.env" \
   "${mirror_root}/etc/arbuzas/secrets/android-adb/adbkey" \
+  "${mirror_root}/etc/arbuzas/secrets/tiny-vless/capability.secret" \
   "${mirror_root}/etc/arbuzas/cloudflared/train-bot.json" \
   "${mirror_root}/etc/arbuzas/current/release.env"; do
   if [[ "$(stat -f '%Lp' "${private_path}" 2>/dev/null || stat -c '%a' "${private_path}")" != 600 ]]; then
@@ -69,10 +80,15 @@ python3 "${SCRIPT}" push --profile arbuzas --remote-root "${remote_root}" --mirr
 grep -F 'BOT_TOKEN=local-change' "${remote_root}/etc/arbuzas/env/train-bot.env" >/dev/null
 grep -F 'ARBUZAS_RELEASE_ID=remote-advanced' "${remote_root}/etc/arbuzas/current/release.env" >/dev/null
 grep -Fx 'etc/arbuzas/env/train-bot.env' "${changed_paths}" >/dev/null
-if [[ "$(stat -f '%Lp' "${remote_root}/etc/arbuzas/env/train-bot.env" 2>/dev/null || stat -c '%a' "${remote_root}/etc/arbuzas/env/train-bot.env")" != 600 ]]; then
-  echo "FAIL: permission-only mirror push did not harden the remote env" >&2
-  exit 1
-fi
+for private_path in \
+  "${remote_root}/etc/arbuzas/env/train-bot.env" \
+  "${remote_root}/etc/arbuzas/env/tiny-vless.env" \
+  "${remote_root}/etc/arbuzas/secrets/tiny-vless/capability.secret"; do
+  if [[ "$(stat -f '%Lp' "${private_path}" 2>/dev/null || stat -c '%a' "${private_path}")" != 600 ]]; then
+    echo "FAIL: permission-only mirror push did not harden the remote private file: ${private_path}" >&2
+    exit 1
+  fi
+done
 
 cp "${mirror_root}/etc/arbuzas/current/release.env" "${tmpdir}/release.env.snapshot"
 printf 'ARBUZAS_RELEASE_ID=must-not-push\n' > "${mirror_root}/etc/arbuzas/current/release.env"
@@ -125,6 +141,16 @@ EOF
 affected="$(python3 "${SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths}")"
 if [[ "${affected}" != satiksme_bot ]]; then
   echo "FAIL: analyzer secret change should restart only satiksme_bot" >&2
+  exit 1
+fi
+
+cat > "${changed_paths}" <<'EOF'
+etc/arbuzas/env/tiny-vless.env
+etc/arbuzas/secrets/tiny-vless/cert/private.key
+EOF
+affected="$(python3 "${SCRIPT}" affected --profile arbuzas --changed-paths-file "${changed_paths}")"
+if [[ "${affected}" != tiny_vless ]]; then
+  echo "FAIL: tiny-VLESS env and secret changes should affect only tiny_vless" >&2
   exit 1
 fi
 

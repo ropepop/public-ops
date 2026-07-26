@@ -123,6 +123,7 @@ VALIDATE_TICKET_PHONE_BRIDGE=0
 VALIDATE_TICKET_REMOTE=0
 VALIDATE_QBITTORRENT=0
 VALIDATE_JELLYFIN=0
+VALIDATE_TINY_VLESS=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
 DIAGNOSTIC_SERVICES=()
@@ -156,6 +157,7 @@ ALL_SERVICES=(
   qbittorrent
   qbittorrent_housekeeper
   jellyfin
+  tiny_vless
 )
 
 log() {
@@ -1600,7 +1602,8 @@ Services:
   subscription_tunnel, ticket_phone_bridge,
   ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel,
   qbittorrent, qbittorrent_housekeeper,
-  jellyfin
+  jellyfin,
+  tiny_vless (separate Compose project; explicit selection required to recreate)
 EOF
 }
 
@@ -1741,6 +1744,9 @@ mark_validation_group() {
       VALIDATE_JELLYFIN=1
       append_unique DIAGNOSTIC_SERVICES jellyfin
       ;;
+    tiny_vless)
+      VALIDATE_TINY_VLESS=1
+      ;;
     *)
       echo "Unknown validation group: ${group_name}" >&2
       exit 2
@@ -1822,6 +1828,11 @@ resolve_requested_services() {
         append_unique COMPOSE_TARGET_SERVICES jellyfin
         mark_validation_group jellyfin
         ;;
+      tiny_vless)
+        # tiny-vless remains a distinct Compose project. It is deliberately
+        # kept out of the main arbuzas Compose service selection.
+        mark_validation_group tiny_vless
+        ;;
       *)
         echo "Unknown service: ${service_name}" >&2
         exit 2
@@ -1832,10 +1843,18 @@ resolve_requested_services() {
 
 populate_current_diagnostic_services() {
   local array_name="$1"
+  local service_name
   if (( TARGETED_MODE == 0 )); then
-    eval "${array_name}=(\"\${ALL_SERVICES[@]}\")"
+    eval "${array_name}=()"
+    for service_name in "${ALL_SERVICES[@]}"; do
+      [[ "${service_name}" == "tiny_vless" ]] && continue
+      append_unique "${array_name}" "${service_name}"
+    done
   else
-    eval "${array_name}=(\"\${DIAGNOSTIC_SERVICES[@]}\")"
+    eval "${array_name}=()"
+    for service_name in ${DIAGNOSTIC_SERVICES[@]+"${DIAGNOSTIC_SERVICES[@]}"}; do
+      append_unique "${array_name}" "${service_name}"
+    done
   fi
 }
 
@@ -1918,6 +1937,102 @@ targeted_service_selected() {
   return 1
 }
 
+tiny_vless_deployment_selected() {
+  local service_name
+
+  # Unscoped application deploys validate the external VPN component but do
+  # not recreate it. A restart requires an explicit tiny_vless selection.
+  (( TARGETED_MODE == 1 )) || return 1
+  for service_name in "${REQUESTED_SERVICES[@]}"; do
+    [[ "${service_name}" == "tiny_vless" ]] && return 0
+  done
+  return 1
+}
+
+tiny_vless_manager_source_dir() {
+  local release_id="${1:-${ARBUZAS_RELEASE_ID}}"
+  printf '%s/infra/arbuzas/tiny-vless' "${REMOTE_RELEASES_ROOT}/${release_id}"
+}
+
+run_remote_tiny_vless_manager_at_source() {
+  local manager_action="$1"
+  local source_dir="$2"
+  local validation_level="${3:-${VALIDATION_PROFILE}}"
+  local manager_path=""
+  local level_args=""
+  local action_args=""
+
+  manager_path="${source_dir}/manage.py"
+  if [[ "${manager_action}" == "validate" ]]; then
+    level_args=" --level $(shell_quote "${validation_level}")"
+  fi
+  if [[ "${manager_action}" == "deploy" ]]; then
+    action_args=" --defer-rollback"
+  fi
+  remote_root_command "
+    [[ -f $(shell_quote "${manager_path}") && ! -L $(shell_quote "${manager_path}") ]] || {
+      echo 'missing tiny-vless component manager in release' >&2
+      exit 1
+    }
+    python3 $(shell_quote "${manager_path}") $(shell_quote "${manager_action}") \\
+      --source-dir $(shell_quote "${source_dir}")${level_args}${action_args}
+  " 1
+}
+
+run_remote_tiny_vless_manager() {
+  local manager_action="$1"
+  local release_id="${2:-${ARBUZAS_RELEASE_ID}}"
+  local validation_level="${3:-${VALIDATION_PROFILE}}"
+  run_remote_tiny_vless_manager_at_source \
+    "${manager_action}" \
+    "$(tiny_vless_manager_source_dir "${release_id}")" \
+    "${validation_level}"
+}
+
+adopt_remote_tiny_vless() {
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager adopt
+}
+
+deploy_remote_tiny_vless() {
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager deploy
+}
+
+commit_remote_tiny_vless() {
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager commit
+}
+
+rollback_remote_tiny_vless() {
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager rollback
+}
+
+abort_remote_tiny_vless() {
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager abort
+}
+
+deploy_remote_tiny_vless_from_release() {
+  local release_id="$1"
+  tiny_vless_deployment_selected || return 0
+  run_remote_tiny_vless_manager deploy "${release_id}"
+}
+
+validate_remote_tiny_vless_workload_health() {
+  local remote_release_dir="${1:-${REMOTE_CURRENT_LINK}}"
+  local level="${2:-${VALIDATION_PROFILE}}"
+  if run_remote_tiny_vless_manager_at_source \
+    validate \
+    "${remote_release_dir}/infra/arbuzas/tiny-vless" \
+    "${level}"; then
+    return 0
+  fi
+  mark_remote_validation_failed
+  return 1
+}
+
 resolve_remote_release_dir() {
   local target_release_id="${1:-${requested_release_id}}"
   if [[ -n "${target_release_id}" ]]; then
@@ -1933,7 +2048,7 @@ collect_remote_validation_diagnostics() {
   local services=("$@")
   local service_args=""
 
-  for service_name in "${services[@]}"; do
+  for service_name in ${services[@]+"${services[@]}"}; do
     service_args+=" ${service_name}"
   done
 
@@ -1965,7 +2080,7 @@ validate_remote_probe() {
   if ! remote_compose_shell "${probe_release_dir}" "${script}"; then
     log "Validation failed: ${label}"
     mark_remote_validation_failed
-    collect_remote_validation_diagnostics "${probe_release_dir}" "${services[@]}"
+    collect_remote_validation_diagnostics "${probe_release_dir}" ${services[@]+"${services[@]}"}
     return 1
   fi
 }
@@ -1981,7 +2096,7 @@ validate_remote_host_probe() {
   if ! remote_shell "${script}"; then
     log "Validation failed: ${label}"
     mark_remote_validation_failed
-    collect_remote_validation_diagnostics "${diagnostics_release_dir}" "${services[@]}"
+    collect_remote_validation_diagnostics "${diagnostics_release_dir}" ${services[@]+"${services[@]}"}
     return 1
   fi
 }
@@ -2958,7 +3073,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin infra/arbuzas/tiny-vless tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -2995,6 +3110,7 @@ included_roots = [
     pathlib.Path("infra/arbuzas/docker"),
     pathlib.Path("infra/arbuzas/qbittorrent"),
     pathlib.Path("infra/arbuzas/jellyfin"),
+    pathlib.Path("infra/arbuzas/tiny-vless"),
     pathlib.Path("tools/arbuzas"),
     pathlib.Path("workloads/shared-go"),
     pathlib.Path("workloads/train-bot"),
@@ -3101,6 +3217,7 @@ prepare_local_release_bundle() {
   copy_tree_into_release "infra/arbuzas/docker"
   copy_tree_into_release "infra/arbuzas/qbittorrent"
   copy_tree_into_release "infra/arbuzas/jellyfin"
+  copy_tree_into_release "infra/arbuzas/tiny-vless"
   copy_tree_into_release "workloads/shared-go"
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
@@ -3133,7 +3250,10 @@ prepare_local_fast_release_overlay() {
   FAST_RELEASE_OVERLAY_PATHS=()
 
   copy_tree_into_fast_release_overlay "infra/arbuzas/docker"
-  for service_name in "${COMPOSE_TARGET_SERVICES[@]}"; do
+  if (( VALIDATE_TINY_VLESS == 1 )); then
+    copy_tree_into_fast_release_overlay "infra/arbuzas/tiny-vless"
+  fi
+  for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
       train_bot)
         copy_tree_into_fast_release_overlay "workloads/shared-go"
@@ -4448,7 +4568,7 @@ copy_fast_release_overlay_to_remote() {
 fast_profile_requires_cloudflared_render() {
   local service_name
 
-  for service_name in "${COMPOSE_TARGET_SERVICES[@]}"; do
+  for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
       train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
         return 0
@@ -4678,7 +4798,7 @@ validate_remote_running_services() {
   local expected_services_args=""
   local service_name
 
-  for service_name in "${services[@]}"; do
+  for service_name in ${services[@]+"${services[@]}"}; do
     expected_services_args+=" ${service_name}"
   done
 
@@ -7589,7 +7709,7 @@ validate_remote_selected_smoke_health() {
       fi
       sleep 1
     done
-  " "${diagnostics_services[@]}"
+  " ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_workload_health() {
@@ -7602,6 +7722,7 @@ validate_remote_workload_health() {
   validate_remote_qbittorrent_workload_health "${remote_release_dir}"
   validate_remote_jellyfin_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
+  validate_remote_tiny_vless_workload_health "${remote_release_dir}" "${VALIDATION_PROFILE}"
 }
 
 validate_remote_selected_workload_health() {
@@ -7628,6 +7749,9 @@ validate_remote_selected_workload_health() {
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
   fi
+  if (( VALIDATE_TINY_VLESS == 1 )); then
+    validate_remote_tiny_vless_workload_health "${remote_release_dir}" "${VALIDATION_PROFILE}"
+  fi
 }
 
 validate_remote_current_release_link() {
@@ -7645,7 +7769,7 @@ validate_remote_current_release_link() {
         exit 1
       }
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_swarm_baseline() {
@@ -7663,7 +7787,7 @@ validate_remote_swarm_baseline() {
         exit 1
       fi
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 
   validate_remote_host_probe "${remote_release_dir}" \
     "swarm service and stack lists empty" \
@@ -7679,7 +7803,7 @@ validate_remote_swarm_baseline() {
         exit 1
       fi
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_host_baseline() {
@@ -7763,7 +7887,7 @@ validate_remote_private_configuration_permissions() {
         exit 1
       fi
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_retired_portainer_absence() {
@@ -7788,7 +7912,7 @@ validate_remote_retired_portainer_absence() {
         exit 1
       }
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_retired_chatgpt_absence() {
@@ -7815,7 +7939,7 @@ validate_remote_retired_chatgpt_absence() {
         exit 1
       }
     " \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
 validate_remote_release() {
@@ -7828,6 +7952,9 @@ validate_remote_release() {
 
   if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
     validate_remote_selected_smoke_health "${remote_release_dir}" 0
+    if (( VALIDATE_TINY_VLESS == 1 )); then
+      validate_remote_tiny_vless_workload_health "${remote_release_dir}" fast
+    fi
     return_remote_validation_status
     return
   fi
@@ -7835,7 +7962,7 @@ validate_remote_release() {
   validate_remote_probe "${remote_release_dir}" \
     "release bundle exists" \
     "[[ -f '${remote_release_dir}/release.env' ]]" \
-    "${diagnostics_services[@]}"
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 
   if (( TARGETED_MODE == 1 )); then
     validate_remote_selected_workload_health "${remote_release_dir}"
@@ -7855,7 +7982,10 @@ validate_deployed_release() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
 
   if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
-    validate_remote_selected_smoke_health "${remote_release_dir}" 1
+    validate_remote_selected_smoke_health "${remote_release_dir}" 1 || return $?
+    if (( VALIDATE_TINY_VLESS == 1 )); then
+      validate_remote_tiny_vless_workload_health "${remote_release_dir}" fast
+    fi
     return
   fi
   validate_remote_current_release_link "${remote_release_dir}" && validate_remote_release "${ARBUZAS_RELEASE_ID}"
@@ -7970,22 +8100,94 @@ csv_join_services() {
   printf '%s' "${joined}"
 }
 
+prepare_remote_tiny_vless_config_rollback() {
+  local output_variable="$1"
+  local backup_root=""
+  backup_root="$(remote_root_command "
+    base='/srv/arbuzas/tiny-vless/config-rollbacks'
+    mkdir -p \"\${base}\"
+    chown root:root \"\${base}\"
+    chmod 0700 \"\${base}\"
+    rollback_dir=\$(mktemp -d \"\${base}/pending.XXXXXX\")
+    chmod 0700 \"\${rollback_dir}\"
+    if [[ -f /etc/arbuzas/env/tiny-vless.env && ! -L /etc/arbuzas/env/tiny-vless.env ]]; then
+      cp -a /etc/arbuzas/env/tiny-vless.env \"\${rollback_dir}/environment\"
+      touch \"\${rollback_dir}/environment.present\"
+    fi
+    if [[ -d /etc/arbuzas/secrets/tiny-vless && ! -L /etc/arbuzas/secrets/tiny-vless ]]; then
+      cp -a /etc/arbuzas/secrets/tiny-vless \"\${rollback_dir}/secrets\"
+      touch \"\${rollback_dir}/secrets.present\"
+    fi
+    printf '%s\n' \"\${rollback_dir}\"
+  " 1 | tail -n 1 | tr -d '\r\n')" || return $?
+  [[ "${backup_root}" =~ ^/srv/arbuzas/tiny-vless/config-rollbacks/pending\.[A-Za-z0-9]+$ ]] || {
+    echo "invalid tiny-vless config rollback path" >&2
+    return 1
+  }
+  printf -v "${output_variable}" '%s' "${backup_root}"
+}
+
+restore_remote_tiny_vless_config_rollback() {
+  local backup_root="$1"
+  [[ "${backup_root}" =~ ^/srv/arbuzas/tiny-vless/config-rollbacks/pending\.[A-Za-z0-9]+$ ]] || {
+    echo "refusing unsafe tiny-vless config rollback path" >&2
+    return 1
+  }
+  remote_root_command "
+    rollback_dir=$(shell_quote "${backup_root}")
+    [[ -d \"\${rollback_dir}\" && ! -L \"\${rollback_dir}\" ]] || {
+      echo 'missing tiny-vless config rollback snapshot' >&2
+      exit 1
+    }
+    rm -f /etc/arbuzas/env/tiny-vless.env
+    rm -rf /etc/arbuzas/secrets/tiny-vless
+    if [[ -f \"\${rollback_dir}/environment.present\" ]]; then
+      cp -a \"\${rollback_dir}/environment\" /etc/arbuzas/env/tiny-vless.env
+    fi
+    if [[ -f \"\${rollback_dir}/secrets.present\" ]]; then
+      cp -a \"\${rollback_dir}/secrets\" /etc/arbuzas/secrets/tiny-vless
+    fi
+  " 1
+}
+
+cleanup_remote_tiny_vless_config_rollback() {
+  local backup_root="$1"
+  [[ -z "${backup_root}" ]] && return 0
+  [[ "${backup_root}" =~ ^/srv/arbuzas/tiny-vless/config-rollbacks/pending\.[A-Za-z0-9]+$ ]] || return 1
+  remote_root_command "rm -rf -- $(shell_quote "${backup_root}")" 1
+}
+
 deploy_config_from_mirror() {
   local changed_paths_file
   local affected_output=""
   local -a affected_services=()
+  local -a compose_services=()
   local service_name=""
   local service_args=""
+  local tiny_vless_changed=0
+  local tiny_vless_config_rollback=""
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
-  trap "rm -f '${changed_paths_file}'; trap - RETURN" RETURN
+  prepare_remote_tiny_vless_config_rollback tiny_vless_config_rollback || return $?
+  trap 'cleanup_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" >/dev/null 2>&1 || true; rm -f "${changed_paths_file}"; trap - RETURN' RETURN
 
   harden_remote_release_env_permissions || return $?
   run_host_mirror_push "${changed_paths_file}" || return $?
-  prepare_remote_ticket_runtime_permissions || return $?
+  if grep -Eq '^etc/arbuzas/(env/tiny-vless\.env|secrets/tiny-vless(/|$))' "${changed_paths_file}"; then
+    tiny_vless_changed=1
+  fi
+  if ! prepare_remote_ticket_runtime_permissions; then
+    if (( tiny_vless_changed == 1 )); then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+    fi
+    return 1
+  fi
   if affected_output="$(host_mirror_affected_services "${changed_paths_file}")"; then
     :
   else
-    return $?
+    if (( tiny_vless_changed == 1 )); then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+    fi
+    return 1
   fi
   if [[ -z "${affected_output}" ]]; then
     log "Deploy config: mirror is already in sync; no services need restart"
@@ -7998,19 +8200,70 @@ deploy_config_from_mirror() {
   done <<< "${affected_output}"
 
   log "Deploy config: affected services $(csv_join_services "${affected_services[@]}")"
+  for service_name in "${affected_services[@]}"; do
+    if [[ "${service_name}" == "tiny_vless" ]]; then
+      tiny_vless_changed=1
+    else
+      compose_services+=("${service_name}")
+      service_args+=" ${service_name}"
+    fi
+  done
   remote_shell "
     [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]] || { echo 'missing active release: ${REMOTE_CURRENT_LINK}/release.env' >&2; exit 1; }
     [[ -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing active compose file under ${REMOTE_CURRENT_LINK}' >&2; exit 1; }
-  " || return $?
-
-  for service_name in "${affected_services[@]}"; do
-    service_args+=" ${service_name}"
-  done
-  remote_shell "
-    cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
-  " || return $?
-  stabilize_remote_declared_docker_no_swap_limits
+  " || {
+    if (( tiny_vless_changed == 1 )); then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+    fi
+    return 1
+  }
+  if (( ${#compose_services[@]} > 0 )); then
+    remote_shell "
+      cd '${REMOTE_CURRENT_LINK}'
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
+    " || {
+      if (( tiny_vless_changed == 1 )); then
+        restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+      fi
+      return 1
+    }
+    stabilize_remote_declared_docker_no_swap_limits
+  fi
+  if (( tiny_vless_changed == 1 )); then
+    if ! run_remote_tiny_vless_manager_at_source \
+      deploy \
+      "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+      standard; then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || return 1
+      run_remote_tiny_vless_manager_at_source \
+        abort \
+        "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+        standard || return 1
+      return 1
+    fi
+    if ! run_remote_tiny_vless_manager_at_source \
+      validate \
+      "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+      standard; then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || return 1
+      run_remote_tiny_vless_manager_at_source \
+        abort \
+        "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+        standard || return 1
+      return 1
+    fi
+    if ! run_remote_tiny_vless_manager_at_source \
+      commit \
+      "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+      standard; then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || return 1
+      run_remote_tiny_vless_manager_at_source \
+        abort \
+        "${REMOTE_CURRENT_LINK}/infra/arbuzas/tiny-vless" \
+        standard || return 1
+      return 1
+    fi
+  fi
 }
 
 while (( $# > 0 )); do
@@ -8197,7 +8450,10 @@ case "${action}" in
     previous_release_id=""
     run_timed_phase resolve_current_release resolve_remote_current_release_id previous_release_id || true
     if (( TARGETED_MODE == 1 )); then
-      log "Deploy: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
+      log "Deploy: targeted services $(csv_join_services "${REQUESTED_SERVICES[@]}") profile=${VALIDATION_PROFILE}"
+      if tiny_vless_deployment_selected; then
+        log "Deploy: external component tiny_vless profile=${VALIDATION_PROFILE}"
+      fi
     fi
     mirror_changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
     DEPLOYMENT_TIMING_EXIT_CLEANUP_PATH="${mirror_changed_paths_file}"
@@ -8210,6 +8466,9 @@ case "${action}" in
       run_timed_phase prepare_host prepare_remote_host_layout
     fi
     run_timed_phase upload_release copy_deploy_release_payload
+    if ! run_timed_phase adopt_tiny_vless adopt_remote_tiny_vless; then
+      exit 1
+    fi
     if ! run_timed_phase render_tunnels render_deploy_cloudflared_configs; then
       exit 1
     fi
@@ -8220,8 +8479,21 @@ case "${action}" in
       exit 1
     fi
     deploy_ready_for_validation=1
+    tiny_vless_deploy_completed=0
     if ! run_timed_phase restart_services remote_compose_up; then
       deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )); then
+      if run_timed_phase restart_tiny_vless deploy_remote_tiny_vless; then
+        if tiny_vless_deployment_selected; then
+          tiny_vless_deploy_completed=1
+        fi
+      else
+        if tiny_vless_deployment_selected; then
+          run_timed_phase abort_tiny_vless abort_remote_tiny_vless || true
+        fi
+        deploy_ready_for_validation=0
+      fi
     fi
     if (( deploy_ready_for_validation == 1 )) && ! run_timed_phase bootstrap_jellyfin bootstrap_remote_jellyfin; then
       deploy_ready_for_validation=0
@@ -8233,8 +8505,16 @@ case "${action}" in
       deploy_ready_for_validation=0
     fi
     if (( deploy_ready_for_validation == 1 )) && run_timed_phase validate_release validate_deployed_release; then
-      run_timed_phase post_deploy_maintenance run_post_deploy_maintenance
-      exit 0
+      if run_timed_phase commit_tiny_vless commit_remote_tiny_vless; then
+        run_timed_phase post_deploy_maintenance run_post_deploy_maintenance
+        exit 0
+      fi
+    fi
+    if (( tiny_vless_deploy_completed == 1 )); then
+      if ! run_timed_phase rollback_tiny_vless rollback_remote_tiny_vless; then
+        log "Tiny-VLESS rollback failed; retaining the current release pointer for explicit recovery"
+        exit 1
+      fi
     fi
     if [[ -n "${previous_release_id}" && "${previous_release_id}" != "${ARBUZAS_RELEASE_ID}" ]]; then
       log "Deploy validation failed; rolling back to ${previous_release_id}"
@@ -8270,7 +8550,10 @@ case "${action}" in
     ;;
   validate)
     if (( TARGETED_MODE == 1 )); then
-      log "Validate: targeted services ${COMPOSE_TARGET_SERVICES[*]} profile=${VALIDATION_PROFILE}"
+      log "Validate: targeted services $(csv_join_services "${REQUESTED_SERVICES[@]}") profile=${VALIDATION_PROFILE}"
+      if (( VALIDATE_TINY_VLESS == 1 )); then
+        log "Validate: external component tiny_vless profile=${VALIDATION_PROFILE}"
+      fi
     fi
     run_timed_phase validate_release validate_remote_release "${requested_release_id}"
     ;;
@@ -8298,6 +8581,9 @@ case "${action}" in
           run_timed_phase prepare_rollback_jellyfin prepare_remote_jellyfin_runtime "${requested_release_id}" 1
         fi
         run_timed_phase rollback_release rollback_remote_release
+        if tiny_vless_deployment_selected; then
+          run_timed_phase rollback_tiny_vless deploy_remote_tiny_vless_from_release "${requested_release_id}"
+        fi
         if jellyfin_deployment_selected && previous_release_has_jellyfin "${requested_release_id}"; then
           run_timed_phase bootstrap_rollback_jellyfin bootstrap_remote_jellyfin "${requested_release_id}" 1
           run_timed_phase publish_rollback_jellyfin publish_remote_jellyfin_tailscale
@@ -8309,6 +8595,13 @@ case "${action}" in
           run_timed_phase validate_rollback_services validate_remote_release "${requested_release_id}"
         fi
       fi
+    fi
+    if tiny_vless_deployment_selected; then
+      run_timed_phase validate_rollback_tiny_vless \
+        validate_remote_tiny_vless_workload_health \
+        "${REMOTE_RELEASES_ROOT}/${requested_release_id}" \
+        "${VALIDATION_PROFILE}"
+      run_timed_phase commit_rollback_tiny_vless commit_remote_tiny_vless
     fi
     run_timed_phase post_rollback_maintenance run_post_deploy_maintenance "${requested_release_id}"
     ;;

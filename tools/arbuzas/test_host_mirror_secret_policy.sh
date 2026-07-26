@@ -7,6 +7,7 @@ SATIKSME_ENV="${MIRROR_ROOT}/etc/arbuzas/env/satiksme-bot.env"
 
 python3 - "${REPO_ROOT}" "${MIRROR_ROOT}" "${SATIKSME_ENV}" <<'PY'
 from pathlib import Path
+import importlib.util
 import stat
 import subprocess
 import sys
@@ -14,6 +15,22 @@ import sys
 repo_root = Path(sys.argv[1])
 mirror_root = Path(sys.argv[2])
 satiksme_env = Path(sys.argv[3])
+host_mirror_script = repo_root / "tools/arbuzas/host_mirror.py"
+
+spec = importlib.util.spec_from_file_location("host_mirror_secret_policy", host_mirror_script)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load the host mirror policy")
+host_mirror = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = host_mirror
+spec.loader.exec_module(host_mirror)
+
+for rel in (
+    "etc/arbuzas/env/tiny-vless.env",
+    "etc/arbuzas/secrets/tiny-vless/capability.secret",
+    "etc/arbuzas/secrets/tiny-vless/cert/private.key",
+):
+    if host_mirror.required_private_mode(rel) != 0o600:
+        raise SystemExit(f"tiny-VLESS mirror path is not private: {rel}")
 
 
 def is_history(path: Path) -> bool:

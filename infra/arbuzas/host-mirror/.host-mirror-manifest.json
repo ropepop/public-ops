@@ -37,8 +37,8 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "b88325cfb9f6d4c5171f46508fcfc36cb5a9a945f6c5c22608abaebefc48e30d",
-      "size": 1897
+      "sha256": "e08bbab796cccb64aeab9618ee723888f866f581a08d5640339bcb907e70df48",
+      "size": 1910
     },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 384,
@@ -54,6 +54,11 @@
       "mode": 384,
       "sha256": "11d8ce3f5a0fe385de7fe4f8a6439916107673dcc99299caf3899f85e1d677ea",
       "size": 1398
+    },
+    "etc/arbuzas/env/tiny-vless.env": {
+      "mode": 384,
+      "sha256": "8a99ebe46bcd911e010ba3c78baa7efa68d5c6f8a11ac0991e2fdfde0d690640",
+      "size": 282
     },
     "etc/arbuzas/env/train-bot.env": {
       "mode": 384,
@@ -130,6 +135,26 @@
       "sha256": "baddaa25139b7cd6ac5aa3e7361a808ed1f929eb6b1700af1e17b8da42cd8c6c",
       "size": 45
     },
+    "etc/arbuzas/secrets/tiny-vless/capability.secret": {
+      "mode": 384,
+      "sha256": "7dd9269103332a7acd0e1da11b5b7ae6e0a660faff050287082240a182459ff2",
+      "size": 65
+    },
+    "etc/arbuzas/secrets/tiny-vless/cert/mobility-fullchain.pem": {
+      "mode": 384,
+      "sha256": "d0a84b945f4891545713eb731c4727d12f250179bdbf58f4df3e4fd21839344a",
+      "size": 668
+    },
+    "etc/arbuzas/secrets/tiny-vless/cert/mobility-privkey.pem": {
+      "mode": 384,
+      "sha256": "23e5fc73fdc78d1ca4eaea5127d6366c9b8255138de3c2417293d6e4c00f6328",
+      "size": 241
+    },
+    "etc/arbuzas/secrets/tiny-vless/legacy-subscription-id.secret": {
+      "mode": 384,
+      "sha256": "173686864d85f045388efe4843d638e02a7726c100552b07c01f17ddb0a90ba2",
+      "size": 17
+    },
     "etc/arbuzas/secrets/train-bot-spacetime.key": {
       "mode": 384,
       "sha256": "661e441a90382de6765b0fd40b575ae21fa63f3b5dbe5fd16841529f9bb0c4e7",
@@ -147,5 +172,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1784796907
+  "updatedEpochSeconds": 1785025358
 }

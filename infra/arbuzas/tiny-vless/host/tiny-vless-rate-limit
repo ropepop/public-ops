@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+CONTAINER="${CONTAINER:-tiny-vless-3xui}"
+RATE="${RATE:-100mbit}"
+IFB_IF="${IFB_IF:-ifb-tinyvless}"
+
+case "${CONTAINER}" in
+  *[!A-Za-z0-9_.-]*|'') exit 1 ;;
+esac
+case "${RATE}" in
+  *[!A-Za-z0-9.]*|'') exit 1 ;;
+esac
+case "${IFB_IF}" in
+  *[!A-Za-z0-9_.-]*|'') exit 1 ;;
+esac
+
+attempt=0
+container_pid=""
+while [ "${attempt}" -lt 60 ]; do
+  container_pid="$(docker inspect --format '{{.State.Pid}}' "${CONTAINER}" 2>/dev/null || true)"
+  case "${container_pid}" in
+    ''|0|*[!0-9]*) ;;
+    *) break ;;
+  esac
+  attempt=$((attempt + 1))
+  sleep 1
+done
+case "${container_pid}" in
+  ''|0|*[!0-9]*) exit 1 ;;
+esac
+
+container_iflink="$(docker exec "${CONTAINER}" sh -c 'cat /sys/class/net/eth0/iflink' 2>/dev/null || true)"
+case "${container_iflink}" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+
+host_veth=""
+for index_file in /sys/class/net/*/ifindex; do
+  [ -f "${index_file}" ] || continue
+  if [ "$(cat "${index_file}")" = "${container_iflink}" ]; then
+    host_veth="$(basename "$(dirname "${index_file}")")"
+    break
+  fi
+done
+
+case "${host_veth}" in
+  ''|eth0|tailscale0|lo|"${IFB_IF}"|*[!A-Za-z0-9_.-]*) exit 1 ;;
+esac
+
+modprobe ifb numifbs=4
+if ! ip link show dev "${IFB_IF}" >/dev/null 2>&1; then
+  ip link add "${IFB_IF}" type ifb
+fi
+ip link set dev "${IFB_IF}" up
+
+# Root controls packets delivered to the container. Ingress is redirected to
+# the dedicated IFB so packets emitted by the container receive the same cap.
+tc qdisc del dev "${host_veth}" root 2>/dev/null || true
+tc qdisc del dev "${host_veth}" ingress 2>/dev/null || true
+tc qdisc del dev "${IFB_IF}" root 2>/dev/null || true
+
+tc qdisc add dev "${host_veth}" root tbf rate "${RATE}" burst 512kb latency 50ms
+tc qdisc add dev "${host_veth}" handle ffff: ingress
+tc filter add dev "${host_veth}" parent ffff: protocol all prio 1 matchall \
+  action mirred egress redirect dev "${IFB_IF}"
+tc qdisc add dev "${IFB_IF}" root tbf rate "${RATE}" burst 512kb latency 50ms

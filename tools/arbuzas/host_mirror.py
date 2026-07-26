@@ -83,6 +83,7 @@ SERVICE_ORDER = [
     "ticket_remote_spacetime_sidecar",
     "ticket_remote",
     "ticket_remote_tunnel",
+    "tiny_vless",
 ]
 
 
@@ -755,7 +756,11 @@ def add_service(services: set[str], name: str) -> None:
 
 def affected_services_for_path(rel: str) -> set[str]:
     services: set[str] = set()
-    if rel == "etc/arbuzas/env/train-bot.env":
+    if rel == "etc/arbuzas/env/tiny-vless.env":
+        add_service(services, "tiny_vless")
+    elif rel.startswith("etc/arbuzas/secrets/tiny-vless/"):
+        add_service(services, "tiny_vless")
+    elif rel == "etc/arbuzas/env/train-bot.env":
         add_service(services, "train_bot")
     elif rel == "etc/arbuzas/env/satiksme-bot.env":
         add_service(services, "satiksme_bot")

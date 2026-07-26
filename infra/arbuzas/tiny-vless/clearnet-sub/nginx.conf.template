@@ -1,0 +1,126 @@
+# This file is safe to keep in the repository. The installer replaces all
+# placeholders only on kitty-gration and writes the rendered file root-only.
+
+map $remote_addr $tiny_sub_client_key {
+    default $binary_remote_addr;
+    __PUBLIC_ADDRESS__ "";
+    127.0.0.1 "";
+}
+
+map $remote_addr $tiny_sub_global_key {
+    default $server_addr;
+    __PUBLIC_ADDRESS__ "";
+    127.0.0.1 "";
+}
+
+limit_req_zone $tiny_sub_client_key zone=tiny_sub_per_ip:1m rate=30r/m;
+limit_req_zone $tiny_sub_global_key zone=tiny_sub_global:1m rate=300r/m;
+limit_conn_zone $tiny_sub_client_key zone=tiny_sub_connections:1m;
+
+server {
+    listen __PUBLIC_ADDRESS__:__PUBLIC_PORT__ default_server;
+    server_name _;
+
+    server_tokens off;
+    access_log off;
+    error_log /dev/null emerg;
+
+    gzip off;
+    etag off;
+    autoindex off;
+    max_ranges 0;
+    client_max_body_size 1k;
+    client_body_timeout 5s;
+    client_header_timeout 5s;
+    keepalive_timeout 5s;
+    keepalive_requests 10;
+    send_timeout 10s;
+
+    limit_req zone=tiny_sub_per_ip burst=5 nodelay;
+    limit_req zone=tiny_sub_global burst=20 nodelay;
+    limit_req_status 404;
+    limit_conn tiny_sub_connections 4;
+    limit_conn_status 404;
+
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 404;
+    }
+    if ($request_uri ~ "[?%]") {
+        return 404;
+    }
+    if ($request_uri ~ "//") {
+        return 404;
+    }
+
+    error_page 400 401 403 404 405 408 413 414 429 500 502 503 504 =404 @concealed_not_found;
+
+    proxy_http_version 1.1;
+    proxy_pass_request_body off;
+    proxy_pass_request_headers off;
+    proxy_set_header Host "127.0.0.1:12096";
+    proxy_set_header Accept "text/plain, application/json, application/yaml, application/octet-stream";
+    proxy_set_header Accept-Encoding "";
+    proxy_set_header User-Agent "tiny-clearnet-sub/1";
+    proxy_set_header Content-Length "";
+    proxy_set_header Connection "";
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    proxy_redirect off;
+    proxy_max_temp_file_size 0;
+    proxy_connect_timeout 3s;
+    proxy_read_timeout 10s;
+    proxy_send_timeout 10s;
+    proxy_intercept_errors on;
+
+    proxy_hide_header Profile-Web-Page-Url;
+    proxy_hide_header Location;
+    proxy_hide_header Refresh;
+    proxy_hide_header Set-Cookie;
+    proxy_hide_header WWW-Authenticate;
+    proxy_hide_header Server;
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header Pragma;
+    proxy_hide_header Expires;
+
+    # Compatibility alias for the clearnet link issued before 3X-UI pairing.
+    location = /__CAPABILITY_TOKEN__.dat {
+        proxy_pass http://127.0.0.1:12096__UPSTREAM_RAW_BASE____CURRENT_SUBSCRIPTION_ID__?;
+    }
+
+    # 3X-UI appends every current or future strongly generated subId to these
+    # managed bases. Strict captures are rewritten to the private native paths.
+    location ~ "^/__CAPABILITY_TOKEN__/raw/(?<tiny_raw_id>(?:[0-9a-z]{16}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}))$" {
+        rewrite ^ __UPSTREAM_RAW_BASE__$tiny_raw_id break;
+        proxy_pass http://127.0.0.1:12096;
+    }
+
+    location ~ "^/__CAPABILITY_TOKEN__/json/(?<tiny_json_id>(?:[0-9a-z]{16}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}))$" {
+        rewrite ^ __UPSTREAM_JSON_BASE__$tiny_json_id break;
+        proxy_pass http://127.0.0.1:12096;
+    }
+
+    location ~ "^/__CAPABILITY_TOKEN__/clash/(?<tiny_clash_id>(?:[0-9a-z]{16}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}))$" {
+        rewrite ^ __UPSTREAM_CLASH_BASE__$tiny_clash_id break;
+        proxy_pass http://127.0.0.1:12096;
+    }
+
+    location @concealed_not_found {
+        internal;
+        return 404 "";
+    }
+
+    location / {
+        return 404 "";
+    }
+}

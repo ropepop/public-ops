@@ -5,6 +5,7 @@ This is the detailed operator runbook for the active kitty-gration runtime.
 ## Files
 
 - Active layout: `infra/arbuzas/docker/`
+- Existing external VPN project source: `infra/arbuzas/tiny-vless/`
 - Host Netdata config: `infra/arbuzas/netdata/`
 - Active deploy entrypoint: `tools/arbuzas/deploy.sh`
 - Tunnel config renderer: `tools/arbuzas/render_cloudflared_config.py`
@@ -25,11 +26,17 @@ This is the detailed operator runbook for the active kitty-gration runtime.
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
    - `/etc/arbuzas/cloudflared/subscription-bot.json`
+   - `/etc/arbuzas/env/tiny-vless.env`
+   - `/etc/arbuzas/secrets/tiny-vless/`
 6. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
 
 ### Private configuration rules
 
 - Host environment, secret, tunnel-credential, and release environment files must be mode `0600`. Every mirror action repairs checkout-default local modes; normal deploy and config-only deploy repair the host modes before restarting services; full validation rejects unsafe modes.
+- Tiny-VLESS certificates, keys, and the clearnet capability belong under
+  `infra/arbuzas/host-mirror/etc/arbuzas/secrets/tiny-vless/`. Its live SQLite
+  database does not: it remains application state under `/opt/tiny-vless/db`
+  and uses SQLite-safe backups under `/srv/arbuzas/tiny-vless/backups`.
 - Do not create `.bak`, `.before-*`, `.retired-*`, or editor backup copies under `/etc/arbuzas/env` or its local mirror. Mirror operations ignore these files, deploy removes old copies from the host, and full validation rejects any that remain.
 - Satiksme chat-analyzer Telegram and Google credentials belong under `infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/`, not inline in `satiksme-bot.env`. The directory is intentionally ignored by Git. The service environment contains only the matching `*_FILE` paths.
 
@@ -65,6 +72,14 @@ Deploy only one service or a few services:
 ./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
+Deploy or validate the existing external VPN project through the same
+entrypoint:
+
+```bash
+./tools/arbuzas/deploy.sh deploy --services tiny_vless --validation-profile standard --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --services tiny_vless --validation-profile standard --ssh-host kitty-gration --ssh-user "$USER"
+```
+
 Use an explicit validation profile for targeted iteration:
 
 ```bash
@@ -75,13 +90,19 @@ Use an explicit validation profile for targeted iteration:
 Notes for targeted updates:
 
 - `--services` is available only for `deploy` and `validate`.
-- Service names use the Compose service names from `infra/arbuzas/docker/compose.yml`.
+- Service names normally use the Compose service names from
+  `infra/arbuzas/docker/compose.yml`. `tiny_vless` is the deliberate exception:
+  it is a first-class umbrella selector for the existing separate Compose
+  project and is never passed to the main Compose project.
 - `train_bot`, `satiksme_bot`, and `subscription_bot` automatically bring along their matching tunnel service so the public route stays aligned.
 - `site-notifications` is kept in the repo for reference and testing, but it is not part of the active kitty-gration deploy set.
 - Targeted validation checks the slice you touched instead of forcing a full-stack validation pass.
 - `fast` is the inner iteration lane. It requires `--services`, reuses the unchanged release content, restarts only the selected slice, runs bounded readiness probes concurrently, and defers remote Docker/release cleanup. It still prunes expired local release artifacts after successful validation.
 - `standard` is the targeted confidence lane. It validates the selected workload more deeply while still avoiding unrelated full-stack checks.
 - `full` is the release lane and remains the default for unscoped deploys. It validates the complete host and performs release and image cleanup.
+- An unscoped deploy validates tiny-VLESS health but does not restart its
+  separate project. Recreating the VPN always requires an explicit
+  `--services tiny_vless` selection.
 - Full validation refuses releases marked dirty or unknown. A temporary dirty fast release cannot be used as final production proof.
 - Direct Spacetime privacy probes retry for up to four minutes so brief upstream interruptions do not incorrectly fail an otherwise healthy release.
 - Finish a sequence of fast iterations with an unscoped full deploy and validation. A fast release deliberately preserves unchanged service images and is not a replacement for the canonical full release.
@@ -137,6 +158,107 @@ Push only local mirror changes and restart/reload affected services without rebu
 ./tools/arbuzas/deploy.sh deploy-config --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
+## External tiny-VLESS project
+
+3X-UI/Xray remains in the separate Compose project that already owns the live
+VPN identities. It is not being copied into `infra/arbuzas/docker/compose.yml`.
+The deployment script treats it as a first-class external component so the
+same source, mirror, validation, and rollback controls cover it without
+renaming containers or regenerating client material.
+
+### Source, configuration, and state
+
+- Reproducible source: `infra/arbuzas/tiny-vless/`
+- Canonical environment: `/etc/arbuzas/env/tiny-vless.env`
+- Canonical private material: `/etc/arbuzas/secrets/tiny-vless/`
+- Live SQLite state: `/opt/tiny-vless/db`
+- Consistent recovery copies: `/srv/arbuzas/tiny-vless/backups`
+
+The environment and secret paths use the existing local-first mirror. The
+database is live application state and must never be copied into that plaintext
+mirror. Pull and audit before editing:
+
+```bash
+./tools/arbuzas/deploy.sh mirror-pull --ssh-host kitty-gration --ssh-user ropepop
+./tools/arbuzas/deploy.sh mirror-audit --ssh-host kitty-gration --ssh-user ropepop
+```
+
+Apply a mirrored VPN-only configuration change with `deploy-config`, or push a
+reviewed mirror without restarting anything with `mirror-push`:
+
+```bash
+./tools/arbuzas/deploy.sh deploy-config --ssh-host kitty-gration --ssh-user ropepop
+./tools/arbuzas/deploy.sh mirror-push --ssh-host kitty-gration --ssh-user ropepop
+```
+
+`deploy-config` maps changes below the two tiny-VLESS mirror paths to the
+`tiny_vless` selector. It does not rebuild or restart the main application
+project.
+
+### Host prerequisites and publications
+
+A clean target needs Docker and the Compose plugin, Python 3, SQLite tooling,
+Nginx, Tailscale, host firewall tools, `iproute2` traffic control, SSH, and the
+same required public TCP/UDP listener availability. The operator needs
+passwordless `sudo` for the guarded host actions.
+
+The private panel and HTTPS subscription publication use Tailscale. The
+separate capability-addressed clearnet subscription publication uses host
+Nginx on public TCP port 18081. That listener is plain HTTP and has no TLS; the
+unguessable capability does not protect the response from an on-path observer.
+Deploy and restore operations compare the complete Tailscale Serve/Funnel
+configuration so unrelated private routes are preserved.
+
+The same deployment slice also owns the VPN abuse firewall rules and the
+recurring bandwidth limiter. The limiter must resolve and attach to the
+container's current host interface after every recreation; a stale rule on an
+old interface is a failed validation, not a healthy limit.
+
+Hysteria2 uses dedicated public UDP port `8447`. UDP `443` must remain
+unpublished and have no host listener; TCP `443` belongs to the independent
+HTTP/2 recovery profile. Restore or migrate the Hysteria database port and
+Docker UDP publication as one matched state, then refresh clients through the
+existing subscription.
+
+### Manual read-only inspection
+
+Use the umbrella for routine work. For emergency read-only inspection of the
+separate project, keep its existing project name and canonical environment:
+
+```bash
+ssh kitty-gration 'cd /opt/tiny-vless && docker compose --project-name tiny-vless --env-file /etc/arbuzas/env/tiny-vless.env -f docker-compose.yml ps'
+```
+
+Do not run a manual `up`, create a second project name, or substitute a new
+database. Use the targeted deploy command for a managed recreation.
+
+### Identity-preserving restore
+
+The normal recovery path restores a matching set: the SQLite backup, mirrored
+environment, certificate/key material, and capability. The umbrella then
+reinstalls the same source and host integrations. This keeps the existing
+subscription, client identities, profile credentials, and certificate pins.
+
+A fresh reroll is intentionally different. Use it only when explicitly
+abandoning the prior VPN identity and after planning the client migration; it
+is never the default response to a host move or failed deploy.
+
+### VPN verification
+
+The targeted validation is complete only when all of the following pass
+without printing private profile material:
+
+- container health and restart stability;
+- SQLite integrity plus the expected enabled profile classes and counts;
+- required TCP and UDP listeners and private panel publication;
+- agreement between the private subscription generator and the public port-18081
+  alias for the private capability;
+- generic rejection of unknown public paths, queries, and unsupported methods;
+- preservation of every unrelated Tailscale route;
+- active, boot-persistent firewall policy;
+- an active limiter on the current container interface; and
+- real tunnel checks for the original profile and supported added profiles.
+
 Netdata is installed on the live host. The following actions refresh or validate its host-native setup.
 
 Install or refresh the host-native Netdata setup:
@@ -170,6 +292,9 @@ Re-run the fan-controller checks without reinstalling it:
 - updates `/etc/arbuzas/current`
 - runs `docker compose -p arbuzas up -d --build`
 - when `--services` is set, rebuilds and restarts only the requested services instead of the full stack
+- when `--services tiny_vless` is set, updates only the existing external VPN
+  project after taking its guarded recovery snapshot; an unscoped deploy only
+  validates that project and leaves it running
 - validates the apps, tunnels, and standalone Docker baseline
 - after every successful validation profile, prunes expired local bundles under `output/arbuzas/releases` while protecting the deployed release
 - prunes unused Docker images after they have stayed unprotected for 7 days
@@ -181,6 +306,8 @@ Re-run the fan-controller checks without reinstalling it:
 The normal Docker release flow does not install or update Netdata. Netdata is a separate host-maintenance action.
 The corrected memory report service is also a separate host-maintenance action.
 The ThinkPad fan controller is also a separate host-maintenance action.
+The external tiny-VLESS project participates in this release and validation
+umbrella, but remains outside the main `arbuzas` Compose project.
 
 ## Rollback
 
@@ -189,6 +316,13 @@ The ThinkPad fan controller is also a separate host-maintenance action.
 ```
 
 Rollback re-runs the same post-validation cleanup policy after the host is healthy again.
+
+Before a targeted VPN rollout, the deploy path creates a consistent SQLite
+backup and snapshots the host integration state it may change. If that rollout
+fails, it restores the previous inputs and validates the restored external
+project. For disaster recovery, restore a matching database/config/secret set
+and then run the targeted `tiny_vless` deploy and validation. Do not generate a
+new database or client identities as an implicit rollback.
 
 ## Cleanup
 
@@ -338,7 +472,9 @@ Netdata Agent 2.10.4 is installed and active on the live kitty-gration host. The
 ## Notes
 
 - Netdata lives on the host outside the `arbuzas` Compose project and is reachable only through its private Tailscale route.
-- The active runtime is one Compose project named `arbuzas`.
+- The main application runtime is the Compose project named `arbuzas`. The
+  existing tiny-VLESS project remains separate, under the same deployment
+  umbrella.
 - kitty-gration does not run a public DNS service. The host ports `443` and `853` are free; the `dns_controlplane` service was retired on 2026-06-21 (see `archive/dns-controlplane/`).
 - The live kitty-gration host must stay out of Docker Swarm. Validation fails if Swarm is enabled.
 - Swarm and rooted Pixel deployment paths are rollback-only legacy material.

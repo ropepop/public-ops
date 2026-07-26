@@ -30,6 +30,10 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `runbooks/`: operator procedures that should remain valid across sessions.
 - `reference/` if present: exhaustive command/config/API detail.
 - `../infra/arbuzas/docker/README.md`: active Docker layout and Compose details.
+- `../infra/arbuzas/tiny-vless/README.md`: 3X-UI/Xray source, existing external
+  Compose ownership, local-first configuration, recovery, and VPN-specific
+  validation. Read it for any VPN, subscription-publication, mobility-profile,
+  Nginx, Tailscale, firewall, or traffic-limiter task.
 
 ## Historical / heavy docs
 

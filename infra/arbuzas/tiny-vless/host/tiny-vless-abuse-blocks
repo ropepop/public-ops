@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+CHAIN="TINYVLESS-FILTER"
+SOURCE="172.30.77.2/32"
+
+iptables -w -N "${CHAIN}" 2>/dev/null || true
+iptables -w -F "${CHAIN}"
+
+# Keep exactly one early jump. Repeated runs must never grow DOCKER-USER.
+while iptables -w -C DOCKER-USER -j "${CHAIN}" 2>/dev/null; do
+  iptables -w -D DOCKER-USER -j "${CHAIN}"
+done
+iptables -w -I DOCKER-USER 1 -j "${CHAIN}"
+
+# A compromised proxy must not become a mail relay or reach host/private space.
+iptables -w -A "${CHAIN}" -s "${SOURCE}" -p tcp -m multiport --dports 25,465,587 -j REJECT --reject-with tcp-reset
+
+for destination in \
+  0.0.0.0/8 \
+  10.0.0.0/8 \
+  100.64.0.0/10 \
+  127.0.0.0/8 \
+  169.254.0.0/16 \
+  172.16.0.0/12 \
+  192.0.0.0/24 \
+  192.0.2.0/24 \
+  192.168.0.0/16 \
+  198.18.0.0/15 \
+  198.51.100.0/24 \
+  203.0.113.0/24 \
+  224.0.0.0/4 \
+  240.0.0.0/4
+do
+  iptables -w -A "${CHAIN}" -s "${SOURCE}" -d "${destination}" -j REJECT
+done
+
+iptables -w -A "${CHAIN}" -j RETURN
