@@ -281,7 +281,7 @@ def build_payload(before: dict[str, object]) -> dict[str, object]:
         "streamSettings": json.dumps(source_stream),
         "sniffing": str(before["sniffing"] or '{"enabled":false}'),
         "tag": "",
-        "subSortIndex": 7,
+        "subSortIndex": 5,
         "shareAddrStrategy": "custom",
         "shareAddr": str(before["share_addr"]),
     }
@@ -308,7 +308,7 @@ def verify_database(before: dict[str, object], *, enabled: bool) -> sqlite3.Row:
             "inbounds": con.execute("SELECT count(*) FROM inbounds").fetchone()[0],
             "attachments": con.execute("SELECT count(*) FROM client_inbounds").fetchone()[0],
         }
-        if counts != {"clients": 7, "inbounds": 7, "attachments": 7}:
+        if counts != {"clients": 5, "inbounds": 5, "attachments": 5}:
             raise ApplyError("the normalized row counts are unexpected")
         row = con.execute("SELECT * FROM inbounds WHERE remark = ?", (REMARK,)).fetchone()
         if row is None or bool(row["enable"]) != enabled or row["port"] != PORT:
@@ -378,8 +378,8 @@ def verify_subscription(api: PanelAPI, before: dict[str, object]) -> None:
     if not isinstance(obj, list):
         raise ApplyError("subscription link API did not return a list")
     links = [item for item in obj if isinstance(item, str) and item]
-    if len(links) != 7:
-        raise ApplyError("the shared subscription does not contain seven profiles")
+    if len(links) != 5:
+        raise ApplyError("the shared subscription does not contain five profiles")
     matches = []
     for link in links:
         if not link.startswith("vless://"):
@@ -439,7 +439,7 @@ def discard_staged(api: PanelAPI, before: dict[str, object]) -> None:
             con.execute("SELECT count(*) FROM inbounds").fetchone()[0],
             con.execute("SELECT count(*) FROM client_inbounds").fetchone()[0],
         )
-        if counts != (7, 7, 7):
+        if counts != (4, 4, 4):
             raise ApplyError("discarding the stage did not restore baseline counts")
         if con.execute("SELECT count(*) FROM clients WHERE email = ?", (EMAIL,)).fetchone()[0]:
             raise ApplyError("the staged compatibility client still exists")
@@ -511,7 +511,7 @@ def main() -> int:
         enable(api, before)
         print("enable_ok=true")
         print("compatibility_profile=enabled")
-        print("subscription_profiles=7")
+        print("subscription_profiles=5")
         print("runtime_compatibility_floor=active")
         print("protected_original_unchanged=true")
     else:

@@ -216,7 +216,7 @@ remains 100 Mbps in both directions, with a 2 MiB token bucket and the existing
 must leave matching live qdiscs and their counters untouched; it changes them
 only when an attachment or setting has actually drifted.
 
-The seven-profile subscription publishes Hysteria2 only on dedicated UDP
+The five-profile subscription publishes Hysteria2 only on dedicated UDP
 `8447`. The separate HTTP/2 recovery profile uses dedicated TCP `18448`. The
 VPN project publishes neither TCP nor UDP `443` on the VPS public IPv4 address.
 Tailscale HTTPS on the private overlay remains unchanged. Restore each database

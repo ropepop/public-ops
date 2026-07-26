@@ -42,10 +42,8 @@ EXPECTED_CONTAINER_IP = "172.30.77.2"
 EXPECTED_PROFILE_ENDPOINTS = (
     ("hysteria", 8447),
     ("vless", 8443),
-    ("vless", 8444),
     ("vless", 8446),
     ("vless", 18448),
-    ("vmess", 8445),
     ("wireguard", 51820),
 )
 EXPECTED_ENABLED_INBOUNDS = len(EXPECTED_PROFILE_ENDPOINTS)
@@ -327,6 +325,8 @@ def validate_source_contract(source_dir: Path) -> None:
         raise ComponentError("source_compose_contract_mismatch")
     if ":443:443/tcp" in compose or ":443:443/udp" in compose:
         raise ComponentError("source_standard_vpn_port_present")
+    if ":8444:8444/udp" in compose or ":8445:8445/udp" in compose:
+        raise ComponentError("source_retired_vpn_port_present")
     if "./db:/etc/x-ui" in compose or "./cert:/root/cert" in compose:
         raise ComponentError("source_compose_uses_relative_state")
 
@@ -1098,8 +1098,6 @@ def validate_container() -> None:
         "8446/tcp": [("0.0.0.0", "8446")],
         "18448/tcp": [(public_address, "18448")],
         "8447/udp": [("0.0.0.0", "8447")],
-        "8444/udp": [("0.0.0.0", "8444")],
-        "8445/udp": [("0.0.0.0", "8445")],
         "51820/udp": [("0.0.0.0", "51820")],
     }
     bindings = host.get("PortBindings", {})
@@ -1164,7 +1162,8 @@ def validate_tcp_listeners(clearnet_port: int) -> None:
 
 def validate_udp_listeners() -> None:
     output = command(["ss", "-H", "-lun"], capture=True)
-    required = {8447, 8444, 8445, 51820}
+    required = {8447, 51820}
+    retired = {8444, 8445}
     observed: set[int] = set()
     for line in output.splitlines():
         columns = line.split()
@@ -1177,6 +1176,8 @@ def validate_udp_listeners() -> None:
             observed.add(int(match.group(1)))
     if not required.issubset(observed):
         raise ComponentError("udp_listener_mismatch")
+    if retired.intersection(observed):
+        raise ComponentError("retired_vpn_listener_present")
     if 443 in observed:
         raise ComponentError("standard_hysteria_listener_present")
 

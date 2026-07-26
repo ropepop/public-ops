@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Secret-safe sustained acceptance for the seven-profile VPN subscription.
+"""Secret-safe sustained acceptance for the five-profile VPN subscription.
 
 The runner intentionally accepts private share links only on stdin or through a
 caller-owned regular file with mode 0600.  Links are parsed by
@@ -69,10 +69,8 @@ class RunnerError(RuntimeError):
 EXPECTED_LABELS = (
     "mobility-hysteria2",
     "original-vless-reality",
-    "mobility-vless-xhttp-h3",
     "mobility-wireguard",
     "mobility-vless-xhttp-h2",
-    "mobility-vmess-mkcp",
     "karing-singbox-reality-compat",
 )
 STAGE_KINDS = ("stream", "download", "upload")

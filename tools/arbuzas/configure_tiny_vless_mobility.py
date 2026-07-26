@@ -39,10 +39,8 @@ H2_RECOVERY_PORT = 18448
 
 TARGETS = (
     ("mobility-hy2", "Kitty Mobility - Hysteria2", "hysteria", HYSTERIA_PORT),
-    ("mobility-h3", "Kitty Mobility - VLESS XHTTP H3", "vless", 8444),
     ("mobility-wg", "Kitty Mobility - WireGuard", "wireguard", 51820),
     ("mobility-h2", "Kitty Mobility - XHTTP H2 Recovery", "vless", H2_RECOVERY_PORT),
-    ("mobility-mkcp", "Kitty Mobility - VMess mKCP", "vmess", 8445),
 )
 
 
@@ -269,7 +267,6 @@ def xhttp_settings(
     path: str,
     *,
     xmux: bool = False,
-    stable_packet_up: bool = False,
 ) -> dict[str, object]:
     out: dict[str, object] = {
         "path": path,
@@ -282,19 +279,7 @@ def xhttp_settings(
         "serverMaxHeaderBytes": 0,
         "headers": {},
     }
-    if stable_packet_up:
-        # Xray 26.7.11's randomized 600-900 request lifetime can rotate an
-        # H3 packet-up client while POST responses are still in flight. Keep
-        # the connection pool bounded, but do not rotate it by request count.
-        out["xmux"] = {
-            "maxConcurrency": 0,
-            "maxConnections": 6,
-            "cMaxReuseTimes": 0,
-            "hMaxRequestTimes": 0,
-            "hMaxReusableSecs": 0,
-            "hKeepAlivePeriod": 0,
-        }
-    elif xmux:
+    if xmux:
         out["xmux"] = {
             "maxConcurrency": "16-32",
             "maxConnections": 0,
@@ -342,8 +327,6 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
 
     hy_client = common_client("mobility-hy2", sub_id, "QUIC roaming experiment")
     hy_client["auth"] = secrets.token_urlsafe(24)
-    h3_client = common_client("mobility-h3", sub_id, "VLESS HTTP/3 roaming experiment")
-    h3_client.update({"id": str(uuid.uuid4()), "flow": ""})
     wg_client = common_client("mobility-wg", sub_id, "WireGuard endpoint roaming experiment")
     wg_client.update({
         "id": str(uuid.uuid4()),
@@ -355,11 +338,8 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
     })
     h2_client = common_client("mobility-h2", sub_id, "TCP fast-recovery control")
     h2_client.update({"id": str(uuid.uuid4()), "flow": ""})
-    mkcp_client = common_client("mobility-mkcp", sub_id, "Loss-tolerance control")
-    mkcp_client.update({"id": str(uuid.uuid4()), "security": "auto"})
 
     tls = tls_settings(pin)
-    h3_path = "/" + secrets.token_urlsafe(12)
     h2_path = "/" + secrets.token_urlsafe(12)
     short_id = secrets.token_hex(8)
 
@@ -384,27 +364,8 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
 
     payloads.append({
         **common_top,
-        "remark": "Kitty Mobility - VLESS XHTTP H3",
-        "subSortIndex": 3,
-        "port": 8444,
-        "protocol": "vless",
-        "settings": json.dumps({
-            "clients": [h3_client], "decryption": "none", "encryption": "none", "fallbacks": [],
-        }),
-        "streamSettings": json.dumps({
-            "network": "xhttp",
-            "security": "tls",
-            "xhttpSettings": xhttp_settings(h3_path, stable_packet_up=True),
-            "tlsSettings": tls,
-            "finalmask": {"quicParams": quic_tuning()},
-        }),
-        "sniffing": json.dumps(enabled_sniffing),
-    })
-
-    payloads.append({
-        **common_top,
         "remark": "Kitty Mobility - WireGuard",
-        "subSortIndex": 4,
+        "subSortIndex": 3,
         "port": 51820,
         "protocol": "wireguard",
         "settings": json.dumps({
@@ -423,7 +384,7 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
     payloads.append({
         **common_top,
         "remark": "Kitty Mobility - XHTTP H2 Recovery",
-        "subSortIndex": 5,
+        "subSortIndex": 4,
         "port": H2_RECOVERY_PORT,
         "protocol": "vless",
         "settings": json.dumps({
@@ -456,28 +417,6 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
                 "tcpKeepAliveIdle": 30,
                 "tcpKeepAliveInterval": 10,
                 "tcpUserTimeout": 30000,
-            },
-        }),
-        "sniffing": json.dumps(enabled_sniffing),
-    })
-
-    payloads.append({
-        **common_top,
-        "remark": "Kitty Mobility - VMess mKCP",
-        "subSortIndex": 6,
-        "port": 8445,
-        "protocol": "vmess",
-        "settings": json.dumps({"clients": [mkcp_client]}),
-        "streamSettings": json.dumps({
-            "network": "kcp",
-            "security": "none",
-            "kcpSettings": {
-                "mtu": 1200,
-                "tti": 20,
-                "uplinkCapacity": 20,
-                "downlinkCapacity": 100,
-                "cwndMultiplier": 1,
-                "maxSendingWindow": 2097152,
             },
         }),
         "sniffing": json.dumps(enabled_sniffing),

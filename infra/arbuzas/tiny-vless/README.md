@@ -73,24 +73,16 @@ an on-path observer.
 ## Mobility profiles
 
 The mobility expansion keeps the original VLESS/REALITY/TCP inbound and client
-unchanged. Five independent experimental clients reuse the original
+unchanged. Three independent mobility clients reuse the original
 subscription identifier through 3X-UI's inbound-add path:
 
 - Hysteria2 with conservative QUIC timing on dedicated public UDP port
   `8447`;
-- VLESS XHTTP over HTTP/3;
 - WireGuard with endpoint roaming;
 - VLESS XHTTP over HTTP/2/REALITY as a fast-recovery control on dedicated TCP
-  port `18448`;
-- VMess over mKCP as a packet-loss control.
+  port `18448`.
 
-The HTTP/3 profile keeps Xray's packet-up connection pool bounded at six but
-disables request-count rotation. In Xray 26.7.11, the default randomized
-request budget can rotate a busy H3 upload connection while packet POSTs are
-still completing, which resets long uploads even though the server remains
-healthy.
-
-A seventh, distinctly named profile provides Karing/sing-box compatibility.
+A fifth, distinctly named profile provides Karing/sing-box compatibility.
 It is a separate VLESS/TCP/REALITY/Vision inbound on TCP 8446 with an explicit
 REALITY minimum-client version of 1.8.1. It reuses the same subscription but
 has independent client and REALITY credentials, so the original profile stays
@@ -149,8 +141,8 @@ then run `tools/arbuzas/configure_tiny_vless_clearnet_sub.py` as root with
 `--template` and `--limits`. The helper emits only fixed validation fields; it
 never prints either subscription address, either token, or profile content.
 
-The Hysteria2 and HTTP/3 profiles use a locally generated, certificate-pinned
-self-signed certificate. A client must honor the pin carried by the share
+The Hysteria2 profile uses a locally generated, certificate-pinned self-signed
+certificate. A client must honor the pin carried by the share
 profile; do not disable certificate verification as a workaround.
 
 Hysteria2 is published only on dedicated UDP `8447`, and the separate HTTP/2
@@ -170,8 +162,8 @@ runtime configuration contains the explicit compatibility floor. It applies
 the same original-profile fingerprint guards and secret-free output policy.
 
 `tools/arbuzas/test_tiny_vless_mobility.py` performs secret-safe client-side
-checks with an Xray binary matching the server. The seven-profile suite checks
-the original profile, the five mobility profiles, and the Karing compatibility
+checks with an Xray binary matching the server. The five-profile suite checks
+the original profile, the three mobility profiles, and the Karing compatibility
 profile through real tunnels. Passing `--karing-core` adds the decisive check
 through Karing's modified sing-box core, which must pass both configuration
 validation and a live tunnel without a REALITY verification failure.

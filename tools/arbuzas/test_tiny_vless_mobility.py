@@ -32,7 +32,7 @@ class TestError(RuntimeError):
 
 
 EXPECTED_HYSTERIA_PORTS = (8447,)
-EXPECTED_PROFILE_COUNT = 7
+EXPECTED_PROFILE_COUNT = 5
 
 
 def one(values: dict[str, list[str]], key: str, default: str = "") -> str:
@@ -100,10 +100,8 @@ def fixed_label(scheme: str, port: int) -> str:
             raise TestError("the subscription contains an unexpected Hysteria2 port") from exc
     labels = {
         ("vless", 8443): "original-vless-reality",
-        ("vless", 8444): "mobility-vless-xhttp-h3",
         ("wireguard", 51820): "mobility-wireguard",
         ("vless", 18448): "mobility-vless-xhttp-h2",
-        ("vmess", 8445): "mobility-vmess-mkcp",
         ("vless", 8446): "karing-singbox-reality-compat",
     }
     try:
@@ -254,43 +252,6 @@ def parse_wireguard(link: str) -> tuple[str, str, dict[str, Any]]:
     return fixed_label("wireguard", port), parsed.hostname or "", outbound
 
 
-def parse_vmess(link: str) -> tuple[str, str, dict[str, Any]]:
-    encoded = link.split("://", 1)[1]
-    padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
-    try:
-        obj = json.loads(base64.urlsafe_b64decode(padded))
-    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
-        raise TestError("the VMess profile is malformed") from exc
-    port = int(obj["port"])
-    network = str(obj.get("net") or "tcp")
-    security = "tls" if obj.get("tls") == "tls" else "none"
-    stream = common_stream(network, security)
-    if network == "kcp":
-        kcp = stream["kcpSettings"]
-        kcp["mtu"] = int(obj.get("mtu") or 1350)
-        kcp["tti"] = int(obj.get("tti") or 20)
-        if str(obj.get("type") or "none") != "none" or obj.get("path"):
-            raise TestError("the mKCP profile uses removed header or seed settings")
-    if obj.get("fm"):
-        stream["finalmask"] = decode_json_param(str(obj["fm"]))
-    outbound = {
-        "protocol": "vmess",
-        "tag": "proxy",
-        "settings": {
-            "vnext": [{
-                "address": obj["add"],
-                "port": port,
-                "users": [{
-                    "id": obj["id"],
-                    "security": obj.get("scy") or "auto",
-                }],
-            }],
-        },
-        "streamSettings": stream,
-    }
-    return fixed_label("vmess", port), str(obj["add"]), outbound
-
-
 def parse_link(link: str) -> tuple[str, str, dict[str, Any]]:
     scheme = link.split(":", 1)[0].lower()
     if scheme == "vless":
@@ -299,8 +260,6 @@ def parse_link(link: str) -> tuple[str, str, dict[str, Any]]:
         return parse_hysteria2(link)
     if scheme == "wireguard":
         return parse_wireguard(link)
-    if scheme == "vmess":
-        return parse_vmess(link)
     raise TestError("the subscription contains an unsupported profile scheme")
 
 
@@ -614,9 +573,7 @@ def test_udp_rebind(
 
                     # A transport that cannot preserve the existing inner TCP
                     # stream may still heal cleanly for the next connection.
-                    # Keep that recovery result separate from continuity so the
-                    # mKCP control remains informative instead of failing the
-                    # whole mobility experiment by design.
+                    # Keep that recovery result separate from continuity.
                     recovery_path = tmpdir / "recovery.txt"
                     with recovery_path.open("wb") as response:
                         recovery = subprocess.run(
@@ -782,9 +739,7 @@ def main() -> int:
         action="append",
         choices=[
             "mobility-hysteria2",
-            "mobility-vless-xhttp-h3",
             "mobility-wireguard",
-            "mobility-vmess-mkcp",
         ],
         help="limit optional rebinding checks to one or more fixed profile labels",
     )
@@ -824,7 +779,7 @@ def main() -> int:
         or len(links) != EXPECTED_PROFILE_COUNT
         or not all(isinstance(x, str) for x in links)
     ):
-        raise TestError("the subscription did not contain exactly seven profiles")
+        raise TestError("the subscription did not contain exactly five profiles")
     expected_hysteria_ports = tuple(
         sorted(args.hysteria_ports or EXPECTED_HYSTERIA_PORTS)
     )
@@ -877,13 +832,10 @@ def main() -> int:
     if args.simulate_udp_rebind:
         udp_labels = {
             "mobility-hysteria2",
-            "mobility-vless-xhttp-h3",
             "mobility-wireguard",
-            "mobility-vmess-mkcp",
         }
         continuity_required = {
             "mobility-hysteria2",
-            "mobility-vless-xhttp-h3",
             "mobility-wireguard",
         }
         for label, endpoint, outbound in parsed:
