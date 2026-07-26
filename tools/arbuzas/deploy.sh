@@ -81,7 +81,6 @@ ARBUZAS_RELEASE_DIR="${ARBUZAS_RELEASE_DIR:-${LOCAL_RELEASES_ROOT}/${ARBUZAS_REL
 
 ARBUZAS_TRAIN_BOT_PORT="${ARBUZAS_TRAIN_BOT_PORT:-9317}"
 ARBUZAS_SATIKSME_BOT_PORT="${ARBUZAS_SATIKSME_BOT_PORT:-9318}"
-ARBUZAS_SUBSCRIPTION_BOT_PORT="${ARBUZAS_SUBSCRIPTION_BOT_PORT:-9320}"
 ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
 ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
@@ -106,7 +105,6 @@ ARBUZAS_FAN_EXIT_AUTO_C="${ARBUZAS_FAN_EXIT_AUTO_C:-89}"
 
 ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"
 ARBUZAS_SATIKSME_BOT_HOSTNAME="${ARBUZAS_SATIKSME_BOT_HOSTNAME:-kontrole.info}"
-ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME="${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME:-farel-subscription-bot.jolkins.id.lv}"
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
 ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
 ARBUZAS_TICKET_CLOUDFLARED_IMAGE="${ARBUZAS_TICKET_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0}"
@@ -118,7 +116,6 @@ VALIDATION_PROFILE_OPTION_SET=0
 TARGETED_MODE=0
 VALIDATE_TRAIN=0
 VALIDATE_SATIKSME=0
-VALIDATE_SUBSCRIPTION=0
 VALIDATE_TICKET_PHONE_BRIDGE=0
 VALIDATE_TICKET_REMOTE=0
 VALIDATE_QBITTORRENT=0
@@ -146,13 +143,11 @@ JELLYFIN_SECRET_CREATED=0
 ALL_SERVICES=(
   train_bot
   satiksme_bot
-  subscription_bot
   ticket_phone_bridge
   ticket_remote_spacetime_sidecar
   ticket_remote
   train_tunnel
   satiksme_tunnel
-  subscription_tunnel
   ticket_remote_tunnel
   qbittorrent
   qbittorrent_housekeeper
@@ -1598,8 +1593,7 @@ Options:
   --env-file PATH
 
 Services:
-  train_bot, train_tunnel, satiksme_bot, satiksme_tunnel, subscription_bot,
-  subscription_tunnel, ticket_phone_bridge,
+  train_bot, train_tunnel, satiksme_bot, satiksme_tunnel, ticket_phone_bridge,
   ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel,
   qbittorrent, qbittorrent_housekeeper,
   jellyfin,
@@ -1719,11 +1713,6 @@ mark_validation_group() {
       append_unique DIAGNOSTIC_SERVICES satiksme_bot
       append_unique DIAGNOSTIC_SERVICES satiksme_tunnel
       ;;
-    subscription)
-      VALIDATE_SUBSCRIPTION=1
-      append_unique DIAGNOSTIC_SERVICES subscription_bot
-      append_unique DIAGNOSTIC_SERVICES subscription_tunnel
-      ;;
     ticket_phone_bridge)
       VALIDATE_TICKET_PHONE_BRIDGE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
@@ -1783,15 +1772,6 @@ resolve_requested_services() {
         append_unique COMPOSE_TARGET_SERVICES satiksme_bot
         append_unique COMPOSE_TARGET_SERVICES satiksme_tunnel
         mark_validation_group satiksme
-        ;;
-      subscription_bot)
-        append_unique COMPOSE_TARGET_SERVICES subscription_bot
-        append_unique COMPOSE_TARGET_SERVICES subscription_tunnel
-        mark_validation_group subscription
-        ;;
-      subscription_tunnel)
-        append_unique COMPOSE_TARGET_SERVICES subscription_tunnel
-        mark_validation_group subscription
         ;;
       ticket_phone_bridge)
         append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
@@ -1872,7 +1852,7 @@ compose_target_service_args_without_tunnels() {
   local service_name
   for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
-      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|ticket_remote_tunnel)
         continue
         ;;
       *)
@@ -1888,7 +1868,7 @@ compose_target_tunnel_service_args() {
   local service_name
   for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
-      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|ticket_remote_tunnel)
         service_args+=" ${service_name}"
         ;;
     esac
@@ -1902,7 +1882,6 @@ compose_all_service_args() {
   local all_services=(
     train_bot
     satiksme_bot
-    subscription_bot
     ticket_phone_bridge
     ticket_remote_spacetime_sidecar
     ticket_remote
@@ -1917,7 +1896,7 @@ compose_all_service_args() {
 }
 
 compose_all_tunnel_service_args() {
-  printf '%s' " train_tunnel satiksme_tunnel subscription_tunnel ticket_remote_tunnel"
+  printf '%s' " train_tunnel satiksme_tunnel ticket_remote_tunnel"
 }
 
 targeted_service_selected() {
@@ -3073,7 +3052,7 @@ compute_release_source_dirty() {
     printf 'unknown\n'
     return
   fi
-  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin infra/arbuzas/tiny-vless tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all -- infra/arbuzas/docker infra/arbuzas/qbittorrent infra/arbuzas/jellyfin infra/arbuzas/tiny-vless tools/arbuzas test_arbuzas_deploy_contract.sh test_ticket_phone_bridge_hardening.sh workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/ticket-remote workloads/qbittorrent-housekeeper)" ]]; then
     printf 'dirty\n'
   else
     printf 'clean\n'
@@ -3115,7 +3094,6 @@ included_roots = [
     pathlib.Path("workloads/shared-go"),
     pathlib.Path("workloads/train-bot"),
     pathlib.Path("workloads/satiksme-bot"),
-    pathlib.Path("workloads/subscription-bot"),
     pathlib.Path("workloads/ticket-remote"),
     pathlib.Path("workloads/qbittorrent-housekeeper"),
 ]
@@ -3172,7 +3150,6 @@ ARBUZAS_RELEASE_SOURCE_SHA256=${ARBUZAS_RELEASE_SOURCE_SHA256}
 ARBUZAS_TZ=${ARBUZAS_TZ}
 ARBUZAS_TRAIN_BOT_PORT=${ARBUZAS_TRAIN_BOT_PORT}
 ARBUZAS_SATIKSME_BOT_PORT=${ARBUZAS_SATIKSME_BOT_PORT}
-ARBUZAS_SUBSCRIPTION_BOT_PORT=${ARBUZAS_SUBSCRIPTION_BOT_PORT}
 ARBUZAS_TICKET_REMOTE_PORT=${ARBUZAS_TICKET_REMOTE_PORT}
 ARBUZAS_QBITTORRENT_WEBUI_PORT=${ARBUZAS_QBITTORRENT_WEBUI_PORT}
 ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT=${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT}
@@ -3192,7 +3169,6 @@ ARBUZAS_TICKET_TUNNEL_UID=${ARBUZAS_TICKET_TUNNEL_UID}
 ARBUZAS_TICKET_TUNNEL_GID=${ARBUZAS_TICKET_TUNNEL_GID}
 ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
 ARBUZAS_SATIKSME_BOT_HOSTNAME=${ARBUZAS_SATIKSME_BOT_HOSTNAME}
-ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME=${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}
 ARBUZAS_TICKET_REMOTE_HOSTNAME=${ARBUZAS_TICKET_REMOTE_HOSTNAME}
 ARBUZAS_TICKET_REMOTE_AUTH_MODE=${ARBUZAS_TICKET_REMOTE_AUTH_MODE:-spacetime}
 ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN=${ARBUZAS_TICKET_REMOTE_CF_ACCESS_TEAM_DOMAIN:-}
@@ -3221,7 +3197,6 @@ prepare_local_release_bundle() {
   copy_tree_into_release "workloads/shared-go"
   copy_tree_into_release "workloads/train-bot"
   copy_tree_into_release "workloads/satiksme-bot"
-  copy_tree_into_release "workloads/subscription-bot"
   copy_tree_into_release "workloads/ticket-remote"
   copy_tree_into_release "workloads/qbittorrent-housekeeper"
 
@@ -3263,9 +3238,6 @@ prepare_local_fast_release_overlay() {
         copy_tree_into_fast_release_overlay "workloads/shared-go"
         copy_tree_into_fast_release_overlay "workloads/satiksme-bot"
         ;;
-      subscription_bot)
-        copy_tree_into_fast_release_overlay "workloads/subscription-bot"
-        ;;
       ticket_remote_spacetime_sidecar|ticket_remote)
         copy_tree_into_fast_release_overlay "workloads/ticket-remote"
         ;;
@@ -3277,7 +3249,7 @@ prepare_local_fast_release_overlay() {
         copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
         copy_tree_into_fast_release_overlay "infra/arbuzas/jellyfin"
         ;;
-      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
         ;;
       *)
         echo "No fast release overlay mapping for service: ${service_name}" >&2
@@ -3358,7 +3330,6 @@ prepare_remote_ticket_runtime_permissions() {
     for path in \
       '/etc/arbuzas/env/train-bot.env' \
       '/etc/arbuzas/env/satiksme-bot.env' \
-      '/etc/arbuzas/env/subscription-bot.env' \
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
@@ -3371,7 +3342,6 @@ prepare_remote_ticket_runtime_permissions() {
       '/etc/arbuzas/secrets/train-bot-test-ticket.secret' \
       '/etc/arbuzas/cloudflared/train-bot.json' \
       '/etc/arbuzas/cloudflared/satiksme-bot.json' \
-      '/etc/arbuzas/cloudflared/subscription-bot.json' \
       '/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'; do
       secure_private_file \"\${path}\" 'root:root'
     done
@@ -3407,8 +3377,6 @@ prepare_remote_host_layout() {
       '/srv/arbuzas/satiksme-bot/data/catalog/source' \
       '/srv/arbuzas/satiksme-bot/data/catalog/generated' \
       '/srv/arbuzas/satiksme-bot/data/public-bundles' \
-      '/srv/arbuzas/subscription-bot/run' \
-      '/srv/arbuzas/subscription-bot/state' \
       '/srv/arbuzas/ticket-remote/run' \
       '/srv/arbuzas/ticket-remote/state' \
       '/etc/arbuzas/env' \
@@ -3422,7 +3390,6 @@ prepare_remote_host_layout() {
     touch \
       '/etc/arbuzas/env/train-bot.env' \
       '/etc/arbuzas/env/satiksme-bot.env' \
-      '/etc/arbuzas/env/subscription-bot.env' \
       '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
   "
   prepare_remote_ticket_runtime_permissions
@@ -4134,7 +4101,7 @@ rollback_release_before_qbittorrent() {
       --env-file '${REMOTE_CURRENT_LINK}/release.env' \
       -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
     retired_service_args=()
-    for retired_service in portainer chatgpt_broker chatgpt_bot; do
+    for retired_service in portainer chatgpt_broker chatgpt_bot subscription_bot subscription_tunnel; do
       if \"\${compose_args[@]}\" config --services | grep -Fxq \"\${retired_service}\"; then
         retired_service_args+=(--scale \"\${retired_service}=0\")
       fi
@@ -4237,7 +4204,7 @@ validate_release_before_qbittorrent_recovery() {
   validate_remote_host_probe "${remote_release_dir}" "pre-qBittorrent release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
-      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot)$')
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot|subscription_bot|subscription_tunnel)$')
       deadline=\$((SECONDS + 180))
       while (( SECONDS < deadline )); do
         running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
@@ -4255,6 +4222,8 @@ validate_release_before_qbittorrent_recovery() {
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=portainer')\"
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_broker')\"
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_bot')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=subscription_bot')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=subscription_tunnel')\"
       if [[ '${require_route_absent}' == '1' ]]; then
         tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_QBITTORRENT_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
       fi
@@ -4405,7 +4374,7 @@ rollback_release_before_jellyfin() {
         --env-file '${REMOTE_CURRENT_LINK}/release.env' \
         -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
       retired_service_args=()
-      for retired_service in portainer chatgpt_broker chatgpt_bot; do
+      for retired_service in portainer chatgpt_broker chatgpt_bot subscription_bot subscription_tunnel; do
         if \"\${compose_args[@]}\" config --services | grep -Fxq \"\${retired_service}\"; then
           retired_service_args+=(--scale \"\${retired_service}=0\")
         fi
@@ -4431,7 +4400,7 @@ validate_release_before_jellyfin_recovery() {
   validate_remote_host_probe "${remote_release_dir}" "pre-Jellyfin release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
-      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot)$')
+      expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot|subscription_bot|subscription_tunnel)$')
       deadline=\$((SECONDS + 180))
       while (( SECONDS < deadline )); do
         running=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml ps --services --status running)
@@ -4448,6 +4417,8 @@ validate_release_before_jellyfin_recovery() {
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=portainer')\"
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_broker')\"
       test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=chatgpt_bot')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=subscription_bot')\"
+      test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=subscription_tunnel')\"
       if [[ '${require_route_absent}' == '1' ]]; then
         tailscale serve status --json | python3 -c 'import json,sys; payload=json.load(sys.stdin); port=\"${ARBUZAS_JELLYFIN_TAILSCALE_HTTPS_PORT}\"; assert payload.get(\"TCP\", {}).get(port) is None; assert not any(key.rsplit(\":\", 1)[-1] == port for key in payload.get(\"Web\", {}))'
       fi
@@ -4547,6 +4518,13 @@ copy_fast_release_overlay_to_remote() {
     if [[ -d '${remote_tmp_dir}/workloads/chatgpt-broker' ]]; then
       sudo -n find '${remote_tmp_dir}/workloads/chatgpt-broker' -depth -delete
     fi
+    if [[ -d '${remote_tmp_dir}/workloads/subscription-bot' ]]; then
+      sudo -n find '${remote_tmp_dir}/workloads/subscription-bot' -depth -delete
+    fi
+    sudo -n rm -f \
+      '${remote_tmp_dir}/infra/arbuzas/docker/images/subscription-bot.Dockerfile' \
+      '${remote_tmp_dir}/docs/runbooks/MODULE_SUBSCRIPTION_BOT.md' \
+      '${remote_tmp_dir}/generated/cloudflared/subscription-bot.yml'
     sudo -n tar -C '${remote_tmp_dir}' -xf '${remote_tarball}'
     sudo -n rm -f '${remote_tarball}'
     [[ -f '${remote_tmp_dir}/release.env' ]] || { echo 'incomplete fast overlay: missing release.env' >&2; exit 1; }
@@ -4554,7 +4532,7 @@ copy_fast_release_overlay_to_remote() {
     sudo -n chmod 0600 '${remote_tmp_dir}/release.env'
     [[ -f '${remote_tmp_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'incomplete fast overlay: missing compose.yml' >&2; exit 1; }
     [[ -f '${remote_tmp_dir}/tools/arbuzas/render_cloudflared_config.py' ]] || { echo 'incomplete fast overlay: missing tunnel renderer' >&2; exit 1; }
-    for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/subscription-bot workloads/ticket-remote; do
+    for required_root in workloads/shared-go workloads/train-bot workloads/satiksme-bot workloads/ticket-remote; do
       [[ -d '${remote_tmp_dir}/'\"\${required_root}\" ]] || {
         echo \"incomplete fast overlay: missing \${required_root}\" >&2
         exit 1
@@ -4570,7 +4548,7 @@ fast_profile_requires_cloudflared_render() {
 
   for service_name in ${COMPOSE_TARGET_SERVICES[@]+"${COMPOSE_TARGET_SERVICES[@]}"}; do
     case "${service_name}" in
-      train_tunnel|satiksme_tunnel|subscription_tunnel|ticket_remote_tunnel)
+      train_tunnel|satiksme_tunnel|ticket_remote_tunnel)
         return 0
         ;;
     esac
@@ -4617,11 +4595,6 @@ render_remote_cloudflared_configs() {
       --upstream 'http://satiksme_bot:${ARBUZAS_SATIKSME_BOT_PORT}' \
       --out '${remote_release_dir}/generated/cloudflared/satiksme-bot.yml'
     sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
-      --credentials-file '/etc/arbuzas/cloudflared/subscription-bot.json' \
-      --hostname '${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}' \
-      --upstream 'http://subscription_bot:${ARBUZAS_SUBSCRIPTION_BOT_PORT}' \
-      --out '${remote_release_dir}/generated/cloudflared/subscription-bot.yml'
-    sudo -n python3 '${remote_release_dir}/tools/arbuzas/render_cloudflared_config.py' \
       --credentials-file '/etc/arbuzas/cloudflared/ticket-remote.json' \
       --hostname '${ARBUZAS_TICKET_REMOTE_HOSTNAME}' \
       --upstream 'http://ticket_remote:${ARBUZAS_TICKET_REMOTE_PORT}' \
@@ -4667,7 +4640,6 @@ remote_compose_up() {
         for service_image in \
           train_bot=arbuzas/train-bot \
           satiksme_bot=arbuzas/satiksme-bot \
-          subscription_bot=arbuzas/subscription-bot \
           ticket_phone_bridge=arbuzas/ticket-phone-bridge \
           ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
           ticket_remote=arbuzas/ticket-remote \
@@ -7000,18 +6972,6 @@ validate_remote_satiksme_dependency_dns() {
   exit 1
 }
 
-validate_remote_subscription_workload_health() {
-  local remote_release_dir="$1"
-
-  validate_remote_running_services "${remote_release_dir}" "expected services running" subscription_bot subscription_tunnel
-  validate_remote_probe "${remote_release_dir}" "subscription local health" \
-    "wait_until_ok compose exec -T subscription_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SUBSCRIPTION_BOT_PORT}/pixel-stack/subscription/api/v1/health >/dev/null 2>/dev/null'" \
-    subscription_bot subscription_tunnel
-  validate_remote_probe "${remote_release_dir}" "subscription public health" \
-    "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}/pixel-stack/subscription/api/v1/health >/dev/null 2>/dev/null'" \
-    subscription_bot subscription_tunnel
-}
-
 validate_remote_ticket_phone_bridge_workload_health() {
   local remote_release_dir="$1"
 
@@ -7651,10 +7611,6 @@ validate_remote_selected_smoke_health() {
         compose exec -T satiksme_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
         curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_SATIKSME_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
       fi
-      if [[ '${VALIDATE_SUBSCRIPTION}' == '1' ]]; then
-        compose exec -T subscription_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SUBSCRIPTION_BOT_PORT}/api/v1/health >/dev/null' >/dev/null 2>&1 || return 1
-        curl -fsS --connect-timeout 2 --max-time 4 https://${ARBUZAS_SUBSCRIPTION_BOT_HOSTNAME}/api/v1/health >/dev/null 2>&1 || return 1
-      fi
       if [[ '${VALIDATE_TICKET_PHONE_BRIDGE}' == '1' ]]; then
         case \" \${running} \" in *' ticket_phone_bridge '*) ;; *) return 1 ;; esac
         compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null' >/dev/null 2>&1 || return 1
@@ -7717,7 +7673,6 @@ validate_remote_workload_health() {
 
   validate_remote_train_workload_health "${remote_release_dir}"
   validate_remote_satiksme_workload_health "${remote_release_dir}"
-  validate_remote_subscription_workload_health "${remote_release_dir}"
   validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
   validate_remote_qbittorrent_workload_health "${remote_release_dir}"
   validate_remote_jellyfin_workload_health "${remote_release_dir}"
@@ -7733,9 +7688,6 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_SATIKSME == 1 )); then
     validate_remote_satiksme_workload_health "${remote_release_dir}"
-  fi
-  if (( VALIDATE_SUBSCRIPTION == 1 )); then
-    validate_remote_subscription_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_TICKET_PHONE_BRIDGE == 1 )); then
     validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
@@ -7813,6 +7765,7 @@ validate_remote_host_baseline() {
   validate_remote_swarm_baseline "${remote_release_dir}"
   validate_remote_retired_portainer_absence "${remote_release_dir}"
   validate_remote_retired_chatgpt_absence "${remote_release_dir}"
+  validate_remote_retired_subscription_absence "${remote_release_dir}"
 }
 
 validate_remote_private_configuration_permissions() {
@@ -7838,8 +7791,7 @@ validate_remote_private_configuration_permissions() {
 
       for path in \
         '/etc/arbuzas/env/train-bot.env' \
-        '/etc/arbuzas/env/satiksme-bot.env' \
-        '/etc/arbuzas/env/subscription-bot.env'; do
+        '/etc/arbuzas/env/satiksme-bot.env'; do
         assert_private_file \"\${path}\" '0:0:600'
       done
       assert_private_file '/etc/arbuzas/env/ticket-remote.env' '1001:1001:600'
@@ -7942,6 +7894,51 @@ validate_remote_retired_chatgpt_absence() {
     ${diagnostics_services[@]+"${diagnostics_services[@]}"}
 }
 
+validate_remote_retired_subscription_absence() {
+  local remote_release_dir="$1"
+  local diagnostics_services=()
+
+  populate_current_diagnostic_services diagnostics_services
+
+  validate_remote_host_probe "${remote_release_dir}" \
+    "retired Subscription containers, configuration, listener, and public app stay absent" \
+    "
+      for service_name in subscription_bot subscription_tunnel; do
+        container_ids=\$(docker ps -aq \\
+          --filter 'label=com.docker.compose.project=arbuzas' \\
+          --filter \"label=com.docker.compose.service=\${service_name}\")
+        [[ -z \"\${container_ids}\" ]] || {
+          echo \"retired Subscription containers remain for \${service_name}: \${container_ids}\" >&2
+          exit 1
+        }
+      done
+      for path in \
+        '/etc/arbuzas/env/subscription-bot.env' \
+        '/etc/arbuzas/cloudflared/subscription-bot.json' \
+        '/etc/arbuzas/cloudflared/subscription-bot.yml' \
+        '/srv/arbuzas/subscription-bot'; do
+        [[ ! -e \"\${path}\" ]] || {
+          echo \"retired Subscription active configuration remains: \${path}\" >&2
+          exit 1
+        }
+      done
+      listeners=\$(ss -ltnH 'sport = :9320' || true)
+      [[ -z \"\${listeners}\" ]] || {
+        echo \"retired Subscription port 9320 is still listening: \${listeners}\" >&2
+        exit 1
+      }
+      public_code=\$(curl -sS --connect-timeout 3 --max-time 8 -o /dev/null -w '%{http_code}' \
+        'https://farel-subscription-bot.jolkins.id.lv/pixel-stack/subscription/api/v1/health' || true)
+      case \"\${public_code}\" in
+        2??|3??)
+          echo \"retired Subscription public app still responds with HTTP \${public_code}\" >&2
+          exit 1
+          ;;
+      esac
+    " \
+    ${diagnostics_services[@]+"${diagnostics_services[@]}"}
+}
+
 validate_remote_release() {
   local target_release_id="${1:-${requested_release_id}}"
   local remote_release_dir
@@ -8026,7 +8023,7 @@ rollback_remote_release() {
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     compose_args=(docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
-    for retired_service in portainer chatgpt_broker chatgpt_bot; do
+    for retired_service in portainer chatgpt_broker chatgpt_bot subscription_bot subscription_tunnel; do
       retired_container_ids=\$(docker ps -aq \
         --filter 'label=com.docker.compose.project=arbuzas' \
         --filter \"label=com.docker.compose.service=\${retired_service}\")

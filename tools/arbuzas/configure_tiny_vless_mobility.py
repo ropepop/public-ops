@@ -35,12 +35,13 @@ PANEL_BASE = "http://127.0.0.1:12053"
 XRAY = "/app/bin/xray-linux-amd64"
 TLS_NAME = "mobility.kitty-gration"
 HYSTERIA_PORT = 8447
+H2_RECOVERY_PORT = 18448
 
 TARGETS = (
     ("mobility-hy2", "Kitty Mobility - Hysteria2", "hysteria", HYSTERIA_PORT),
     ("mobility-h3", "Kitty Mobility - VLESS XHTTP H3", "vless", 8444),
     ("mobility-wg", "Kitty Mobility - WireGuard", "wireguard", 51820),
-    ("mobility-h2", "Kitty Mobility - XHTTP H2 Recovery", "vless", 443),
+    ("mobility-h2", "Kitty Mobility - XHTTP H2 Recovery", "vless", H2_RECOVERY_PORT),
     ("mobility-mkcp", "Kitty Mobility - VMess mKCP", "vmess", 8445),
 )
 
@@ -423,7 +424,7 @@ def build_payloads(state: dict[str, object], pin: str) -> list[dict[str, object]
         **common_top,
         "remark": "Kitty Mobility - XHTTP H2 Recovery",
         "subSortIndex": 5,
-        "port": 443,
+        "port": H2_RECOVERY_PORT,
         "protocol": "vless",
         "settings": json.dumps({
             "clients": [h2_client], "decryption": "none", "encryption": "none", "fallbacks": [],
@@ -532,13 +533,18 @@ def verify_database(before: dict[str, object]) -> dict[str, int]:
             "inbounds": con.execute("SELECT count(*) FROM inbounds").fetchone()[0],
             "attachments": con.execute("SELECT count(*) FROM client_inbounds").fetchone()[0],
         }
-        if counts != {"clients": 6, "inbounds": 6, "attachments": 6}:
+        expected_total = 1 + len(TARGETS)
+        if counts != {name: expected_total for name in counts}:
             raise ApplyError(f"unexpected normalized-row counts: {counts}")
+        remarks = tuple(item[1] for item in TARGETS)
+        placeholders = ",".join("?" for _ in remarks)
         rows = con.execute(
-            "SELECT protocol, port, enable, settings FROM inbounds WHERE remark LIKE 'Kitty Mobility - %' ORDER BY sub_sort_index"
+            "SELECT protocol, port, enable, settings FROM inbounds "
+            f"WHERE remark IN ({placeholders}) ORDER BY sub_sort_index",
+            remarks,
         ).fetchall()
-        if len(rows) != 5 or not all(bool(row["enable"]) for row in rows):
-            raise ApplyError("not all five mobility inbounds are enabled")
+        if len(rows) != len(TARGETS) or not all(bool(row["enable"]) for row in rows):
+            raise ApplyError("not all mobility inbounds are enabled")
         observed = sorted((str(row["protocol"]), int(row["port"])) for row in rows)
         expected = sorted((protocol, port) for _, _, protocol, port in TARGETS)
         if observed != expected:
@@ -557,7 +563,13 @@ def verify_subscription(api: PanelAPI, state: dict[str, object]) -> list[str]:
         raise ApplyError("subscription link API did not return a list")
     links = [item for item in obj if isinstance(item, str) and item]
     schemes = sorted(link.split(":", 1)[0].lower() for link in links)
-    expected = sorted(["vless", "hysteria2", "vless", "wireguard", "vless", "vmess"])
+    expected = sorted([
+        "vless",
+        *(
+            "hysteria2" if protocol == "hysteria" else protocol
+            for _, _, protocol, _ in TARGETS
+        ),
+    ])
     if schemes != expected:
         raise ApplyError(f"subscription scheme set is incomplete: {schemes}")
     return schemes

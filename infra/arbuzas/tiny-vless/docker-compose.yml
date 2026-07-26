@@ -26,7 +26,7 @@ services:
       - "127.0.0.1:12096:2096/tcp"
       - "0.0.0.0:${PUBLIC_VLESS_PORT}:${PUBLIC_VLESS_PORT}/tcp"
       - "0.0.0.0:8446:8446/tcp"
-      - "${PUBLIC_VLESS_ADDRESS:-38.45.80.240}:443:443/tcp"
+      - "${PUBLIC_VLESS_ADDRESS:-38.45.80.240}:18448:18448/tcp"
       - "0.0.0.0:8447:8447/udp"
       - "0.0.0.0:8444:8444/udp"
       - "0.0.0.0:8445:8445/udp"

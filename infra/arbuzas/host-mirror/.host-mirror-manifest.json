@@ -10,16 +10,6 @@
       "sha256": "ee48885b768cfca60c8ca4c620a587900d0eb93a6f860fd5e78dc2b9f7e5391d",
       "size": 220
     },
-    "etc/arbuzas/cloudflared/subscription-bot.json": {
-      "mode": 384,
-      "sha256": "def0800f3a8dd7b7737f1f0d2a2f83eeea299664e614c190006981080a9ed65f",
-      "size": 175
-    },
-    "etc/arbuzas/cloudflared/subscription-bot.yml": {
-      "mode": 384,
-      "sha256": "e0a62edb39158216c66dcb5684211b156a7c8c896d61ded84cd20c5b1731fd4e",
-      "size": 234
-    },
     "etc/arbuzas/cloudflared/ticket-remote.json": {
       "mode": 384,
       "sha256": "d6f7c96c8c09564a807b9eac2f0922daba094db1e2d703b349228245490f8a43",
@@ -37,18 +27,13 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "e08bbab796cccb64aeab9618ee723888f866f581a08d5640339bcb907e70df48",
-      "size": 1910
+      "sha256": "a595790cecd58eb6136e4559b4634772cd351e4fe56db5b17d8a2e087d12c69a",
+      "size": 1815
     },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 384,
       "sha256": "dd22c5476e5516803e33db10f029358420d0b99d8c4db937bf842b96275f4044",
       "size": 4139
-    },
-    "etc/arbuzas/env/subscription-bot.env": {
-      "mode": 384,
-      "sha256": "6ed9bf7b6f7ee22777de42dbcc399540c57685ba428dc5d578759404d45ed18b",
-      "size": 1697
     },
     "etc/arbuzas/env/ticket-remote.env": {
       "mode": 384,
@@ -172,5 +157,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1785025358
+  "updatedEpochSeconds": 1785065921
 }

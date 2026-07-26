@@ -18,7 +18,6 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
 - `../workloads/operational-logging/README.md`: the one-database private logging
   schema, writer boundaries, retention, and migration contract.
-- `../workloads/subscription-bot/README.md` and `../workloads/subscription-bot/AGENTS.md`: subscription bot and mini app overview plus web UI checks.
 - For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
 
 ## Durable docs

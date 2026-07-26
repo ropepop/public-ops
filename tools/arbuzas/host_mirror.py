@@ -77,8 +77,6 @@ SERVICE_ORDER = [
     "train_tunnel",
     "satiksme_bot",
     "satiksme_tunnel",
-    "subscription_bot",
-    "subscription_tunnel",
     "ticket_phone_bridge",
     "ticket_remote_spacetime_sidecar",
     "ticket_remote",
@@ -764,8 +762,6 @@ def affected_services_for_path(rel: str) -> set[str]:
         add_service(services, "train_bot")
     elif rel == "etc/arbuzas/env/satiksme-bot.env":
         add_service(services, "satiksme_bot")
-    elif rel == "etc/arbuzas/env/subscription-bot.env":
-        add_service(services, "subscription_bot")
     elif rel == "etc/arbuzas/env/ticket-remote.env":
         add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")
@@ -790,13 +786,12 @@ def affected_services_for_path(rel: str) -> set[str]:
     elif rel.startswith("etc/arbuzas/secrets/train-bot-"):
         add_service(services, "train_bot")
     elif rel.startswith("etc/arbuzas/secrets/"):
-        services.update({"train_bot", "satiksme_bot", "subscription_bot", "ticket_remote"})
+        services.update({"train_bot", "satiksme_bot", "ticket_remote"})
     elif rel.startswith("etc/arbuzas/cloudflared/"):
         name = pathlib.PurePosixPath(rel).name
         tunnel_map = {
             "train-bot.json": "train_tunnel",
             "satiksme-bot.json": "satiksme_tunnel",
-            "subscription-bot.json": "subscription_tunnel",
             "ticket-remote.json": "ticket_remote_tunnel",
         }
         if name in tunnel_map:

@@ -57,8 +57,12 @@ unit:
 - the private Tailscale panel route and HTTPS subscription publication;
 - the public Nginx subscription gateway on TCP port 18081;
 - the boot-persistent VPN abuse firewall policy; and
-- the recurring bandwidth limiter, which must reattach to the container's
-  current host interface after every recreation.
+- the recurring 100 Mbps bandwidth limiter, which must reattach to the
+  container's current host interface after every recreation. Both directions
+  use a 2 MiB token bucket with the existing 50 ms queue ceiling so QUIC/GSO
+  microbursts are absorbed without raising the sustained cap. The two-minute
+  repair run is a no-op while both live attachments already match, so it does
+  not flush queues or interrupt a healthy tunnel.
 
 Tailscale changes are made against the complete Serve/Funnel configuration and
 must preserve every unrelated route. The public Nginx listener is plain HTTP
@@ -76,7 +80,8 @@ subscription identifier through 3X-UI's inbound-add path:
   `8447`;
 - VLESS XHTTP over HTTP/3;
 - WireGuard with endpoint roaming;
-- VLESS XHTTP over HTTP/2/REALITY as a fast-recovery TCP control;
+- VLESS XHTTP over HTTP/2/REALITY as a fast-recovery control on dedicated TCP
+  port `18448`;
 - VMess over mKCP as a packet-loss control.
 
 The HTTP/3 profile keeps Xray's packet-up connection pool bounded at six but
@@ -148,13 +153,11 @@ The Hysteria2 and HTTP/3 profiles use a locally generated, certificate-pinned
 self-signed certificate. A client must honor the pin carried by the share
 profile; do not disable certificate verification as a workaround.
 
-Hysteria2 must remain on UDP `8447`. TCP `443` continues to serve the separate
-HTTP/2 recovery profile, but UDP `443` is intentionally unpublished and must
-have no host listener. Do not add port hopping. A port migration must update
-the 3X-UI inbound and Docker publication together, preserve the existing
-client authentication, certificate pin, SNI, subscription identity, and
-display name, and prove the previous UDP endpoint is closed. Clients must
-refresh the existing subscription after such a migration.
+Hysteria2 is published only on dedicated UDP `8447`, and the separate HTTP/2
+recovery profile is published on dedicated TCP `18448`. The VPN project does
+not publish TCP or UDP `443`; unrelated Tailscale HTTPS publication remains
+unchanged. Do not add port hopping. Treat each database inbound and its matching
+Docker publication as one recovery unit.
 
 Run the guarded server-side mutation from this checkout by streaming
 `tools/arbuzas/configure_tiny_vless_mobility.py` to root on kitty-gration. The
@@ -190,10 +193,10 @@ the matched mirrored environment and secret set. If the rollout fails, restore
 that matched set together with the previous project and host-integration
 state, then validate before returning the VPN to use.
 
-For Hysteria recovery, the database inbound port and Compose UDP publication
-are one matched state. Never restore only one side. The current matched state
-is UDP `8447`; a rollback to an older recovery copy must restore both the old
-database port and its matching Compose mapping before reconnect testing.
+For Hysteria recovery, its database inbound and Compose UDP publication are one
+matched state. Never restore only one side. The current matched state is UDP
+`8447`. The HTTP/2 recovery inbound and its TCP `18448` publication must
+likewise be restored together before reconnect testing.
 
 For a move to another VPS, restore the same database, environment,
 certificate/key material, and capability before the targeted deployment

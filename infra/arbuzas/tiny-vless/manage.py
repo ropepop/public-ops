@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -38,10 +39,18 @@ EXPECTED_IMAGE = (
     "344f7a68a91e59d592fc355d67e32d8c2041b1c2082a7eaa3c413dc3a5cab7db"
 )
 EXPECTED_CONTAINER_IP = "172.30.77.2"
-EXPECTED_PROTOCOLS = {"vless": 4, "hysteria": 1, "wireguard": 1, "vmess": 1}
-EXPECTED_ENABLED_INBOUNDS = 7
+EXPECTED_PROFILE_ENDPOINTS = (
+    ("hysteria", 8447),
+    ("vless", 8443),
+    ("vless", 8444),
+    ("vless", 8446),
+    ("vless", 18448),
+    ("vmess", 8445),
+    ("wireguard", 51820),
+)
+EXPECTED_ENABLED_INBOUNDS = len(EXPECTED_PROFILE_ENDPOINTS)
+EXPECTED_PROTOCOLS = dict(Counter(protocol for protocol, _ in EXPECTED_PROFILE_ENDPOINTS))
 EXPECTED_CLEARNET_PORT = 18081
-EXPECTED_HYSTERIA_PORT = 8447
 EXPECTED_NON_TARGET_TAILSCALE_PORTS = (19999, 24680, 29096)
 EXPECTED_RESERVED_DESTINATIONS = (
     "0.0.0.0/8",
@@ -311,12 +320,13 @@ def validate_source_contract(source_dir: Path) -> None:
         "mem_limit: 1g",
         "memswap_limit: 1g",
         "pids_limit: 256",
-        f'0.0.0.0:{EXPECTED_HYSTERIA_PORT}:{EXPECTED_HYSTERIA_PORT}/udp',
+        '0.0.0.0:8447:8447/udp',
+        '${PUBLIC_VLESS_ADDRESS:-38.45.80.240}:18448:18448/tcp',
     )
     if not all(needle in compose for needle in compose_needles):
         raise ComponentError("source_compose_contract_mismatch")
-    if "0.0.0.0:443:443/udp" in compose:
-        raise ComponentError("source_legacy_hysteria_port_present")
+    if ":443:443/tcp" in compose or ":443:443/udp" in compose:
+        raise ComponentError("source_standard_vpn_port_present")
     if "./db:/etc/x-ui" in compose or "./cert:/root/cert" in compose:
         raise ComponentError("source_compose_uses_relative_state")
 
@@ -325,6 +335,21 @@ def validate_source_contract(source_dir: Path) -> None:
     )
     if "RemainAfterExit" in rate_unit or "Type=oneshot" not in rate_unit:
         raise ComponentError("source_rate_unit_not_recurring")
+    rate_script = (source_dir / "host/tiny-vless-rate-limit").read_text(
+        encoding="utf-8"
+    )
+    rate_script_needles = (
+        'RATE="${RATE:-100mbit}"',
+        'BURST="${BURST:-2mb}"',
+        'LATENCY="${LATENCY:-50ms}"',
+        'SYS_CLASS_NET_ROOT="${SYS_CLASS_NET_ROOT:-/sys/class/net}"',
+        "healthy_configuration()",
+        'tc -j filter show dev "${host_veth}" parent ffff:',
+        'tc qdisc change dev "${device}" root tbf',
+        "if healthy_configuration; then",
+    )
+    if not all(needle in rate_script for needle in rate_script_needles):
+        raise ComponentError("source_rate_script_contract_mismatch")
     timer = (source_dir / "host/tiny-vless-rate-limit.timer").read_text(encoding="utf-8")
     if "OnBootSec=45s" not in timer or "OnUnitActiveSec=2min" not in timer:
         raise ComponentError("source_rate_timer_mismatch")
@@ -897,13 +922,15 @@ def validate_database() -> dict[str, int]:
         if integrity is None or integrity[0] != "ok":
             raise ComponentError("database_integrity_failed")
         inbound_rows = connection.execute(
-            "SELECT protocol, remark FROM inbounds WHERE enable = 1"
+            "SELECT protocol, port, remark FROM inbounds WHERE enable = 1"
         ).fetchall()
         protocol_counts: dict[str, int] = {}
+        profile_endpoints: list[tuple[str, int]] = []
         remarks: set[str] = set()
-        for protocol, remark in inbound_rows:
+        for protocol, port, remark in inbound_rows:
             normalized = str(protocol).lower()
             protocol_counts[normalized] = protocol_counts.get(normalized, 0) + 1
+            profile_endpoints.append((normalized, int(port)))
             remarks.add(str(remark))
         if len(inbound_rows) != EXPECTED_ENABLED_INBOUNDS:
             raise ComponentError("enabled_inbound_count_mismatch")
@@ -911,11 +938,8 @@ def validate_database() -> dict[str, int]:
             raise ComponentError("inbound_names_not_unique")
         if protocol_counts != EXPECTED_PROTOCOLS:
             raise ComponentError("protocol_class_count_mismatch")
-        hysteria_ports = connection.execute(
-            "SELECT port FROM inbounds WHERE enable = 1 AND protocol = 'hysteria'"
-        ).fetchall()
-        if hysteria_ports != [(EXPECTED_HYSTERIA_PORT,)]:
-            raise ComponentError("hysteria_port_mismatch")
+        if tuple(sorted(profile_endpoints)) != EXPECTED_PROFILE_ENDPOINTS:
+            raise ComponentError("profile_endpoint_mismatch")
         enabled_clients, identities = connection.execute(
             """
             SELECT COUNT(*), COUNT(DISTINCT sub_id)
@@ -932,6 +956,21 @@ def validate_database() -> dict[str, int]:
             raise ComponentError("enabled_client_without_subscription")
         if int(identities) != 1:
             raise ComponentError("subscription_identity_count_mismatch")
+        attachments, attached_clients, attached_inbounds = connection.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT ci.client_id), COUNT(DISTINCT ci.inbound_id)
+            FROM client_inbounds AS ci
+            JOIN clients AS c ON c.id = ci.client_id
+            JOIN inbounds AS i ON i.id = ci.inbound_id
+            WHERE c.enable = 1 AND i.enable = 1
+            """
+        ).fetchone()
+        if (
+            int(attachments) != EXPECTED_ENABLED_INBOUNDS
+            or int(attached_clients) != EXPECTED_ENABLED_INBOUNDS
+            or int(attached_inbounds) != EXPECTED_ENABLED_INBOUNDS
+        ):
+            raise ComponentError("enabled_client_attachment_mismatch")
     finally:
         connection.close()
     return {
@@ -1057,10 +1096,8 @@ def validate_container() -> None:
         "2096/tcp": [("127.0.0.1", "12096")],
         "8443/tcp": [("0.0.0.0", "8443")],
         "8446/tcp": [("0.0.0.0", "8446")],
-        "443/tcp": [(public_address, "443")],
-        f"{EXPECTED_HYSTERIA_PORT}/udp": [
-            ("0.0.0.0", str(EXPECTED_HYSTERIA_PORT))
-        ],
+        "18448/tcp": [(public_address, "18448")],
+        "8447/udp": [("0.0.0.0", "8447")],
         "8444/udp": [("0.0.0.0", "8444")],
         "8445/udp": [("0.0.0.0", "8445")],
         "51820/udp": [("0.0.0.0", "51820")],
@@ -1118,7 +1155,7 @@ def validate_tcp_listeners(clearnet_port: int) -> None:
         "127.0.0.1:12096",
         "0.0.0.0:8443",
         "0.0.0.0:8446",
-        f"{public_address}:443",
+        f"{public_address}:18448",
         f"{public_address}:{clearnet_port}",
     )
     if any(item not in output for item in required):
@@ -1127,7 +1164,7 @@ def validate_tcp_listeners(clearnet_port: int) -> None:
 
 def validate_udp_listeners() -> None:
     output = command(["ss", "-H", "-lun"], capture=True)
-    required = {EXPECTED_HYSTERIA_PORT, 8444, 8445, 51820}
+    required = {8447, 8444, 8445, 51820}
     observed: set[int] = set()
     for line in output.splitlines():
         columns = line.split()
@@ -1141,7 +1178,7 @@ def validate_udp_listeners() -> None:
     if not required.issubset(observed):
         raise ComponentError("udp_listener_mismatch")
     if 443 in observed:
-        raise ComponentError("legacy_hysteria_listener_present")
+        raise ComponentError("standard_hysteria_listener_present")
 
 
 def detect_clearnet_port(public_address: str) -> int:
@@ -1397,11 +1434,49 @@ def tbf_is_100mbit(output: str) -> bool:
             "qdisc tbf" in line
             and " root " in f" {line} "
             and "rate 100mbit" in line
-            and "burst 512kb" in line
+            and "burst 2mb" in line
             and "lat 50ms" in line
         ):
             return True
     return False
+
+
+def rate_filter_is_expected(output: str) -> bool:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, list) or len(payload) != 2:
+        return False
+    detailed = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return False
+        if (
+            item.get("protocol") != "all"
+            or item.get("pref") != 1
+            or item.get("kind") != "matchall"
+            or item.get("chain") != 0
+        ):
+            return False
+        if isinstance(item.get("options"), dict):
+            detailed.append(item)
+    if len(detailed) != 1:
+        return False
+    actions = detailed[0]["options"].get("actions", [])
+    if not isinstance(actions, list) or len(actions) != 1:
+        return False
+    action = actions[0]
+    return bool(
+        isinstance(action, dict)
+        and action.get("order") == 1
+        and action.get("kind") == "mirred"
+        and action.get("mirred_action") == "redirect"
+        and action.get("direction") == "egress"
+        and action.get("to_dev") == IFB_INTERFACE
+        and isinstance(action.get("control_action"), dict)
+        and action["control_action"].get("type") == "stolen"
+    )
 
 
 def validate_rate_limit() -> None:
@@ -1410,9 +1485,10 @@ def validate_rate_limit() -> None:
     if not tbf_is_100mbit(host_qdisc) or "qdisc ingress ffff:" not in host_qdisc.lower():
         raise ComponentError("rate_limit_host_qdisc_mismatch")
     host_filter = command(
-        ["tc", "filter", "show", "dev", interface, "parent", "ffff:"], capture=True
-    ).lower()
-    if "mirred" not in host_filter or "redirect" not in host_filter or IFB_INTERFACE not in host_filter:
+        ["tc", "-j", "filter", "show", "dev", interface, "parent", "ffff:"],
+        capture=True,
+    )
+    if not rate_filter_is_expected(host_filter):
         raise ComponentError("rate_limit_redirect_missing")
     ifb_qdisc = command(["tc", "qdisc", "show", "dev", IFB_INTERFACE], capture=True)
     if not tbf_is_100mbit(ifb_qdisc):

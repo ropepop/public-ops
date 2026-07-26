@@ -1,6 +1,0 @@
-tunnel: cce0b2b4-264b-48ce-8182-68c2a86135b5
-credentials-file: /etc/arbuzas/cloudflared/subscription-bot.json
-ingress:
-  - hostname: farel-subscription-bot.jolkins.id.lv
-    service: http://127.0.0.1:9320
-  - service: http_status:404

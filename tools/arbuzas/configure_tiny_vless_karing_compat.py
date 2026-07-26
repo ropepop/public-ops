@@ -439,7 +439,7 @@ def discard_staged(api: PanelAPI, before: dict[str, object]) -> None:
             con.execute("SELECT count(*) FROM inbounds").fetchone()[0],
             con.execute("SELECT count(*) FROM client_inbounds").fetchone()[0],
         )
-        if counts != (6, 6, 6):
+        if counts != (7, 7, 7):
             raise ApplyError("discarding the stage did not restore baseline counts")
         if con.execute("SELECT count(*) FROM clients WHERE email = ?", (EMAIL,)).fetchone()[0]:
             raise ApplyError("the staged compatibility client still exists")

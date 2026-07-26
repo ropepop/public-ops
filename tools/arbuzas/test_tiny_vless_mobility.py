@@ -31,7 +31,8 @@ class TestError(RuntimeError):
     pass
 
 
-DEFAULT_HYSTERIA_PORT = 8447
+EXPECTED_HYSTERIA_PORTS = (8447,)
+EXPECTED_PROFILE_COUNT = 7
 
 
 def one(values: dict[str, list[str]], key: str, default: str = "") -> str:
@@ -90,12 +91,18 @@ def pin_to_hex(value: str) -> str:
 
 def fixed_label(scheme: str, port: int) -> str:
     if scheme == "hysteria2":
-        return "mobility-hysteria2"
+        labels = {
+            8447: "mobility-hysteria2",
+        }
+        try:
+            return labels[port]
+        except KeyError as exc:
+            raise TestError("the subscription contains an unexpected Hysteria2 port") from exc
     labels = {
         ("vless", 8443): "original-vless-reality",
         ("vless", 8444): "mobility-vless-xhttp-h3",
         ("wireguard", 51820): "mobility-wireguard",
-        ("vless", 443): "mobility-vless-xhttp-h2",
+        ("vless", 18448): "mobility-vless-xhttp-h2",
         ("vmess", 8445): "mobility-vmess-mkcp",
         ("vless", 8446): "karing-singbox-reality-compat",
     }
@@ -493,6 +500,7 @@ def test_udp_rebind(
     expected_bytes: int,
     limit_rate: str,
     trigger_bytes: int,
+    min_payload_seconds: float,
 ) -> tuple[bool | None, bool, float]:
     protocol = str(outbound["protocol"])
     if protocol == "wireguard":
@@ -537,9 +545,10 @@ def test_udp_rebind(
                     if not wait_for_listener(socks_port, process):
                         return None, False, time.monotonic() - started
                     with response_path.open("wb") as response:
+                        curl_timeout = max(50, int(min_payload_seconds) + 60)
                         curl_args = [
                                 "/usr/bin/curl", "-fsSL", "--http1.1",
-                                "--max-time", "50",
+                                "--max-time", str(curl_timeout),
                         ]
                         if limit_rate:
                             curl_args.extend(["--limit-rate", limit_rate])
@@ -553,11 +562,15 @@ def test_udp_rebind(
                             stderr=log,
                         )
                         deadline = time.monotonic() + 25
+                        first_payload_at: float | None = None
                         rebind_threshold = trigger_bytes or min(
                             32768, max(512, expected_bytes // 8)
                         )
                         while time.monotonic() < deadline:
                             up, down = rebinder.snapshot()
+                            delivered = response_path.stat().st_size
+                            if delivered > 0 and first_payload_at is None:
+                                first_payload_at = time.monotonic()
                             # A slow TCP download carried inside UDP can be very
                             # asymmetric: WireGuard or QUIC may ACK many packets
                             # in one outer datagram. One packet each way plus
@@ -566,7 +579,7 @@ def test_udp_rebind(
                             if (
                                 up >= 1
                                 and down >= 1
-                                and response_path.stat().st_size >= rebind_threshold
+                                and delivered >= rebind_threshold
                             ):
                                 break
                             if curl.poll() is not None:
@@ -579,15 +592,25 @@ def test_udp_rebind(
                         before_up, before_down = rebinder.snapshot()
                         rebinder.rebind()
                         try:
-                            returncode = curl.wait(timeout=50)
+                            returncode = curl.wait(timeout=curl_timeout + 5)
                         except subprocess.TimeoutExpired:
                             curl.kill()
                             curl.wait(timeout=3)
                             returncode = -1
                     after_up, after_down = rebinder.snapshot()
+                    payload_elapsed = (
+                        time.monotonic() - first_payload_at
+                        if first_payload_at is not None
+                        else 0.0
+                    )
                     size_ok = response_path.stat().st_size == expected_bytes
                     path_moved = after_up > before_up and after_down > before_down
-                    continuity_ok = returncode == 0 and size_ok and path_moved
+                    continuity_ok = (
+                        returncode == 0
+                        and size_ok
+                        and path_moved
+                        and payload_elapsed >= min_payload_seconds
+                    )
 
                     # A transport that cannot preserve the existing inner TCP
                     # stream may still heal cleanly for the next connection.
@@ -622,14 +645,13 @@ def test_udp_rebind(
         rebinder.close()
 
 
-def test_karing_compatibility(core: Path, link: str) -> tuple[bool, bool, float]:
+def karing_client_config(link: str, port: int) -> dict[str, Any]:
     parsed = urlsplit(link)
     query = parse_qs(parsed.query, keep_blank_values=True)
     if parsed.scheme != "vless" or parsed.port != 8446:
         raise TestError("the Karing compatibility profile is missing")
-    port = unused_local_port()
-    config = {
-        "log": {"level": "debug", "timestamp": True},
+    return {
+        "log": {"level": "warn", "timestamp": True},
         "inbounds": [{
             "type": "mixed",
             "tag": "probe-in",
@@ -659,6 +681,12 @@ def test_karing_compatibility(core: Path, link: str) -> tuple[bool, bool, float]
         }],
         "route": {"final": "proxy"},
     }
+
+
+def test_karing_compatibility(core: Path, link: str) -> tuple[bool, bool, float]:
+    parsed = urlsplit(link)
+    port = unused_local_port()
+    config = karing_client_config(link, port)
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="tiny-vless-karing-") as tmp:
         tmpdir = Path(tmp)
@@ -721,8 +749,12 @@ def main() -> int:
     parser.add_argument(
         "--hysteria-port",
         type=int,
-        default=DEFAULT_HYSTERIA_PORT,
-        help="expected dedicated Hysteria2 UDP endpoint port",
+        action="append",
+        dest="hysteria_ports",
+        help=(
+            "expected Hysteria2 UDP endpoint port; repeat for multiple ports "
+            "(default: 8447)"
+        ),
     )
     parser.add_argument(
         "--karing-core",
@@ -767,7 +799,17 @@ def main() -> int:
         default=0,
         help="override the delivered-byte threshold used before changing the UDP source mapping",
     )
+    parser.add_argument(
+        "--rebind-min-payload-seconds",
+        type=float,
+        default=0.0,
+        help="minimum live payload duration required by the optional rebinding probe",
+    )
     args = parser.parse_args()
+    if not 0.0 <= args.rebind_min_payload_seconds <= 600.0:
+        raise TestError("the rebinding payload-duration requirement is invalid")
+    if args.rebind_min_payload_seconds and not args.simulate_udp_rebind:
+        raise TestError("the rebinding payload-duration requirement needs simulation")
     if not args.xray.is_file() or not os.access(args.xray, os.X_OK):
         raise TestError("the Xray executable is unavailable")
     if str(args.links_file) == "-":
@@ -777,20 +819,30 @@ def main() -> int:
             raise TestError("the private links file must not be readable by group or others")
         raw_links = args.links_file.read_text()
     links = json.loads(raw_links)
-    if not isinstance(links, list) or len(links) != 7 or not all(isinstance(x, str) for x in links):
+    if (
+        not isinstance(links, list)
+        or len(links) != EXPECTED_PROFILE_COUNT
+        or not all(isinstance(x, str) for x in links)
+    ):
         raise TestError("the subscription did not contain exactly seven profiles")
-    if not 1 <= args.hysteria_port <= 65535:
-        raise TestError("the expected Hysteria2 port is invalid")
+    expected_hysteria_ports = tuple(
+        sorted(args.hysteria_ports or EXPECTED_HYSTERIA_PORTS)
+    )
+    if (
+        len(expected_hysteria_ports) != len(set(expected_hysteria_ports))
+        or any(not 1 <= port <= 65535 for port in expected_hysteria_ports)
+    ):
+        raise TestError("the expected Hysteria2 port set is invalid")
     hysteria_ports = [
         urlsplit(link).port or 443
         for link in links
         if link.split(":", 1)[0].lower() == "hysteria2"
     ]
-    if hysteria_ports != [args.hysteria_port]:
-        raise TestError("the Hysteria2 profile is missing, duplicated, or on the wrong port")
+    if tuple(sorted(hysteria_ports)) != expected_hysteria_ports:
+        raise TestError("the Hysteria2 profiles are missing, duplicated, or on the wrong ports")
 
     parsed = [parse_link(link) for link in links]
-    if len({label for label, _, _ in parsed}) != 7:
+    if len({label for label, _, _ in parsed}) != EXPECTED_PROFILE_COUNT:
         raise TestError("the subscription profile set is incomplete")
 
     tunnel_passed = True
@@ -847,6 +899,7 @@ def main() -> int:
                 args.rebind_stream_bytes,
                 args.rebind_limit_rate,
                 args.rebind_trigger_bytes,
+                args.rebind_min_payload_seconds,
             )
             print(
                 f"profile={label} udp_continuity="

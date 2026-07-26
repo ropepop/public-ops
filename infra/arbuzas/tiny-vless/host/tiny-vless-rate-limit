@@ -3,17 +3,33 @@ set -eu
 
 CONTAINER="${CONTAINER:-tiny-vless-3xui}"
 RATE="${RATE:-100mbit}"
+BURST="${BURST:-2mb}"
+LATENCY="${LATENCY:-50ms}"
 IFB_IF="${IFB_IF:-ifb-tinyvless}"
+SYS_CLASS_NET_ROOT="${SYS_CLASS_NET_ROOT:-/sys/class/net}"
 
 case "${CONTAINER}" in
   *[!A-Za-z0-9_.-]*|'') exit 1 ;;
 esac
 case "${RATE}" in
-  *[!A-Za-z0-9.]*|'') exit 1 ;;
+  *[!A-Za-z0-9]*|'') exit 1 ;;
+esac
+case "${BURST}" in
+  *[!A-Za-z0-9]*|'') exit 1 ;;
+esac
+case "${LATENCY}" in
+  *[!A-Za-z0-9]*|'') exit 1 ;;
 esac
 case "${IFB_IF}" in
   *[!A-Za-z0-9_.-]*|'') exit 1 ;;
 esac
+case "${SYS_CLASS_NET_ROOT}" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+printf '%s\n' "${RATE}" | grep -Eq '^[1-9][0-9]*(kbit|mbit|gbit)$' || exit 1
+printf '%s\n' "${BURST}" | grep -Eq '^[1-9][0-9]*(kb|mb)$' || exit 1
+printf '%s\n' "${LATENCY}" | grep -Eq '^[1-9][0-9]*(us|ms|s)$' || exit 1
 
 attempt=0
 container_pid=""
@@ -36,7 +52,7 @@ case "${container_iflink}" in
 esac
 
 host_veth=""
-for index_file in /sys/class/net/*/ifindex; do
+for index_file in "${SYS_CLASS_NET_ROOT}"/*/ifindex; do
   [ -f "${index_file}" ] || continue
   if [ "$(cat "${index_file}")" = "${container_iflink}" ]; then
     host_veth="$(basename "$(dirname "${index_file}")")"
@@ -56,12 +72,86 @@ ip link set dev "${IFB_IF}" up
 
 # Root controls packets delivered to the container. Ingress is redirected to
 # the dedicated IFB so packets emitted by the container receive the same cap.
-tc qdisc del dev "${host_veth}" root 2>/dev/null || true
-tc qdisc del dev "${host_veth}" ingress 2>/dev/null || true
-tc qdisc del dev "${IFB_IF}" root 2>/dev/null || true
+qdisc_matches() {
+  tc qdisc show dev "$1" | grep -Eiq \
+    "qdisc tbf .* root .*rate ${RATE} .*burst ${BURST} .*lat ${LATENCY}"
+}
 
-tc qdisc add dev "${host_veth}" root tbf rate "${RATE}" burst 512kb latency 50ms
-tc qdisc add dev "${host_veth}" handle ffff: ingress
-tc filter add dev "${host_veth}" parent ffff: protocol all prio 1 matchall \
-  action mirred egress redirect dev "${IFB_IF}"
-tc qdisc add dev "${IFB_IF}" root tbf rate "${RATE}" burst 512kb latency 50ms
+ingress_matches() {
+  tc qdisc show dev "${host_veth}" | grep -Fq "qdisc ingress ffff:" &&
+    tc -j filter show dev "${host_veth}" parent ffff: | python3 -c '
+import json
+import sys
+
+expected = sys.argv[1]
+payload = json.load(sys.stdin)
+detailed = [item for item in payload if isinstance(item.get("options"), dict)]
+common = all(
+    item.get("protocol") == "all"
+    and item.get("pref") == 1
+    and item.get("kind") == "matchall"
+    and item.get("chain") == 0
+    for item in payload
+)
+actions = detailed[0].get("options", {}).get("actions", []) if len(detailed) == 1 else []
+valid = (
+    isinstance(payload, list)
+    and len(payload) == 2
+    and common
+    and len(detailed) == 1
+    and len(actions) == 1
+    and actions[0].get("order") == 1
+    and actions[0].get("kind") == "mirred"
+    and actions[0].get("mirred_action") == "redirect"
+    and actions[0].get("direction") == "egress"
+    and actions[0].get("to_dev") == expected
+    and actions[0].get("control_action", {}).get("type") == "stolen"
+)
+raise SystemExit(0 if valid else 1)
+' "${IFB_IF}"
+}
+
+healthy_configuration() {
+  qdisc_matches "${host_veth}" &&
+    ingress_matches &&
+    qdisc_matches "${IFB_IF}"
+}
+
+ensure_tbf() {
+  device="$1"
+  if qdisc_matches "${device}"; then
+    return 0
+  fi
+  if tc qdisc show dev "${device}" | grep -Eiq "^qdisc tbf .* root"; then
+    if tc qdisc change dev "${device}" root tbf rate "${RATE}" \
+      burst "${BURST}" latency "${LATENCY}"; then
+      return 0
+    fi
+  fi
+  tc qdisc del dev "${device}" root 2>/dev/null || true
+  tc qdisc add dev "${device}" root tbf rate "${RATE}" \
+    burst "${BURST}" latency "${LATENCY}"
+}
+
+ensure_ingress() {
+  if ingress_matches; then
+    return 0
+  fi
+  tc qdisc del dev "${host_veth}" ingress 2>/dev/null || true
+  tc qdisc add dev "${host_veth}" handle ffff: ingress
+  tc filter add dev "${host_veth}" parent ffff: protocol all prio 1 matchall \
+    action mirred egress redirect dev "${IFB_IF}"
+}
+
+# The two-minute repair timer reaches this healthy fast path during normal
+# operation. It must not flush a live queue or reset counters just to prove the
+# limiter is still attached.
+if healthy_configuration; then
+  exit 0
+fi
+
+ensure_tbf "${host_veth}"
+ensure_ingress
+ensure_tbf "${IFB_IF}"
+
+healthy_configuration

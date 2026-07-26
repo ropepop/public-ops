@@ -47,6 +47,7 @@ configuration is `/etc/arbuzas/env/tiny-vless.env` plus
 and host-integration details.
 
 Portainer was retired on 2026-07-20. There is no active Portainer container or listener on `9443`. Its former state is retained temporarily only as a restricted rollback archive matching `/srv/arbuzas/portainer-backups/portainer-retired-<timestamp>.tar.gz`; normal operations do not use it. Netdata runs separately as a host-native service with private Tailscale access. The live kitty-gration host must stay out of Docker Swarm, and the old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
+The subscription bot and Mini App were retired on 2026-07-26. They are absent from the active Compose project and public tunnel set. Their source is recoverable through `archive/subscription-bot/README.md`, and the final private state is retained only in a restricted host retirement archive.
 The ticket service talks privately and directly to `ticket_phone_bridge`, which owns the ADB connection to the physical Pixel. Stream desired state and commands are durable in SpacetimeDB; there is no ticket device lab or separate phone broker inside the production Compose project.
 
 qBittorrent uses VueTorrent at `https://arbuzas-vps.tail9345a.ts.net:24680/` over Tailscale with no application login. Its Web listener is loopback-only, its peer traffic uses TCP and UDP `45123`, and its configuration plus payload live inside a capped 25 GiB filesystem. See `docs/runbooks/QBITTORRENT_TAILSCALE.md` for retention and deployment details.

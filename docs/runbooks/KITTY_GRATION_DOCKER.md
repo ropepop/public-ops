@@ -22,13 +22,11 @@ This is the detailed operator runbook for the active kitty-gration runtime.
 5. Make sure these host files exist, preferably via the local mirror:
    - `/etc/arbuzas/env/train-bot.env`
    - `/etc/arbuzas/env/satiksme-bot.env`
-   - `/etc/arbuzas/env/subscription-bot.env`
    - `/etc/arbuzas/cloudflared/train-bot.json`
    - `/etc/arbuzas/cloudflared/satiksme-bot.json`
-   - `/etc/arbuzas/cloudflared/subscription-bot.json`
    - `/etc/arbuzas/env/tiny-vless.env`
    - `/etc/arbuzas/secrets/tiny-vless/`
-6. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train, Satiksme, or Subscription host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
+6. Do not set `*_WEB_BIND_ADDR` or `*_WEB_PORT` in the Train or Satiksme host env files. Do not set `TRAIN_WEB_PUBLIC_BASE_URL` in the Train host env file. Docker Compose owns those runtime values on kitty-gration.
 
 ### Private configuration rules
 
@@ -69,7 +67,7 @@ Deploy the current repo state:
 Deploy only one service or a few services:
 
 ```bash
-./tools/arbuzas/deploy.sh deploy --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh deploy --services train_bot,satiksme_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Deploy or validate the existing external VPN project through the same
@@ -94,7 +92,7 @@ Notes for targeted updates:
   `infra/arbuzas/docker/compose.yml`. `tiny_vless` is the deliberate exception:
   it is a first-class umbrella selector for the existing separate Compose
   project and is never passed to the main Compose project.
-- `train_bot`, `satiksme_bot`, and `subscription_bot` automatically bring along their matching tunnel service so the public route stays aligned.
+- `train_bot` and `satiksme_bot` automatically bring along their matching tunnel service so the public route stays aligned.
 - `site-notifications` is kept in the repo for reference and testing, but it is not part of the active kitty-gration deploy set.
 - Targeted validation checks the slice you touched instead of forcing a full-stack validation pass.
 - `fast` is the inner iteration lane. It requires `--services`, reuses the unchanged release content, restarts only the selected slice, runs bounded readiness probes concurrently, and defers remote Docker/release cleanup. It still prunes expired local release artifacts after successful validation.
@@ -111,7 +109,7 @@ Validate an existing release:
 
 ```bash
 ./tools/arbuzas/deploy.sh validate --release-id "<release-id>" --ssh-host kitty-gration --ssh-user "$USER"
-./tools/arbuzas/deploy.sh validate --services train_bot,subscription_bot --ssh-host kitty-gration --ssh-user "$USER"
+./tools/arbuzas/deploy.sh validate --services train_bot,satiksme_bot --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Inspect the active Compose project directly over SSH:
@@ -212,13 +210,50 @@ configuration so unrelated private routes are preserved.
 The same deployment slice also owns the VPN abuse firewall rules and the
 recurring bandwidth limiter. The limiter must resolve and attach to the
 container's current host interface after every recreation; a stale rule on an
-old interface is a failed validation, not a healthy limit.
+old interface is a failed validation, not a healthy limit. Its sustained cap
+remains 100 Mbps in both directions, with a 2 MiB token bucket and the existing
+50 ms queue ceiling to absorb short QUIC/GSO bursts. The two-minute repair run
+must leave matching live qdiscs and their counters untouched; it changes them
+only when an attachment or setting has actually drifted.
 
-Hysteria2 uses dedicated public UDP port `8447`. UDP `443` must remain
-unpublished and have no host listener; TCP `443` belongs to the independent
-HTTP/2 recovery profile. Restore or migrate the Hysteria database port and
-Docker UDP publication as one matched state, then refresh clients through the
-existing subscription.
+The seven-profile subscription publishes Hysteria2 only on dedicated UDP
+`8447`. The separate HTTP/2 recovery profile uses dedicated TCP `18448`. The
+VPN project publishes neither TCP nor UDP `443` on the VPS public IPv4 address.
+Tailscale HTTPS on the private overlay remains unchanged. Restore each database
+inbound and its matching Docker publication together, then refresh clients
+through the existing subscription.
+
+### iPhone mobility checks
+
+The wired Mac acceptance does not prove cellular or train-Wi-Fi reachability.
+Select the Hysteria UDP `8447` profile manually, then use the HTTP/2 TCP `18448`
+profile as the recovery control. Never use an automatic selector. Test these
+underlays in order:
+
+1. known-good Wi-Fi;
+2. direct cellular with Wi-Fi disabled; and
+3. train Wi-Fi after completing its captive portal, then enabling Airplane
+   Mode and re-enabling Wi-Fi so iOS cannot silently fall back to cellular.
+
+For each network/profile cell, connect at T+0, open an IP-literal HTTPS target
+at T+20, open the matching hostname HTTPS target at T+30, transfer an exact
+1 MiB from the same test destination at T+40, refresh the affected app at T+50,
+and disconnect at T+70. Interpret each cell consistently:
+
+- Hysteria fails while the TCP recovery profile works: the underlay likely
+  filters or degrades UDP `8447`;
+- both profiles fail: check the underlay, client VPN engine, and server
+  reachability separately;
+- handshake advances but IP-literal and hostname HTTPS differ: client DNS or
+  routing;
+- small HTTPS succeeds but the 1 MiB transfer stalls: loss, MTU, or shaping;
+- the tunnel tests pass but the app fails: iOS TUN, Network Extension, or
+  app-specific routing.
+
+If Hysteria fails, immediately test the TCP `18448` recovery profile on the same
+underlay, retry Hysteria once, and repeat in a second client where supported.
+The iPhone result remains pending until these cells are run on the actual
+networks.
 
 ### Manual read-only inspection
 
@@ -422,6 +457,20 @@ The former Portainer state was preserved temporarily as a restricted rollback ar
 
 Use the deployment script for normal operations and the documented SSH commands for direct Docker inspection. Restoring Portainer is a separate, explicit recovery decision, not part of a routine deploy or rollback.
 
+## Retired Subscription Bot
+
+The Telegram subscription bot and hosted Mini App were retired on 2026-07-26.
+The active Compose project contains neither `subscription_bot` nor
+`subscription_tunnel`, and routine rollback paths keep both services disabled
+even when an older release still defines them.
+
+The final database, runtime state, environment, tunnel credentials, and exact
+live-image metadata are retained only in a root-owned archive under
+`/srv/arbuzas/subscription-bot-backups/`. The former active state and
+configuration paths are absent. Treat the archive as sensitive because it can
+contain user, billing, session, and provider credential material. Source and
+recovery cautions are documented in `archive/subscription-bot/README.md`.
+
 ## Netdata Host Observability
 
 Netdata is installed host-native on kitty-gration, not as a Compose service.
@@ -475,7 +524,10 @@ Netdata Agent 2.10.4 is installed and active on the live kitty-gration host. The
 - The main application runtime is the Compose project named `arbuzas`. The
   existing tiny-VLESS project remains separate, under the same deployment
   umbrella.
-- kitty-gration does not run a public DNS service. The host ports `443` and `853` are free; the `dns_controlplane` service was retired on 2026-06-21 (see `archive/dns-controlplane/`).
+- kitty-gration does not run a public DNS service. Public-interface ports `443`
+  and `853` are free; private Tailscale HTTPS remains separate. The
+  `dns_controlplane` service was retired on 2026-06-21 (see
+  `archive/dns-controlplane/`).
 - The live kitty-gration host must stay out of Docker Swarm. Validation fails if Swarm is enabled.
 - Swarm and rooted Pixel deployment paths are rollback-only legacy material.
 - If the live host still carries old localhost-only web bind or port values from the Pixel era, remove those keys from `/etc/arbuzas/env/*.env` before the next deploy.

@@ -68,4 +68,3 @@ infra/arbuzas/host-mirror/etc/arbuzas/env/*.bak*
 infra/arbuzas/host-mirror/etc/arbuzas/env/*.before-*
 infra/arbuzas/host-mirror/etc/arbuzas/env/*.retired-*
 infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/
-workloads/subscription-bot/.env
