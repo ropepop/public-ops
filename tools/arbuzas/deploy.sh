@@ -85,6 +85,9 @@ ARBUZAS_TICKET_REMOTE_PORT="${ARBUZAS_TICKET_REMOTE_PORT:-9338}"
 ARBUZAS_TICKET_PHONE_ADB_TARGET="${ARBUZAS_TICKET_PHONE_ADB_TARGET:-100.76.50.43:5555}"
 ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
 ARBUZAS_TICKET_TUNNEL_GID="${ARBUZAS_TICKET_TUNNEL_GID:-50}"
+ARBUZAS_MESHCENTRAL_HOST_PORT="${ARBUZAS_MESHCENTRAL_HOST_PORT:-28443}"
+ARBUZAS_MESHCENTRAL_HOSTNAME="${ARBUZAS_MESHCENTRAL_HOSTNAME:-mesh.jolkins.id.lv}"
+ARBUZAS_MESHCENTRAL_IMAGE="${ARBUZAS_MESHCENTRAL_IMAGE:-ghcr.io/ylianst/meshcentral:1.2.4-slim}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
 ARBUZAS_QBITTORRENT_WEBUI_PORT="${ARBUZAS_QBITTORRENT_WEBUI_PORT:-18080}"
 ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT="${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT:-24680}"
@@ -120,6 +123,7 @@ VALIDATE_TICKET_PHONE_BRIDGE=0
 VALIDATE_TICKET_REMOTE=0
 VALIDATE_QBITTORRENT=0
 VALIDATE_JELLYFIN=0
+VALIDATE_MESHCENTRAL=0
 VALIDATE_TINY_VLESS=0
 REQUESTED_SERVICES=()
 COMPOSE_TARGET_SERVICES=()
@@ -152,6 +156,7 @@ ALL_SERVICES=(
   qbittorrent
   qbittorrent_housekeeper
   jellyfin
+  meshcentral
   tiny_vless
 )
 
@@ -1733,6 +1738,10 @@ mark_validation_group() {
       VALIDATE_JELLYFIN=1
       append_unique DIAGNOSTIC_SERVICES jellyfin
       ;;
+    meshcentral)
+      VALIDATE_MESHCENTRAL=1
+      append_unique DIAGNOSTIC_SERVICES meshcentral
+      ;;
     tiny_vless)
       VALIDATE_TINY_VLESS=1
       ;;
@@ -1807,6 +1816,10 @@ resolve_requested_services() {
       jellyfin)
         append_unique COMPOSE_TARGET_SERVICES jellyfin
         mark_validation_group jellyfin
+        ;;
+      meshcentral)
+        append_unique COMPOSE_TARGET_SERVICES meshcentral
+        mark_validation_group meshcentral
         ;;
       tiny_vless)
         # tiny-vless remains a distinct Compose project. It is deliberately
@@ -1888,6 +1901,7 @@ compose_all_service_args() {
     qbittorrent
     qbittorrent_housekeeper
     jellyfin
+    meshcentral
   )
   for service_name in "${all_services[@]}"; do
     service_args+=" ${service_name}"
@@ -3167,6 +3181,9 @@ ARBUZAS_JELLYFIN_PGID=${ARBUZAS_JELLYFIN_PGID}
 ARBUZAS_TICKET_PHONE_ADB_TARGET=${ARBUZAS_TICKET_PHONE_ADB_TARGET}
 ARBUZAS_TICKET_TUNNEL_UID=${ARBUZAS_TICKET_TUNNEL_UID}
 ARBUZAS_TICKET_TUNNEL_GID=${ARBUZAS_TICKET_TUNNEL_GID}
+ARBUZAS_MESHCENTRAL_HOST_PORT=${ARBUZAS_MESHCENTRAL_HOST_PORT}
+ARBUZAS_MESHCENTRAL_HOSTNAME=${ARBUZAS_MESHCENTRAL_HOSTNAME}
+ARBUZAS_MESHCENTRAL_IMAGE=${ARBUZAS_MESHCENTRAL_IMAGE}
 ARBUZAS_TRAIN_BOT_HOSTNAME=${ARBUZAS_TRAIN_BOT_HOSTNAME}
 ARBUZAS_SATIKSME_BOT_HOSTNAME=${ARBUZAS_SATIKSME_BOT_HOSTNAME}
 ARBUZAS_TICKET_REMOTE_HOSTNAME=${ARBUZAS_TICKET_REMOTE_HOSTNAME}
@@ -3193,6 +3210,7 @@ prepare_local_release_bundle() {
   copy_tree_into_release "infra/arbuzas/docker"
   copy_tree_into_release "infra/arbuzas/qbittorrent"
   copy_tree_into_release "infra/arbuzas/jellyfin"
+  copy_tree_into_release "infra/arbuzas/meshcentral"
   copy_tree_into_release "infra/arbuzas/tiny-vless"
   copy_tree_into_release "workloads/shared-go"
   copy_tree_into_release "workloads/train-bot"
@@ -3248,6 +3266,9 @@ prepare_local_fast_release_overlay() {
       jellyfin)
         copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
         copy_tree_into_fast_release_overlay "infra/arbuzas/jellyfin"
+        ;;
+      meshcentral)
+        copy_tree_into_fast_release_overlay "infra/arbuzas/meshcentral"
         ;;
       train_tunnel|satiksme_tunnel|ticket_phone_bridge|ticket_remote_tunnel)
         ;;
@@ -3307,6 +3328,10 @@ append_csv_unique() {
 }
 
 prepare_remote_ticket_runtime_permissions() {
+  local meshcentral_selected=0
+  if (( TARGETED_MODE == 0 )) || targeted_service_selected meshcentral; then
+    meshcentral_selected=1
+  fi
   remote_root_command "
     secure_private_file() {
       local path=\"\$1\"
@@ -3359,6 +3384,16 @@ prepare_remote_ticket_runtime_permissions() {
     secure_private_file \
       '/etc/arbuzas/cloudflared/ticket-remote.json' \
       '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}'
+    if [[ -f '/etc/arbuzas/env/meshcentral.env' ]]; then
+      chown root:root '/etc/arbuzas/env/meshcentral.env'
+      chmod 0644 '/etc/arbuzas/env/meshcentral.env'
+    fi
+    if [[ -f '/etc/arbuzas/env/meshcentral-config.json' ]]; then
+      chown root:root '/etc/arbuzas/env/meshcentral-config.json'
+      chmod 0644 '/etc/arbuzas/env/meshcentral-config.json'
+    fi
+    install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/meshcentral'
+    find '/etc/arbuzas/secrets/meshcentral' -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +
   "
 }
 
@@ -3379,11 +3414,16 @@ prepare_remote_host_layout() {
       '/srv/arbuzas/satiksme-bot/data/public-bundles' \
       '/srv/arbuzas/ticket-remote/run' \
       '/srv/arbuzas/ticket-remote/state' \
+      '/srv/arbuzas/meshcentral/data' \
+      '/srv/arbuzas/meshcentral/files' \
+      '/srv/arbuzas/meshcentral/web' \
+      '/srv/arbuzas/meshcentral/backups' \
       '/etc/arbuzas/env' \
       '/etc/arbuzas/releases' \
       '/etc/arbuzas/docker-gc' \
       '/etc/arbuzas/cloudflared' \
       '/etc/arbuzas/secrets'
+    install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/meshcentral'
     if [[ ! -f '${DOCKER_GC_REMOTE_STATE_FILE}' && -r '/srv/arbuzas/docker-gc/state.json' ]]; then
       cp '/srv/arbuzas/docker-gc/state.json' '${DOCKER_GC_REMOTE_STATE_FILE}'
     fi
@@ -4570,6 +4610,34 @@ copy_deploy_release_payload() {
   else
     copy_release_to_remote
   fi
+}
+
+install_remote_meshcentral_certificate_runtime() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+  local meshcentral_selected=0
+  if (( TARGETED_MODE == 0 )) || targeted_service_selected meshcentral; then
+    meshcentral_selected=1
+  fi
+  remote_shell "
+    [[ -f '${remote_release_dir}/infra/arbuzas/meshcentral/renew-cert.sh' ]] || {
+      echo 'MeshCentral certificate renewal script is missing from the release' >&2
+      exit 1
+    }
+    sudo -n install -o root -g root -m 0750 \
+      '${remote_release_dir}/infra/arbuzas/meshcentral/renew-cert.sh' \
+      /usr/local/libexec/arbuzas-meshcentral-renew-cert
+    sudo -n install -o root -g root -m 0644 \
+      '${remote_release_dir}/infra/arbuzas/meshcentral/arbuzas-meshcentral-cert-renew.service' \
+      /etc/systemd/system/arbuzas-meshcentral-cert-renew.service
+    sudo -n install -o root -g root -m 0644 \
+      '${remote_release_dir}/infra/arbuzas/meshcentral/arbuzas-meshcentral-cert-renew.timer' \
+      /etc/systemd/system/arbuzas-meshcentral-cert-renew.timer
+    sudo -n systemctl daemon-reload
+    sudo -n systemctl enable --now arbuzas-meshcentral-cert-renew.timer
+    if (( ${meshcentral_selected} == 1 )); then
+      sudo -n systemctl start arbuzas-meshcentral-cert-renew.service
+    fi
+  "
 }
 
 render_deploy_cloudflared_configs() {
@@ -7325,10 +7393,12 @@ expected_mounts = {
     '/transcodes': ('/srv/arbuzas/jellyfin/transcodes', True),
     '/media': ('/srv/arbuzas/qbittorrent/storage/payload', False),
 }
+
 actual_mounts = {
     item.get('Destination'): (item.get('Source'), item.get('RW'))
     for item in container.get('Mounts', [])
 }
+
 if actual_mounts != expected_mounts:
     raise SystemExit(f'unexpected Jellyfin mounts: {actual_mounts!r}')
 if any('/etc/arbuzas/secrets' in str(source) for source, _writable in actual_mounts.values()):
@@ -7392,6 +7462,27 @@ if len(target_web) != 1 or handler.get('Proxy') != expected:
     raise SystemExit(f'Jellyfin Tailscale route is {target_web!r}, expected only {expected!r}')
 PY" \
     jellyfin
+}
+
+validate_remote_meshcentral_workload_health() {
+  local remote_release_dir="$1"
+
+  validate_remote_running_services "${remote_release_dir}" "MeshCentral container is running" meshcentral
+  validate_remote_probe "${remote_release_dir}" "MeshCentral container health" \
+    "wait_until_ok compose ps --status running meshcentral >/dev/null" \
+    meshcentral
+  validate_remote_host_probe "${remote_release_dir}" "MeshCentral direct HTTPS endpoint" \
+    "deadline=\$((SECONDS + 120))
+      reachable=0
+      while (( SECONDS < deadline )); do
+        if curl -fsS --connect-timeout 10 \"https://${ARBUZAS_MESHCENTRAL_HOSTNAME}:${ARBUZAS_MESHCENTRAL_HOST_PORT}/\" >/dev/null 2>&1; then
+          reachable=1
+          break
+        fi
+        sleep 2
+      done
+      (( reachable == 1 ))" \
+    meshcentral
 }
 
 validate_remote_ticket_remote_workload_health() {
@@ -7676,6 +7767,7 @@ validate_remote_workload_health() {
   validate_remote_ticket_phone_bridge_workload_health "${remote_release_dir}"
   validate_remote_qbittorrent_workload_health "${remote_release_dir}"
   validate_remote_jellyfin_workload_health "${remote_release_dir}"
+  validate_remote_meshcentral_workload_health "${remote_release_dir}"
   validate_remote_ticket_remote_workload_health "${remote_release_dir}"
   validate_remote_tiny_vless_workload_health "${remote_release_dir}" "${VALIDATION_PROFILE}"
 }
@@ -7697,6 +7789,9 @@ validate_remote_selected_workload_health() {
   fi
   if (( VALIDATE_JELLYFIN == 1 )); then
     validate_remote_jellyfin_workload_health "${remote_release_dir}"
+  fi
+  if (( VALIDATE_MESHCENTRAL == 1 )); then
+    validate_remote_meshcentral_workload_health "${remote_release_dir}"
   fi
   if (( VALIDATE_TICKET_REMOTE == 1 )); then
     validate_remote_ticket_remote_workload_health "${remote_release_dir}"
@@ -8463,6 +8558,7 @@ case "${action}" in
       run_timed_phase prepare_host prepare_remote_host_layout
     fi
     run_timed_phase upload_release copy_deploy_release_payload
+    run_timed_phase install_meshcentral_cert_runtime install_remote_meshcentral_certificate_runtime
     if ! run_timed_phase adopt_tiny_vless adopt_remote_tiny_vless; then
       exit 1
     fi

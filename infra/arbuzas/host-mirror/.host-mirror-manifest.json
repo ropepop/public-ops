@@ -30,6 +30,16 @@
       "sha256": "a595790cecd58eb6136e4559b4634772cd351e4fe56db5b17d8a2e087d12c69a",
       "size": 1815
     },
+    "etc/arbuzas/env/meshcentral-config.json": {
+      "mode": 420,
+      "sha256": "4d9a70eebc08c70c5ccccdf8f18e2e6a39c14103b71125af2f5f783a6bd1ef7e",
+      "size": 438
+    },
+    "etc/arbuzas/env/meshcentral.env": {
+      "mode": 420,
+      "sha256": "0e5c9bc693f61716fc1698b54cdcb0afd345fb5ef3a289d7231d707c4f9f4a38",
+      "size": 191
+    },
     "etc/arbuzas/env/satiksme-bot.env": {
       "mode": 384,
       "sha256": "dd22c5476e5516803e33db10f029358420d0b99d8c4db937bf842b96275f4044",
@@ -69,6 +79,11 @@
       "mode": 384,
       "sha256": "01492b54effc5a8a3531a02abfbda456d53aa8374d484714b79194c654504fa6",
       "size": 65
+    },
+    "etc/arbuzas/secrets/meshcentral/cloudflare-api-token": {
+      "mode": 384,
+      "sha256": "6c0c1f1afbe0374b84d526efc5838a34c1159987c3cec57045f68eaf7b4606ac",
+      "size": 41
     },
     "etc/arbuzas/secrets/satiksme-bot-spacetime.key": {
       "mode": 384,
@@ -157,5 +172,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1785065921
+  "updatedEpochSeconds": 1786384570
 }

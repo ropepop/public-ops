@@ -65,7 +65,10 @@ PROFILES: dict[str, list[Entry]] = {
 }
 
 EXCLUDES: dict[str, tuple[str, ...]] = {
-    "arbuzas": (),
+    "arbuzas": (
+        "etc/arbuzas/secrets/meshcentral/webserver-cert-public.crt",
+        "etc/arbuzas/secrets/meshcentral/webserver-cert-private.key",
+    ),
     "ticket-recovery": (),
     "pixel": (
         "data/local/pixel-stack/conf/runtime/artifacts",
@@ -81,6 +84,7 @@ SERVICE_ORDER = [
     "ticket_remote_spacetime_sidecar",
     "ticket_remote",
     "ticket_remote_tunnel",
+    "meshcentral",
     "tiny_vless",
 ]
 
@@ -114,6 +118,11 @@ def is_host_history_file(rel: str) -> bool:
 def required_private_mode(rel: str) -> int | None:
     """Return the local/remote mode required for credential-bearing mirrors."""
     rel = rel.strip("/")
+    if rel in {
+        "etc/arbuzas/env/meshcentral.env",
+        "etc/arbuzas/env/meshcentral-config.json",
+    }:
+        return 0o644
     if rel == "etc/arbuzas/current/release.env":
         return 0o600
     if rel.startswith(
@@ -785,8 +794,12 @@ def affected_services_for_path(rel: str) -> set[str]:
         add_service(services, "satiksme_bot")
     elif rel.startswith("etc/arbuzas/secrets/train-bot-"):
         add_service(services, "train_bot")
+    elif rel.startswith("etc/arbuzas/secrets/meshcentral/"):
+        add_service(services, "meshcentral")
     elif rel.startswith("etc/arbuzas/secrets/"):
         services.update({"train_bot", "satiksme_bot", "ticket_remote"})
+    elif rel == "etc/arbuzas/env/meshcentral.env" or rel == "etc/arbuzas/env/meshcentral-config.json":
+        add_service(services, "meshcentral")
     elif rel.startswith("etc/arbuzas/cloudflared/"):
         name = pathlib.PurePosixPath(rel).name
         tunnel_map = {

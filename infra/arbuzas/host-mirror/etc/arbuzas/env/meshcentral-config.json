@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
+  "settings": {
+    "cert": "mesh.jolkins.id.lv",
+    "WANonly": true,
+    "port": 28443,
+    "redirport": 0,
+    "mpsport": 0,
+    "exactports": true,
+    "TLSOffload": false,
+    "SelfUpdate": false,
+    "WebRTC": false
+  },
+  "domains": {
+    "": {
+      "NewAccounts": false,
+      "localSessionRecording": true
+    }
+  }
+}

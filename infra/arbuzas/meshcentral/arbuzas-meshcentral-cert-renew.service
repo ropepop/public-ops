@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew MeshCentral direct HTTPS certificate
+Wants=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/arbuzas-meshcentral-renew-cert
