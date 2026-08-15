@@ -242,6 +242,7 @@ import { html, reactive } from '@arrow-js/core';
   let firstFrameServerRecoveryAttempts = 0;
   let firstFrameServerRecoveryExhausted = false;
   let decoder = null;
+  let decoderGeneration = 0;
   let decoderConfigured = false;
   let decoderMode = 'annexb';
   let avcAdapterTried = false;
@@ -278,7 +279,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastControlCodeCaptureKeyframeRequestAt = 0;
   let lastControlCodeCaptureKeyframeRetryCount = 0;
   let lastControlCodeLowLatencyFrameKey = '';
-  let lastControlCodeDecoderBacklogResetRequestID = '';
+  let lastControlCodeDecoderBacklogResetKey = '';
   let controlCodeResultCaptureStartedAt = 0;
   let lastControlCodeMarkerReceivedLogKey = '';
   let lastControlCodeMarkerWaitingLogKey = '';
@@ -359,9 +360,13 @@ import { html, reactive } from '@arrow-js/core';
   const controlCodeLowLatencyDecodeQueueLimit = 1;
   const controlCodeResultImageReadyTimeoutMs = 1200;
   const controlCodeResultPaintFrameTimeoutMs = 500;
-  const controlCodeGeneratedChipScanStartY = 0.50;
-  const controlCodeGeneratedChipScanEndY = 0.61;
-  const controlCodeGeneratedChipScanStepY = 0.01;
+  // The ViVi generated-code strip is a full-width dark panel immediately below the Aztec
+  // graphic. Recent releases moved it upward slightly, so scan a narrow band around that
+  // anchor and require several rows to be dark across most of the strip. The Aztec itself
+  // must never satisfy this proof.
+  const controlCodeGeneratedChipScanStartY = 0.30;
+  const controlCodeGeneratedChipScanEndY = 0.50;
+  const controlCodeGeneratedChipScanStepY = 0.005;
   const FRAME_ENVELOPE_MAGIC = 0x54534632;
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
   const doubleTapSuppressMs = 420;
@@ -1660,6 +1665,10 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function closeDecoder() {
+    // Chromium may still deliver output callbacks that were queued before close(). Tag every
+    // decoder instance so a result-marker reset cannot render those stale frames through the
+    // replacement decoder's metadata queue.
+    decoderGeneration += 1;
     if (decoder) {
       try { decoder.close(); } catch (_) {}
       decoder = null;
@@ -1702,26 +1711,48 @@ import { html, reactive } from '@arrow-js/core';
     if (!codec || !codedWidth || !codedHeight) return null;
     if (decoderMode === 'avc') {
       if (!avcDescription) return null;
-      return { codec, codedWidth, codedHeight, description: avcDescription };
+      return { codec, codedWidth, codedHeight, description: avcDescription, optimizeForLatency: true };
     }
-    return { codec, codedWidth, codedHeight, avc: { format: 'annexb' } };
+    return { codec, codedWidth, codedHeight, avc: { format: 'annexb' }, optimizeForLatency: true };
   }
 
-  function resetControlCodeDecoderBacklog(requestID, reason) {
+  function resetControlCodeDecoderBacklog(requestID, reason, force) {
     requestID = String(requestID || '').trim();
-    if (!requestID || lastControlCodeDecoderBacklogResetRequestID === requestID) return false;
-    if (!decoder || !decoderConfigured || typeof decoder.reset !== 'function') return false;
+    const resetKey = `${requestID}:${reason || 'control_code'}`;
+    if (!requestID || lastControlCodeDecoderBacklogResetKey === resetKey) return false;
+    if (!decoder || !decoderConfigured || typeof decoder.close !== 'function') return false;
     const backlogReason = controlCodeDecoderBacklogReason();
-    if (!backlogReason) return false;
+    if (!force && !backlogReason) return false;
     const resetConfig = controlCodeDecoderResetConfig();
     if (!resetConfig) return false;
     try {
       preserveCurrentFrame(`control_code_decoder_backlog:${reason || backlogReason}`);
-      decoder.reset();
-      decoderConfigured = false;
+      // A VideoDecoder.reset() can leave already-scheduled output callbacks from the
+      // previous instance draining on Chromium. The generated-result marker must drop
+      // those callbacks, not merely return the same decoder to an unconfigured state.
+      closeDecoder();
       pendingFrameMetadata = [];
-      // VideoDecoder.reset() leaves the decoder unconfigured. Re-arm the same
-      // decoder before asking the phone for the fresh control-code keyframe.
+      const decoderInstanceGeneration = decoderGeneration;
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          if (decoderInstanceGeneration !== decoderGeneration) {
+            try { frame.close(); } catch (_) {}
+            return;
+          }
+          renderDecodedFrame(frame, decoderMode === 'avc' ? 'avc' : 'annexb');
+        },
+        error: (error) => {
+          if (decoderInstanceGeneration !== decoderGeneration) return;
+          reportDecoderError(error, decoderMode === 'avc' ? 'avc' : 'annexb');
+          needsKeyFrame = true;
+          if (decoderMode === 'avc') {
+            resetDecoderForRecovery('control_code_decoder_recreated_error');
+            requestKeyframe('control_code_decoder_recreated_error');
+          } else {
+            switchToAvcAdapter('control_code_decoder_recreated_error');
+          }
+        }
+      });
       decoder.configure(resetConfig);
       decoderConfigured = true;
       needsKeyFrame = true;
@@ -1730,11 +1761,12 @@ import { html, reactive } from '@arrow-js/core';
       lastAcceptedFrameReceivedAt = 0;
       lastAcceptedFrameQueuedAt = 0;
       lastAcceptedFrameVisualAgeMillis = 0;
-      lastControlCodeDecoderBacklogResetRequestID = requestID;
+      lastControlCodeDecoderBacklogResetKey = resetKey;
       sendVideoClientLog('control_code_decoder_backlog_reset', JSON.stringify({
         requestKey: accountPublicId(requestID),
         reason: reason || 'control_code',
-        backlogReason,
+        backlogReason: backlogReason || 'forced_result_marker',
+        forced: Boolean(force),
         renderedFrameEpoch: Number(lastRenderedFrameEpoch || 0),
         renderedFrameSequence: Number(lastRenderedFrameSequence || 0)
       }));
@@ -1754,11 +1786,18 @@ import { html, reactive } from '@arrow-js/core';
     const status = String(codeRequest.status || '');
     if (status !== 'queued' && status !== 'running' && status !== 'succeeded') return false;
     lastControlCodeLowLatencyFrameKey = requestKey;
-    resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency');
+    // Keep the live socket intact for the control-code flow. Reconnecting here
+    // preserves the popup/old frame while the new socket warms up, which can make the
+    // browser miss the short generated-result window and force phone-side cleanup.
+    // Clear a decoder backlog once when the request starts, before ViVi renders the generated
+    // result. The later result marker must stay lightweight and must not reopen the stream.
+    const resetForRequestStart = reason === 'control_code_running_low_latency';
+    resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);
     return requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);
   }
 
   function publishStreamDebug() {
+    const controlCodeCapture = lastControlCodeCaptureDebug;
     window.ticketStreamDebug = {
       pageVersion,
       configured,
@@ -1784,6 +1823,50 @@ import { html, reactive } from '@arrow-js/core';
       latestStreamStatus,
       controlCodeCapture: lastControlCodeCaptureDebug
     };
+    // Keep the capture decision inspectable without exposing the request id,
+    // entered digits, or any rendered ticket content. This is also available
+    // in restricted browser automation contexts where custom window fields
+    // are not visible.
+    if (document.body) {
+      const captureStage = controlCodeCapture
+        ? (controlCodeCapture.candidateAccepted
+          ? 'accepted'
+          : String(controlCodeCapture.candidateRejectedReason || 'waiting'))
+        : 'idle';
+      document.body.dataset.controlCodeCaptureStage = captureStage.slice(0, 80);
+      document.body.dataset.controlCodeMarkerEpoch = String(Number(controlCodeCapture && controlCodeCapture.markerEpoch || 0));
+      document.body.dataset.controlCodeMarkerSequence = String(Number(controlCodeCapture && controlCodeCapture.markerSequence || 0));
+      document.body.dataset.controlCodeCandidateEpoch = String(Number(controlCodeCapture && controlCodeCapture.candidateFrameEpoch || 0));
+      document.body.dataset.controlCodeCandidateSequence = String(Number(controlCodeCapture && controlCodeCapture.candidateFrameSequence || 0));
+      document.body.dataset.controlCodeChipVisible = String(Boolean(controlCodeCapture && controlCodeCapture.generatedChipVisible));
+      document.body.dataset.controlCodeCodeVisible = String(Boolean(controlCodeCapture && controlCodeCapture.generatedCodeVisible));
+      document.body.dataset.controlCodeChipY = String(Number(controlCodeCapture && controlCodeCapture.generatedChipY || 0));
+      document.body.dataset.controlCodeChipDarkRatio = String(Number(controlCodeCapture && controlCodeCapture.generatedChipDarkRatio || 0));
+      document.body.dataset.controlCodeChipLightRatio = String(Number(controlCodeCapture && controlCodeCapture.generatedChipLightRatio || 0));
+      document.body.dataset.controlCodeChipRows = String(Number(controlCodeCapture && controlCodeCapture.generatedChipRows || 0));
+      document.body.dataset.controlCodeChipScore = String(Number(controlCodeCapture && controlCodeCapture.generatedChipScore || 0));
+      document.body.dataset.controlCodePopupVisible = String(Boolean(controlCodeCapture && controlCodeCapture.popupVisible));
+      document.body.dataset.controlCodePopupKeyboardVisible = String(Boolean(controlCodeCapture && (controlCodeCapture.popupKeyboardVisible || controlCodeCapture.keyboardVisible)));
+      document.body.dataset.controlCodePopupGhostVisible = String(Boolean(controlCodeCapture && (controlCodeCapture.popupGhostVisible || controlCodeCapture.dialogGhostVisible)));
+      document.body.dataset.controlCodePopupUnsafe = String(Boolean(controlCodeCapture && controlCodeCapture.unsafeOverlayVisible));
+      document.body.dataset.controlCodeKeyboardLight = String(Number(controlCodeCapture && controlCodeCapture.keyboardLightCellRatio || 0));
+      document.body.dataset.controlCodeKeyboardMean = String(Number(controlCodeCapture && controlCodeCapture.keyboardMean || 0));
+      document.body.dataset.controlCodeKeyboardContrast = String(Number(controlCodeCapture && controlCodeCapture.keyboardContrastScore || 0));
+      document.body.dataset.controlCodePopupLight = String(Number(controlCodeCapture && controlCodeCapture.popupLightCellRatio || 0));
+      document.body.dataset.controlCodePopupDark = String(Number(controlCodeCapture && controlCodeCapture.popupDarkCellRatio || 0));
+      document.body.dataset.controlCodePopupContrast = String(Number(controlCodeCapture && controlCodeCapture.popupContrastScore || 0));
+      document.body.dataset.controlCodeDimMean = String(Number(controlCodeCapture && controlCodeCapture.dimOverlayMean || 0));
+      document.body.dataset.controlCodeDimContrast = String(Number(controlCodeCapture && controlCodeCapture.dimOverlayContrastScore || 0));
+      document.body.dataset.controlCodeOkOrange = String(Number(controlCodeCapture && controlCodeCapture.okButtonOrangeRatio || 0));
+      document.body.dataset.controlCodeRendered = String(Boolean(hasRenderedFrame));
+      document.body.dataset.streamLastAcceptedSequence = String(Number(lastAcceptedFrameSequence || 0));
+      document.body.dataset.streamLastRenderedSequence = String(Number(lastRenderedFrameSequence || 0));
+      document.body.dataset.streamFrameSequenceLag = String(Math.max(0, Number(lastAcceptedFrameSequence || 0) - Number(lastRenderedFrameSequence || 0)));
+      document.body.dataset.streamPendingMetadata = String(Array.isArray(pendingFrameMetadata) ? pendingFrameMetadata.length : 0);
+      document.body.dataset.streamDecoderQueue = String(Number(decoder && decoder.decodeQueueSize || 0));
+      document.body.dataset.streamRenderedVisualAge = String(Math.round(Number(lastRenderedFrameVisualAgeMillis || 0)));
+      document.body.dataset.streamAcceptedVisualAge = String(Math.round(Number(lastAcceptedFrameVisualAgeMillis || 0)));
+    }
   }
 
   function readUint64(view, offset) {
@@ -2097,7 +2180,13 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     const preferAvc = Boolean(options.preferAvc) || isAppleWebKit();
-    const decoderConfig = { codec, codedWidth: width, codedHeight: height, avc: { format: 'annexb' } };
+    const decoderConfig = {
+      codec,
+      codedWidth: width,
+      codedHeight: height,
+      avc: { format: 'annexb' },
+      optimizeForLatency: true
+    };
     let supported = false;
     if (!preferAvc) {
       try {
@@ -2151,11 +2240,17 @@ import { html, reactive } from '@arrow-js/core';
       sendVideoClientLog('h264_decoder_mode', 'avc_adapter');
       return;
     }
+    const decoderInstanceGeneration = decoderGeneration;
     decoder = new VideoDecoder({
       output: (frame) => {
+        if (decoderInstanceGeneration !== decoderGeneration) {
+          try { frame.close(); } catch (_) {}
+          return;
+        }
         renderDecodedFrame(frame, 'annexb');
       },
       error: (error) => {
+        if (decoderInstanceGeneration !== decoderGeneration) return;
         reportDecoderError(error, 'annexb');
         needsKeyFrame = true;
         switchToAvcAdapter('decoder_error');
@@ -2176,11 +2271,17 @@ import { html, reactive } from '@arrow-js/core';
     preserveCurrentFrame('configure_avc_decoder');
     closeDecoder();
     decoderMode = 'avc';
+    const decoderInstanceGeneration = decoderGeneration;
     decoder = new VideoDecoder({
       output: (frame) => {
+        if (decoderInstanceGeneration !== decoderGeneration) {
+          try { frame.close(); } catch (_) {}
+          return;
+        }
         renderDecodedFrame(frame, 'avc');
       },
       error: (error) => {
+        if (decoderInstanceGeneration !== decoderGeneration) return;
         reportDecoderError(error, 'avc');
         needsKeyFrame = true;
         resetDecoderForRecovery('decoder_error_avc');
@@ -2188,7 +2289,7 @@ import { html, reactive } from '@arrow-js/core';
       }
     });
     try {
-      decoder.configure({ codec, codedWidth: width, codedHeight: height, description });
+      decoder.configure({ codec, codedWidth: width, codedHeight: height, description, optimizeForLatency: true });
     } catch (error) {
       closeDecoder();
       showUnsupported('Šī pārlūkprogramma nevar atvērt H.264 biļetes video.');
@@ -2591,9 +2692,12 @@ import { html, reactive } from '@arrow-js/core';
     const okButton = sample(0.64, 0.51, 0.18, 0.07);
     const okButtonUpper = sample(0.64, 0.43, 0.18, 0.07);
     const keyboardVisible = Boolean(keyboard &&
-      keyboard.lightCellRatio >= 0.58 &&
-      keyboard.mean >= 150 &&
-      keyboard.contrastScore <= 95);
+      keyboard.lightCellRatio >= 0.08 &&
+      keyboard.lightCellRatio <= 0.35 &&
+      keyboard.darkCellRatio >= 0.12 &&
+      keyboard.mean >= 75 &&
+      keyboard.mean <= 155 &&
+      keyboard.contrastScore <= 100);
     const dialogLowerVisible = Boolean(dialog &&
       dialog.lightCellRatio >= 0.42 &&
       dialog.mean >= 118 &&
@@ -2635,7 +2739,10 @@ import { html, reactive } from '@arrow-js/core';
       okButtonUpper.mean <= 220 &&
       okButtonUpper.contrastScore <= 85 &&
       okButtonUpper.lightCellRatio >= 0.18);
-    const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);
+    // The ordinary ticket body also looks like a bright dialog in these samples. Require
+    // the updated ViVi dialog's orange OK control before declaring an unsafe popup; the
+    // input-line fallback was accepting the Aztec pattern as a stale dialog.
+    const popupVisible = dialogVisible && okButtonVisible && okButtonOrangeRatio >= 0.03;
     const popupKeyboardVisible = dialogVisible && keyboardVisible;
     return {
       keyboardVisible: popupKeyboardVisible,
@@ -2668,7 +2775,7 @@ import { html, reactive } from '@arrow-js/core';
     };
   }
 
-  function sampleControlCodeResultChipRegion(yRatio) {
+  function sampleControlCodeResultChipRegion(yRatio, sampledFrame) {
     if (!canvas.width || !canvas.height) {
       return emptyControlCodeResultChipProof();
     }
@@ -2679,8 +2786,16 @@ import { html, reactive } from '@arrow-js/core';
     const cols = 52;
     const rows = 12;
     let imageData;
+    let sampleOffsetX = 0;
+    let sampleOffsetY = 0;
     try {
-      imageData = ctx.getImageData(x, y, Math.min(width, canvas.width - x), Math.min(height, canvas.height - y));
+      if (sampledFrame && sampledFrame.imageData) {
+        imageData = sampledFrame.imageData;
+        sampleOffsetX = x - Number(sampledFrame.x || 0);
+        sampleOffsetY = y - Number(sampledFrame.y || 0);
+      } else {
+        imageData = ctx.getImageData(x, y, Math.min(width, canvas.width - x), Math.min(height, canvas.height - y));
+      }
     } catch (error) {
       reportClientFault('control_code_chip_proof_failed', error);
       return emptyControlCodeResultChipProof();
@@ -2692,26 +2807,30 @@ import { html, reactive } from '@arrow-js/core';
     let dark = 0;
     let light = 0;
     let chipRows = 0;
+    // The updated ViVi result strip is rendered as a dark panel spanning almost the entire
+    // sampled width. Requiring dark cells across most columns separates it from the ordinary
+    // Aztec pattern, which only occupies isolated cells in each row.
+    const minimumDarkCellsPerRow = 35;
     for (let row = 0; row < rows; row++) {
       let rowDark = 0;
       for (let col = 0; col < cols; col++) {
-        const px = Math.max(0, Math.min(sampleWidth - 1, Math.round((col + 0.5) * sampleWidth / cols)));
-        const py = Math.max(0, Math.min(sampleHeight - 1, Math.round((row + 0.5) * sampleHeight / rows)));
+        const px = Math.max(0, Math.min(sampleWidth - 1, sampleOffsetX + Math.round((col + 0.5) * width / cols)));
+        const py = Math.max(0, Math.min(sampleHeight - 1, sampleOffsetY + Math.round((row + 0.5) * height / rows)));
         const offset = (py * sampleWidth + px) * 4;
         const red = data[offset] || 0;
         const green = data[offset + 1] || 0;
         const blue = data[offset + 2] || 0;
         const luminance = Math.round((red * 299 + green * 587 + blue * 114) / 1000);
-        if (luminance <= 80) {
+        if (luminance <= 100) {
           dark++;
           rowDark++;
         }
-        if (luminance >= 175) {
+        if (luminance >= 145) {
           light++;
         }
         sampled++;
       }
-      if (rowDark >= 32) {
+      if (rowDark >= minimumDarkCellsPerRow) {
         chipRows++;
       }
     }
@@ -2719,7 +2838,8 @@ import { html, reactive } from '@arrow-js/core';
     const chipLightRatio = sampled ? light / sampled : 0;
     const chipScore = Math.max(0, (chipRows * 10) + (chipDarkRatio * 80) - (chipLightRatio * 20));
     return {
-      chipVisible: chipRows >= 4 && chipDarkRatio >= 0.34 && chipLightRatio <= 0.62 && chipScore >= 34,
+      chipVisible: chipRows >= 4 && chipDarkRatio >= 0.42 && chipLightRatio >= 0.10 &&
+        chipLightRatio <= 0.60 && chipScore >= 38,
       chipDarkRatio: Math.round(chipDarkRatio * 100) / 100,
       chipLightRatio: Math.round(chipLightRatio * 100) / 100,
       chipRows,
@@ -2729,9 +2849,29 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeResultChipProof() {
+    const scanX = Math.max(0, Math.round(canvas.width * 0.14));
+    const scanY = Math.max(0, Math.round(canvas.height * controlCodeGeneratedChipScanStartY));
+    const scanWidth = Math.max(1, Math.min(canvas.width - scanX, Math.round(canvas.width * 0.72)));
+    const scanHeight = Math.max(1, Math.min(
+      canvas.height - scanY,
+      Math.round(canvas.height * (controlCodeGeneratedChipScanEndY - controlCodeGeneratedChipScanStartY + 0.06))
+    ));
+    let sampledFrame = null;
+    try {
+      // Read the whole candidate strip once. The previous implementation issued one
+      // getImageData call for every y position, which made result detection compete
+      // with video decoding and delayed the browser acknowledgement.
+      sampledFrame = {
+        imageData: ctx.getImageData(scanX, scanY, scanWidth, scanHeight),
+        x: scanX,
+        y: scanY
+      };
+    } catch (error) {
+      reportClientFault('control_code_chip_scan_failed', error);
+    }
     let bestChip = emptyControlCodeResultChipProof();
     for (let yRatio = controlCodeGeneratedChipScanStartY; yRatio <= controlCodeGeneratedChipScanEndY + 0.0001; yRatio += controlCodeGeneratedChipScanStepY) {
-      const candidate = sampleControlCodeResultChipRegion(yRatio);
+      const candidate = sampleControlCodeResultChipRegion(yRatio, sampledFrame);
       if (!bestChip || candidate.chipScore > bestChip.chipScore) {
         bestChip = candidate;
       }
@@ -2744,13 +2884,13 @@ import { html, reactive } from '@arrow-js/core';
     const resultBar = canvasRegionFingerprint({ x: 0.14, y: chip.chipY || 0.55, width: 0.72, height: 0.06 });
     const codeArea = canvasRegionFingerprint({ x: 0.18, y: Math.max(0.12, chip.chipY - 0.34), width: 0.64, height: 0.30 });
     const generatedBarVisible = Boolean(resultBar &&
-      Number(resultBar.darkCellRatio || 0) >= 0.24 &&
-      Number(resultBar.lightCellRatio || 0) >= 0.22 &&
-      Number(resultBar.contrastScore || 0) >= 60);
+      Number(resultBar.darkCellRatio || 0) >= 0.20 &&
+      Number(resultBar.lightCellRatio || 0) >= 0.16 &&
+      Number(resultBar.contrastScore || 0) >= 45);
     const generatedCodeVisible = Boolean(codeArea &&
-      Number(codeArea.darkCellRatio || 0) >= 0.06 &&
-      Number(codeArea.lightCellRatio || 0) >= 0.18 &&
-      Number(codeArea.contrastScore || 0) >= 42);
+      Number(codeArea.darkCellRatio || 0) >= 0.04 &&
+      Number(codeArea.lightCellRatio || 0) >= 0.14 &&
+      Number(codeArea.contrastScore || 0) >= 35);
     const generatedCodeScore = codeArea
       ? (Number(codeArea.darkCellRatio || 0) * 100) + (Number(codeArea.lightCellRatio || 0) * 40) + Number(codeArea.contrastScore || 0)
       : 0;
@@ -2848,7 +2988,11 @@ import { html, reactive } from '@arrow-js/core';
       resultProof === 'phone_visual';
   }
 
-  const controlCodeSafeGeneratedFrameRequiredCount = 1;
+  // A single generated-looking frame can be a transition frame. Require two
+  // distinct rendered frames before treating the browser canvas as ready. The
+  // rooted phone proof is allowed to shorten this only after the phone has
+  // independently confirmed the generated surface.
+  const controlCodeSafeGeneratedFrameRequiredCount = 2;
   const controlCodeTrustedProofSafeGeneratedFrameRequiredCount = 1;
 
   function controlCodeCandidateFrameKey(proof) {
@@ -3073,10 +3217,21 @@ import { html, reactive } from '@arrow-js/core';
     const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
     if (!markerEpoch || !markerSequence) return false;
     if (Number(proof.candidateFrameEpoch || 0) !== markerEpoch) return false;
-    if (Number(proof.candidateFrameSequence || 0) < markerSequence) return false;
+    const candidateSequence = Number(proof.candidateFrameSequence || 0);
+    const candidatePrecedesPhoneMarker = candidateSequence < markerSequence;
+    const trustedPhoneProof = controlCodeTrustedPhonePostSubmitProof(request.resultProof);
+    // The browser may prove and freeze the generated frame while the request is
+    // still running. That is the fastest safe path: the later phone marker
+    // confirms the same request, while the frozen frame itself remains tied to
+    // the current stream epoch. Do not discard it just because the marker was
+    // published after that frame.
+    if (candidatePrecedesPhoneMarker && !(proof.provisional && trustedPhoneProof)) return false;
+    proof.trustedPhonePostSubmitProof = trustedPhoneProof;
     proof.markerEpoch = markerEpoch;
     proof.markerSequence = markerSequence;
-    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    proof.acceptedReason = candidatePrecedesPhoneMarker
+      ? 'browser_prepared_generated_frame_confirmed_by_phone'
+      : 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
     proof.provisional = false;
     return true;
   }
@@ -3953,6 +4108,23 @@ import { html, reactive } from '@arrow-js/core';
     if (ownedRequest) {
       renderControlCodeRequest(ownedRequest);
     } else {
+      const requestRows = Array.isArray(state && state.controlCodeRequests)
+        ? state.controlCodeRequests
+        : null;
+      const localRequestID = String(codeRequest && codeRequest.requestId || '').trim();
+      const localRequestStillPresent = Boolean(requestRows && localRequestID && requestRows.some((request) =>
+        request && String(request.requestId || '').trim() === localRequestID &&
+        isOwnedControlCodeRequest(request) &&
+        request.status !== 'closed' && request.status !== 'expired'
+      ));
+      // A browser can be reopened after the phone has already timed out or closed a
+      // successful capture. Do not let that locally retained success keep the request
+      // button locked when the authoritative Spacetime snapshot no longer contains it.
+      if (requestRows && codeRequest && !localRequestStillPresent &&
+        ['succeeded', 'closed', 'expired'].includes(String(codeRequest.status || ''))) {
+        codeRequest = null;
+        clearControlCodeResultCapture();
+      }
       renderControlCodeRequest(controlCodeRequestIsStillRelevant(codeRequest) ? codeRequest : null);
     }
     if (!relayStatus || String(relayStatus.streamVerdict || '') === 'live') {
@@ -4368,18 +4540,28 @@ import { html, reactive } from '@arrow-js/core';
     const expiresAt = controlCodeRequestExpiryTime(request);
     if (expiresAt && Date.now() + serverClockSkewMs > expiresAt + 1000) return false;
     const status = String(request.status || '');
+    if (status === 'closed' || status === 'expired' || status === 'failed') return false;
     if (status === 'queued' || status === 'running') return true;
+    if (status !== 'succeeded') return false;
     if (request.cleanupPending === true) return true;
-    return status === 'succeeded' && request.captureRequired === true && request.captureAcknowledged !== true;
+    return request.captureRequired === true && request.captureAcknowledged !== true;
   }
 
   function controlCodeRequestOccupiesQueue() {
     if (controlCodeSubmitInFlight) return true;
-    if (controlCodeRequestOccupiesPhone(codeRequest)) return true;
-    const requests = Array.isArray(currentState && currentState.controlCodeRequests)
-      ? currentState.controlCodeRequests
-      : [];
-    return requests.some((request) => controlCodeRequestOccupiesPhone(request));
+    const requestsAvailable = Array.isArray(currentState && currentState.controlCodeRequests);
+    const requests = requestsAvailable ? currentState.controlCodeRequests : [];
+    const localRequestID = String(codeRequest && codeRequest.requestId || '').trim();
+    const localRequestIsPresent = Boolean(!requestsAvailable || !localRequestID || requests.some((request) =>
+      request && String(request.requestId || '').trim() === localRequestID &&
+      request.status !== 'closed' && request.status !== 'expired'
+    ));
+    if (localRequestIsPresent && controlCodeRequestOccupiesPhone(codeRequest)) return true;
+    return requests.some((request) =>
+      isOwnedControlCodeRequest(request) &&
+      controlCodeRequestIsStillRelevant(request) &&
+      controlCodeRequestOccupiesPhone(request)
+    );
   }
 
   function updateControlCodeSubmitAvailability() {

@@ -1724,8 +1724,10 @@ expression_functions! {
             && parse_time_ms(&row.expiresAt) > parse_time_ms(clock);
     fn control_code_request_occupies_phone(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
         if parse_time_ms(&row.expiresAt) <= parse_time_ms(clock) { return false; }
-        matches!(row.status.as_str(), "queued" | "running") || row.cleanupPending
-            || (row.status == "succeeded" && row.captureRequired && !row.captureAcknowledged)
+        if matches!(row.status.as_str(), "closed" | "expired" | "failed") { return false; }
+        matches!(row.status.as_str(), "queued" | "running")
+            || (row.status == "succeeded" && (row.cleanupPending
+                || (row.captureRequired && !row.captureAcknowledged)))
     };
     fn control_code_request_ttl_is_healthy(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
         let now = parse_time_ms(clock);
@@ -3586,6 +3588,7 @@ mod tests {
         assert!(!control_code_request_occupies_phone(&request, now));
 
         request.status = "closed".into();
+        request.cleanupPending = true;
         assert!(!control_code_request_occupies_phone(&request, now));
 
         request.status = "running".into();

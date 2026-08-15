@@ -264,7 +264,7 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		"function maybeRequestControlCodeResultWaitKeyframe(requestID, reason) {",
 		"  function waitForControlCodeResultScreenshot(request) {")
 	lowLatencyBody := substringBetween(t, source,
-		"function resetControlCodeDecoderBacklog(requestID, reason) {",
+		"function resetControlCodeDecoderBacklog(requestID, reason, force) {",
 		"  function requestControlCodeLowLatencyFrame(requestID, reason) {")
 	renderRequestBody := substringBetween(t, source,
 		"function renderControlCodeRequest(request) {",
@@ -283,7 +283,8 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		"const keyframeCommandMinIntervalMs = 2500;",
 		"let lastKeyframeCommandAt = 0;",
 		"let lastControlCodeLowLatencyFrameKey = '';",
-		"let lastControlCodeDecoderBacklogResetRequestID = '';",
+		"let lastControlCodeDecoderBacklogResetKey = '';",
+		"let decoderGeneration = 0;",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code capture throttling missing %q", needle)
@@ -314,11 +315,19 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		}
 	}
 	for _, needle := range []string{
-		"decoder.reset();",
+		"closeDecoder();",
+		"decoder = new VideoDecoder({",
+		"decoder.configure(resetConfig);",
 		"pendingFrameMetadata = [];",
+		"const decoderInstanceGeneration = decoderGeneration;",
+		"if (decoderInstanceGeneration !== decoderGeneration)",
+		"try { frame.close(); } catch (_) {}",
 		"needsKeyFrame = true;",
 		"lastAcceptedFrameSequence = Number(lastRenderedFrameSequence || 0);",
-		"lastControlCodeDecoderBacklogResetRequestID = requestID;",
+		"const resetKey = `${requestID}:${reason || 'control_code'}`;",
+		"lastControlCodeDecoderBacklogResetKey = resetKey;",
+		"if (!force && !backlogReason) return false;",
+		"forced: Boolean(force),",
 		"control_code_decoder_backlog_reset",
 	} {
 		if !strings.Contains(lowLatencyBody, needle) {
@@ -357,41 +366,88 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 	}
 }
 
-func TestControlCodeLowLatencyResetReconfiguresDecoderBeforeFreshKeyframe(t *testing.T) {
+func TestControlCodeLowLatencyResetRecreatesDecoderBeforeFreshKeyframe(t *testing.T) {
 	source := ticketAppSource(t)
 	resetConfigBody := substringBetween(t, source,
 		"function controlCodeDecoderResetConfig() {",
-		"  function resetControlCodeDecoderBacklog(requestID, reason) {")
+		"  function resetControlCodeDecoderBacklog(requestID, reason, force) {")
 	resetBody := substringBetween(t, source,
-		"function resetControlCodeDecoderBacklog(requestID, reason) {",
+		"function resetControlCodeDecoderBacklog(requestID, reason, force) {",
 		"  function requestControlCodeLowLatencyFrame(requestID, reason) {")
 
 	for _, needle := range []string{
 		"const config = lastDecoderConfig || {};",
 		"if (decoderMode === 'avc') {",
 		"if (!avcDescription) return null;",
-		"return { codec, codedWidth, codedHeight, description: avcDescription };",
-		"return { codec, codedWidth, codedHeight, avc: { format: 'annexb' } };",
+		"return { codec, codedWidth, codedHeight, description: avcDescription, optimizeForLatency: true };",
+		"return { codec, codedWidth, codedHeight, avc: { format: 'annexb' }, optimizeForLatency: true };",
 	} {
 		if !strings.Contains(resetConfigBody, needle) {
 			t.Fatalf("control-code decoder reset config missing %q", needle)
 		}
 	}
 
-	resetIndex := strings.Index(resetBody, "decoder.reset();")
-	disabledIndex := strings.Index(resetBody, "decoderConfigured = false;")
+	closeIndex := strings.Index(resetBody, "closeDecoder();")
+	constructorIndex := strings.Index(resetBody, "decoder = new VideoDecoder({")
 	configureIndex := strings.Index(resetBody, "decoder.configure(resetConfig);")
 	enabledIndex := strings.Index(resetBody, "decoderConfigured = true;")
-	keyframeIndex := strings.Index(resetBody, "needsKeyFrame = true;")
-	if resetIndex < 0 || disabledIndex < 0 || configureIndex < 0 || enabledIndex < 0 || keyframeIndex < 0 {
-		t.Fatal("control-code low-latency reset must explicitly restore the decoder configuration")
+	keyframeIndex := -1
+	if configureIndex >= 0 {
+		keyframeIndex = strings.Index(resetBody[configureIndex:], "needsKeyFrame = true;")
+		if keyframeIndex >= 0 {
+			keyframeIndex += configureIndex
+		}
 	}
-	if !(resetIndex < disabledIndex && disabledIndex < configureIndex && configureIndex < enabledIndex && enabledIndex < keyframeIndex) {
-		t.Fatal("decoder must be reconfigured successfully before the fresh control-code keyframe is requested")
+	if closeIndex < 0 || constructorIndex < 0 || configureIndex < 0 || enabledIndex < 0 || keyframeIndex < 0 {
+		t.Fatal("control-code low-latency reset must recreate and configure the decoder")
+	}
+	if !(closeIndex < constructorIndex && constructorIndex < configureIndex && configureIndex < enabledIndex && enabledIndex < keyframeIndex) {
+		t.Fatal("decoder must be recreated and configured before the fresh control-code keyframe is requested")
 	}
 	if !strings.Contains(resetBody, "const resetConfig = controlCodeDecoderResetConfig();") ||
 		!strings.Contains(resetBody, "if (!resetConfig) return false;") {
 		t.Fatal("decoder reset must not run unless its replacement configuration is ready")
+	}
+	if !strings.Contains(source, "const resetForRequestStart = reason === 'control_code_running_low_latency';") ||
+		!strings.Contains(source, "resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);") ||
+		!strings.Contains(source, "requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);") ||
+		!strings.Contains(source, "optimizeForLatency: true") {
+		t.Fatal("control-code flow must reset only at request start and request a fresh keyframe")
+	}
+}
+
+func TestControlCodeResultMarkerKeepsLiveVideoPath(t *testing.T) {
+	source := ticketAppSource(t)
+	lowLatencyBody := substringBetween(t, source,
+		"function requestControlCodeLowLatencyFrame(requestID, reason) {",
+		"  function publishStreamDebug() {")
+	for _, forbidden := range []string{
+		"function reconnectVideoForControlCodeResult(",
+		"lastControlCodeResultVideoReconnectKey",
+		"controlCodeResultVideoReconnected(",
+	} {
+		if strings.Contains(source, forbidden) || strings.Contains(lowLatencyBody, forbidden) {
+			t.Fatalf("result marker must keep the live video path, found %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{
+		"closeDirectVideo();",
+		"resetStreamState({ preserveFrame: true });",
+		"connectDirectVideo({ skipEarlyGrace: true });",
+	} {
+		if strings.Contains(lowLatencyBody, forbidden) {
+			t.Fatalf("result marker must not reconnect the live video path, found %q", forbidden)
+		}
+	}
+	for _, needle := range []string{
+		"Keep the live socket intact for the control-code flow.",
+		"const resetForRequestStart = reason === 'control_code_running_low_latency';",
+		"resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);",
+		"return requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);",
+	} {
+		if !strings.Contains(lowLatencyBody, needle) {
+			t.Fatalf("live result marker path missing %q", needle)
+		}
 	}
 }
 
@@ -791,7 +847,7 @@ func TestControlCodeCaptureRejectsPopupFadeAndRequiresVerifiedGeneratedFrame(t *
 		"dimOverlayVisible",
 		"unsafeOverlayVisible",
 		"const popupKeyboardVisible = dialogVisible && keyboardVisible;",
-		"const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);",
+		"const popupVisible = dialogVisible && okButtonVisible && okButtonOrangeRatio >= 0.03;",
 		"popupVisible,",
 		"unsafeOverlayVisible: popupVisible || popupKeyboardVisible || dialogGhostVisible || (dimOverlayVisible && (popupVisible || dialogGhostVisible || popupKeyboardVisible))",
 	} {
@@ -816,8 +872,8 @@ func TestControlCodeCaptureRejectsPopupFadeAndRequiresVerifiedGeneratedFrame(t *
 			t.Fatalf("candidate frame proof must reject popup fade and require stable frames, missing %q", needle)
 		}
 	}
-	if !strings.Contains(source, "const controlCodeSafeGeneratedFrameRequiredCount = 1;") {
-		t.Fatalf("untrusted generated-code capture must accept the first verified generated frame for the sub-5s path")
+	if !strings.Contains(source, "const controlCodeSafeGeneratedFrameRequiredCount = 2;") {
+		t.Fatalf("untrusted generated-code capture must require two distinct verified frames before freezing")
 	}
 	for _, needle := range []string{
 		"controlCodeSafeGeneratedFrameCount",
@@ -1022,6 +1078,9 @@ func TestControlCodeStateIgnoresExpiredOwnedRequests(t *testing.T) {
 		"return (Date.now() + serverClockSkewMs) <= expiresAt + 1000;",
 		".filter((request) => isOwnedControlCodeRequest(request) && controlCodeRequestIsStillRelevant(request))",
 		".sort((a, b) => controlCodeRequestSortTime(b) - controlCodeRequestSortTime(a))[0] || null;",
+		"const localRequestStillPresent = Boolean(requestRows && localRequestID && requestRows.some((request) =>",
+		"['succeeded', 'closed', 'expired'].includes(String(codeRequest.status || ''))",
+		"clearControlCodeResultCapture();",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code request selection must ignore expired rows and prefer newest valid requests, missing %q", needle)
@@ -1082,6 +1141,11 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));",
 		"function controlCodeRequestOccupiesPhone(request) {",
 		"function controlCodeRequestOccupiesQueue() {",
+		"const requestsAvailable = Array.isArray(currentState && currentState.controlCodeRequests);",
+		"const localRequestIsPresent = Boolean(!requestsAvailable || !localRequestID || requests.some((request) =>",
+		"isOwnedControlCodeRequest(request) &&",
+		"controlCodeRequestIsStillRelevant(request) &&",
+		"if (status === 'closed' || status === 'expired' || status === 'failed') return false;",
 		"request.cleanupPending === true",
 		"request.captureRequired === true && request.captureAcknowledged !== true",
 	} {
@@ -1284,8 +1348,8 @@ func TestTicketBrowserDeduplicatesResumeOutcomesAndHiddenDecoderNoise(t *testing
 			t.Fatalf("hidden decoder faults must collapse into one transient diagnostic per hidden episode, missing %q", needle)
 		}
 	}
-	if strings.Count(source, "reportDecoderError(error,") != 3 {
-		t.Fatalf("both decoder error callbacks must use the bounded classifier")
+	if strings.Count(source, "reportDecoderError(error,") != 4 {
+		t.Fatalf("all decoder error callbacks must use the bounded classifier")
 	}
 	if strings.Count(visibility, "hiddenDecoderTransientLogged = false;") != 2 {
 		t.Fatalf("decoder transient gate must reset at the visible/hidden episode boundaries")
@@ -1434,11 +1498,16 @@ func TestControlCodeGeneratedProofScansLowerResultStrip(t *testing.T) {
 		"  function noteControlCodeCandidateRejected(proof) {")
 
 	for _, needle := range []string{
-		"const controlCodeGeneratedChipScanStartY = 0.50;",
-		"const controlCodeGeneratedChipScanEndY = 0.61;",
-		"const controlCodeGeneratedChipScanStepY = 0.01;",
+        "const controlCodeGeneratedChipScanStartY = 0.30;",
+        "const controlCodeGeneratedChipScanEndY = 0.50;",
+        "const controlCodeGeneratedChipScanStepY = 0.005;",
+        "const minimumDarkCellsPerRow = 35;",
+        "if (rowDark >= minimumDarkCellsPerRow)",
+        "chipRows >= 4 && chipDarkRatio >= 0.42",
+        "chipLightRatio <= 0.60",
 		"for (let yRatio = controlCodeGeneratedChipScanStartY;",
-		"sampleControlCodeResultChipRegion(yRatio)",
+		"sampleControlCodeResultChipRegion(yRatio, sampledFrame)",
+		"ctx.getImageData(scanX, scanY, scanWidth, scanHeight)",
 		"candidate.chipScore > bestChip.chipScore",
 	} {
 		if !strings.Contains(source, needle) {
@@ -1469,9 +1538,11 @@ func TestControlCodePopupProofTargetsCenteredEntryDialog(t *testing.T) {
 		"const okButton = sample(0.64, 0.51, 0.18, 0.07);",
 		"const okButtonUpper = sample(0.64, 0.43, 0.18, 0.07);",
 		"function regionOrangeCellRatio(region) {",
+		"keyboard.lightCellRatio <= 0.35",
+		"keyboard.darkCellRatio >= 0.12",
 		"okButtonOrangeRatio",
 		"okButtonVisible",
-		"const popupVisible = dialogVisible && (okButtonVisible || inputLineVisible);",
+		"const popupVisible = dialogVisible && okButtonVisible && okButtonOrangeRatio >= 0.03;",
 		"dialogGhostVisible",
 		"dialogProof.darkCellRatio <= 0.30",
 		"dialogProof.contrastScore <= 106",

@@ -604,8 +604,9 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 		`"fast_ready"`,
 		`"queued_warmup"`,
 		`matches!(row.status.as_str(), "queued" | "running")`,
-		"row.cleanupPending",
-		`row.status == "succeeded" && row.captureRequired && !row.captureAcknowledged`,
+		`row.status == "succeeded" && (row.cleanupPending`,
+		`row.captureRequired && !row.captureAcknowledged`,
+		`matches!(row.status.as_str(), "closed" | "expired" | "failed")`,
 		".ticketremote_control_code_request()",
 		".ticketId()",
 	} {
