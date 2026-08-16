@@ -189,7 +189,7 @@ func TestTrustedPhoneMarkerFrameCannotBypassBrowserGeneratedDetector(t *testing.
 	source := ticketAppSource(t)
 	candidateBody := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
-		"  function controlCodePreparedProofUsable(request, proof) {")
+		"  function noteControlCodeCandidateRejected(proof) {")
 
 	markerGuardIndex := strings.Index(candidateBody, "if (markerEpoch && markerSequence && (renderedEpoch !== markerEpoch || renderedSequence < markerSequence))")
 	fallbackIndex := strings.Index(candidateBody, "const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof")
@@ -212,12 +212,14 @@ func TestTrustedPhoneMarkerFrameCannotBypassBrowserGeneratedDetector(t *testing.
 	for _, needle := range []string{
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
-		"(request.status === 'succeeded' || allowProvisional)",
 		"proof.generatedMarkerOnlyRejected = true;",
 	} {
 		if !strings.Contains(candidateBody[fallbackIndex:rejectIndex], needle) {
 			t.Fatalf("trusted phone marker-frame rejection missing guard %q", needle)
 		}
+	}
+	if !strings.Contains(candidateBody, "request.status !== 'succeeded'") {
+		t.Fatal("candidate frame proof must require a succeeded request")
 	}
 }
 
@@ -334,13 +336,18 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 			t.Fatalf("control-code low-latency reset missing %q", needle)
 		}
 	}
-	for _, needle := range []string{
+	for _, forbidden := range []string{
 		"requestControlCodeLowLatencyFrame(currentRequestID, 'control_code_running_low_latency');",
 		"requestKeyframeDebounced('control_code_running', controlCodeCaptureKeyframeRetryMs);",
+		"maybePrepareControlCodeResultFrame();",
 	} {
-		if !strings.Contains(renderRequestBody, needle) {
-			t.Fatalf("running control-code request must arm low-latency stream capture, missing %q", needle)
+		if strings.Contains(renderRequestBody, forbidden) {
+			t.Fatalf("running control-code request must not do pre-generated-result work, found %q", forbidden)
 		}
+	}
+	if strings.Contains(source, "function maybePrepareControlCodeResultFrame() {") ||
+		strings.Contains(source, "controlCodePreparedCaptureProof") {
+		t.Fatal("browser must not retain a speculative pre-generated-result capture path")
 	}
 	for _, needle := range []string{
 		"now - controlCodeResultCaptureStartedAt < controlCodeResultInitialKeyframeDelayMs",
@@ -408,11 +415,11 @@ func TestControlCodeLowLatencyResetRecreatesDecoderBeforeFreshKeyframe(t *testin
 		!strings.Contains(resetBody, "if (!resetConfig) return false;") {
 		t.Fatal("decoder reset must not run unless its replacement configuration is ready")
 	}
-	if !strings.Contains(source, "const resetForRequestStart = reason === 'control_code_running_low_latency';") ||
-		!strings.Contains(source, "resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);") ||
+	if strings.Contains(source, "control_code_running_low_latency") ||
+		!strings.Contains(source, "resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', false);") ||
 		!strings.Contains(source, "requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);") ||
 		!strings.Contains(source, "optimizeForLatency: true") {
-		t.Fatal("control-code flow must reset only at request start and request a fresh keyframe")
+		t.Fatal("control-code flow must defer any decoder reset/keyframe request until the generated marker")
 	}
 }
 
@@ -441,8 +448,7 @@ func TestControlCodeResultMarkerKeepsLiveVideoPath(t *testing.T) {
 	}
 	for _, needle := range []string{
 		"Keep the live socket intact for the control-code flow.",
-		"const resetForRequestStart = reason === 'control_code_running_low_latency';",
-		"resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);",
+		"resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', false);",
 		"return requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);",
 	} {
 		if !strings.Contains(lowLatencyBody, needle) {
@@ -925,7 +931,7 @@ func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 		"const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof",
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
-		"(request.status === 'succeeded' || allowProvisional)",
+		"request.status !== 'succeeded'",
 		"if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame)",
 		"proof.generatedMarkerOnlyRejected = true;",
 		"if (!proof.browserTrustedGeneratedVisible)",
@@ -1107,12 +1113,6 @@ func TestSpacetimeClientIncludesControlCodeRequestExpiry(t *testing.T) {
 
 func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	source := ticketAppSource(t)
-	readiness := substringBetween(t, source,
-		"function liveFrameReadyForControlCode() {",
-		"  function updateControlCodeSubmitAvailability() {")
-	autoPrepare := substringBetween(t, source,
-		"function maybeAutoPrepareControlCode(reason) {",
-		"  function updateControlCodeSubmitAvailability() {")
 	openDialog := substringBetween(t, source,
 		"function openControlCodeDialog() {",
 		"  function closeControlCodeDialog() {")
@@ -1127,18 +1127,9 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"  function reconnectVideoForRecovery(reason) {")
 
 	for _, needle := range []string{
-		"function liveFrameReadyForControlCode() {",
-		"function spacetimeReadyForControlCode() {",
 		"function controlCodeFastStateFresh(state) {",
 		"function renderControlCodeFastStateDataset() {",
-		"function scheduleControlCodeFastStateExpiryCheck() {",
-		"controlCodeFastStateExpiryTimer = setTimeout(() => {",
-		"refreshControlCodeReadiness('control_code_fast_state_expired');",
-		"spacetimeClientStatus === 'live'",
 		"if (controlCodeSubmitInFlight) return true;",
-		"function refreshControlCodeReadiness(reason, options) {",
-		"const allowPrepare = !options || options.prepare !== false;",
-		"connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));",
 		"function controlCodeRequestOccupiesPhone(request) {",
 		"function controlCodeRequestOccupiesQueue() {",
 		"const requestsAvailable = Array.isArray(currentState && currentState.controlCodeRequests);",
@@ -1149,46 +1140,48 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"request.cleanupPending === true",
 		"request.captureRequired === true && request.captureAcknowledged !== true",
 	} {
-		if !strings.Contains(readiness, needle) {
+		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code background readiness/queue contract missing %q", needle)
 		}
 	}
-	if !strings.Contains(source, "const controlCodeAutoPrepareMinIntervalMs = 5000;") {
-		t.Fatalf("control-code auto-prepare must have a bounded interval")
-	}
 	for _, needle := range []string{
-		"if (document.visibilityState === 'hidden') return;",
-		"if (!codeResultArea.hidden) return;",
-		"if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;",
-		"if (controlCodeFastStateFresh()) return;",
-		"const busy = controlCodeRequestOccupiesQueue();",
-		"now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs",
-		"client.prepareControlCode(reason || 'page_ready_control_code')",
-	} {
-		if !strings.Contains(autoPrepare, needle) {
-			t.Fatalf("control-code auto-prepare must be visible-only and debounced, missing %q", needle)
-		}
-	}
-	if !strings.Contains(updateSubmit, "if (!busy && spacetimeReadyForControlCode() && !controlCodeFastStateFresh())") {
-		t.Fatalf("Spacetime-ready but fast-stale control-code page should trigger one debounced prepare")
-	}
-	for _, needle := range []string{
-		"refreshControlCodeReadiness('control_code_dialog_background_warmup');",
-		"reconnectVideoForRecovery('control_code_dialog_stream_warmup');",
+		"function scheduleControlCodeFastStateExpiryCheck() {",
+		"controlCodeFastStateExpiryTimer = setTimeout(() => {",
+		"updateControlCodeSubmitAvailability();",
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("dialog entry must warm the transport and fast path in the background, missing %q", needle)
+			t.Fatalf("fast-state expiry handling missing %q", needle)
 		}
 	}
-	if strings.Contains(autoPrepare, "if (codeDialogOpen) return;") {
-		t.Fatalf("an open control-code dialog must not block readiness preparation")
+	for _, forbidden := range []string{
+		"maybeAutoPrepareControlCode",
+		"controlCodeAutoPrepareInFlight",
+		"lastControlCodeAutoPrepareAt",
+		"prepareControlCode(",
+		"control_code_auto_prepare",
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("ordinary browser rendering must not launch redundant preparation %q", forbidden)
+		}
+	}
+	if !strings.Contains(openDialog, "if (controlCodeRequestOccupiesQueue()) return;") {
+		t.Fatalf("dialog entry must keep only the existing request-occupancy guard")
+	}
+	for _, forbidden := range []string{
+		"refreshControlCodeReadiness",
+		"reconnectVideoForRecovery",
+		"prepareControlCode",
+	} {
+		if strings.Contains(openDialog, forbidden) {
+			t.Fatalf("dialog entry must not launch preparation or recovery %q", forbidden)
+		}
 	}
 	if strings.Contains(source, "function controlCodeRequestBusyForAutoPrepare() {") {
-		t.Fatalf("auto-prepare must not maintain a second, divergent phone-occupancy predicate")
+		t.Fatalf("browser must not maintain a second phone-occupancy predicate")
 	}
 	if !strings.Contains(source, "let controlCodeFastStateExpiryTimer = null;") ||
 		!strings.Contains(source, "scheduleControlCodeFastStateExpiryCheck();") ||
-		!strings.Contains(source, "renderControlCodeFastStateDataset();\n    const busy = controlCodeRequestOccupiesQueue();") {
+		!strings.Contains(source, "renderControlCodeFastStateDataset();\n      updateControlCodeSubmitAvailability();") {
 		t.Fatalf("control-code readiness must re-evaluate when a fast-ready lease expires while the dialog is open")
 	}
 	for _, needle := range []string{
@@ -1387,12 +1380,13 @@ func TestSpacetimeClientReducersWaitForLiveConnection(t *testing.T) {
 	}
 	source := string(data)
 	for _, needle := range []string{
-		"private readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void; timer: number }> = [];",
-		"this.resolveReadyWaiters();",
-		"await this.whenReady(5000);",
-		"private whenReady(timeoutMs: number): Promise<void> {",
+		"private livePromise: Promise<void> | null = null;",
+		"this.createLivePromise();",
+		"this.resolveLive();",
+		"await this.whenLive(2000);",
+		"private whenLive(timeoutMs: number): Promise<void> {",
 		"reject(new Error(\"Spacetime connection is not ready\"));",
-		"private rejectReadyWaiters(error: Error): void {",
+		"private rejectLive(error: Error): void {",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("Spacetime client reducers must wait for a live connection, missing %q", needle)
@@ -1498,13 +1492,13 @@ func TestControlCodeGeneratedProofScansLowerResultStrip(t *testing.T) {
 		"  function noteControlCodeCandidateRejected(proof) {")
 
 	for _, needle := range []string{
-        "const controlCodeGeneratedChipScanStartY = 0.30;",
-        "const controlCodeGeneratedChipScanEndY = 0.50;",
-        "const controlCodeGeneratedChipScanStepY = 0.005;",
-        "const minimumDarkCellsPerRow = 35;",
-        "if (rowDark >= minimumDarkCellsPerRow)",
-        "chipRows >= 4 && chipDarkRatio >= 0.42",
-        "chipLightRatio <= 0.60",
+		"const controlCodeGeneratedChipScanStartY = 0.30;",
+		"const controlCodeGeneratedChipScanEndY = 0.50;",
+		"const controlCodeGeneratedChipScanStepY = 0.005;",
+		"const minimumDarkCellsPerRow = 35;",
+		"if (rowDark >= minimumDarkCellsPerRow)",
+		"chipRows >= 4 && chipDarkRatio >= 0.42",
+		"chipLightRatio <= 0.60",
 		"for (let yRatio = controlCodeGeneratedChipScanStartY;",
 		"sampleControlCodeResultChipRegion(yRatio, sampledFrame)",
 		"ctx.getImageData(scanX, scanY, scanWidth, scanHeight)",
@@ -1632,15 +1626,24 @@ func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	waitBody := substringBetween(t, source,
 		"function waitForControlCodeResultScreenshot(request) {",
 		"  function rememberOwnedControlCodeRequest(request) {")
+	queueBody := substringBetween(t, source,
+		"function controlCodeRequestOccupiesQueue() {",
+		"  function updateControlCodeSubmitAvailability() {")
 
 	postIndex := strings.Index(closeBody, "client.closeControlCode(requestID, 'browser_closed')")
 	closedIndex := strings.Index(closeBody, "locallyClosedControlCodeRequestIDs.add(String(requestID));")
+	cleanupBarrierIndex := strings.Index(closeBody, "controlCodeCleanupPendingRequestID = requestID;")
 	codeRequestNilIndex := strings.Index(closeBody, "codeRequest = null;")
-	if postIndex < 0 || closedIndex < 0 || codeRequestNilIndex < 0 {
+	if postIndex < 0 || closedIndex < 0 || cleanupBarrierIndex < 0 || codeRequestNilIndex < 0 {
 		t.Fatalf("close path must mark a request locally closed and clear the retained request before syncing")
 	}
-	if closedIndex > codeRequestNilIndex || codeRequestNilIndex > postIndex {
+	if closedIndex > cleanupBarrierIndex || cleanupBarrierIndex > codeRequestNilIndex || codeRequestNilIndex > postIndex {
 		t.Fatalf("close path must clear local request state before the asynchronous close can race with capture")
+	}
+	if !strings.Contains(closeBody, "request.status === 'succeeded' && request.cleanupPending === true") ||
+		!strings.Contains(queueBody, "if (controlCodeCleanupPendingRequestID) return true;") ||
+		!strings.Contains(source, "if (controlCodeCleanupPendingRequestID && controlCodeFastStateFresh())") {
+		t.Fatalf("browser must keep the phone lane occupied until fresh fast-ready cleanup is published")
 	}
 	if strings.Count(captureBody, "locallyClosedControlCodeRequestIDs.has(requestID)") < 4 {
 		t.Fatalf("browser capture must check for locally closed requests before and after async capture work")
@@ -1673,39 +1676,22 @@ func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	}
 }
 
-func TestControlCodeRunningOnlyPreparesHiddenResult(t *testing.T) {
+func TestControlCodeCaptureStartsOnlyAfterGeneratedMarker(t *testing.T) {
 	source := ticketAppSource(t)
-	prepareBody := substringBetween(t, source,
-		"function maybePrepareControlCodeResultFrame() {",
-		"  function noteControlCodeMarkerWaiting(request) {")
 	captureBody := substringBetween(t, source,
 		"async function captureControlCodeResultScreenshot(request, proof) {",
 		"  function failControlCodeResultScreenshotWait() {")
 
-	for _, needle := range []string{
-		"if (!codeRequest || codeRequest.status !== 'running') return false;",
-		"const proof = controlCodeCandidateFrameProof(codeRequest, { allowProvisional: true });",
-		"controlCodePreparedCaptureProof = Object.assign({}, proof, {",
-		"preparedAt: Date.now()",
-	} {
-		if !strings.Contains(prepareBody, needle) {
-			t.Fatalf("running control-code request must only prepare a hidden frozen frame, missing %q", needle)
-		}
-	}
-	for _, forbidden := range []string{
-		"displayControlCodeResultImage(",
-		"captureControlCodeResultImage(",
-		"confirmControlCodeBrowserCapture(",
-		"setControlCodeResultVisible(true)",
-		"control_code_frame_displayed",
-		"control_code_frame_painted",
-	} {
-		if strings.Contains(prepareBody, forbidden) {
-			t.Fatalf("running control-code request must not display or acknowledge provisionally, found %q", forbidden)
-		}
+	if strings.Contains(source, "maybePrepareControlCodeResultFrame") ||
+		strings.Contains(source, "allowProvisional") ||
+		strings.Contains(source, "browser_prepared_generated_frame_before_marker") {
+		t.Fatal("browser must not prepare or freeze a generated frame before the phone marker")
 	}
 	if !strings.Contains(captureBody, "if (!request || request.status !== 'succeeded'") {
 		t.Fatal("browser result display must reject any direct provisional capture call")
+	}
+	if !strings.Contains(source, "requestControlCodeLowLatencyFrame(requestID, 'control_code_result_marker_low_latency');") {
+		t.Fatal("browser must request the existing low-latency marker refresh only after result publication")
 	}
 }
 
@@ -1777,7 +1763,7 @@ func TestTicketViewerResumeRecoveryWaitsForLiveFrameAndReusesFreshSocket(t *test
 		"  async function configureDecoder(config, options) {")
 	freshnessBody := substringBetween(t, source,
 		"function updateStreamFreshnessStatus(reason) {",
-		"  function liveFrameReadyForControlCode() {")
+		"  function controlCodeFastStateExpiryMillis(state) {")
 
 	if !strings.Contains(recoveryBody, "lastRecoveryVideoReconnectSeq === videoSocketOpenSeq") ||
 		!strings.Contains(recoveryBody, "now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs") ||

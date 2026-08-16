@@ -794,44 +794,6 @@ member_stream_reducers! {
 }
 
 member_reducers! {
-    ticketremote_member_prepare_control_code(ctx; ticketId: String, backendId: String,
-        reason: String; ticket = ticketId) |ticket, email, now| {
-    let backend_id = clean_backend_id(&backendId);
-    if control_code_fast_state_current_ready(ctx, &ticket.id, &backend_id, &now)
-        || ticket_has_control_code_phone_occupancy(ctx, &ticket.id, &backend_id, &now)
-    {
-        return Ok(());
-    }
-    let owner_public_id = account_public_id(&email);
-    let payload = serde_json::json!({
-        "type": "prepare_control_code",
-        "owner": "ticket",
-        "app": "vivi",
-        "flow": "control_code",
-        "source": "browser_spacetime",
-        "requester": owner_public_id
-    })
-    .to_string();
-    insert_stream_command(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        &format!(
-            "{}:browser:{}:prepare_control_code",
-            ticket.id,
-            stable_stamp(&now)
-        ),
-        "prepare_control_code",
-        &now,
-        &bounded_text(&non_empty(&reason, "dialog_open"), 120),
-        &payload,
-        CONTROL_CODE_COMMAND_TTL_MS,
-        &now,
-    );
-    }
-}
-
-member_reducers! {
     ticketremote_member_request_control_code(ctx; ticketId: String, backendId: String,
         sessionId: String, digits: String, expectedFastRevision: String; ticket = ticketId)
         |ticket, email, now| {
@@ -858,14 +820,10 @@ member_reducers! {
         .ticketremote_control_code_fast_state()
         .id()
         .find(&fast_state_id);
-    let (fast_state_ready, fast_state_status, cleanup_revision, cleanup_stream_epoch,
-        cleanup_frame_sequence, stream_was_live) = fast_state.as_ref().map(|row| (
-            control_code_fast_state_row_ready(row, &expectedFastRevision, &now),
-            row.status.clone(), row.revision.clone(), row.streamEpoch.clone(),
-            row.frameSequence.clone(), row.streamLive,
-        )).unwrap_or_else(|| (false, "missing".into(), now.clone(), String::new(),
-            String::new(), false));
-    let submit_mode = control_code_submit_mode(fast_state_ready);
+    let (cleanup_revision, cleanup_stream_epoch, cleanup_frame_sequence, stream_was_live) =
+        fast_state.as_ref().map(|row| (
+            row.revision.clone(), row.streamEpoch.clone(), row.frameSequence.clone(), row.streamLive,
+        )).unwrap_or_else(|| (now.clone(), String::new(), String::new(), false));
     let request_id = control_code_request_id(&ticket.id, &session_id, &now);
     let owner_public_id = account_public_id(&email);
     let owner = TicketremoteControlCodeOwner {
@@ -892,10 +850,7 @@ member_reducers! {
         "requester": owner_public_id.clone(),
         "serverSentAt": now,
         "dispatchAttempt": 1,
-        "fastRevision": bounded_text(&expectedFastRevision, 160),
-        "fastStateStatusAtSubmit": fast_state_status.clone(),
-        "fastStateReadyAtSubmit": fast_state_ready,
-        "submitMode": submit_mode
+        "fastRevision": bounded_text(&expectedFastRevision, 160)
     })
     .to_string();
     insert_stream_command(
@@ -1239,10 +1194,7 @@ pub fn ticketremote_append_stream_command(
     let command_type = non_empty(&commandType, "command");
     let command_reason = non_empty(&reason, "stream_command");
     let background = suppressible_background_stream_command(&command_type);
-    if (command_type == "prepare_control_code"
-        && (control_code_fast_state_current_ready(ctx, &ticketId, &backendId, &now)
-            || ticket_has_control_code_phone_occupancy(ctx, &ticketId, &backendId, &now)))
-        || (background
+    if (background
             && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
             && !idle_stream_command_is_allowed(&command_reason, &payloadJson))
         || (background
@@ -1563,7 +1515,6 @@ expression_functions! {
     fn frame_ordinal_number(value: &str) -> i64 = value.trim().parse::<i64>().unwrap_or(0);
     fn operator_identity_is_valid(identity: &str) -> bool = identity.trim() == OPERATOR_IDENTITY;
     fn control_code_fast_state_id(ticket: &str, backend: &str) -> String = phone_row_id(ticket, backend);
-    fn control_code_submit_mode(ready: bool) -> &'static str = if ready { "fast_ready" } else { "queued_warmup" };
     fn cleanup_remaining(limit: u32, deleted: u32) -> u32 =
         if limit == 0 { 0 } else { limit.saturating_sub(deleted) };
     fn stream_viewer_focus_expired(row: &TicketremoteStreamViewerFocus, clock: &str) -> bool =
@@ -1592,12 +1543,6 @@ expression_functions! {
     fn updated_ordinal(value: &str, fallback: &str) -> Option<String> =
         Some(bounded_frame_ordinal(&non_empty(value, fallback)));
     fn optional_text(value: String) -> Option<String> = (!value.is_empty()).then_some(value);
-    fn control_code_stream_command_occupies_phone(row: &TicketremoteStreamCommand,
-        clock: &str) -> bool = row.status == "pending"
-            && parse_time_ms(&row.expiresAt) > parse_time_ms(clock)
-            && (matches!(row.commandType.as_str(), "prepare_control_code" | "generate_control_code"
-                | "control_code_browser_capture")
-                || stream_command_is_control_code(&row.reason, &row.payloadJson));
     fn control_code_request_same_payload(left: &TicketremoteControlCodeRequest,
         right: &TicketremoteControlCodeRequest) -> bool = same_fields!(left, right;
             status, reason, message, resultProof, resultProofAt, captureRequired,
@@ -1717,11 +1662,6 @@ expression_functions! {
         else { CONTROL_CODE_FAST_STATE_TTL_MS });
     fn clean_control_code_fast_status(value: &str) -> String = allowlisted(&non_empty(value, "stale"),
         &["fast_ready", "warming", "cleanup", "blocked", "stale"], "blocked");
-    fn control_code_fast_state_row_ready(row: &TicketremoteControlCodeFastState,
-        expected: &str, clock: &str) -> bool = !expected.trim().is_empty()
-            && row.status == "fast_ready" && row.revision == expected.trim()
-            && row.rawTicketConfirmed && row.cleanupClear && row.streamLive
-            && parse_time_ms(&row.expiresAt) > parse_time_ms(clock);
     fn control_code_request_occupies_phone(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
         if parse_time_ms(&row.expiresAt) <= parse_time_ms(clock) { return false; }
         if matches!(row.status.as_str(), "closed" | "expired" | "failed") { return false; }
@@ -2679,7 +2619,7 @@ fn insert_stream_command(
     let table = ctx.db.ticketremote_stream_command();
     if matches!(
         command_type.as_str(),
-        "start" | "keyframe" | "recover_stream" | "prepare_control_code"
+        "start" | "keyframe" | "recover_stream"
     ) {
         let now_ms = parse_time_ms(now);
         if let Some(existing) = table
@@ -3011,20 +2951,6 @@ fn upsert_control_code_fast_state(
     row
 }
 
-fn control_code_fast_state_current_ready(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-) -> bool {
-    let id = control_code_fast_state_id(ticket_id, backend_id);
-    let Some(row) = ctx.db.ticketremote_control_code_fast_state().id().find(&id) else {
-        return false;
-    };
-    let revision = row.revision.clone();
-    control_code_fast_state_row_ready(&row, &revision, now)
-}
-
 fn active_control_code_owner_rows(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -3053,24 +2979,6 @@ fn ticket_has_control_code_request_in_progress(
         .ticketId()
         .filter(&ticket_id)
         .any(|row| control_code_request_occupies_phone(&row, now))
-}
-
-fn ticket_has_control_code_phone_occupancy(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-) -> bool {
-    if ticket_has_control_code_request_in_progress(ctx, ticket_id, now) {
-        return true;
-    }
-    let ticket_id = clean_ticket_id(ticket_id);
-    let backend_id = clean_backend_id(backend_id);
-    ctx.db
-        .ticketremote_stream_command()
-        .ticketBackendStatus()
-        .filter((&ticket_id, &backend_id, "pending"))
-        .any(|row| control_code_stream_command_occupies_phone(&row, now))
 }
 
 fn insert_control_code_public_request(
@@ -3535,35 +3443,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_state_classifies_the_optional_submit_lane() {
-        let ready = fast_state("2026-07-10T12:00:12Z");
-        assert!(control_code_fast_state_row_ready(
-            &ready,
-            "revision-1",
-            "2026-07-10T12:00:01Z"
-        ));
-        assert!(!control_code_fast_state_row_ready(
-            &ready,
-            "revision-2",
-            "2026-07-10T12:00:01Z"
-        ));
-        assert!(!control_code_fast_state_row_ready(
-            &ready,
-            "revision-1",
-            "2026-07-10T12:00:12Z"
-        ));
-        let mut warming = ready;
-        warming.status = "warming".into();
-        assert!(!control_code_fast_state_row_ready(
-            &warming,
-            "revision-1",
-            "2026-07-10T12:00:01Z"
-        ));
-        assert_eq!(control_code_submit_mode(true), "fast_ready");
-        assert_eq!(control_code_submit_mode(false), "queued_warmup");
-    }
-
-    #[test]
     fn only_unfinished_control_code_work_occupies_the_phone() {
         let now = "2026-07-10T12:00:01Z";
         let mut request = control_request();
@@ -3594,35 +3473,6 @@ mod tests {
         request.status = "running".into();
         request.expiresAt = now.into();
         assert!(!control_code_request_occupies_phone(&request, now));
-    }
-
-    #[test]
-    fn pending_control_code_commands_block_prepare_until_they_settle() {
-        let now = "2026-07-10T12:00:01Z";
-        for command_type in [
-            "prepare_control_code",
-            "generate_control_code",
-            "control_code_browser_capture",
-        ] {
-            assert!(control_code_stream_command_occupies_phone(
-                &stream_command(command_type, "stream_command"),
-                now
-            ));
-        }
-
-        let mut cleanup = stream_command("cleanup", "control_code_cleanup");
-        assert!(control_code_stream_command_occupies_phone(&cleanup, now));
-        cleanup.status = "acknowledged".into();
-        assert!(!control_code_stream_command_occupies_phone(&cleanup, now));
-
-        let mut expired = stream_command("generate_control_code", "control_code_request");
-        expired.expiresAt = now.into();
-        assert!(!control_code_stream_command_occupies_phone(&expired, now));
-
-        assert!(!control_code_stream_command_occupies_phone(
-            &stream_command("keyframe", "browser_recovery"),
-            now
-        ));
     }
 
     #[test]

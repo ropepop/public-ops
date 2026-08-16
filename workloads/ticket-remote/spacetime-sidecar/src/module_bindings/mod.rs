@@ -23,7 +23,6 @@ pub mod ticketremote_latest_ticket_reselect_timer_type;
 pub mod ticketremote_member_append_safe_operational_log_reducer;
 pub mod ticketremote_member_close_control_code_reducer;
 pub mod ticketremote_member_confirm_control_code_browser_capture_reducer;
-pub mod ticketremote_member_prepare_control_code_reducer;
 pub mod ticketremote_member_recover_stream_reducer;
 pub mod ticketremote_member_remove_member_reducer;
 pub mod ticketremote_member_request_control_code_reducer;
@@ -86,7 +85,6 @@ pub use ticketremote_latest_ticket_reselect_timer_type::TicketremoteLatestTicket
 pub use ticketremote_member_append_safe_operational_log_reducer::ticketremote_member_append_safe_operational_log;
 pub use ticketremote_member_close_control_code_reducer::ticketremote_member_close_control_code;
 pub use ticketremote_member_confirm_control_code_browser_capture_reducer::ticketremote_member_confirm_control_code_browser_capture;
-pub use ticketremote_member_prepare_control_code_reducer::ticketremote_member_prepare_control_code;
 pub use ticketremote_member_recover_stream_reducer::ticketremote_member_recover_stream;
 pub use ticketremote_member_remove_member_reducer::ticketremote_member_remove_member;
 pub use ticketremote_member_request_control_code_reducer::ticketremote_member_request_control_code;
@@ -201,11 +199,6 @@ pub enum Reducer {
         candidate_frame_epoch: String,
         candidate_frame_sequence: String,
         accepted_reason: String,
-    },
-    TicketremoteMemberPrepareControlCode {
-        ticket_id: String,
-        backend_id: String,
-        reason: String,
     },
     TicketremoteMemberRecoverStream {
         ticket_id: String,
@@ -376,9 +369,6 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteMemberConfirmControlCodeBrowserCapture { .. } => {
                 "ticketremote_member_confirm_control_code_browser_capture"
             }
-            Reducer::TicketremoteMemberPrepareControlCode { .. } => {
-                "ticketremote_member_prepare_control_code"
-            }
             Reducer::TicketremoteMemberRecoverStream { .. } => "ticketremote_member_recover_stream",
             Reducer::TicketremoteMemberRemoveMember { .. } => "ticketremote_member_remove_member",
             Reducer::TicketremoteMemberRequestControlCode { .. } => {
@@ -540,15 +530,6 @@ impl __sdk::Reducer for Reducer {
                 candidate_frame_epoch: candidate_frame_epoch.clone(),
                 candidate_frame_sequence: candidate_frame_sequence.clone(),
                 accepted_reason: accepted_reason.clone(),
-}),
-            Reducer::TicketremoteMemberPrepareControlCode{
-                ticket_id,
-                backend_id,
-                reason,
-}             => __sats::bsatn::to_vec(&ticketremote_member_prepare_control_code_reducer::TicketremoteMemberPrepareControlCodeArgs {
-                ticket_id: ticket_id.clone(),
-                backend_id: backend_id.clone(),
-                reason: reason.clone(),
 }),
             Reducer::TicketremoteMemberRecoverStream{
                 ticket_id,

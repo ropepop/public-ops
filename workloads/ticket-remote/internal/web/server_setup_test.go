@@ -586,7 +586,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"navigator.wakeLock.request('screen')",
 		"if(!screenWakeLock)return;const lock=screenWakeLock",
 		"function openControlCodeDialog()",
-		"if(!spacetimeReadyForControlCode())",
 		"document.exitFullscreen().catch",
 		"function layoutViewportRect()",
 		"const engagedOffset=screenEngaged?Math.round(Math.min(96,Math.max(24,height*.12))):0",
@@ -1137,7 +1136,6 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"controlCodeHotspot.setAttribute('aria-disabled',hotspotUnavailable?'true':'false')",
 		"codeDialog.addEventListener('click'",
 		"event.key==='Escape'",
-		"requestKeyframeDebounced('control_code_request_submitted', 0, true)",
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("control-code request flow missing %q", snippet)
@@ -1155,8 +1153,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	if !strings.Contains(hotspotHandler, "closeCurrentControlCode(false)") {
 		t.Fatalf("top-left hotspot should close visible result without immediately opening a new request")
 	}
-	if !strings.Contains(js, `reconnectVideoForRecovery("control_code_dialog_stream_warmup")`) {
-		t.Fatalf("opening the control-code dialog should warm local video recovery without blocking submission")
+	if strings.Contains(js, `refreshControlCodeReadiness("control_code_dialog_background_warmup")`) {
+		t.Fatalf("opening the control-code dialog must not launch preparation")
+	}
+	if strings.Contains(js, `reconnectVideoForRecovery("control_code_dialog_stream_warmup")`) {
+		t.Fatalf("opening the control-code dialog must not launch a second local video recovery")
 	}
 	if strings.Contains(hotspotHandler, "closeCurrentControlCode(true)") {
 		t.Fatalf("top-left hotspot should not immediately reopen the request dialog after closing a visible result")
@@ -1190,12 +1191,14 @@ func TestTicketSpacetimeModuleRemovesOldControlMutations(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	for _, snippet := range []string{
 		"ticketremote_member_request_control_code(ctx;",
-		"ticketremote_member_prepare_control_code(ctx;",
 		"ticketremote_member_close_control_code(ctx;",
 	} {
 		if !strings.Contains(module, snippet) {
 			t.Fatalf("SpacetimeDB module missing %q", snippet)
 		}
+	}
+	if strings.Contains(module, "prepare_control_code") {
+		t.Fatalf("SpacetimeDB module must not retain the removed preparation reducer")
 	}
 	for _, snippet := range []string{
 		"pub fn ticketremote_member_claim_control(",

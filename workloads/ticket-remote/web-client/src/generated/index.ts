@@ -36,7 +36,6 @@ import {
 // Import all reducer arg schemas
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
-import TicketremoteMemberPrepareControlCodeReducer from "./ticketremote_member_prepare_control_code_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "./ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "./ticketremote_member_request_keyframe_reducer";
@@ -203,7 +202,6 @@ const tablesSchema = __schema({
 const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
-  __reducerSchema("ticketremote_member_prepare_control_code", TicketremoteMemberPrepareControlCodeReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),
   __reducerSchema("ticketremote_member_request_control_code", TicketremoteMemberRequestControlCodeReducer),
   __reducerSchema("ticketremote_member_request_keyframe", TicketremoteMemberRequestKeyframeReducer),

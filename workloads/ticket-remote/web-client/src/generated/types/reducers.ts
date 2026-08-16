@@ -8,7 +8,6 @@ import { type Infer as __Infer } from "spacetimedb";
 // Import all reducer arg schemas
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
-import TicketremoteMemberPrepareControlCodeReducer from "../ticketremote_member_prepare_control_code_reducer";
 import TicketremoteMemberRecoverStreamReducer from "../ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "../ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "../ticketremote_member_request_keyframe_reducer";
@@ -16,7 +15,6 @@ import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_
 
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
-export type TicketremoteMemberPrepareControlCodeParams = __Infer<typeof TicketremoteMemberPrepareControlCodeReducer>;
 export type TicketremoteMemberRecoverStreamParams = __Infer<typeof TicketremoteMemberRecoverStreamReducer>;
 export type TicketremoteMemberRequestControlCodeParams = __Infer<typeof TicketremoteMemberRequestControlCodeReducer>;
 export type TicketremoteMemberRequestKeyframeParams = __Infer<typeof TicketremoteMemberRequestKeyframeReducer>;

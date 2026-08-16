@@ -241,7 +241,7 @@ func TestSpacetimeBrowserInstallsCSPSafeCodecsBeforeBuildingConnection(t *testin
 		"this.connected = false;",
 		"this.conn = null;",
 		"this.handlers.onStatus?.(\"offline\", connectionError.message);",
-		"this.rejectReadyWaiters(connectionError);",
+		"this.rejectLive(connectionError);",
 		"if (!this.manuallyDisconnected) this.scheduleReconnect();",
 	} {
 		if !strings.Contains(connectBody, required) {
@@ -378,8 +378,8 @@ func TestLowCostHotPathsUseSingleSignalAndOneRowLookups(t *testing.T) {
 	if !strings.Contains(module, "upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);") {
 		t.Fatalf("desired-state changes must wake the Pixel signal row")
 	}
-	if !strings.Contains(module, `"start" | "keyframe" | "recover_stream" | "prepare_control_code"`) {
-		t.Fatalf("background stream commands must be deduped like other low-value repeated commands")
+	if !strings.Contains(module, `"start" | "keyframe" | "recover_stream"`) || strings.Contains(module, "prepare_control_code") {
+		t.Fatalf("only the retained background stream commands may be deduped")
 	}
 	if strings.Contains(module, "lastFrameAgoMillis: last_frame_ago_millis") {
 		t.Fatalf("relay current report must not write a constantly changing frame age")
@@ -474,15 +474,13 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 	appendReducer := substringBetween(t, module,
 		"pub fn ticketremote_append_stream_command(",
 		"service_reducers! {\n    ticketremote_ack_stream_command")
-	prepareReducer := substringBetween(t, module,
-		"ticketremote_member_prepare_control_code(ctx;",
-		"ticketremote_member_request_control_code(ctx;")
 	memberStreamReducers := substringBetween(t, module,
 		"macro_rules! member_stream_reducers",
-		"member_reducers! {\n    ticketremote_member_prepare_control_code")
-	helper := substringBetween(t, module,
-		"fn live_relay_suppresses_background_stream_command(",
-		"fn control_code_fast_state_current_ready(")
+		"member_reducers! {")
+	if strings.Contains(module, "prepare_control_code") ||
+		strings.Contains(module, "control_code_fast_state_current_ready") {
+		t.Fatalf("the single-path contract must not retain a preparation reducer or fast-state suppression helper")
+	}
 
 	if strings.Contains(memberStreamReducers, "live_relay_suppresses_background_stream_command(") {
 		t.Fatalf("member stream reducers must not use relay-wide liveness to suppress one stale requester")
@@ -509,35 +507,24 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 		}
 	}
 	for _, required := range []string{
-		"ticketremote_relay_current_report().id().find(id)",
+		"relay_current_report_suppresses_background_stream_command(ctx, &id, now)",
 		"clean_reason.contains(\"control_code\")",
 		"report.videoClients == 0 || report.streamVerdict != \"live\"",
 		"STREAM_BACKGROUND_REPORT_MAX_AGE_MS",
 		"lastFrameVisualAgeMillis",
 		"liveFrameMaxAgeMillis",
 	} {
-		if !strings.Contains(helper, required) {
+		if !strings.Contains(module, required) {
 			t.Fatalf("live relay suppression helper missing %q", required)
 		}
 	}
 	for _, required := range []string{
 		"suppressible_background_stream_command(&command_type)",
-		"command_type == \"prepare_control_code\"",
-		"control_code_fast_state_current_ready(ctx, &ticketId, &backendId, &now)",
 		"live_relay_suppresses_background_stream_command(",
 		"return Ok(());",
 	} {
 		if !strings.Contains(appendReducer, required) {
 			t.Fatalf("service stream command append reducer missing live suppression marker %q", required)
-		}
-	}
-	for _, required := range []string{
-		"control_code_fast_state_current_ready(ctx, &ticket.id, &backend_id, &now)",
-		"return Ok(());",
-		"insert_stream_command(",
-	} {
-		if !strings.Contains(prepareReducer, required) {
-			t.Fatalf("member prepare reducer missing fast-ready suppression marker %q", required)
 		}
 	}
 	for _, required := range []string{
@@ -553,21 +540,12 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 		"videoClients",
 		"relayViewers",
 	} {
-		if !strings.Contains(helper, required) {
+		if !strings.Contains(module, required) {
 			t.Fatalf("live phone suppression fallback missing %q", required)
 		}
 	}
-	for _, required := range []string{
-		"fn control_code_fast_state_current_ready(",
-		"row.status == \"fast_ready\"",
-		"row.rawTicketConfirmed",
-		"row.cleanupClear",
-		"row.streamLive",
-		"parse_time_ms(&row.expiresAt) > parse_time_ms(clock)",
-	} {
-		if !strings.Contains(module, required) {
-			t.Fatalf("fast-ready prepare suppression helper missing %q", required)
-		}
+	if !strings.Contains(module, `"fastRevision": bounded_text(&expectedFastRevision, 160)`) {
+		t.Fatalf("the durable request must carry only the browser's fast-state handoff revision")
 	}
 }
 
@@ -582,12 +560,9 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 		"ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now)",
 		`return Err("request_in_progress".into());`,
 		"CONTROL_CODE_RATE_LIMIT",
-		"control_code_submit_mode(fast_state_ready)",
-		`"fastStateReadyAtSubmit": fast_state_ready`,
-		`"submitMode": submit_mode`,
 		"insert_control_code_public_request(",
 		`"generate_control_code"`,
-		"unwrap_or_else(|| (false, \"missing\".into(), now.clone()",
+		`"fastRevision": bounded_text(&expectedFastRevision, 160)`,
 	} {
 		if !strings.Contains(reducer, required) {
 			t.Fatalf("queue-first control-code reducer missing %q", required)
@@ -599,10 +574,12 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 	if strings.Contains(reducer, "unwrap_or_else(|| expectedFastRevision.clone())") {
 		t.Fatalf("browser fast revision must not overwrite the authoritative server state")
 	}
+	if strings.Contains(reducer, "fastStateReadyAtSubmit") || strings.Contains(reducer, "submitMode") {
+		t.Fatalf("request payload must not duplicate fast-state readiness fields")
+	}
 	for _, required := range []string{
 		"let $email = client_email_from_auth($ctx, &$ticket.id)?;",
 		`"fast_ready"`,
-		`"queued_warmup"`,
 		`matches!(row.status.as_str(), "queued" | "running")`,
 		`row.status == "succeeded" && (row.cleanupPending`,
 		`row.captureRequired && !row.captureAcknowledged`,

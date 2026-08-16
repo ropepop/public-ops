@@ -22,7 +22,6 @@ import { html, reactive } from '@arrow-js/core';
   const sampledClientLogState = new Map();
   const sampledClientLogEvents = new Set(['control_code_capture_keepalive', 'stream_command_dispatched']);
   const sampledClientLogIntervalMs = 60000;
-  const controlCodeAutoPrepareMinIntervalMs = 5000;
   let spacetimeClient = null;
 
   function compactClientEventName(value) {
@@ -266,6 +265,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastStreamStatusAt = 0;
   let codeRequest = null;
   let controlCodeSubmitInFlight = false;
+  let controlCodeCleanupPendingRequestID = '';
   let controlCodeFastState = null;
   let pendingFrameMetadata = [];
   let controlCodeResultCaptureTimer = null;
@@ -290,10 +290,7 @@ import { html, reactive } from '@arrow-js/core';
   let controlCodeSafeGeneratedFrameCount = 0;
   let controlCodeFrozenFrameCanvas = null;
   let controlCodeFrozenFrameKey = '';
-  let controlCodePreparedCaptureProof = null;
   let controlCodePreparedCaptureDisplayedRequestID = '';
-  let controlCodeAutoPrepareInFlight = false;
-  let lastControlCodeAutoPrepareAt = 0;
   let controlCodeFastStateExpiryTimer = null;
   let lastRenderedControlCodeRequestSignature = '';
   const localSessionID = String(cfg.sessionId || '').trim();
@@ -1789,10 +1786,9 @@ import { html, reactive } from '@arrow-js/core';
     // Keep the live socket intact for the control-code flow. Reconnecting here
     // preserves the popup/old frame while the new socket warms up, which can make the
     // browser miss the short generated-result window and force phone-side cleanup.
-    // Clear a decoder backlog once when the request starts, before ViVi renders the generated
-    // result. The later result marker must stay lightweight and must not reopen the stream.
-    const resetForRequestStart = reason === 'control_code_running_low_latency';
-    resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', resetForRequestStart);
+    // Only clear a genuinely stale decoder backlog after the generated-result marker exists.
+    // The request-start path does no decoder reset or speculative keyframe work.
+    resetControlCodeDecoderBacklog(requestID, reason || 'control_code_low_latency', false);
     return requestKeyframeDebounced(reason || 'control_code_low_latency_frame', 0, true);
   }
 
@@ -2143,7 +2139,6 @@ import { html, reactive } from '@arrow-js/core';
         firstRenderedTraceSent = true;
         sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);
       }
-      maybePrepareControlCodeResultFrame();
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
@@ -3041,7 +3036,6 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function clearControlCodePreparedCapture() {
-    controlCodePreparedCaptureProof = null;
     controlCodePreparedCaptureDisplayedRequestID = '';
   }
 
@@ -3068,8 +3062,6 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeCandidateFrameProof(request) {
-    const options = arguments.length > 1 ? arguments[1] : null;
-    const allowProvisional = Boolean(options && options.allowProvisional);
     const requestID = String(request && request.requestId || '').trim();
     const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
     const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
@@ -3090,12 +3082,8 @@ import { html, reactive } from '@arrow-js/core';
       frozenFrameKey: controlCodeFrozenFrameKey,
       keyframeRetryCount: lastControlCodeCaptureKeyframeRetryCount
     };
-    if (!request || (!allowProvisional && request.status !== 'succeeded')) {
+    if (!request || request.status !== 'succeeded') {
       proof.candidateRejectedReason = 'request_not_succeeded';
-      return proof;
-    }
-    if (allowProvisional && request.status !== 'running' && request.status !== 'succeeded') {
-      proof.candidateRejectedReason = 'request_not_running';
       return proof;
     }
     if (request.cleanupCompletedAt) {
@@ -3106,7 +3094,7 @@ import { html, reactive } from '@arrow-js/core';
       proof.candidateRejectedReason = 'request_id_missing';
       return proof;
     }
-    if ((!markerEpoch || !markerSequence) && !allowProvisional) {
+    if (!markerEpoch || !markerSequence) {
       proof.candidateRejectedReason = 'marker_waiting';
       return proof;
     }
@@ -3157,7 +3145,7 @@ import { html, reactive } from '@arrow-js/core';
       markerSequence &&
       renderedEpoch === markerEpoch &&
       renderedSequence >= markerSequence &&
-      (request.status === 'succeeded' || allowProvisional));
+      request.status === 'succeeded');
     proof.trustedPhoneMarkerFrame = trustedPhoneMarkerFrame;
     proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;
     if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame) {
@@ -3192,10 +3180,8 @@ import { html, reactive } from '@arrow-js/core';
     proof.accepted = true;
     proof.candidateAccepted = true;
     proof.candidateRejectedReason = '';
-    proof.acceptedReason = markerEpoch && markerSequence
-      ? 'candidate_frame_at_or_after_phone_marker_and_generated_visual'
-      : 'browser_prepared_generated_frame_before_marker';
-    proof.provisional = allowProvisional && (!markerEpoch || !markerSequence || request.status !== 'succeeded');
+    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    proof.provisional = false;
     controlCodeCaptureTrace('control_code_frame_frozen', request, proof, {
       acceptedReason: proof.acceptedReason,
       provisional: Boolean(proof.provisional)
@@ -3205,35 +3191,6 @@ import { html, reactive } from '@arrow-js/core';
       provisional: Boolean(proof.provisional)
     });
     return proof;
-  }
-
-  function controlCodePreparedProofUsable(request, proof) {
-    if (!request || !proof || !proof.accepted) return false;
-    const requestID = String(request.requestId || '').trim();
-    if (!requestID || String(proof.requestId || '').trim() !== requestID) return false;
-    if (!controlCodeFrozenCandidateFrameForProof(proof)) return false;
-    if (request.status !== 'succeeded') return false;
-    const markerEpoch = Number(request.resultFrameEpoch || request.streamEpoch || 0);
-    const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
-    if (!markerEpoch || !markerSequence) return false;
-    if (Number(proof.candidateFrameEpoch || 0) !== markerEpoch) return false;
-    const candidateSequence = Number(proof.candidateFrameSequence || 0);
-    const candidatePrecedesPhoneMarker = candidateSequence < markerSequence;
-    const trustedPhoneProof = controlCodeTrustedPhonePostSubmitProof(request.resultProof);
-    // The browser may prove and freeze the generated frame while the request is
-    // still running. That is the fastest safe path: the later phone marker
-    // confirms the same request, while the frozen frame itself remains tied to
-    // the current stream epoch. Do not discard it just because the marker was
-    // published after that frame.
-    if (candidatePrecedesPhoneMarker && !(proof.provisional && trustedPhoneProof)) return false;
-    proof.trustedPhonePostSubmitProof = trustedPhoneProof;
-    proof.markerEpoch = markerEpoch;
-    proof.markerSequence = markerSequence;
-    proof.acceptedReason = candidatePrecedesPhoneMarker
-      ? 'browser_prepared_generated_frame_confirmed_by_phone'
-      : 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
-    proof.provisional = false;
-    return true;
   }
 
   function clearUnpaintedControlCodeResultImage(requestID) {
@@ -3422,34 +3379,6 @@ import { html, reactive } from '@arrow-js/core';
       !codeResultArea.hidden &&
       !codeResultImage.hidden &&
       Boolean(codeResultImage.currentSrc || codeResultImage.src));
-  }
-
-  function maybePrepareControlCodeResultFrame() {
-    if (!codeRequest || codeRequest.status !== 'running') return false;
-    const requestID = String(codeRequest.requestId || '').trim();
-    if (!requestID || requestID.startsWith('pending:')) return false;
-    if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
-    if (controlCodePreparedCaptureProof &&
-      String(controlCodePreparedCaptureProof.requestId || '').trim() === requestID &&
-      controlCodeFrozenCandidateFrameForProof(controlCodePreparedCaptureProof)) {
-      return true;
-    }
-    const proof = controlCodeCandidateFrameProof(codeRequest, { allowProvisional: true });
-    if (!proof.accepted) {
-      if (proof.candidateRejectedReason === 'generated_frame_not_visible' ||
-        proof.candidateRejectedReason === 'candidate_matches_pre_request_frame') {
-        lastControlCodeCaptureDebug = Object.assign({}, proof, {
-          accepted: false,
-          candidateAccepted: false,
-          preparedAt: Date.now()
-        });
-      }
-      return false;
-    }
-    controlCodePreparedCaptureProof = Object.assign({}, proof, {
-      preparedAt: Date.now()
-    });
-    return true;
   }
 
   function noteControlCodeMarkerWaiting(request) {
@@ -3641,15 +3570,6 @@ import { html, reactive } from '@arrow-js/core';
       noteControlCodeMarkerWaiting(codeRequest);
       return false;
     }
-    if (controlCodePreparedProofUsable(codeRequest, controlCodePreparedCaptureProof)) {
-      if (controlCodeResultCaptureTimer) {
-        clearTimeout(controlCodeResultCaptureTimer);
-        controlCodeResultCaptureTimer = null;
-      }
-      controlCodeResultCaptureRequestID = '';
-      captureControlCodeResultScreenshot(codeRequest, controlCodePreparedCaptureProof);
-      return true;
-    }
     const proof = controlCodeCandidateFrameProof(codeRequest);
     if (!proof.accepted) {
       noteControlCodeCandidateRejected(proof);
@@ -3823,11 +3743,6 @@ import { html, reactive } from '@arrow-js/core';
     }
     if (busy) {
       keepControlCodeVideoAlive('control_code_request_active');
-      if (current.status === 'running') {
-        requestKeyframeDebounced('control_code_running', controlCodeCaptureKeyframeRetryMs);
-        requestControlCodeLowLatencyFrame(currentRequestID, 'control_code_running_low_latency');
-        maybePrepareControlCodeResultFrame();
-      }
       if (controlCodeResultDisplayedForRequest(currentRequestID)) {
         scheduleControlCodeTicker(current);
         return;
@@ -3904,12 +3819,6 @@ import { html, reactive } from '@arrow-js/core';
 
   function openControlCodeDialog() {
     if (controlCodeRequestOccupiesQueue()) return;
-    if (!liveFrameReadyForControlCode()) {
-      reconnectVideoForRecovery('control_code_dialog_stream_warmup');
-    }
-    if (!spacetimeReadyForControlCode() || !liveFrameReadyForControlCode() || !controlCodeFastStateFresh()) {
-      refreshControlCodeReadiness('control_code_dialog_background_warmup');
-    }
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
       try {
         document.exitFullscreen().catch(() => {});
@@ -3965,7 +3874,6 @@ import { html, reactive } from '@arrow-js/core';
     try {
       await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision), 'control_code_request');
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
-      requestKeyframeDebounced('control_code_request_submitted', 0, true);
       clientLog('control_code_submitted', JSON.stringify({
         digitCount: digits.length,
         mutationLatencyMs,
@@ -4004,6 +3912,17 @@ import { html, reactive } from '@arrow-js/core';
       // The result overlay is requester-local. Clear it first even if a delayed
       // subscription update has not restored the ownership cache yet.
       locallyClosedControlCodeRequestIDs.add(String(requestID));
+      if (request && request.status === 'succeeded' && request.cleanupPending === true) {
+        // The phone is available again only after badge-cross cleanup publishes
+        // a fresh fast-ready state. Keep a local admission barrier while that
+        // cleanup is still in flight.
+        controlCodeCleanupPendingRequestID = requestID;
+      } else {
+        // A completed request already has its post-cleanup fast state. Do not
+        // leave a local barrier behind when the browser simply dismisses the
+        // finished result after cleanup has completed.
+        controlCodeCleanupPendingRequestID = '';
+      }
     }
     setControlCodeResultVisible(false);
     clearControlCodeResultCapture();
@@ -4451,15 +4370,6 @@ import { html, reactive } from '@arrow-js/core';
     return freshness;
   }
 
-  function liveFrameReadyForControlCode() {
-    const freshness = currentRenderedFreshness(performance.now());
-    return Boolean(hasRenderedFrame && freshness.liveLabeled);
-  }
-
-  function spacetimeReadyForControlCode() {
-    return Boolean(spacetimeClient && spacetimeClientStatus === 'live');
-  }
-
   function controlCodeFastStateExpiryMillis(state) {
     const expiresAt = Date.parse(state && state.expiresAt || '');
     return Number.isFinite(expiresAt) ? expiresAt : 0;
@@ -4483,6 +4393,9 @@ import { html, reactive } from '@arrow-js/core';
   function renderControlCodeFastStateDataset() {
     document.body.dataset.controlCodeFastState = String(controlCodeFastState && controlCodeFastState.status || 'missing');
     document.body.dataset.controlCodeFastReady = controlCodeFastStateFresh() ? 'true' : 'false';
+    if (controlCodeCleanupPendingRequestID && controlCodeFastStateFresh()) {
+      controlCodeCleanupPendingRequestID = '';
+    }
   }
 
   function scheduleControlCodeFastStateExpiryCheck() {
@@ -4497,42 +4410,8 @@ import { html, reactive } from '@arrow-js/core';
     controlCodeFastStateExpiryTimer = setTimeout(() => {
       controlCodeFastStateExpiryTimer = null;
       renderControlCodeFastStateDataset();
-      refreshControlCodeReadiness('control_code_fast_state_expired');
+      updateControlCodeSubmitAvailability();
     }, Math.min(delayMs, 60_000));
-  }
-
-  function refreshControlCodeReadiness(reason, options) {
-    const allowPrepare = !options || options.prepare !== false;
-    if (!liveFrameReadyForControlCode()) {
-      connectDirectVideo();
-      requestServerRecoveryDebounced(reason || 'control_code_wait_for_live_frame');
-    }
-    if (!spacetimeReadyForControlCode()) {
-      connectSpacetimeState().catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
-    }
-    if (allowPrepare && spacetimeReadyForControlCode() && !controlCodeFastStateFresh()) {
-      maybeAutoPrepareControlCode(reason || 'control_code_wait_for_fast_ready');
-    }
-    updateControlCodeSubmitAvailability();
-  }
-
-  function maybeAutoPrepareControlCode(reason) {
-    if (document.visibilityState === 'hidden') return;
-    if (!codeResultArea.hidden) return;
-    if (controlCodeAutoPrepareInFlight || !spacetimeReadyForControlCode()) return;
-    if (controlCodeFastStateFresh()) return;
-    const busy = controlCodeRequestOccupiesQueue();
-    if (busy) return;
-    const now = performance.now();
-    if (lastControlCodeAutoPrepareAt && now - lastControlCodeAutoPrepareAt < controlCodeAutoPrepareMinIntervalMs) return;
-    lastControlCodeAutoPrepareAt = now;
-    controlCodeAutoPrepareInFlight = true;
-    runSpacetimeMutation((client) => client.prepareControlCode(reason || 'page_ready_control_code'), 'control_code_auto_prepare')
-      .then(() => clientLog('control_code_auto_prepare_complete', reason || 'page_ready_control_code'))
-      .catch((error) => clientLog('control_code_auto_prepare_failed', error && error.message || 'prepare failed'))
-      .finally(() => {
-        controlCodeAutoPrepareInFlight = false;
-      });
   }
 
   function controlCodeRequestOccupiesPhone(request) {
@@ -4548,6 +4427,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function controlCodeRequestOccupiesQueue() {
+    if (controlCodeCleanupPendingRequestID) return true;
     if (controlCodeSubmitInFlight) return true;
     const requestsAvailable = Array.isArray(currentState && currentState.controlCodeRequests);
     const requests = requestsAvailable ? currentState.controlCodeRequests : [];
@@ -4580,9 +4460,6 @@ import { html, reactive } from '@arrow-js/core';
     const hotspotUnavailable = busy && codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
-    if (!busy && spacetimeReadyForControlCode() && !controlCodeFastStateFresh()) {
-      maybeAutoPrepareControlCode('page_ready_control_code');
-    }
   }
 
   function reconnectVideoForRecovery(reason) {

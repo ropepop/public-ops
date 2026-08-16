@@ -108,7 +108,9 @@ class TicketSpacetimeClient {
   private lastHeartbeatAt = 0;
   private lastStreamFocusActive: boolean | null = null;
   private viewerPresenceExpiryTimer = 0;
-  private readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void; timer: number }> = [];
+  private livePromise: Promise<void> | null = null;
+  private resolveLivePromise: (() => void) | null = null;
+  private rejectLivePromise: ((error: Error) => void) | null = null;
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
     this.cfg = cfg;
@@ -120,6 +122,7 @@ class TicketSpacetimeClient {
     const generation = this.connectionGeneration + 1;
     this.connectionGeneration = generation;
     this.manuallyDisconnected = false;
+    this.createLivePromise();
     this.connected = false;
     this.handlers.onStatus?.("connecting");
     try {
@@ -136,13 +139,14 @@ class TicketSpacetimeClient {
           this.connected = true;
           this.reconnectDelayMs = 1000;
           this.handlers.onStatus?.("live");
-          this.resolveReadyWaiters();
+          this.resolveLive();
           this.subscribeState(connection);
         })
         .onDisconnect(() => {
           if (generation !== this.connectionGeneration) return;
           this.connected = false;
           this.conn = null;
+          this.rejectLive(new Error("Spacetime connection disconnected"));
           if (this.manuallyDisconnected) return;
           this.handlers.onStatus?.("reconnecting");
           this.scheduleReconnect();
@@ -151,6 +155,7 @@ class TicketSpacetimeClient {
           if (generation !== this.connectionGeneration) return;
           this.connected = false;
           this.conn = null;
+          this.rejectLive(new Error(error && String(error) || "Spacetime connection failed"));
           this.handlers.onStatus?.("offline", error && String(error));
           this.scheduleReconnect();
         });
@@ -161,13 +166,14 @@ class TicketSpacetimeClient {
       this.conn = null;
       const connectionError = error instanceof Error ? error : new Error(String(error || "Spacetime connection failed"));
       this.handlers.onStatus?.("offline", connectionError.message);
-      this.rejectReadyWaiters(connectionError);
+      this.rejectLive(connectionError);
       if (!this.manuallyDisconnected) this.scheduleReconnect();
     }
   }
 
   disconnect(markDisconnected = true): void {
     this.connectionGeneration += 1;
+    this.rejectLive(new Error("Spacetime connection stopped"));
     if (this.reconnectTimer) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = 0;
@@ -189,7 +195,7 @@ class TicketSpacetimeClient {
 
   close(): void {
     this.manuallyDisconnected = true;
-    this.rejectReadyWaiters(new Error("Spacetime connection closed"));
+    this.rejectLive(new Error("Spacetime connection closed"));
     this.disconnect(true);
   }
 
@@ -244,10 +250,6 @@ class TicketSpacetimeClient {
 
   recoverStream(reason: string): Promise<void> {
     return this.streamAction("memberRecoverStream", reason);
-  }
-
-  prepareControlCode(reason: string): Promise<void> {
-    return this.streamAction("memberPrepareControlCode", reason);
   }
 
   requestControlCode(digits: string, expectedFastRevision = ""): Promise<void> {
@@ -477,7 +479,7 @@ class TicketSpacetimeClient {
   }
 
   private async callReducer(name: string, args: Record<string, unknown>): Promise<void> {
-    await this.whenReady(5000);
+    await this.whenLive(2000);
     const reducer = this.reducer(name);
     await reducer(args);
   }
@@ -520,31 +522,52 @@ class TicketSpacetimeClient {
     this.viewerPresenceExpiryTimer = 0;
   }
 
-  private whenReady(timeoutMs: number): Promise<void> {
+  private createLivePromise(): void {
+    this.livePromise = new Promise((resolve, reject) => {
+      this.resolveLivePromise = resolve;
+      this.rejectLivePromise = reject;
+    });
+    // The generation promise is also the admission gate. Keep a passive
+    // rejection handler attached so a cold page that has not submitted yet
+    // cannot produce an unhandled browser rejection.
+    void this.livePromise.catch(() => undefined);
+  }
+
+  private resolveLive(): void {
+    const resolve = this.resolveLivePromise;
+    this.resolveLivePromise = null;
+    this.rejectLivePromise = null;
+    resolve?.();
+  }
+
+  private rejectLive(error: Error): void {
+    const reject = this.rejectLivePromise;
+    this.resolveLivePromise = null;
+    this.rejectLivePromise = null;
+    reject?.(error);
+  }
+
+  private whenLive(timeoutMs: number): Promise<void> {
     if (this.isReady()) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    const livePromise = this.livePromise;
+    if (!livePromise) {
+      return Promise.reject(new Error("Spacetime connection is not starting"));
+    }
+    return new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => {
-        this.readyWaiters = this.readyWaiters.filter((waiter) => waiter.resolve !== resolve);
         reject(new Error("Spacetime connection is not ready"));
       }, Math.max(1, timeoutMs));
-      this.readyWaiters.push({ resolve, reject, timer });
+      livePromise.then(
+        () => {
+          window.clearTimeout(timer);
+          resolve();
+        },
+        (error) => {
+          window.clearTimeout(timer);
+          reject(error);
+        },
+      );
     });
-  }
-
-  private resolveReadyWaiters(): void {
-    const waiters = this.readyWaiters.splice(0);
-    for (const waiter of waiters) {
-      window.clearTimeout(waiter.timer);
-      waiter.resolve();
-    }
-  }
-
-  private rejectReadyWaiters(error: Error): void {
-    const waiters = this.readyWaiters.splice(0);
-    for (const waiter of waiters) {
-      window.clearTimeout(waiter.timer);
-      waiter.reject(error);
-    }
   }
 }
 
