@@ -14,8 +14,9 @@ Use this file to pick the smallest useful Markdown context for a kitty-gration o
 - `../workloads/satiksme-bot/AGENTS.md`: service-specific tests, deploy checks, and live-map pitfalls.
 - `../workloads/train-bot/README.md`: Vilciens/train app overview and test-login docs.
 - `../workloads/train-bot/AGENTS.md`: train app verification and public-cache cautions.
-- `../workloads/ticket-remote/README.md`: public ViVi ticket viewer runtime model.
-- `../workloads/ticket-remote/AGENTS.md`: ticket viewer auth, stream, control-code, and browser verification rules.
+- `../workloads/ticket-remote/CURRENT.md`: current Ticket product map. Read this first for Ticket work.
+- `../workloads/ticket-remote/AGENTS.md`: Ticket proof rules after the current map.
+- `../workloads/ticket-remote/README.md`: Ticket runtime model and production config.
 - `../workloads/operational-logging/README.md`: the one-database private logging
   schema, writer boundaries, retention, and migration contract.
 - For browser UI tasks, also read `architecture/WEB_UI_GUIDANCE.md`.
@@ -44,6 +45,8 @@ Do not load these by default:
 - `../workloads/*/ops/evidence/`: workload-local historical proof.
 - `../workloads/*/ops/monitoring/`: watch logs and dated monitoring writeups.
 - `superpowers/plans/archive/` or old dated plan files: useful for archaeology, not normal implementation context.
+- `archive/ticket/` and `archive/ticket` on the phone checkout: leftover Ticket pictures and proof packs.
+- `docs/archive/ticket/`: leftover Ticket plans and watch notes. Not the current product map.
 
 When a task asks for evidence or historical debugging, read the narrow timestamp/topic folder only and summarize findings back into the active runbook or architecture doc if the lesson is durable.
 

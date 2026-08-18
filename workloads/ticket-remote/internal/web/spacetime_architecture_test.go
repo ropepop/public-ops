@@ -697,6 +697,8 @@ func TestTicketSliderFingerProgressUsesOneCurrentSample(t *testing.T) {
 		"renderTicketSliderProgress",
 		"setPointerCapture(event.pointerId)",
 		"updateTicketSlider(",
+		"const livePictureReady = streamHasFreshRenderedFrame();",
+		"!livePictureReady",
 	} {
 		if !strings.Contains(browser, required) {
 			t.Fatalf("browser slider path missing %q", required)

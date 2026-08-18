@@ -1,3 +1,4 @@
+/* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
 
 (function () {
@@ -2162,6 +2163,7 @@ import { html, reactive } from '@arrow-js/core';
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
+      renderTicketInteraction(currentState && currentState.ticketInteraction);
       updateControlCodeSubmitAvailability();
       publishStreamDebug();
     } catch (error) {
@@ -4151,9 +4153,10 @@ import { html, reactive } from '@arrow-js/core';
     // Keep the detected slider visible as a locked, view-only region for other authorized
     // browsers while one browser owns the lease. Only the owner can receive pointer events.
     const sliderReady = status === 'unactivated_ready' || status === 'control_active';
+    const livePictureReady = streamHasFreshRenderedFrame();
     const bounds = interaction && Number(interaction.sliderRight) > Number(interaction.sliderLeft) && Number(interaction.sliderBottom) > Number(interaction.sliderTop)
       ? interaction : null;
-    if (!sliderReady || !bounds || !configured || !streamSize.width || !streamSize.height) {
+    if (!sliderReady || !bounds || !configured || !streamSize.width || !streamSize.height || !livePictureReady) {
       clearTicketSliderOverlay();
       return;
     }
@@ -4892,7 +4895,7 @@ import { html, reactive } from '@arrow-js/core';
     if (streamUnsupported) return;
     if (!viewerIsForeground()) {
       if (document.visibilityState === 'hidden') {
-        pauseVideoWhileHidden('chase_live_stream_hidden');
+        if (hasRenderedFrame && streamHasFreshRenderedFrame()) pauseVideoWhileHidden('chase_live_stream_hidden');
       }
       return;
     }
@@ -5089,8 +5092,12 @@ import { html, reactive } from '@arrow-js/core';
 	      lastHiddenWallAt = Date.now();
 	      clearActivationReconnectBurst();
 	      releaseScreenWakeLock('visibility_hidden');
-	      releaseStreamFocusAfterHiddenGrace('visibility_hidden');
-	      pauseVideoWhileHidden('visibility_hidden');
+	      if (hasRenderedFrame && streamHasFreshRenderedFrame()) {
+	        releaseStreamFocusAfterHiddenGrace('visibility_hidden');
+	        pauseVideoWhileHidden('visibility_hidden');
+	      } else {
+	        logResumeCheckpoint('activation_visibility_hidden_kept_open', { reason: 'cold_open' }, flow);
+	      }
 	    }
 	  });
 	  window.addEventListener('pageshow', (event) => {

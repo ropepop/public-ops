@@ -2,9 +2,11 @@
 
 Public manager for `ticket.jolkins.id.lv`.
 
-For agent-specific context, browser verification, auth-mode selection, and control-code pitfalls, start with [AGENTS.md](./AGENTS.md).
+Start with [CURRENT.md](./CURRENT.md). That is the live Ticket product map: open the signed-in page, get a live picture, swipe the oval, open a fresh unused ticket, or request a control code.
 
-The service validates the configured email identity, checks ticket membership in SpacetimeDB, and relays the active phone backend stream. Authenticated browsers request control codes through member-only Spacetime reducers; they never receive direct phone control.
+For agent rules and live-page proof, use [AGENTS.md](./AGENTS.md). For start, stop, and health, use the [Ticket runbook](../../docs/runbooks/MODULE_TICKET_REMOTE.md).
+
+The service checks Ticket membership, relays the phone stream to signed-in browsers, and lets a linked person register, reset, or request a control code. Browsers never receive direct phone control.
 
 ## Local Development
 

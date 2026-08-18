@@ -17,3 +17,9 @@ explicit deployment decision.
 
 The subscription bot has its own recovery boundary and final-state notes in
 [`subscription-bot/README.md`](./subscription-bot/README.md).
+
+## Ticket leftovers
+
+Leftover Ticket pictures, proof packs, and retired notes now live in [`ticket/`](./ticket/).
+That folder is backup only. Start live Ticket work from `workloads/ticket-remote/CURRENT.md`.
+

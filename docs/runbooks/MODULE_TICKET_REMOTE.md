@@ -1,7 +1,10 @@
 # ticket_remote Module Runbook
 
+Current Ticket product map: [CURRENT.md](../../workloads/ticket-remote/CURRENT.md).
+This runbook is for start, stop, health, and deploy. It is not the first product explanation.
+
 - Canonical operations: [ROOT_OPERATIONS](./ROOT_OPERATIONS.md)
-- Disaster recovery and standby requirements: [TICKET_REMOTE_DISASTER_RECOVERY](./TICKET_REMOTE_DISASTER_RECOVERY.md)
+- Disaster recovery, rare operator backup: [TICKET_REMOTE_DISASTER_RECOVERY](./TICKET_REMOTE_DISASTER_RECOVERY.md)
 
 ## Start / Stop / Restart
 
@@ -117,4 +120,5 @@ The production path currently has one kitty-gration host and one physical Pixel.
 
 ## Evidence Paths
 
-- `ops/evidence/ticket-remote/`
+New Ticket proof, if a task explicitly needs local artifacts, goes under `ops/evidence/ticket-remote/<timestamp-or-topic>/` with a short index.
+Leftover Ticket pictures and old proof packs now live in `archive/ticket/`. Do not start Ticket work there.
