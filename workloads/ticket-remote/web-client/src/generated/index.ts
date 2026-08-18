@@ -34,12 +34,15 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import TicketremoteMemberClaimTicketSliderReducer from "./ticketremote_member_claim_ticket_slider_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "./ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "./ticketremote_member_request_keyframe_reducer";
+import TicketremoteMemberRequestTicketResetReducer from "./ticketremote_member_request_ticket_reset_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "./ticketremote_member_set_stream_focus_reducer";
+import TicketremoteMemberUpdateTicketSliderReducer from "./ticketremote_member_update_ticket_slider_reducer";
 
 // Import all procedure arg schemas
 
@@ -50,6 +53,7 @@ import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_repo
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
 import TicketremoteStreamDesiredStateRow from "./ticketremote_stream_desired_state_table";
 import TicketremoteStreamViewerFocusRow from "./ticketremote_stream_viewer_focus_table";
+import TicketremoteTicketInteractionRow from "./ticketremote_ticket_interaction_table";
 
 /** Type-only namespace exports for generated type groups. */
 
@@ -196,16 +200,47 @@ const tablesSchema = __schema({
       { name: 'ticketremote_stream_viewer_focus_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteStreamViewerFocusRow),
+  ticketremote_ticket_interaction: __table({
+    name: 'ticketremote_ticket_interaction',
+    indexes: [
+      { accessor: 'backendId', name: 'ticketremote_ticket_interaction_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'backendId',
+      ] },
+      { accessor: 'expiresAt', name: 'ticketremote_ticket_interaction_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'expiresAt',
+      ] },
+      { accessor: 'id', name: 'ticketremote_ticket_interaction_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketBackend', name: 'ticketremote_ticket_interaction_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+      ] },
+      { accessor: 'ticketExpiresAt', name: 'ticketremote_ticket_interaction_ticket_id_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'expiresAt',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_ticket_interaction_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_ticket_interaction_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteTicketInteractionRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("ticketremote_member_claim_ticket_slider", TicketremoteMemberClaimTicketSliderReducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),
   __reducerSchema("ticketremote_member_request_control_code", TicketremoteMemberRequestControlCodeReducer),
   __reducerSchema("ticketremote_member_request_keyframe", TicketremoteMemberRequestKeyframeReducer),
+  __reducerSchema("ticketremote_member_request_ticket_reset", TicketremoteMemberRequestTicketResetReducer),
   __reducerSchema("ticketremote_member_set_stream_focus", TicketremoteMemberSetStreamFocusReducer),
+  __reducerSchema("ticketremote_member_update_ticket_slider", TicketremoteMemberUpdateTicketSliderReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */

@@ -37,6 +37,12 @@ const CONTROL_CODE_RESULT_TTL_MS: i64 = 60_000;
 const CONTROL_CODE_COMMAND_TTL_MS: i64 = 2 * 60_000;
 const LATEST_TICKET_RESELECT_COMMAND_TTL_MS: i64 = 10 * 60_000;
 const LATEST_TICKET_RESELECT_MAX_HORIZON_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+const TICKET_INTERACTION_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+const TICKET_SLIDER_LEASE_MS: i64 = 3_000;
+const TICKET_SLIDER_COOLDOWN_MS: i64 = 800;
+const TICKET_SLIDER_QUALIFY_HOLD_MS: u32 = 80;
+const TICKET_SLIDER_QUALIFY_TRAVEL_CSS: u32 = 10;
+const TICKET_ACTIVATION_RESET_DELAY_MS: i64 = 60 * 60 * 1000;
 const CONTROL_CODE_PHONE_TTL_MS: i64 = 105_000;
 const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
@@ -176,6 +182,14 @@ macro_rules! purge_ticket_history {
             $limit,
             $deleted
         );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_ticket_interaction,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
     }};
 }
 
@@ -194,6 +208,7 @@ macro_rules! bootstrap_stream_state {
         );
         upsert_phone_current_report($ctx, $ticket, $backend, "idle", false, "", "", "{}", $clock);
         upsert_relay_current_report($ctx, $ticket, $backend, 0, "idle", "", "0", "{}", $clock);
+        current_ticket_interaction($ctx, $ticket, $backend, $clock);
     }};
 }
 
@@ -406,6 +421,10 @@ pub struct TicketremoteLatestTicketReselectSchedule {
     pub triggeredAt: String,
     pub completedAt: String,
     pub expiresAt: String,
+    #[default(None::<String>)]
+    pub purpose: Option<String>,
+    #[default(None::<String>)]
+    pub activationRevision: Option<String>,
 }
 
 #[spacetimedb::table(
@@ -481,6 +500,48 @@ pub struct TicketremoteControlCodeFastState {
     pub streamLive: bool,
     #[index(btree)]
     pub updatedAt: String,
+}
+
+#[spacetimedb::table(accessor = ticketremote_ticket_interaction, public,
+    index(accessor = ticketBackend, btree(columns = [ticketId, backendId])),
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteTicketInteraction {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub backendId: String,
+    pub status: String,
+    pub interactionRevision: String,
+    pub activationRevision: String,
+    pub activationAt: String,
+    pub scheduledResetAt: String,
+    pub resetRequestId: String,
+    pub streamEpoch: String,
+    pub frameSequence: String,
+    pub phoneDisplayWidth: u32,
+    pub phoneDisplayHeight: u32,
+    pub sliderLeft: u32,
+    pub sliderTop: u32,
+    pub sliderRight: u32,
+    pub sliderBottom: u32,
+    pub ownerPublicId: String,
+    pub controlId: String,
+    pub leasePhase: String,
+    pub leaseExpiresAt: String,
+    pub latestInputSequence: String,
+    pub latestInputPhase: String,
+    pub latestProgress: u32,
+    pub lastAppliedSequence: String,
+    pub lastAppliedProgress: u32,
+    pub reason: String,
+    pub createdAt: String,
+    pub updatedAt: String,
+    #[index(btree)]
+    pub expiresAt: String,
 }
 
 #[spacetimedb::table(accessor = ticketremote_relay_current_report, public)]
@@ -657,7 +718,8 @@ cloned_projection! {
     TicketremoteServiceLatestTicketReselectSchedule from TicketremoteLatestTicketReselectSchedule
         with service_latest_ticket_reselect_schedule_from_row {
         id: String, ticketId: String, backendId: String, scheduledAt: String,
-        phoneLocalTime: String, phoneTimeZone: String, status: String, commandId: String,
+        phoneLocalTime: String, phoneTimeZone: String, purpose: Option<String>,
+        activationRevision: Option<String>, status: String, commandId: String,
         resultReason: String, resultPhase: String, proofSource: String, requestedBy: String,
         createdAt: String, updatedAt: String, triggeredAt: String, completedAt: String,
         expiresAt: String
@@ -814,6 +876,17 @@ member_reducers! {
         return Err("rate_limited".into());
     }
     let backend_id = clean_backend_id(&backendId);
+    if ticket_has_ticket_registration_reset_in_progress(ctx, &ticket.id, &backend_id, &now) {
+        return Err("ticket_reset_in_progress".into());
+    }
+    let interaction = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
+    let interaction_busy = matches!(
+        interaction.status.as_str(),
+        "reset_queued" | "preparing" | "control_active" | "completing"
+    ) || interaction.leasePhase == "active";
+    if interaction_busy {
+        return Err("ticket_mutation_in_progress".into());
+    }
     let fast_state_id = control_code_fast_state_id(&ticket.id, &backend_id);
     let fast_state = ctx
         .db
@@ -879,6 +952,214 @@ member_reducers! {
         stream_was_live,
         &now,
     );
+    }
+}
+
+member_reducers! {
+    ticketremote_member_request_ticket_reset(ctx; ticketId: String, backendId: String,
+        resetRequestId: String, reason: String; ticket = ticketId)
+        |ticket, _email, now| {
+    if ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now) {
+        return Err("control_code_in_progress".into());
+    }
+    let backend_id = clean_backend_id(&backendId);
+    let request_id = resetRequestId.trim();
+    if !valid_schedule_identifier(request_id) {
+        return Err("invalid_reset_request_id".into());
+    }
+    let current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
+    if ticket_has_ticket_registration_reset_in_progress(ctx, &ticket.id, &backend_id, &now) {
+        if current.resetRequestId != request_id {
+            return Err("ticket_reset_in_progress".into());
+        }
+    }
+    let lease_active = current.leasePhase == "active" &&
+        parse_time_ms(&current.leaseExpiresAt) > parse_time_ms(&now);
+    let cooldown_active = current.leasePhase == "cooldown" &&
+        parse_time_ms(&current.leaseExpiresAt) > parse_time_ms(&now);
+    let stale_lease = !matches!(current.leasePhase.as_str(), "" | "none") &&
+        parse_time_ms(&current.leaseExpiresAt) <= parse_time_ms(&now);
+    if lease_active || cooldown_active ||
+        current.status == "completing" ||
+        (current.status == "control_active" && !stale_lease) {
+        return Err("slider_in_progress".into());
+    }
+    if matches!(current.status.as_str(), "reset_queued" | "preparing") {
+        if current.resetRequestId == request_id {
+            return Ok(());
+        }
+        return Err("reset_in_progress".into());
+    }
+    let revision = interaction_revision(&ticket.id, &backend_id, request_id);
+    let mut current = current;
+    if stale_lease {
+        purge_pending_ticket_slider_commands(ctx, &ticket.id, &backend_id, &revision, &now);
+        current.ownerPublicId.clear();
+        current.controlId.clear();
+        current.leasePhase = "none".into();
+        current.leaseExpiresAt.clear();
+        current.latestInputSequence = "0".into();
+        current.latestInputPhase.clear();
+        current.latestProgress = 0;
+        current.lastAppliedSequence = "0".into();
+        current.lastAppliedProgress = 0;
+    }
+    let payload = serde_json::json!({
+        "type": "reset_ticket_registration",
+        "flow": "manual_ticket_reset",
+        "resetRequestId": request_id,
+        "source": "browser",
+        "reason": bounded_text(&non_empty(&reason, "ticket_reset_requested"), 120)
+    }).to_string();
+    insert_stream_command(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        &format!("{}:{}:reset_ticket_registration", ticket.id, request_id),
+        "reset_ticket_registration",
+        &revision,
+        "ticket_reset_requested",
+        &payload,
+        LATEST_TICKET_RESELECT_COMMAND_TTL_MS,
+        &now,
+    );
+    upsert_ticket_interaction(ctx, TicketremoteTicketInteraction {
+        status: "reset_queued".into(),
+        interactionRevision: revision,
+        resetRequestId: request_id.into(),
+        reason: bounded_text(&non_empty(&reason, "ticket_reset_requested"), 160),
+        updatedAt: now.clone(),
+        expiresAt: add_ms(&now, TICKET_INTERACTION_TTL_MS),
+        ..current
+    });
+    }
+}
+
+member_reducers! {
+    ticketremote_member_claim_ticket_slider(ctx; ticketId: String, backendId: String,
+        interactionRevision: String, controlId: String, initialInputSequence: String,
+        holdDurationMillis: u32, horizontalTravelCss: u32, verticalTravelCss: u32,
+        initialProgress: u32; ticket = ticketId)
+        |ticket, email, now| {
+    if ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now) {
+        return Err("control_code_in_progress".into());
+    }
+    let backend_id = clean_backend_id(&backendId);
+    let mut current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
+    let stale_lease = !matches!(current.leasePhase.as_str(), "" | "none") &&
+        parse_time_ms(&current.leaseExpiresAt) <= parse_time_ms(&now);
+    let recoverable = current.status == "unactivated_ready"
+        || current.status == "needs_attention"
+        || (current.status == "control_active" && stale_lease);
+    if !recoverable || current.interactionRevision != bounded_text(&interactionRevision, 160) {
+        return Err("slider_proof_stale".into());
+    }
+    if stale_lease || current.status == "needs_attention" {
+        current.status = "unactivated_ready".into();
+        current.ownerPublicId.clear();
+        current.controlId.clear();
+        current.leasePhase = "none".into();
+        current.leaseExpiresAt.clear();
+        current.latestInputSequence = "0".into();
+        current.latestInputPhase.clear();
+        current.latestProgress = 0;
+        current.lastAppliedSequence = "0".into();
+        current.lastAppliedProgress = 0;
+    }
+    if current.sliderRight <= current.sliderLeft || current.sliderBottom <= current.sliderTop {
+        return Err("slider_bounds_missing".into());
+    }
+    if holdDurationMillis < TICKET_SLIDER_QUALIFY_HOLD_MS
+        || horizontalTravelCss < TICKET_SLIDER_QUALIFY_TRAVEL_CSS
+        || verticalTravelCss.saturating_mul(3) > horizontalTravelCss.saturating_mul(2)
+    {
+        return Err("slider_qualification_failed".into());
+    }
+    let public_id = account_public_id(&email);
+    let control_id = controlId.trim();
+    let input_sequence = bounded_frame_ordinal(&initialInputSequence);
+    if !valid_schedule_identifier(control_id) || input_sequence == "0" {
+        return Err("invalid_slider_control".into());
+    }
+    let lease_available = current.leasePhase == "none" ||
+        parse_time_ms(&current.leaseExpiresAt) <= parse_time_ms(&now);
+    if !lease_available {
+        return Err("slider_busy".into());
+    }
+    purge_pending_ticket_slider_commands(ctx, &ticket.id, &backend_id, &current.interactionRevision, &now);
+    let progress = initialProgress.min(10_000);
+    let revision = current.interactionRevision.clone();
+    let payload = serde_json::json!({
+        "type": "slider_control_start",
+        "flow": "ticket_slider",
+        "interactionRevision": revision,
+        "controlId": control_id,
+        "initialInputSequence": input_sequence,
+        "initialProgress": progress
+    }).to_string();
+    insert_stream_command(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        &format!("{}:{}:slider_control_start", ticket.id, control_id),
+        "slider_control_start",
+        &revision,
+        "slider_lease_acquired",
+        &payload,
+        TICKET_INTERACTION_TTL_MS,
+        &now,
+    );
+    current.status = "control_active".into();
+    current.ownerPublicId = public_id;
+    current.controlId = control_id.into();
+    current.leasePhase = "active".into();
+    current.leaseExpiresAt = add_ms(&now, TICKET_SLIDER_LEASE_MS);
+    current.latestInputSequence = input_sequence;
+    current.latestInputPhase = "move".into();
+    current.latestProgress = progress;
+    current.reason = "slider_lease_acquired".into();
+    current.updatedAt = now.clone();
+    current.expiresAt = add_ms(&now, TICKET_INTERACTION_TTL_MS);
+    upsert_ticket_interaction(ctx, current);
+    }
+}
+
+member_reducers! {
+    ticketremote_member_update_ticket_slider(ctx; ticketId: String, backendId: String,
+        interactionRevision: String, controlId: String, inputSequence: String,
+        inputPhase: String, progress: u32; ticket = ticketId)
+        |ticket, email, now| {
+    let backend_id = clean_backend_id(&backendId);
+    let mut current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
+    if current.interactionRevision != bounded_text(&interactionRevision, 160) ||
+        current.controlId != controlId.trim() ||
+        current.ownerPublicId != account_public_id(&email) {
+        return Ok(());
+    }
+    if current.leasePhase != "active" || current.status != "control_active" {
+        return Ok(());
+    }
+    let sequence = bounded_frame_ordinal(&inputSequence);
+    if sequence == "0" || compare_ordinal(&sequence, &current.latestInputSequence) <= 0 {
+        return Ok(());
+    }
+    let phase = allowlisted(&inputPhase, &["move", "heartbeat", "up", "cancel"], "");
+    if phase.is_empty() {
+        return Err("invalid_slider_phase".into());
+    }
+    current.latestInputSequence = sequence;
+    current.latestInputPhase = phase.clone();
+    current.latestProgress = progress.min(10_000);
+    current.updatedAt = now.clone();
+    current.expiresAt = add_ms(&now, TICKET_INTERACTION_TTL_MS);
+    if matches!(phase.as_str(), "up" | "cancel") {
+        current.leasePhase = "cooldown".into();
+        current.leaseExpiresAt = add_ms(&now, TICKET_SLIDER_COOLDOWN_MS);
+        current.status = "unactivated_ready".into();
+    } else {
+        current.leaseExpiresAt = add_ms(&now, TICKET_SLIDER_LEASE_MS);
+    }
+    upsert_ticket_interaction(ctx, current);
     }
 }
 
@@ -1154,8 +1435,83 @@ pub fn ticketremote_schedule_latest_ticket_reselect(
         &phoneLocalTime,
         &phoneTimeZone,
         &requestedBy,
+        "latest_ticket_reselect",
+        "",
         &now_or(ctx, &nowArg),
     )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_schedule_activation_expiry_reset(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    activationRevision: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let activation_revision = bounded_text(&activationRevision, 160);
+    if activation_revision.is_empty() {
+        return Err("activation_revision_required".into());
+    }
+    let interaction = current_ticket_interaction(ctx, &ticketId, &backendId, &now);
+    if interaction.activationRevision != activation_revision
+        || interaction.activationAt.trim().is_empty()
+    {
+        return Err("activation_not_proven".into());
+    }
+    let activation_at_micros = parse_time_micros(&interaction.activationAt);
+    if activation_at_micros <= 0 {
+        return Err("activation_timestamp_invalid".into());
+    }
+    let expiry_at_micros =
+        activation_at_micros.saturating_add(TICKET_ACTIVATION_RESET_DELAY_MS.saturating_mul(1_000));
+    let scheduled_at_micros = if expiry_at_micros > ctx.timestamp.to_micros_since_unix_epoch() {
+        expiry_at_micros
+    } else {
+        // If Pixel or the database was unavailable past the expiry, enqueue the same reset
+        // immediately on the scheduler rather than manufacturing a new 60-minute window.
+        ctx.timestamp
+            .to_micros_since_unix_epoch()
+            .saturating_add(1_000_000)
+    };
+    let schedule_id = format!(
+        "{}:{}:activation_expiry:{}",
+        clean_ticket_id(&ticketId),
+        clean_backend_id(&backendId),
+        stable_stamp(&safe_token(&activation_revision, "activation"))
+    );
+    let result = schedule_latest_ticket_reselect(
+        ctx,
+        &ticketId,
+        &backendId,
+        &schedule_id,
+        scheduled_at_micros,
+        "",
+        "",
+        "pixel_activation",
+        "activation_expiry_reset",
+        &activation_revision,
+        &now,
+    );
+    if result.is_ok() {
+        if interaction.activationRevision == activation_revision {
+            upsert_ticket_interaction(
+                ctx,
+                TicketremoteTicketInteraction {
+                    scheduledResetAt: iso(Timestamp::from_micros_since_unix_epoch(
+                        scheduled_at_micros,
+                    )),
+                    reason: "activation_reset_scheduled".into(),
+                    updatedAt: now.clone(),
+                    expiresAt: add_ms(&now, TICKET_INTERACTION_TTL_MS),
+                    ..interaction
+                },
+            );
+        }
+    }
+    result
 }
 
 #[spacetimedb::reducer]
@@ -1195,8 +1551,8 @@ pub fn ticketremote_append_stream_command(
     let command_reason = non_empty(&reason, "stream_command");
     let background = suppressible_background_stream_command(&command_type);
     if (background
-            && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
-            && !idle_stream_command_is_allowed(&command_reason, &payloadJson))
+        && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
+        && !idle_stream_command_is_allowed(&command_reason, &payloadJson))
         || (background
             && !stream_command_is_requester_scoped(&command_reason, &payloadJson)
             && live_relay_suppresses_background_stream_command(
@@ -1260,6 +1616,131 @@ service_ticket_reducers! {
         upsert_relay_current_report(ctx, &ticket.id, &backendId, videoClients, &streamVerdict,
             &lastFrameAt, &framesForwarded, &statusJson, &now);
     }
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_update_ticket_interaction(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    status: String,
+    interactionRevision: String,
+    activationRevision: String,
+    activationAt: String,
+    scheduledResetAt: String,
+    resetRequestId: String,
+    streamEpoch: String,
+    frameSequence: String,
+    phoneDisplayWidth: u32,
+    phoneDisplayHeight: u32,
+    sliderBoundsJson: String,
+    ownerPublicId: String,
+    controlId: String,
+    leasePhase: String,
+    leaseExpiresAt: String,
+    latestInputSequence: String,
+    latestInputPhase: String,
+    latestProgress: u32,
+    lastAppliedSequence: String,
+    lastAppliedProgress: u32,
+    reason: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let backend_id = clean_backend_id(&backendId);
+    let mut current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
+    let bounds = serde_json::from_str::<serde_json::Value>(&sliderBoundsJson)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let incoming_sequence = bounded_frame_ordinal(&latestInputSequence);
+    let incoming_is_older = compare_ordinal(&current.latestInputSequence, &incoming_sequence) > 0;
+    let incoming_status = allowlisted(
+        &status,
+        &[
+            "activated",
+            "reset_queued",
+            "preparing",
+            "unactivated_ready",
+            "control_active",
+            "completing",
+            "needs_attention",
+            "failed",
+        ],
+        "needs_attention",
+    );
+    if incoming_status == "activated" && activationAt.trim().is_empty() {
+        current.activationAt = now.clone();
+    }
+    if incoming_status == "unactivated_ready" {
+        cancel_pending_activation_expiry_schedules(
+            ctx,
+            &ticket.id,
+            &backend_id,
+            &current.activationRevision,
+            &now,
+        );
+        current.activationAt = String::new();
+        current.scheduledResetAt = String::new();
+        current.activationRevision = String::new();
+        // A fresh registration proof starts a new slider revision. Do not let
+        // a previous browser lease or progress sample make the new thumb look
+        // occupied or partially moved.
+        current.ownerPublicId = String::new();
+        current.controlId = String::new();
+        current.leasePhase = "none".into();
+        current.leaseExpiresAt = String::new();
+        current.latestInputSequence = "0".into();
+        current.latestInputPhase = String::new();
+        current.latestProgress = 0;
+        current.lastAppliedSequence = "0".into();
+        current.lastAppliedProgress = 0;
+    }
+    current.status = incoming_status;
+    current.interactionRevision = bounded_text(
+        &non_empty(&interactionRevision, &current.interactionRevision),
+        160,
+    );
+    if !activationRevision.trim().is_empty() {
+        current.activationRevision = bounded_text(&activationRevision, 160);
+    }
+    if !activationAt.trim().is_empty() {
+        current.activationAt = bounded_text(&activationAt, 80);
+    }
+    if !scheduledResetAt.trim().is_empty() {
+        current.scheduledResetAt = bounded_text(&scheduledResetAt, 80);
+    }
+    if !resetRequestId.trim().is_empty() {
+        current.resetRequestId = bounded_text(&resetRequestId, 160);
+    }
+    current.streamEpoch = bounded_frame_ordinal(&streamEpoch);
+    current.frameSequence = bounded_frame_ordinal(&frameSequence);
+    current.phoneDisplayWidth = phoneDisplayWidth.min(10_000);
+    current.phoneDisplayHeight = phoneDisplayHeight.min(10_000);
+    current.sliderLeft = bounds.get("left").and_then(json_i64).unwrap_or(0).max(0) as u32;
+    current.sliderTop = bounds.get("top").and_then(json_i64).unwrap_or(0).max(0) as u32;
+    current.sliderRight = bounds.get("right").and_then(json_i64).unwrap_or(0).max(0) as u32;
+    current.sliderBottom = bounds.get("bottom").and_then(json_i64).unwrap_or(0).max(0) as u32;
+    current.ownerPublicId = bounded_text(&ownerPublicId, 64);
+    current.controlId = bounded_text(&controlId, 120);
+    current.leasePhase = allowlisted(&leasePhase, &["none", "active", "cooldown"], "none");
+    current.leaseExpiresAt = bounded_text(&leaseExpiresAt, 80);
+    if !incoming_is_older {
+        current.latestInputSequence = incoming_sequence;
+        current.latestInputPhase = allowlisted(
+            &latestInputPhase,
+            &["move", "heartbeat", "up", "cancel", ""],
+            "",
+        );
+        current.latestProgress = latestProgress.min(10_000);
+    }
+    current.lastAppliedSequence = bounded_frame_ordinal(&lastAppliedSequence);
+    current.lastAppliedProgress = lastAppliedProgress.min(10_000);
+    current.reason = bounded_text(&non_empty(&reason, &current.reason), 200);
+    current.updatedAt = now.clone();
+    current.expiresAt = add_ms(&now, TICKET_INTERACTION_TTL_MS);
+    upsert_ticket_interaction(ctx, current);
+    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -2055,6 +2536,8 @@ fn schedule_latest_ticket_reselect(
     phone_local_time: &str,
     phone_time_zone: &str,
     requested_by: &str,
+    purpose: &str,
+    activation_revision: &str,
     now: &str,
 ) -> Result<(), String> {
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
@@ -2067,14 +2550,29 @@ fn schedule_latest_ticket_reselect(
     if !valid_public_identifier(requested_by) {
         return Err("invalid_requested_by".into());
     }
+    let purpose = safe_token(purpose, "latest_ticket_reselect");
+    let activation_revision = bounded_text(activation_revision, 160);
     let phone_local_time = bounded_text(phone_local_time.trim(), 80);
     let phone_time_zone = bounded_text(phone_time_zone.trim(), 80);
-    if phone_local_time.is_empty() || phone_time_zone.is_empty() {
+    if purpose == "latest_ticket_reselect"
+        && (phone_local_time.is_empty() || phone_time_zone.is_empty())
+    {
         return Err("phone_local_time_required".into());
+    }
+    if purpose == "activation_expiry_reset" && activation_revision.is_empty() {
+        return Err("activation_revision_required".into());
     }
     let scheduled_at = iso(Timestamp::from_micros_since_unix_epoch(scheduled_at_micros));
     let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
     if let Some(existing) = table.id().find(schedule_id.to_string()) {
+        if purpose == "activation_expiry_reset"
+            && existing.ticketId == ticket.id
+            && existing.backendId == backend_id
+            && existing.activationRevision.as_deref().unwrap_or("") == activation_revision
+            && latest_ticket_reselect_idempotent_status(&existing.status)
+        {
+            return Ok(());
+        }
         if latest_ticket_reselect_submission_matches(
             &existing,
             &ticket.id,
@@ -2083,6 +2581,8 @@ fn schedule_latest_ticket_reselect(
             &phone_local_time,
             &phone_time_zone,
             requested_by,
+            &purpose,
+            &activation_revision,
         ) {
             return if latest_ticket_reselect_idempotent_status(&existing.status) {
                 Ok(())
@@ -2139,6 +2639,8 @@ fn schedule_latest_ticket_reselect(
         scheduledAt: scheduled_at.clone(),
         phoneLocalTime: phone_local_time,
         phoneTimeZone: phone_time_zone,
+        purpose: Some(purpose),
+        activationRevision: Some(activation_revision),
         status: "pending".into(),
         commandId: String::new(),
         resultReason: String::new(),
@@ -2206,6 +2708,47 @@ fn cancel_latest_ticket_reselect(
     Ok(())
 }
 
+fn cancel_pending_activation_expiry_schedules(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    activation_revision: &str,
+    now: &str,
+) {
+    let activation_revision = activation_revision.trim();
+    if activation_revision.is_empty() {
+        return;
+    }
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let table = ctx.db.ticketremote_latest_ticket_reselect_schedule();
+    let mut rows = Vec::new();
+    for status in ["pending", "queued", "running"] {
+        rows.extend(
+            table
+                .ticketBackendStatus()
+                .filter((&ticket_id, &backend_id, status))
+                .filter(|row| {
+                    row.purpose.as_deref() == Some("activation_expiry_reset")
+                        && row.activationRevision.as_deref() == Some(activation_revision)
+                }),
+        );
+    }
+    for existing in rows {
+        delete_latest_ticket_reselect_timers(ctx, &existing.id);
+        table.id().update(TicketremoteLatestTicketReselectSchedule {
+            status: "canceled".into(),
+            resultReason: "activation_reset_completed".into(),
+            resultPhase: "canceled".into(),
+            proofSource: "phone_worker".into(),
+            updatedAt: now.into(),
+            completedAt: now.into(),
+            expiresAt: add_ms(now, HISTORY_TTL_MS),
+            ..existing
+        });
+    }
+}
+
 fn trigger_scheduled_latest_ticket_reselect(
     ctx: &ReducerContext,
     timer: &TicketremoteLatestTicketReselectTimer,
@@ -2227,12 +2770,23 @@ fn trigger_scheduled_latest_ticket_reselect(
     let now = now(ctx);
     let command_id =
         latest_ticket_reselect_command_id(&existing.ticketId, &existing.backendId, &existing.id);
+    let purpose = existing.purpose.as_deref().unwrap_or("");
+    let activation_revision = existing.activationRevision.as_deref().unwrap_or("");
+    let activation_expiry = purpose == "activation_expiry_reset";
+    let command_reason = if activation_expiry {
+        "activation_expiry_reset"
+    } else {
+        "scheduled_latest_ticket_reselect"
+    };
     let payload = serde_json::json!({
         "type": "force_ticket_reselect",
         "source": "ticket_remote_schedule",
-        "reason": "scheduled_latest_ticket_reselect",
+        "flow": purpose,
+        "reason": command_reason,
         "backendId": existing.backendId,
         "scheduleId": existing.id,
+        "activationRevision": activation_revision,
+        "scheduledAt": existing.scheduledAt,
     })
     .to_string();
     let command = insert_stream_command(
@@ -2242,7 +2796,7 @@ fn trigger_scheduled_latest_ticket_reselect(
         &command_id,
         "force_ticket_reselect",
         &format!("schedule:{}", existing.id),
-        "scheduled_latest_ticket_reselect",
+        command_reason,
         &payload,
         LATEST_TICKET_RESELECT_COMMAND_TTL_MS,
         &now,
@@ -2277,6 +2831,8 @@ fn latest_ticket_reselect_submission_matches(
     phone_local_time: &str,
     phone_time_zone: &str,
     requested_by: &str,
+    purpose: &str,
+    activation_revision: &str,
 ) -> bool {
     row.ticketId == ticket_id
         && row.backendId == backend_id
@@ -2284,6 +2840,8 @@ fn latest_ticket_reselect_submission_matches(
         && row.phoneLocalTime == phone_local_time
         && row.phoneTimeZone == phone_time_zone
         && row.requestedBy == requested_by
+        && row.purpose.as_deref().unwrap_or("") == purpose
+        && row.activationRevision.as_deref().unwrap_or("") == activation_revision
 }
 
 fn latest_ticket_reselect_idempotent_status(status: &str) -> bool {
@@ -2558,6 +3116,31 @@ fn purge_pending_idle_background_commands(
             suppressible_background_stream_command(&row.commandType)
                 && !stream_command_is_control_code(&row.reason, &row.payloadJson)
         })
+        .collect();
+    for row in &rows {
+        ctx.db.ticketremote_stream_command().id().delete(&row.id);
+    }
+    if !rows.is_empty() {
+        upsert_stream_command_signal(ctx, &ticket_id, &backend_id, revision, now);
+    }
+    rows.len().min(u32::MAX as usize) as u32
+}
+
+fn purge_pending_ticket_slider_commands(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    revision: &str,
+    now: &str,
+) -> u32 {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let rows: Vec<_> = ctx
+        .db
+        .ticketremote_stream_command()
+        .ticketBackendStatus()
+        .filter((&ticket_id, &backend_id, "pending"))
+        .filter(|row| row.commandType == "slider_control_start")
         .collect();
     for row in &rows {
         ctx.db.ticketremote_stream_command().id().delete(&row.id);
@@ -2951,6 +3534,115 @@ fn upsert_control_code_fast_state(
     row
 }
 
+fn ticket_interaction_id(ticket_id: &str, backend_id: &str) -> String {
+    phone_row_id(ticket_id, backend_id)
+}
+
+fn default_ticket_interaction(
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) -> TicketremoteTicketInteraction {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let id = ticket_interaction_id(&ticket_id, &backend_id);
+    TicketremoteTicketInteraction {
+        id,
+        ticketId: ticket_id,
+        backendId: backend_id,
+        status: "needs_attention".into(),
+        interactionRevision: now.into(),
+        activationRevision: String::new(),
+        activationAt: String::new(),
+        scheduledResetAt: String::new(),
+        resetRequestId: String::new(),
+        streamEpoch: "0".into(),
+        frameSequence: "0".into(),
+        phoneDisplayWidth: 0,
+        phoneDisplayHeight: 0,
+        sliderLeft: 0,
+        sliderTop: 0,
+        sliderRight: 0,
+        sliderBottom: 0,
+        ownerPublicId: String::new(),
+        controlId: String::new(),
+        leasePhase: "none".into(),
+        leaseExpiresAt: String::new(),
+        latestInputSequence: "0".into(),
+        latestInputPhase: String::new(),
+        latestProgress: 0,
+        lastAppliedSequence: "0".into(),
+        lastAppliedProgress: 0,
+        reason: "interaction_not_proved".into(),
+        createdAt: now.into(),
+        updatedAt: now.into(),
+        expiresAt: add_ms(now, TICKET_INTERACTION_TTL_MS),
+    }
+}
+
+fn upsert_ticket_interaction(
+    ctx: &ReducerContext,
+    mut row: TicketremoteTicketInteraction,
+) -> TicketremoteTicketInteraction {
+    row.ticketId = clean_ticket_id(&row.ticketId);
+    row.backendId = clean_backend_id(&row.backendId);
+    row.id = ticket_interaction_id(&row.ticketId, &row.backendId);
+    row.status = safe_token(&row.status, "needs_attention");
+    row.leasePhase = allowlisted(&row.leasePhase, &["none", "active", "cooldown"], "none");
+    row.latestInputPhase = allowlisted(
+        &row.latestInputPhase,
+        &["move", "heartbeat", "up", "cancel", ""],
+        "",
+    );
+    row.latestProgress = row.latestProgress.min(10_000);
+    row.lastAppliedProgress = row.lastAppliedProgress.min(10_000);
+    let table = ctx.db.ticketremote_ticket_interaction();
+    if let Some(existing) = table.id().find(&row.id) {
+        if same_fields!(existing, row;
+            status, interactionRevision, activationRevision, activationAt, scheduledResetAt,
+            resetRequestId, streamEpoch, frameSequence, phoneDisplayWidth, phoneDisplayHeight,
+            sliderLeft, sliderTop, sliderRight, sliderBottom, ownerPublicId, controlId,
+            leasePhase, leaseExpiresAt, latestInputSequence, latestInputPhase, latestProgress,
+            lastAppliedSequence, lastAppliedProgress, reason
+        ) && parse_time_ms(&existing.expiresAt).saturating_sub(parse_time_ms(&row.updatedAt))
+            > TICKET_INTERACTION_TTL_MS / 2
+        {
+            return existing;
+        }
+        table.id().update(row.clone());
+    } else {
+        table.insert(row.clone());
+    }
+    row
+}
+
+fn current_ticket_interaction(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) -> TicketremoteTicketInteraction {
+    let id = ticket_interaction_id(ticket_id, backend_id);
+    ctx.db
+        .ticketremote_ticket_interaction()
+        .id()
+        .find(&id)
+        .unwrap_or_else(|| {
+            let row = default_ticket_interaction(ticket_id, backend_id, now);
+            ctx.db.ticketremote_ticket_interaction().insert(row.clone());
+            row
+        })
+}
+
+fn interaction_revision(ticket_id: &str, backend_id: &str, stamp: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        clean_ticket_id(ticket_id),
+        clean_backend_id(backend_id),
+        stable_stamp(stamp)
+    )
+}
+
 fn active_control_code_owner_rows(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -2979,6 +3671,27 @@ fn ticket_has_control_code_request_in_progress(
         .ticketId()
         .filter(&ticket_id)
         .any(|row| control_code_request_occupies_phone(&row, now))
+}
+
+fn ticket_has_ticket_registration_reset_in_progress(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) -> bool {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let now_ms = parse_time_ms(now);
+    ctx.db
+        .ticketremote_stream_command()
+        .ticketBackendStatus()
+        .filter((&ticket_id, &backend_id, "pending"))
+        .any(|row| {
+            parse_time_ms(&row.expiresAt) > now_ms
+                && (row.commandType == "reset_ticket_registration"
+                    || (row.commandType == "force_ticket_reselect"
+                        && row.payloadJson.contains("activation_expiry_reset")))
+        })
 }
 
 fn insert_control_code_public_request(
@@ -3271,6 +3984,8 @@ mod tests {
             scheduledAt: "2026-07-23T15:00:00Z".into(),
             phoneLocalTime: "2026-07-23T18:00".into(),
             phoneTimeZone: "Europe/Riga".into(),
+            purpose: Some("latest_ticket_reselect".into()),
+            activationRevision: Some(String::new()),
             status: "pending".into(),
             commandId: String::new(),
             resultReason: String::new(),
@@ -3310,6 +4025,8 @@ mod tests {
             "2026-07-23T18:00",
             "Europe/Riga",
             "1on9",
+            "latest_ticket_reselect",
+            "",
         ));
         assert!(!latest_ticket_reselect_submission_matches(
             &row,
@@ -3319,6 +4036,8 @@ mod tests {
             "2026-07-23T18:01",
             "Europe/Riga",
             "1on9",
+            "latest_ticket_reselect",
+            "",
         ));
         assert!(latest_ticket_reselect_idempotent_status(&row.status));
         row.status = "canceled".into();
@@ -3327,6 +4046,14 @@ mod tests {
         assert!(!latest_ticket_reselect_idempotent_status(&row.status));
         row.status = "succeeded".into();
         assert!(latest_ticket_reselect_idempotent_status(&row.status));
+    }
+
+    #[test]
+    fn activation_expiry_reset_cancellation_is_explicitly_scoped() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("cancel_pending_activation_expiry_schedules"));
+        assert!(source.contains("activation_reset_completed"));
+        assert!(source.contains("purpose.as_deref() == Some(\"activation_expiry_reset\")"));
     }
 
     #[test]

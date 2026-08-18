@@ -105,3 +105,37 @@ export const TicketremoteStreamViewerFocus = __t.object("TicketremoteStreamViewe
 });
 export type TicketremoteStreamViewerFocus = __Infer<typeof TicketremoteStreamViewerFocus>;
 
+export const TicketremoteTicketInteraction = __t.object("TicketremoteTicketInteraction", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  status: __t.string(),
+  interactionRevision: __t.string(),
+  activationRevision: __t.string(),
+  activationAt: __t.string(),
+  scheduledResetAt: __t.string(),
+  resetRequestId: __t.string(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  phoneDisplayWidth: __t.u32(),
+  phoneDisplayHeight: __t.u32(),
+  sliderLeft: __t.u32(),
+  sliderTop: __t.u32(),
+  sliderRight: __t.u32(),
+  sliderBottom: __t.u32(),
+  ownerPublicId: __t.string(),
+  controlId: __t.string(),
+  leasePhase: __t.string(),
+  leaseExpiresAt: __t.string(),
+  latestInputSequence: __t.string(),
+  latestInputPhase: __t.string(),
+  latestProgress: __t.u32(),
+  lastAppliedSequence: __t.string(),
+  lastAppliedProgress: __t.u32(),
+  reason: __t.string(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteTicketInteraction = __Infer<typeof TicketremoteTicketInteraction>;
+

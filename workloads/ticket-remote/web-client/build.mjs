@@ -31,9 +31,9 @@ execFileSync(
 );
 
 const keptBindings = new Set([
-  ...["control_code_fast_state", "control_code_request", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus"]
+  ...["control_code_fast_state", "control_code_request", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_interaction"]
     .map((name) => `ticketremote_${name}_table`),
-  ...["close_control_code", "confirm_control_code_browser_capture", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus"]
+  ...["close_control_code", "confirm_control_code_browser_capture", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus", "request_ticket_reset", "claim_ticket_slider", "update_ticket_slider"]
     .map((name) => `ticketremote_member_${name}_reducer`),
 ]);
 const allowedGeneratedFiles = new Set([

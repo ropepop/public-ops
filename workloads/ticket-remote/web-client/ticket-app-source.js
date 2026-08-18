@@ -179,6 +179,10 @@ import { html, reactive } from '@arrow-js/core';
   const panel = document.getElementById('panel');
   const presence = requireElement('#presence', 'presence');
   const requestCodeButton = requireElement('#requestControlCode', 'requestControlCode');
+  const requestTicketResetButton = requireElement('#requestTicketReset', 'requestTicketReset');
+  const ticketResetDetail = requireElement('#ticketResetDetail', 'ticketResetDetail');
+  const ticketActivationTimer = requireElement('#ticketActivationTimer', 'ticketActivationTimer');
+  const ticketSliderOverlay = requireElement('#ticketSliderOverlay', 'ticketSliderOverlay');
   const codeRequestState = requireElement('#codeRequestState', 'codeRequestState');
   const codeRequestDetail = requireElement('#codeRequestDetail', 'codeRequestDetail');
   const codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog');
@@ -194,7 +198,7 @@ import { html, reactive } from '@arrow-js/core';
   const codeResultTimer = requireElement('#controlCodeResultTimer', 'controlCodeResultTimer');
   const codeResultClose = requireElement('#closeControlCodeResult', 'closeControlCodeResult');
   const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');
-  if (!presence || !requestCodeButton || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
+  if (!presence || !requestCodeButton || !requestTicketResetButton || !ticketResetDetail || !ticketActivationTimer || !ticketSliderOverlay || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
   const presenceListAnchorKey = 'viewer-list-anchor';
@@ -208,10 +212,26 @@ import { html, reactive } from '@arrow-js/core';
   let hiddenStreamFocusTimer = null;
   let configured = false;
   let streamUnsupported = false;
-  let streamSize = { width: 540, height: 1080 };
+  let streamSize = { width: 540, height: 1080, sourceHeight: 2424, sourceTopCrop: 200, sourceVisibleHeight: 2224 };
   let currentState = null;
   let serverClockSkewMs = 0;
   let pointerStart = null;
+  let ticketSliderPointer = null;
+  let ticketSliderSequence = 0;
+  let ticketSliderResetInFlight = false;
+  let ticketSliderControlId = '';
+  let ticketSliderInteractionRevision = '';
+  let ticketSliderUpdateTimer = null;
+  let ticketSliderUpdateInFlight = false;
+  let ticketSliderHeartbeatTimer = null;
+  let ticketSliderLeaseExpiryTimer = null;
+  let ticketSliderPendingUpdate = null;
+  let ticketSliderState = 'idle';
+  let ticketSliderLatestProgress = 0;
+  let ticketSliderLocalProgress = 0;
+  const ticketSliderQualifyHoldMs = 80;
+  const ticketSliderQualifyTravelPx = 10;
+  const ticketSliderUpdateIntervalMs = 32;
   let connectedAt = 0;
   let videoSocketCreatedAt = 0;
   let videoConnectedAt = 0;
@@ -2216,7 +2236,13 @@ import { html, reactive } from '@arrow-js/core';
     if (shouldPreserveFrame) {
       redrawPreservedFrame();
     }
-    streamSize = { width, height };
+    streamSize = {
+      width,
+      height,
+      sourceHeight: Number(config.sourceHeight || height) || height,
+      sourceTopCrop: Math.max(0, Number(config.sourceTopCrop || 0) || 0),
+      sourceVisibleHeight: Number(config.sourceVisibleHeight || config.sourceHeight || height) || height
+    };
     currentStreamEpoch = Number(config.streamEpoch || 0);
     lastAcceptedFrameSequence = options.preserveSequence ? previousSequence : 0;
     lastAcceptedFrameTimestamp = options.preserveSequence ? previousTimestamp : 0;
@@ -4049,7 +4075,158 @@ import { html, reactive } from '@arrow-js/core';
     if (!relayStatus || String(relayStatus.streamVerdict || '') === 'live') {
       setStatus('Tiešraide rāda biļeti.');
     }
+    renderTicketInteraction(state.ticketInteraction);
     renderPresence(viewers, visibleViewerCount);
+  }
+
+  function ticketInteractionOwnsControl(interaction) {
+    const owner = String(interaction && interaction.ownerPublicId || '').trim();
+    const controlId = String(interaction && interaction.controlId || '').trim();
+    return Boolean(owner && localPublicID && owner === localPublicID && controlId && controlId === ticketSliderControlId);
+  }
+
+  function ticketInteractionIsBusy(interaction) {
+    return ['reset_queued', 'preparing', 'control_active', 'completing'].includes(String(interaction && interaction.status || ''));
+  }
+
+  function ticketInteractionLeaseExpired(interaction) {
+    const phase = String(interaction && interaction.leasePhase || '').trim();
+    if (!phase || phase === 'none') return false;
+    const expiresAt = Date.parse(String(interaction && interaction.leaseExpiresAt || ''));
+    return Number.isFinite(expiresAt) && expiresAt <= Date.now() + serverClockSkewMs;
+  }
+
+  function clearTicketSliderOverlay() {
+    if (ticketSliderPointer) return;
+    if (ticketSliderLeaseExpiryTimer) {
+      clearTimeout(ticketSliderLeaseExpiryTimer);
+      ticketSliderLeaseExpiryTimer = null;
+    }
+    ticketSliderOverlay.dataset.active = 'false';
+    ticketSliderOverlay.dataset.locked = 'false';
+    ticketSliderOverlay.style.removeProperty('left');
+    ticketSliderOverlay.style.removeProperty('top');
+    ticketSliderOverlay.style.removeProperty('width');
+    ticketSliderOverlay.style.removeProperty('height');
+    ticketSliderOverlay.setAttribute('aria-valuenow', '0');
+  }
+
+  function renderTicketSliderProgress(progress) {
+    const local = Math.max(0, Math.min(10000, Math.round(Number(progress) || 0)));
+    ticketSliderOverlay.setAttribute('aria-valuenow', String(Math.round(local / 100)));
+  }
+
+  function renderTicketInteraction(interaction) {
+    const status = String(interaction && interaction.status || '');
+    const staleControlLease = status === 'control_active' && ticketInteractionLeaseExpired(interaction);
+    const resetBusy = ticketSliderResetInFlight || ['reset_queued', 'preparing'].includes(status);
+    const controlBusy = controlCodeRequestOccupiesQueue();
+    requestTicketResetButton.disabled = Boolean(resetBusy || controlBusy || (['control_active', 'completing'].includes(status) && !staleControlLease));
+    if (ticketSliderResetInFlight) {
+      ticketResetDetail.textContent = 'Tālrunis atver jaunu nereģistrētu biļeti…';
+    } else if (status === 'reset_queued' || status === 'preparing') {
+      ticketResetDetail.textContent = 'Tālrunis gatavo jaunu nereģistrētu biļeti…';
+    } else if (status === 'unactivated_ready') {
+      ticketResetDetail.textContent = 'Biļete ir gatava aktivizēšanai ar slīdni straumē.';
+    } else if (status === 'activated') {
+      ticketResetDetail.textContent = 'Aktivizētā biļete paliek atvērta; pēc 60 minūtēm tā tiks sagatavota atkārtotai aktivizēšanai.';
+    } else if (status === 'needs_attention' || status === 'failed') {
+      ticketResetDetail.textContent = 'Tālruņa biļetes stāvoklis jāpārbauda.';
+    } else {
+      ticketResetDetail.textContent = 'Pieejams, kad tālrunis ir brīvs.';
+    }
+    const activationAt = Date.parse(String(interaction && interaction.activationAt || ''));
+    const resetAt = Date.parse(String(interaction && interaction.scheduledResetAt || ''));
+    if (status === 'activated' && Number.isFinite(resetAt) && resetAt > 0) {
+      const remaining = Math.max(0, resetAt - (Date.now() + serverClockSkewMs));
+      const minutes = Math.floor(remaining / 60000);
+      const seconds = Math.floor((remaining % 60000) / 1000);
+      ticketActivationTimer.textContent = `Atjaunošana pēc ${minutes} min ${String(seconds).padStart(2, '0')} s.`;
+    } else if (Number.isFinite(activationAt) && activationAt > 0) {
+      ticketActivationTimer.textContent = `Aktivizēts: ${new Date(activationAt).toLocaleString('lv-LV')}`;
+    } else {
+      ticketActivationTimer.textContent = '';
+    }
+    const owns = ticketInteractionOwnsControl(interaction);
+    // Keep the detected slider visible as a locked, view-only region for other authorized
+    // browsers while one browser owns the lease. Only the owner can receive pointer events.
+    const sliderReady = status === 'unactivated_ready' || status === 'control_active';
+    const bounds = interaction && Number(interaction.sliderRight) > Number(interaction.sliderLeft) && Number(interaction.sliderBottom) > Number(interaction.sliderTop)
+      ? interaction : null;
+    if (!sliderReady || !bounds || !configured || !streamSize.width || !streamSize.height) {
+      clearTicketSliderOverlay();
+      return;
+    }
+    const canvasRect = canvas.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
+    const phoneWidth = Math.max(1, Number(bounds.phoneDisplayWidth) || streamSize.width);
+    const phoneHeight = Math.max(1, Number(bounds.phoneDisplayHeight) || streamSize.height);
+    const sourceTopCrop = Math.max(0, Math.min(phoneHeight - 1, Number(streamSize.sourceTopCrop) || 0));
+    const sourceVisibleHeight = Math.max(1, Number(streamSize.sourceVisibleHeight) || (phoneHeight - sourceTopCrop));
+    const left = canvasRect.left - stageRect.left + (Number(bounds.sliderLeft) / phoneWidth) * canvasRect.width;
+    const top = canvasRect.top - stageRect.top + ((Number(bounds.sliderTop) - sourceTopCrop) / sourceVisibleHeight) * canvasRect.height;
+    const width = ((Number(bounds.sliderRight) - Number(bounds.sliderLeft)) / phoneWidth) * canvasRect.width;
+    const height = ((Number(bounds.sliderBottom) - Number(bounds.sliderTop)) / sourceVisibleHeight) * canvasRect.height;
+    if (!(width > 30 && height > 8)) {
+      clearTicketSliderOverlay();
+      return;
+    }
+    const liveEpoch = Number(currentStreamEpoch || 0);
+    const proofEpoch = Number(bounds.streamEpoch || 0);
+    if (liveEpoch && proofEpoch && liveEpoch !== proofEpoch) {
+      clearTicketSliderOverlay();
+      return;
+    }
+    ticketSliderOverlay.style.left = left + 'px';
+    ticketSliderOverlay.style.top = top + 'px';
+    ticketSliderOverlay.style.width = width + 'px';
+    ticketSliderOverlay.style.height = height + 'px';
+    ticketSliderOverlay.dataset.active = 'true';
+    // An empty owner means the lease is available. Only an occupied lease that
+    // belongs to another browser is view-only for this browser.
+    const ownerPublicId = String(bounds.ownerPublicId || '').trim();
+    ticketSliderOverlay.dataset.locked = ownerPublicId && !owns && !ticketInteractionLeaseExpired(interaction) ? 'true' : 'false';
+    if (ticketSliderLeaseExpiryTimer) {
+      clearTimeout(ticketSliderLeaseExpiryTimer);
+      ticketSliderLeaseExpiryTimer = null;
+    }
+    const leaseExpiresAt = Date.parse(String(interaction.leaseExpiresAt || ''));
+    if (Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now()) {
+      ticketSliderLeaseExpiryTimer = setTimeout(() => {
+        ticketSliderLeaseExpiryTimer = null;
+        renderTicketInteraction(currentState && currentState.ticketInteraction);
+      }, Math.min(leaseExpiresAt - Date.now() + 25, 60_000));
+    }
+    if (!ticketSliderPointer && ticketSliderInteractionRevision !== String(bounds.interactionRevision || '')) {
+      ticketSliderInteractionRevision = String(bounds.interactionRevision || '');
+      ticketSliderLatestProgress = Number(bounds.latestProgress || 0);
+      ticketSliderLocalProgress = ticketSliderLatestProgress;
+    }
+    if (!ticketSliderPointer) {
+      ticketSliderLocalProgress = Number(interaction.latestProgress || ticketSliderLocalProgress || 0);
+    }
+    renderTicketSliderProgress(ticketSliderLocalProgress);
+  }
+
+  function ticketResetRequestId() {
+    return `reset_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  async function requestTicketReset() {
+    if (ticketSliderResetInFlight || controlCodeRequestOccupiesQueue()) return;
+    ticketSliderResetInFlight = true;
+    renderTicketInteraction(currentState && currentState.ticketInteraction);
+    try {
+      await runSpacetimeMutation((client) => client.requestTicketReset(ticketResetRequestId(), 'browser_ticket_reset'), 'ticket_reset_request');
+      clientLog('ticket_reset_requested', 'page_panel');
+      setStatus('Jaunas biļetes sagatavošana nosūtīta.');
+    } catch (error) {
+      ticketResetDetail.textContent = localizePublicMessage(error && error.message || 'Biļeti neizdevās sagatavot.');
+      clientLog('ticket_reset_request_failed', error && error.message || 'request failed');
+    } finally {
+      ticketSliderResetInFlight = false;
+      renderTicketInteraction(currentState && currentState.ticketInteraction);
+    }
   }
 
   function rememberServerClock(state) {
@@ -4144,6 +4321,7 @@ import { html, reactive } from '@arrow-js/core';
     }, 80);
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
+  requestTicketResetButton.addEventListener('click', () => requestTicketReset());
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
@@ -4200,6 +4378,227 @@ import { html, reactive } from '@arrow-js/core';
       canvas.releasePointerCapture(pointerId);
     } catch (_) {}
   }
+
+  function ticketSliderProgressFromClientX(clientX) {
+    const rect = ticketSliderOverlay.getBoundingClientRect();
+    if (!rect.width) return 0;
+    return Math.max(0, Math.min(10000, Math.round(((clientX - rect.left) / rect.width) * 10000)));
+  }
+
+  function queueTicketSliderUpdate(inputPhase, progress, controlId = ticketSliderControlId, interactionRevision = ticketSliderInteractionRevision) {
+    if (!controlId || !interactionRevision) return;
+    ticketSliderPendingUpdate = {
+      inputPhase,
+      progress: Math.max(0, Math.min(10000, Math.round(progress))),
+      controlId,
+      interactionRevision
+    };
+    if (ticketSliderUpdateTimer || ticketSliderUpdateInFlight) return;
+    ticketSliderUpdateTimer = setTimeout(flushTicketSliderUpdate, 0);
+  }
+
+  async function flushTicketSliderUpdate() {
+    ticketSliderUpdateTimer = null;
+    if (ticketSliderUpdateInFlight) return;
+    const pending = ticketSliderPendingUpdate;
+    ticketSliderPendingUpdate = null;
+    if (!pending) return;
+    const sequence = String(++ticketSliderSequence);
+    ticketSliderUpdateInFlight = true;
+    try {
+      await runSpacetimeMutation((client) => client.updateTicketSlider(
+        sequence,
+        pending.controlId,
+        pending.interactionRevision,
+        pending.inputPhase,
+        pending.progress
+      ), 'ticket_slider_input');
+    } catch (error) {
+      clientLog('ticket_slider_input_failed', error && error.message || 'input failed');
+      ticketSliderState = 'cancelled';
+    } finally {
+      ticketSliderUpdateInFlight = false;
+    }
+    if (ticketSliderPendingUpdate && !ticketSliderUpdateTimer) {
+      ticketSliderUpdateTimer = setTimeout(flushTicketSliderUpdate, ticketSliderUpdateIntervalMs);
+    }
+  }
+
+  function cancelTicketSliderFromLifecycle(reason) {
+    const wasClaimed = Boolean(ticketSliderControlId && ticketSliderInteractionRevision &&
+      ticketSliderPointer && ticketSliderPointer.qualified);
+    if (wasClaimed) {
+      ticketSliderLatestProgress = ticketSliderLocalProgress;
+      queueTicketSliderUpdate('cancel', ticketSliderLatestProgress);
+      clientLog('ticket_slider_cancelled', reason || 'lifecycle');
+    }
+    ticketSliderPointer = null;
+    if (ticketSliderHeartbeatTimer) {
+      clearInterval(ticketSliderHeartbeatTimer);
+      ticketSliderHeartbeatTimer = null;
+    }
+    ticketSliderState = 'idle';
+    ticketSliderControlId = '';
+    ticketSliderInteractionRevision = '';
+  }
+
+  function cancelTicketSliderCandidate() {
+    if (ticketSliderUpdateTimer) {
+      clearTimeout(ticketSliderUpdateTimer);
+      ticketSliderUpdateTimer = null;
+    }
+    ticketSliderPendingUpdate = null;
+    if (ticketSliderHeartbeatTimer) {
+      clearInterval(ticketSliderHeartbeatTimer);
+      ticketSliderHeartbeatTimer = null;
+    }
+    const controlId = ticketSliderControlId;
+    const interactionRevision = ticketSliderInteractionRevision;
+    const progress = ticketSliderLatestProgress;
+    ticketSliderPointer = null;
+    ticketSliderState = 'idle';
+    if (controlId && interactionRevision) {
+      queueTicketSliderUpdate('cancel', progress, controlId, interactionRevision);
+    }
+    ticketSliderControlId = '';
+    ticketSliderInteractionRevision = '';
+  }
+
+  ticketSliderOverlay.addEventListener('pointerdown', (event) => {
+    if (ticketSliderOverlay.dataset.active !== 'true' || ticketSliderOverlay.dataset.locked === 'true') return;
+    if (event.button != null && event.button !== 0) return;
+    const interaction = currentState && currentState.ticketInteraction;
+    const interactionStatus = String(interaction && interaction.status || '');
+    if (!interaction || (
+      interactionStatus !== 'unactivated_ready' &&
+      !(interactionStatus === 'control_active' && ticketInteractionLeaseExpired(interaction))
+    )) return;
+    if (event.cancelable) event.preventDefault();
+    try { ticketSliderOverlay.setPointerCapture(event.pointerId); } catch (_) {}
+    ticketSliderPointer = {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType || 'touch',
+      clientX: event.clientX,
+      clientY: event.clientY,
+      at: performance.now(),
+      qualified: false,
+      claiming: false,
+      released: false
+    };
+    ticketSliderInteractionRevision = String(interaction.interactionRevision || '');
+    ticketSliderLocalProgress = ticketSliderProgressFromClientX(event.clientX);
+    renderTicketSliderProgress(ticketSliderLocalProgress);
+  });
+
+  ticketSliderOverlay.addEventListener('pointermove', (event) => {
+    const pointer = ticketSliderPointer;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    const dx = event.clientX - pointer.clientX;
+    const dy = event.clientY - pointer.clientY;
+    const heldMs = performance.now() - pointer.at;
+    const horizontal = dx >= ticketSliderQualifyTravelPx && Math.abs(dx) >= Math.max(1, Math.abs(dy) * 1.5);
+    if (!pointer.qualified) {
+      if (dx < -ticketSliderQualifyTravelPx || (Math.abs(dy) >= 28 && Math.abs(dy) > Math.abs(dx) * 1.5)) {
+        cancelTicketSliderCandidate();
+        return;
+      }
+      if (heldMs < ticketSliderQualifyHoldMs || !horizontal || pointer.claiming) return;
+      pointer.claiming = true;
+      pointer.qualified = true;
+      ticketSliderControlId = `slider_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      ticketSliderState = 'claiming';
+      const progress = ticketSliderProgressFromClientX(event.clientX);
+      ticketSliderLocalProgress = progress;
+      try {
+      ticketSliderOverlay.setPointerCapture(event.pointerId);
+      } catch (_) {}
+      const claimedControlId = ticketSliderControlId;
+      const claimInteractionRevision = ticketSliderInteractionRevision;
+      runSpacetimeMutation((client) => client.claimTicketSlider({
+        interactionRevision: claimInteractionRevision,
+        controlId: claimedControlId,
+        initialInputSequence: String(++ticketSliderSequence),
+        holdDurationMillis: Math.round(heldMs),
+        horizontalTravelCss: Math.round(dx),
+        verticalTravelCss: Math.round(Math.abs(dy)),
+        initialProgress: progress
+      }), 'ticket_slider_claim')
+        .then(() => {
+          // The pointer may be released while the lease reducer is in flight. Keep the
+          // request-owned identity alive until the reducer resolves, then close the lease
+          // explicitly instead of leaving Pixel with an abandoned active gesture.
+          if (ticketSliderPointer !== pointer || ticketSliderControlId !== claimedControlId ||
+            ticketSliderInteractionRevision !== claimInteractionRevision) {
+            queueTicketSliderUpdate('cancel', ticketSliderLocalProgress, claimedControlId, claimInteractionRevision);
+            return;
+          }
+          ticketSliderState = 'active';
+          if (ticketSliderHeartbeatTimer) clearInterval(ticketSliderHeartbeatTimer);
+          ticketSliderHeartbeatTimer = setInterval(() => {
+            if (ticketSliderPointer === pointer && ticketSliderState === 'active') {
+              queueTicketSliderUpdate('heartbeat', ticketSliderLocalProgress);
+            }
+          }, 500);
+          if (pointer.released) {
+            queueTicketSliderUpdate(
+              pointer.releasePhase || 'up',
+              ticketSliderLocalProgress,
+              claimedControlId,
+              claimInteractionRevision
+            );
+            ticketSliderPointer = null;
+            if (ticketSliderHeartbeatTimer) {
+              clearInterval(ticketSliderHeartbeatTimer);
+              ticketSliderHeartbeatTimer = null;
+            }
+            ticketSliderState = 'idle';
+            ticketSliderControlId = '';
+            ticketSliderInteractionRevision = '';
+          } else {
+            queueTicketSliderUpdate('move', ticketSliderLocalProgress, claimedControlId, claimInteractionRevision);
+          }
+        })
+        .catch((error) => {
+          clientLog('ticket_slider_claim_failed', error && error.message || 'claim failed');
+          cancelTicketSliderCandidate();
+        });
+      return;
+    }
+    if (event.cancelable) event.preventDefault();
+    ticketSliderLocalProgress = ticketSliderProgressFromClientX(event.clientX);
+    renderTicketSliderProgress(ticketSliderLocalProgress);
+    if (ticketSliderState === 'active') queueTicketSliderUpdate('move', ticketSliderLocalProgress);
+  });
+
+  function finishTicketSliderPointer(event, phase) {
+    const pointer = ticketSliderPointer;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (pointer.qualified && ticketSliderState === 'active') {
+      ticketSliderLatestProgress = ticketSliderLocalProgress;
+      queueTicketSliderUpdate(phase, ticketSliderLocalProgress);
+    } else if (pointer.qualified && ticketSliderState === 'claiming') {
+      // Do not discard the lease identity while claimTicketSlider is still in flight.
+      // The claim completion handler will send the matching up/cancel event immediately.
+      pointer.released = true;
+      pointer.releasePhase = phase;
+      ticketSliderLatestProgress = ticketSliderLocalProgress;
+    }
+    try { ticketSliderOverlay.releasePointerCapture(event.pointerId); } catch (_) {}
+    if (pointer.released && ticketSliderState === 'claiming') return;
+    ticketSliderPointer = null;
+    if (phase !== 'move') {
+      if (ticketSliderHeartbeatTimer) {
+        clearInterval(ticketSliderHeartbeatTimer);
+        ticketSliderHeartbeatTimer = null;
+      }
+      ticketSliderState = 'idle';
+      ticketSliderControlId = '';
+      ticketSliderInteractionRevision = '';
+    }
+  }
+
+  ticketSliderOverlay.addEventListener('pointerup', (event) => finishTicketSliderPointer(event, 'up'));
+  ticketSliderOverlay.addEventListener('pointercancel', (event) => finishTicketSliderPointer(event, 'cancel'));
 
   canvas.addEventListener('pointerdown', (event) => {
     if (!configured) return;
@@ -4682,6 +5081,7 @@ import { html, reactive } from '@arrow-js/core';
       }
       recoverAfterVisibilityResume('visibility_resume');
 	    } else if (document.visibilityState === 'hidden') {
+	      cancelTicketSliderFromLifecycle('visibility_hidden');
 	      hiddenDecoderTransientLogged = false;
 	      const flow = startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });
 	      logResumeCheckpoint('activation_visibility_hidden', { reason: 'hidden' }, flow);
@@ -4714,6 +5114,7 @@ import { html, reactive } from '@arrow-js/core';
 	    startActivationResumeFlow('focus', 'focus');
 	  });
 	  window.addEventListener('pagehide', (event) => {
+	    cancelTicketSliderFromLifecycle(event && event.persisted ? 'pagehide_cached' : 'pagehide');
 	    const flow = startActivationResumeFlow(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide', { pauseBurst: true });
 	    logResumeCheckpoint('activation_pagehide', {
 	      cache: resumeBooleanLabel(Boolean(event && event.persisted))

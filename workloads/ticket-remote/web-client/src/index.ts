@@ -262,6 +262,43 @@ class TicketSpacetimeClient {
     });
   }
 
+  requestTicketReset(resetRequestId: string, reason = "ticket_reset_requested"): Promise<void> {
+    return this.callReducer("memberRequestTicketReset", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      resetRequestId,
+      reason,
+    });
+  }
+
+  claimTicketSlider(args: {
+    interactionRevision: string;
+    controlId: string;
+    initialInputSequence: string;
+    holdDurationMillis: number;
+    horizontalTravelCss: number;
+    verticalTravelCss: number;
+    initialProgress: number;
+  }): Promise<void> {
+    return this.callReducer("memberClaimTicketSlider", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      ...args,
+    });
+  }
+
+  updateTicketSlider(inputSequence: string, controlId: string, interactionRevision: string, inputPhase: string, progress: number): Promise<void> {
+    return this.callReducer("memberUpdateTicketSlider", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      interactionRevision,
+      controlId,
+      inputSequence,
+      inputPhase,
+      progress,
+    });
+  }
+
   confirmControlCodeBrowserCapture(requestId: string, candidateFrameEpoch: unknown, candidateFrameSequence: unknown, acceptedReason: string): Promise<void> {
     return this.callReducer("memberConfirmControlCodeBrowserCapture", {
       ticketId: this.cfg.ticketId,
@@ -330,6 +367,7 @@ class TicketSpacetimeClient {
         `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
+        `SELECT * FROM ticketremote_ticket_interaction WHERE id = ${backendRow}`,
       ]);
   }
 
@@ -344,6 +382,8 @@ class TicketSpacetimeClient {
     const controlCodeFastState = tableRows(tableAccessor(db, "control_code_fast_state"))
       .find((row) => rowId(row) === backendRow) || null;
     const relayReport = tableRows(tableAccessor(db, "relay_current_report"))
+      .find((row) => rowId(row) === backendRow) || null;
+    const ticketInteraction = tableRows(tableAccessor(db, "ticket_interaction"))
       .find((row) => rowId(row) === backendRow) || null;
     const viewerFocusRows = activeViewerFocusRows(
       tableRows(tableAccessor(db, "stream_viewer_focus")),
@@ -425,6 +465,34 @@ class TicketSpacetimeClient {
         streamLive: controlCodeFastState.streamLive ?? controlCodeFastState.stream_live === true,
         updatedAt: String(controlCodeFastState.updatedAt || controlCodeFastState.updated_at || ""),
       } : null,
+      ticketInteraction: ticketInteraction ? {
+        status: String(ticketInteraction.status || ""),
+        interactionRevision: String(ticketInteraction.interactionRevision || ticketInteraction.interaction_revision || ""),
+        activationRevision: String(ticketInteraction.activationRevision || ticketInteraction.activation_revision || ""),
+        activationAt: String(ticketInteraction.activationAt || ticketInteraction.activation_at || ""),
+        scheduledResetAt: String(ticketInteraction.scheduledResetAt || ticketInteraction.scheduled_reset_at || ""),
+        resetRequestId: String(ticketInteraction.resetRequestId || ticketInteraction.reset_request_id || ""),
+        streamEpoch: String(ticketInteraction.streamEpoch || ticketInteraction.stream_epoch || "0"),
+        frameSequence: String(ticketInteraction.frameSequence || ticketInteraction.frame_sequence || "0"),
+        phoneDisplayWidth: Number(ticketInteraction.phoneDisplayWidth ?? ticketInteraction.phone_display_width ?? 0),
+        phoneDisplayHeight: Number(ticketInteraction.phoneDisplayHeight ?? ticketInteraction.phone_display_height ?? 0),
+        sliderLeft: Number(ticketInteraction.sliderLeft ?? ticketInteraction.slider_left ?? 0),
+        sliderTop: Number(ticketInteraction.sliderTop ?? ticketInteraction.slider_top ?? 0),
+        sliderRight: Number(ticketInteraction.sliderRight ?? ticketInteraction.slider_right ?? 0),
+        sliderBottom: Number(ticketInteraction.sliderBottom ?? ticketInteraction.slider_bottom ?? 0),
+        ownerPublicId: String(ticketInteraction.ownerPublicId || ticketInteraction.owner_public_id || ""),
+        controlId: String(ticketInteraction.controlId || ticketInteraction.control_id || ""),
+        leasePhase: String(ticketInteraction.leasePhase || ticketInteraction.lease_phase || "none"),
+        leaseExpiresAt: String(ticketInteraction.leaseExpiresAt || ticketInteraction.lease_expires_at || ""),
+        latestInputSequence: String(ticketInteraction.latestInputSequence || ticketInteraction.latest_input_sequence || "0"),
+        latestInputPhase: String(ticketInteraction.latestInputPhase || ticketInteraction.latest_input_phase || ""),
+        latestProgress: Number(ticketInteraction.latestProgress ?? ticketInteraction.latest_progress ?? 0),
+        lastAppliedSequence: String(ticketInteraction.lastAppliedSequence || ticketInteraction.last_applied_sequence || "0"),
+        lastAppliedProgress: Number(ticketInteraction.lastAppliedProgress ?? ticketInteraction.last_applied_progress ?? 0),
+        reason: String(ticketInteraction.reason || ""),
+        updatedAt: String(ticketInteraction.updatedAt || ticketInteraction.updated_at || ""),
+        expiresAt: String(ticketInteraction.expiresAt || ticketInteraction.expires_at || ""),
+      } : null,
       relayCurrentReport: relayReport ? {
         backendId: String(relayReport.backendId || relayReport.backend_id || ""),
         videoClients: Number(relayReport.videoClients ?? relayReport.video_clients ?? 0),
@@ -464,7 +532,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request"]
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction"]
       .map((name) => tableAccessor(source, name));
   }
 

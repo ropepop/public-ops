@@ -672,6 +672,55 @@ func removedSpacetimeMarkers() []string {
 	}
 }
 
+func TestTicketSliderFingerProgressUsesOneCurrentSample(t *testing.T) {
+	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
+	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
+	page := ticketRemoteSourceFile(t, "internal", "web", "static", "index.html.tmpl")
+	for _, required := range []string{
+		"const TICKET_SLIDER_QUALIFY_HOLD_MS: u32 = 80;",
+		"const TICKET_SLIDER_QUALIFY_TRAVEL_CSS: u32 = 10;",
+		"holdDurationMillis < TICKET_SLIDER_QUALIFY_HOLD_MS",
+		"horizontalTravelCss < TICKET_SLIDER_QUALIFY_TRAVEL_CSS",
+		"current.status == \"needs_attention\"",
+	} {
+		if !strings.Contains(module, required) {
+			t.Fatalf("Spacetime slider claim missing %q", required)
+		}
+	}
+	if strings.Contains(module, "holdDurationMillis < 500") || strings.Contains(module, "horizontalTravelCss < 50") {
+		t.Fatal("Spacetime slider claim still uses the slow 500ms/50px gate")
+	}
+	for _, required := range []string{
+		"const ticketSliderQualifyHoldMs = 80;",
+		"const ticketSliderQualifyTravelPx = 10;",
+		"ticketSliderProgressFromClientX",
+		"renderTicketSliderProgress",
+		"setPointerCapture(event.pointerId)",
+		"updateTicketSlider(",
+	} {
+		if !strings.Contains(browser, required) {
+			t.Fatalf("browser slider path missing %q", required)
+		}
+	}
+	if strings.Contains(browser, "heldMs < 500") || strings.Contains(browser, "dx >= 50") {
+		t.Fatal("browser slider path still uses the slow 500ms/50px gate")
+	}
+	if strings.Contains(page, `id="ticketSliderLocalThumb"`) || strings.Contains(page, `id="ticketSliderAppliedThumb"`) {
+		t.Fatal("ticket overlay still includes extra moving thumbs")
+	}
+	if strings.Contains(browser, "ticketSliderLocalThumb") || strings.Contains(browser, "renderTicketSliderThumbs") {
+		t.Fatal("browser slider path still draws extra overlay thumbs")
+	}
+	for _, required := range []string{
+		`id="ticketSliderOverlay"`,
+		`role="slider"`,
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("ticket overlay missing %q", required)
+		}
+	}
+}
+
 func rustItemChunk(t *testing.T, source string, marker string) string {
 	t.Helper()
 	start := strings.Index(source, marker)
