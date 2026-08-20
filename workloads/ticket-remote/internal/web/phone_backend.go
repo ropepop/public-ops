@@ -14,6 +14,8 @@ import (
 	"ticketremote/internal/state"
 )
 
+const backgroundKeyframeMinInterval = 2500 * time.Millisecond
+
 func (s *Server) activePhoneBackend() config.PhoneBackend {
 	s.backendMu.RLock()
 	defer s.backendMu.RUnlock()
@@ -239,8 +241,16 @@ func (s *Server) requestPhoneKeyframe(reason string) {
 	if s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
 		return
 	}
+	background := backgroundKeyframeDedupEligible(reason)
+	if background && !s.beginBackgroundKeyframe(time.Now()) {
+		s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+		return
+	}
 	s.direct.recordKeyframeRequested()
 	go func() {
+		if background {
+			defer s.finishBackgroundKeyframe()
+		}
 		if err := s.sendPhoneKeyframe(reason); err != nil {
 			s.recordRuntimeErrorAsync("phone_keyframe_request_failed", reason, err, map[string]any{"reason": reason})
 		}
@@ -251,8 +261,44 @@ func (s *Server) requestPhoneKeyframeNow(reason string) error {
 	if s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
 		return nil
 	}
+	background := backgroundKeyframeDedupEligible(reason)
+	if background && !s.beginBackgroundKeyframe(time.Now()) {
+		s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+		return nil
+	}
+	if background {
+		defer s.finishBackgroundKeyframe()
+	}
 	s.direct.recordKeyframeRequested()
 	return s.sendPhoneKeyframe(reason)
+}
+
+func (s *Server) beginBackgroundKeyframe(now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.backgroundKeyframeMu.Lock()
+	defer s.backgroundKeyframeMu.Unlock()
+	if s.backgroundKeyframeInFlight || (!s.lastBackgroundKeyframeAt.IsZero() && now.Sub(s.lastBackgroundKeyframeAt) < backgroundKeyframeMinInterval) {
+		return false
+	}
+	s.backgroundKeyframeInFlight = true
+	s.lastBackgroundKeyframeAt = now
+	return true
+}
+
+func (s *Server) finishBackgroundKeyframe() {
+	s.backgroundKeyframeMu.Lock()
+	s.backgroundKeyframeInFlight = false
+	s.backgroundKeyframeMu.Unlock()
+}
+
+func backgroundKeyframeDedupEligible(reason string) bool {
+	cleanReason := strings.ToLower(cleanStreamControlText(reason, "keyframe"))
+	if strings.Contains(cleanReason, "control_code") || cleanReason == "phone_config_active_viewer" {
+		return false
+	}
+	return backgroundStreamCommandRequiresDemand("keyframe", cleanReason)
 }
 
 func (s *Server) sendPhoneKeyframe(reason string) error {

@@ -24,6 +24,12 @@ pub struct TicketremoteLatestTicketReselectSchedule {
     pub triggered_at: String,
     pub completed_at: String,
     pub expires_at: String,
+    pub purpose: Option<String>,
+    pub activation_revision: Option<String>,
+    pub activation_attempt_id: Option<String>,
+    pub original_due_at: Option<String>,
+    pub next_retry_at: Option<String>,
+    pub retry_attempt: u32,
 }
 
 impl __sdk::InModule for TicketremoteLatestTicketReselectSchedule {
@@ -54,6 +60,17 @@ pub struct TicketremoteLatestTicketReselectScheduleCols {
     pub triggered_at: __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, String>,
     pub completed_at: __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, String>,
     pub expires_at: __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, String>,
+    pub purpose:
+        __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, Option<String>>,
+    pub activation_revision:
+        __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, Option<String>>,
+    pub activation_attempt_id:
+        __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, Option<String>>,
+    pub original_due_at:
+        __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, Option<String>>,
+    pub next_retry_at:
+        __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, Option<String>>,
+    pub retry_attempt: __sdk::__query_builder::Col<TicketremoteLatestTicketReselectSchedule, u32>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteLatestTicketReselectSchedule {
@@ -77,6 +94,18 @@ impl __sdk::__query_builder::HasCols for TicketremoteLatestTicketReselectSchedul
             triggered_at: __sdk::__query_builder::Col::new(table_name, "triggered_at"),
             completed_at: __sdk::__query_builder::Col::new(table_name, "completed_at"),
             expires_at: __sdk::__query_builder::Col::new(table_name, "expires_at"),
+            purpose: __sdk::__query_builder::Col::new(table_name, "purpose"),
+            activation_revision: __sdk::__query_builder::Col::new(
+                table_name,
+                "activation_revision",
+            ),
+            activation_attempt_id: __sdk::__query_builder::Col::new(
+                table_name,
+                "activation_attempt_id",
+            ),
+            original_due_at: __sdk::__query_builder::Col::new(table_name, "original_due_at"),
+            next_retry_at: __sdk::__query_builder::Col::new(table_name, "next_retry_at"),
+            retry_attempt: __sdk::__query_builder::Col::new(table_name, "retry_attempt"),
         }
     }
 }

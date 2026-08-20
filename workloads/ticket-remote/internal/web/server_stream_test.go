@@ -84,6 +84,49 @@ func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 	waitForPhoneSignalCounts(t, phoneCommands, map[string]int{"start": 1, "keyframe": 1}, "prewarm stream commands")
 }
 
+func TestStreamPrewarmQueuesStartBeforeKeyframe(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+
+	server.prewarmStreamForSession("ordered-startup", "ordered_test")
+	readCommand := func() string {
+		t.Helper()
+		select {
+		case message := <-phoneCommands:
+			return message
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for ordered prewarm command")
+			return ""
+		}
+	}
+	first := phoneSignalType(readCommand())
+	second := phoneSignalType(readCommand())
+	if first != "start" || second != "keyframe" {
+		t.Fatalf("prewarm commands were not ordered start then keyframe: first=%q second=%q", first, second)
+	}
+}
+
 func TestAuthenticatedIndexPrewarmsPhoneRelayBeforeBrowserVideoSocket(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 
@@ -1158,6 +1201,31 @@ func TestPhoneRecoveryCommandQueueIsServerRateLimited(t *testing.T) {
 	waitForPhoneSignalCounts(t, phoneSignals, map[string]int{"recover_stream": 1}, "first recovery command")
 	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
 		t.Fatalf("server recovery cooldown allowed duplicate recover_stream commands: %d", got)
+	}
+}
+
+func TestBackgroundKeyframeQueueCoalescesAcrossReconnectingViewers(t *testing.T) {
+	server := &Server{}
+	now := time.Now()
+	if !server.beginBackgroundKeyframe(now) {
+		t.Fatal("first background keyframe should acquire the queue gate")
+	}
+	if server.beginBackgroundKeyframe(now.Add(time.Second)) {
+		t.Fatal("replacement viewer queued a keyframe while the first write was in flight")
+	}
+	server.finishBackgroundKeyframe()
+	if server.beginBackgroundKeyframe(now.Add(2 * time.Second)) {
+		t.Fatal("replacement viewer queued a keyframe inside the cooldown")
+	}
+	if !server.beginBackgroundKeyframe(now.Add(backgroundKeyframeMinInterval)) {
+		t.Fatal("a later page generation should be allowed after the cooldown")
+	}
+	server.finishBackgroundKeyframe()
+	if backgroundStreamCommandRequiresDemand("keyframe", "control_code_result_marker_low_latency") {
+		t.Fatal("interactive control-code keyframes must bypass the background gate")
+	}
+	if backgroundKeyframeDedupEligible("phone_config_active_viewer") {
+		t.Fatal("a newly received phone config must be followed by its required fresh keyframe")
 	}
 }
 

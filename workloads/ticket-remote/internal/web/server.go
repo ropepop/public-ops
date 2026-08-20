@@ -54,10 +54,13 @@ type Server struct {
 	lastPixelTicketEvent  pixelTicketEvent
 	lastPixelTicketHealth string
 
-	phoneStartMu           sync.Mutex
-	lastPhoneStartAttempt  time.Time
-	phoneHTTPStartInFlight bool
-	lastPhoneHTTPStartAt   time.Time
+	phoneStartMu               sync.Mutex
+	lastPhoneStartAttempt      time.Time
+	phoneHTTPStartInFlight     bool
+	lastPhoneHTTPStartAt       time.Time
+	backgroundKeyframeMu       sync.Mutex
+	backgroundKeyframeInFlight bool
+	lastBackgroundKeyframeAt   time.Time
 
 	streamRecoveryMu            sync.Mutex
 	lastStreamRecoveryAt        time.Time
@@ -79,6 +82,9 @@ type Server struct {
 	streamDesiredReleaseTimer *time.Timer
 	streamDesiredReleaseSeq   uint64
 	streamLifecycleMu         sync.RWMutex
+	streamCadenceMu           sync.Mutex
+	lastStreamCadenceDemand   string
+	lastStreamCadenceMaxFPS   int
 	browserClientLogMu        sync.Mutex
 	browserClientLogWindow    time.Time
 	browserClientLogCount     int
@@ -95,7 +101,11 @@ type client struct {
 	conn      *websocket.Conn
 	sessionID string
 	email     string
-	sendMu    sync.Mutex
+
+	// All browser-bound writes are serialized by the per-client writer pump.
+	// sendMu is retained for source compatibility with older test fixtures; new
+	// code must enqueue through the pump instead of writing to conn directly.
+	sendMu sync.Mutex
 
 	clientLogMu          sync.Mutex
 	clientLogWindowStart time.Time
@@ -108,6 +118,39 @@ type client struct {
 	videoPendingAt       time.Time
 	videoReadyForDelta   bool
 	videoReadyEpoch      uint64
+
+	videoDeliveryMode            videoDeliveryMode
+	videoEpoch                   uint64
+	videoLastWrittenSeq          uint64
+	videoProbeAwaitingKeyframe   bool
+	videoQueueBytes              int
+	videoQueue                   []queuedVideoFrame
+	controlQueue                 []queuedControlMessage
+	controlQueueBytes            int
+	writerWake                   chan struct{}
+	writerDone                   chan struct{}
+	writerCancel                 context.CancelFunc
+	writerStartOnce              sync.Once
+	writerStopOnce               sync.Once
+	writerClosed                 bool
+	writerCloseReason            string
+	feedbackMu                   sync.Mutex
+	lastFeedbackAt               time.Time
+	lastFeedbackEpoch            uint64
+	lastFeedbackReceived         uint64
+	lastFeedbackDecoded          uint64
+	lastFeedbackRendered         uint64
+	lastFeedbackRenderedKeyframe uint64
+	lastFeedbackQueue            uint64
+	lastFeedbackAge              uint64
+	feedbackCount                uint64
+	feedbackDropped              uint64
+	feedbackPressureStreak       uint8
+	feedbackHealthyStreak        uint8
+	feedbackKeyframeStreak       uint8
+	feedbackProbeSince           time.Time
+	feedbackState                string
+	feedbackVisibility           string
 
 	firstVideoFrameRendered bool
 }
@@ -392,8 +435,11 @@ func (s *Server) prewarmStreamForSession(sessionID string, reason string) {
 	s.direct.recordStartupPhase("prewarm_accepted", cleanReason)
 	prewarmID := streamPrewarmRelayLeaseID(cleanSessionID)
 	s.retainRelayViewerForPrewarm(prewarmID, streamPrewarmHold)
-	s.startPhoneSessionForPrewarm(cleanReason)
-	s.requestPhoneKeyframe(cleanReason)
+	// Keep the initial start and keyframe commands in order.  Sending these
+	// through two independent goroutines allowed the keyframe command to win
+	// the race and arrive while the Pixel was still stopped, adding a full
+	// capture cycle to cold startup.
+	s.queuePrewarmStreamCommands(cleanReason)
 }
 
 func streamPrewarmRelayLeaseID(sessionID string) string {
@@ -418,6 +464,39 @@ func (s *Server) startPhoneSessionForPrewarm(reason string) {
 	s.appendStreamCommandAsync("start", reason, map[string]any{
 		"source": "ticket_remote",
 	}, streamCommandTTL)
+}
+
+func (s *Server) queuePrewarmStreamCommands(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "stream_prewarm"
+	}
+	now := time.Now()
+	s.phoneStartMu.Lock()
+	if !s.lastPhoneHTTPStartAt.IsZero() && now.Sub(s.lastPhoneHTTPStartAt) < streamPrewarmHTTPStartDedupe {
+		s.phoneStartMu.Unlock()
+		s.direct.recordStartupPhase("stream_start_dedupe", reason)
+		return
+	}
+	s.lastPhoneHTTPStartAt = now
+	s.phoneStartMu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
+		defer cancel()
+		s.direct.recordStartupPhase("stream_start_command_queued", reason)
+		if _, err := s.appendStreamCommand(ctx, "start", reason, map[string]any{
+			"source": "ticket_remote",
+		}, streamCommandTTL); err != nil {
+			s.recordRuntimeErrorAsync("stream_command_publish_failed", "start", err, map[string]any{"reason": reason})
+			return
+		}
+		// The keyframe is deliberately written only after the start command
+		// has been accepted by the state backend.
+		if err := s.sendPhoneKeyframe(reason); err != nil {
+			s.recordRuntimeErrorAsync("phone_keyframe_request_failed", reason, err, map[string]any{"reason": reason})
+		}
+	}()
 }
 
 func publicHealthError(err error) string {
@@ -1072,6 +1151,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "connection limit reached")
 		return
 	}
+	c.startVideoWriter()
 	traceID := safeRuntimeTraceID("browser", sessionID)
 	s.direct.beginStartupTrace(sessionID, "video_socket_open")
 	s.direct.recordStartupPhase("video_socket_accepted", "")
@@ -1088,12 +1168,15 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	s.cancelIdleStreamDesiredRelease()
 	s.direct.addVideoClient()
 	s.direct.recordStartupPhase("video_client_registered", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
+	s.publishAdaptiveStreamCadence("video_client_registered")
 	s.wakePhoneStreamFromVideoSocketOpen("video_socket_open")
 	s.sendBrowserVideoWarmStart(c)
 	s.publishRelayCurrentReportAsync("video_socket_open")
 	defer func() {
+		c.stopVideoWriter()
 		s.removeClient(c)
 		s.direct.removeVideoClient()
+		s.publishAdaptiveStreamCadence("video_socket_closed")
 		s.direct.recordStartupPhase("video_socket_closed", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_closed", traceID, map[string]any{
 			"activeVideoClients": s.direct.activeVideoClientCount(),
@@ -1146,13 +1229,11 @@ func browserVideoSocketContext(r *http.Request) map[string]any {
 
 func (s *Server) sendBrowserVideoWarmStart(c *client) {
 	if configFrame, keyFrame := s.direct.warmStart(); len(configFrame) > 0 {
-		c.sendText(context.Background(), configFrame)
+		c.enqueueWarmStart(configFrame, keyFrame)
 		s.direct.recordWarmStartSent(true, len(keyFrame) > 0)
 		s.direct.recordStartupPhaseOnce("warm_config_sent", fmt.Sprintf("keyframe=%t", len(keyFrame) > 0))
 		if len(keyFrame) > 0 {
 			s.direct.recordStartupPhaseOnce("warm_keyframe_sent", "cached_keyframe=true")
-			c.noteVideoKeyFrame(keyFrame)
-			c.sendBinary(context.Background(), keyFrame)
 		} else {
 			s.direct.recordStartupPhase("warm_config_sent", "provisional=true")
 			s.requestPhoneKeyframe("browser_video_provisional_config")
@@ -1190,6 +1271,14 @@ func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data [
 		s.direct.recordClientTelemetry(event, detailText)
 		detail["video"] = true
 		s.recordRuntimeEventForSourceAsync("ticket_remote_browser", "info", event, safeRuntimeTraceID("browser", c.sessionID), detail)
+		return
+	case "stream_feedback":
+		if c.acceptStreamFeedback(data, time.Now()) {
+			s.publishAdaptiveStreamCadence("stream_feedback")
+			if c.deliveryMode() == videoDeliveryKeyframeOnly {
+				s.direct.recordClientTelemetry("stream_feedback_keyframe_only", "browser_pressure")
+			}
+		}
 		return
 	case "keyframe", "recover_stream":
 		return
@@ -1244,6 +1333,7 @@ func (s *Server) handlePhoneMessage(msg phone.Message) {
 				s.direct.completeStartupTrace("first_forwarded_frame", fmt.Sprintf("epoch=%d sequence=%d keyframe=%t", meta.epoch, meta.sequence, meta.keyFrame))
 			}
 			s.broadcastFrame(frame)
+			s.publishAdaptiveStreamCadence("video_frame_delivery")
 		}
 	}
 }
@@ -1349,6 +1439,19 @@ func browserVideoConfigMessage(raw []byte) []byte {
 	}
 	payload["serverVersion"] = serverVersion
 	payload["assetVersion"] = assetVersion()
+	if _, ok := payload["feedbackVersion"]; !ok {
+		payload["feedbackVersion"] = 1
+	}
+	if _, ok := payload["sourceFps"]; !ok {
+		if fps, exists := payload["fps"]; exists {
+			payload["sourceFps"] = fps
+		} else {
+			payload["sourceFps"] = 10
+		}
+	}
+	if _, ok := payload["keyframeIntervalFrames"]; !ok {
+		payload["keyframeIntervalFrames"] = 10
+	}
 	next, err := json.Marshal(payload)
 	if err != nil {
 		return raw
@@ -1706,6 +1809,8 @@ func (s *Server) resetVideoDeltaReadiness() {
 		c.videoMu.Lock()
 		c.videoReadyForDelta = false
 		c.videoReadyEpoch = 0
+		c.videoLastWrittenSeq = 0
+		c.videoDeliveryMode = videoDeliveryAwaitingKeyframe
 		c.videoMu.Unlock()
 	}
 }
@@ -1776,117 +1881,6 @@ func effectiveOriginPort(value *url.URL) string {
 	default:
 		return ""
 	}
-}
-
-func (c *client) sendText(ctx context.Context, value []byte) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	_ = c.conn.Write(ctx, websocket.MessageText, value)
-}
-
-func (c *client) sendBinary(ctx context.Context, value []byte) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	_ = c.conn.Write(ctx, websocket.MessageBinary, value)
-}
-
-func (c *client) sendBinaryLatest(ctx context.Context, value []byte) {
-	if len(value) == 0 {
-		return
-	}
-	frame := append([]byte(nil), value...)
-	keyFrame := frameIsKeyframe(frame)
-	meta := parseTSF2(frame)
-	now := time.Now()
-	c.videoMu.Lock()
-	if !keyFrame {
-		if !c.videoReadyForDelta || (meta.ok && c.videoReadyEpoch != 0 && meta.epoch != c.videoReadyEpoch) {
-			c.videoMu.Unlock()
-			return
-		}
-	} else {
-		c.noteVideoKeyFrameLocked(meta)
-	}
-	if c.videoWriteActive {
-		c.queuePendingVideoFrameLocked(frame, keyFrame, now)
-		c.videoMu.Unlock()
-		return
-	}
-	c.videoWriteActive = true
-	c.videoMu.Unlock()
-	go c.videoWriteLoop(ctx, frame)
-}
-
-func (c *client) noteVideoKeyFrame(frame []byte) {
-	meta := parseTSF2(frame)
-	c.videoMu.Lock()
-	c.noteVideoKeyFrameLocked(meta)
-	c.videoMu.Unlock()
-}
-
-func (c *client) noteVideoKeyFrameLocked(meta tsf2Metadata) {
-	c.videoReadyForDelta = true
-	if meta.ok {
-		c.videoReadyEpoch = meta.epoch
-	}
-}
-
-func (c *client) queuePendingVideoFrameLocked(frame []byte, keyFrame bool, now time.Time) {
-	if keyFrame {
-		c.videoPendingFrame = frame
-		c.videoPendingKeyFrame = true
-		c.videoPendingAt = now
-		return
-	}
-	if len(c.videoPendingFrame) == 0 {
-		c.videoPendingFrame = frame
-		c.videoPendingKeyFrame = false
-		c.videoPendingAt = now
-		return
-	}
-	c.videoPendingFrame = nil
-	c.videoPendingKeyFrame = false
-	c.videoPendingAt = time.Time{}
-	c.videoReadyForDelta = false
-	c.videoReadyEpoch = 0
-}
-
-func (c *client) videoWriteLoop(ctx context.Context, frame []byte) {
-	for {
-		writeCtx, cancel := context.WithTimeout(ctx, videoWriteTimeout)
-		c.sendBinary(writeCtx, frame)
-		err := writeCtx.Err()
-		cancel()
-		if err != nil {
-			_ = c.conn.Close(websocket.StatusPolicyViolation, "video client too slow")
-			return
-		}
-		c.videoMu.Lock()
-		if len(c.videoPendingFrame) == 0 {
-			c.videoWriteActive = false
-			c.videoMu.Unlock()
-			return
-		}
-		if videoPendingFrameStale(c.videoPendingAt, time.Now()) {
-			c.videoPendingFrame = nil
-			c.videoPendingKeyFrame = false
-			c.videoPendingAt = time.Time{}
-			c.videoWriteActive = false
-			c.videoReadyForDelta = false
-			c.videoReadyEpoch = 0
-			c.videoMu.Unlock()
-			return
-		}
-		frame = c.videoPendingFrame
-		c.videoPendingFrame = nil
-		c.videoPendingKeyFrame = false
-		c.videoPendingAt = time.Time{}
-		c.videoMu.Unlock()
-	}
-}
-
-func videoPendingFrameStale(pendingAt time.Time, now time.Time) bool {
-	return !pendingAt.IsZero() && now.Sub(pendingAt) > videoPendingFrameMaxAge
 }
 
 func randomID() string {

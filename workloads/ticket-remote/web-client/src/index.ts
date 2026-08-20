@@ -15,6 +15,7 @@ type TicketClientConfig = {
 type TicketClientHandlers = {
   onState?: (state: any) => void;
   onStatus?: (status: string, detail?: string) => void;
+  onSnapshotApplied?: () => void;
 };
 
 const STREAM_FOCUS_REFRESH_MS = 30000;
@@ -111,6 +112,12 @@ class TicketSpacetimeClient {
   private livePromise: Promise<void> | null = null;
   private resolveLivePromise: (() => void) | null = null;
   private rejectLivePromise: ((error: Error) => void) | null = null;
+  private latestActivationDecisions: any[] = [];
+  private activationDecisionWaiters = new Map<string, {
+    resolve: (decision: any) => void;
+    reject: (error: Error) => void;
+    timer: number;
+  }>();
 
   constructor(cfg: TicketClientConfig, handlers: TicketClientHandlers) {
     this.cfg = cfg;
@@ -171,6 +178,11 @@ class TicketSpacetimeClient {
     }
   }
 
+  refresh(): void {
+    if (this.manuallyDisconnected) return;
+    this.connect();
+  }
+
   disconnect(markDisconnected = true): void {
     this.connectionGeneration += 1;
     this.rejectLive(new Error("Spacetime connection stopped"));
@@ -191,6 +203,12 @@ class TicketSpacetimeClient {
       try { this.conn.disconnect(); } catch (_) {}
       this.conn = null;
     }
+    for (const waiter of this.activationDecisionWaiters.values()) {
+      window.clearTimeout(waiter.timer);
+      waiter.reject(new Error("Spacetime connection stopped"));
+    }
+    this.activationDecisionWaiters.clear();
+    this.latestActivationDecisions = [];
   }
 
   close(): void {
@@ -271,6 +289,41 @@ class TicketSpacetimeClient {
     });
   }
 
+  requestTicketResetV2(attemptId: string, resetRequestId: string, reason = "ticket_reset_requested"): Promise<void> {
+    return this.callReducer("memberRequestTicketResetV2", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      resetRequestId,
+      reason,
+      attemptId,
+    });
+  }
+
+  activateTicketButton(args: {
+    interactionRevision: string;
+    controlId: string;
+    inputSequence: string;
+  }): Promise<void> {
+    return this.callReducer("memberActivateTicketButton", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      ...args,
+    });
+  }
+
+  activateTicketButtonV2(args: {
+    interactionRevision: string;
+    controlId: string;
+    inputSequence: string;
+    attemptId: string;
+  }): Promise<void> {
+    return this.callReducer("memberActivateTicketButtonV2", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      ...args,
+    });
+  }
+
   claimTicketSlider(args: {
     interactionRevision: string;
     controlId: string;
@@ -284,6 +337,39 @@ class TicketSpacetimeClient {
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       ...args,
+    });
+  }
+
+  claimTicketSliderV2(args: {
+    interactionRevision: string;
+    controlId: string;
+    initialInputSequence: string;
+    holdDurationMillis: number;
+    horizontalTravelCss: number;
+    verticalTravelCss: number;
+    initialProgress: number;
+    attemptId: string;
+  }): Promise<void> {
+    return this.callReducer("memberClaimTicketSliderV2", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      ...args,
+    });
+  }
+
+  waitForActivationDecision(attemptId: string, timeoutMs = 4000): Promise<any> {
+    const cleanAttemptId = String(attemptId || "").trim();
+    if (!cleanAttemptId) return Promise.reject(new Error("activation attempt ID is required"));
+    const existing = this.latestActivationDecisions.find((row) =>
+      String(row.attemptId || row.attempt_id || "") === cleanAttemptId
+    );
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.activationDecisionWaiters.delete(cleanAttemptId);
+        reject(new Error("activation decision timed out"));
+      }, Math.max(500, timeoutMs));
+      this.activationDecisionWaiters.set(cleanAttemptId, { resolve, reject, timer });
     });
   }
 
@@ -358,6 +444,7 @@ class TicketSpacetimeClient {
           applied = true;
           this.attachStateListeners(connection);
         }
+        this.handlers.onSnapshotApplied?.();
         this.publishFocusedState();
       })
       .subscribe([
@@ -368,6 +455,8 @@ class TicketSpacetimeClient {
         `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
         `SELECT * FROM ticketremote_ticket_interaction WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_activation_eligibility WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_activation_decision WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
       ]);
   }
 
@@ -385,6 +474,29 @@ class TicketSpacetimeClient {
       .find((row) => rowId(row) === backendRow) || null;
     const ticketInteraction = tableRows(tableAccessor(db, "ticket_interaction"))
       .find((row) => rowId(row) === backendRow) || null;
+    const activationEligibility = tableRows(tableAccessor(db, "activation_eligibility"))
+      .find((row) => rowId(row) === backendRow) || null;
+    const activationDecisions = tableRows(tableAccessor(db, "activation_decision"))
+      .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
+      .map((row) => ({
+        id: String(row.id || ""),
+        attemptId: String(row.attemptId || row.attempt_id || ""),
+        flow: String(row.flow || ""),
+        accepted: row.accepted === true,
+        reason: String(row.reason || ""),
+        retryAt: String(row.retryAt || row.retry_at || ""),
+        serverAt: String(row.serverAt || row.server_at || ""),
+        interactionRevision: String(row.interactionRevision || row.interaction_revision || ""),
+        updatedAt: String(row.updatedAt || row.updated_at || ""),
+      }));
+    this.latestActivationDecisions = activationDecisions;
+    for (const decision of activationDecisions) {
+      const waiter = this.activationDecisionWaiters.get(decision.attemptId);
+      if (!waiter) continue;
+      window.clearTimeout(waiter.timer);
+      this.activationDecisionWaiters.delete(decision.attemptId);
+      waiter.resolve(decision);
+    }
     const viewerFocusRows = activeViewerFocusRows(
       tableRows(tableAccessor(db, "stream_viewer_focus")),
       this.cfg.ticketId,
@@ -493,6 +605,16 @@ class TicketSpacetimeClient {
         updatedAt: String(ticketInteraction.updatedAt || ticketInteraction.updated_at || ""),
         expiresAt: String(ticketInteraction.expiresAt || ticketInteraction.expires_at || ""),
       } : null,
+      activationEligibility: activationEligibility ? {
+        allowed: activationEligibility.allowed === true,
+        reason: String(activationEligibility.reason || ""),
+        retryAt: String(activationEligibility.retryAt || activationEligibility.retry_at || ""),
+        cooldownUntil: String(activationEligibility.cooldownUntil || activationEligibility.cooldown_until || ""),
+        admissionsInWindow: Number(activationEligibility.admissionsInWindow ?? activationEligibility.admissions_in_window ?? 0),
+        serverAt: String(activationEligibility.serverAt || activationEligibility.server_at || ""),
+        updatedAt: String(activationEligibility.updatedAt || activationEligibility.updated_at || ""),
+      } : null,
+      activationDecisions,
       relayCurrentReport: relayReport ? {
         backendId: String(relayReport.backendId || relayReport.backend_id || ""),
         videoClients: Number(relayReport.videoClients ?? relayReport.video_clients ?? 0),
@@ -532,7 +654,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction"]
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision"]
       .map((name) => tableAccessor(source, name));
   }
 

@@ -6,23 +6,33 @@
 import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
+import TicketremoteFinalizeTicketActivationAttemptReducer from "../ticketremote_finalize_ticket_activation_attempt_reducer";
+import TicketremoteMemberActivateTicketButtonReducer from "../ticketremote_member_activate_ticket_button_reducer";
+import TicketremoteMemberActivateTicketButtonV2Reducer from "../ticketremote_member_activate_ticket_button_v_2_reducer";
 import TicketremoteMemberClaimTicketSliderReducer from "../ticketremote_member_claim_ticket_slider_reducer";
+import TicketremoteMemberClaimTicketSliderV2Reducer from "../ticketremote_member_claim_ticket_slider_v_2_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberRecoverStreamReducer from "../ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "../ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "../ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberRequestTicketResetReducer from "../ticketremote_member_request_ticket_reset_reducer";
+import TicketremoteMemberRequestTicketResetV2Reducer from "../ticketremote_member_request_ticket_reset_v_2_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_stream_focus_reducer";
 import TicketremoteMemberUpdateTicketSliderReducer from "../ticketremote_member_update_ticket_slider_reducer";
 
+export type TicketremoteFinalizeTicketActivationAttemptParams = __Infer<typeof TicketremoteFinalizeTicketActivationAttemptReducer>;
+export type TicketremoteMemberActivateTicketButtonParams = __Infer<typeof TicketremoteMemberActivateTicketButtonReducer>;
+export type TicketremoteMemberActivateTicketButtonV2Params = __Infer<typeof TicketremoteMemberActivateTicketButtonV2Reducer>;
 export type TicketremoteMemberClaimTicketSliderParams = __Infer<typeof TicketremoteMemberClaimTicketSliderReducer>;
+export type TicketremoteMemberClaimTicketSliderV2Params = __Infer<typeof TicketremoteMemberClaimTicketSliderV2Reducer>;
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
 export type TicketremoteMemberRecoverStreamParams = __Infer<typeof TicketremoteMemberRecoverStreamReducer>;
 export type TicketremoteMemberRequestControlCodeParams = __Infer<typeof TicketremoteMemberRequestControlCodeReducer>;
 export type TicketremoteMemberRequestKeyframeParams = __Infer<typeof TicketremoteMemberRequestKeyframeReducer>;
 export type TicketremoteMemberRequestTicketResetParams = __Infer<typeof TicketremoteMemberRequestTicketResetReducer>;
+export type TicketremoteMemberRequestTicketResetV2Params = __Infer<typeof TicketremoteMemberRequestTicketResetV2Reducer>;
 export type TicketremoteMemberSetStreamFocusParams = __Infer<typeof TicketremoteMemberSetStreamFocusReducer>;
 export type TicketremoteMemberUpdateTicketSliderParams = __Infer<typeof TicketremoteMemberUpdateTicketSliderReducer>;
 

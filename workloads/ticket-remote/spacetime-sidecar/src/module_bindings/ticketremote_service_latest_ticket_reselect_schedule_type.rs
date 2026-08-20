@@ -13,6 +13,8 @@ pub struct TicketremoteServiceLatestTicketReselectSchedule {
     pub scheduled_at: String,
     pub phone_local_time: String,
     pub phone_time_zone: String,
+    pub purpose: Option<String>,
+    pub activation_revision: Option<String>,
     pub status: String,
     pub command_id: String,
     pub result_reason: String,
@@ -45,6 +47,14 @@ pub struct TicketremoteServiceLatestTicketReselectScheduleCols {
         __sdk::__query_builder::Col<TicketremoteServiceLatestTicketReselectSchedule, String>,
     pub phone_time_zone:
         __sdk::__query_builder::Col<TicketremoteServiceLatestTicketReselectSchedule, String>,
+    pub purpose: __sdk::__query_builder::Col<
+        TicketremoteServiceLatestTicketReselectSchedule,
+        Option<String>,
+    >,
+    pub activation_revision: __sdk::__query_builder::Col<
+        TicketremoteServiceLatestTicketReselectSchedule,
+        Option<String>,
+    >,
     pub status:
         __sdk::__query_builder::Col<TicketremoteServiceLatestTicketReselectSchedule, String>,
     pub command_id:
@@ -79,6 +89,11 @@ impl __sdk::__query_builder::HasCols for TicketremoteServiceLatestTicketReselect
             scheduled_at: __sdk::__query_builder::Col::new(table_name, "scheduled_at"),
             phone_local_time: __sdk::__query_builder::Col::new(table_name, "phone_local_time"),
             phone_time_zone: __sdk::__query_builder::Col::new(table_name, "phone_time_zone"),
+            purpose: __sdk::__query_builder::Col::new(table_name, "purpose"),
+            activation_revision: __sdk::__query_builder::Col::new(
+                table_name,
+                "activation_revision",
+            ),
             status: __sdk::__query_builder::Col::new(table_name, "status"),
             command_id: __sdk::__query_builder::Col::new(table_name, "command_id"),
             result_reason: __sdk::__query_builder::Col::new(table_name, "result_reason"),

@@ -320,7 +320,7 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		"closeDecoder();",
 		"decoder = new VideoDecoder({",
 		"decoder.configure(resetConfig);",
-		"pendingFrameMetadata = [];",
+		"clearFrameMetadata();",
 		"const decoderInstanceGeneration = decoderGeneration;",
 		"if (decoderInstanceGeneration !== decoderGeneration)",
 		"try { frame.close(); } catch (_) {}",
@@ -1854,7 +1854,8 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 	for _, needle := range []string{
 		"idleDisconnected = false;",
 		"setStatus('Atjauno tiešraidi...');",
-		"connectSpacetimeState().catch",
+		"const stateRefresh = refreshSpacetimeState(reason || 'idle_resume');",
+		"stateRefresh.catch",
 		"publishCurrentStreamFocus(reason || 'idle_resume');",
 		"connectDirectVideo();",
 		"requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);",

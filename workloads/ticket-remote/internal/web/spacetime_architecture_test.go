@@ -679,8 +679,8 @@ func TestTicketSliderFingerProgressUsesOneCurrentSample(t *testing.T) {
 	for _, required := range []string{
 		"const TICKET_SLIDER_QUALIFY_HOLD_MS: u32 = 80;",
 		"const TICKET_SLIDER_QUALIFY_TRAVEL_CSS: u32 = 10;",
-		"holdDurationMillis < TICKET_SLIDER_QUALIFY_HOLD_MS",
-		"horizontalTravelCss < TICKET_SLIDER_QUALIFY_TRAVEL_CSS",
+		"hold_duration_millis < TICKET_SLIDER_QUALIFY_HOLD_MS",
+		"horizontal_travel_css < TICKET_SLIDER_QUALIFY_TRAVEL_CSS",
 		"current.status == \"needs_attention\"",
 	} {
 		if !strings.Contains(module, required) {

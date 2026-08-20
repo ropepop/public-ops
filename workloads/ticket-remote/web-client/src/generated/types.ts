@@ -10,6 +10,37 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const TicketremoteActivationDecision = __t.object("TicketremoteActivationDecision", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  attemptId: __t.string(),
+  flow: __t.string(),
+  accepted: __t.bool(),
+  reason: __t.string(),
+  retryAt: __t.string(),
+  serverAt: __t.string(),
+  interactionRevision: __t.string(),
+  inputFingerprint: __t.string(),
+  updatedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteActivationDecision = __Infer<typeof TicketremoteActivationDecision>;
+
+export const TicketremoteActivationEligibility = __t.object("TicketremoteActivationEligibility", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  allowed: __t.bool(),
+  reason: __t.string(),
+  retryAt: __t.string(),
+  cooldownUntil: __t.string(),
+  admissionsInWindow: __t.u32(),
+  serverAt: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteActivationEligibility = __Infer<typeof TicketremoteActivationEligibility>;
+
 export const TicketremoteControlCodeFastState = __t.object("TicketremoteControlCodeFastState", {
   id: __t.string(),
   ticketId: __t.string(),

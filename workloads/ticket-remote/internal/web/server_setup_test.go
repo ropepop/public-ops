@@ -1369,7 +1369,9 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"ticketremote_phone_current_report",
 		"ticketremote_relay_current_report",
 		"ticketremote_control_code_request",
-		"onApplied(()=>{if(!applied){applied=true;this.attachStateListeners(connection);}this.publishFocusedState();})",
+		"onApplied(()=>",
+		"this.handlers.onSnapshotApplied?.()",
+		"this.publishFocusedState()",
 	} {
 		if !staticContains(string(clientBody), snippet) {
 			t.Fatalf("ticket Spacetime browser bundle missing %q", snippet)

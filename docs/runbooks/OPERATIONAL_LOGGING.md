@@ -129,6 +129,38 @@ must pass through the authenticated Ticket service, which checks membership,
 sanitizes the event, and writes with the enrolled Ticket service identity.
 SpacetimeDB reducers cannot write across databases.
 
+Ticket action latency producers use
+`operationallog_append_ticket_latency_phase` through that same trusted service
+identity. The producer creates an opaque 24-character lowercase hexadecimal
+trace ID and reuses it across these fixed checkpoints, at most once each:
+
+1. `browser_intent`
+2. `reducer_committed`
+3. `phone_observed`
+4. `executor_started`
+5. `action_completed`
+6. `frame_captured`
+7. `relay_sent`
+8. `browser_rendered`
+
+Each call supplies fixed action, phase, status, component, and proof values,
+plus the phase duration and total duration in milliseconds. Frame capture,
+relay, and render checkpoints require a positive bounded frame sequence; all
+other successful phases require zero. Failed, timed-out, and cancelled phases
+use proof `none` and frame sequence zero. A producer that cannot know the
+browser's monotonic end-to-end duration uses total duration zero; the browser
+render checkpoint supplies the final total. Durations may not exceed two
+minutes. The reducer rejects a ninth phase, caps new latency rows at 30 per
+minute, and keeps exact retries idempotent. A retry with changed data under the
+same trace and phase is an error.
+
+Do not derive a cross-device duration by subtracting unrelated wall clocks.
+Each producer measures local adjacent work with a monotonic clock. The browser
+measures intent-to-render total duration. Database occurrence time provides
+ordering and audit evidence. Keep latency writes asynchronous and best effort;
+logging availability is never a prerequisite for a reducer, phone action,
+capture, relay, or browser render.
+
 Live and imported detail objects use the same strict privacy boundary. Keys
 that describe email, user/chat/session identity, credentials, Telegram, OCR,
 result text, prompts, secrets, or raw payloads are not accepted. Values that
@@ -172,6 +204,9 @@ spacetime sql --server https://maincloud.spacetimedb.com operational-logging-pro
 
 spacetime sql --server https://maincloud.spacetimedb.com operational-logging-prod \
   "SELECT * FROM operationallog_event WHERE domain = 'ticket';"
+
+spacetime sql --server https://maincloud.spacetimedb.com operational-logging-prod \
+  "SELECT correlationId, operation, event, component, status, result, durationMillis, totalDurationMillis, count, occurredAt FROM operationallog_event WHERE domain = 'ticket' AND recordType = 'latency_phase';"
 ```
 
 Keep queries domain- and time-bounded when possible. The table has indexes for
@@ -192,9 +227,11 @@ bounded. With no backlog, an expired row can remain for up to five additional
 minutes; a backlog drains at up to 12,000 rows per hour. The Ticket service
 admits at most 60 browser diagnostics per minute globally, uses no more than 64
 fixed browser event names, and the central reducer samples every informational
-browser name by minute. Cleanup therefore safely outpaces bounded browser
-ingestion. Archive rows use retention class `archive` and stay outside the
-normal cleanup range.
+browser name by minute. Typed Ticket latency proof admits at most 1,800 rows
+per hour, while the worst-case sampled browser vocabulary adds at most 3,840.
+Their combined 5,640 rows use less than half of the 12,000-row hourly cleanup
+capacity, leaving meaningful headroom for warnings and other domains. Archive
+rows use retention class `archive` and stay outside the normal cleanup range.
 
 After publication, insert disposable owner-authenticated test rows in each live
 domain only when an approved test plan allows it. Confirm their expiry values,

@@ -48,8 +48,11 @@ expiry by up to five minutes; a backlog drains at up to 12,000 rows per hour.
 Ticket browser admission is globally capped at 60 messages per minute, has a
 fixed vocabulary of at most 64 names, and every informational browser name is
 sampled into one shared minute bucket. Cleanup capacity is therefore more than
-three times that browser bound. Archive rows use a far-future expiry and stay
-outside the normal cleanup range.
+three times that browser bound. Typed Ticket latency proof is separately capped
+at 30 new phase rows per minute and eight rows per trace. Together, the maximum
+sampled browser and latency-proof rates use less than half of cleanup capacity,
+leaving headroom for warnings and other domains. Archive rows use a far-future
+expiry and stay outside the normal cleanup range.
 
 ## Writer contracts
 
@@ -65,12 +68,28 @@ Live reducers are domain-specific:
 - `operationallog_append_deployment_completed_run`
 - `operationallog_append_pixel_event`
 - `operationallog_append_ticket_event`
+- `operationallog_append_ticket_latency_phase`
 
 Deployment completion accepts the existing bounded phase-bundle format and
 inserts all phases plus the finished run in one transaction. Pixel uses the
 same fixed 11-value vocabulary as the previous observability module. Ticket
 accepts only its safe event shape and preserves minute-bucket sampling for
 known high-volume informational events.
+
+Ticket action latency proof uses the separate typed reducer but still writes
+to the same `operationallog_event` table with six-hour retention. One opaque
+24-hex trace ID joins at most eight fixed checkpoints: browser intent, reducer
+commit, phone observation, executor start, action completion, captured frame,
+relay send, and browser render. Action, phase, component, status, and proof are
+fixed vocabularies. Phase and end-to-end latency use `durationMillis` and
+`totalDurationMillis`; post-action frame phases carry a bounded frame sequence
+in `count`.
+
+The latency reducer accepts no free-form detail, screen content, account or
+session identity, command payload, coordinates, device identifier, URL, or raw
+revision. Exact phase retries are no-ops and changed retries collide. Producers
+must write this diagnostic evidence asynchronously: logging failure must never
+make a Ticket action or stream fail.
 
 Every live ID is deterministically prefixed by its domain. An exact retry is a
 no-op. Reusing an ID for a different payload fails the whole transaction,
