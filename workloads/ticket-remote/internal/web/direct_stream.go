@@ -56,12 +56,13 @@ type directStreamHub struct {
 	phoneReconnects    uint64
 	phoneStartTimeouts uint64
 
-	codec       string
-	transport   string
-	width       int
-	height      int
-	rootCapture bool
-	streamEpoch uint64
+	codec            string
+	transport        string
+	width            int
+	height           int
+	rootCapture      bool
+	streamEpoch      uint64
+	configGeneration uint64
 
 	lastConfig []byte
 
@@ -216,6 +217,7 @@ func (h *directStreamHub) setConfig(raw []byte) {
 	h.height = payload.Height
 	h.rootCapture = payload.RootCapture
 	h.streamEpoch = payload.StreamEpoch
+	h.configGeneration++
 	h.lastConfig = append(h.lastConfig[:0], raw...)
 	h.lastConfigAt = now
 	if payload.PhoneUptimeMillis > 0 {
@@ -330,6 +332,45 @@ func (h *directStreamHub) warmStart() (config []byte, keyFrame []byte) {
 		return h.provisionalConfigLocked(), nil
 	}
 	return append([]byte(nil), h.lastConfig...), append([]byte(nil), h.lastKeyFrame...)
+}
+
+// warmEncoderReusable proves that prewarm is joining the same live encoder,
+// even when its short-lived cached keyframe is already too old to replay. The
+// browser still needs a fresh keyframe, but writing another start command first
+// only delays that request and can produce a duplicate keyframe burst.
+func (h *directStreamHub) warmEncoderReusable(now time.Time, phoneHealth phone.Health) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !phoneHealth.Desired || !phoneHealth.Connected || phoneHealth.StreamState != "streaming" {
+		return false
+	}
+	if h.streamEpoch == 0 || h.lastFrameEpoch != h.streamEpoch {
+		return false
+	}
+	return h.streamVerdictLocked(now, phoneHealth) == "live"
+}
+
+func (h *directStreamHub) configGenerationSnapshot() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.configGeneration
+}
+
+func (h *directStreamHub) warmEncoderConfigReceivedAfter(generation uint64) bool {
+	_, ok := h.warmEncoderConfigEpochAfter(generation)
+	return ok
+}
+
+func (h *directStreamHub) warmEncoderConfigEpochAfter(generation uint64) (uint64, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.configGeneration <= generation || h.streamEpoch == 0 || len(h.lastConfig) == 0 {
+		return 0, false
+	}
+	return h.streamEpoch, true
 }
 
 func (h *directStreamHub) provisionalConfigLocked() []byte {
@@ -478,12 +519,6 @@ func currentVisualAgeMillis(now time.Time, observedAt time.Time, observedAgeMill
 		elapsedMillis = 0
 	}
 	return observedAgeMillis + elapsedMillis, true
-}
-
-func (h *directStreamHub) needsActiveViewerKeyframe(now time.Time) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.activeVideoClients > 0 && !h.warmKeyFrameAllowedLocked(now)
 }
 
 func (h *directStreamHub) startupGraceActive(now time.Time) bool {

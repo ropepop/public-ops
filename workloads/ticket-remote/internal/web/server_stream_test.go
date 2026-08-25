@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +19,29 @@ import (
 	"ticketremote/internal/phone"
 	"ticketremote/internal/state"
 )
+
+type blockingFirstStartCommandStore struct {
+	state.Store
+	started chan<- state.StreamCommandInput
+	release <-chan struct{}
+	blocked atomic.Bool
+}
+
+func (s *blockingFirstStartCommandStore) AppendStreamCommand(ctx context.Context, input state.StreamCommandInput) error {
+	if input.CommandType == "start" && !s.blocked.Swap(true) {
+		select {
+		case s.started <- input:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Store.AppendStreamCommand(ctx, input)
+}
 
 func TestBrowserVideoSocketContextParsesOldPageQuery(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream?page_version=page-1&asset_version=asset-1&visibility=visible&restore_reason=pageshow&recovery_id=recover-1&frame_age_ms=13000&hidden_age_ms=8000&has_frame=1&configured=1&open_seq=7", nil)
@@ -86,10 +110,15 @@ func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 
 func TestStreamPrewarmQueuesStartBeforeKeyframe(t *testing.T) {
 	phoneCommands := make(chan string, 8)
+	phoneTraceHeaders := make(chan string, 1)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/stream" {
 			http.NotFound(w, r)
 			return
+		}
+		select {
+		case phoneTraceHeaders <- r.Header.Get("X-Ticket-Startup-Trace"):
+		default:
 		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -120,10 +149,540 @@ func TestStreamPrewarmQueuesStartBeforeKeyframe(t *testing.T) {
 			return ""
 		}
 	}
-	first := phoneSignalType(readCommand())
-	second := phoneSignalType(readCommand())
+	firstMessage := readCommand()
+	secondMessage := readCommand()
+	first := phoneSignalType(firstMessage)
+	second := phoneSignalType(secondMessage)
 	if first != "start" || second != "keyframe" {
 		t.Fatalf("prewarm commands were not ordered start then keyframe: first=%q second=%q", first, second)
+	}
+	var firstPayload map[string]any
+	if err := json.Unmarshal([]byte(firstMessage), &firstPayload); err != nil {
+		t.Fatalf("decode prewarm start payload: %v", err)
+	}
+	traceID, _ := firstPayload["traceId"].(string)
+	if !strings.HasPrefix(traceID, "startup_") || len(traceID) != len("startup_")+8 {
+		t.Fatalf("prewarm start did not carry opaque startup trace correlation: %#v", firstPayload)
+	}
+	select {
+	case headerTraceID := <-phoneTraceHeaders:
+		if headerTraceID != traceID {
+			t.Fatalf("private relay startup trace = %q, durable start trace = %q", headerTraceID, traceID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for private relay startup trace header")
+	}
+}
+
+func TestWarmPrewarmSkipsRedundantStartAndQueuesOneEarlyKeyframe(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.NotFoundHandler())
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	relay.AddViewer()
+	defer relay.RemoveViewer()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	if !server.direct.recordFrame(testTSF2FrameWithTimestamp(7, 1, false, 10000)) {
+		t.Fatal("fresh same-epoch frame was not accepted")
+	}
+	server.backgroundKeyframeMu.Lock()
+	server.lastBackgroundKeyframeAt = time.Now()
+	server.backgroundKeyframeMu.Unlock()
+
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_test",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"},
+		server.direct.configGenerationSnapshot(),
+	)
+	waitForPhoneMessage(t, phoneCommands, `"type":"keyframe"`)
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_test_duplicate",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"},
+		server.direct.configGenerationSnapshot(),
+	)
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("warm prewarm ignored recent-background or same-trace dedupe: %v", extras)
+	}
+}
+
+func TestWarmReconnectConfigSkipsStartAndQueuesOneEarlyKeyframe(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.NotFoundHandler())
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	relay.AddViewer()
+	defer relay.RemoveViewer()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+
+	baselineGeneration := server.direct.configGenerationSnapshot()
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":8,"phoneUptimeMillis":10000}`))
+	}()
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_reconnect_test",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: false, Desired: true, Viewers: 1, StreamState: "connecting"},
+		baselineGeneration,
+	)
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_reconnect_duplicate",
+		"startup_cafebabe",
+		"",
+		phone.Health{Connected: false, Desired: true, Viewers: 1, StreamState: "connecting"},
+		baselineGeneration,
+	)
+	waitForPhoneMessage(t, phoneCommands, `"type":"keyframe"`)
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("warm reconnect emitted redundant commands: %v", extras)
+	}
+}
+
+func TestWarmReconnectSocketBeforeConfigQueuesOneDurableKeyframe(t *testing.T) {
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+	baselineGeneration := server.direct.configGenerationSnapshot()
+
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_socket_before_config",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: false, Desired: true, Viewers: 1, StreamState: "connecting"},
+		baselineGeneration,
+	)
+	server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":12,"phoneUptimeMillis":10000}`))
+
+	waitForPhoneMessage(t, phoneSignals, `"type":"keyframe"`)
+	if extras := countPhoneSignalTypesWithin(phoneSignals, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("socket-before-config race emitted redundant commands: %v", extras)
+	}
+}
+
+func TestWarmReconnectConnectedBeforeConfigQueuesOneDurableKeyframe(t *testing.T) {
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+	baselineGeneration := server.direct.configGenerationSnapshot()
+
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":13,"phoneUptimeMillis":10000}`))
+	}()
+	server.queuePrewarmStreamCommandsForHealth(
+		"warm_connected_before_config",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"},
+		baselineGeneration,
+	)
+
+	waitForPhoneMessage(t, phoneSignals, `"type":"keyframe"`)
+	if extras := countPhoneSignalTypesWithin(phoneSignals, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("connected-before-config race emitted redundant commands: %v", extras)
+	}
+}
+
+func TestWarmRelayReconnectConfigUsesKeyframeOnlyPath(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		config := []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":11,"phoneUptimeMillis":10000}`)
+		if err := conn.Write(r.Context(), websocket.MessageText, config); err != nil {
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+
+	server.prewarmStreamForSession("real-warm-reconnect", "real_warm_reconnect")
+	waitForPhoneMessage(t, phoneCommands, `"type":"keyframe"`)
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("real warm relay reconnect emitted redundant commands: %v", extras)
+	}
+	health := relay.Snapshot()
+	if !health.Connected || health.StreamState != "streaming" {
+		t.Fatalf("real relay health did not reach streaming: %#v", health)
+	}
+	if phoneRelayNeedsSocketWakeKeyframe(health) {
+		t.Fatalf("actual connected relay snapshot would queue a duplicate socket wake keyframe: %#v", health)
+	}
+}
+
+func TestWarmReconnectWithoutActiveConfigFallsBackToOrderedStart(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.NotFoundHandler())
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	relay.AddViewer()
+	defer relay.RemoveViewer()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+
+	server.queuePrewarmStreamCommandsForHealth(
+		"cold_after_probe",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: false, Desired: true, Viewers: 1, StreamState: "connecting"},
+		server.direct.configGenerationSnapshot(),
+	)
+	first := phoneSignalType(waitForPhoneMessageText(t, phoneCommands, `"type":"start"`))
+	second := phoneSignalType(waitForPhoneMessageText(t, phoneCommands, `"type":"keyframe"`))
+	if first != "start" || second != "keyframe" {
+		t.Fatalf("reconnect probe timeout changed ordered startup: first=%q second=%q", first, second)
+	}
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("reconnect timeout emitted duplicate commands: %v", extras)
+	}
+}
+
+func TestStreamingRelayStateDoesNotQueueSocketWakeKeyframe(t *testing.T) {
+	if phoneRelayNeedsSocketWakeKeyframe(phone.Health{Connected: true, Desired: true, StreamState: "streaming"}) {
+		t.Fatal("connected relay streaming state must not queue a duplicate socket wake keyframe")
+	}
+	if !phoneRelayNeedsSocketWakeKeyframe(phone.Health{Connected: true, Desired: true, StreamState: "connecting"}) {
+		t.Fatal("non-streaming relay state should still request a wake keyframe")
+	}
+}
+
+func TestWarmPrewarmWithStaleRelayFrameKeepsStartBeforeKeyframe(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.NotFoundHandler())
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	relay.AddViewer()
+	defer relay.RemoveViewer()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+
+	server.queuePrewarmStreamCommandsForHealth(
+		"stale_warm_test",
+		"startup_deadbeef",
+		"",
+		phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"},
+		server.direct.configGenerationSnapshot(),
+	)
+	first := phoneSignalType(waitForPhoneMessageText(t, phoneCommands, `"type":"start"`))
+	second := phoneSignalType(waitForPhoneMessageText(t, phoneCommands, `"type":"keyframe"`))
+	if first != "start" || second != "keyframe" {
+		t.Fatalf("stale warm evidence changed ordered startup: first=%q second=%q", first, second)
+	}
+}
+
+func TestSocketBeforeCachedPrewarmKeepsOneOrderedStartAndKeyframe(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	commandStarted := make(chan state.StreamCommandInput, 1)
+	releaseCommand := make(chan struct{})
+	store := &blockingFirstStartCommandStore{
+		Store:   newTicketMemoryStore(t, phoneServer.URL),
+		started: commandStarted,
+		release: releaseCommand,
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	ticketServer := httptest.NewServer(server)
+	defer ticketServer.Close()
+
+	const sessionID = "socket-before-prewarm"
+	runOrigin := newStartupRunOrigin()
+	traceID := server.direct.startStartupTraceForRun(sessionID, runOrigin, "cached_index")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := dialStreamTestClientForRun(t, ctx, ticketServer.URL, sessionID, runOrigin)
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	select {
+	case <-commandStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("socket-led start did not reach blocked durable write")
+	}
+	prewarmDone := make(chan struct{})
+	go func() {
+		server.prewarmStreamForSession(sessionID, "cached_membership_complete", traceID)
+		close(prewarmDone)
+	}()
+	if pending := countPhoneSignalTypesWithin(phoneCommands, 150*time.Millisecond); pending["start"] != 0 || pending["keyframe"] != 0 {
+		t.Fatalf("media command committed before blocked start was released: %v", pending)
+	}
+
+	close(releaseCommand)
+	first := waitForPhoneMessageText(t, phoneCommands, `"type":"start"`)
+	second := waitForPhoneMessageText(t, phoneCommands, `"type":"keyframe"`)
+	if phoneSignalType(first) != "start" || phoneSignalType(second) != "keyframe" {
+		t.Fatalf("socket-led commands were not ordered: first=%s second=%s", first, second)
+	}
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 200*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("socket/prewarm race emitted duplicate commands: %v", extras)
+	}
+	select {
+	case <-prewarmDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cached prewarm did not finish after ordered startup write")
+	}
+}
+
+func TestCrossTracePrewarmSharesBlockedStartBarrier(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+	commandStarted := make(chan state.StreamCommandInput, 1)
+	releaseCommand := make(chan struct{})
+	store := &blockingFirstStartCommandStore{
+		Store:   newTicketMemoryStore(t, phoneServer.URL),
+		started: commandStarted,
+		release: releaseCommand,
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	server.addRelayViewer("barrier-demand")
+	defer server.removeRelayViewer("barrier-demand")
+
+	traceA := server.direct.startStartupTrace("session-a", "trace_a")
+	server.queuePrewarmStreamCommands("trace_a", startupTraceCorrelationID(traceA), traceA)
+	select {
+	case <-commandStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first trace start did not reach blocked durable write")
+	}
+	traceB := server.direct.startStartupTrace("session-b", "trace_b")
+	server.queuePrewarmStreamCommands("trace_b", startupTraceCorrelationID(traceB), traceB)
+	server.sendBrowserVideoWarmStart(&client{startupTraceID: traceB})
+	if pending := countPhoneSignalTypesWithin(phoneCommands, 150*time.Millisecond); pending["start"] != 0 || pending["keyframe"] != 0 {
+		t.Fatalf("second trace overtook blocked global start barrier: %v", pending)
+	}
+
+	close(releaseCommand)
+	first := waitForPhoneMessageText(t, phoneCommands, `"type":"start"`)
+	second := waitForPhoneMessageText(t, phoneCommands, `"type":"keyframe"`)
+	if phoneSignalType(first) != "start" || phoneSignalType(second) != "keyframe" {
+		t.Fatalf("cross-trace commands were not ordered: first=%s second=%s", first, second)
+	}
+	if extras := countPhoneSignalTypesWithin(phoneCommands, 200*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
+		t.Fatalf("cross-trace startup emitted duplicate commands: %v", extras)
+	}
+}
+
+func TestPrewarmCommandMarkersStayWithOriginatingTrace(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+
+	commandStarted := make(chan state.StreamCommandInput, 1)
+	releaseCommand := make(chan struct{})
+	store := &blockingFirstStartCommandStore{
+		Store:   newTicketMemoryStore(t, phoneServer.URL),
+		started: commandStarted,
+		release: releaseCommand,
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	defer server.releaseRetainedRelayViewer("origin-session")
+
+	server.prewarmStreamForSession("origin-session", "blocked_origin")
+	var startInput state.StreamCommandInput
+	select {
+	case startInput = <-commandStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("originating start command did not reach the blocked store")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(startInput.PayloadJSON), &payload); err != nil {
+		t.Fatalf("decode originating start payload: %v", err)
+	}
+	originCorrelation, _ := payload["traceId"].(string)
+	originSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	originTrace := originSnapshot["startupTrace"].(map[string]any)
+	if originCorrelation == "" || originTrace["correlationId"] != originCorrelation {
+		t.Fatalf("blocked start payload correlation = %q, origin trace = %#v", originCorrelation, originTrace)
+	}
+
+	currentTraceID := server.direct.beginStartupTrace("replacement-session", "replacement_trace")
+	close(releaseCommand)
+	waitForPhoneMessage(t, phoneCommands, `"type":"keyframe"`)
+
+	currentSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	currentTrace := currentSnapshot["startupTrace"].(map[string]any)
+	if currentTrace["id"] != currentTraceID {
+		t.Fatalf("replacement startup trace changed unexpectedly: %#v", currentTrace)
+	}
+	phases, _ := currentTrace["phases"].([]streamStartupTracePhase)
+	for _, phase := range phases {
+		if (phase.Name == "stream_start_command_queued" || phase.Name == "keyframe_command_queued" || phase.Name == "spacetime_command_written") && strings.Contains(phase.Detail, "blocked_origin") {
+			t.Fatalf("originating prewarm command marked the replacement trace: %#v", phases)
+		}
+	}
+}
+
+func TestRepeatedPrewarmRefreshesNextRelayHandshakeTrace(t *testing.T) {
+	phoneCommands := make(chan string, 16)
+	phoneTraceHeaders := make(chan string, 4)
+	releaseFirstConnection := make(chan struct{})
+	var connectionCount atomic.Int32
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		connection := connectionCount.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		phoneTraceHeaders <- r.Header.Get("X-Ticket-Startup-Trace")
+		if connection == 1 {
+			select {
+			case <-releaseFirstConnection:
+				_ = conn.Close(websocket.StatusInternalError, "force trace refresh reconnect")
+			case <-r.Context().Done():
+			}
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+
+	store := newTicketMemoryStore(t, phoneServer.URL)
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: 10 * time.Millisecond, ReconnectMaxDelay: 10 * time.Millisecond,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, store, relay, phoneServer.URL)
+	defer server.releaseRetainedRelayViewer("same-session")
+
+	server.prewarmStreamForSession("same-session", "first_trace")
+	firstSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	firstTrace := firstSnapshot["startupTrace"].(map[string]any)
+	firstCorrelation, _ := firstTrace["correlationId"].(string)
+	select {
+	case header := <-phoneTraceHeaders:
+		if header != firstCorrelation {
+			t.Fatalf("first relay header = %q, trace correlation = %q", header, firstCorrelation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first prewarm relay handshake did not connect")
+	}
+
+	server.direct.completeStartupTrace("test_complete", "first_trace")
+	server.phoneStartMu.Lock()
+	server.lastPhoneHTTPStartAt = time.Time{}
+	server.phoneStartMu.Unlock()
+	server.prewarmStreamForSession("same-session", "second_trace")
+	secondSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	secondTrace := secondSnapshot["startupTrace"].(map[string]any)
+	secondCorrelation, _ := secondTrace["correlationId"].(string)
+	if secondCorrelation == "" || secondCorrelation == firstCorrelation {
+		t.Fatalf("second prewarm correlation = %q, first = %q", secondCorrelation, firstCorrelation)
+	}
+	close(releaseFirstConnection)
+
+	select {
+	case header := <-phoneTraceHeaders:
+		if header != secondCorrelation {
+			t.Fatalf("reconnected relay header = %q, latest trace correlation = %q", header, secondCorrelation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not reconnect with the repeated prewarm trace")
 	}
 }
 
@@ -494,6 +1053,156 @@ func TestAuthenticatedIndexUsesCachedStateBeforeStoreRefresh(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedIndexCachedPageDefersPrewarmUntilFreshMembership(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+
+	baseStore := newTicketMemoryStore(t, phoneServer.URL)
+	blockingStore := &blockingSnapshotStore{
+		Store:           baseStore,
+		snapshotStarted: make(chan struct{}),
+		releaseSnapshot: make(chan struct{}),
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, blockingStore, relay, phoneServer.URL)
+	freshSnapshot, err := baseStore.Snapshot(context.Background(), "vivi-default", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.cacheSnapshot(freshSnapshot)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	startedAt := time.Now()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cached index status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if elapsed := time.Since(startedAt); elapsed > 350*time.Millisecond {
+		t.Fatalf("cached index waited for fresh prewarm membership: %s", elapsed)
+	}
+	select {
+	case <-blockingStore.snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cached index did not start a fresh membership check")
+	}
+	select {
+	case command := <-phoneCommands:
+		t.Fatalf("phone prewarm started before fresh membership completed: %s", command)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if got := relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers before fresh membership completed = %d, want 0", got)
+	}
+
+	close(blockingStore.releaseSnapshot)
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
+	traceSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	trace, ok := traceSnapshot["startupTrace"].(map[string]any)
+	if !ok {
+		t.Fatalf("startup trace missing after cached-index prewarm: %#v", traceSnapshot["startupTrace"])
+	}
+	phases, ok := trace["phases"].([]streamStartupTracePhase)
+	if !ok {
+		t.Fatalf("startup trace phases missing: %#v", trace["phases"])
+	}
+	seen := map[string]bool{}
+	for _, phase := range phases {
+		seen[phase.Name] = true
+	}
+	if !seen["authenticated_index_accepted"] || !seen["prewarm_accepted"] {
+		t.Fatalf("cached-index prewarm lost authentication phase: %#v", phases)
+	}
+}
+
+func TestCachedMembershipPrewarmStillRunsWhenUnrelatedSessionReplacesLatestTrace(t *testing.T) {
+	phoneCommands := make(chan string, 8)
+	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer phoneServer.Close()
+	registerTicketStreamCommandSink(t, phoneServer.URL, phoneCommands)
+
+	baseStore := newTicketMemoryStore(t, phoneServer.URL)
+	blockingStore := &blockingSnapshotStore{
+		Store:           baseStore,
+		snapshotStarted: make(chan struct{}),
+		releaseSnapshot: make(chan struct{}),
+	}
+	relay := phone.NewRelay(phone.RelayConfig{
+		BackendID: "pixel", AttachName: "Pixel", BaseURL: phoneServer.URL,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+		NoViewerStopDelay: time.Hour,
+	})
+	defer relay.Close()
+	server := newTicketWebServer(t, blockingStore, relay, phoneServer.URL)
+	freshSnapshot, err := baseStore.Snapshot(context.Background(), "vivi-default", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.cacheSnapshot(freshSnapshot)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cached index status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-blockingStore.snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cached index did not start a fresh membership check")
+	}
+	unrelatedTraceID := server.direct.startStartupTraceForRun(
+		"unrelated-session",
+		newStartupRunOrigin(),
+		"unrelated_authenticated_index",
+	)
+	close(blockingStore.releaseSnapshot)
+	waitForPhoneMessage(t, phoneCommands, `"type":"start"`)
+
+	snapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	trace, ok := snapshot["startupTrace"].(map[string]any)
+	if !ok || trace["id"] != unrelatedTraceID {
+		t.Fatalf("unrelated current trace was replaced by cached prewarm: %#v", snapshot["startupTrace"])
+	}
+	phases, _ := trace["phases"].([]streamStartupTracePhase)
+	for _, phase := range phases {
+		if phase.Name == "authenticated_index_accepted" || phase.Name == "prewarm_accepted" || phase.Name == "spacetime_command_written" {
+			t.Fatalf("cached prewarm contaminated unrelated trace: %#v", phases)
+		}
+	}
+}
+
 func TestRemovedMemberCachedPageCannotPrewarmPhone(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 	phoneServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -717,11 +1426,25 @@ func TestVideoClientLogsAreAcceptedAndSanitizedOnAuthenticatedVideoSocket(t *tes
 		t.Fatalf("write client log: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
-	event, ok := snapshot["lastBrowserEvent"].(clientTelemetryEvent)
-	if !ok || event.Event != "stream_started" {
-		t.Fatalf("validated client log was not accepted on the authenticated media socket: %#v", snapshot["lastBrowserEvent"])
+	var event clientTelemetryEvent
+	var recent []clientTelemetryEvent
+	deadline := time.Now().Add(time.Second)
+	for event.Event == "" {
+		snapshot := server.direct.snapshot(time.Now(), phone.Health{})
+		recent, _ = snapshot["recentBrowserEvents"].([]clientTelemetryEvent)
+		for index := len(recent) - 1; index >= 0; index-- {
+			if recent[index].Event == "stream_started" {
+				event = recent[index]
+				break
+			}
+		}
+		if event.Event != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("validated client log was not accepted on the authenticated media socket: %#v", recent)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if !strings.Contains(event.Detail, "[redacted]") || strings.Contains(event.Detail, "123") {
 		t.Fatalf("client log detail was not sanitized: %#v", event)
@@ -813,13 +1536,33 @@ func TestLiveFramesAreShared(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
+	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	controllerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "controller-session")
+	controllerRunOrigin := newStartupRunOrigin()
+	server.direct.startStartupTraceForRun("controller-session", controllerRunOrigin, "controller_test")
+	controllerConn := dialStreamTestClientForRun(t, ctx, ticketServer.URL, "controller-session", controllerRunOrigin)
 	defer controllerConn.Close(websocket.StatusNormalClosure, "test complete")
-	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
+	viewerRunOrigin := newStartupRunOrigin()
+	server.direct.startStartupTraceForRun("viewer-session", viewerRunOrigin, "viewer_test")
+	viewerConn := dialStreamTestClientForRun(t, ctx, ticketServer.URL, "viewer-session", viewerRunOrigin)
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
+	clientDeadline := time.Now().Add(time.Second)
+	for {
+		clients := server.clientSnapshot()
+		ready := len(clients) >= 2
+		for _, live := range clients {
+			ready = ready && live.readyForVideoBroadcast()
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(clientDeadline) {
+			t.Fatalf("browser clients were not config-ready before broadcast: %d", len(clients))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	frame := testTSF2KeyFrameWithEpoch(1, 77, true)
 	server.broadcastFrame(frame)
@@ -829,6 +1572,97 @@ func TestLiveFramesAreShared(t *testing.T) {
 	}
 	if got := readNextBinaryFrame(t, ctx, viewerConn); !bytes.Equal(got, frame) {
 		t.Fatalf("viewer frame = %q", string(got))
+	}
+	controllerMarkers := []string{
+		`{"type":"client_log","event":"browser_first_frame_decoded","detail":"{\"frameEpoch\":1,\"frameSequence\":77}"}`,
+		`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":1,\"frameSequence\":77}"}`,
+	}
+	for _, marker := range controllerMarkers {
+		if err := controllerConn.Write(ctx, websocket.MessageText, []byte(marker)); err != nil {
+			t.Fatalf("write old browser lifecycle marker: %v", err)
+		}
+	}
+	if err := controllerConn.Close(websocket.StatusNormalClosure, "old viewer complete"); err != nil {
+		t.Fatalf("close old browser connection: %v", err)
+	}
+	oldViewerDeadline := time.Now().Add(time.Second)
+	for {
+		oldViewerPresent := false
+		for _, liveClient := range server.clientSnapshot() {
+			if liveClient.sessionID == "controller-session" {
+				oldViewerPresent = true
+			}
+		}
+		if !oldViewerPresent {
+			break
+		}
+		if time.Now().After(oldViewerDeadline) {
+			t.Fatal("old browser connection did not finish processing lifecycle markers")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	oldViewerSnapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+	oldViewerTrace, ok := oldViewerSnapshot["startupTrace"].(map[string]any)
+	if !ok {
+		t.Fatalf("current startup trace missing after old viewer closed: %#v", oldViewerSnapshot["startupTrace"])
+	}
+	if oldViewerTrace["complete"] == true {
+		t.Fatalf("old viewer completed the current startup trace: %#v", oldViewerTrace)
+	}
+	oldViewerPhases, _ := oldViewerTrace["phases"].([]streamStartupTracePhase)
+	for _, phase := range oldViewerPhases {
+		if phase.Name == "browser_first_frame_decoded" || phase.Name == "browser_first_frame_painted" || phase.Name == "browser_first_rendered_frame" {
+			t.Fatalf("old viewer marked the current startup trace: %#v", oldViewerPhases)
+		}
+	}
+
+	for _, marker := range controllerMarkers {
+		if err := viewerConn.Write(ctx, websocket.MessageText, []byte(marker)); err != nil {
+			t.Fatalf("write browser lifecycle marker: %v", err)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		snapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+		trace, ok := snapshot["startupTrace"].(map[string]any)
+		if !ok {
+			t.Fatalf("startup trace missing after viewer writes: %#v", snapshot["startupTrace"])
+		}
+		phases, ok := trace["phases"].([]streamStartupTracePhase)
+		if !ok {
+			t.Fatalf("startup trace phases missing after viewer writes: %#v", trace)
+		}
+		if trace["complete"] == true {
+			phaseIndex := map[string]int{}
+			for index, phase := range phases {
+				if _, exists := phaseIndex[phase.Name]; !exists {
+					phaseIndex[phase.Name] = index
+				}
+			}
+			ordered := []string{
+				"video_socket_accepted",
+				"first_forwarded_keyframe",
+				"first_forwarded_frame",
+				"browser_first_frame_decoded",
+				"browser_first_frame_painted",
+				"browser_first_rendered_frame",
+			}
+			for index, phase := range ordered {
+				got, exists := phaseIndex[phase]
+				if !exists {
+					t.Fatalf("startup phase %q missing after viewer write and paint: %#v", phase, phases)
+				}
+				if index > 0 && got <= phaseIndex[ordered[index-1]] {
+					t.Fatalf("startup phases are not causally ordered %v: %#v", ordered, phases)
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("viewer writer and browser paint did not complete startup trace: %#v", phases)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -859,6 +1693,23 @@ func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
 
 	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
+	readyDeadline := time.Now().Add(time.Second)
+	for {
+		ready := false
+		for _, live := range server.clientSnapshot() {
+			if live.sessionID == "viewer-session" && live.readyForVideoBroadcast() {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			t.Fatal("viewer was not config-ready before keyframe broadcast")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	keyFrame := testTSF2FrameWithTimestamp(1, 79, true, 10001)
 	deltaFrame := testTSF2FrameWithTimestamp(1, 80, false, 10002)
@@ -891,6 +1742,217 @@ func TestVideoStreamDoesNotSendStreamStatus(t *testing.T) {
 	typ, data, err := viewerConn.Read(readCtx)
 	if err == nil && typ == websocket.MessageText && strings.Contains(string(data), `"stream_status"`) {
 		t.Fatalf("video stream must not send stream_status messages: %s", data)
+	}
+}
+
+func TestLiveKeyframeCannotReachBrowserBeforeStartupConfigIsQueued(t *testing.T) {
+	server, ticketServer, relay := newStreamSharingTestServer(t)
+	defer ticketServer.Close()
+	defer relay.Close()
+	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+
+	server.startupRunMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			server.startupRunMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn := dialStreamTestClient(t, ctx, ticketServer.URL, "config-gate-session")
+	defer conn.Close(websocket.StatusNormalClosure, "test complete")
+	deadline := time.Now().Add(time.Second)
+	for len(server.clientSnapshot()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("browser client was not registered behind startup gate")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	server.broadcastFrame(testTSF2KeyFrameWithEpoch(1, 1, true))
+	client := server.clientSnapshot()[0]
+	client.videoMu.Lock()
+	writerStartedBeforeConfig := client.writerWake != nil
+	queuedBeforeConfig := len(client.videoQueue)
+	client.videoMu.Unlock()
+	if writerStartedBeforeConfig || queuedBeforeConfig != 0 {
+		t.Fatalf("pre-config live keyframe started writer=%t queued=%d", writerStartedBeforeConfig, queuedBeforeConfig)
+	}
+
+	server.startupRunMu.Unlock()
+	locked = false
+	_ = readNextTextMessageOfType(t, ctx, conn, "config")
+	server.broadcastFrame(testTSF2KeyFrameWithEpoch(1, 2, true))
+	frame := readNextBinaryFrame(t, ctx, conn)
+	if got := parseTSF2(frame).sequence; got != 2 {
+		t.Fatalf("first browser keyframe sequence = %d, want post-config sequence 2", got)
+	}
+}
+
+func TestLegacyVideoSocketCloseBeforeFirstPaintKeepsPublicOpenGrace(t *testing.T) {
+	server, ticketServer, relay := newStreamSharingTestServer(t)
+	defer ticketServer.Close()
+	defer relay.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	conn := dialStreamTestClient(t, ctx, ticketServer.URL, "legacy-session")
+	if err := conn.Close(websocket.StatusNormalClosure, "close before first paint"); err != nil {
+		t.Fatalf("close legacy browser socket: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.mu.Lock()
+		viewerRefs := server.relayViewerRefs["legacy-session"]
+		graceRetained := server.streamPrewarmTimers["legacy-session"] != nil
+		server.mu.Unlock()
+		if len(server.clientSnapshot()) == 0 && viewerRefs == 1 && graceRetained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("legacy browser socket cleanup incomplete: refs=%d grace=%t", viewerRefs, graceRetained)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("relay viewers after legacy socket closed before first paint = %d, want grace viewer", got)
+	}
+	server.releaseRelayViewerPublicOpenGrace("legacy-session", "test_cleanup", "")
+	if got := relay.Snapshot().Viewers; got != 0 {
+		t.Fatalf("relay viewers after legacy grace release = %d, want 0", got)
+	}
+}
+
+func TestUnboundSameSessionSocketCannotReplaceOrReleaseCurrentRunGrace(t *testing.T) {
+	server, ticketServer, relay := newStreamSharingTestServer(t)
+	defer ticketServer.Close()
+	defer relay.Close()
+
+	const sessionID = "shared-session"
+	runOrigin := newStartupRunOrigin()
+	server.direct.startStartupTraceForRun(sessionID, runOrigin, "authenticated_index_accepted")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	current := dialStreamTestClientForRun(t, ctx, ticketServer.URL, sessionID, runOrigin)
+	defer current.Close(websocket.StatusNormalClosure, "test complete")
+	legacy := dialStreamTestClient(t, ctx, ticketServer.URL, sessionID)
+
+	server.mu.Lock()
+	currentTimer := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if currentTimer == nil {
+		t.Fatal("current startup run did not retain public-open grace")
+	}
+	if err := legacy.Write(ctx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameSequence\":1}"}`)); err != nil {
+		t.Fatalf("write legacy first-paint marker: %v", err)
+	}
+	if err := legacy.Close(websocket.StatusNormalClosure, "stale socket complete"); err != nil {
+		t.Fatalf("close legacy socket: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		legacyPresent := false
+		for _, live := range server.clientSnapshot() {
+			if live.sessionID == sessionID && live.startupTraceID == "" {
+				legacyPresent = true
+			}
+		}
+		server.mu.Lock()
+		retainedTimer := server.streamPrewarmTimers[sessionID]
+		viewerRefs := server.relayViewerRefs[sessionID]
+		server.mu.Unlock()
+		if !legacyPresent && viewerRefs == 2 {
+			if retainedTimer != currentTimer {
+				t.Fatal("unbound same-session socket replaced the current run grace timer")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("legacy same-session cleanup incomplete: present=%t refs=%d", legacyPresent, viewerRefs)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestCompletedRunSecondSocketCannotRecreatePublicOpenGrace(t *testing.T) {
+	server, ticketServer, relay := newStreamSharingTestServer(t)
+	defer ticketServer.Close()
+	defer relay.Close()
+
+	const sessionID = "shared-complete-session"
+	runOrigin := newStartupRunOrigin()
+	server.direct.startStartupTraceForRun(sessionID, runOrigin, "authenticated_index_accepted")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	painted := dialStreamTestClientForRun(t, ctx, ticketServer.URL, sessionID, runOrigin)
+	defer painted.Close(websocket.StatusNormalClosure, "test complete")
+	unpainted := dialStreamTestClientForRun(t, ctx, ticketServer.URL, sessionID, runOrigin)
+	writerEvidenceDeadline := time.Now().Add(time.Second)
+	for {
+		clients := server.clientSnapshot()
+		seeded := len(clients) >= 2
+		for _, live := range clients {
+			if live.sessionID == sessionID && live.startupTraceID != "" {
+				noteTestKeyframeWritten(live, 7, 1, time.Now())
+			} else {
+				seeded = false
+			}
+		}
+		if seeded {
+			break
+		}
+		if time.Now().After(writerEvidenceDeadline) {
+			t.Fatal("painted socket did not register for writer evidence")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := painted.Write(ctx, websocket.MessageText, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":7,\"frameSequence\":1}"}`)); err != nil {
+		t.Fatalf("write first-paint marker: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snapshot := server.direct.snapshot(time.Now(), relay.Snapshot())
+		trace, _ := snapshot["startupTrace"].(map[string]any)
+		server.mu.Lock()
+		retained := server.streamPrewarmTimers[sessionID] != nil
+		server.mu.Unlock()
+		if trace["complete"] == true && !retained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("first socket did not complete and release grace: trace=%#v retained=%t", trace, retained)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := unpainted.Close(websocket.StatusNormalClosure, "unpainted sibling closed"); err != nil {
+		t.Fatalf("close second same-run socket: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		unpaintedPresent := false
+		for _, live := range server.clientSnapshot() {
+			if live.sessionID == sessionID && !live.firstVideoFrameRendered {
+				unpaintedPresent = true
+			}
+		}
+		server.mu.Lock()
+		retained := server.streamPrewarmTimers[sessionID] != nil
+		viewerRefs := server.relayViewerRefs[sessionID]
+		server.mu.Unlock()
+		if !unpaintedPresent && viewerRefs == 1 {
+			if retained {
+				t.Fatal("completed startup run recreated grace from its unpainted sibling socket")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("second socket cleanup incomplete: present=%t refs=%d retained=%t", unpaintedPresent, viewerRefs, retained)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -1142,19 +2204,272 @@ func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
 }
 
 func TestPhoneConfigForActiveViewerRequestsFreshKeyframe(t *testing.T) {
-	server, _, _ := newTicketVideoStreamTestServer(t)
-
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+	now := time.Now()
 	server.direct.mu.Lock()
-	before := server.direct.lastKeyframeRequestedAt
+	server.direct.streamEpoch = 7
+	server.direct.lastFrameAt = now
+	server.direct.lastKeyFrameAt = now
+	server.direct.lastFrameEpoch = 7
+	server.direct.lastKeyFrameEpoch = 7
+	server.direct.lastFrameSequence = 77
+	server.direct.lastKeyFrameSequence = 70
+	server.direct.lastFrameVisualAgeMillis = 100
+	server.direct.lastKeyFrameVisualAgeMillis = 100
+	server.direct.lastFrameVisualAgeKnown = true
+	server.direct.lastKeyFrameVisualAgeKnown = true
 	server.direct.mu.Unlock()
+	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 
-	server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42}`))
+	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42}`)
+	server.handlePhoneText(config)
+	server.handlePhoneText(config)
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "phone config viewer-required keyframe")
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("repeated phone configs bypassed keyframe coalescing: %d extra requests", got)
+	}
+	newEpochConfig := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":43}`)
+	server.handlePhoneText(newEpochConfig)
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "new config epoch viewer-required keyframe")
+}
 
-	server.direct.mu.Lock()
-	after := server.direct.lastKeyframeRequestedAt
-	server.direct.mu.Unlock()
-	if after.IsZero() || !after.After(before) {
-		t.Fatalf("phone config did not request a fresh keyframe; before=%v after=%v", before, after)
+func TestViewerRequiredKeyframePayloadUsesExistingRequesterScope(t *testing.T) {
+	for _, reason := range []string{
+		"viewer_sequence_gap",
+		"viewer_source_stall",
+		"frame_sequence_gap",
+		"phone_config_active_viewer",
+		"browser_video_provisional_config",
+		"browser_video_config_needed",
+	} {
+		payload := phoneKeyframeCommandPayload(reason, "startup_1234abcd")
+		if payload["source"] != "browser" || payload["traceId"] != "startup_1234abcd" {
+			t.Fatalf("viewer-required reason %q changed existing payload=%#v", reason, payload)
+		}
+		if _, exists := payload["viewerRequired"]; exists {
+			t.Fatalf("viewer-required reason %q introduced a new wire field: %#v", reason, payload)
+		}
+	}
+	for _, reason := range []string{"stale_video_frames", "stream_prewarm", "relay_watchdog"} {
+		payload := phoneKeyframeCommandPayload(reason)
+		if payload["source"] != "ticket_remote" {
+			t.Fatalf("ordinary reason %q lost backward-compatible source: %#v", reason, payload)
+		}
+	}
+}
+
+func TestStreamFeedbackSourceStallTransitionsOnceAndRecovers(t *testing.T) {
+	hub := newDirectStreamHub()
+	requests := make(chan string, 2)
+	viewer := &client{
+		videoEpoch:          7,
+		videoDeliveryMode:   videoDeliveryFull,
+		videoLastWrittenSeq: 120,
+		videoReadyForDelta:  true,
+		videoReadyEpoch:     7,
+		onVideoKeyframeNeeded: func(reason string, _ uint64) {
+			requests <- reason
+		},
+	}
+	server := &Server{
+		direct:  hub,
+		clients: map[*client]struct{}{viewer: {}},
+	}
+	now := time.Unix(1_700_000_000, 0)
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 100), now)
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 2_100), now.Add(500*time.Millisecond))
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 2_600), now.Add(time.Second))
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 3_100), now.Add(1500*time.Millisecond))
+
+	select {
+	case reason := <-requests:
+		if reason != "source_stall" {
+			t.Fatalf("source-stall request reason=%q", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler did not request a source-stall keyframe")
+	}
+	select {
+	case reason := <-requests:
+		t.Fatalf("handler requested a duplicate source-stall keyframe: %q", reason)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	adaptiveEvents := func() []clientTelemetryEvent {
+		t.Helper()
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		var events []clientTelemetryEvent
+		for _, event := range hub.recentBrowserEvents {
+			if event.Event == "stream_feedback_transition" {
+				events = append(events, event)
+			}
+		}
+		return events
+	}
+	events := adaptiveEvents()
+	if len(events) != 1 || !strings.Contains(events[0].Detail, "cause=upstream_or_delivery_stall") ||
+		!strings.Contains(events[0].Detail, "action=keyframe_requested") ||
+		!strings.Contains(events[0].Detail, "from=full to=full") {
+		t.Fatalf("source-stall transition telemetry=%#v", events)
+	}
+	server.streamCadenceMu.Lock()
+	demand, maxFPS := server.lastStreamCadenceDemand, server.lastStreamCadenceMaxFPS
+	server.streamCadenceMu.Unlock()
+	if demand != "full" || maxFPS != 10 {
+		t.Fatalf("source stall changed source demand=%q maxFps=%d, want full/10", demand, maxFPS)
+	}
+
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 121, 121, 121, 121, 0, 100), now.Add(2*time.Second))
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 122, 122, 122, 121, 0, 100), now.Add(2500*time.Millisecond))
+	events = adaptiveEvents()
+	if len(events) != 2 || !strings.Contains(events[1].Detail, "cause=healthy") ||
+		!strings.Contains(events[1].Detail, "action=recovered") {
+		t.Fatalf("source-stall recovery telemetry=%#v", events)
+	}
+}
+
+func TestStreamFeedbackKeyframeOnlyHealthySampleIsStabilizingNotRecovered(t *testing.T) {
+	hub := newDirectStreamHub()
+	now := time.Unix(1_700_000_000, 0)
+	viewer := &client{
+		videoEpoch:                   7,
+		videoDeliveryMode:            videoDeliveryKeyframeOnly,
+		feedbackCount:                1,
+		lastFeedbackAt:               now.Add(-feedbackMinInterval),
+		lastFeedbackEpoch:            7,
+		lastFeedbackReceived:         120,
+		lastFeedbackDecoded:          120,
+		lastFeedbackRendered:         120,
+		lastFeedbackRenderedKeyframe: 111,
+		feedbackState:                "congested_awaiting_keyframe",
+		feedbackCause:                "browser_render_stall",
+		feedbackKeyframeStreak:       0,
+		feedbackHealthyStreak:        0,
+		feedbackSourceStallStreak:    0,
+		feedbackSourceStallRequested: false,
+	}
+	server := &Server{direct: hub, clients: map[*client]struct{}{viewer: {}}}
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 121, 121, 121, 111, 0, 100), now)
+
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	var transitions []clientTelemetryEvent
+	for _, event := range hub.recentBrowserEvents {
+		if event.Event == "stream_feedback_transition" {
+			transitions = append(transitions, event)
+		}
+	}
+	if len(transitions) != 1 || !strings.Contains(transitions[0].Detail, "action=stabilizing") ||
+		strings.Contains(transitions[0].Detail, "action=recovered") ||
+		!strings.Contains(transitions[0].Detail, "to=keyframe_only") {
+		t.Fatalf("keyframe-only healthy telemetry=%#v", transitions)
+	}
+}
+
+func TestSecondViewerGapInsideCooldownRequestsFreshKeyframe(t *testing.T) {
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+	var viewer *client
+	deadline := time.Now().Add(time.Second)
+	for viewer == nil {
+		for _, candidate := range server.clientSnapshot() {
+			viewer = candidate
+			break
+		}
+		if viewer != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser viewer was not registered for the gap recovery fixture")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	viewer.videoMu.Lock()
+	viewer.videoEpoch = 7
+	viewer.videoDeliveryMode = videoDeliveryFull
+	viewer.videoLastWrittenSeq = 10
+	viewer.videoKeyframeRequestPending = false
+	viewer.videoKeyframeRequestSequence = 0
+	viewer.videoMu.Unlock()
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 12, false, 12000))
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "first broken GOP keyframe")
+
+	noteTestKeyframeWritten(viewer, 7, 20, time.Now())
+	viewer.setVideoDeliveryMode(videoDeliveryFull)
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 22, false, 22000))
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "second broken GOP keyframe inside cooldown")
+
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 23, false, 23000))
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("repeated deltas in the same broken GOP scheduled %d extra keyframes", got)
+	}
+}
+
+func TestRequiredKeyframeWaitsBehindFinishingRequest(t *testing.T) {
+	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+
+	server.backgroundKeyframeMu.Lock()
+	server.backgroundKeyframeInFlight = true
+	server.backgroundKeyframeMu.Unlock()
+
+	const requirement = "viewer_999_sequence_gap:2"
+	server.requestPhoneKeyframeWithRequirement("frame_sequence_gap", requirement)
+	server.requestPhoneKeyframeWithRequirement("frame_sequence_gap", requirement)
+
+	server.backgroundKeyframeMu.Lock()
+	pending := len(server.backgroundKeyframePending)
+	_, active := server.backgroundKeyframeActive[requirement]
+	server.backgroundKeyframeMu.Unlock()
+	if pending != 1 || !active {
+		t.Fatalf("required keyframe was not retained exactly once behind finishing request: pending=%d active=%t", pending, active)
+	}
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 100*time.Millisecond); got != 0 {
+		t.Fatalf("deferred required keyframe ran before the active request finished: %d", got)
+	}
+
+	server.finishBackgroundKeyframe()
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "deferred required keyframe")
+	waitForStartupCommandIdle(t, server)
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("duplicate retained requirement scheduled %d extra keyframes", got)
+	}
+}
+
+func TestPhoneConfigReplaysMatchingCachedKeyframeToEveryViewer(t *testing.T) {
+	hub := newDirectStreamHub()
+	viewerA := &client{}
+	viewerB := &client{}
+	server := &Server{
+		direct: hub,
+		clients: map[*client]struct{}{
+			viewerA: {},
+			viewerB: {},
+		},
+	}
+	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"phoneUptimeMillis":10000}`)
+	hub.setConfig(config)
+	keyframe := testTSF2FrameWithTimestamp(42, 77, true, 10000)
+	if !hub.recordFrame(keyframe) {
+		t.Fatal("matching cached keyframe fixture was rejected")
+	}
+
+	server.handlePhoneText(config)
+	for index, viewer := range []*client{viewerA, viewerB} {
+		viewer.videoMu.Lock()
+		if len(viewer.controlQueue) != 1 || !viewer.controlQueue[0].config || viewer.controlQueue[0].epoch != 42 {
+			viewer.videoMu.Unlock()
+			t.Fatalf("viewer %d config queue mismatch: %#v", index, viewer.controlQueue)
+		}
+		if len(viewer.videoQueue) != 1 {
+			viewer.videoMu.Unlock()
+			t.Fatalf("viewer %d did not receive cached keyframe: %#v", index, viewer.videoQueue)
+		}
+		meta := viewer.videoQueue[0].meta
+		viewer.videoMu.Unlock()
+		if !meta.ok || !meta.keyFrame || meta.epoch != 42 || meta.sequence != 77 {
+			t.Fatalf("viewer %d cached keyframe mismatch: %#v", index, meta)
+		}
 	}
 }
 
@@ -1224,13 +2539,79 @@ func TestBackgroundKeyframeQueueCoalescesAcrossReconnectingViewers(t *testing.T)
 	if backgroundStreamCommandRequiresDemand("keyframe", "control_code_result_marker_low_latency") {
 		t.Fatal("interactive control-code keyframes must bypass the background gate")
 	}
-	if backgroundKeyframeDedupEligible("phone_config_active_viewer") {
-		t.Fatal("a newly received phone config must be followed by its required fresh keyframe")
+	if !perViewerKeyframeRequired("phone_config_active_viewer") || !perViewerKeyframeRequired("frame_sequence_gap") || !perViewerKeyframeRequired("viewer_sequence_gap") {
+		t.Fatal("per-viewer decoder gaps must bypass only global live suppression")
 	}
+	if !backgroundKeyframeDedupEligible("phone_config_active_viewer") || !backgroundKeyframeDedupEligible("frame_sequence_gap") {
+		t.Fatal("per-viewer decoder gaps must retain global request coalescing")
+	}
+
+	server = &Server{}
+	if !server.beginBackgroundKeyframe(now) {
+		t.Fatal("generic background request should acquire a fresh gate")
+	}
+	server.finishBackgroundKeyframe()
+	if !server.beginBackgroundKeyframe(now.Add(time.Millisecond), "phone_config_active_viewer:42") {
+		t.Fatal("new config epoch requirement was suppressed by an unrelated cooldown")
+	}
+	server.finishBackgroundKeyframe()
+	if server.beginBackgroundKeyframe(now.Add(2*time.Millisecond), "phone_config_active_viewer:42") {
+		t.Fatal("repeated config epoch bypassed keyframe coalescing")
+	}
+	if !server.beginBackgroundKeyframe(now.Add(3*time.Millisecond), "phone_config_active_viewer:43") {
+		t.Fatal("new config epoch did not supersede the previous epoch cooldown")
+	}
+	server.finishBackgroundKeyframe()
+	if !server.beginBackgroundKeyframe(now.Add(4*time.Millisecond), "viewer_sequence_gap:1") {
+		t.Fatal("first broken GOP requirement was suppressed by the config cooldown")
+	}
+	server.finishBackgroundKeyframe()
+	if !server.beginBackgroundKeyframe(now.Add(5*time.Millisecond), "viewer_sequence_gap:2") {
+		t.Fatal("second broken GOP requirement was suppressed by the first GOP cooldown")
+	}
+	server.finishBackgroundKeyframe()
+
+	server = &Server{clients: map[*client]struct{}{}}
+	viewerA := &client{sessionID: "viewer-a", email: "viewer-a@example.test"}
+	viewerB := &client{sessionID: "viewer-b", email: "viewer-b@example.test"}
+	if !server.tryAddClient(viewerA) || !server.tryAddClient(viewerB) {
+		t.Fatal("distinct viewer fixtures were rejected")
+	}
+	if viewerA.videoKeyframeRequirementID == 0 || viewerA.videoKeyframeRequirementID == viewerB.videoKeyframeRequirementID {
+		t.Fatalf("viewer keyframe owners are not distinct: a=%d b=%d", viewerA.videoKeyframeRequirementID, viewerB.videoKeyframeRequirementID)
+	}
+	viewerARequirement := fmt.Sprintf("viewer_%d_sequence_gap:1", viewerA.videoKeyframeRequirementID)
+	viewerBRequirement := fmt.Sprintf("viewer_%d_sequence_gap:1", viewerB.videoKeyframeRequirementID)
+	if !server.beginBackgroundKeyframe(now, viewerARequirement) {
+		t.Fatal("viewer A gap should acquire a fresh gate")
+	}
+	server.finishBackgroundKeyframe()
+	if !server.beginBackgroundKeyframe(now.Add(time.Millisecond), viewerBRequirement) {
+		t.Fatal("viewer B gap collided with viewer A request generation")
+	}
+	server.finishBackgroundKeyframe()
+	if server.beginBackgroundKeyframe(now.Add(2*time.Millisecond), viewerARequirement) {
+		t.Fatal("A-B-A request pattern bypassed viewer A cooldown")
+	}
+	if !server.beginBackgroundKeyframe(now.Add(backgroundKeyframeMinInterval), viewerARequirement) {
+		t.Fatal("viewer A requirement did not expire after the cooldown")
+	}
+	server.finishBackgroundKeyframe()
 }
 
 func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
+	relayDeadline := time.Now().Add(3 * time.Second)
+	for {
+		health := server.relay.Snapshot()
+		if health.Desired && health.Connected {
+			break
+		}
+		if time.Now().After(relayDeadline) {
+			t.Fatalf("phone relay did not become live for suppression fixture: desired=%t connected=%t", health.Desired, health.Connected)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	now := time.Now()
 	server.direct.mu.Lock()
@@ -1247,6 +2628,10 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	server.direct.lastKeyFrameVisualAgeKnown = true
 	server.direct.lastBrowserMediaError = ""
 	server.direct.mu.Unlock()
+	server.backgroundKeyframeMu.Lock()
+	server.backgroundKeyframeInFlight = false
+	server.lastBackgroundKeyframeAt = time.Time{}
+	server.backgroundKeyframeMu.Unlock()
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 
 	if err := server.requestPhoneKeyframeNow("stale_video_frames"); err != nil {
@@ -1254,12 +2639,31 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	}
 	server.requestPhoneRecovery("stale_video_frames")
 
-	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
-		t.Fatalf("live stream allowed background keyframe commands: %d", got)
+	if got := collectPhoneSignalsWithin(phoneSignals, 250*time.Millisecond); len(got["keyframe"]) != 0 {
+		t.Fatalf("live stream allowed background keyframe commands: %#v", got)
 	}
 	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
 		t.Fatalf("live stream allowed background recovery commands: %d", got)
 	}
+	if err := server.requestPhoneKeyframeNow("frame_sequence_gap"); err != nil {
+		t.Fatalf("viewer-required sequence-gap keyframe returned error: %v", err)
+	}
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "viewer-required sequence-gap keyframe")
+	if err := server.requestPhoneKeyframeNow("frame_sequence_gap"); err != nil {
+		t.Fatalf("coalesced sequence-gap keyframe returned error: %v", err)
+	}
+	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
+		t.Fatalf("viewer-required sequence gap bypassed keyframe coalescing: %d", got)
+	}
+	server.backgroundKeyframeMu.Lock()
+	server.backgroundKeyframeInFlight = false
+	server.lastBackgroundKeyframeAt = time.Time{}
+	server.backgroundKeyframeMu.Unlock()
+
+	if err := server.requestPhoneKeyframeNow("browser_video_provisional_config"); err != nil {
+		t.Fatalf("new viewer warm-start keyframe returned error: %v", err)
+	}
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "new viewer warm-start keyframe")
 
 	if err := server.requestPhoneKeyframeNow("control_code_result_marker_low_latency"); err != nil {
 		t.Fatalf("control-code keyframe returned error: %v", err)
@@ -1341,8 +2745,37 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 		_ = videoConn.Close(websocket.StatusNormalClosure, "test complete")
 	})
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "initial phone keyframe")
+	waitForStartupCommandIdle(t, server)
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 	return server, phoneSignals, videoConn
+}
+
+func waitForStartupCommandIdle(t *testing.T, server *Server) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		server.phoneStartMu.Lock()
+		startInFlight := server.phoneHTTPStartInFlight
+		server.phoneStartMu.Unlock()
+		server.startupSequenceMu.Lock()
+		sequenceInFlight := len(server.startupKeyframeSequences) > 0
+		server.startupSequenceMu.Unlock()
+		server.backgroundKeyframeMu.Lock()
+		keyframeInFlight := server.backgroundKeyframeInFlight
+		server.backgroundKeyframeMu.Unlock()
+		if !startInFlight && !sequenceInFlight && !keyframeInFlight {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"startup commands did not settle: start=%t sequence=%t keyframe=%t",
+				startInFlight,
+				sequenceInFlight,
+				keyframeInFlight,
+			)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func newTicketRecoveryTestServer(t *testing.T, phoneBaseURL string) (*Server, *httptest.Server, *phone.Relay) {
@@ -1518,6 +2951,21 @@ func countPhoneSignalsWithin(phoneSignals <-chan string, signal string, duration
 	return countPhoneSignalTypesWithin(phoneSignals, duration)[signal]
 }
 
+func collectPhoneSignalsWithin(phoneSignals <-chan string, duration time.Duration) map[string][]string {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	collected := map[string][]string{}
+	for {
+		select {
+		case got := <-phoneSignals:
+			typeName := phoneSignalType(got)
+			collected[typeName] = append(collected[typeName], got)
+		case <-timer.C:
+			return collected
+		}
+	}
+}
+
 func countPhoneSignalTypesWithin(phoneSignals <-chan string, duration time.Duration) map[string]int {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -1623,13 +3071,24 @@ func (s *blockingSnapshotStore) Snapshot(ctx context.Context, ticketID string, n
 }
 
 func dialStreamTestClient(t *testing.T, ctx context.Context, serverURL string, sessionID string) *websocket.Conn {
+	return dialStreamTestClientForRun(t, ctx, serverURL, sessionID, "")
+}
+
+func dialStreamTestClientForRun(t *testing.T, ctx context.Context, serverURL string, sessionID string, runOrigin string) *websocket.Conn {
 	t.Helper()
 	wsBase := "ws" + strings.TrimPrefix(serverURL, "http")
 	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
 	header.Add("Cookie", "ticket_remote_session="+sessionID)
-	conn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/stream", &websocket.DialOptions{HTTPHeader: header})
+	options := &websocket.DialOptions{HTTPHeader: header}
+	if runOrigin != "" {
+		options.Subprotocols = []string{"ticket.video.v1", runOrigin}
+	}
+	conn, _, err := websocket.Dial(ctx, wsBase+"/api/v1/stream", options)
 	if err != nil {
 		t.Fatalf("dial browser video websocket: %v", err)
+	}
+	if runOrigin != "" && conn.Subprotocol() != "ticket.video.v1" {
+		t.Fatalf("negotiated video subprotocol = %q; private startup origin must not be echoed", conn.Subprotocol())
 	}
 	return conn
 }

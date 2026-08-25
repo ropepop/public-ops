@@ -2,6 +2,7 @@ package web
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,9 @@ func TestControlCodeResultCaptureWaitsQuietlyBeforeRenderedAztecFrame(t *testing
 
 func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *testing.T) {
 	source := ticketAppSource(t)
+	visibilityBody := substringBetween(t, source,
+		"function setControlCodeResultVisible(visible) {",
+		"  function clearControlCodeResultCapture() {")
 	imageReadyBody := substringBetween(t, source,
 		"function waitForControlCodeResultImageReady(image) {",
 		"  function controlCodeResultPaintReady(requestID) {")
@@ -89,6 +93,22 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	captureBody := substringBetween(t, source,
 		"async function captureControlCodeResultScreenshot(request, proof) {",
 		"  function failControlCodeResultScreenshotWait() {")
+
+	for _, needle := range []string{
+		"if (visible)",
+		"document.body.classList.remove('details-visible')",
+		"panel.setAttribute('aria-hidden', 'true')",
+		"stage.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })",
+	} {
+		if !strings.Contains(visibilityBody, needle) {
+			t.Fatalf("result visibility must align the stream stage with the viewport before paint: missing %q", needle)
+		}
+	}
+	scrollIndex := strings.Index(visibilityBody, "stage.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })")
+	revealAreaIndex := strings.Index(visibilityBody, "codeResultArea.hidden = !visible;")
+	if scrollIndex < 0 || revealAreaIndex < 0 || scrollIndex > revealAreaIndex {
+		t.Fatal("control-code result must move into the viewport before its area is revealed")
+	}
 
 	for _, needle := range []string{
 		"const controlCodeResultImageReadyTimeoutMs = 1200;",
@@ -185,7 +205,7 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	}
 }
 
-func TestTrustedPhoneMarkerFrameCannotBypassBrowserGeneratedDetector(t *testing.T) {
+func TestTrustedPhoneChangedMarkerFrameCanBridgeGeneratedDetectorDesignDrift(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateBody := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
@@ -193,33 +213,79 @@ func TestTrustedPhoneMarkerFrameCannotBypassBrowserGeneratedDetector(t *testing.
 
 	markerGuardIndex := strings.Index(candidateBody, "if (markerEpoch && markerSequence && (renderedEpoch !== markerEpoch || renderedSequence < markerSequence))")
 	fallbackIndex := strings.Index(candidateBody, "const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof")
-	rejectIndex := strings.Index(candidateBody, "if (!proof.browserTrustedGeneratedVisible) {")
+	changedIndex := strings.Index(candidateBody, "const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint")
+	bridgeIndex := strings.Index(candidateBody, "const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&")
+	resultIndex := strings.Index(candidateBody, "const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||")
+	rejectIndex := strings.Index(candidateBody, "if (!proof.browserTrustedResultVisible) {")
 	rejectedIndex := strings.Index(candidateBody, "proof.generatedMarkerOnlyRejected = true;")
-	if markerGuardIndex < 0 || fallbackIndex < 0 || rejectIndex < 0 || rejectedIndex < 0 {
-		t.Fatalf("trusted phone marker-frame rejection diagnostics are missing")
+	if markerGuardIndex < 0 || changedIndex < 0 || fallbackIndex < 0 || bridgeIndex < 0 || resultIndex < 0 || rejectIndex < 0 || rejectedIndex < 0 {
+		t.Fatalf("trusted phone changed marker-frame bridge or its rejection diagnostics are missing")
 	}
 	if markerGuardIndex > fallbackIndex {
 		t.Fatalf("trusted phone marker-frame diagnostics must run only after the frame-at-or-after-marker guard")
 	}
-	if fallbackIndex > rejectIndex {
-		t.Fatalf("trusted phone marker-frame diagnostics must happen before generated-frame rejection")
+	if changedIndex > bridgeIndex || fallbackIndex > bridgeIndex || bridgeIndex > resultIndex || resultIndex > rejectIndex {
+		t.Fatalf("trusted phone changed marker-frame bridge must be built after its guards and before result rejection")
 	}
-	if strings.Contains(candidateBody, "? 'trusted_phone_marker_frame'") ||
-		strings.Contains(candidateBody, "proof.generatedVisibleByPhoneMarker = true;") ||
-		strings.Contains(candidateBody[fallbackIndex:rejectIndex], "proof.browserTrustedGeneratedVisible = true;") {
-		t.Fatalf("trusted phone marker-frame must not bypass browser generated-frame proof")
+	if strings.Contains(candidateBody, "proof.generatedVisibleByPhoneMarker = true;") ||
+		strings.Contains(candidateBody, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
+		t.Fatalf("trusted phone marker alone must not bypass browser changed-frame proof")
 	}
 	for _, needle := range []string{
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
+		"frameChangedFromBaseline",
+		"trustedPhoneMarkerFrame &&",
+		"browserTrustedGeneratedVisible ||",
 		"proof.generatedMarkerOnlyRejected = true;",
 	} {
-		if !strings.Contains(candidateBody[fallbackIndex:rejectIndex], needle) {
-			t.Fatalf("trusted phone marker-frame rejection missing guard %q", needle)
+		if !strings.Contains(candidateBody[changedIndex:rejectIndex], needle) && !strings.Contains(candidateBody[fallbackIndex:rejectIndex], needle) {
+			t.Fatalf("trusted phone changed marker-frame bridge missing guard %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"controlCodeBaselineFrameFingerprint &&",
+		"proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold",
+		"proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold",
+	} {
+		if !strings.Contains(candidateBody[changedIndex:bridgeIndex], needle) {
+			t.Fatalf("trusted phone bridge must require a changed pre-request baseline, missing %q", needle)
 		}
 	}
 	if !strings.Contains(candidateBody, "request.status !== 'succeeded'") {
 		t.Fatal("candidate frame proof must require a succeeded request")
+	}
+}
+
+func TestControlCodeBusyRenderPreservesPreRequestBaseline(t *testing.T) {
+	source := ticketAppSource(t)
+	renderBody := substringBetween(t, source,
+		"function renderControlCodeRequest(request) {",
+		"  function setDetailsPanelVisible(visible) {")
+	submitBody := substringBetween(t, source,
+		"async function submitControlCodeRequest() {",
+		"  async function closeCurrentControlCode(openNext) {")
+
+	baselineIndex := strings.Index(submitBody, "pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());")
+	mutationIndex := strings.Index(submitBody, "await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision)")
+	if baselineIndex < 0 || mutationIndex < 0 || baselineIndex > mutationIndex {
+		t.Fatal("control-code submission must capture its raw-ticket baseline before the reducer call")
+	}
+	busyBody := substringBetween(t, renderBody,
+		"if (busy) {",
+		"    if (!current || current.status === 'closed' || current.status === 'expired') {")
+	for _, needle := range []string{
+		"rememberControlCodeBaselineFrame(requestID);",
+		"clearUnpaintedControlCodeResultImage(currentRequestID);",
+		"scheduleControlCodeTicker(current);",
+		"return;",
+	} {
+		if !strings.Contains(renderBody, needle) {
+			t.Fatalf("busy control-code rendering must preserve the pre-request baseline, missing %q", needle)
+		}
+	}
+	if strings.Contains(busyBody, "clearControlCodeResultCapture();") {
+		t.Fatal("queued/running control-code rendering must not erase the pre-request baseline")
 	}
 }
 
@@ -363,7 +429,7 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		t.Fatalf("control-code capture polling must not run every 20ms")
 	}
 	for _, needle := range []string{
-		"if (!force && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;",
+		"if (!force && lastKeyframeCommandAt > 0 && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;",
 		"lastKeyframeCommandAt = now;",
 		"return true;",
 	} {
@@ -493,16 +559,1210 @@ func TestTicketViewerClaimsEarlyVideoSocketInsteadOfClosingItAtLoad(t *testing.T
 		t.Fatalf("ticket viewer must claim the head-opened video socket instead of closing it at app load")
 	}
 	for _, needle := range []string{
+		"function claimableEarlyVideoQueue(early) {",
 		"function claimEarlyVideoSocket() {",
-		"const queued = Array.isArray(early.queue) ? early.queue.slice() : [];",
+		"const queued = claimableEarlyVideoQueue(early);",
 		"function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {",
 		"claimEarlyVideoSocket()",
-		"queuedMessages.forEach((queued) => {",
+		"queuedMessages.forEach((queued) => queueVideoSocketMessage(queued, true));",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("ticket viewer missing early video reuse behavior: %q", needle)
 		}
 	}
+}
+
+func TestTicketViewerSerializesEarlyConfigBeforeQueuedAndLiveFrames(t *testing.T) {
+	source := ticketAppSource(t)
+	claimBody := substringBetween(t, source,
+		"function claimEarlyVideoSocket() {",
+		"  function scheduleViewerIdleDisconnect(reason) {")
+	adoptBody := substringBetween(t, source,
+		"function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {",
+		"  function sendVideoClientLog(event, detail) {")
+
+	if !strings.Contains(claimBody, "if (early.config) queued.unshift(early.config);") {
+		t.Fatal("early decoder config must remain first in the adopted message queue")
+	}
+	for _, needle := range []string{
+		"let videoMessageChain = Promise.resolve();",
+		"function queueVideoSocketMessage(event, queued) {",
+		"videoMessageChain = videoMessageChain.then(() => {",
+		"return handleVideoSocketMessage(event);",
+		"socket.onmessage = (event) => queueVideoSocketMessage(event, false);",
+		"queuedMessages.forEach((queued) => queueVideoSocketMessage(queued, true));",
+	} {
+		if !strings.Contains(adoptBody, needle) {
+			t.Fatalf("early video adoption must serialize config, cached frames, and live frames, missing %q", needle)
+		}
+	}
+	if strings.Contains(adoptBody, "queuedMessages.forEach((queued) => {\n      handleVideoSocketMessage(queued)") {
+		t.Fatal("early cached frames must not race asynchronous decoder configuration")
+	}
+}
+
+func TestTicketViewerAllowsFirstEligibleKeyframeAndRecoveryRequests(t *testing.T) {
+	source := ticketAppSource(t)
+	keyframeBody := substringBetween(t, source,
+		"function requestKeyframe(reason, force) {",
+		"  function requestKeyframeDebounced(reason, minIntervalMs, force) {")
+	keyframeDebounceBody := substringBetween(t, source,
+		"function requestKeyframeDebounced(reason, minIntervalMs, force) {",
+		"  function requestServerRecoveryDebounced(reason, force) {")
+	recoveryBody := substringBetween(t, source,
+		"function requestServerRecoveryDebounced(reason, force) {",
+		"  function resetFirstFrameServerRecovery() {")
+
+	for body, needle := range map[string]string{
+		keyframeBody:         "lastKeyframeCommandAt > 0 && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs",
+		keyframeDebounceBody: "lastRecoveryKeyframeAt > 0 && now - lastRecoveryKeyframeAt < minIntervalMs",
+		recoveryBody:         "lastRecoveryServerRecoverAt > 0 && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("startup throttle must treat zero as no previous request, missing %q", needle)
+		}
+	}
+}
+
+func TestTicketViewerDoesNotRaceInitialResumeBurstWithEarlySocketAdoption(t *testing.T) {
+	source := ticketAppSource(t)
+	connectBody := substringBetween(t, source,
+		"function connect() {",
+		"  function resetStreamState(options) {")
+	idleResumeBody := substringBetween(t, source,
+		"function resumeFromIdleDisconnect(reason) {",
+		"  function layoutViewportRect() {")
+	visibilityResumeBody := substringBetween(t, source,
+		"function recoverAfterVisibilityResume(reason) {",
+		"  window.addEventListener('resize', resizeCanvasBox);")
+	startupIndex := strings.LastIndex(source, "connect();")
+	if startupIndex < 0 {
+		t.Fatal("ticket viewer initializer must call connect")
+	}
+	startupBody := source[startupIndex:]
+	initialFlow := "startActivationResumeFlow('initial_load', 'initial_load');"
+	initialFlowIndex := strings.Index(startupBody, initialFlow)
+	if initialFlowIndex < 0 {
+		t.Fatal("ticket viewer initializer must start the initial resume flow")
+	}
+
+	for _, needle := range []string{
+		"if (!hasRenderedFrame && !activeResumeFlow)",
+		"startActivationResumeFlow('cold_open', 'initial_load');",
+	} {
+		if !strings.Contains(connectBody, needle) {
+			t.Fatalf("connect must keep the first-load resume burst single and adoption-safe, missing %q", needle)
+		}
+	}
+	if strings.Contains(connectBody, "startActivationResumeFlow('cold_open', 'watchdog');") {
+		t.Fatal("cold startup must not skip the early WebSocket adoption grace")
+	}
+	burstBody := substringBetween(t, source,
+		"function runActivationReconnectBurst(reason, flow) {",
+		"  function initialVideoSocketNeedsAdoption() {")
+	noteOpenBody := substringBetween(t, source,
+		"function noteVideoSocketOpen(socket, reason) {",
+		"  function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {")
+	helperBody := substringBetween(t, source,
+		"function initialVideoSocketNeedsAdoption() {",
+		"  function recoverFreshMediaSession(reason, kind, options) {")
+	recoveryBody := substringBetween(t, source,
+		"function recoverFreshMediaSession(reason, kind, options) {",
+		"  function connect() {")
+	for _, needle := range []string{
+		"waitForInitialSocket: flow.trigger === 'initial_load'",
+		"function initialVideoSocketNeedsAdoption() {",
+		"videoWs.readyState === WebSocket.CONNECTING",
+		"videoWs.readyState === WebSocket.OPEN",
+		"early.ws.readyState === WebSocket.CONNECTING || early.ws.readyState === WebSocket.OPEN",
+		"if (options.waitForInitialSocket && initialVideoSocketNeedsAdoption())",
+		"connectDirectVideo({ skipEarlyGrace: false });",
+	} {
+		if !strings.Contains(burstBody+helperBody+recoveryBody, needle) {
+			t.Fatalf("initial-load retry must preserve a pending startup socket, missing %q", needle)
+		}
+	}
+	if !strings.Contains(recoveryBody, "skipEarlyGrace: Boolean(options.skipEarlyGrace)") {
+		t.Fatal("explicit recovery must retain its skip-early-grace behavior")
+	}
+	waitIndex := strings.Index(recoveryBody, "if (options.waitForInitialSocket && initialVideoSocketNeedsAdoption())")
+	waitReturnIndex := -1
+	if waitIndex >= 0 {
+		waitReturnIndex = strings.Index(recoveryBody[waitIndex:], "return true;")
+	}
+	if waitIndex < 0 || waitReturnIndex < 0 || strings.Contains(recoveryBody[waitIndex:waitIndex+waitReturnIndex], "closeDirectVideo()") {
+		t.Fatal("initial-load socket guard must return without closing or replacing the pending socket")
+	}
+	if guardIndex := strings.LastIndex(startupBody[:initialFlowIndex], "if (!activeResumeFlow)"); guardIndex < 0 {
+		t.Fatal("initializer must not start a second resume burst when connect already started the first one")
+	}
+	if strings.Count(idleResumeBody, "startActivationResumeFlow(") != 1 ||
+		strings.Contains(idleResumeBody, "startActivationResumeFlow(reason || 'idle_resume', 'watchdog');") ||
+		strings.Contains(idleResumeBody, "requestKeyframeDebounced(") {
+		t.Fatal("idle resume must start one bounded recovery burst, not a duplicate watchdog cascade")
+	}
+	if strings.Count(visibilityResumeBody, "claimActivationResumeLifecycle(") != 1 ||
+		strings.Contains(visibilityResumeBody, "startActivationResumeFlow(") {
+		t.Fatal("visibility resume must reuse one paused recovery burst, not start a second watchdog cascade")
+	}
+	if strings.Contains(noteOpenBody, "requestKeyframe(") || strings.Contains(noteOpenBody, "requestKeyframeDebounced(") {
+		t.Fatal("socket open must rely on the server ordered start and keyframe path")
+	}
+	for _, needle := range []string{
+		"const initialLoad = flow.trigger === 'initial_load';",
+		"connectDirectVideo({ skipEarlyGrace: !initialLoad });",
+		"if (!initialLoad) {",
+		"requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);",
+	} {
+		if !strings.Contains(burstBody, needle) {
+			t.Fatalf("initial-load keyframe deferral missing %q", needle)
+		}
+	}
+}
+
+func TestTicketViewerKeepsInitialLoadFlowAcrossOrdinaryPageshowAndFocus(t *testing.T) {
+	source := ticketAppSource(t)
+	flowBody := substringBetween(t, source,
+		"function startActivationResumeFlow(reason, trigger, options) {",
+		"  function runActivationReconnectBurst(reason, flow) {")
+
+	for _, needle := range []string{
+		"const nextReason = safeResumeLabel(reason, 'activation');",
+		"const nextTrigger = safeResumeLabel(trigger, 'activation');",
+		"flow && !flow.done && flow.trigger === 'initial_load'",
+		"(nextReason === 'pageshow' || nextReason === 'focus')",
+		"flow.reason = nextReason;",
+		"flow.trigger = nextTrigger;",
+	} {
+		if !strings.Contains(flowBody, needle) {
+			t.Fatalf("initial-load lifecycle ownership missing %q", needle)
+		}
+	}
+	guardIndex := strings.Index(flowBody, "flow && !flow.done && flow.trigger === 'initial_load'")
+	returnIndex := strings.Index(flowBody[guardIndex:], "return flow;")
+	updateIndex := strings.Index(flowBody, "flow.trigger = nextTrigger;")
+	burstIndex := strings.Index(flowBody, "runActivationReconnectBurst(flow.reason, flow);")
+	if guardIndex < 0 || returnIndex < 0 || updateIndex < 0 || burstIndex < 0 ||
+		guardIndex+returnIndex > updateIndex || guardIndex+returnIndex > burstIndex {
+		t.Fatal("ordinary initial pageshow/focus must return before replacing or rerunning the active initial-load flow")
+	}
+	if strings.Contains(flowBody, "nextReason === 'pageshow_persisted'") {
+		t.Fatal("persisted-page recovery must not be suppressed by the ordinary initial-load lifecycle guard")
+	}
+}
+
+func TestTicketViewerLifecycleEventSequencesHaveOneRecoveryOwner(t *testing.T) {
+	source := ticketAppSource(t)
+	noteActivity := substringBetween(t, source,
+		"function noteViewerActivity(event, reason) {",
+		"  function expireViewerIdle(reason) {")
+	resumeFlow := substringBetween(t, source,
+		"function startActivationResumeFlow(reason, trigger, options) {",
+		"  function initialVideoSocketNeedsAdoption() {")
+	handlers := substringBetween(t, source,
+		"document.addEventListener('visibilitychange', () => {",
+		"  window.addEventListener('pagehide'")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const performance = { now: () => now };
+const handlers = {};
+const document = {
+  visibilityState: 'visible',
+  wasDiscarded: false,
+  addEventListener: (name, fn) => { handlers[name] = fn; }
+};
+const window = { addEventListener: (name, fn) => { handlers[name] = fn; } };
+let streamUnsupported = false;
+let activeResumeFlow = null;
+let activationReconnectBurstTimer = null;
+let idleDisconnected = false;
+let idleDisconnectTimer = null;
+let hiddenStreamFocusTimer = null;
+let hiddenDecoderTransientLogged = false;
+let lastHiddenAt = 0;
+let lastHiddenWallAt = 0;
+let hasRenderedFrame = false;
+let screenEngaged = false;
+const activationReconnectBurstMs = 10000;
+const activationReconnectFirstRetryMs = 150;
+const activationReconnectTickMs = 500;
+const activationReconnectMaxTicks = 10;
+const recoveryKeyframeDebounceMs = 2500;
+let recoveryRuns = 0;
+let keyframeRequests = 0;
+let exhaustedRecoveries = 0;
+let idleResumes = 0;
+let scheduled = [];
+function check(value, message) { if (!value) throw new Error(message); }
+function safeResumeLabel(value, fallback) { return String(value || fallback); }
+function resumeBooleanLabel(value) { return value ? 'true' : 'false'; }
+function logResumeCheckpoint() {}
+function clearActivationReconnectBurst() { activationReconnectBurstTimer = null; }
+function streamHasFreshRenderedFrame() { return false; }
+function finishActivationResumeFlow(reason, flow) { flow.done = true; if (flow === activeResumeFlow) activeResumeFlow = null; }
+function requestServerRecoveryDebounced(reason) { if (String(reason).includes('exhausted')) exhaustedRecoveries += 1; }
+function connectSpacetimeState() { return Promise.resolve(); }
+function clientLog() {}
+function publishCurrentStreamFocus() {}
+function mediaSessionStuckOnPreservedFrame() { return false; }
+function connectDirectVideo() {}
+function requestKeyframeDebounced() { keyframeRequests += 1; return true; }
+function recoverFreshMediaSession() { recoveryRuns += 1; return true; }
+function setTimeout(fn, delay) { scheduled.push({ fn, delay }); return scheduled.length; }
+function clearTimeout() {}
+function scheduleViewerIdleDisconnect() {}
+function resumeFromIdleDisconnect(reason) {
+  if (!idleDisconnected) return false;
+  idleDisconnected = false;
+  idleResumes += 1;
+  const flow = startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
+  if (flow) flow.lifecycleResumeStarted = true;
+  return true;
+}
+function scheduleStreamFeedback() {}
+function cancelTicketSliderFromLifecycle() {}
+function releaseScreenWakeLock() {}
+function pauseHiddenStreamAfterGrace() {}
+function requestScreenWakeLock() {}
+function keepFirstScreenPinned() {}
+function chaseLiveStream() {}
+function publishCurrentStreamFocus() {}
+function streamHasFreshRenderedFrame() { return false; }
+function recoverAfterVisibilityResume(reason) {
+  const flow = claimActivationResumeLifecycle(reason, 'visibility_resume');
+  if (!flow) return false;
+  recoveryRuns += 1;
+  runActivationReconnectBurst(reason, flow);
+  return true;
+}
+	`+noteActivity+resumeFlow+handlers+`
+	startActivationResumeFlow('initial_load', 'initial_load');
+	check(keyframeRequests === 0, 'initial load must wait for the server ordered keyframe');
+	handlers.pageshow({ persisted: false, isTrusted: true });
+	handlers.focus();
+	check(keyframeRequests === 0 && recoveryRuns === 0, 'ordinary pageshow and focus must follow the initial-load owner');
+
+document.visibilityState = 'hidden';
+handlers.visibilitychange();
+now += 20000;
+document.visibilityState = 'visible';
+handlers.visibilitychange();
+handlers.focus();
+check(recoveryRuns === 1, 'visibilitychange then focus must run one recovery');
+	check(keyframeRequests === 1, 'visibilitychange then focus must request one recovery keyframe');
+check(exhaustedRecoveries === 0, 'a long-hidden flow must receive a fresh retry budget');
+
+document.visibilityState = 'hidden';
+handlers.visibilitychange();
+now += 20000;
+document.visibilityState = 'visible';
+handlers.pageshow({ persisted: true, isTrusted: true });
+handlers.focus();
+check(recoveryRuns === 2, 'persisted pageshow then focus must run one recovery');
+check(exhaustedRecoveries === 0, 'persisted restore must not inherit an exhausted hidden budget');
+
+activeResumeFlow = null;
+idleDisconnected = true;
+const recoveriesBeforeIdleFocus = recoveryRuns;
+handlers.focus();
+check(idleResumes === 1, 'idle focus must resume exactly once');
+check(recoveryRuns === recoveriesBeforeIdleFocus, 'idle focus must return before a second lifecycle recovery');
+`)
+}
+
+func TestTicketViewerHiddenColdStartStopsSocketAndFocusAtThreeSeconds(t *testing.T) {
+	source := ticketAppSource(t)
+	hiddenPause := substringBetween(t, source,
+		"function pauseVideoWhileHidden(reason) {",
+		"  function connectDirectVideo(options) {")
+
+	runTicketJavaScript(t, `
+let clock = 0;
+let nextTimer = 1;
+const timers = new Map();
+function setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, at: clock + delay, id }); return id; }
+function clearTimeout(id) { timers.delete(id); }
+function advance(ms) {
+  clock += ms;
+  for (;;) {
+    const due = [...timers.values()].filter((timer) => timer.at <= clock).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+    if (!due) return;
+    timers.delete(due.id);
+    due.fn();
+  }
+}
+function check(value, message) { if (!value) throw new Error(message); }
+const hiddenVideoCloseDelayMs = 3000;
+const document = { visibilityState: 'hidden' };
+const WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+let videoWs = { readyState: WebSocket.OPEN };
+let hiddenVideoCloseTimer = null;
+let hiddenStreamFocusTimer = null;
+let closes = 0;
+const focusChanges = [];
+function controlCodeKeepsVideoAliveWhileHidden() { return false; }
+function keepControlCodeVideoAlive() {}
+function publishStreamFocus(active) { focusChanges.push(active); }
+function clientLog() {}
+function preserveCurrentFrame() {}
+function closeDirectVideo() {
+  closes += 1;
+  videoWs = null;
+  if (hiddenStreamFocusTimer) clearTimeout(hiddenStreamFocusTimer);
+  hiddenStreamFocusTimer = null;
+}
+`+hiddenPause+`
+pauseHiddenStreamAfterGrace('visibility_hidden');
+advance(1000);
+pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
+advance(1000);
+pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
+advance(999);
+check(closes === 0 && !focusChanges.includes(false), 'hidden cold start must retain the three-second grace');
+advance(1);
+check(closes === 1, 'hidden cold start socket must close at three seconds');
+check(focusChanges.filter((value) => value === false).length === 1, 'hidden stream focus must release once at three seconds');
+`)
+}
+
+func TestTicketViewerPersistedPagehideKeepsHiddenGraceAndRapidRestoreCancelsIt(t *testing.T) {
+	source := ticketAppSource(t)
+	hiddenPause := substringBetween(t, source,
+		"function pauseVideoWhileHidden(reason) {",
+		"  function connectDirectVideo(options) {")
+	recovery := substringBetween(t, source,
+		"function recoverAfterVisibilityResume(reason) {",
+		"  window.addEventListener('resize', resizeCanvasBox);")
+	freshRecovery := substringBetween(t, source,
+		"function recoverFreshMediaSession(reason, kind, options) {",
+		"  function connect() {")
+	reconnectBurst := substringBetween(t, source,
+		"function runActivationReconnectBurst(reason, flow) {",
+		"  function initialVideoSocketNeedsAdoption() {")
+	pageshow := substringBetween(t, source,
+		"window.addEventListener('pageshow', (event) => {",
+		"  window.addEventListener('focus', () => {")
+	pagehide := substringBetween(t, source,
+		"window.addEventListener('pagehide', (event) => {",
+		"  window.addEventListener('load', () => keepFirstScreenPinned(true));")
+
+	runTicketJavaScript(t, `
+let clock = 0;
+let nextTimer = 1;
+const timers = new Map();
+function setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, at: clock + delay, id }); return id; }
+function clearTimeout(id) { timers.delete(id); }
+function advance(ms) {
+  clock += ms;
+  for (;;) {
+    const due = [...timers.values()].filter((timer) => timer.at <= clock).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+    if (!due) return;
+    timers.delete(due.id);
+    due.fn();
+  }
+}
+function check(value, message) { if (!value) throw new Error(message); }
+const performance = { now: () => clock };
+Date.now = () => 100000 + clock;
+const handlers = {};
+const window = { addEventListener: (name, fn) => { handlers[name] = fn; } };
+const document = { visibilityState: 'hidden', wasDiscarded: false };
+const WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+const hiddenVideoCloseDelayMs = 3000;
+const backgroundRecoveryHiddenMs = 30000;
+const oldTabFreshResumeHiddenMs = 5000;
+const streamStaleVideoReconnectMs = 5000;
+const resumeSoftReconnectMs = 2000;
+const activationReconnectBurstMs = 10000;
+const activationReconnectFirstRetryMs = 150;
+const activationReconnectTickMs = 500;
+const activationReconnectMaxTicks = 10;
+let videoWs = { readyState: WebSocket.OPEN };
+let hiddenVideoCloseTimer = null;
+let hiddenStreamFocusTimer = null;
+let lastHiddenAt = 0;
+let lastHiddenWallAt = 0;
+let configured = false;
+let lastFrameAt = 0;
+let videoSocketCreatedAt = 0;
+let idleDisconnected = false;
+let streamUnsupported = false;
+let fallbackFrameAvailable = true;
+let screenEngaged = false;
+let activationReconnectBurstTimer = null;
+let activeResumeFlow = null;
+let lastRecoveryVideoReconnectSeq = -1;
+let videoSocketOpenSeq = 1;
+let lastRecoveryVideoReconnectAt = 0;
+const recoveryVideoReconnectDebounceMs = 8000;
+let spacetimeClient = null;
+let closes = 0;
+let opens = 0;
+let resets = 0;
+let keyframeRequests = 0;
+let preservedFrames = 0;
+const focusChanges = [];
+function controlCodeKeepsVideoAliveWhileHidden() { return false; }
+function keepControlCodeVideoAlive() {}
+function videoSocketKeepsStreamActive() { return Boolean(videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)); }
+function publishStreamFocus(active) { focusChanges.push(active); }
+function publishCurrentStreamFocus() {}
+function clientLog() {}
+function preserveCurrentFrame() { preservedFrames += 1; }
+function closeDirectVideo() {
+  closes += 1;
+  videoWs = null;
+  if (hiddenVideoCloseTimer) clearTimeout(hiddenVideoCloseTimer);
+  if (hiddenStreamFocusTimer) clearTimeout(hiddenStreamFocusTimer);
+  hiddenVideoCloseTimer = null;
+  hiddenStreamFocusTimer = null;
+}
+function cancelTicketSliderFromLifecycle() {}
+function newResumeFlow(paused) {
+  return { startedAt: clock, attempts: 0, done: false, paused: Boolean(paused), trigger: 'pagehide', lifecycleResumeStarted: false };
+}
+function pauseActivationResumeLifecycle() {
+  if (!activeResumeFlow || activeResumeFlow.done) activeResumeFlow = newResumeFlow(true);
+  activeResumeFlow.paused = true;
+  activeResumeFlow.lifecycleResumeStarted = false;
+  clearActivationReconnectBurst();
+  return activeResumeFlow;
+}
+function logResumeCheckpoint() {}
+function resumeBooleanLabel(value) { return value ? 'true' : 'false'; }
+function closeEarlyVideo() {}
+function clearActivationReconnectBurst() {
+  if (activationReconnectBurstTimer) clearTimeout(activationReconnectBurstTimer);
+  activationReconnectBurstTimer = null;
+}
+function claimActivationResumeLifecycle() {
+  if (!activeResumeFlow || activeResumeFlow.done) activeResumeFlow = newResumeFlow(true);
+  activeResumeFlow.startedAt = clock;
+  activeResumeFlow.attempts = 0;
+  activeResumeFlow.paused = true;
+  activeResumeFlow.lifecycleResumeStarted = true;
+  return activeResumeFlow;
+}
+function safeResumeLabel(value, fallback) { return String(value || fallback); }
+function hiddenDurationBucket() { return 'short'; }
+function redrawPreservedFrame() {}
+function requestScreenWakeLock() {}
+function keepFirstScreenPinned() {}
+function refreshSpacetimeState() { return Promise.resolve(); }
+function streamHasFreshRenderedFrame() { return false; }
+function finishActivationResumeFlow(reason, flow) { flow.done = true; if (flow === activeResumeFlow) activeResumeFlow = null; }
+function connectSpacetimeState() { return Promise.resolve(); }
+function mediaSessionStuckOnPreservedFrame() { return false; }
+function connectDirectVideo() {
+  if (videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)) return;
+  videoSocketOpenSeq += 1;
+  opens += 1;
+  videoWs = { readyState: WebSocket.OPEN, generation: videoSocketOpenSeq };
+}
+function resetStreamState() { configured = false; resets += 1; }
+function showStreamRecovery() {}
+function requestKeyframeDebounced() { keyframeRequests += 1; return true; }
+function safeString(value) { return JSON.stringify(value); }
+function requestServerRecoveryDebounced() {}
+function reconnectVideoForRecovery() {}
+function chaseLiveStream() {}
+function noteViewerActivity() { return false; }
+function followActivationResumeLifecycle() {}
+`+hiddenPause+freshRecovery+reconnectBurst+recovery+pageshow+pagehide+`
+
+handlers.pagehide({ persisted: true });
+pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
+pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
+advance(2999);
+check(closes === 0, 'persisted pagehide must retain the three-second socket grace');
+check(focusChanges.filter((value) => value === false).length === 0, 'persisted pagehide must retain the three-second focus grace');
+advance(1);
+check(closes === 1, 'persisted pagehide must close the direct socket once at three seconds');
+check(focusChanges.filter((value) => value === false).length === 1, 'persisted pagehide must release stream focus once at three seconds');
+check(preservedFrames > 0, 'persisted pagehide must preserve the current frame');
+
+timers.clear();
+hiddenVideoCloseTimer = null;
+hiddenStreamFocusTimer = null;
+videoWs = { readyState: WebSocket.OPEN, generation: videoSocketOpenSeq };
+document.visibilityState = 'hidden';
+const closesBeforeRestore = closes;
+const opensBeforeRestore = opens;
+const keyframesBeforeRestore = keyframeRequests;
+const liveSocketBeforeRestore = videoWs;
+const falseFocusBeforeRestore = focusChanges.filter((value) => value === false).length;
+handlers.pagehide({ persisted: true });
+advance(1000);
+document.visibilityState = 'visible';
+handlers.pageshow({ persisted: true, isTrusted: true });
+check(hiddenVideoCloseTimer === null && hiddenStreamFocusTimer === null, 'rapid persisted pageshow must cancel both hidden grace timers');
+advance(2001);
+check(videoWs === liveSocketBeforeRestore, 'rapid persisted pageshow must reuse the healthy current socket');
+check(closes === closesBeforeRestore, 'rapid persisted pageshow must not close the healthy current socket');
+check(opens === opensBeforeRestore, 'rapid persisted pageshow must not open a replacement socket');
+check(keyframeRequests === keyframesBeforeRestore + 2, 'rapid persisted pageshow and its first follow-up must nudge the reused socket without replacing it');
+check(focusChanges.filter((value) => value === false).length === falseFocusBeforeRestore, 'rapid persisted pageshow must cancel the pending hidden focus release');
+
+document.visibilityState = 'hidden';
+configured = true;
+lastFrameAt = clock - streamStaleVideoReconnectMs - 1;
+const staleSocket = videoWs;
+const closesBeforeStaleRestore = closes;
+const opensBeforeStaleRestore = opens;
+const resetsBeforeStaleRestore = resets;
+const keyframesBeforeStaleRestore = keyframeRequests;
+handlers.pagehide({ persisted: true });
+advance(1000);
+document.visibilityState = 'visible';
+handlers.pageshow({ persisted: true, isTrusted: true });
+check(closes === closesBeforeStaleRestore + 1, 'stale persisted pageshow must close the old media session once');
+check(opens === opensBeforeStaleRestore + 1, 'stale persisted pageshow must open one replacement socket');
+check(videoWs !== staleSocket, 'stale persisted pageshow must replace the stale current socket');
+check(resets === resetsBeforeStaleRestore + 1 && keyframeRequests === keyframesBeforeStaleRestore + 1, 'stale persisted pageshow must reset media state and request one keyframe');
+
+document.visibilityState = 'hidden';
+configured = false;
+lastFrameAt = 0;
+const thresholdSocket = videoWs;
+const closesBeforeThresholdRestore = closes;
+const opensBeforeThresholdRestore = opens;
+handlers.pagehide({ persisted: true });
+clock += hiddenVideoCloseDelayMs;
+document.visibilityState = 'visible';
+handlers.pageshow({ persisted: true, isTrusted: true });
+check(closes === closesBeforeThresholdRestore + 1, 'persisted pageshow at the hidden grace boundary must close the old media session once');
+check(opens === opensBeforeThresholdRestore + 1, 'persisted pageshow at the hidden grace boundary must open one replacement socket');
+check(videoWs !== thresholdSocket, 'persisted pageshow at the hidden grace boundary must not reuse the expired socket');
+
+document.visibilityState = 'hidden';
+configured = false;
+videoWs = { readyState: WebSocket.CONNECTING, generation: videoSocketOpenSeq };
+videoSocketCreatedAt = clock - resumeSoftReconnectMs - 1;
+const connectingSocket = videoWs;
+const closesBeforeConnectingRestore = closes;
+const opensBeforeConnectingRestore = opens;
+handlers.pagehide({ persisted: true });
+advance(1000);
+document.visibilityState = 'visible';
+handlers.pageshow({ persisted: true, isTrusted: true });
+check(closes === closesBeforeConnectingRestore + 1, 'overlong cached CONNECTING socket must close once on persisted pageshow');
+check(opens === opensBeforeConnectingRestore + 1, 'overlong cached CONNECTING socket must open one replacement');
+check(videoWs !== connectingSocket && videoWs.readyState === WebSocket.OPEN, 'overlong cached CONNECTING socket must recover to a new open socket');
+`)
+}
+
+func TestTicketEarlySocketRetainsFreshKeyframeAcrossDelayedAdoption(t *testing.T) {
+	template := ticketIndexTemplate(t)
+	earlyQueue := substringBetween(t, template,
+		"var earlyMaxFrames = 8;",
+		"      function streamURL() {")
+
+	runTicketJavaScript(t, `
+let monotonic = 10;
+const wallStart = 1000000;
+const performance = { now: () => monotonic };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + monotonic + 10000;
+const early = { config: { data: '{"type":"config"}' }, queue: [], queueBytes: 0, firstCaptureAt: 0, lastCaptureAt: 0 };
+function check(value, message) { if (!value) throw new Error(message); }
+function frame(key, sequence, capturedAt) {
+  const raw = new ArrayBuffer(30);
+  const view = new DataView(raw);
+  view.setUint32(0, 0x54534632);
+  view.setUint8(4, key ? 1 : 0);
+  view.setUint32(5, 0);
+  view.setUint32(9, 1);
+  view.setUint32(13, 0);
+  view.setUint32(17, sequence);
+  const timestamp = (wallStart + capturedAt) * 1000;
+  view.setUint32(21, Math.floor(timestamp / 4294967296));
+  view.setUint32(25, timestamp >>> 0);
+  return { data: raw };
+}
+`+earlyQueue+`
+earlyEnqueue(frame(true, 1, monotonic));
+monotonic = 110; earlyEnqueue(frame(false, 2, monotonic));
+monotonic = 210; earlyEnqueue(frame(false, 3, monotonic));
+monotonic = 310; earlyEnqueue(frame(false, 4, monotonic));
+check(early.queue.length === 1 && early.queue[0].meta.key && early.queue[0].meta.sequence === 1,
+  'delayed adoption must retain the fresh keyframe after trimming dependent deltas');
+check(early.config && early.config.data.includes('config'), 'decoder config must survive delayed queue trimming');
+monotonic = 410; earlyEnqueue(frame(false, 5, monotonic));
+check(early.queue.length === 1 && early.queue[0].meta.sequence === 1,
+  'later deltas with a trimmed dependency must not evict the retained keyframe');
+monotonic = 510; earlyEnqueue(frame(true, 10, monotonic));
+check(early.queue.length === 1 && early.queue[0].meta.sequence === 10,
+  'a newer keyframe must replace the retained GOP');
+monotonic = 2011; earlyEnqueue(frame(false, 11, monotonic));
+check(early.queue.length === 0, 'a retained keyframe must still expire at the bounded freshness limit');
+Date.now = originalDateNow;
+	`)
+}
+
+func TestTicketEarlySocketRevalidatesRetainedKeyframeWhenClaimed(t *testing.T) {
+	source := ticketAppSource(t)
+	template := ticketIndexTemplate(t)
+	claimEarly := substringBetween(t, source,
+		"function claimableEarlyVideoQueue(early) {",
+		"  function scheduleViewerIdleDisconnect(reason) {")
+	if !strings.Contains(template, "early.maxKeyframeAgeMs = earlyMaxKeyframeAgeMs;") {
+		t.Fatal("head socket must expose its retained-keyframe freshness bound to the app claim path")
+	}
+
+	runTicketJavaScript(t, `
+let monotonic = 100;
+const wallStart = 1000000;
+const performance = { now: () => monotonic };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + monotonic + 10000;
+const WebSocket = { OPEN: 1, CLOSING: 2, CLOSED: 3 };
+const window = { TICKET_EARLY_VIDEO: null };
+function check(value, message) { if (!value) throw new Error(message); }
+function makeEarly(receivedAt) {
+  return {
+    ws: { readyState: WebSocket.OPEN, close() {} },
+    config: { data: '{"type":"config"}' },
+    queue: [{
+      data: new ArrayBuffer(30),
+      meta: { key: true, epoch: 1, sequence: 1, timestamp: (wallStart + receivedAt) * 1000 },
+      receivedAt
+    }],
+    queueBytes: 30,
+    maxKeyframeAgeMs: 1500,
+    openedAt: receivedAt,
+    claimed: false,
+    error: false,
+    closed: false
+  };
+}
+`+claimEarly+`
+const freshEarly = makeEarly(10);
+window.TICKET_EARLY_VIDEO = freshEarly;
+const freshClaim = claimEarlyVideoSocket();
+check(freshClaim && freshClaim.queued.length === 2,
+  'fresh claim must retain decoder config and the retained keyframe');
+
+monotonic = 1600;
+const expiredEarly = makeEarly(10);
+window.TICKET_EARLY_VIDEO = expiredEarly;
+const expiredClaim = claimEarlyVideoSocket();
+check(expiredClaim && expiredClaim.queued.length === 1,
+  'expired retained keyframe must be discarded when the app claims the socket');
+check(typeof expiredClaim.queued[0].data === 'string' && expiredClaim.queued[0].data.includes('config'),
+  'claim-time media expiry must preserve decoder configuration');
+Date.now = originalDateNow;
+`)
+}
+
+func TestTicketViewerFreshIngressIgnoresRenderedCanvasAgeButKeepsHardQueueLimit(t *testing.T) {
+	source := ticketAppSource(t)
+	acceptFrame := substringBetween(t, source,
+		"function acceptFreshFrame(frame) {",
+		"  function queueFrameMetadata(frame) {")
+	handleMessage := substringBetween(t, source,
+		"async function handleVideoSocketMessage(event) {",
+		"  function decodeAvcFrame(frame) {")
+
+	if strings.Contains(handleMessage, "currentRenderedFreshness") ||
+		strings.Contains(handleMessage, "streamVisualAgeHardLimitMs") {
+		t.Fatal("rendered canvas age must not reject an incoming recovery frame")
+	}
+	if !strings.Contains(handleMessage, "Number(decoder && decoder.decodeQueueSize || 0) > streamDecoderQueueHardLimit") ||
+		!strings.Contains(handleMessage, "serverClockHasLiveSample && Number(lastAcceptedFrameVisualAgeMillis || 0) > streamIngressFrameMaxAgeMs") {
+		t.Fatal("decoder queue hard-limit protection must remain active")
+	}
+
+	runTicketJavaScript(t, `
+let now = 100;
+const wallStart = 1000000;
+const performance = { now: () => now };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + now + 10000;
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = -10000;
+let freshnessQueries = 0;
+let currentStreamEpoch = 1;
+let lastDecoderConfig = { streamEpoch: 1 };
+let lastPacketSequence = 0;
+let lastPacketSequenceAdvancedAt = 0;
+let lastPacketTimestamp = 0;
+let lastAcceptedFrameSequence = 0;
+let lastAcceptedFrameTimestamp = 0;
+let lastAcceptedFrameReceivedAt = 0;
+let lastAcceptedFrameVisualAgeMillis = 0;
+let lastAcceptedFrameQueuedAt = 0;
+let needsKeyFrame = true;
+let configured = true;
+let decoderMode = 'annexb';
+let videoWs = null;
+let decoderRejectedFrames = 0;
+let resyncDroppedFrames = 0;
+let avcAdapterTried = true;
+const streamDecoderQueueHardLimit = 4;
+const streamIngressFrameMaxAgeMs = 2000;
+const frames = [];
+const decoded = [];
+const resetReasons = [];
+const keyframeReasons = [];
+let metadataClears = 0;
+const decoder = {
+  decodeQueueSize: 0,
+  decode: () => { decoded.push(lastAcceptedFrameSequence); }
+};
+class EncodedVideoChunk {
+  constructor(value) { Object.assign(this, value); }
+}
+function check(value, message) { if (!value) throw new Error(message); }
+function parseFrameEnvelope() { return frames.shift() || null; }
+function currentRenderedFreshness() {
+  freshnessQueries += 1;
+  return { visualAgeMillis: 5000 };
+}
+function requestKeyframeDebounced() { return true; }
+function requestKeyframe(reason) { keyframeReasons.push(reason); return true; }
+function scheduleStreamFeedback() {}
+function queueFrameMetadata() {}
+function clearFrameMetadata() { metadataClears += 1; }
+function resetDecoderForRecovery(reason) { resetReasons.push(reason); return true; }
+function decodeAvcFrame() { throw new Error('unexpected AVC path'); }
+function sendVideoClientLog() {}
+function switchToAvcAdapter() {}
+`+acceptFrame+handleMessage+`
+;(async () => {
+  frames.push({ kind: 'key', epoch: 1, sequence: 1, timestamp: (wallStart + now) * 1000, data: new Uint8Array([1]) });
+  await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
+  check(decoded.length === 1 && decoded[0] === 1, 'old painted canvas rejected a valid incoming keyframe');
+  check(freshnessQueries === 0, 'incoming frame path consulted rendered canvas age');
+
+  frames.push({ kind: 'delta', epoch: 1, sequence: 2, timestamp: (wallStart + now - 3000) * 1000, data: new Uint8Array([2]) });
+  await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
+  check(decoded.length === 1, 'genuinely stale incoming frame reached the decoder');
+  check(needsKeyFrame, 'genuinely stale incoming frame did not enter keyframe-only recovery');
+  check(resetReasons.length === 1 && resetReasons[0] === 'visual_age_overflow',
+    'genuinely stale incoming frame did not retain its bounded reset path');
+
+  decoder.decodeQueueSize = 5;
+  frames.push({ kind: 'key', epoch: 1, sequence: 10, timestamp: (wallStart + now) * 1000, data: new Uint8Array([10]) });
+  await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
+  check(decoded.length === 1, 'decoder queue hard limit did not stop a congested frame');
+  check(needsKeyFrame, 'decoder queue overflow must return to keyframe-only recovery');
+  check(resetReasons.length === 2 && resetReasons[1] === 'decoder_queue_overflow',
+    'decoder queue overflow must retain its bounded reset path');
+  check(metadataClears === 2, 'stale ingress and decoder queue overflow must clear pending metadata');
+  check(keyframeReasons.length === 0, 'successful bounded resets must not add duplicate keyframe requests');
+  Date.now = originalDateNow;
+})().catch((error) => {
+  Date.now = originalDateNow;
+  console.error(error && error.stack || error);
+  process.exit(1);
+});
+		`)
+}
+
+func TestTicketViewerProvisionalConfigBindsFirstKeyframeEpochBeforeFeedback(t *testing.T) {
+	source := ticketAppSource(t)
+	acceptFrame := substringBetween(t, source,
+		"function acceptFreshFrame(frame) {",
+		"  function queueFrameMetadata(frame) {")
+	sendFeedback := substringBetween(t, source,
+		"function sendStreamFeedback(reason, immediate) {",
+		"  function scheduleStreamFeedback(reason) {")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const wallStart = 1000000;
+const performance = { now: () => now };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + now;
+const WebSocket = { OPEN: 1 };
+const document = { visibilityState: 'visible' };
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = 0;
+let currentStreamEpoch = 0;
+let lastDecoderConfig = { streamEpoch: 0, provisional: true, codec: 'avc1.42C028' };
+let lastPacketSequence = 0;
+let lastPacketSequenceAdvancedAt = 0;
+let lastPacketTimestamp = 0;
+let lastAcceptedFrameSequence = 0;
+let lastAcceptedFrameTimestamp = 0;
+let lastAcceptedFrameReceivedAt = 0;
+let lastAcceptedFrameVisualAgeMillis = 0;
+let needsKeyFrame = true;
+let lastFeedbackSentAt = 0;
+let lastDecodedFrameSequence = 0;
+let lastRenderedFrameSequence = 0;
+let lastRenderedKeyframeSequence = 0;
+let feedbackSentCount = 0;
+let feedbackSendFailureCount = 0;
+let feedbackImmediateKey = '';
+const streamFeedbackVersion = 1;
+const streamFeedbackIntervalMs = 500;
+const streamFeedbackHiddenIntervalMs = 2000;
+let sentFeedback = null;
+const videoWs = {
+  readyState: WebSocket.OPEN,
+  send(value) { sentFeedback = JSON.parse(value); }
+};
+const decoder = { decodeQueueSize: 0 };
+function check(value, message) { if (!value) throw new Error(message); }
+function requestKeyframeDebounced() { throw new Error('unexpected keyframe request'); }
+function scheduleStreamFeedback() {}
+function clampFeedbackNumber(value, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.min(max, Math.round(numeric));
+}
+function currentRenderedFreshness() { return { visualAgeMillis: 0 }; }
+`+acceptFrame+sendFeedback+`
+const delta = { kind: 'delta', epoch: 42, sequence: 1, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(delta) === false, 'provisional decoder bound to a delta frame');
+check(currentStreamEpoch === 0 && lastDecoderConfig.streamEpoch === 0,
+  'rejected delta changed the provisional epoch');
+
+const keyframe = { kind: 'key', epoch: 42, sequence: 2, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(keyframe) === true, 'fresh recovery keyframe was rejected');
+check(currentStreamEpoch === 42, 'first recovery keyframe did not bind the live epoch');
+check(lastDecoderConfig.streamEpoch === 42 && lastDecoderConfig.provisional === false,
+  'decoder recovery config retained the provisional epoch');
+check(sendStreamFeedback('recovery_keyframe', true) === true, 'bound-epoch feedback was not sent');
+check(sentFeedback && sentFeedback.epoch === 42,
+  'feedback advertised provisional epoch 0 after the live keyframe');
+
+const wrongEpochKeyframe = { kind: 'key', epoch: 43, sequence: 3, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(wrongEpochKeyframe) === false,
+  'later mismatched epoch was accepted after provisional binding');
+check(currentStreamEpoch === 42, 'mismatched frame replaced the bound epoch');
+Date.now = originalDateNow;
+`)
+}
+
+func TestTicketViewerRenderedAgeUsesCalibratedIngressAge(t *testing.T) {
+	source := ticketAppSource(t)
+	renderFrame := substringBetween(t, source,
+		"function renderDecodedFrame(frame, source) {",
+		"  async function configureDecoder(config, options) {")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const wallStart = 1000000;
+const performance = { now: () => now };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + now + 10000;
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = -10000;
+let lastFrameAt = 0;
+let lastDecodedFrameAt = 0;
+let lastDecodedFrameSequence = 0;
+let lastAcceptedFrameSequence = 1;
+let lastAcceptedFrameReceivedAt = 80;
+let lastAcceptedFrameQueuedAt = 90;
+let lastAcceptedFrameVisualAgeMillis = 50;
+let lastRenderedFrameReceivedAt = 0;
+let lastRenderedFrameQueuedAt = 0;
+let lastRenderedFrameRenderedAt = 0;
+let lastRenderedFrameVisualAgeMillis = 0;
+let lastRenderedFrameEpoch = 0;
+let lastRenderedFrameSequence = 0;
+let lastRenderedKeyframeSequence = 0;
+let lastRenderedFrameTimestamp = 0;
+let firstFrameReceived = false;
+let hasRenderedFrame = false;
+let firstRenderedTraceSent = false;
+let needsKeyFrame = false;
+let currentState = null;
+let firstFrameDetail = null;
+let closes = 0;
+const canvas = { width: 720, height: 1482 };
+const ctx = { drawImage() {} };
+const frame = { close() { closes += 1; } };
+const metadata = {
+  epoch: 1,
+  sequence: 1,
+  timestamp: (wallStart + now - 50) * 1000,
+  keyFrame: true,
+  visualAgeMillis: 50,
+  visualAgeKnown: true,
+  receivedAt: 80,
+  queuedAt: 90
+};
+function check(value, message) { if (!value) throw new Error(message); }
+function shiftFrameMetadata() { throw new Error('explicit metadata was ignored'); }
+function resetFirstFrameServerRecovery() {}
+function sendVideoSocketClientLog(event, detail) {
+  if (event === 'stream_first_rendered_frame') firstFrameDetail = detail;
+}
+function maybeCaptureControlCodeResultImage() {}
+function hideEmpty() {}
+function updateStreamFreshnessStatus() {}
+function renderTicketInteraction() {}
+function updateControlCodeSubmitAvailability() {}
+function publishStreamDebug() {}
+function scheduleStreamFeedback() {}
+function sendVideoClientLog() {}
+function preserveCurrentFrame() {}
+function showStreamRecovery() {}
+function requestKeyframe() {}
+`+renderFrame+`
+renderDecodedFrame(frame, 'annexb', metadata);
+check(lastRenderedFrameVisualAgeMillis === 70,
+  'browser wall-clock skew was added to the rendered frame age');
+check(firstFrameDetail && firstFrameDetail.visualAgeMillis === 70,
+  'first rendered trace did not use the calibrated frame age');
+check(hasRenderedFrame && lastRenderedFrameSequence === 1 && closes === 1,
+  'calibrated frame did not complete the normal render path');
+Date.now = originalDateNow;
+`)
+}
+
+func TestTicketViewerRejectsTrimmedGOPGapUntilRecoveryKeyframe(t *testing.T) {
+	source := ticketAppSource(t)
+	template := ticketIndexTemplate(t)
+	earlyQueue := substringBetween(t, template,
+		"var earlyMaxFrames = 8;",
+		"      function streamURL() {")
+	parseFrame := substringBetween(t, source,
+		"function readUint64(view, offset) {",
+		"  function isAppleWebKit() {")
+	keyframePolicy := substringBetween(t, source,
+		"function liveStreamSuppressesBackgroundRequest(reason) {",
+		"  function requestServerRecoveryDebounced(reason, force) {")
+	acceptFrame := substringBetween(t, source,
+		"function acceptFreshFrame(frame) {",
+		"  function queueFrameMetadata(frame) {")
+	handleMessage := substringBetween(t, source,
+		"async function handleVideoSocketMessage(event) {",
+		"  function decodeAvcFrame(frame) {")
+
+	runTicketJavaScript(t, `
+let monotonic = 10;
+const wallStart = 1000000;
+const performance = { now: () => monotonic };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + monotonic;
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = 0;
+const early = { config: { data: '{"type":"config"}' }, queue: [], queueBytes: 0, firstCaptureAt: 0, lastCaptureAt: 0 };
+const FRAME_ENVELOPE_MAGIC = 0x54534632;
+const FRAME_ENVELOPE_HEADER_BYTES = 29;
+const streamDecoderQueueHardLimit = 4;
+const streamIngressFrameMaxAgeMs = 2000;
+const recoveryKeyframeDebounceMs = 2000;
+const keyframeCommandMinIntervalMs = 2500;
+const streamFirstFrameKeyframeMs = 2000;
+let currentStreamEpoch = 1;
+let lastPacketSequence = 0;
+let lastPacketSequenceAdvancedAt = 0;
+let lastPacketTimestamp = 0;
+let lastAcceptedFrameSequence = 0;
+let lastAcceptedFrameTimestamp = 0;
+let lastAcceptedFrameReceivedAt = 0;
+let lastAcceptedFrameVisualAgeMillis = 0;
+let lastAcceptedFrameQueuedAt = 0;
+let needsKeyFrame = true;
+let configured = true;
+let decoderMode = 'annexb';
+let decoderRejectedFrames = 0;
+let resyncDroppedFrames = 0;
+let avcAdapterTried = true;
+let lastKeyframeCommandAt = 0;
+let lastRecoveryKeyframeAt = 0;
+let hasRenderedFrame = false;
+let activeResumeFlow = { trigger: 'initial_load', done: false, startedAt: 10 };
+let videoWs = null;
+let lastFrameAt = 0;
+let keyframeMutations = 0;
+const decoded = [];
+const decoder = {
+  decodeQueueSize: 0,
+  decode: () => { decoded.push(lastAcceptedFrameSequence); }
+};
+class EncodedVideoChunk {
+  constructor(value) { Object.assign(this, value); }
+}
+function check(value, message) { if (!value) throw new Error(message); }
+function frame(key, sequence, capturedAt) {
+  const raw = new ArrayBuffer(30);
+  const view = new DataView(raw);
+  view.setUint32(0, FRAME_ENVELOPE_MAGIC);
+  view.setUint8(4, key ? 1 : 0);
+  view.setUint32(5, 0);
+  view.setUint32(9, 1);
+  view.setUint32(13, 0);
+  view.setUint32(17, sequence);
+  const timestamp = (wallStart + capturedAt) * 1000;
+  view.setUint32(21, Math.floor(timestamp / 4294967296));
+  view.setUint32(25, timestamp >>> 0);
+  return { data: raw };
+}
+function streamHasFreshRenderedFrame() { return true; }
+function clientLog() {}
+function runSpacetimeMutation(callback) {
+  keyframeMutations += 1;
+  callback({ requestKeyframe() {} });
+  return Promise.resolve();
+}
+function scheduleStreamFeedback() {}
+function queueFrameMetadata() {}
+function clearFrameMetadata() {}
+function resetDecoderForRecovery() { return false; }
+function currentRenderedFreshness() { return { visualAgeMillis: 0 }; }
+function decodeAvcFrame() { throw new Error('unexpected AVC path'); }
+function sendVideoClientLog() {}
+function showUnsupported(message) { throw new Error(message); }
+function switchToAvcAdapter() {}
+`+earlyQueue+parseFrame+keyframePolicy+acceptFrame+handleMessage+`
+;(async () => {
+  earlyEnqueue(frame(true, 1, monotonic));
+  monotonic = 110; earlyEnqueue(frame(false, 2, monotonic));
+  monotonic = 210; earlyEnqueue(frame(false, 3, monotonic));
+  monotonic = 310; earlyEnqueue(frame(false, 4, monotonic));
+  check(early.queue.length === 1 && early.queue[0].meta.sequence === 1,
+    'test setup did not trim the early GOP to its retained keyframe');
+
+  await handleVideoSocketMessage(early.queue[0]);
+  check(decoded.join(',') === '1', 'retained keyframe was not decoded');
+
+  monotonic = 410;
+  await handleVideoSocketMessage(frame(false, 5, monotonic));
+  check(decoded.join(',') === '1', 'noncontiguous live delta reached the decoder');
+  check(lastAcceptedFrameSequence === 1 && needsKeyFrame, 'sequence gap did not enter keyframe-only recovery');
+  check(keyframeMutations === 1, 'sequence gap did not request one bounded recovery keyframe');
+
+  await handleVideoSocketMessage(frame(false, 6, monotonic));
+  check(keyframeMutations === 1, 'repeated gapped deltas bypassed the recovery debounce');
+  check(resyncDroppedFrames === 2, 'gapped deltas were not counted as resync drops');
+
+  monotonic = 600;
+  await handleVideoSocketMessage(frame(true, 10, monotonic));
+  await handleVideoSocketMessage(frame(false, 11, monotonic));
+  check(decoded.join(',') === '1,10,11', 'recovery keyframe did not restore exact delta continuity');
+  check(!needsKeyFrame && lastAcceptedFrameSequence === 11, 'recovery did not return the viewer to flowing state');
+  Date.now = originalDateNow;
+})().catch((error) => {
+  Date.now = originalDateNow;
+  console.error(error && error.stack || error);
+  process.exit(1);
+});
+`)
+}
+
+func TestTicketViewerSupersededAsyncDecoderConfigurationCannotWin(t *testing.T) {
+	source := ticketAppSource(t)
+	closeDecoder := substringBetween(t, source,
+		"function closeDecoder() {",
+		"  function resetDecoderForRecovery(reason) {")
+	configureDecoder := substringBetween(t, source,
+		"async function configureDecoder(config, options) {",
+		"  function configureAvcDecoderFromDescription(config, description) {")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const performance = { now: () => now };
+const probes = new Map();
+const configuredWidths = [];
+const configuredEpochs = [];
+const unsupported = [];
+const keyframeReasons = [];
+let decoder = null;
+let decoderGeneration = 0;
+let decoderConfigureGeneration = 0;
+let decoderConfigured = false;
+let decoderMode = 'annexb';
+let pendingPresentedFrame = null;
+let presentationFrameHandle = null;
+let lastDecoderConfig = null;
+let lastAcceptedFrameSequence = 0;
+let lastAcceptedFrameTimestamp = 0;
+let hasRenderedFrame = false;
+let fallbackFrameAvailable = false;
+let avcAdapterTried = false;
+let avcDescription = null;
+let avcSps = null;
+let avcPps = null;
+let streamSize = null;
+let currentStreamEpoch = 0;
+let lastDecodedFrameSequence = 0;
+let lastRenderedKeyframeSequence = 0;
+let needsKeyFrame = true;
+let configured = false;
+let configuredAt = 0;
+let firstFrameReceived = false;
+const canvas = { width: 0, height: 0 };
+const ctx = { imageSmoothingEnabled: true };
+class EncodedVideoChunk {}
+class VideoDecoder {
+  constructor(callbacks) {
+    this.callbacks = callbacks;
+    this.decodeQueueSize = 0;
+  }
+  configure(config) { configuredWidths.push(config.codedWidth); }
+  close() {}
+  static isConfigSupported(config) {
+    return new Promise((resolve) => probes.set(config.codedWidth, resolve));
+  }
+}
+const window = { VideoDecoder, EncodedVideoChunk };
+function check(value, message) { if (!value) throw new Error(message); }
+function showUnsupported(message) { unsupported.push(message); }
+function isAppleWebKit() { return false; }
+function preserveCurrentFrame() {}
+function redrawPreservedFrame() {}
+function clearFrameMetadata() {}
+function resizeCanvasBox() {}
+function publishStreamDebug() {}
+function showStreamWaiting() {}
+function keepFirstScreenPinned() {}
+function requestKeyframe(reason) { keyframeReasons.push(reason); return true; }
+function sendVideoClientLog() {}
+function sendVideoSocketClientLog(event, detail) {
+  if (event === 'browser_configured') configuredEpochs.push(detail.streamEpoch);
+}
+function scheduleDecodedFrame() {}
+function reportDecoderError() {}
+function switchToAvcAdapter() {}
+`+closeDecoder+configureDecoder+`
+function config(width, epoch) {
+  return { codec: 'avc1.42C028', transport: 'h264-annexb', width, height: width + 1, streamEpoch: epoch };
+}
+;(async () => {
+  const oldFirst = configureDecoder(config(101, 1));
+  const newFirst = configureDecoder(config(201, 2));
+  probes.get(201)({ supported: true });
+  await newFirst;
+  probes.get(101)({ supported: false });
+  await oldFirst;
+  check(configuredWidths.join(',') === '201', 'late old capability result replaced the newer decoder');
+  check(configuredEpochs.join(',') === '2', 'late old capability result emitted a stale configured event');
+  check(currentStreamEpoch === 2 && lastDecoderConfig.streamEpoch === 2 && canvas.width === 201,
+    'late old capability result overwrote current stream state');
+  check(unsupported.length === 0, 'late unsupported result replaced the valid newer configuration');
+
+  const oldSecond = configureDecoder(config(102, 3));
+  const newSecond = configureDecoder(config(202, 4));
+  probes.get(102)({ supported: true });
+  await oldSecond;
+  check(configuredWidths.join(',') === '201', 'older request won merely because its probe resolved first');
+  probes.get(202)({ supported: true });
+  await newSecond;
+  check(configuredWidths.join(',') === '201,202' && configuredEpochs.join(',') === '2,4',
+    'newest configuration did not win in request order');
+  check(currentStreamEpoch === 4 && lastDecoderConfig.streamEpoch === 4 && canvas.width === 202,
+    'newest stream configuration was not authoritative');
+
+  const closedPending = configureDecoder(config(303, 5));
+  closeDecoder();
+  probes.get(303)({ supported: true });
+  await closedPending;
+  check(decoder === null && currentStreamEpoch === 4 && configuredEpochs.join(',') === '2,4',
+    'socket close allowed an old pending configure result to resurrect the decoder');
+  check(keyframeReasons.join(',') === 'config_received,config_received',
+    'superseded configurations caused extra keyframe requests');
+})().catch((error) => {
+  console.error(error && error.stack || error);
+  process.exit(1);
+});
+`)
 }
 
 func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
@@ -531,8 +1791,11 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 		}
 	}
 	if !strings.Contains(connectBody, "videoSocketOpenSeq += 1;") ||
-		!strings.Contains(connectBody, "safeWebSocket(streamURL('connect_direct_video'), 'video')") {
+		!strings.Contains(connectBody, "safeWebSocket(streamURL('connect_direct_video'), 'video', videoSocketProtocols())") {
 		t.Fatalf("direct video socket must attach current open context")
+	}
+	if strings.Contains(streamURLBody, "startupRunOrigin") || strings.Contains(streamURLBody, "ticket.startup.") {
+		t.Fatal("private startup origin must never enter the video URL")
 	}
 	for _, needle := range []string{
 		"options = options || {};",
@@ -551,12 +1814,63 @@ func TestTicketViewerSendsVideoSocketOpenContext(t *testing.T) {
 		`url.searchParams.set("restore_reason", "early_video_socket")`,
 		`url.searchParams.set("has_frame", "0")`,
 		`url.searchParams.set("configured", "0")`,
-		`new WebSocket(streamURL())`,
+		`function streamProtocols()`,
+		`var protocols = ["ticket.video.v1"]`,
+		`/^ticket\.startup\.[0-9a-f]{32}$/.test(startupRun)`,
+		`new WebSocket(streamURL(), streamProtocols())`,
 	} {
 		if !strings.Contains(template, needle) {
 			t.Fatalf("early video socket context missing %q", needle)
 		}
 	}
+}
+
+func TestTicketViewerDoesNotBypassOrderedStartupWithBrowserKeyframe(t *testing.T) {
+	source := ticketAppSource(t)
+	noteOpen := substringBetween(t, source,
+		"function noteVideoSocketOpen(socket, reason) {",
+		"  function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {")
+	keyframePolicy := substringBetween(t, source,
+		"function initialLoadDefersBrowserKeyframe(reason) {",
+		"  function requestKeyframeDebounced(reason, minIntervalMs, force) {")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const performance = { now: () => now };
+const WebSocket = { OPEN: 1 };
+const document = { visibilityState: 'visible' };
+const socket = { readyState: WebSocket.OPEN, close() {} };
+let videoWs = socket;
+let idleDisconnected = false;
+let videoConnectedAt = 0;
+let videoSocketCreatedAt = 25;
+let lastFrameAt = 0;
+let lastKeyframeCommandAt = 0;
+let configured = false;
+let hasRenderedFrame = false;
+let activeResumeFlow = { trigger: 'initial_load', done: false, startedAt: now };
+let browserReducerKeyframes = 0;
+const keyframeCommandMinIntervalMs = 2500;
+const streamFirstFrameKeyframeMs = 2000;
+const intentionallyClosedVideoSockets = new Set();
+function check(value, message) { if (!value) throw new Error(message); }
+function clientLog() {}
+function flushClientLogs() {}
+function resetFirstFrameServerRecovery() {}
+function showStreamWaiting() {}
+function scheduleStreamFeedback() {}
+function liveStreamSuppressesBackgroundRequest() { return false; }
+function runSpacetimeMutation() { browserReducerKeyframes += 1; return Promise.resolve(); }
+`+keyframePolicy+noteOpen+`
+noteVideoSocketOpen(socket, 'early_video_socket_open');
+check(browserReducerKeyframes === 0, 'socket open bypassed the blocked ordered start path');
+check(requestKeyframe('config_received') === false, 'initial config requested a keyframe before the ordered server nudge');
+check(requestKeyframe('initial_load_recovery', true) === false, 'forced initial recovery requested a keyframe before startup grace');
+check(browserReducerKeyframes === 0, 'initial config bypassed the blocked ordered start path');
+now = 2101;
+check(requestKeyframe('first_frame_timeout') === true, 'post-grace recovery keyframe was not retained');
+check(browserReducerKeyframes === 1, 'post-grace recovery must make one reducer request');
+`)
 }
 
 func TestControlCodePostConfirmationStressAllowsWaitingModalButRejectsEarlyCapture(t *testing.T) {
@@ -634,6 +1948,7 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"control_popup_keyboard_frame",
 		"generated_frame_not_visible",
 		"candidate_frame_at_or_after_phone_marker_and_generated_visual",
+		"candidate_frame_at_or_after_trusted_phone_marker_and_changed_visual",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code freeze proof missing %q", needle)
@@ -666,9 +1981,12 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"const generatedProof = controlCodeGeneratedFrameProof();",
 		"const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||",
 		"const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof",
-		"if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame)",
+		"const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint",
+		"const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&",
+		"const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||",
+		"if (!browserTrustedResultVisible && trustedPhoneMarkerFrame)",
 		"proof.generatedMarkerOnlyRejected = true;",
-		"if (!proof.browserTrustedGeneratedVisible)",
+		"if (!proof.browserTrustedResultVisible)",
 		"candidateFrameEpoch: controlCodeRenderedFrameEpoch()",
 		"candidateFrameSequence: controlCodeRenderedFrameSequence()",
 		"const renderedEpoch = controlCodeRenderedFrameEpoch();",
@@ -691,13 +2009,13 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		}
 	}
 	markerOnlyRejectIndex := strings.Index(candidateProof, "proof.generatedMarkerOnlyRejected = true;")
-	generatedIndex := strings.Index(candidateProof, "if (!proof.browserTrustedGeneratedVisible)")
+	generatedIndex := strings.Index(candidateProof, "if (!proof.browserTrustedResultVisible)")
 	if markerOnlyRejectIndex < 0 || generatedIndex < 0 || markerOnlyRejectIndex > generatedIndex {
 		t.Fatalf("candidate frame must reject marker-only proof before accepting a generated frame")
 	}
 	if strings.Contains(candidateProof, "proof.generatedVisibleByPhoneMarker") ||
-		strings.Contains(candidateProof, "'trusted_phone_marker_frame'") {
-		t.Fatalf("candidate frame must not accept marker-only phone proof")
+		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
+		t.Fatalf("candidate frame must not accept marker-only phone proof without a changed browser frame")
 	}
 	baselineRejectIndex := strings.Index(candidateProof, "proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';")
 	if baselineRejectIndex < 0 || baselineRejectIndex < generatedIndex {
@@ -827,7 +2145,7 @@ func TestControlCodeBrowserCaptureCanContinueAfterPhoneRawReturn(t *testing.T) {
 		t.Fatalf("browser capture must still reject after cleanup is fully completed")
 	}
 	cleanupCompletedIndex := strings.Index(candidateProof, "if (request.cleanupCompletedAt)")
-	generatedRejectIndex := strings.Index(candidateProof, "if (!proof.browserTrustedGeneratedVisible)")
+	generatedRejectIndex := strings.Index(candidateProof, "if (!proof.browserTrustedResultVisible)")
 	if cleanupCompletedIndex < 0 || generatedRejectIndex < 0 || cleanupCompletedIndex > generatedRejectIndex {
 		t.Fatalf("cleanup-completed rejection must happen before any generated-frame capture can be accepted")
 	}
@@ -911,7 +2229,7 @@ func TestControlCodeRecoveryQueueReasonsArePublicAndVisible(t *testing.T) {
 	}
 }
 
-func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
+func TestControlCodeCaptureTrustsPhoneProofOnlyWithExactMarkerAndChangedBrowserFrame(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
@@ -929,38 +2247,42 @@ func TestControlCodeCaptureDoesNotTrustPhonePostSubmitProofAlone(t *testing.T) {
 		"generatedProof.generatedChipVisible &&",
 		"proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;",
 		"const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof",
+		"const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint",
+		"const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&",
+		"const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||",
+		"proof.browserTrustedResultVisible = browserTrustedResultVisible;",
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
 		"request.status !== 'succeeded'",
-		"if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame)",
+		"if (!browserTrustedResultVisible && trustedPhoneMarkerFrame)",
 		"proof.generatedMarkerOnlyRejected = true;",
-		"if (!proof.browserTrustedGeneratedVisible)",
+		"if (!proof.browserTrustedResultVisible)",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("post-submit phone proof diagnostic path missing %q", needle)
 		}
 	}
 	if strings.Contains(candidateProof, "proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;") ||
-		strings.Contains(candidateProof, "proof.browserTrustedGeneratedVisible = true;") ||
 		strings.Contains(candidateProof, "proof.generatedVisibleByPhoneMarker") ||
 		strings.Contains(source, "resultProof === 'phone_visual_raw_ticket_after_submit'") {
-		t.Fatalf("phone post-submit proof must not bypass browser generated-screen or marker-frame proof")
+		t.Fatalf("phone post-submit proof must not bypass exact marker or changed browser-frame proof")
 	}
 
 	popupRejectIndex := strings.Index(candidateProof, "if (popupProof.popupVisible)")
 	trustedDiagnosticIndex := strings.Index(candidateProof, "if (trustedPhonePostSubmitProof) {")
-	generatedRejectIndex := strings.Index(candidateProof, "if (!proof.browserTrustedGeneratedVisible)")
+	generatedRejectIndex := strings.Index(candidateProof, "if (!proof.browserTrustedResultVisible)")
 	if popupRejectIndex < 0 || trustedDiagnosticIndex < 0 || generatedRejectIndex < 0 {
-		t.Fatalf("candidate proof must keep popup rejection, phone proof diagnostics, and generated visual enforcement")
+		t.Fatalf("candidate proof must keep popup rejection, phone proof diagnostics, and trusted result enforcement")
 	}
 	if popupRejectIndex > trustedDiagnosticIndex || trustedDiagnosticIndex > generatedRejectIndex {
-		t.Fatalf("phone proof diagnostics must happen after popup rejection and before generated visual enforcement")
+		t.Fatalf("phone proof diagnostics must happen after popup rejection and before trusted result enforcement")
 	}
 	if !strings.Contains(candidateProof, "proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold") ||
 		!strings.Contains(candidateProof, "proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold") {
 		t.Fatalf("phone post-submit proof may assist only when the browser frame changed from the pre-request baseline")
 	}
-	if strings.Contains(candidateProof, "browserTrustedGeneratedVisible = trustedPhonePostSubmitProof") {
+	if strings.Contains(candidateProof, "browserTrustedGeneratedVisible = trustedPhonePostSubmitProof") ||
+		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
 		t.Fatalf("phone post-submit proof must not be the sole generated-frame trust signal")
 	}
 }
@@ -1013,11 +2335,11 @@ func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testin
 		t.Fatalf("control-code dialog close must blur focused input and release dialog-owned state")
 	}
 	if !strings.Contains(closeDialog, "updateControlCodeSubmitAvailability();") ||
-		!strings.Contains(updateSubmit, "codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;") {
+		!strings.Contains(updateSubmit, "codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !digitsValid;") {
 		t.Fatalf("control-code submit must be unavailable while the dialog is closed")
 	}
-	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = busy;") {
-		t.Fatalf("closed-page request button should be unavailable only while the phone lane is occupied")
+	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = busy || limitBlocked;") {
+		t.Fatalf("closed-page request button should be unavailable while the phone lane or SpaceTime quota blocks it")
 	}
 	if !strings.Contains(updateReveal, "if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;") {
 		t.Fatalf("details reveal must ignore modal-owned scroll while dialog body lock is active")
@@ -1125,6 +2447,9 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	updateSubmit := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
+	mutationLaneBusy := substringBetween(t, source,
+		"function controlCodeMutationLaneBusy() {",
+		"  function updateControlCodeSubmitAvailability() {")
 
 	for _, needle := range []string{
 		"function controlCodeFastStateFresh(state) {",
@@ -1164,16 +2489,26 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 			t.Fatalf("ordinary browser rendering must not launch redundant preparation %q", forbidden)
 		}
 	}
-	if !strings.Contains(openDialog, "if (controlCodeRequestOccupiesQueue()) return;") {
-		t.Fatalf("dialog entry must keep only the existing request-occupancy guard")
+	if !strings.Contains(openDialog, "if (controlCodeMutationLaneBusy()) return;") {
+		t.Fatalf("dialog entry must use the shared phone-mutation lane guard")
+	}
+	for _, required := range []string{
+		"controlCodeRequestOccupiesQueue()",
+		"ticketInteractionIsBusy(currentState && currentState.ticketInteraction)",
+		"ticketActionV3Busy(currentState && currentState.ticketAction)",
+	} {
+		if !strings.Contains(mutationLaneBusy, required) {
+			t.Fatalf("shared phone-mutation lane guard missing %q", required)
+		}
 	}
 	for _, forbidden := range []string{
 		"refreshControlCodeReadiness",
 		"reconnectVideoForRecovery",
 		"prepareControlCode",
+		"controlCodeFastStateFresh",
 	} {
-		if strings.Contains(openDialog, forbidden) {
-			t.Fatalf("dialog entry must not launch preparation or recovery %q", forbidden)
+		if strings.Contains(openDialog+mutationLaneBusy, forbidden) {
+			t.Fatalf("dialog entry and lane gate must not wait for or launch fast-path work %q", forbidden)
 		}
 	}
 	if strings.Contains(source, "function controlCodeRequestBusyForAutoPrepare() {") {
@@ -1219,13 +2554,14 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	for _, needle := range []string{
 		"const digitCount = sanitizeControlDigits(codeDigits.value).length;",
 		"const digitsValid = digitCount >= 2 && digitCount <= 8;",
-		"codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;",
+		"const limitBlocked = memberLimitBlocked('control_code');",
+		"codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !digitsValid;",
 		"codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';",
 		"codeSubmit.setAttribute('aria-busy', 'true');",
-		"requestCodeButton.disabled = busy;",
+		"requestCodeButton.disabled = busy || limitBlocked;",
 	} {
 		if !strings.Contains(updateSubmit, needle) {
-			t.Fatalf("submit availability must depend only on valid digits and occupied work, missing %q", needle)
+			t.Fatalf("submit availability must depend on valid digits, occupied work, and SpaceTime quota, missing %q", needle)
 		}
 	}
 	setInFlight := strings.Index(submitRequest, "controlCodeSubmitInFlight = true;")
@@ -1257,7 +2593,12 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, needle := range []string{
-		"clientLog('page_boot'",
+		"const navigationEntry = performance.getEntriesByType('navigation')[0];",
+		"sendVideoSocketClientLog('browser_opened'",
+		"source: 'navigation_timing'",
+		"function browserLifecycleSourceTime(sourceAtPerformanceMillis) {",
+		"sourceAtEpochMillis: Math.round(timeOrigin + performanceMillis)",
+		"sourceAtPerformanceMillis: Number(performanceMillis.toFixed(3))",
 		"clientLog('video_socket_connect_attempt'",
 		"clientLog('video_socket_opened'",
 		"clientLog('video_socket_closed'",
@@ -1267,6 +2608,44 @@ func TestTicketBrowserLogsStreamTraceBreadcrumbs(t *testing.T) {
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("browser stream trace breadcrumb missing %q", needle)
+		}
+	}
+	bundle, err := os.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{"browser_opened", "navigation_timing", "sourceAtEpochMillis", "sourceAtPerformanceMillis"} {
+		if !strings.Contains(string(bundle), needle) {
+			t.Fatalf("shipped browser bundle is missing startup lifecycle marker %q", needle)
+		}
+	}
+}
+
+func TestTicketViewerCarriesOnlyTheOpaqueStartupOriginAsAVideoSubprotocol(t *testing.T) {
+	source := ticketAppSource(t)
+	template := ticketIndexTemplate(t)
+	bundle, err := os.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"source":   source,
+		"template": template,
+		"bundle":   string(bundle),
+	} {
+		for _, needle := range []string{"ticket.video.v1", `ticket\.startup\.`, "startupRunOrigin"} {
+			if !strings.Contains(body, needle) {
+				t.Fatalf("%s is missing private startup subprotocol contract %q", name, needle)
+			}
+		}
+	}
+	for _, forbidden := range []string{
+		"appendStreamURLParam(url, 'startup",
+		`url.searchParams.set("startup`,
+		"clientLog('startup_run",
+	} {
+		if strings.Contains(source, forbidden) || strings.Contains(template, forbidden) || strings.Contains(string(bundle), forbidden) {
+			t.Fatalf("private startup origin leaked into a URL or browser log via %q", forbidden)
 		}
 	}
 }
@@ -1308,7 +2687,7 @@ func TestTicketBrowserDeduplicatesResumeOutcomesAndHiddenDecoderNoise(t *testing
 		"  function finishActivationResumeFlow(reason, flow) {")
 	decoderReport := substringBetween(t, source,
 		"function reportDecoderError(error, mode) {",
-		"  function sendVideoSocketClientLog(event, detail) {")
+		"  function browserLifecycleSourceTime(sourceAtPerformanceMillis) {")
 	visibility := substringBetween(t, source,
 		"document.addEventListener('visibilitychange', () => {",
 		"  window.addEventListener('pageshow'")
@@ -1713,6 +3092,9 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"requestServerRecoveryDebounced(`${reason || 'resume'}_exhausted`, true);",
 		"connectSpacetimeState().catch",
 		"publishCurrentStreamFocus(reason || 'activation');",
+		"const initialLoad = flow.trigger === 'initial_load';",
+		"connectDirectVideo({ skipEarlyGrace: !initialLoad });",
+		"if (!initialLoad) {",
 		"requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);",
 		"recoverFreshMediaSession(reason || 'activation', 'activation_resume'",
 		"flow.attempts += 1;",
@@ -1727,10 +3109,13 @@ func TestTicketViewerRunsBoundedActivationReconnectBurst(t *testing.T) {
 		"connectDirectVideo({ skipEarlyGrace: Boolean(options.skipEarlyGrace) });",
 		"recoverFreshMediaSession(reason || 'visibility_resume', 'old_tab_resume'",
 		"keyframeReason: `${reason || 'resume'}_cached_keyframe`",
-		"startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');",
-		"startActivationResumeFlow('focus', 'focus');",
+		"followActivationResumeLifecycle('pageshow', 'pageshow');",
+		"followActivationResumeLifecycle('focus', 'focus');",
 		"startActivationResumeFlow('initial_load', 'initial_load');",
-		"startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });",
+		"pauseActivationResumeLifecycle('visibility_hidden', 'visibility_hidden');",
+		"claimActivationResumeLifecycle(reason || 'visibility_resume', 'visibility_resume');",
+		"flow.startedAt = performance.now();",
+		"flow.attempts = 0;",
 		"recoverAfterVisibilityResume('visibility_resume');",
 		"if (!videoWs || videoWs.readyState !== WebSocket.OPEN || !pendingClientLogs.length) return;",
 	} {
@@ -1820,7 +3205,7 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 		"claimEarlyVideoSocket()",
 		"closeEarlyVideo('pagehide');",
 		"if (event && event.persisted) {",
-		"publishStreamFocus(false, 'pagehide_cached');",
+		"pauseHiddenStreamAfterGrace('pagehide_cached');",
 		"for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown', 'scroll', 'focus'])",
 		"document.addEventListener('visibilitychange'",
 		"noteViewerActivity(null, 'visibility_visible');",
@@ -1891,16 +3276,31 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 func TestFirstRenderedFrameIsSentOverVideoSocket(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, needle := range []string{
-		"function sendVideoSocketClientLog(event, detail) {",
-		"clientLog(event, safeDetail);",
+		"function sendVideoSocketClientLog(event, detail, sourceAtPerformanceMillis) {",
+		"const timing = browserLifecycleSourceTime(sourceAtPerformanceMillis);",
+		"detailJson: safeString(payload).slice(0, 1000)",
+		"sourceAtEpochMillis: Math.round(timeOrigin + performanceMillis)",
+		"sourceAtPerformanceMillis: Number(performanceMillis.toFixed(3))",
 		"function flushClientLogs() {",
 		"videoWs.send(JSON.stringify({",
 		"type: 'client_log'",
 		"event: String(entry.event || 'client_event').slice(0, 80)",
-		"sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);",
+		"sendVideoSocketClientLog('browser_configured',",
+		"sendVideoSocketClientLog('browser_first_frame_decoded',",
+		"sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail, lastFrameAt);",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("first rendered frame must be sent over the video socket, missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"const configuredAtPerformanceMillis = performance.now();",
+		"}, configuredAtPerformanceMillis);",
+		"const decodedAtPerformanceMillis = performance.now();",
+		"}, decodedAtPerformanceMillis);",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("browser lifecycle source timestamp missing %q", needle)
 		}
 	}
 }
@@ -1978,4 +3378,14 @@ func substringBetween(t *testing.T, source, startNeedle, endNeedle string) strin
 		t.Fatalf("missing end needle %q", endNeedle)
 	}
 	return source[start : start+len(startNeedle)+end]
+}
+
+func runTicketJavaScript(t *testing.T, source string) {
+	t.Helper()
+	command := exec.Command("node", "--input-type=commonjs", "-")
+	command.Stdin = strings.NewReader(source)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser behavior script failed: %v\n%s", err, output)
+	}
 }

@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-08-23T21:24:53.097Z",
+  "includeContent": false,
+  "summary": {
+    "ok": false,
+    "status": "partial",
+    "warnings": [],
+    "error": {
+      "name": "[redacted:5 chars]",
+      "message": "[redacted:2779 chars]",
+      "recoverable": false
+    },
+    "context": {
+      "timestamp": "2026-08-23T21:24:53.096Z",
+      "url": "[redacted:66 chars]",
+      "title": "[redacted:19 chars]",
+      "turnCount": 0,
+      "assistantTurnCount": 0
+    }
+  },
+  "steps": [
+    {
+      "id": "bootstrap",
+      "command": "session.bootstrap",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-23T21:24:48.468Z",
+      "endedAt": "2026-08-23T21:24:48.524Z",
+      "warnings": [],
+      "dataPreview": {
+        "browserName": "[redacted:6 chars]",
+        "tabId": "[redacted:9 chars]",
+        "url": "[redacted:66 chars]",
+        "loggedIn": true
+      }
+    },
+    {
+      "id": "experience",
+      "command": "experience.open",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-23T21:24:48.524Z",
+      "endedAt": "2026-08-23T21:24:48.602Z",
+      "warnings": [],
+      "dataPreview": {
+        "experience": "[redacted:4 chars]",
+        "previousExperience": "[redacted:4 chars]",
+        "changed": false,
+        "selectorProfile": "[redacted:18 chars]"
+      }
+    },
+    {
+      "id": "configuration",
+      "command": "configuration.apply",
+      "status": "ok",
+      "ok": true,
+      "startedAt": "2026-08-23T21:24:48.602Z",
+      "endedAt": "2026-08-23T21:24:49.953Z",
+      "warnings": [],
+      "dataPreview": {
+        "requested": {
+          "intelligence": "[redacted:3 chars]"
+        },
+        "selected": [
+          {
+            "axis": "[redacted:12 chars]",
+            "requested": "[redacted:3 chars]",
+            "selected": "[redacted:3 chars]"
+          }
+        ],
+        "before": {
+          "experience": "[redacted:4 chars]",
+          "selectorProfile": "[redacted:18 chars]",
+          "availableAxes": [
+            "[redacted:6 chars]"
+          ],
+          "active": {
+            "effort": "[redacted:3 chars]"
+          },
+          "options": {},
+          "verified": true,
+          "evidence": [
+            {
+              "source": "[redacted:7 chars]",
+              "label": "[redacted:21 chars]"
+            }
+          ]
+        },
+        "after": {
+          "experience": "[redacted:4 chars]",
+          "selectorProfile": "[redacted:18 chars]",
+          "availableAxes": [
+            "[redacted:6 chars]"
+          ],
+          "active": {
+            "effort": "[redacted:3 chars]"
+          },
+          "options": {},
+          "verified": true,
+          "evidence": [
+            {
+              "source": "[redacted:7 chars]",
+              "label": "[redacted:21 chars]"
+            }
+          ]
+        },
+        "verified": true
+      }
+    },
+    {
+      "id": "ask",
+      "command": "messages.ask",
+      "status": "error",
+      "ok": false,
+      "startedAt": "2026-08-23T21:24:49.953Z",
+      "endedAt": "2026-08-23T21:24:53.096Z",
+      "warnings": []
+    }
+  ],
+  "data": {
+    "bootstrap": {
+      "browserName": "[redacted:6 chars]",
+      "tabId": "[redacted:9 chars]",
+      "url": "[redacted:66 chars]",
+      "loggedIn": true
+    },
+    "experience": {
+      "experience": "[redacted:4 chars]",
+      "previousExperience": "[redacted:4 chars]",
+      "changed": false,
+      "selectorProfile": "[redacted:18 chars]"
+    },
+    "configuration": {
+      "requested": {
+        "intelligence": "[redacted:3 chars]"
+      },
+      "selected": [
+        {
+          "axis": "[redacted:12 chars]",
+          "requested": "[redacted:3 chars]",
+          "selected": "[redacted:3 chars]"
+        }
+      ],
+      "before": {
+        "experience": "[redacted:4 chars]",
+        "selectorProfile": "[redacted:18 chars]",
+        "availableAxes": [
+          "[redacted:6 chars]"
+        ],
+        "active": {
+          "effort": "[redacted:3 chars]"
+        },
+        "options": {},
+        "verified": true,
+        "evidence": [
+          {
+            "source": "[redacted:7 chars]",
+            "label": "[redacted:21 chars]"
+          }
+        ]
+      },
+      "after": {
+        "experience": "[redacted:4 chars]",
+        "selectorProfile": "[redacted:18 chars]",
+        "availableAxes": [
+          "[redacted:6 chars]"
+        ],
+        "active": {
+          "effort": "[redacted:3 chars]"
+        },
+        "options": {},
+        "verified": true,
+        "evidence": [
+          {
+            "source": "[redacted:7 chars]",
+            "label": "[redacted:21 chars]"
+          }
+        ]
+      },
+      "verified": true
+    }
+  }
+}

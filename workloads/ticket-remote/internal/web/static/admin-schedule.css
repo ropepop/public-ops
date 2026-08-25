@@ -60,6 +60,27 @@
   overflow-wrap: anywhere;
 }
 
+.admin-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.admin-toggle input {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: #4d8dff;
+}
+
+.admin-toggle:has(input:disabled) {
+  cursor: wait;
+  opacity: .72;
+}
+
 @media (max-width: 780px) {
   .admin-schedule-form,
   .admin-schedule-card {

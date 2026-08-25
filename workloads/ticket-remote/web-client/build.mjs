@@ -31,11 +31,11 @@ execFileSync(
 );
 
 const keptBindings = new Set([
-  ...["activation_decision", "activation_eligibility", "control_code_fast_state", "control_code_request", "latency_link_v_1", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_interaction"]
+  ...["activation_decision", "activation_eligibility", "control_code_fast_state", "control_code_request", "latency_link_v_1", "member_limit_state", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_interaction", "ticket_action_v_3", "ticket_slider_region_v_3"]
     .map((name) => `ticketremote_${name}_table`),
-  ...["close_control_code", "confirm_control_code_browser_capture", "recover_stream", "request_control_code", "request_keyframe", "set_stream_focus", "request_ticket_reset", "request_ticket_reset_v_2", "activate_ticket_button", "activate_ticket_button_v_2", "claim_ticket_slider", "claim_ticket_slider_v_2", "update_ticket_slider"]
+  ...["close_control_code", "confirm_control_code_browser_capture", "recover_stream", "refresh_limit_state", "request_control_code", "request_keyframe", "set_limit_preference", "set_stream_focus", "request_ticket_action_v_3"]
     .map((name) => `ticketremote_member_${name}_reducer`),
-  "ticketremote_finalize_ticket_activation_attempt_reducer",
+  "ticketremote_admin_schedule_ticket_action_v_3_reducer",
 ]);
 const allowedGeneratedFiles = new Set([
   "index.ts", "types.ts", path.join("types", "procedures.ts"), path.join("types", "reducers.ts"),
@@ -60,11 +60,20 @@ function pruneBindings(relativeFile, importPattern, referencePattern) {
 
 pruneBindings("index.ts", /^import\s+(\w+)\s+from\s+"\.\/(ticketremote_[^"]+)";$/gm, (symbol, name) => name.endsWith("_table")
   ? new RegExp(`\\n  ${name.slice(0, -6)}: __table\\(\\{[\\s\\S]*?\\n  \\}, ${symbol}\\),`, "g")
-  : new RegExp(`\\n  __reducerSchema\\("${name.slice(0, -8)}", ${symbol}\\),`, "g"));
+  : new RegExp(`\\n  __reducerSchema\\("[^"]+", ${symbol}\\),`, "g"));
 pruneBindings(path.join("types", "reducers.ts"), /^import\s+(\w+)\s+from\s+"\.\.\/(ticketremote_[^"]+)";$/gm,
   (symbol) => new RegExp(`^export type \\w+ = __Infer<typeof ${symbol}>;\\n`, "gm"));
 rewrite("types.ts", (source) => source.replace(/\nexport const (Ticketremote\w+) = __t\.object\("\1", \{[\s\S]*?\n\}\);\nexport type \1 = __Infer<typeof \1>;\n/g,
   (block, name) => keepsType(name) ? block : ""));
+
+const generatedIndex = readFileSync(path.join(generatedDir, "index.ts"), "utf8");
+const importedSymbols = new Set([...generatedIndex.matchAll(/^import\s+(\w+)\s+from\s+/gm)].map((match) => match[1]));
+const missingReducerImports = [...generatedIndex.matchAll(/__reducerSchema\("[^"]+",\s*(\w+)\)/g)]
+  .map((match) => match[1])
+  .filter((symbol) => !importedSymbols.has(symbol));
+if (missingReducerImports.length > 0) {
+  throw new Error(`Pruned bindings left reducer schemas without imports: ${[...new Set(missingReducerImports)].join(", ")}`);
+}
 for (const relativeFile of readdirSync(generatedDir, { recursive: true })) {
   const file = path.join(generatedDir, relativeFile);
   if (statSync(file).isFile() && !allowedGeneratedFiles.has(relativeFile)) rmSync(file, { force: true });

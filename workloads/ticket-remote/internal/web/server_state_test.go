@@ -88,8 +88,8 @@ func TestAdminPageRendersDashboardShell(t *testing.T) {
 	body := rec.Body.String()
 	for _, expected := range []string{
 		`class="admin-status-grid"`,
-		`action="/api/v1/admin/ticket/reselect-latest"`,
-		`action="/api/v1/admin/ticket/reselect-latest/schedule"`,
+		`class="admin-redetect-form" data-direct-ticket-action-v3="true"`,
+		`class="admin-schedule-form" data-direct-ticket-action-v3="true"`,
 		`name="date" type="date"`,
 		`name="time" type="time" step="60"`,
 		`Europe/Riga`,
@@ -101,6 +101,14 @@ func TestAdminPageRendersDashboardShell(t *testing.T) {
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("admin page missing %q in %s", expected, body)
+		}
+	}
+	for _, forbidden := range []string{
+		`action="/api/v1/admin/ticket/reselect-latest"`,
+		`action="/api/v1/admin/ticket/reselect-latest/schedule"`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("admin page retained legacy Ticket producer %q in %s", forbidden, body)
 		}
 	}
 	if strings.Contains(body, `/static/app.js`) {

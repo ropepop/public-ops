@@ -26,6 +26,7 @@ func TestRetiredTicketRoutesReturnOneCompactGoneContract(t *testing.T) {
 		"/api/v1/control/extend",
 		"/api/v1/control/release",
 		"/api/v1/admin/control/revoke",
+		"/api/v1/admin/ticket/reselect-latest",
 	} {
 		t.Run(strings.TrimPrefix(path, "/api/v1/"), func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))

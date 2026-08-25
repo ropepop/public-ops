@@ -1,10 +1,32 @@
 /* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
+import {
+  beginTicketActionV3LocalRequest,
+  handleTicketLocalRegisterSliderChange,
+  isTicketActionV3RegistrationProofFresh,
+  observeTicketActionV3LocalRequest,
+  settleTicketActionV3LocalRequest,
+  ticketCurrentProofFingerprintChanged,
+  ticketCurrentProofRequestNeeded,
+  ticketControlCodeVisualRecoveryRequired,
+  ticketActionV3ExplicitResultForDisplay,
+  ticketActionV3LocalRequestBusy,
+  ticketActionV3OccupiesPhone,
+  ticketActionV3RequestArgs,
+  ticketActionV3SmartSwitchForView,
+  ticketMemberLimitBlocks,
+  ticketMemberLimitCountdown,
+  ticketSliderRegionV3ForAction,
+  ticketSliderRegionV3Layout
+} from './ticket-action-v3-core.mjs';
 
 (function () {
   const cfg = window.TICKET_REMOTE_CONFIG || {};
   const pageVersion = cfg.pageVersion || 'ticket-remote-dev';
   const assetVersion = String(cfg.assetVersion || pageVersion || '').trim();
+  const startupRunOrigin = /^ticket\.startup\.[0-9a-f]{32}$/.test(String(cfg.startupRunOrigin || '').trim())
+    ? String(cfg.startupRunOrigin).trim()
+    : '';
 
   function safeString(value) {
     if (value == null) return '';
@@ -187,10 +209,18 @@ import { html, reactive } from '@arrow-js/core';
   const requestTicketResetButton = requireElement('#requestTicketReset', 'requestTicketReset');
   const requestTicketResetAndActivateButton = requireElement('#requestTicketResetAndActivate', 'requestTicketResetAndActivate');
   const activateTicketButton = requireElement('#activateTicket', 'activateTicket');
+  const ticketRegisterOverlay = requireElement('#ticketRegisterOverlay', 'ticketRegisterOverlay');
+  const ticketLocalRegisterSlider = requireElement('#ticketLocalRegisterSlider', 'ticketLocalRegisterSlider');
+  const ticketViewSwitchButton = requireElement('#ticketViewSwitch', 'ticketViewSwitch');
+  const ticketViewSwitchDetail = requireElement('#ticketViewSwitchDetail', 'ticketViewSwitchDetail');
   const ticketResetDetail = requireElement('#ticketResetDetail', 'ticketResetDetail');
   const ticketActivationAt = requireElement('#ticketActivationAt', 'ticketActivationAt');
   const ticketActivationTimer = requireElement('#ticketActivationTimer', 'ticketActivationTimer');
-  const ticketSliderOverlay = requireElement('#ticketSliderOverlay', 'ticketSliderOverlay');
+  const ticketLimitMode = requireElement('#ticketLimitMode', 'ticketLimitMode');
+  const ticketRegistrationLimitUsage = requireElement('#ticketRegistrationLimitUsage', 'ticketRegistrationLimitUsage');
+  const ticketRegistrationLimitDetail = requireElement('#ticketRegistrationLimitDetail', 'ticketRegistrationLimitDetail');
+  const ticketControlCodeLimitUsage = requireElement('#ticketControlCodeLimitUsage', 'ticketControlCodeLimitUsage');
+  const ticketControlCodeLimitDetail = requireElement('#ticketControlCodeLimitDetail', 'ticketControlCodeLimitDetail');
   const codeRequestState = requireElement('#codeRequestState', 'codeRequestState');
   const codeRequestDetail = requireElement('#codeRequestDetail', 'codeRequestDetail');
   const codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog');
@@ -206,7 +236,7 @@ import { html, reactive } from '@arrow-js/core';
   const codeResultTimer = requireElement('#controlCodeResultTimer', 'controlCodeResultTimer');
   const codeResultClose = requireElement('#closeControlCodeResult', 'closeControlCodeResult');
   const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');
-  if (!presence || !requestCodeButton || !requestTicketResetButton || !requestTicketResetAndActivateButton || !activateTicketButton || !ticketResetDetail || !ticketActivationAt || !ticketActivationTimer || !ticketSliderOverlay || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
+  if (!presence || !requestCodeButton || !requestTicketResetButton || !requestTicketResetAndActivateButton || !activateTicketButton || !ticketRegisterOverlay || !ticketLocalRegisterSlider || !ticketViewSwitchButton || !ticketViewSwitchDetail || !ticketResetDetail || !ticketActivationAt || !ticketActivationTimer || !ticketLimitMode || !ticketRegistrationLimitUsage || !ticketRegistrationLimitDetail || !ticketControlCodeLimitUsage || !ticketControlCodeLimitDetail || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
   const viewerCount = document.getElementById('viewerCount');
   const viewerCountDetail = document.getElementById('viewerCountDetail');
   const presenceListAnchorKey = 'viewer-list-anchor';
@@ -225,26 +255,35 @@ import { html, reactive } from '@arrow-js/core';
   let serverClockSkewMs = 0;
   let serverClockHasLiveSample = false;
   let pointerStart = null;
-  let ticketSliderPointer = null;
-  let ticketSliderSequence = 0;
-  let ticketSliderResetInFlight = false;
-  let ticketSliderButtonInFlight = false;
-  let ticketSliderControlId = '';
-  let ticketSliderInteractionRevision = '';
-  let ticketSliderActivationAttemptId = '';
-  let ticketSliderUpdateTimer = null;
-  let ticketSliderUpdateInFlight = false;
-  let ticketSliderHeartbeatTimer = null;
-  let ticketSliderLeaseExpiryTimer = null;
-  let activationPolicyRetryTimer = null;
-  const activationPolicyRetryTimerMaxDelayMs = 60 * 1000;
-  let ticketSliderPendingUpdate = null;
-  let ticketSliderState = 'idle';
-  let ticketSliderLatestProgress = 0;
-  let ticketSliderLocalProgress = 0;
-  const ticketSliderQualifyHoldMs = 80;
-  const ticketSliderQualifyTravelPx = 10;
-  const ticketSliderUpdateIntervalMs = 32;
+  const ticketActionV3LocalRequestState = { actionId: '', reducerSettled: false, observed: false };
+  let ticketActionV3LastUserActionId = '';
+  let ticketActionV3LastUserAction = null;
+  let ticketActionV3LastUserMessage = '';
+  let ticketActionV3ReconcileTimer = null;
+  const ticketActionV3ReconcileIntervalMs = 1000;
+  let ticketViewSwitchExpiryTimer = null;
+  const ticketLocalRegisterSliderState = { inFlight: false };
+  let ticketLimitPresentationTimer = null;
+  let ticketSliderRegionExpiryTimer = null;
+  let ticketCurrentProofInFlight = false;
+  let ticketCurrentProofLastActionId = '';
+  let ticketCurrentProofRequestedScope = '';
+  let ticketCurrentProofLastRequestAt = 0;
+  let ticketCurrentProofLastSampleAt = 0;
+  let ticketCurrentProofFingerprint = null;
+  let ticketCurrentProofCandidateFingerprint = null;
+  let ticketCurrentProofStableChangeCount = 0;
+  let ticketCurrentProofChangePending = false;
+  let ticketCurrentProofResumePending = true;
+  const ticketCurrentProofSampleIntervalMs = 1000;
+  const ticketCurrentProofRequestCooldownMs = 2500;
+  const ticketCurrentProofFingerprintCanvas = document.createElement('canvas');
+  ticketCurrentProofFingerprintCanvas.width = 8;
+  ticketCurrentProofFingerprintCanvas.height = 12;
+  const ticketCurrentProofFingerprintContext = ticketCurrentProofFingerprintCanvas.getContext('2d', {
+    alpha: false,
+    willReadFrequently: true
+  });
   let connectedAt = 0;
   let videoSocketCreatedAt = 0;
   let videoConnectedAt = 0;
@@ -277,6 +316,7 @@ import { html, reactive } from '@arrow-js/core';
   let firstFrameServerRecoveryExhausted = false;
   let decoder = null;
   let decoderGeneration = 0;
+  let decoderConfigureGeneration = 0;
   let decoderConfigured = false;
   let decoderMode = 'annexb';
   let avcAdapterTried = false;
@@ -291,6 +331,7 @@ import { html, reactive } from '@arrow-js/core';
   let lastAcceptedFrameSequence = 0;
   let lastAcceptedFrameTimestamp = 0;
   let firstFrameReceived = false;
+  let firstDecodedTraceSent = false;
   let firstRenderedTraceSent = false;
   let hasRenderedFrame = false;
   let fallbackFrameCanvas = null;
@@ -423,7 +464,7 @@ import { html, reactive } from '@arrow-js/core';
   const streamFeedbackHiddenIntervalMs = 2000;
   const streamDecoderQueueSoftLimit = 2;
   const streamDecoderQueueHardLimit = 4;
-  const streamVisualAgeHardLimitMs = 2000;
+  const streamIngressFrameMaxAgeMs = 2000;
   const streamIngressMetadataLimit = 32;
   const streamPresentationFrameTimeoutMs = 1000;
   const doubleTapSuppressMs = 420;
@@ -442,12 +483,24 @@ import { html, reactive } from '@arrow-js/core';
     try { socket.close(1000, reason || 'app_loaded'); } catch (_) {}
   }
 
+  function claimableEarlyVideoQueue(early) {
+    const queued = Array.isArray(early && early.queue) ? early.queue.slice() : [];
+    if (!queued.length) return queued;
+    const keyframe = queued[0];
+    const metadata = keyframe && keyframe.meta;
+    const receivedAt = Number(keyframe && keyframe.receivedAt);
+    const maxAgeMillis = Math.max(0, Number(early && early.maxKeyframeAgeMs || 1500));
+    const receivedAgeMillis = Number.isFinite(receivedAt) ? Math.max(0, performance.now() - receivedAt) : Number.POSITIVE_INFINITY;
+    if (!metadata || !metadata.key || receivedAgeMillis > maxAgeMillis) return [];
+    return queued;
+  }
+
   function claimEarlyVideoSocket() {
     const early = window.TICKET_EARLY_VIDEO;
     if (!early || early.claimed) return null;
     early.claimed = true;
     const socket = early.ws;
-    const queued = Array.isArray(early.queue) ? early.queue.slice() : [];
+    const queued = claimableEarlyVideoQueue(early);
     if (early.config) queued.unshift(early.config);
     early.queue = [];
     early.config = null;
@@ -472,12 +525,12 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function noteViewerActivity(event, reason) {
-    if (event && event.isTrusted === false) return;
+    if (event && event.isTrusted === false) return false;
     if (idleDisconnected) {
-      resumeFromIdleDisconnect(reason || (event && event.type) || 'activity');
-      return;
+      return resumeFromIdleDisconnect(reason || (event && event.type) || 'activity');
     }
     scheduleViewerIdleDisconnect(reason || (event && event.type) || 'activity');
+    return false;
   }
 
   function expireViewerIdle(reason) {
@@ -537,12 +590,11 @@ import { html, reactive } from '@arrow-js/core';
     stateRefresh.catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     connectDirectVideo();
     publishCurrentStreamFocus(reason || 'idle_resume');
-    requestKeyframeDebounced(`${reason || 'idle_resume'}_keyframe`, 0, true);
     requestServerRecoveryDebounced(`${reason || 'idle_resume'}_recover`, true);
-	    startActivationResumeFlow(reason || 'idle_resume', 'watchdog');
 	    publishStreamDebug();
 	    clientLog('viewer_idle_resumed', reason || 'idle_resume');
-	    startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
+	    const resumeFlow = startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
+    if (resumeFlow) resumeFlow.lifecycleResumeStarted = true;
 	    return true;
 	  }
 
@@ -718,6 +770,7 @@ import { html, reactive } from '@arrow-js/core';
   function isControlCodeUiEventTarget(target) {
     if (!target || target === document || target === window) return false;
     return Boolean(
+      (panel && panel.contains(target)) ||
       controlCodeHotspot.contains(target) ||
       requestCodeButton.contains(target) ||
       codeDialog.contains(target) ||
@@ -795,13 +848,17 @@ import { html, reactive } from '@arrow-js/core';
     connectionState.textContent = text;
   }
 
-  function safeWebSocket(url, label) {
+  function videoSocketProtocols() {
+    return startupRunOrigin ? ['ticket.video.v1', startupRunOrigin] : ['ticket.video.v1'];
+  }
+
+  function safeWebSocket(url, label, protocols) {
     if (typeof WebSocket !== 'function') {
       reportClientFault('websocket_unavailable', label || url);
       return null;
     }
     try {
-      return new WebSocket(url);
+      return new WebSocket(url, protocols);
     } catch (error) {
       reportClientFault('websocket_create_failed', `${label || url}:${error && error.message || 'create failed'}`);
       return null;
@@ -818,6 +875,7 @@ import { html, reactive } from '@arrow-js/core';
     ['Unavailable', 'Nav pieejams'],
     ['invalid_code', 'Ievadi 2-8 ciparus'],
     ['request_in_progress', 'Iepriekšējais koda pieprasījums vēl tiek pabeigts'],
+    ['ticket_action_in_progress', 'Tālrunis izpilda iepriekšējo biļetes darbību'],
     ['Spacetime connection is not ready', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
     ['Spacetime connection failed', 'Neizdevās savienot vadības kanālu. Mēģini vēlreiz.'],
     ['Spacetime connection closed', 'Vadības kanāls pārtrauca savienojumu. Mēģini vēlreiz.'],
@@ -1007,12 +1065,13 @@ import { html, reactive } from '@arrow-js/core';
     reportClientFault(event, detail);
   }
 
-  clientLog('page_boot', JSON.stringify({
-    pageVersion,
-    assetVersion,
+  const navigationEntry = performance.getEntriesByType('navigation')[0];
+  const navigationStartPerformanceMillis = Number(navigationEntry && navigationEntry.startTime || 0);
+  sendVideoSocketClientLog('browser_opened', {
+    source: 'navigation_timing',
     visibility: document.visibilityState,
     webCodecs: 'VideoDecoder' in window
-  }));
+  }, navigationStartPerformanceMillis);
 
   function flushClientLogs() {
     if (!videoWs || videoWs.readyState !== WebSocket.OPEN || !pendingClientLogs.length) return;
@@ -1157,6 +1216,7 @@ import { html, reactive } from '@arrow-js/core';
     stage.style.setProperty('--stream-height', `${displayHeight}px`);
     stage.style.setProperty('--stream-left', `${Math.max(0, Math.floor((maxWidth - displayWidth) / 2))}px`);
     stage.style.setProperty('--stream-top', `${Math.max(0, Math.floor((maxHeight - displayHeight) / 2))}px`);
+    if (currentState) renderTicketActionV3Controls(currentState);
   }
 
   function videoSocketState() {
@@ -1251,23 +1311,32 @@ import { html, reactive } from '@arrow-js/core';
   function startActivationResumeFlow(reason, trigger, options) {
     if (streamUnsupported) return null;
     const paused = Boolean(options && options.pauseBurst);
+    const nextReason = safeResumeLabel(reason, 'activation');
+    const nextTrigger = safeResumeLabel(trigger, 'activation');
     let flow = activeResumeFlow;
+    if (
+      flow && !flow.done && flow.trigger === 'initial_load' &&
+      (nextReason === 'pageshow' || nextReason === 'focus')
+    ) {
+      return flow;
+    }
     if (!flow || flow.done) {
       flow = {
         id: `resume_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-        reason: safeResumeLabel(reason, 'activation'),
-        trigger: safeResumeLabel(trigger, 'activation'),
+        reason: nextReason,
+        trigger: nextTrigger,
         startedAt: performance.now(),
         attempts: 0,
         logs: 0,
         done: false,
-        paused
+        paused,
+        lifecycleResumeStarted: false
       };
       activeResumeFlow = flow;
       logResumeCheckpoint('activation_resume_start', { trigger: flow.trigger, paused: resumeBooleanLabel(paused) }, flow);
     } else {
-      flow.reason = safeResumeLabel(reason, flow.reason);
-      flow.trigger = safeResumeLabel(trigger, flow.trigger);
+      flow.reason = nextReason;
+      flow.trigger = nextTrigger;
       flow.paused = paused;
     }
     if (paused) {
@@ -1275,6 +1344,41 @@ import { html, reactive } from '@arrow-js/core';
     } else {
       runActivationReconnectBurst(flow.reason, flow);
     }
+    return flow;
+  }
+
+  function followActivationResumeLifecycle(reason, trigger) {
+    const current = activeResumeFlow;
+    if (current && !current.done) return current;
+    const flow = startActivationResumeFlow(reason, trigger);
+    if (flow) flow.lifecycleResumeStarted = true;
+    return flow;
+  }
+
+  function claimActivationResumeLifecycle(reason, trigger) {
+    const current = activeResumeFlow;
+    if (current && !current.done && current.lifecycleResumeStarted) return null;
+    const resetPausedBudget = Boolean(current && !current.done && current.paused);
+    const flow = startActivationResumeFlow(reason, trigger, { pauseBurst: true });
+    if (flow) {
+      if (resetPausedBudget && flow === current) {
+        flow.startedAt = performance.now();
+        flow.attempts = 0;
+        flow.logs = 0;
+        logResumeCheckpoint('activation_resume_start', {
+          trigger: flow.trigger,
+          paused: 'true',
+          budget: 'reset'
+        }, flow);
+      }
+      flow.lifecycleResumeStarted = true;
+    }
+    return flow;
+  }
+
+  function pauseActivationResumeLifecycle(reason, trigger) {
+    const flow = startActivationResumeFlow(reason, trigger, { pauseBurst: true });
+    if (flow) flow.lifecycleResumeStarted = false;
     return flow;
   }
 
@@ -1297,13 +1401,17 @@ import { html, reactive } from '@arrow-js/core';
     flow.paused = false;
     connectSpacetimeState().catch(() => clientLog('spacetime_reconnect_failed', 'activation_resume'));
     publishCurrentStreamFocus(reason || 'activation');
+    const initialLoad = flow.trigger === 'initial_load';
     if (flow.attempts === 0 && !mediaSessionStuckOnPreservedFrame()) {
-      connectDirectVideo({ skipEarlyGrace: flow.trigger !== 'initial_load' });
-      requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);
+      connectDirectVideo({ skipEarlyGrace: !initialLoad });
+      if (!initialLoad) {
+        requestKeyframeDebounced(`${reason || 'activation'}_keyframe`, 0, true);
+      }
     } else {
       recoverFreshMediaSession(reason || 'activation', 'activation_resume', {
         forceServerRecovery: mediaSessionStuckOnPreservedFrame(),
-        skipEarlyGrace: flow.trigger !== 'initial_load'
+        skipEarlyGrace: flow.trigger !== 'initial_load',
+        waitForInitialSocket: flow.trigger === 'initial_load'
       });
     }
     flow.attempts += 1;
@@ -1313,11 +1421,27 @@ import { html, reactive } from '@arrow-js/core';
     );
   }
 
+  function initialVideoSocketNeedsAdoption() {
+    if (videoWs && (videoWs.readyState === WebSocket.CONNECTING || videoWs.readyState === WebSocket.OPEN)) return true;
+    if (videoWs) return false;
+    const early = window.TICKET_EARLY_VIDEO;
+    if (!early || early.claimed || early.closed || early.error || !early.ws) return false;
+    return early.ws.readyState === WebSocket.CONNECTING || early.ws.readyState === WebSocket.OPEN;
+  }
+
   function recoverFreshMediaSession(reason, kind, options) {
     if (idleDisconnected || streamUnsupported) return false;
     options = options || {};
+    if (options.waitForInitialSocket && initialVideoSocketNeedsAdoption()) {
+      // During the first-load burst, let the head-opened socket finish its
+      // handshake (or let connectDirectVideo adopt it) instead of replacing
+      // a healthy CONNECTING socket on the 150 ms retry.
+      connectDirectVideo({ skipEarlyGrace: false });
+      return true;
+    }
     const now = performance.now();
-    const reusable = videoSocketKeepsStreamActive()
+    const reusable = !options.forceReconnect
+      && videoSocketKeepsStreamActive()
       && lastRecoveryVideoReconnectSeq === videoSocketOpenSeq
       && now - lastRecoveryVideoReconnectAt < recoveryVideoReconnectDebounceMs;
     if (reusable) {
@@ -1367,8 +1491,12 @@ import { html, reactive } from '@arrow-js/core';
       reconnectTimer = setTimeout(connect, 1500);
     });
     connectDirectVideo();
-    if (!hasRenderedFrame) {
-      startActivationResumeFlow('cold_open', 'watchdog');
+    // The page initializer starts the first-load resume flow. Keep a
+    // reconnect flow available only after that flow has finished; starting a
+    // second burst here races the head-opened socket and can skip its short
+    // adoption grace before the app has installed its handlers.
+    if (!hasRenderedFrame && !activeResumeFlow) {
+      startActivationResumeFlow('cold_open', 'initial_load');
     }
   }
 
@@ -1392,6 +1520,7 @@ import { html, reactive } from '@arrow-js/core';
     lastPacketTimestamp = 0;
     lastAcceptedFrameSequence = 0;
     lastAcceptedFrameTimestamp = 0;
+    firstDecodedTraceSent = false;
     lastAcceptedFrameReceivedAt = 0;
     lastAcceptedFrameVisualAgeMillis = 0;
     lastAcceptedFrameQueuedAt = 0;
@@ -1520,14 +1649,15 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function releaseStreamFocusAfterHiddenGrace(reason) {
-    if (hiddenStreamFocusTimer) {
-      clearTimeout(hiddenStreamFocusTimer);
-      hiddenStreamFocusTimer = null;
-    }
     if (controlCodeKeepsVideoAliveWhileHidden()) {
+      if (hiddenStreamFocusTimer) {
+        clearTimeout(hiddenStreamFocusTimer);
+        hiddenStreamFocusTimer = null;
+      }
       publishStreamFocus(true, reason || 'hidden_control_code_capture');
       return;
     }
+    if (hiddenStreamFocusTimer) return;
     hiddenStreamFocusTimer = setTimeout(() => {
       hiddenStreamFocusTimer = null;
       if (document.visibilityState !== 'hidden') return;
@@ -1537,6 +1667,11 @@ import { html, reactive } from '@arrow-js/core';
       }
       publishStreamFocus(false, reason || 'visibility_hidden');
     }, hiddenVideoCloseDelayMs);
+  }
+
+  function pauseHiddenStreamAfterGrace(reason) {
+    releaseStreamFocusAfterHiddenGrace(reason || 'visibility_hidden');
+    pauseVideoWhileHidden(reason || 'visibility_hidden');
   }
 
   function connectDirectVideo(options) {
@@ -1581,7 +1716,7 @@ import { html, reactive } from '@arrow-js/core';
       frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
     }));
     videoSocketOpenSeq += 1;
-	    const socket = safeWebSocket(streamURL('connect_direct_video'), 'video');
+	    const socket = safeWebSocket(streamURL('connect_direct_video'), 'video', videoSocketProtocols());
 	    if (!socket) {
       clientLog('video_socket_create_failed', 'safe_websocket_unavailable');
 	      showStreamRecovery();
@@ -1607,7 +1742,6 @@ import { html, reactive } from '@arrow-js/core';
 	  flushClientLogs();
 	    resetFirstFrameServerRecovery();
 	    showStreamWaiting('Saņem video konfigurāciju...');
-	    requestKeyframe(reason || 'video_socket_open');
 	    scheduleStreamFeedback('video_socket_open');
   }
 
@@ -1617,14 +1751,19 @@ import { html, reactive } from '@arrow-js/core';
     activeVideoSockets.add(socket);
     socket.binaryType = 'arraybuffer';
     publishCurrentStreamFocus(reason || 'video_socket_adopted');
-    socket.onopen = () => noteVideoSocketOpen(socket, reason || 'video_socket_open');
-    socket.onmessage = (event) => {
-      if (idleDisconnected || videoWs !== socket) return;
-      handleVideoSocketMessage(event).catch((error) => {
-        sendVideoClientLog('video_message_failed', error && error.message || 'message failed');
-        requestKeyframe('video_message_failed');
+    let videoMessageChain = Promise.resolve();
+    function queueVideoSocketMessage(event, queued) {
+      videoMessageChain = videoMessageChain.then(() => {
+        if (idleDisconnected || videoWs !== socket) return;
+        return handleVideoSocketMessage(event);
+      }).catch((error) => {
+        if (idleDisconnected || videoWs !== socket) return;
+        sendVideoClientLog('video_message_failed', error && error.message || (queued ? 'queued message failed' : 'message failed'));
+        if (!queued) requestKeyframe('video_message_failed');
       });
-    };
+    }
+    socket.onopen = () => noteVideoSocketOpen(socket, reason || 'video_socket_open');
+    socket.onmessage = (event) => queueVideoSocketMessage(event, false);
     socket.onclose = (event) => {
       activeVideoSockets.delete(socket);
       if (videoWs === socket) videoWs = null;
@@ -1663,11 +1802,7 @@ import { html, reactive } from '@arrow-js/core';
       if (openedAt > 0) videoConnectedAt = openedAt;
       noteVideoSocketOpen(socket, reason || 'early_video_socket_open');
     }
-    queuedMessages.forEach((queued) => {
-      handleVideoSocketMessage(queued).catch((error) => {
-        sendVideoClientLog('video_message_failed', error && error.message || 'queued message failed');
-      });
-    });
+    queuedMessages.forEach((queued) => queueVideoSocketMessage(queued, true));
     return true;
   }
 
@@ -1754,21 +1889,60 @@ import { html, reactive } from '@arrow-js/core';
     sendVideoClientLog('decoder_error', error && error.message || 'decoder error');
   }
 
-  function sendVideoSocketClientLog(event, detail) {
-    const safeDetail = safeString(detail).slice(0, 500);
-    clientLog(event, safeDetail);
+  function browserLifecycleSourceTime(sourceAtPerformanceMillis) {
+    const performanceMillis = Number.isFinite(Number(sourceAtPerformanceMillis))
+      ? Number(sourceAtPerformanceMillis)
+      : performance.now();
+    const timeOrigin = Number.isFinite(Number(performance.timeOrigin))
+      ? Number(performance.timeOrigin)
+      : Date.now() - performance.now();
+    return {
+      sourceAtEpochMillis: Math.round(timeOrigin + performanceMillis),
+      sourceAtPerformanceMillis: Number(performanceMillis.toFixed(3))
+    };
+  }
+
+  function sendVideoSocketClientLog(event, detail, sourceAtPerformanceMillis) {
+    const timing = browserLifecycleSourceTime(sourceAtPerformanceMillis);
+    const safeDetail = detail != null && typeof detail === 'object' && !Array.isArray(detail)
+      ? detail
+      : { detail: safeString(detail).slice(0, 500) };
+    const payload = Object.assign({
+      pageVersion,
+      assetVersion,
+      visibility: document.visibilityState,
+      webCodecs: 'VideoDecoder' in window
+    }, safeDetail, timing);
+    enqueueClientLog({
+      level: 'info',
+      event: String(event || 'client_event').slice(0, 80),
+      detailJson: safeString(payload).slice(0, 1000),
+      at: timing.sourceAtEpochMillis
+    });
   }
 
   function liveStreamSuppressesBackgroundRequest(reason) {
     const cleanReason = String(reason || '').toLowerCase();
     if (cleanReason.includes('control_code')) return false;
+    if (cleanReason.includes('frame_sequence_gap')) return false;
     return streamHasFreshRenderedFrame();
+  }
+
+  function initialLoadDefersBrowserKeyframe(reason) {
+    const cleanReason = String(reason || '').toLowerCase();
+    if (cleanReason.includes('control_code') || cleanReason.includes('frame_sequence_gap')) return false;
+    const flow = activeResumeFlow;
+    if (!flow || flow.done || flow.trigger !== 'initial_load' || hasRenderedFrame) return false;
+    const startedAt = Number(flow.startedAt);
+    if (!Number.isFinite(startedAt)) return false;
+    return Math.max(0, performance.now() - startedAt) < streamFirstFrameKeyframeMs;
   }
 
   function requestKeyframe(reason, force) {
     if (liveStreamSuppressesBackgroundRequest(reason)) return false;
+    if (initialLoadDefersBrowserKeyframe(reason)) return false;
     const now = performance.now();
-    if (!force && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
+    if (!force && lastKeyframeCommandAt > 0 && now - lastKeyframeCommandAt < keyframeCommandMinIntervalMs) return false;
     lastKeyframeCommandAt = now;
     clientLog('keyframe_request', JSON.stringify({
       reason: reason || 'browser_request',
@@ -1784,7 +1958,7 @@ import { html, reactive } from '@arrow-js/core';
 
   function requestKeyframeDebounced(reason, minIntervalMs, force) {
     const now = performance.now();
-    if (!force && now - lastRecoveryKeyframeAt < minIntervalMs) return false;
+    if (!force && lastRecoveryKeyframeAt > 0 && now - lastRecoveryKeyframeAt < minIntervalMs) return false;
     if (!requestKeyframe(reason, force)) return false;
     lastRecoveryKeyframeAt = now;
     return true;
@@ -1793,7 +1967,7 @@ import { html, reactive } from '@arrow-js/core';
   function requestServerRecoveryDebounced(reason, force) {
     if (liveStreamSuppressesBackgroundRequest(reason)) return false;
     const now = performance.now();
-    if (!force && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
+    if (!force && lastRecoveryServerRecoverAt > 0 && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
     clientLog('stream_recovery_request', JSON.stringify({
       reason: reason || 'browser_recovery',
@@ -1839,6 +2013,7 @@ import { html, reactive } from '@arrow-js/core';
     // Chromium may still deliver output callbacks that were queued before close(). Tag every
     // decoder instance so a result-marker reset cannot render those stale frames through the
     // replacement decoder's metadata queue.
+    decoderConfigureGeneration += 1;
     decoderGeneration += 1;
     if (decoder) {
       try { decoder.close(); } catch (_) {}
@@ -2185,15 +2360,35 @@ import { html, reactive } from '@arrow-js/core';
     if (frame.sequence && frame.sequence <= lastAcceptedFrameSequence) {
       return false;
     }
+    if (frame.kind !== 'key' && frame.sequence && lastAcceptedFrameSequence && frame.sequence !== lastAcceptedFrameSequence + 1) {
+      needsKeyFrame = true;
+      requestKeyframeDebounced('frame_sequence_gap', recoveryKeyframeDebounceMs, false);
+      scheduleStreamFeedback('frame_sequence_gap');
+      return false;
+    }
     if (needsKeyFrame && frame.kind !== 'key') {
       return false;
     }
-	    if (frame.kind === 'key') needsKeyFrame = false;
+    if (frame.kind === 'key') {
+      const frameEpoch = Number(frame.epoch || 0);
+      if (!currentStreamEpoch && frameEpoch > 0) {
+        // A warm join can intentionally receive a provisional decoder config
+        // with epoch 0 while the server waits for a fresh keyframe. Bind that
+        // decoder to the first independently decodable frame so feedback and
+        // all later epoch checks describe the stream that is actually shown.
+        currentStreamEpoch = frameEpoch;
+        if (lastDecoderConfig && Number(lastDecoderConfig.streamEpoch || 0) === 0) {
+          lastDecoderConfig = { ...lastDecoderConfig, streamEpoch: frameEpoch, provisional: false };
+        }
+      }
+      needsKeyFrame = false;
+    }
     if (frame.sequence) lastAcceptedFrameSequence = frame.sequence;
     if (frame.timestamp) lastAcceptedFrameTimestamp = frame.timestamp;
     const captureWallMillis = frame.timestamp ? frame.timestamp / 1000 : 0;
     lastAcceptedFrameReceivedAt = now;
-	    lastAcceptedFrameVisualAgeMillis = captureWallMillis > 0 ? Math.max(0, Date.now() - captureWallMillis) : 0;
+    const calibratedServerNowMillis = Date.now() + (serverClockHasLiveSample ? serverClockSkewMs : 0);
+    lastAcceptedFrameVisualAgeMillis = captureWallMillis > 0 ? Math.max(0, calibratedServerNowMillis - captureWallMillis) : 0;
     return true;
   }
 
@@ -2203,6 +2398,8 @@ import { html, reactive } from '@arrow-js/core';
       sequence: Number(frame && frame.sequence || 0),
       timestamp: Number(frame && frame.timestamp || 0),
       keyFrame: frame && frame.kind === 'key',
+      visualAgeMillis: Number(lastAcceptedFrameVisualAgeMillis || 0),
+      visualAgeKnown: Boolean(serverClockHasLiveSample),
       receivedAt: lastAcceptedFrameReceivedAt,
       queuedAt: performance.now()
     };
@@ -2242,6 +2439,8 @@ import { html, reactive } from '@arrow-js/core';
       epoch: currentStreamEpoch,
       sequence: lastAcceptedFrameSequence,
       timestamp: lastAcceptedFrameTimestamp,
+      visualAgeMillis: Number(lastAcceptedFrameVisualAgeMillis || 0),
+      visualAgeKnown: Boolean(serverClockHasLiveSample),
       receivedAt: lastAcceptedFrameReceivedAt,
       queuedAt: lastAcceptedFrameQueuedAt
     };
@@ -2275,6 +2474,7 @@ import { html, reactive } from '@arrow-js/core';
 
   function scheduleDecodedFrame(frame, source) {
     if (!frame) return;
+    const decodedAtPerformanceMillis = performance.now();
     const metadata = shiftFrameMetadata(frame.timestamp, false);
     if (!metadata) {
       try { frame.close(); } catch (_) {}
@@ -2282,6 +2482,14 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     lastDecodedFrameSequence = Number(metadata.sequence || lastDecodedFrameSequence || 0);
+    if (!firstDecodedTraceSent) {
+      firstDecodedTraceSent = true;
+      sendVideoSocketClientLog('browser_first_frame_decoded', {
+        frameEpoch: Number(metadata.epoch || 0),
+        frameSequence: Number(metadata.sequence || 0),
+        frameTimestamp: Number(metadata.timestamp || 0)
+      }, decodedAtPerformanceMillis);
+    }
     if (pendingPresentedFrame) {
       const priority = controlCodePresentationPriorityActive();
       const previous = pendingPresentedFrame;
@@ -2327,6 +2535,17 @@ import { html, reactive } from '@arrow-js/core';
       return;
     }
     lastAcceptedFrameQueuedAt = performance.now();
+    const sourceFrameTooOld = serverClockHasLiveSample && Number(lastAcceptedFrameVisualAgeMillis || 0) > streamIngressFrameMaxAgeMs;
+    if (Number(decoder && decoder.decodeQueueSize || 0) > streamDecoderQueueHardLimit || sourceFrameTooOld) {
+      clearFrameMetadata();
+      needsKeyFrame = true;
+      const hardReason = sourceFrameTooOld ? 'visual_age_overflow' : 'decoder_queue_overflow';
+      if (!resetDecoderForRecovery(hardReason)) {
+        requestKeyframe(hardReason);
+        scheduleStreamFeedback(hardReason);
+      }
+      return;
+    }
     if (decoderMode === 'avc') {
       decodeAvcFrame(frame);
       return;
@@ -2334,17 +2553,6 @@ import { html, reactive } from '@arrow-js/core';
     try {
       queueFrameMetadata(frame);
       try {
-        const visualAge = Number(currentRenderedFreshness(performance.now()).visualAgeMillis || 0);
-        if (Number(decoder.decodeQueueSize || 0) > streamDecoderQueueHardLimit || visualAge > streamVisualAgeHardLimitMs) {
-          clearFrameMetadata();
-          needsKeyFrame = true;
-          const hardReason = visualAge > streamVisualAgeHardLimitMs ? 'visual_age_overflow' : 'decoder_queue_overflow';
-          if (!resetDecoderForRecovery(hardReason)) {
-            requestKeyframe(hardReason);
-            scheduleStreamFeedback(hardReason);
-          }
-          return;
-        }
         decoder.decode(new EncodedVideoChunk({ type: frame.kind, timestamp: frame.timestamp, data: frame.data }));
       } catch (error) {
         discardFrameMetadata(frame.timestamp);
@@ -2430,7 +2638,11 @@ import { html, reactive } from '@arrow-js/core';
       lastRenderedFrameQueuedAt = Number(frameMetadata.queuedAt || lastAcceptedFrameQueuedAt || lastFrameAt);
       lastRenderedFrameRenderedAt = lastFrameAt;
       const captureWallMillis = Number(frameMetadata.timestamp || 0) / 1000;
-      const metadataAge = captureWallMillis > 0 ? Math.max(0, Date.now() - captureWallMillis) : Number(lastAcceptedFrameVisualAgeMillis || 0);
+      const metadataAge = frameMetadata.visualAgeKnown
+        ? Math.max(0, Number(frameMetadata.visualAgeMillis || 0))
+        : (captureWallMillis > 0 && serverClockHasLiveSample
+          ? Math.max(0, Date.now() + serverClockSkewMs - captureWallMillis)
+          : 0);
       lastRenderedFrameVisualAgeMillis = metadataAge + Math.max(0, lastFrameAt - lastRenderedFrameReceivedAt);
       lastRenderedFrameEpoch = Number(frameMetadata.epoch || 0);
       lastRenderedFrameSequence = Number(frameMetadata.sequence || 0);
@@ -2452,12 +2664,13 @@ import { html, reactive } from '@arrow-js/core';
       };
       if (!firstRenderedTraceSent) {
         firstRenderedTraceSent = true;
-        sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail);
+        sendVideoSocketClientLog('stream_first_rendered_frame', firstFrameDetail, lastFrameAt);
       }
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
       renderTicketInteraction(currentState && currentState.ticketInteraction);
+      observeTicketCurrentProofFrame();
       updateControlCodeSubmitAvailability();
       publishStreamDebug();
       scheduleStreamFeedback('frame_presented');
@@ -2474,6 +2687,7 @@ import { html, reactive } from '@arrow-js/core';
 
   async function configureDecoder(config, options) {
     options = options || {};
+    const configureGeneration = ++decoderConfigureGeneration;
     if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
       showUnsupported('Šī pārlūkprogramma neatbalsta H.264 video dekodēšanu šajā lapā.');
       return;
@@ -2508,6 +2722,7 @@ import { html, reactive } from '@arrow-js/core';
         supported = false;
       }
     }
+    if (configureGeneration !== decoderConfigureGeneration) return;
     if (!supported && !preferAvc) {
       showUnsupported('Šī pārlūkprogramma nevar atvērt H.264 biļetes video.');
       return;
@@ -2577,7 +2792,15 @@ import { html, reactive } from '@arrow-js/core';
       }
     });
     decoder.configure(decoderConfig);
+    const configuredAtPerformanceMillis = performance.now();
     decoderConfigured = true;
+    sendVideoSocketClientLog('browser_configured', {
+      codec,
+      width,
+      height,
+      streamEpoch: currentStreamEpoch,
+      mode: 'annexb'
+    }, configuredAtPerformanceMillis);
     publishStreamDebug();
     showStreamWaiting('Gaida pirmo video kadru...');
     requestKeyframe(options.requestReason || 'config_received');
@@ -2616,7 +2839,15 @@ import { html, reactive } from '@arrow-js/core';
       sendVideoClientLog('h264_avc_config_failed', error && error.message || 'avc config failed');
       return;
     }
+    const configuredAtPerformanceMillis = performance.now();
     decoderConfigured = true;
+    sendVideoSocketClientLog('browser_configured', {
+      codec,
+      width,
+      height,
+      streamEpoch: currentStreamEpoch,
+      mode: 'avc'
+    }, configuredAtPerformanceMillis);
     sendVideoClientLog('h264_decoder_mode', 'avc_adapter_configured');
     publishStreamDebug();
   }
@@ -2735,6 +2966,7 @@ import { html, reactive } from '@arrow-js/core';
         database: st.database || '',
         token,
         ticketId: cfg.ticketId || 'vivi-default',
+        backendId: cfg.backendId || 'pixel',
         sessionId: cfg.sessionId || '',
         email: cfg.email || ''
       }, {
@@ -2880,6 +3112,15 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function setControlCodeResultVisible(visible) {
+    if (visible) {
+      // The controls live below the full-height stream stage. A control-code
+      // request can therefore finish while that stage is above the viewport.
+      // Move the stage back into view in the same task that reveals the local
+      // result so the paint handshake never acknowledges an off-screen image.
+      document.body.classList.remove('details-visible');
+      if (panel) panel.setAttribute('aria-hidden', 'true');
+      stage.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+    }
     codeResultArea.hidden = !visible;
     document.body.classList.toggle('control-code-result-visible', Boolean(visible));
     updateControlCodeSubmitAvailability();
@@ -3488,11 +3729,14 @@ import { html, reactive } from '@arrow-js/core';
     }
     const generatedProof = controlCodeGeneratedFrameProof();
     Object.assign(proof, generatedProof);
+    const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint &&
+      (proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold ||
+        proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold));
+    proof.frameChangedFromBaseline = frameChangedFromBaseline;
     const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||
       Boolean(trustedPhonePostSubmitProof &&
         generatedProof.generatedChipVisible &&
-        (proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold ||
-          proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold));
+        frameChangedFromBaseline);
     const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof &&
       markerEpoch &&
       markerSequence &&
@@ -3500,11 +3744,22 @@ import { html, reactive } from '@arrow-js/core';
       renderedSequence >= markerSequence &&
       request.status === 'succeeded');
     proof.trustedPhoneMarkerFrame = trustedPhoneMarkerFrame;
+    // The ViVi result layout can change independently of this narrow browser
+    // detector. A rooted phone proof tied to the exact result marker may bridge
+    // that design drift only when the post-marker browser frame is also
+    // materially different from the pre-request baseline. Popup, keyboard and
+    // fade frames have already failed closed above.
+    const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&
+      frameChangedFromBaseline);
+    proof.trustedPhoneChangedMarkerFrame = trustedPhoneChangedMarkerFrame;
     proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;
-    if (!browserTrustedGeneratedVisible && trustedPhoneMarkerFrame) {
+    const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||
+      trustedPhoneChangedMarkerFrame);
+    proof.browserTrustedResultVisible = browserTrustedResultVisible;
+    if (!browserTrustedResultVisible && trustedPhoneMarkerFrame) {
       proof.generatedMarkerOnlyRejected = true;
     }
-    if (!proof.browserTrustedGeneratedVisible) {
+    if (!proof.browserTrustedResultVisible) {
       resetControlCodeSafeGeneratedFrame('generated_not_visible');
       proof.safeGeneratedFrameCount = controlCodeSafeGeneratedFrameCount;
       if (controlCodeBaselineFrameFingerprint &&
@@ -3533,7 +3788,9 @@ import { html, reactive } from '@arrow-js/core';
     proof.accepted = true;
     proof.candidateAccepted = true;
     proof.candidateRejectedReason = '';
-    proof.acceptedReason = 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
+    proof.acceptedReason = trustedPhoneChangedMarkerFrame && !browserTrustedGeneratedVisible
+      ? 'candidate_frame_at_or_after_trusted_phone_marker_and_changed_visual'
+      : 'candidate_frame_at_or_after_phone_marker_and_generated_visual';
     proof.provisional = false;
     controlCodeCaptureTrace('control_code_frame_frozen', request, proof, {
       acceptedReason: proof.acceptedReason,
@@ -4103,6 +4360,15 @@ import { html, reactive } from '@arrow-js/core';
         scheduleControlCodeTicker(current);
         return;
       }
+      // The submission path captured the raw-ticket baseline before the
+      // reducer call. Keep that baseline through queued/running renders so the
+      // later exact phone marker can be compared with the generated result.
+      // A full capture reset here used to erase both the pending baseline and
+      // the real-request baseline before the succeeded row arrived.
+      setControlCodeResultVisible(false);
+      clearUnpaintedControlCodeResultImage(currentRequestID);
+      scheduleControlCodeTicker(current);
+      return;
     }
     if (!current || current.status === 'closed' || current.status === 'expired') {
       setControlCodeResultVisible(false);
@@ -4174,7 +4440,7 @@ import { html, reactive } from '@arrow-js/core';
   }
 
   function openControlCodeDialog() {
-    if (controlCodeRequestOccupiesQueue()) return;
+    if (controlCodeMutationLaneBusy()) return;
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
       try {
         document.exitFullscreen().catch(() => {});
@@ -4217,8 +4483,10 @@ import { html, reactive } from '@arrow-js/core';
       codeError.textContent = 'Ievadi 2-8 ciparus.';
       return;
     }
-    if (controlCodeRequestOccupiesQueue()) {
-      codeError.textContent = localizePublicMessage('request_in_progress');
+    if (controlCodeMutationLaneBusy()) {
+      codeError.textContent = localizePublicMessage(
+        controlCodeRequestOccupiesQueue() ? 'request_in_progress' : 'ticket_action_in_progress'
+      );
       return;
     }
     const fastRevision = controlCodeFastRevisionForRequest();
@@ -4308,7 +4576,7 @@ import { html, reactive } from '@arrow-js/core';
       closeCurrentControlCode(false);
       return;
     }
-    if (controlCodeRequestOccupiesQueue()) return;
+    if (controlCodeMutationLaneBusy()) return;
     openControlCodeDialog();
   }
 
@@ -4360,6 +4628,19 @@ import { html, reactive } from '@arrow-js/core';
     return (Date.now() + serverClockSkewMs) <= expiresAt + 1000;
   }
 
+  function controlCodeVisualRecoveryRequired() {
+    if (controlCodeCleanupPendingRequestID) return true;
+    const requests = Array.isArray(currentState && currentState.controlCodeRequests)
+      ? currentState.controlCodeRequests
+      : [];
+    const candidates = codeRequest && !requests.some((request) =>
+      request && String(request.requestId || '') === String(codeRequest.requestId || '')
+    ) ? [...requests, codeRequest] : requests;
+    return ticketControlCodeVisualRecoveryRequired(candidates.filter((request) =>
+      isOwnedControlCodeRequest(request)
+    ));
+  }
+
   function latestOwnedControlCodeRequest(state) {
     const requests = Array.isArray(state && state.controlCodeRequests) ? state.controlCodeRequests : [];
     return requests
@@ -4370,6 +4651,13 @@ import { html, reactive } from '@arrow-js/core';
   function renderState() {
     const state = currentState;
     if (!state) return;
+    if (observeTicketActionV3LocalRequest(ticketActionV3LocalRequestState, state.ticketAction)) {
+      if (ticketActionV3ReconcileTimer) {
+        clearTimeout(ticketActionV3ReconcileTimer);
+        ticketActionV3ReconcileTimer = null;
+      }
+      clientLog('ticket_action_v3_authoritative', String(state.ticketAction && state.ticketAction.target || 'observed'));
+    }
     rememberServerClock(state);
     controlCodeFastState = state && state.controlCodeFastState || null;
     renderControlCodeFastStateDataset();
@@ -4415,13 +4703,8 @@ import { html, reactive } from '@arrow-js/core';
       setStatus('Tiešraide rāda biļeti.');
     }
     renderTicketInteraction(spacetimeStateFresh ? state.ticketInteraction : null);
+    renderTicketActionV3Controls(state);
     renderPresence(viewers, visibleViewerCount);
-  }
-
-  function ticketInteractionOwnsControl(interaction) {
-    const owner = String(interaction && interaction.ownerPublicId || '').trim();
-    const controlId = String(interaction && interaction.controlId || '').trim();
-    return Boolean(owner && localPublicID && owner === localPublicID && controlId && controlId === ticketSliderControlId);
   }
 
   function ticketInteractionPreparingIsStale(interaction, now) {
@@ -4441,399 +4724,471 @@ import { html, reactive } from '@arrow-js/core';
     });
   }
 
-  function ticketInteractionHasSliderBounds(interaction) {
-    return Boolean(
-      interaction && Number(interaction.sliderRight) > Number(interaction.sliderLeft) &&
-      Number(interaction.sliderBottom) > Number(interaction.sliderTop)
-    );
-  }
-
-  function ticketSliderProofIsFresh(interaction) {
-    if (!interaction || !ticketInteractionHasSliderBounds(interaction) || !streamHasFreshRenderedFrame()) return false;
-    const proofEpoch = Number(interaction.streamEpoch || 0);
-    const liveEpoch = Number(currentStreamEpoch || lastRenderedFrameEpoch || 0);
-    const proofSequence = Number(interaction.frameSequence || 0);
-    const liveSequence = Number(lastRenderedFrameSequence || lastAcceptedFrameSequence || 0);
-    // A proof without a frame identity cannot safely be placed over the current
-    // picture. Do not show an old overlay after a stream restart or a blank proof.
-    if (!(proofEpoch > 0 && liveEpoch > 0 && proofEpoch === liveEpoch)) return false;
-    if (!(proofSequence > 0 && liveSequence > 0 && proofSequence <= liveSequence)) return false;
-    return true;
-  }
-
-  function ticketInteractionResetIsAllowed(interaction) {
-    const display = ticketInteractionForDisplay(interaction);
-    const status = String(display && display.status || '');
-    if (status === 'reset_queued' || status === 'preparing') return false;
-    if (status === 'control_active' || status === 'completing') {
-      return ticketInteractionLeaseExpired(display);
-    }
-    return true;
-  }
-
-  function ticketInteractionStateEndsLocalSlider(status) {
-    return ['needs_attention', 'failed', 'activated'].includes(status);
-  }
-
   function ticketInteractionIsBusy(interaction) {
     const display = ticketInteractionForDisplay(interaction);
     return ['reset_queued', 'preparing', 'control_active', 'completing'].includes(String(display && display.status || ''));
   }
 
-  function ticketInteractionLeaseExpired(interaction) {
-    const phase = String(interaction && interaction.leasePhase || '').trim();
-    if (!phase || phase === 'none') return false;
-    const expiresAt = Date.parse(String(interaction && interaction.leaseExpiresAt || ''));
-    return Number.isFinite(expiresAt) && expiresAt <= Date.now() + serverClockSkewMs;
-  }
-
-  function clearTicketSliderOverlay() {
-    if (ticketSliderPointer) return;
-    if (ticketSliderLeaseExpiryTimer) {
-      clearTimeout(ticketSliderLeaseExpiryTimer);
-      ticketSliderLeaseExpiryTimer = null;
-    }
-    ticketSliderOverlay.dataset.active = 'false';
-    ticketSliderOverlay.dataset.locked = 'false';
-    ticketSliderOverlay.setAttribute('aria-hidden', 'true');
-    // The invisible control-code hotspot occupies the left side of the stream. Once the
-    // registration oval is active it must stop hit-testing, otherwise a drag beginning on the
-    // thumb lands on the code hotspot instead of the slider and no gesture is ever claimed.
-    controlCodeHotspot.style.pointerEvents = '';
-    ticketSliderOverlay.style.removeProperty('left');
-    ticketSliderOverlay.style.removeProperty('top');
-    ticketSliderOverlay.style.removeProperty('width');
-    ticketSliderOverlay.style.removeProperty('height');
-    ticketSliderOverlay.setAttribute('aria-valuenow', '0');
-  }
-
-  function renderTicketSliderProgress(progress) {
-    const local = Math.max(0, Math.min(10000, Math.round(Number(progress) || 0)));
-    ticketSliderOverlay.setAttribute('aria-valuenow', String(Math.round(local / 100)));
-  }
-
-  function activationEligibility(state = currentState) {
+  function memberLimits(state = currentState) {
     if (state === currentState && !spacetimeStateFresh) return null;
-    return state && state.activationEligibility || null;
+    return state && state.memberLimits || null;
+  }
+
+  function memberLimitBlocked(kind, state = currentState) {
+    return ticketMemberLimitBlocks(memberLimits(state), kind);
   }
 
   function activationPolicyBlocked(state = currentState) {
-    const eligibility = activationEligibility(state);
-    if (!eligibility) return true;
-    if (eligibility.allowed === true) return false;
-    const retryAt = activationPolicyRetryAt(state);
-    return !retryAt || retryAt > Date.now() + serverClockSkewMs;
+    return memberLimitBlocked('registration', state);
   }
 
   function activationPolicyReason(state = currentState) {
-    const eligibility = activationEligibility(state);
-    return String(eligibility && eligibility.reason || 'activation_policy_unavailable');
-  }
-
-  function activationPolicyRetryAt(state = currentState) {
-    const eligibility = activationEligibility(state);
-    const retryAt = Date.parse(String(eligibility && (eligibility.retryAt || eligibility.cooldownUntil) || ''));
-    return Number.isFinite(retryAt) ? retryAt : 0;
+    const limits = memberLimits(state);
+    return String(limits && limits.registrationReason || 'activation_policy_unavailable');
   }
 
   function activationPolicyMessage(state = currentState) {
     const reason = activationPolicyReason(state);
-    if (reason === 'activation_minute_limit') return 'Aktivizēšanas limits sasniegts; mēģini vēlreiz pēc norādītā laika.';
-    if (reason === 'activation_success_cooldown') return 'Pēc veiksmīgas aktivizēšanas jāgaida 15 minūtes.';
-    if (reason === 'activation_allowed') return '';
-    return 'Aktivizēšanas servera lēmums vēl nav pieejams.';
+    if (reason === 'registration_interval') return 'Starp reģistrācijām jāgaida 30 sekundes.';
+    if (reason === 'registration_hour_limit') return 'Pēdējās stundas 10 reģistrāciju limits ir sasniegts.';
+    if (reason === 'registration_allowed' || reason === 'limits_bypassed') return '';
+    return 'SpaceTime reģistrācijas lēmums vēl nav pieejams.';
   }
 
-  function scheduleActivationPolicyRetry(state = currentState) {
-    if (activationPolicyRetryTimer) {
-      clearTimeout(activationPolicyRetryTimer);
-      activationPolicyRetryTimer = null;
+  function renderMemberLimits(state = currentState) {
+    if (ticketLimitPresentationTimer) {
+      clearTimeout(ticketLimitPresentationTimer);
+      ticketLimitPresentationTimer = null;
     }
-    if (!activationPolicyBlocked(state)) return;
-    const retryAt = activationPolicyRetryAt(state);
-    if (!retryAt) return;
-    const delayMs = retryAt - (Date.now() + serverClockSkewMs);
-    if (!Number.isFinite(delayMs) || delayMs <= 0) return;
-    activationPolicyRetryTimer = setTimeout(() => {
-      activationPolicyRetryTimer = null;
-      renderTicketInteraction(currentState && currentState.ticketInteraction);
-    }, Math.min(delayMs, activationPolicyRetryTimerMaxDelayMs));
+    const limits = memberLimits(state);
+    if (!limits) {
+      ticketLimitMode.textContent = 'Nav pieejams';
+      ticketRegistrationLimitUsage.textContent = '—';
+      ticketRegistrationLimitDetail.textContent = 'Gaida SpaceTime stāvokli.';
+      ticketControlCodeLimitUsage.textContent = '—';
+      ticketControlCodeLimitDetail.textContent = 'Gaida SpaceTime stāvokli.';
+      return;
+    }
+    const registrationCount = Math.max(0, Number(limits.registrationCount || 0));
+    const registrationLimit = Math.max(1, Number(limits.registrationLimit || 10));
+    const controlCodeCount = Math.max(0, Number(limits.controlCodeCount || 0));
+    const controlCodeLimit = Math.max(1, Number(limits.controlCodeLimit || 2));
+    const now = Date.now() + serverClockSkewMs;
+    ticketLimitMode.textContent = limits.effectiveLimited === false ? 'Neierobežots režīms' : 'Parastie limiti';
+    ticketRegistrationLimitUsage.textContent = `${registrationCount} / ${registrationLimit} pēdējās 60 minūtēs`;
+    ticketControlCodeLimitUsage.textContent = `${controlCodeCount} / ${controlCodeLimit} pēdējās 60 sekundēs`;
+    if (limits.effectiveLimited === false) {
+      ticketRegistrationLimitDetail.textContent = 'Admina darbības tiek auditētas, bet kvotu nepatērē.';
+      ticketControlCodeLimitDetail.textContent = 'Kontroles kodu kvota šim admina kontam netiek piemērota.';
+      return;
+    }
+    const registrationRetryText = ticketMemberLimitCountdown(limits.registrationRetryAt || limits.registrationNextReleaseAt, now);
+    const registrationReleaseText = ticketMemberLimitCountdown(limits.registrationNextReleaseAt, now);
+    if (limits.registrationAllowed === true) {
+      ticketRegistrationLimitDetail.textContent = registrationReleaseText && registrationCount > 0
+        ? `Pieejams tagad; nākamā stundas vieta ${registrationReleaseText}.`
+        : 'Pieejams tagad; starp reģistrācijām jābūt vismaz 30 sekundēm.';
+    } else {
+      ticketRegistrationLimitDetail.textContent = `${activationPolicyMessage(state)}${registrationRetryText ? ` Pieejams ${registrationRetryText}.` : ''}`;
+    }
+    const controlRetryText = ticketMemberLimitCountdown(limits.controlCodeRetryAt, now);
+    ticketControlCodeLimitDetail.textContent = limits.controlCodeAllowed === true
+      ? 'Pieejams tagad.'
+      : `Limits sasniegts.${controlRetryText ? ` Pieejams ${controlRetryText}.` : ''}`;
+    const futureTargets = [limits.registrationRetryAt, limits.registrationNextReleaseAt, limits.controlCodeRetryAt]
+      .map((value) => Date.parse(String(value || '')))
+      .filter((value) => Number.isFinite(value) && value > now);
+    if (futureTargets.length) {
+      const nearest = Math.min(...futureTargets);
+      ticketLimitPresentationTimer = setTimeout(() => {
+        ticketLimitPresentationTimer = null;
+        renderMemberLimits(currentState);
+      }, Math.min(1000, Math.max(100, nearest - now)));
+    }
   }
 
-  function renderTicketInteraction(interaction) {
-    const stateConfirmed = spacetimeStateFresh;
-    const displayInteraction = stateConfirmed ? ticketInteractionForDisplay(interaction) : null;
-    const status = String(displayInteraction && displayInteraction.status || '');
-    const authoritativeState = stateConfirmed ? currentState : null;
-    const activationBlocked = activationPolicyBlocked(authoritativeState);
-    scheduleActivationPolicyRetry(authoritativeState);
-    if (ticketSliderResetInFlight && status !== 'reset_queued' && status !== 'preparing') {
-      ticketSliderResetInFlight = false;
-    }
-    if (ticketSliderButtonInFlight && ['activated', 'unactivated_ready', 'needs_attention', 'failed'].includes(status)) {
-      ticketSliderButtonInFlight = false;
-    }
-    if (ticketInteractionStateEndsLocalSlider(status) &&
-      (ticketSliderState !== 'idle' || ticketSliderControlId || ticketSliderPendingUpdate)) {
-      cancelTicketSliderFromLifecycle(`interaction_${status}`);
-    }
-    if (panel) panel.dataset.ticketInteractionStatus = status || 'unknown';
-    const staleControlLease = status === 'control_active' && ticketInteractionLeaseExpired(interaction);
-    const resetBusy = ticketSliderResetInFlight || ['reset_queued', 'preparing'].includes(status);
-    const controlBusy = controlCodeRequestOccupiesQueue();
-    requestTicketResetButton.disabled = Boolean(!ticketInteractionResetIsAllowed(displayInteraction) || resetBusy || controlBusy);
-    requestTicketResetButton.setAttribute('aria-busy', resetBusy ? 'true' : 'false');
-    const sliderBusy = ticketSliderButtonInFlight || resetBusy || controlBusy || ticketSliderPointer;
-    const sliderBoundsReady = ticketInteractionHasSliderBounds(displayInteraction);
-    const sliderReadyForButton = status === 'unactivated_ready' && ticketSliderProofIsFresh(displayInteraction);
-    const activationControlsVisible = stateConfirmed && sliderReadyForButton;
-    activateTicketButton.hidden = !activationControlsVisible;
-    requestTicketResetAndActivateButton.hidden = !activationControlsVisible;
-    activateTicketButton.disabled = Boolean(activationBlocked || !sliderReadyForButton || sliderBusy);
-    activateTicketButton.setAttribute('aria-busy', ticketSliderButtonInFlight ? 'true' : 'false');
-    requestTicketResetAndActivateButton.disabled = Boolean(!activationControlsVisible || activationBlocked || resetBusy || controlBusy || ticketSliderButtonInFlight || ticketSliderPointer || (['control_active', 'completing'].includes(status) && !staleControlLease));
-    requestTicketResetAndActivateButton.setAttribute('aria-busy', resetBusy ? 'true' : 'false');
-    if (ticketSliderResetInFlight) {
-      ticketResetDetail.textContent = 'Tālrunis atver jaunu nereģistrētu biļeti…';
-    } else if (status === 'reset_queued' || status === 'preparing') {
-      ticketResetDetail.textContent = 'Tālrunis gatavo jaunu nereģistrētu biļeti…';
-    } else if (!stateConfirmed) {
-      ticketResetDetail.textContent = spacetimeStateRefreshStartedAt > 0 &&
-        Date.now() - spacetimeStateRefreshStartedAt >= spacetimeStateRefreshTimeoutMs
-        ? 'Biļetes stāvokli nevarēja apstiprināt; vari atvērt jaunu nereģistrētu biļeti.'
-        : 'Pārbauda pašreizējo biļetes stāvokli…';
-    } else if (activationBlocked) {
-      const policyText = activationPolicyMessage(authoritativeState);
-      const retryAt = activationPolicyRetryAt(authoritativeState);
-      const retryText = retryAt ? ` Mēģini vēlreiz pēc ${new Date(retryAt).toLocaleTimeString('lv-LV')}.` : '';
-      ticketResetDetail.textContent = `${policyText}${retryText}`.trim();
-    } else if (status === 'unactivated_ready') {
-      ticketResetDetail.textContent = 'Biļete ir gatava aktivizēšanai ar slīdni straumē.';
-    } else if (status === 'needs_attention') {
-      ticketResetDetail.textContent = 'Biļetes sagatavošana jāpārbauda; vari mēģināt vēlreiz.';
-    } else if (status === 'activated') {
-      ticketResetDetail.textContent = 'Aktivizētā biļete paliek atvērta; pēc 60 minūtēm tā tiks sagatavota atkārtotai aktivizēšanai.';
-    } else if (status === 'failed') {
-      ticketResetDetail.textContent = 'Tālruņa biļetes stāvoklis jāpārbauda.';
-    } else {
-      ticketResetDetail.textContent = 'Pieejams, kad tālrunis ir brīvs.';
-    }
-    const activationAt = Date.parse(String(displayInteraction && displayInteraction.activationAt || ''));
-    const resetAt = Date.parse(String(displayInteraction && displayInteraction.scheduledResetAt || ''));
-    const activationRevision = String(displayInteraction && displayInteraction.activationRevision || '').trim();
-    const activationFieldsComplete = status === 'activated' &&
-      Number.isFinite(activationAt) && activationAt > 0 &&
-      Number.isFinite(resetAt) && resetAt > 0 &&
-      Boolean(activationRevision);
-    ticketActivationAt.textContent = activationFieldsComplete
-      ? `Aktivizēts: ${new Date(activationAt).toLocaleString('lv-LV')}`
-      : '';
-    if (activationFieldsComplete) {
-      const remaining = Math.max(0, resetAt - (Date.now() + serverClockSkewMs));
-      const minutes = Math.floor(remaining / 60000);
-      const seconds = Math.floor((remaining % 60000) / 1000);
-      ticketActivationTimer.textContent = `Atjaunošana pēc ${minutes} min ${String(seconds).padStart(2, '0')} s.`;
-    } else if (status !== 'activated' && activationBlocked && activationPolicyRetryAt(authoritativeState)) {
-      const remaining = Math.max(0, activationPolicyRetryAt(authoritativeState) - (Date.now() + serverClockSkewMs));
-      const minutes = Math.floor(remaining / 60000);
-      const seconds = Math.floor((remaining % 60000) / 1000);
-      ticketActivationTimer.textContent = `Aktivizēšana pieejama pēc ${minutes} min ${String(seconds).padStart(2, '0')} s.`;
-    } else {
-      ticketActivationTimer.textContent = '';
-    }
-    const owns = ticketInteractionOwnsControl(displayInteraction);
-    // Keep the detected slider visible as a locked, view-only region for other authorized
-    // browsers while one browser owns the lease. Only the owner can receive pointer events.
-    const livePictureReady = streamHasFreshRenderedFrame();
-    // A fresh unused-ticket proof is the only normal path that exposes the
-    // slider. During an in-flight pointer claim, retain that same overlay until
-    // the release/cancel update completes so the finger does not lose its target.
-    const sliderReady = status === 'unactivated_ready' && ticketSliderProofIsFresh(displayInteraction);
-    const activePointerClaim = status === 'control_active' && Boolean(ticketSliderPointer) && ticketSliderProofIsFresh(displayInteraction);
-    const bounds = ticketInteractionHasSliderBounds(displayInteraction) ? displayInteraction : null;
-    if ((!sliderReady && !activePointerClaim) || !bounds || !configured || !streamSize.width || !streamSize.height || !livePictureReady) {
-      clearTicketSliderOverlay();
-      return;
-    }
-    const canvasRect = canvas.getBoundingClientRect();
-    const stageRect = stage.getBoundingClientRect();
-    const phoneWidth = Math.max(1, Number(bounds.phoneDisplayWidth) || streamSize.width);
-    const phoneHeight = Math.max(1, Number(bounds.phoneDisplayHeight) || streamSize.height);
-    const sourceTopCrop = Math.max(0, Math.min(phoneHeight - 1, Number(streamSize.sourceTopCrop) || 0));
-    const sourceVisibleHeight = Math.max(1, Number(streamSize.sourceVisibleHeight) || (phoneHeight - sourceTopCrop));
-    const left = canvasRect.left - stageRect.left + (Number(bounds.sliderLeft) / phoneWidth) * canvasRect.width;
-    const top = canvasRect.top - stageRect.top + ((Number(bounds.sliderTop) - sourceTopCrop) / sourceVisibleHeight) * canvasRect.height;
-    const width = ((Number(bounds.sliderRight) - Number(bounds.sliderLeft)) / phoneWidth) * canvasRect.width;
-    const height = ((Number(bounds.sliderBottom) - Number(bounds.sliderTop)) / sourceVisibleHeight) * canvasRect.height;
-    if (!(width > 30 && height > 8)) {
-      clearTicketSliderOverlay();
-      return;
-    }
-    const liveEpoch = Number(currentStreamEpoch || 0);
-    const proofEpoch = Number(bounds.streamEpoch || 0);
-    if (liveEpoch && proofEpoch && liveEpoch !== proofEpoch) {
-      clearTicketSliderOverlay();
-      return;
-    }
-    ticketSliderOverlay.style.left = left + 'px';
-    ticketSliderOverlay.style.top = top + 'px';
-    ticketSliderOverlay.style.width = width + 'px';
-    ticketSliderOverlay.style.height = height + 'px';
-    ticketSliderOverlay.dataset.active = 'true';
-    ticketSliderOverlay.setAttribute('aria-hidden', 'false');
-    // Give the live slider the whole gesture surface, including its left thumb. The hotspot is
-    // restored by clearTicketSliderOverlay when the slider is no longer active.
-    controlCodeHotspot.style.pointerEvents = 'none';
-    // An empty owner means the lease is available. Only an occupied lease that
-    // belongs to another browser is view-only for this browser.
-    const ownerPublicId = String(bounds.ownerPublicId || '').trim();
-    ticketSliderOverlay.dataset.locked = activationBlocked || (ownerPublicId && !owns && !ticketInteractionLeaseExpired(interaction)) ? 'true' : 'false';
-    if (ticketSliderLeaseExpiryTimer) {
-      clearTimeout(ticketSliderLeaseExpiryTimer);
-      ticketSliderLeaseExpiryTimer = null;
-    }
-    const leaseExpiresAt = Date.parse(String(interaction.leaseExpiresAt || ''));
-    if (Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now()) {
-      ticketSliderLeaseExpiryTimer = setTimeout(() => {
-        ticketSliderLeaseExpiryTimer = null;
-        renderTicketInteraction(currentState && currentState.ticketInteraction);
-      }, Math.min(leaseExpiresAt - Date.now() + 25, 60_000));
-    }
-    if (!ticketSliderPointer && ticketSliderInteractionRevision !== String(bounds.interactionRevision || '')) {
-      ticketSliderInteractionRevision = String(bounds.interactionRevision || '');
-      ticketSliderLatestProgress = Number(bounds.latestProgress || 0);
-      ticketSliderLocalProgress = ticketSliderLatestProgress;
-    }
-    if (!ticketSliderPointer) {
-      ticketSliderLocalProgress = Number(displayInteraction.latestProgress || ticketSliderLocalProgress || 0);
-    }
-    renderTicketSliderProgress(ticketSliderLocalProgress);
-    // The overlay becomes active only after the geometry/live-frame checks above;
-    // refresh the button after that point so it does not stay disabled for one
-    // extra state update when a fresh ticket picture first arrives.
-    activateTicketButton.disabled = Boolean(
-      activationBlocked || status !== 'unactivated_ready' || !ticketSliderProofIsFresh(displayInteraction) || !livePictureReady || ticketSliderButtonInFlight ||
-      resetBusy || controlBusy || ticketSliderPointer
+  function renderTicketInteraction(_interaction) {
+    if (panel) panel.dataset.ticketInteractionStatus = 'ticket_action_v3';
+    ticketActivationAt.textContent = '';
+    ticketActivationTimer.textContent = '';
+    renderMemberLimits(spacetimeStateFresh ? currentState : null);
+  }
+
+  function ticketActionV3Id() {
+    return `ticket_action_v3_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function ticketActionV3Busy(action) {
+    return ticketActionV3OccupiesPhone(action);
+  }
+
+  function ticketActionV3RegistrationProofIsFresh(action) {
+    return isTicketActionV3RegistrationProofFresh(
+      action,
+      ticketActionV3StreamSnapshot(),
+      Date.now() + serverClockSkewMs
     );
   }
 
-  function ticketResetRequestId() {
-    return `reset_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  function ticketActionV3StreamSnapshot() {
+    return {
+      fresh: streamHasFreshRenderedFrame(),
+      epoch: Number(currentStreamEpoch || lastRenderedFrameEpoch || 0),
+      sequence: Number(lastRenderedFrameSequence || lastAcceptedFrameSequence || 0)
+    };
   }
 
-  function activationAttemptId(flow) {
-    return `activation_${String(flow || 'action').replace(/[^a-z0-9_-]/gi, '_')}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  function currentTicketSliderRegion(state = currentState) {
+    return ticketSliderRegionV3ForAction(
+      state && state.ticketAction || null,
+      state && state.ticketSliderRegion || null,
+      ticketActionV3StreamSnapshot(),
+      Date.now() + serverClockSkewMs
+    );
   }
 
-  async function runAdmittedActivation(action, attemptId, reason) {
-    if (activationPolicyBlocked(currentState)) {
-      ticketResetDetail.textContent = activationPolicyMessage(currentState);
-      return false;
+  function clearTicketRegisterOverlay() {
+    ticketRegisterOverlay.hidden = true;
+    ticketLocalRegisterSlider.disabled = true;
+    if (!ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
+    for (const property of ['left', 'top', 'width', 'height']) {
+      ticketRegisterOverlay.style.removeProperty(property);
     }
-    await runSpacetimeMutation(action, reason);
-    const client = spacetimeClient;
-    if (!client || typeof client.waitForActivationDecision !== 'function') {
-      throw new Error('activation decision channel is unavailable');
-    }
-    const decision = await client.waitForActivationDecision(attemptId);
-    if (!decision || decision.accepted !== true) {
-      const retryAt = Date.parse(String(decision && decision.retryAt || ''));
-      const retryText = Number.isFinite(retryAt) && retryAt > 0
-        ? ` Mēģini vēlreiz pēc ${new Date(retryAt).toLocaleTimeString('lv-LV')}.`
-        : '';
-      ticketResetDetail.textContent = `${activationPolicyMessage({ activationEligibility: { reason: decision && decision.reason } })}${retryText}`.trim();
-      clientLog('ticket_activation_rejected', String(decision && decision.reason || 'policy_rejected'));
-      renderTicketInteraction(currentState && currentState.ticketInteraction);
-      return false;
-    }
-    return true;
+    controlCodeHotspot.style.pointerEvents = '';
   }
 
-  async function requestTicketReset(reason = 'browser_ticket_reset') {
-    if (ticketSliderResetInFlight || controlCodeRequestOccupiesQueue()) return false;
-    if (!ticketInteractionResetIsAllowed(currentState && currentState.ticketInteraction)) {
-      ticketResetDetail.textContent = 'Biļete vēl tiek sagatavota; pagaidi brīdi vai mēģini vēlreiz.';
-      return false;
+  function renderTicketRegisterOverlay(state, busy, controlBusy, registerReady) {
+    if (ticketSliderRegionExpiryTimer) {
+      clearTimeout(ticketSliderRegionExpiryTimer);
+      ticketSliderRegionExpiryTimer = null;
     }
-    ticketSliderResetInFlight = true;
-    renderTicketInteraction(currentState && currentState.ticketInteraction);
+    const region = currentTicketSliderRegion(state);
+    if (!region || !registerReady || busy || controlBusy || !configured) {
+      clearTicketRegisterOverlay();
+      return null;
+    }
+    const layout = ticketSliderRegionV3Layout(
+      region,
+      canvas.getBoundingClientRect(),
+      stage.getBoundingClientRect()
+    );
+    if (!layout || layout.width < 30 || layout.height < 8) {
+      clearTicketRegisterOverlay();
+      return null;
+    }
+    ticketRegisterOverlay.style.left = `${layout.left}px`;
+    ticketRegisterOverlay.style.top = `${layout.top}px`;
+    ticketRegisterOverlay.style.width = `${layout.width}px`;
+    ticketRegisterOverlay.style.height = `${layout.height}px`;
+    ticketRegisterOverlay.hidden = false;
+    ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight);
+    controlCodeHotspot.style.pointerEvents = 'none';
+    const expiresAt = Date.parse(String(region.expiresAt || ''));
+    const delay = expiresAt - (Date.now() + serverClockSkewMs);
+    if (Number.isFinite(delay) && delay > 0) {
+      ticketSliderRegionExpiryTimer = setTimeout(() => {
+        ticketSliderRegionExpiryTimer = null;
+        ticketCurrentProofResumePending = true;
+        renderTicketActionV3Controls(currentState);
+        maybeRequestTicketCurrentProof('slider_region_expired');
+      }, Math.min(delay + 25, 60_000));
+    }
+    return region;
+  }
+
+  function ticketActionV3LocalRequestIsBusy() {
+    return ticketActionV3LocalRequestBusy(ticketActionV3LocalRequestState);
+  }
+
+  function sampleTicketCurrentProofFingerprint() {
+    if (!ticketCurrentProofFingerprintContext || !hasRenderedFrame || !canvas.width || !canvas.height) return null;
     try {
-      const resetRequestID = ticketResetRequestId();
-      const attemptId = reason === 'browser_reset_and_activate' ? activationAttemptId('reset_and_activate') : '';
-      const admitted = reason === 'browser_reset_and_activate'
-        ? await runAdmittedActivation(
-          (client) => client.requestTicketResetV2(attemptId, resetRequestID, reason),
-          attemptId,
-          'ticket_reset_and_activate'
-        )
-        : (await runSpacetimeMutation((client) => client.requestTicketReset(resetRequestID, reason), 'ticket_reset_request'), true);
-      if (!admitted) return false;
-      clientLog('ticket_reset_requested', 'page_panel');
-      setStatus('Jaunas biļetes sagatavošana nosūtīta.');
+      ticketCurrentProofFingerprintContext.drawImage(
+        canvas,
+        0,
+        0,
+        ticketCurrentProofFingerprintCanvas.width,
+        ticketCurrentProofFingerprintCanvas.height
+      );
+      const pixels = ticketCurrentProofFingerprintContext.getImageData(
+        0,
+        0,
+        ticketCurrentProofFingerprintCanvas.width,
+        ticketCurrentProofFingerprintCanvas.height
+      ).data;
+      const values = [];
+      for (let index = 0; index < pixels.length; index += 4) {
+        values.push(Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114));
+      }
+      return {
+        epoch: Number(lastRenderedFrameEpoch || currentStreamEpoch || 0),
+        sequence: Number(lastRenderedFrameSequence || 0),
+        values
+      };
+    } catch (error) {
+      clientLog('ticket_current_proof_sample_failed', error && error.message || 'sample failed');
+      return null;
+    }
+  }
+
+  function observeTicketCurrentProofFrame() {
+    if (document.visibilityState !== 'visible' || !streamHasFreshRenderedFrame()) return;
+    const now = Date.now();
+    const epoch = Number(lastRenderedFrameEpoch || currentStreamEpoch || 0);
+    if (!(epoch > 0)) return;
+    if (ticketCurrentProofFingerprint && ticketCurrentProofFingerprint.epoch !== epoch) {
+      ticketCurrentProofFingerprint = null;
+      ticketCurrentProofCandidateFingerprint = null;
+      ticketCurrentProofStableChangeCount = 0;
+      ticketCurrentProofChangePending = false;
+    }
+    if (now - ticketCurrentProofLastSampleAt >= ticketCurrentProofSampleIntervalMs) {
+      ticketCurrentProofLastSampleAt = now;
+      const sample = sampleTicketCurrentProofFingerprint();
+      if (sample) {
+        if (!ticketCurrentProofFingerprint) {
+          ticketCurrentProofFingerprint = sample;
+        } else if (ticketCurrentProofFingerprintChanged(ticketCurrentProofFingerprint.values, sample.values)) {
+          if (ticketCurrentProofCandidateFingerprint &&
+            !ticketCurrentProofFingerprintChanged(ticketCurrentProofCandidateFingerprint.values, sample.values)) {
+            ticketCurrentProofStableChangeCount += 1;
+          } else {
+            ticketCurrentProofCandidateFingerprint = sample;
+            ticketCurrentProofStableChangeCount = 1;
+          }
+          if (ticketCurrentProofStableChangeCount >= 2) {
+            ticketCurrentProofFingerprint = sample;
+            ticketCurrentProofCandidateFingerprint = null;
+            ticketCurrentProofChangePending = true;
+          }
+        } else {
+          ticketCurrentProofCandidateFingerprint = null;
+          ticketCurrentProofStableChangeCount = 0;
+        }
+      }
+    }
+    maybeRequestTicketCurrentProof('frame_observed');
+  }
+
+  async function maybeRequestTicketCurrentProof(reason) {
+    if (ticketCurrentProofInFlight || !spacetimeStateFresh ||
+      Date.now() - ticketCurrentProofLastRequestAt < ticketCurrentProofRequestCooldownMs) return false;
+    const stream = ticketActionV3StreamSnapshot();
+    const proofScope = `${String(cfg.backendId || 'pixel')}:${Number(stream.epoch || 0)}`;
+    const currentAction = currentState && currentState.ticketAction || null;
+    const ownUnknownAwaitingChange = Boolean(ticketCurrentProofLastActionId &&
+      String(currentAction && currentAction.actionId || '') === ticketCurrentProofLastActionId &&
+      String(currentAction && currentAction.target || '') === 'prove_current' &&
+      ['succeeded', 'failed', 'needs_attention'].includes(String(currentAction && currentAction.status || '')) &&
+      String(currentAction && currentAction.currentView || '') === 'unknown');
+    if (!ticketCurrentProofRequestNeeded({
+      visible: document.visibilityState === 'visible',
+      stream,
+      action: currentAction,
+      region: currentState && currentState.ticketSliderRegion || null,
+      now: Date.now() + serverClockSkewMs,
+      requestedEpoch: ticketCurrentProofRequestedScope === proofScope ? Number(stream.epoch || 0) : 0,
+      stableChangeCount: ticketCurrentProofChangePending ? 2 : ticketCurrentProofStableChangeCount,
+      resumed: ticketCurrentProofResumePending,
+      // A failed or completed control-code request can leave a visual cleanup
+      // checkpoint on the phone. Only the explicit Open action is allowed to
+      // recover it; an automatic proof must not reclaim the phone lane first.
+      recoveryRequired: controlCodeVisualRecoveryRequired(),
+      // A reconnect caused by this exact failed proof is not itself a visual
+      // change. Wait for two agreeing changed frames before trying again.
+      unknownAwaitingChange: ownUnknownAwaitingChange
+    })) return false;
+    ticketCurrentProofInFlight = true;
+    ticketCurrentProofLastRequestAt = Date.now();
+    const actionId = ticketActionV3Id();
+    ticketCurrentProofLastActionId = actionId;
+    try {
+      const accepted = await requestTicketActionV3(
+        'prove_current',
+        'browser_auto_proof',
+        'ticket_action_requested',
+        '',
+        { quiet: true, actionId }
+      );
+      if (accepted) {
+        ticketCurrentProofRequestedScope = proofScope;
+        ticketCurrentProofResumePending = false;
+        ticketCurrentProofStableChangeCount = 0;
+        ticketCurrentProofCandidateFingerprint = null;
+        ticketCurrentProofChangePending = false;
+        clientLog('ticket_current_proof_requested', reason || 'automatic');
+      }
+      if (!accepted && ticketCurrentProofLastActionId === actionId) {
+        ticketCurrentProofLastActionId = '';
+      }
+      return accepted;
+    } finally {
+      ticketCurrentProofInFlight = false;
+    }
+  }
+
+  function scheduleTicketActionV3Reconcile(reason) {
+    if (ticketActionV3ReconcileTimer || !ticketActionV3LocalRequestIsBusy() ||
+      ticketActionV3LocalRequestState.reducerSettled !== true) return;
+    ticketActionV3ReconcileTimer = setTimeout(async () => {
+      ticketActionV3ReconcileTimer = null;
+      if (!ticketActionV3LocalRequestIsBusy()) return;
+      try {
+        await refreshSpacetimeState(reason || 'ticket_action_v3_reconcile');
+      } catch (error) {
+        clientLog('ticket_action_v3_refresh_failed', error && error.message || 'refresh failed');
+      }
+      if (ticketActionV3LocalRequestIsBusy()) {
+        scheduleTicketActionV3Reconcile(reason);
+      }
+    }, ticketActionV3ReconcileIntervalMs);
+  }
+
+  function renderTicketActionV3Controls(state = currentState) {
+    const action = state && state.ticketAction || null;
+    const busy = ticketActionV3LocalRequestIsBusy() || ticketActionV3Busy(action);
+    const observedUserAction = ticketActionV3ExplicitResultForDisplay(
+      state && state.ticketActions || [],
+      ticketActionV3LastUserActionId,
+      ticketActionV3LastUserAction
+    );
+    if (observedUserAction && observedUserAction !== ticketActionV3LastUserAction) {
+      ticketActionV3LastUserAction = observedUserAction;
+      ticketActionV3LastUserMessage = '';
+    }
+    const statusAction = ticketActionV3LastUserAction || action;
+    const statusBusy = ticketActionV3LastUserAction || ticketActionV3LastUserMessage
+      ? ticketActionV3Busy(ticketActionV3LastUserAction)
+      : busy;
+    const controlBusy = controlCodeRequestOccupiesQueue();
+    const region = currentTicketSliderRegion(state);
+    const proofReady = spacetimeStateFresh && ticketActionV3RegistrationProofIsFresh(action);
+    const proveCurrentReady = String(action && action.target || '') !== 'prove_current' || Boolean(region);
+    const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);
+    requestTicketResetButton.disabled = !spacetimeStateFresh || busy || controlBusy;
+    requestTicketResetAndActivateButton.disabled = !spacetimeStateFresh || busy || controlBusy || activationPolicyBlocked(state);
+    activateTicketButton.disabled = busy || controlBusy || !registerReady;
+    renderTicketRegisterOverlay(state, busy, controlBusy, registerReady && Boolean(region));
+    for (const button of [requestTicketResetButton, requestTicketResetAndActivateButton, activateTicketButton]) {
+      button.setAttribute('aria-busy', busy ? 'true' : 'false');
+    }
+    const currentView = String(action && action.currentView || 'unknown');
+    const switchExpiresAt = Date.parse(String(action && action.switchExpiresAt || ''));
+    const switchAvailable = Boolean(action && action.switchAvailable === true && Number.isFinite(switchExpiresAt) && switchExpiresAt > Date.now() + serverClockSkewMs);
+    ticketViewSwitchButton.dataset.target = '';
+    ticketViewSwitchButton.disabled = true;
+    ticketViewSwitchButton.setAttribute('aria-busy', busy ? 'true' : 'false');
+    if (ticketViewSwitchExpiryTimer) {
+      clearTimeout(ticketViewSwitchExpiryTimer);
+      ticketViewSwitchExpiryTimer = null;
+    }
+    if (Number.isFinite(switchExpiresAt) && switchExpiresAt > Date.now() + serverClockSkewMs) {
+      ticketViewSwitchExpiryTimer = setTimeout(() => {
+        ticketViewSwitchExpiryTimer = null;
+        renderTicketActionV3Controls(currentState);
+      }, Math.min(switchExpiresAt - (Date.now() + serverClockSkewMs) + 25, 60_000));
+    }
+    const smartSwitch = ticketActionV3SmartSwitchForView(currentView);
+    ticketViewSwitchButton.textContent = smartSwitch.label;
+    ticketViewSwitchButton.dataset.target = smartSwitch.target;
+    if (switchAvailable && ticketViewSwitchButton.dataset.target && !busy && !controlBusy) {
+      ticketViewSwitchButton.disabled = false;
+      ticketViewSwitchDetail.textContent = 'Var pārslēgt skatu bez biļetes atkārtotas reģistrēšanas.';
+    } else if (busy) {
+      ticketViewSwitchDetail.textContent = 'Tālrunis izpilda iepriekšējo biļetes darbību.';
+    } else if (action && action.switchAvailable === true && Number.isFinite(switchExpiresAt) && switchExpiresAt <= Date.now() + serverClockSkewMs) {
+      ticketViewSwitchDetail.textContent = 'Skata pārslēgšanas laiks ir beidzies.';
+    } else {
+      ticketViewSwitchDetail.textContent = 'Pieejams pēc jaunākās nereģistrētās biļetes noteikšanas.';
+    }
+    const statusTarget = String(statusAction && statusAction.target || '');
+    const statusView = String(statusAction && statusAction.currentView || 'unknown');
+    if (ticketActionV3LastUserMessage) {
+      ticketResetDetail.textContent = ticketActionV3LastUserMessage;
+    } else if (statusAction && statusAction.status === 'succeeded' && statusTarget === 'redetect_latest') {
+      ticketResetDetail.textContent = 'Jaunākā biļete ir veiksmīgi atkārtoti noteikta.';
+    } else if (statusAction && statusAction.status === 'succeeded' && statusView === 'latest_unactivated') {
+      ticketResetDetail.textContent = 'Atvērtā nereģistrētā biļete ir vizuāli apstiprināta.';
+    } else if (statusAction && statusAction.status === 'succeeded' && statusView === 'activated_current') {
+      ticketResetDetail.textContent = 'Atvērtā biļete ir veiksmīgi reģistrēta un vizuāli apstiprināta.';
+    } else if (statusAction && statusAction.status === 'succeeded' && statusView === 'recent_activated') {
+      ticketResetDetail.textContent = 'Nesen aktivizētā biļete ir vizuāli apstiprināta.';
+    } else if (statusAction && statusAction.status === 'succeeded') {
+      ticketResetDetail.textContent = 'Biļetes darbība ir veiksmīgi pabeigta.';
+    } else if (statusBusy) {
+      ticketResetDetail.textContent = 'Tālrunis izpilda biļetes darbību…';
+    } else if (statusAction && statusAction.status === 'needs_attention') {
+      ticketResetDetail.textContent = 'Darbība netika atkārtota; tālruņa skats jāpārbauda.';
+    } else if (statusAction && statusAction.status === 'failed') {
+      ticketResetDetail.textContent = 'Biļetes darbība droši apstājās bez nepierādītas darbības.';
+    } else if (!statusAction) {
+      ticketResetDetail.textContent = 'Pieejams, kad tālrunis ir gatavs.';
+    }
+    updateControlCodeSubmitAvailability();
+    maybeRequestTicketCurrentProof('state_rendered');
+  }
+
+  async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {
+    if (ticketActionV3LocalRequestIsBusy() || ticketActionV3Busy(currentState && currentState.ticketAction)) return false;
+    const actionId = String(options.actionId || ticketActionV3Id()).trim();
+    if (!actionId) return false;
+    const activation = target === 'open_latest_and_register' || target === 'register_current';
+    if (!beginTicketActionV3LocalRequest(ticketActionV3LocalRequestState, actionId)) return false;
+    if (options.quiet !== true) {
+      ticketActionV3LastUserActionId = actionId;
+      ticketActionV3LastUserAction = {
+        actionId,
+        target,
+        status: 'pending',
+        currentView: 'unknown'
+      };
+      ticketActionV3LastUserMessage = '';
+    }
+    renderTicketActionV3Controls(currentState);
+    try {
+      await runSpacetimeMutation((client) => client.requestTicketActionV3(ticketActionV3RequestArgs({
+        actionId,
+        target,
+        source,
+        reason,
+        attemptId: activation ? actionId : '',
+        expectedInteractionRevision: target === 'register_current' ? expectedInteractionRevision : ''
+      })), `ticket_action_v3_${target}`);
+      settleTicketActionV3LocalRequest(ticketActionV3LocalRequestState, true);
+      scheduleTicketActionV3Reconcile(`ticket_action_v3_${target}_reconcile`);
+      clientLog('ticket_action_v3_requested', target);
       return true;
     } catch (error) {
-      ticketResetDetail.textContent = localizePublicMessage(error && error.message || 'Biļeti neizdevās sagatavot.');
-      clientLog('ticket_reset_request_failed', error && error.message || 'request failed');
+      settleTicketActionV3LocalRequest(ticketActionV3LocalRequestState, false);
+      if (options.quiet !== true) {
+        ticketActionV3LastUserAction = {
+          actionId,
+          target,
+          status: 'failed',
+          currentView: 'unknown'
+        };
+        ticketActionV3LastUserMessage = localizePublicMessage(error && error.message || 'Biļetes darbību neizdevās nosūtīt.');
+      }
+      clientLog('ticket_action_v3_failed', error && error.message || target);
       return false;
     } finally {
-      ticketSliderResetInFlight = false;
-      renderTicketInteraction(currentState && currentState.ticketInteraction);
+      renderTicketActionV3Controls(currentState);
     }
   }
 
-  function focusTicketSlider(reason) {
-    if (ticketSliderOverlay.dataset.active !== 'true') {
-      ticketResetDetail.textContent = 'Biļetes attēls vēl tiek atjaunināts; slīdnis parādīsies drīz.';
+  async function registerCurrentTicket(source) {
+    const proofAction = currentState && currentState.ticketAction || null;
+    if (!ticketActionV3RegistrationProofIsFresh(proofAction) ||
+      (String(proofAction && proofAction.target || '') === 'prove_current' && !currentTicketSliderRegion(currentState))) {
+      ticketActionV3LastUserActionId = '';
+      ticketActionV3LastUserAction = null;
+      ticketActionV3LastUserMessage = 'Sagaidi svaigu vizuālu nereģistrētās biļetes apstiprinājumu.';
+      renderTicketActionV3Controls(currentState);
       return false;
     }
-    ticketSliderOverlay.focus({ preventScroll: true });
-    ticketSliderOverlay.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    ticketResetDetail.textContent = 'Slīdnis ir gatavs. Vari to vilkt pa labi vai izmantot pogu Aktivizēt biļeti.';
-    clientLog('ticket_slider_activation_prompted', reason || 'button');
-    return true;
-  }
-
-  async function activateTicketSliderFromButton(reason) {
-    if (ticketSliderButtonInFlight || controlCodeRequestOccupiesQueue()) return;
-    if (activationPolicyBlocked(currentState)) {
-      ticketResetDetail.textContent = activationPolicyMessage(currentState);
-      return;
-    }
-    const interaction = ticketInteractionForDisplay(currentState && currentState.ticketInteraction);
-    if (!interaction || String(interaction.status || '') !== 'unactivated_ready' || !ticketSliderProofIsFresh(interaction) || ticketSliderOverlay.dataset.active !== 'true') {
-      focusTicketSlider(reason);
-      return;
-    }
-    const interactionRevision = String(interaction.interactionRevision || '');
-    if (!interactionRevision) return;
-    ticketSliderButtonInFlight = true;
-    const controlId = `button_slider_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    const initialInputSequence = String(++ticketSliderSequence);
-    const attemptId = activationAttemptId('menu_activate');
-    renderTicketInteraction(interaction);
-    try {
-      const admitted = await runAdmittedActivation((client) => client.activateTicketButtonV2({
-        interactionRevision,
-        controlId,
-        inputSequence: initialInputSequence,
-        attemptId
-      }), attemptId, 'ticket_slider_button_activate');
-      if (!admitted) return;
-      ticketResetDetail.textContent = 'Biļete tiek aktivizēta…';
-      clientLog('ticket_slider_activation_requested', reason || 'button');
-    } catch (error) {
-      ticketResetDetail.textContent = localizePublicMessage(error && error.message || 'Biļeti neizdevās aktivizēt.');
-      clientLog('ticket_slider_activation_failed', error && error.message || 'button activation failed');
-    } finally {
-      ticketSliderButtonInFlight = false;
-      renderTicketInteraction(currentState && currentState.ticketInteraction);
-    }
-  }
-
-  async function requestTicketResetAndActivate() {
-    if (ticketSliderResetInFlight || ticketSliderButtonInFlight || controlCodeRequestOccupiesQueue()) return;
-    const resetAccepted = await requestTicketReset('browser_reset_and_activate');
-    if (resetAccepted) ticketResetDetail.textContent = 'Jauna biļete tiek sagatavota un pēc pārbaudes tiks aktivizēta…';
+    const revision = String(proofAction.actionId || '').trim();
+    if (!revision) return false;
+    return requestTicketActionV3('register_current', source, source === 'browser_slider' ? 'ticket_slider_completed' : 'ticket_register_button', revision);
   }
 
   function selectServerClockSample(state) {
@@ -4842,6 +5197,10 @@ import { html, reactive } from '@arrow-js/core';
       return { timestamp: liveServerTime, source: 'live' };
     }
     if (serverClockHasLiveSample) return null;
+    const memberLimitServerAt = Date.parse(String(state && state.memberLimits && state.memberLimits.serverAt || ''));
+    if (Number.isFinite(memberLimitServerAt)) {
+      return { timestamp: memberLimitServerAt, source: 'member_limits' };
+    }
     const eligibilityServerAt = Date.parse(String(
       state && state.activationEligibility && state.activationEligibility.serverAt || ''
     ));
@@ -4945,9 +5304,29 @@ import { html, reactive } from '@arrow-js/core';
     }, 80);
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
-  requestTicketResetButton.addEventListener('click', () => requestTicketReset());
-  requestTicketResetAndActivateButton.addEventListener('click', () => requestTicketResetAndActivate());
-  activateTicketButton.addEventListener('click', () => activateTicketSliderFromButton('button'));
+  requestTicketResetButton.addEventListener('click', () => requestTicketActionV3(
+    'open_latest_unactivated', 'browser_button', 'ticket_open_latest_unactivated'
+  ));
+  requestTicketResetAndActivateButton.addEventListener('click', () => requestTicketActionV3(
+    'open_latest_and_register', 'browser_button', 'ticket_open_latest_and_register'
+  ));
+  activateTicketButton.addEventListener('click', () => registerCurrentTicket('browser_button'));
+  ticketLocalRegisterSlider.addEventListener('change', async () => {
+    const submitted = await handleTicketLocalRegisterSliderChange({
+      slider: ticketLocalRegisterSlider,
+      state: ticketLocalRegisterSliderState,
+      submitRegisterCurrent: (source) => registerCurrentTicket(source),
+      render: () => renderTicketActionV3Controls(currentState)
+    });
+    if (!submitted && !ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
+  });
+  ticketLocalRegisterSlider.addEventListener('pointercancel', () => {
+    if (!ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
+  });
+  ticketViewSwitchButton.addEventListener('click', () => {
+    const target = String(ticketViewSwitchButton.dataset.target || '');
+    if (target) requestTicketActionV3(target, 'browser_smart_switch', `ticket_${target}`);
+  });
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
@@ -5004,265 +5383,6 @@ import { html, reactive } from '@arrow-js/core';
       canvas.releasePointerCapture(pointerId);
     } catch (_) {}
   }
-
-  function ticketSliderProgressFromClientX(clientX) {
-    const rect = ticketSliderOverlay.getBoundingClientRect();
-    if (!rect.width) return 0;
-    return Math.max(0, Math.min(10000, Math.round(((clientX - rect.left) / rect.width) * 10000)));
-  }
-
-  function queueTicketSliderUpdate(inputPhase, progress, controlId = ticketSliderControlId, interactionRevision = ticketSliderInteractionRevision) {
-    if (!controlId || !interactionRevision) return;
-    ticketSliderPendingUpdate = {
-      inputPhase,
-      progress: Math.max(0, Math.min(10000, Math.round(progress))),
-      controlId,
-      interactionRevision
-    };
-    if (ticketSliderUpdateTimer || ticketSliderUpdateInFlight) return;
-    ticketSliderUpdateTimer = setTimeout(flushTicketSliderUpdate, 0);
-  }
-
-  async function flushTicketSliderUpdate() {
-    ticketSliderUpdateTimer = null;
-    if (ticketSliderUpdateInFlight) return;
-    const pending = ticketSliderPendingUpdate;
-    ticketSliderPendingUpdate = null;
-    if (!pending) return;
-    const sequence = String(++ticketSliderSequence);
-    ticketSliderUpdateInFlight = true;
-    try {
-      await runSpacetimeMutation((client) => client.updateTicketSlider(
-        sequence,
-        pending.controlId,
-        pending.interactionRevision,
-        pending.inputPhase,
-        pending.progress
-      ), 'ticket_slider_input');
-    } catch (error) {
-      clientLog('ticket_slider_input_failed', error && error.message || 'input failed');
-      ticketSliderState = 'cancelled';
-      if (pending.inputPhase !== 'cancel') {
-        // A failed move/up must not strand an active Pixel lease. Send one
-        // best-effort cancel with the same identity before clearing local state.
-        queueTicketSliderUpdate('cancel', pending.progress, pending.controlId, pending.interactionRevision);
-      }
-      ticketSliderPointer = null;
-      if (ticketSliderHeartbeatTimer) {
-        clearInterval(ticketSliderHeartbeatTimer);
-        ticketSliderHeartbeatTimer = null;
-      }
-      ticketSliderControlId = '';
-      ticketSliderInteractionRevision = '';
-      ticketSliderActivationAttemptId = '';
-    } finally {
-      ticketSliderUpdateInFlight = false;
-      if (ticketSliderState === 'cancelled') {
-        renderTicketInteraction(currentState && currentState.ticketInteraction);
-      }
-    }
-    if (ticketSliderPendingUpdate && !ticketSliderUpdateTimer) {
-      ticketSliderUpdateTimer = setTimeout(flushTicketSliderUpdate, ticketSliderUpdateIntervalMs);
-    }
-  }
-
-  function cancelTicketSliderFromLifecycle(reason) {
-    const pending = ticketSliderPendingUpdate;
-    const controlId = ticketSliderControlId || String(pending && pending.controlId || '');
-    const interactionRevision = ticketSliderInteractionRevision || String(pending && pending.interactionRevision || '');
-    const wasClaimed = Boolean(controlId && interactionRevision &&
-      ticketSliderPointer && ticketSliderPointer.qualified);
-    if (controlId && interactionRevision && (wasClaimed || pending)) {
-      ticketSliderLatestProgress = ticketSliderLocalProgress || Number(pending && pending.progress || 0);
-      // Replace an unsent move/up with a cancel carrying the same lease identity.
-      ticketSliderPendingUpdate = null;
-      queueTicketSliderUpdate('cancel', ticketSliderLatestProgress, controlId, interactionRevision);
-      clientLog('ticket_slider_cancelled', reason || 'lifecycle');
-    }
-    ticketSliderPointer = null;
-    if (ticketSliderHeartbeatTimer) {
-      clearInterval(ticketSliderHeartbeatTimer);
-      ticketSliderHeartbeatTimer = null;
-    }
-    ticketSliderState = 'idle';
-    ticketSliderControlId = '';
-    ticketSliderInteractionRevision = '';
-    ticketSliderActivationAttemptId = '';
-  }
-
-  function cancelTicketSliderCandidate() {
-    if (ticketSliderUpdateTimer) {
-      clearTimeout(ticketSliderUpdateTimer);
-      ticketSliderUpdateTimer = null;
-    }
-    ticketSliderPendingUpdate = null;
-    if (ticketSliderHeartbeatTimer) {
-      clearInterval(ticketSliderHeartbeatTimer);
-      ticketSliderHeartbeatTimer = null;
-    }
-    const controlId = ticketSliderControlId;
-    const interactionRevision = ticketSliderInteractionRevision;
-    const progress = ticketSliderLatestProgress;
-    ticketSliderPointer = null;
-    ticketSliderState = 'idle';
-    if (controlId && interactionRevision) {
-      queueTicketSliderUpdate('cancel', progress, controlId, interactionRevision);
-    }
-    ticketSliderControlId = '';
-    ticketSliderInteractionRevision = '';
-    ticketSliderActivationAttemptId = '';
-  }
-
-  ticketSliderOverlay.addEventListener('pointerdown', (event) => {
-    if (ticketSliderOverlay.dataset.active !== 'true' || ticketSliderOverlay.dataset.locked === 'true') return;
-    if (activationPolicyBlocked(currentState)) return;
-    if (event.button != null && event.button !== 0) return;
-    const interaction = ticketInteractionForDisplay(currentState && currentState.ticketInteraction);
-    const interactionStatus = String(interaction && interaction.status || '');
-    if (!interaction || (
-      interactionStatus !== 'unactivated_ready' &&
-      !(interactionStatus === 'control_active' && ticketInteractionLeaseExpired(interaction))
-    )) return;
-    if (event.cancelable) event.preventDefault();
-    try { ticketSliderOverlay.setPointerCapture(event.pointerId); } catch (_) {}
-    ticketSliderPointer = {
-      pointerId: event.pointerId,
-      pointerType: event.pointerType || 'touch',
-      clientX: event.clientX,
-      clientY: event.clientY,
-      at: performance.now(),
-      qualified: false,
-      claiming: false,
-      released: false
-    };
-    ticketSliderInteractionRevision = String(interaction.interactionRevision || '');
-    ticketSliderLocalProgress = ticketSliderProgressFromClientX(event.clientX);
-    renderTicketSliderProgress(ticketSliderLocalProgress);
-  });
-
-  ticketSliderOverlay.addEventListener('pointermove', (event) => {
-    const pointer = ticketSliderPointer;
-    if (!pointer || pointer.pointerId !== event.pointerId) return;
-    const dx = event.clientX - pointer.clientX;
-    const dy = event.clientY - pointer.clientY;
-    const heldMs = performance.now() - pointer.at;
-    const horizontal = dx >= ticketSliderQualifyTravelPx && Math.abs(dx) >= Math.max(1, Math.abs(dy) * 1.5);
-    if (!pointer.qualified) {
-      if (dx < -ticketSliderQualifyTravelPx || (Math.abs(dy) >= 28 && Math.abs(dy) > Math.abs(dx) * 1.5)) {
-        cancelTicketSliderCandidate();
-        return;
-      }
-      if (heldMs < ticketSliderQualifyHoldMs || !horizontal || pointer.claiming) return;
-      pointer.claiming = true;
-      pointer.qualified = true;
-      ticketSliderControlId = `slider_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-      ticketSliderActivationAttemptId = activationAttemptId('manual_slider');
-      ticketSliderState = 'claiming';
-      const progress = ticketSliderProgressFromClientX(event.clientX);
-      ticketSliderLocalProgress = progress;
-      try {
-      ticketSliderOverlay.setPointerCapture(event.pointerId);
-      } catch (_) {}
-      const claimedControlId = ticketSliderControlId;
-      const claimInteractionRevision = ticketSliderInteractionRevision;
-      const claimedAttemptId = ticketSliderActivationAttemptId;
-      runAdmittedActivation((client) => client.claimTicketSliderV2({
-        interactionRevision: claimInteractionRevision,
-        controlId: claimedControlId,
-        initialInputSequence: String(++ticketSliderSequence),
-        holdDurationMillis: Math.round(heldMs),
-        horizontalTravelCss: Math.round(dx),
-        verticalTravelCss: Math.round(Math.abs(dy)),
-        initialProgress: progress,
-        attemptId: claimedAttemptId
-      }), claimedAttemptId, 'ticket_slider_claim')
-        .then((admitted) => {
-          if (!admitted) {
-            ticketSliderPointer = null;
-            ticketSliderState = 'idle';
-            ticketSliderControlId = '';
-            ticketSliderInteractionRevision = '';
-            ticketSliderActivationAttemptId = '';
-            renderTicketInteraction(currentState && currentState.ticketInteraction);
-            return;
-          }
-          // The pointer may be released while the lease reducer is in flight. Keep the
-          // request-owned identity alive until the reducer resolves, then close the lease
-          // explicitly instead of leaving Pixel with an abandoned active gesture.
-          if (ticketSliderPointer !== pointer || ticketSliderControlId !== claimedControlId ||
-            ticketSliderInteractionRevision !== claimInteractionRevision) {
-            queueTicketSliderUpdate('cancel', ticketSliderLocalProgress, claimedControlId, claimInteractionRevision);
-            return;
-          }
-          ticketSliderState = 'active';
-          if (ticketSliderHeartbeatTimer) clearInterval(ticketSliderHeartbeatTimer);
-          ticketSliderHeartbeatTimer = setInterval(() => {
-            if (ticketSliderPointer === pointer && ticketSliderState === 'active') {
-              queueTicketSliderUpdate('heartbeat', ticketSliderLocalProgress);
-            }
-          }, 500);
-          if (pointer.released) {
-            queueTicketSliderUpdate(
-              pointer.releasePhase || 'up',
-              ticketSliderLocalProgress,
-              claimedControlId,
-              claimInteractionRevision
-            );
-            ticketSliderPointer = null;
-            if (ticketSliderHeartbeatTimer) {
-              clearInterval(ticketSliderHeartbeatTimer);
-              ticketSliderHeartbeatTimer = null;
-            }
-            ticketSliderState = 'idle';
-            ticketSliderControlId = '';
-            ticketSliderInteractionRevision = '';
-            ticketSliderActivationAttemptId = '';
-          } else {
-            queueTicketSliderUpdate('move', ticketSliderLocalProgress, claimedControlId, claimInteractionRevision);
-          }
-        })
-        .catch((error) => {
-          clientLog('ticket_slider_claim_failed', error && error.message || 'claim failed');
-          cancelTicketSliderCandidate();
-        });
-      return;
-    }
-    if (event.cancelable) event.preventDefault();
-    ticketSliderLocalProgress = ticketSliderProgressFromClientX(event.clientX);
-    renderTicketSliderProgress(ticketSliderLocalProgress);
-    if (ticketSliderState === 'active') queueTicketSliderUpdate('move', ticketSliderLocalProgress);
-  });
-
-  function finishTicketSliderPointer(event, phase) {
-    const pointer = ticketSliderPointer;
-    if (!pointer || pointer.pointerId !== event.pointerId) return;
-    if (pointer.qualified && ticketSliderState === 'active') {
-      ticketSliderLatestProgress = ticketSliderLocalProgress;
-      queueTicketSliderUpdate(phase, ticketSliderLocalProgress);
-    } else if (pointer.qualified && ticketSliderState === 'claiming') {
-      // Do not discard the lease identity while claimTicketSlider is still in flight.
-      // The claim completion handler will send the matching up/cancel event immediately.
-      pointer.released = true;
-      pointer.releasePhase = phase;
-      ticketSliderLatestProgress = ticketSliderLocalProgress;
-    }
-    try { ticketSliderOverlay.releasePointerCapture(event.pointerId); } catch (_) {}
-    if (pointer.released && ticketSliderState === 'claiming') return;
-    ticketSliderPointer = null;
-    if (phase !== 'move') {
-      if (ticketSliderHeartbeatTimer) {
-        clearInterval(ticketSliderHeartbeatTimer);
-        ticketSliderHeartbeatTimer = null;
-      }
-      ticketSliderState = 'idle';
-      ticketSliderControlId = '';
-      ticketSliderInteractionRevision = '';
-      ticketSliderActivationAttemptId = '';
-    }
-  }
-
-  ticketSliderOverlay.addEventListener('pointerup', (event) => finishTicketSliderPointer(event, 'up'));
-  ticketSliderOverlay.addEventListener('pointercancel', (event) => finishTicketSliderPointer(event, 'cancel'));
 
   canvas.addEventListener('pointerdown', (event) => {
     if (!configured) return;
@@ -5507,24 +5627,31 @@ import { html, reactive } from '@arrow-js/core';
     );
   }
 
+  function controlCodeMutationLaneBusy() {
+    return controlCodeRequestOccupiesQueue() ||
+      ticketInteractionIsBusy(currentState && currentState.ticketInteraction) ||
+      ticketActionV3LocalRequestIsBusy() ||
+      ticketActionV3Busy(currentState && currentState.ticketAction);
+  }
+
   function updateControlCodeSubmitAvailability() {
     renderControlCodeFastStateDataset();
     // Reset/reselect and an active slider claim occupy the same phone mutation
     // lane as control-code generation.  Use the authoritative interaction row
     // here so the UI cannot offer a request that the reducer will reject.
-    const interactionBusy = ticketInteractionIsBusy(currentState && currentState.ticketInteraction);
-    const busy = controlCodeRequestOccupiesQueue() || interactionBusy;
+    const busy = controlCodeMutationLaneBusy();
+    const limitBlocked = memberLimitBlocked('control_code');
     const digitCount = sanitizeControlDigits(codeDigits.value).length;
     const digitsValid = digitCount >= 2 && digitCount <= 8;
-    codeSubmit.disabled = !codeDialogOpen || busy || !digitsValid;
+    codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !digitsValid;
     codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';
     if (controlCodeSubmitInFlight) {
       codeSubmit.setAttribute('aria-busy', 'true');
     } else {
       codeSubmit.removeAttribute('aria-busy');
     }
-    requestCodeButton.disabled = busy;
-    const hotspotUnavailable = busy && codeResultArea.hidden;
+    requestCodeButton.disabled = busy || limitBlocked;
+    const hotspotUnavailable = (busy || limitBlocked) && codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
   }
@@ -5559,9 +5686,7 @@ import { html, reactive } from '@arrow-js/core';
     if (idleDisconnected) return;
     if (streamUnsupported) return;
     if (!viewerIsForeground()) {
-      if (document.visibilityState === 'hidden') {
-        if (hasRenderedFrame && streamHasFreshRenderedFrame()) pauseVideoWhileHidden('chase_live_stream_hidden');
-      }
+      if (document.visibilityState === 'hidden') pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
       return;
     }
     const hadStream = configured || lastDecodedFrameAt > 0 || lastPacketAt > 0 || latestStreamStatus;
@@ -5688,15 +5813,21 @@ import { html, reactive } from '@arrow-js/core';
 	    const videoStale = configured && (lastFrameAt === 0 || now - lastFrameAt > streamStaleVideoReconnectMs);
 	    const cacheRestored = reason === 'pageshow_persisted' || (typeof document !== 'undefined' && document.wasDiscarded === true);
 	    const connectingTooLong = videoWs && videoWs.readyState === WebSocket.CONNECTING && videoSocketCreatedAt > 0 && now - videoSocketCreatedAt > resumeSoftReconnectMs;
-	    const hardRestore = longHidden || oldHiddenTab || cacheRestored || connectingTooLong;
-	    const resumeFlow = startActivationResumeFlow(reason || 'visibility_resume', 'visibility_resume', { pauseBurst: true });
+	    const reusePersistedSocket = reason === 'pageshow_persisted'
+	      && hiddenMs < hiddenVideoCloseDelayMs
+	      && videoSocketKeepsStreamActive()
+	      && !videoStale
+	      && !connectingTooLong;
+	    const hardRestore = longHidden || oldHiddenTab || connectingTooLong || (cacheRestored && !reusePersistedSocket);
+	    const resumeFlow = claimActivationResumeLifecycle(reason || 'visibility_resume', 'visibility_resume');
+    if (!resumeFlow) return;
 	    logResumeCheckpoint('activation_resume_recovery_decision', {
 	      reason: safeResumeLabel(reason, 'visibility_resume'),
 	      hidden: hiddenDurationBucket(hiddenMs),
 	      cache: resumeBooleanLabel(cacheRestored),
 	      stale: resumeBooleanLabel(videoStale),
 	      connecting: resumeBooleanLabel(connectingTooLong),
-	      action: hardRestore ? 'cached_restore' : 'watch'
+	      action: hardRestore ? 'cached_restore' : (reusePersistedSocket ? 'cached_reuse' : 'watch')
 	    }, resumeFlow);
 	    lastHiddenAt = 0;
 	    lastHiddenWallAt = 0;
@@ -5704,6 +5835,10 @@ import { html, reactive } from '@arrow-js/core';
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
     }
+	    if (hiddenStreamFocusTimer) {
+	      clearTimeout(hiddenStreamFocusTimer);
+	      hiddenStreamFocusTimer = null;
+	    }
     if (fallbackFrameAvailable) {
       redrawPreservedFrame();
       if (longHidden || videoStale) showStreamRecovery();
@@ -5714,17 +5849,27 @@ import { html, reactive } from '@arrow-js/core';
     keepFirstScreenPinned(false);
     refreshSpacetimeState(reason || 'visibility_resume').catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     publishCurrentStreamFocus(reason || 'visibility_visible');
+	    if (reusePersistedSocket) {
+	      lastRecoveryVideoReconnectAt = now;
+	      lastRecoveryVideoReconnectSeq = videoSocketOpenSeq;
+	    }
 	    if (hardRestore) {
 	      recoverFreshMediaSession(reason || 'visibility_resume', 'old_tab_resume', {
+	        forceReconnect: cacheRestored && !reusePersistedSocket,
 	        skipEarlyGrace: true,
 	        keyframeReason: `${reason || 'resume'}_cached_keyframe`
 	      });
-	      runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow);
+	      resumeFlow.paused = false;
+	      resumeFlow.attempts = 1;
+	      clearActivationReconnectBurst();
+	      activationReconnectBurstTimer = setTimeout(
+	        () => runActivationReconnectBurst(reason || 'visibility_resume', resumeFlow),
+	        activationReconnectFirstRetryMs
+	      );
 	      return;
-	    }
+    }
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
       connectDirectVideo();
-      startActivationResumeFlow(reason || 'visibility_visible', 'watchdog');
     }
     if (videoStale) {
       reconnectVideoForRecovery('visibility_resume_stale');
@@ -5743,6 +5888,7 @@ import { html, reactive } from '@arrow-js/core';
     scheduleStreamFeedback('visibility_change');
     if (document.visibilityState === 'visible') {
 	      hiddenDecoderTransientLogged = false;
+      ticketCurrentProofResumePending = true;
       noteViewerActivity(null, 'visibility_visible');
       if (hiddenStreamFocusTimer) {
         clearTimeout(hiddenStreamFocusTimer);
@@ -5750,61 +5896,60 @@ import { html, reactive } from '@arrow-js/core';
       }
       recoverAfterVisibilityResume('visibility_resume');
 	    } else if (document.visibilityState === 'hidden') {
-	      cancelTicketSliderFromLifecycle('visibility_hidden');
 	      hiddenDecoderTransientLogged = false;
-	      const flow = startActivationResumeFlow('visibility_hidden', 'visibility_hidden', { pauseBurst: true });
+	      const flow = pauseActivationResumeLifecycle('visibility_hidden', 'visibility_hidden');
 	      logResumeCheckpoint('activation_visibility_hidden', { reason: 'hidden' }, flow);
 	      lastHiddenAt = performance.now();
 	      lastHiddenWallAt = Date.now();
 	      clearActivationReconnectBurst();
 	      releaseScreenWakeLock('visibility_hidden');
-	      if (hasRenderedFrame && streamHasFreshRenderedFrame()) {
-	        releaseStreamFocusAfterHiddenGrace('visibility_hidden');
-	        pauseVideoWhileHidden('visibility_hidden');
-	      } else {
-	        logResumeCheckpoint('activation_visibility_hidden_kept_open', { reason: 'cold_open' }, flow);
+	      pauseHiddenStreamAfterGrace('visibility_hidden');
+	      if (!hasRenderedFrame || !streamHasFreshRenderedFrame()) {
+	        logResumeCheckpoint('activation_visibility_hidden_cold_shutdown', { reason: 'cold_open' }, flow);
 	      }
 	    }
 	  });
 	  window.addEventListener('pageshow', (event) => {
-	    noteViewerActivity(event, 'pageshow');
-	    startActivationResumeFlow(event.persisted ? 'pageshow_persisted' : 'pageshow', 'pageshow');
+	    ticketCurrentProofResumePending = true;
+	    const resumedFromIdle = noteViewerActivity(event, 'pageshow');
 	    if (screenEngaged) {
 	      requestScreenWakeLock('pageshow');
 	    }
     keepFirstScreenPinned(true);
-    if (event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true)) recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');
+    const restored = event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true);
+    if (!resumedFromIdle) {
+      if (restored) {
+        recoverAfterVisibilityResume(event.persisted ? 'pageshow_persisted' : 'pageshow');
+      } else {
+        followActivationResumeLifecycle('pageshow', 'pageshow');
+      }
+    }
     chaseLiveStream();
   });
   window.addEventListener('focus', () => {
-    noteViewerActivity(null, 'focus');
-    if (idleDisconnected) {
-      resumeFromIdleDisconnect('focus');
-      return;
-	    }
+	    if (noteViewerActivity(null, 'focus')) return;
 	    chaseLiveStream();
 	    publishCurrentStreamFocus('focus');
-	    startActivationResumeFlow('focus', 'focus');
+	    followActivationResumeLifecycle('focus', 'focus');
 	  });
 	  window.addEventListener('pagehide', (event) => {
-	    cancelTicketSliderFromLifecycle(event && event.persisted ? 'pagehide_cached' : 'pagehide');
-	    const flow = startActivationResumeFlow(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide', { pauseBurst: true });
+	    const flow = pauseActivationResumeLifecycle(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide');
 	    logResumeCheckpoint('activation_pagehide', {
 	      cache: resumeBooleanLabel(Boolean(event && event.persisted))
 	    }, flow);
 	    closeEarlyVideo('pagehide');
 	    clearActivationReconnectBurst();
-    if (hiddenStreamFocusTimer) {
-      clearTimeout(hiddenStreamFocusTimer);
-      hiddenStreamFocusTimer = null;
-    }
     lastHiddenAt = performance.now();
     lastHiddenWallAt = Date.now();
     if (event && event.persisted) {
       preserveCurrentFrame('pagehide_cached');
-      publishStreamFocus(false, 'pagehide_cached');
+	      pauseHiddenStreamAfterGrace('pagehide_cached');
       return;
     }
+	    if (hiddenStreamFocusTimer) {
+	      clearTimeout(hiddenStreamFocusTimer);
+	      hiddenStreamFocusTimer = null;
+	    }
     publishStreamFocus(false, 'pagehide');
     closeDirectVideo();
     if (spacetimeClient && typeof spacetimeClient.disconnectPresence === 'function') {
@@ -5829,6 +5974,8 @@ import { html, reactive } from '@arrow-js/core';
 	  showQuietStreamLoading();
 	  connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
 	  connect();
-	  startActivationResumeFlow('initial_load', 'initial_load');
+	  if (!activeResumeFlow) {
+	    startActivationResumeFlow('initial_load', 'initial_load');
+	  }
 
 })();

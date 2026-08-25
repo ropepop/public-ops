@@ -21,16 +21,24 @@ const (
 	videoDeliveryProbe            videoDeliveryMode = "probe"
 	videoDeliveryAwaitingKeyframe videoDeliveryMode = "awaiting_keyframe"
 
-	controlQueueMaxMessages = 16
-	controlQueueMaxBytes    = 64 * 1024
-	videoQueueMaxFrames     = 6
-	videoQueueMaxBytes      = 2 * 1024 * 1024
-	videoQueueMaxAge        = 500 * time.Millisecond
-	feedbackMinInterval     = 250 * time.Millisecond
-	feedbackMaxPerSecond    = 4
-	feedbackMaxAgeMillis    = 60_000
-	feedbackMaxQueueSize    = 32
+	controlQueueMaxMessages   = 16
+	controlQueueMaxBytes      = 64 * 1024
+	videoQueueMaxFrames       = 12
+	videoQueueMaxBytes        = 2 * 1024 * 1024
+	videoQueueMaxAge          = 500 * time.Millisecond
+	feedbackMinInterval       = 250 * time.Millisecond
+	feedbackMaxPerSecond      = 4
+	feedbackMaxAgeMillis      = 60_000
+	feedbackMaxQueueSize      = 32
+	feedbackStalledAgeMillis  = 2_000
+	videoWrittenEvidenceLimit = 128
 )
+
+type videoWrittenFrameEvidence struct {
+	epoch     uint64
+	sequence  uint64
+	decodable bool
+}
 
 type queuedControlMessage struct {
 	data   []byte
@@ -39,10 +47,12 @@ type queuedControlMessage struct {
 }
 
 type queuedVideoFrame struct {
-	data      []byte
-	meta      tsf2Metadata
-	queuedAt  time.Time
-	visualAge time.Duration
+	data             []byte
+	meta             tsf2Metadata
+	queuedAt         time.Time
+	visualAge        time.Duration
+	configGeneration uint64
+	probeGeneration  uint64
 }
 
 // streamFeedback is cumulative rather than an acknowledgement for an
@@ -59,6 +69,22 @@ type streamFeedback struct {
 	DecoderQueueSize         int64  `json:"decoderQueueSize"`
 	RenderedVisualAgeMillis  int64  `json:"renderedVisualAgeMillis"`
 	Visibility               string `json:"visibility,omitempty"`
+}
+
+type streamFeedbackOutcome struct {
+	accepted          bool
+	transition        bool
+	keyframeRequested bool
+	cause             string
+	state             string
+	fromMode          videoDeliveryMode
+	toMode            videoDeliveryMode
+	receivedDelta     uint64
+	decodedDelta      uint64
+	renderedDelta     uint64
+	lag               uint64
+	queue             int64
+	visualAgeMillis   int64
 }
 
 func (c *client) startVideoWriter() {
@@ -88,6 +114,7 @@ func (c *client) stopVideoWriter() {
 		cancel := c.writerCancel
 		done := c.writerDone
 		c.writerClosed = true
+		c.clearVideoFrameInFlightLocked(nil)
 		c.videoMu.Unlock()
 		if cancel != nil {
 			cancel()
@@ -154,6 +181,48 @@ type videoWriteItem struct {
 	frame       *queuedVideoFrame
 }
 
+func (c *client) markVideoFrameInFlightLocked(frame queuedVideoFrame) {
+	c.videoInFlight = frame.meta.ok
+	c.videoInFlightKey = frame.meta.keyFrame
+	c.videoInFlightEpoch = frame.meta.epoch
+	c.videoInFlightSeq = frame.meta.sequence
+	c.videoInFlightConfigGen = frame.configGeneration
+	c.videoInFlightProbeGen = frame.probeGeneration
+}
+
+// clearVideoFrameInFlightLocked clears either the named write attempt or all
+// in-flight continuity during a decoder-generation/reset boundary. Matching
+// the frame prevents a late completion from clearing a newer attempt.
+func (c *client) clearVideoFrameInFlightLocked(frame *queuedVideoFrame) {
+	if frame != nil {
+		if !c.videoInFlight ||
+			c.videoInFlightEpoch != frame.meta.epoch ||
+			c.videoInFlightSeq != frame.meta.sequence ||
+			c.videoInFlightConfigGen != frame.configGeneration ||
+			c.videoInFlightProbeGen != frame.probeGeneration {
+			return
+		}
+	}
+	c.videoInFlight = false
+	c.videoInFlightKey = false
+	c.videoInFlightEpoch = 0
+	c.videoInFlightSeq = 0
+	c.videoInFlightConfigGen = 0
+	c.videoInFlightProbeGen = 0
+}
+
+func (c *client) currentVideoFrameInFlightLocked(epoch uint64) bool {
+	return c.videoInFlight &&
+		c.videoInFlightConfigGen == c.videoConfigGeneration &&
+		c.videoInFlightEpoch == epoch
+}
+
+func (c *client) clearVideoFrameInFlight(frame *queuedVideoFrame) {
+	c.videoMu.Lock()
+	c.clearVideoFrameInFlightLocked(frame)
+	c.videoMu.Unlock()
+}
+
 func (c *client) nextVideoWriteItem() (videoWriteItem, bool) {
 	c.videoMu.Lock()
 	defer c.videoMu.Unlock()
@@ -178,6 +247,7 @@ func (c *client) nextVideoWriteItem() (videoWriteItem, bool) {
 			c.enterAwaitingKeyframeLocked("queued_frame_expired")
 			continue
 		}
+		c.markVideoFrameInFlightLocked(item)
 		return videoWriteItem{messageType: websocket.MessageBinary, data: item.data, frame: &item}, true
 	}
 	return videoWriteItem{}, false
@@ -191,7 +261,12 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 		return true
 	}
 	if c.conn == nil {
+		c.clearVideoFrameInFlight(item.frame)
 		return false
+	}
+	if item.frame != nil {
+		c.startupTraceOrderMu.Lock()
+		defer c.startupTraceOrderMu.Unlock()
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, streamControlWriteTimeout)
 	err := c.conn.Write(writeCtx, item.messageType, item.data)
@@ -199,6 +274,7 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 	cancel()
 	if err != nil {
 		c.videoMu.Lock()
+		c.clearVideoFrameInFlightLocked(item.frame)
 		c.writerClosed = true
 		c.writerCloseReason = "write_failed"
 		c.videoMu.Unlock()
@@ -207,6 +283,7 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 	}
 	if canceled != nil {
 		c.videoMu.Lock()
+		c.clearVideoFrameInFlightLocked(item.frame)
 		c.writerClosed = true
 		c.writerCloseReason = "write_timeout"
 		c.videoMu.Unlock()
@@ -220,23 +297,55 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 }
 
 func (c *client) noteVideoFrameWritten(frame queuedVideoFrame) {
+	c.noteVideoFrameWrittenAt(frame, time.Now())
+}
+
+func (c *client) noteVideoFrameWrittenAt(frame queuedVideoFrame, writtenAt time.Time) {
+	if writtenAt.IsZero() {
+		writtenAt = time.Now()
+	}
 	c.videoMu.Lock()
-	defer c.videoMu.Unlock()
-	if frame.meta.ok {
+	c.clearVideoFrameInFlightLocked(&frame)
+	currentConfigGeneration := c.videoConfigGeneration
+	frameBelongsToCurrentConfig := frame.configGeneration == currentConfigGeneration
+	if frame.meta.ok && frameBelongsToCurrentConfig {
+		decodable := frame.meta.keyFrame || (c.videoReadyForDelta && c.videoReadyEpoch == frame.meta.epoch)
 		c.videoEpoch = frame.meta.epoch
 		c.videoLastWrittenSeq = frame.meta.sequence
+		c.videoWrittenEpoch = frame.meta.epoch
+		c.videoWrittenSequence = frame.meta.sequence
 		if frame.meta.keyFrame {
 			// Decoder readiness is granted only after conn.Write succeeded.
 			c.videoReadyForDelta = true
 			c.videoReadyEpoch = frame.meta.epoch
+			c.videoWrittenKeyframeSequence = frame.meta.sequence
+			probeKeyframeMatches := c.videoDeliveryMode == videoDeliveryProbe &&
+				c.videoProbeAwaitingKeyframe &&
+				frame.probeGeneration == c.videoProbeGeneration
+			if c.videoDeliveryMode != videoDeliveryProbe || probeKeyframeMatches {
+				c.videoKeyframeRequestPending = false
+			}
 			if c.videoDeliveryMode == videoDeliveryAwaitingKeyframe {
 				c.videoDeliveryMode = videoDeliveryFull
-			} else if c.videoDeliveryMode == videoDeliveryProbe {
+			} else if probeKeyframeMatches {
 				// Probe starts a complete GOP at a natural keyframe. It remains
 				// probe until feedback proves the browser stable for two seconds.
 				c.videoProbeAwaitingKeyframe = false
+				c.videoProbeKeyframeEpoch = frame.meta.epoch
+				c.videoProbeKeyframeSequence = frame.meta.sequence
 			}
 		}
+		c.videoWrittenEvidence = append(c.videoWrittenEvidence, videoWrittenFrameEvidence{
+			epoch: frame.meta.epoch, sequence: frame.meta.sequence, decodable: decodable,
+		})
+		if len(c.videoWrittenEvidence) > videoWrittenEvidenceLimit {
+			copy(c.videoWrittenEvidence, c.videoWrittenEvidence[len(c.videoWrittenEvidence)-videoWrittenEvidenceLimit:])
+			c.videoWrittenEvidence = c.videoWrittenEvidence[:videoWrittenEvidenceLimit]
+		}
+	}
+	c.videoMu.Unlock()
+	if frame.meta.ok && frameBelongsToCurrentConfig && c.onVideoFrameWritten != nil {
+		c.onVideoFrameWritten(frame.meta)
 	}
 }
 
@@ -254,10 +363,19 @@ func (c *client) enqueueControl(value []byte) {
 	message := queuedControlMessage{data: data, config: payload.Type == "config", epoch: payload.StreamEpoch}
 	c.videoMu.Lock()
 	accepted := c.enqueueControlLocked(message)
+	if accepted && message.config {
+		c.videoBroadcastReady = true
+	}
 	c.videoMu.Unlock()
 	if accepted {
 		c.signalVideoWriter()
 	}
+}
+
+func (c *client) readyForVideoBroadcast() bool {
+	c.videoMu.Lock()
+	defer c.videoMu.Unlock()
+	return c.videoBroadcastReady
 }
 
 // enqueueControlLocked keeps the control queue bounded while retaining the
@@ -268,6 +386,7 @@ func (c *client) enqueueControlLocked(message queuedControlMessage) bool {
 		return false
 	}
 	if message.config {
+		c.clearVideoFrameInFlightLocked(nil)
 		for i := len(c.controlQueue) - 1; i >= 0; i-- {
 			if !c.controlQueue[i].config {
 				continue
@@ -281,6 +400,15 @@ func (c *client) enqueueControlLocked(message queuedControlMessage) bool {
 		c.videoReadyEpoch = 0
 		c.videoLastWrittenSeq = 0
 		c.videoEpoch = message.epoch
+		c.videoConfigGeneration++
+		c.videoWrittenEpoch = 0
+		c.videoWrittenSequence = 0
+		c.videoWrittenKeyframeSequence = 0
+		c.videoWrittenEvidence = nil
+		c.videoProbeAwaitingKeyframe = false
+		c.videoProbeKeyframeEpoch = 0
+		c.videoProbeKeyframeSequence = 0
+		c.videoKeyframeRequestPending = false
 		c.videoDeliveryMode = videoDeliveryAwaitingKeyframe
 	}
 	for len(c.controlQueue) >= controlQueueMaxMessages || c.controlQueueBytes+len(message.data) > controlQueueMaxBytes {
@@ -309,31 +437,70 @@ func (c *client) enqueueControlLocked(message queuedControlMessage) bool {
 	return true
 }
 
-func (c *client) enqueueWarmStart(config, keyFrame []byte) {
-	c.startVideoWriter()
+func (c *client) videoConfigGenerationSnapshot() uint64 {
 	c.videoMu.Lock()
-	acceptedConfig := true
-	if len(config) > 0 {
-		var payload struct {
-			Type        string `json:"type"`
-			StreamEpoch uint64 `json:"streamEpoch"`
-		}
-		_ = json.Unmarshal(config, &payload)
-		acceptedConfig = c.enqueueControlLocked(queuedControlMessage{
-			data:   append([]byte(nil), config...),
-			config: payload.Type == "config",
-			epoch:  payload.StreamEpoch,
-		})
+	defer c.videoMu.Unlock()
+	return c.videoConfigGeneration
+}
+
+func (c *client) enqueueWarmStart(config, keyFrame []byte, expectedConfigGeneration uint64) (bool, bool, bool) {
+	return c.enqueueConfigAndKeyframe(config, keyFrame, &expectedConfigGeneration)
+}
+
+func (c *client) enqueuePhoneConfig(config, keyFrame []byte) (bool, bool) {
+	configAccepted, keyFrameAccepted, _ := c.enqueueConfigAndKeyframe(config, keyFrame, nil)
+	return configAccepted, keyFrameAccepted
+}
+
+// enqueueConfigAndKeyframe admits a decoder configuration and a matching
+// cached keyframe under one client lock. Warm snapshots additionally supply
+// the configuration generation observed before the hub snapshot; a live
+// configuration that wins that race makes the stale warm snapshot a no-op.
+func (c *client) enqueueConfigAndKeyframe(config, keyFrame []byte, expectedConfigGeneration *uint64) (bool, bool, bool) {
+	if len(config) == 0 {
+		return false, false, false
 	}
-	if acceptedConfig && len(keyFrame) > 0 && len(keyFrame) <= videoQueueMaxBytes {
-		meta := parseTSF2(keyFrame)
-		if meta.ok {
-			c.videoQueue = []queuedVideoFrame{{data: append([]byte(nil), keyFrame...), meta: meta, queuedAt: time.Now()}}
-			c.videoQueueBytes = len(keyFrame)
-		}
+	c.startVideoWriter()
+	var payload struct {
+		Type        string `json:"type"`
+		StreamEpoch uint64 `json:"streamEpoch"`
+	}
+	if err := json.Unmarshal(config, &payload); err != nil || payload.Type != "config" {
+		return false, false, false
+	}
+	message := queuedControlMessage{
+		data:   append([]byte(nil), config...),
+		config: true,
+		epoch:  payload.StreamEpoch,
+	}
+	var keyMeta tsf2Metadata
+	keyFrameMatches := false
+	if len(keyFrame) > 0 && len(keyFrame) <= videoQueueMaxBytes {
+		keyMeta = parseTSF2(keyFrame)
+		keyFrameMatches = keyMeta.ok && keyMeta.keyFrame && keyMeta.epoch == payload.StreamEpoch
+	}
+	c.videoMu.Lock()
+	if expectedConfigGeneration != nil && c.videoConfigGeneration != *expectedConfigGeneration {
+		c.videoMu.Unlock()
+		return false, false, true
+	}
+	acceptedConfig := c.enqueueControlLocked(message)
+	if acceptedConfig {
+		c.videoBroadcastReady = true
+	}
+	acceptedKeyFrame := false
+	if acceptedConfig && keyFrameMatches {
+		c.videoQueue = []queuedVideoFrame{{
+			data: append([]byte(nil), keyFrame...), meta: keyMeta, queuedAt: time.Now(), configGeneration: c.videoConfigGeneration, probeGeneration: c.videoProbeGeneration,
+		}}
+		c.videoQueueBytes = len(keyFrame)
+		acceptedKeyFrame = true
 	}
 	c.videoMu.Unlock()
-	c.signalVideoWriter()
+	if acceptedConfig {
+		c.signalVideoWriter()
+	}
+	return acceptedConfig, acceptedKeyFrame, false
 }
 
 func (c *client) enqueueVideoFrame(value []byte) {
@@ -357,6 +524,7 @@ func (c *client) enqueueVideoFrame(value []byte) {
 			return
 		}
 		c.videoEpoch = meta.epoch
+		c.clearVideoFrameInFlightLocked(nil)
 		c.videoQueue = nil
 		c.videoQueueBytes = 0
 		c.videoLastWrittenSeq = 0
@@ -374,15 +542,28 @@ func (c *client) enqueueVideoFrame(value []byte) {
 		return
 	}
 	if !meta.keyFrame && c.videoDeliveryMode == videoDeliveryProbe && c.videoProbeAwaitingKeyframe {
-		return
+		probeKeyframeInFlight := c.currentVideoFrameInFlightLocked(meta.epoch) &&
+			c.videoInFlightKey &&
+			c.videoInFlightProbeGen == c.videoProbeGeneration
+		probeKeyframeQueued := len(c.videoQueue) > 0 &&
+			c.videoQueue[0].meta.keyFrame &&
+			c.videoQueue[0].probeGeneration == c.videoProbeGeneration
+		if !probeKeyframeInFlight && !probeKeyframeQueued {
+			return
+		}
 	}
 	if !meta.keyFrame && c.videoDeliveryMode == videoDeliveryAwaitingKeyframe {
-		if len(c.videoQueue) == 0 || !c.videoQueue[len(c.videoQueue)-1].meta.keyFrame {
+		keyframeInFlight := c.currentVideoFrameInFlightLocked(meta.epoch) && c.videoInFlightKey
+		keyframeQueued := len(c.videoQueue) > 0 && c.videoQueue[0].meta.keyFrame
+		if !keyframeInFlight && !keyframeQueued {
 			return
 		}
 	}
 	if !meta.keyFrame {
 		base := c.videoLastWrittenSeq
+		if c.currentVideoFrameInFlightLocked(meta.epoch) {
+			base = c.videoInFlightSeq
+		}
 		if len(c.videoQueue) > 0 {
 			base = c.videoQueue[len(c.videoQueue)-1].meta.sequence
 		}
@@ -396,14 +577,13 @@ func (c *client) enqueueVideoFrame(value []byte) {
 		// obsolete GOP is safe to replace, but no delta may survive it.
 		c.videoQueue = c.videoQueue[:0]
 		c.videoQueueBytes = 0
-		if c.videoDeliveryMode == videoDeliveryProbe {
-			c.videoProbeAwaitingKeyframe = false
-		}
 	} else if len(c.videoQueue) >= videoQueueMaxFrames || c.videoQueueBytes+len(value) > videoQueueMaxBytes {
 		c.enterAwaitingKeyframeLocked("queue_overflow")
 		return
 	}
-	c.videoQueue = append(c.videoQueue, queuedVideoFrame{data: value, meta: meta, queuedAt: now})
+	c.videoQueue = append(c.videoQueue, queuedVideoFrame{
+		data: value, meta: meta, queuedAt: now, configGeneration: c.videoConfigGeneration, probeGeneration: c.videoProbeGeneration,
+	})
 	c.videoQueueBytes += len(value)
 	if now.Sub(c.videoQueue[0].queuedAt) > videoQueueMaxAge {
 		c.enterAwaitingKeyframeLocked("queue_age")
@@ -412,19 +592,47 @@ func (c *client) enqueueVideoFrame(value []byte) {
 	go c.signalVideoWriter()
 }
 
-func (c *client) enterAwaitingKeyframeLocked(_ string) {
+func (c *client) enterAwaitingKeyframeLocked(reason string) {
+	wasAwaiting := c.videoDeliveryMode == videoDeliveryKeyframeOnly || c.videoDeliveryMode == videoDeliveryAwaitingKeyframe
 	c.videoQueue = nil
 	c.videoQueueBytes = 0
+	c.clearVideoFrameInFlightLocked(nil)
 	c.videoReadyForDelta = false
 	c.videoReadyEpoch = 0
 	c.videoLastWrittenSeq = 0
 	c.videoProbeAwaitingKeyframe = false
+	c.videoProbeKeyframeEpoch = 0
+	c.videoProbeKeyframeSequence = 0
 	c.videoDeliveryMode = videoDeliveryKeyframeOnly
+	if !wasAwaiting && videoGapNeedsFreshKeyframe(reason) {
+		c.scheduleVideoKeyframeLocked(reason)
+	}
+}
+
+func videoGapNeedsFreshKeyframe(reason string) bool {
+	switch reason {
+	case "epoch_gap", "sequence_gap", "queue_overflow", "queue_age", "queued_frame_expired":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *client) scheduleVideoKeyframeLocked(reason string) {
+	if c.videoKeyframeRequestPending || c.onVideoKeyframeNeeded == nil {
+		return
+	}
+	c.videoKeyframeRequestPending = true
+	c.videoKeyframeRequestSequence++
+	requestSequence := c.videoKeyframeRequestSequence
+	request := c.onVideoKeyframeNeeded
+	go request(reason, requestSequence)
 }
 
 func (c *client) setVideoDeliveryMode(mode videoDeliveryMode) {
 	c.videoMu.Lock()
 	defer c.videoMu.Unlock()
+	previousMode := c.videoDeliveryMode
 	if mode == "" {
 		mode = videoDeliveryAwaitingKeyframe
 	}
@@ -432,12 +640,18 @@ func (c *client) setVideoDeliveryMode(mode videoDeliveryMode) {
 		c.enterAwaitingKeyframeLocked("feedback")
 	}
 	if mode == videoDeliveryProbe {
-		c.videoProbeAwaitingKeyframe = true
-		c.feedbackProbeSince = time.Now()
+		if previousMode != videoDeliveryProbe {
+			c.videoProbeGeneration++
+			c.videoProbeAwaitingKeyframe = true
+			c.videoProbeKeyframeEpoch = 0
+			c.videoProbeKeyframeSequence = 0
+			c.scheduleVideoKeyframeLocked("probe_transition")
+		}
 	}
 	if mode == videoDeliveryFull {
 		c.videoProbeAwaitingKeyframe = false
-		c.feedbackProbeSince = time.Time{}
+		c.videoProbeKeyframeEpoch = 0
+		c.videoProbeKeyframeSequence = 0
 	}
 	c.videoDeliveryMode = mode
 }
@@ -545,9 +759,13 @@ func clampFeedbackFPS(value int) int {
 }
 
 func (c *client) acceptStreamFeedback(data []byte, now time.Time) bool {
+	return c.acceptStreamFeedbackOutcome(data, now).accepted
+}
+
+func (c *client) acceptStreamFeedbackOutcome(data []byte, now time.Time) (outcome streamFeedbackOutcome) {
 	feedback, ok := decodeStreamFeedback(data)
 	if !ok {
-		return false
+		return outcome
 	}
 	if now.IsZero() {
 		now = time.Now()
@@ -556,20 +774,47 @@ func (c *client) acceptStreamFeedback(data []byte, now time.Time) bool {
 	defer c.feedbackMu.Unlock()
 	if !c.lastFeedbackAt.IsZero() && (now.Before(c.lastFeedbackAt) || now.Sub(c.lastFeedbackAt) < feedbackMinInterval) {
 		c.feedbackDropped++
-		return false
+		return outcome
 	}
 	c.videoMu.Lock()
 	expectedEpoch := c.videoEpoch
 	c.videoMu.Unlock()
 	if expectedEpoch != 0 && feedback.Epoch != expectedEpoch {
 		c.feedbackDropped++
-		return false
+		return outcome
 	}
 	if feedback.ReceivedSequence < c.lastFeedbackReceived || feedback.DecodedSequence < c.lastFeedbackDecoded || feedback.RenderedSequence < c.lastFeedbackRendered || feedback.RenderedKeyframeSequence < c.lastFeedbackRenderedKeyframe {
 		c.feedbackDropped++
-		return false
+		return outcome
 	}
+	previousReceived := c.lastFeedbackReceived
+	previousDecoded := c.lastFeedbackDecoded
+	previousRendered := c.lastFeedbackRendered
 	previousRenderedKeyframe := c.lastFeedbackRenderedKeyframe
+	hadPreviousFeedback := c.feedbackCount > 0
+	previousState := c.feedbackState
+	previousCause := c.feedbackCause
+	previousMode := c.deliveryMode()
+	outcome.accepted = true
+	outcome.fromMode = previousMode
+	outcome.queue = feedback.DecoderQueueSize
+	outcome.visualAgeMillis = feedback.RenderedVisualAgeMillis
+	if hadPreviousFeedback {
+		outcome.receivedDelta = feedback.ReceivedSequence - previousReceived
+		outcome.decodedDelta = feedback.DecodedSequence - previousDecoded
+		outcome.renderedDelta = feedback.RenderedSequence - previousRendered
+		if outcome.receivedDelta > 0 || outcome.decodedDelta > 0 || outcome.renderedDelta > 0 {
+			c.feedbackSourceStallRequested = false
+		}
+	}
+	defer func() {
+		outcome.cause = c.feedbackCause
+		outcome.state = c.feedbackState
+		outcome.toMode = c.deliveryMode()
+		outcome.transition = outcome.keyframeRequested ||
+			outcome.fromMode != outcome.toMode ||
+			(hadPreviousFeedback && (previousState != outcome.state || previousCause != outcome.cause))
+	}()
 	c.lastFeedbackAt = now
 	c.lastFeedbackEpoch = feedback.Epoch
 	c.lastFeedbackReceived = feedback.ReceivedSequence
@@ -579,39 +824,102 @@ func (c *client) acceptStreamFeedback(data []byte, now time.Time) bool {
 	c.lastFeedbackQueue = uint64(feedback.DecoderQueueSize)
 	c.lastFeedbackAge = uint64(feedback.RenderedVisualAgeMillis)
 	c.feedbackState = "flowing"
+	c.feedbackCause = "healthy"
 	c.feedbackVisibility = feedback.Visibility
 	c.feedbackCount++
 	lag := uint64(0)
 	if feedback.ReceivedSequence >= feedback.RenderedSequence {
 		lag = feedback.ReceivedSequence - feedback.RenderedSequence
 	}
-	hard := feedback.RenderedVisualAgeMillis > 2000 || feedback.DecoderQueueSize >= 5
-	soft := feedback.RenderedVisualAgeMillis > 1000 || feedback.DecoderQueueSize > 2 || lag > 5
+	outcome.lag = lag
+	// Visual age alone is not evidence that this viewer is congested. The source
+	// intentionally falls back to a 1 FPS static cadence, so a healthy advancing
+	// viewer can exceed a second with an empty decoder queue and no delivery lag.
+	// An aged render stall is browser pressure only when ingress or decode keeps
+	// advancing. If every sequence is stationary, the missing progress is
+	// upstream of the browser; lowering source cadence would make that stall worse.
+	renderedSequenceStalled := hadPreviousFeedback &&
+		feedback.RenderedVisualAgeMillis > feedbackStalledAgeMillis &&
+		feedback.RenderedSequence == previousRendered
+	sourceOrDeliveryStalled := renderedSequenceStalled &&
+		feedback.ReceivedSequence == previousReceived &&
+		feedback.DecodedSequence == previousDecoded &&
+		feedback.DecoderQueueSize <= 2 &&
+		lag <= 5
+	browserRenderStalled := renderedSequenceStalled &&
+		(feedback.ReceivedSequence > previousReceived || feedback.DecodedSequence > previousDecoded)
+	hard := feedback.DecoderQueueSize >= 5
+	softCause := ""
+	switch {
+	case feedback.DecoderQueueSize > 2:
+		softCause = "decoder_queue_soft"
+	case lag > 5:
+		softCause = "browser_render_lag"
+	case browserRenderStalled:
+		softCause = "browser_render_stall"
+	}
+	soft := softCause != ""
 	if hard {
+		c.feedbackSourceStallStreak = 0
 		c.feedbackPressureStreak = 2
 		c.feedbackHealthyStreak = 0
 		c.feedbackKeyframeStreak = 0
 		c.feedbackProbeSince = time.Time{}
 		c.feedbackState = "congested_awaiting_keyframe"
+		c.feedbackCause = "decoder_queue_hard"
 		c.setVideoDeliveryMode(videoDeliveryKeyframeOnly)
-		return true
+		return outcome
 	}
+	if sourceOrDeliveryStalled {
+		c.feedbackPressureStreak = 0
+		c.feedbackHealthyStreak = 0
+		c.feedbackKeyframeStreak = 0
+		c.feedbackProbeSince = time.Time{}
+		if c.feedbackSourceStallStreak < 2 {
+			c.feedbackSourceStallStreak++
+		}
+		if c.feedbackSourceStallStreak >= 2 {
+			c.feedbackState = "upstream_or_delivery_stalled"
+			c.feedbackCause = "upstream_or_delivery_stall"
+			if !c.feedbackSourceStallRequested {
+				c.videoMu.Lock()
+				wasPending := c.videoKeyframeRequestPending
+				c.scheduleVideoKeyframeLocked("source_stall")
+				outcome.keyframeRequested = !wasPending && c.videoKeyframeRequestPending
+				c.videoMu.Unlock()
+				c.feedbackSourceStallRequested = true
+			}
+		} else {
+			c.feedbackState = previousState
+			c.feedbackCause = previousCause
+		}
+		return outcome
+	}
+	c.feedbackSourceStallStreak = 0
 	if soft {
 		c.feedbackHealthyStreak = 0
 		c.feedbackKeyframeStreak = 0
 		c.feedbackProbeSince = time.Time{}
 		c.feedbackState = "congested_awaiting_keyframe"
+		c.feedbackCause = softCause
 		if c.feedbackPressureStreak < 2 {
 			c.feedbackPressureStreak++
 		}
 		if c.feedbackPressureStreak >= 2 {
 			c.setVideoDeliveryMode(videoDeliveryKeyframeOnly)
-			return true
+			return outcome
 		}
 	} else {
 		c.feedbackPressureStreak = 0
-		healthyKeyframe := feedback.RenderedVisualAgeMillis <= 750 && feedback.DecoderQueueSize <= 1
 		mode := c.deliveryMode()
+		healthyVisualAgeMillis := int64(750)
+		if mode == videoDeliveryKeyframeOnly || mode == videoDeliveryProbe {
+			// Keyframe-only demand intentionally lowers the source to 1 FPS. Give
+			// its one-second frame interval plus feedback scheduling, command, and
+			// transport latency enough room during both recovery stages.
+			healthyVisualAgeMillis = feedbackStalledAgeMillis
+		}
+		healthyKeyframe := feedback.RenderedVisualAgeMillis <= healthyVisualAgeMillis && feedback.DecoderQueueSize <= 1
 		if mode == videoDeliveryKeyframeOnly {
 			if healthyKeyframe && c.feedbackHealthyStreak < 3 {
 				c.feedbackHealthyStreak++
@@ -627,26 +935,45 @@ func (c *client) acceptStreamFeedback(data []byte, now time.Time) bool {
 			// three-sample fallback keeps compatibility with older browsers that
 			// only reported their latest rendered keyframe cumulatively.
 			if c.feedbackKeyframeStreak >= 2 || (c.feedbackKeyframeStreak >= 1 && c.feedbackHealthyStreak >= 3) {
+				c.feedbackProbeSince = time.Time{}
 				c.setVideoDeliveryMode(videoDeliveryProbe)
 			}
 		} else if mode == videoDeliveryProbe {
 			if !healthyKeyframe {
 				c.feedbackKeyframeStreak = 0
+				c.feedbackProbeSince = time.Time{}
 				c.setVideoDeliveryMode(videoDeliveryKeyframeOnly)
-				return true
-			}
-			if c.feedbackProbeSince.IsZero() {
-				c.feedbackProbeSince = now
+				return outcome
 			}
 			c.videoMu.Lock()
 			probeAwaitingKeyframe := c.videoProbeAwaitingKeyframe
+			probeKeyframeEpoch := c.videoProbeKeyframeEpoch
+			probeKeyframeSequence := c.videoProbeKeyframeSequence
 			c.videoMu.Unlock()
-			if !probeAwaitingKeyframe && now.Sub(c.feedbackProbeSince) >= 2*time.Second {
+			// Probe stability begins with the first healthy browser sample that
+			// proves the specifically requested, successfully written keyframe was
+			// rendered. Command latency and an older rendered GOP cannot consume
+			// the two-second evidence window.
+			probeKeyframeRendered := !probeAwaitingKeyframe &&
+				probeKeyframeEpoch != 0 &&
+				feedback.Epoch == probeKeyframeEpoch &&
+				feedback.RenderedSequence >= probeKeyframeSequence &&
+				feedback.RenderedKeyframeSequence >= probeKeyframeSequence
+			if !probeKeyframeRendered {
+				c.feedbackProbeSince = time.Time{}
+				return outcome
+			}
+			if c.feedbackProbeSince.IsZero() {
+				c.feedbackProbeSince = now
+				return outcome
+			}
+			if now.Sub(c.feedbackProbeSince) >= 2*time.Second {
+				c.feedbackProbeSince = time.Time{}
 				c.setVideoDeliveryMode(videoDeliveryFull)
 			}
 		}
 	}
-	return true
+	return outcome
 }
 
 func (c *client) feedbackSnapshot() map[string]any {
@@ -670,6 +997,7 @@ func (c *client) feedbackSnapshot() map[string]any {
 		"feedbackVisualAge":   c.lastFeedbackAge,
 		"feedbackVisibility":  c.feedbackVisibility,
 		"feedbackState":       c.feedbackState,
+		"feedbackCause":       c.feedbackCause,
 		"videoDeliveryMode":   string(mode),
 		"videoQueueFrames":    queueFrames,
 		"videoQueueBytes":     queueBytes,

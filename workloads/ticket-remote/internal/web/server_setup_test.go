@@ -71,6 +71,32 @@ func TestRelayViewerCountTracksUniqueBrowserSessions(t *testing.T) {
 	}
 }
 
+func TestRelayViewerAddRecordsPrivateRelayConnectStart(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	t.Cleanup(server.Close)
+	traceID := server.direct.beginStartupTrace("session-a", "index_prewarm")
+	server.addRelayViewer("session-a")
+
+	snapshot := server.direct.snapshot(time.Now(), server.relay.Snapshot())
+	trace, ok := snapshot["startupTrace"].(map[string]any)
+	if !ok {
+		t.Fatalf("startup trace missing: %#v", snapshot["startupTrace"])
+	}
+	if trace["id"] != traceID {
+		t.Fatalf("startup trace id = %#v, want %q", trace["id"], traceID)
+	}
+	phases, ok := trace["phases"].([]streamStartupTracePhase)
+	if !ok {
+		t.Fatalf("startup trace phases missing: %#v", trace["phases"])
+	}
+	for _, phase := range phases {
+		if phase.Name == "private_relay_connect_started" {
+			return
+		}
+	}
+	t.Fatalf("private relay connect phase missing: %#v", phases)
+}
+
 func TestSpacetimeClientUsesCurrentProductTablesOnly(t *testing.T) {
 	body, err := staticFS.ReadFile("static/spacetime-client.js")
 	if err != nil {
@@ -207,13 +233,188 @@ func TestPublicOpenGraceExpiresIfNoFrameRenders(t *testing.T) {
 	}
 }
 
+func TestExplicitUncorrelatedGraceDoesNotMarkUnrelatedStartupTrace(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	traceID := server.direct.startStartupTrace("session-b", "authenticated_index_accepted")
+	beforeSnapshot := server.direct.snapshot(time.Now(), server.relay.Snapshot())
+	before, _ := beforeSnapshot["startupTrace"].(map[string]any)
+	beforePhases, _ := before["phases"].([]streamStartupTracePhase)
+
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "legacy_socket_open", "")
+	afterRetainSnapshot := server.direct.snapshot(time.Now(), server.relay.Snapshot())
+	afterRetain, _ := afterRetainSnapshot["startupTrace"].(map[string]any)
+	afterRetainPhases, _ := afterRetain["phases"].([]streamStartupTracePhase)
+	if len(afterRetainPhases) != len(beforePhases) {
+		t.Fatalf("explicit uncorrelated grace marked unrelated trace %q: %#v", traceID, afterRetainPhases)
+	}
+	server.releaseRelayViewerPublicOpenGrace("session-a", "legacy_socket_cleanup", "")
+	afterReleaseSnapshot := server.direct.snapshot(time.Now(), server.relay.Snapshot())
+	afterRelease, _ := afterReleaseSnapshot["startupTrace"].(map[string]any)
+	afterReleasePhases, _ := afterRelease["phases"].([]streamStartupTracePhase)
+	if len(afterReleasePhases) != len(beforePhases) {
+		t.Fatalf("explicit uncorrelated grace release marked unrelated trace %q: %#v", traceID, afterReleasePhases)
+	}
+}
+
+func TestPublicOpenGraceOwnerCASRejectsLateOldRunRelease(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	const sessionID = "shared-session"
+	traceA := server.direct.startStartupTrace(sessionID, "run_a")
+	server.addRelayViewer(sessionID)
+	server.retainRelayViewerForPublicOpenGrace(sessionID, time.Hour, "run_a_open", traceA)
+	traceB := server.direct.startStartupTrace(sessionID, "run_b")
+	server.retainRelayViewerForPublicOpenGrace(sessionID, time.Hour, "run_b_open", traceB)
+
+	server.mu.Lock()
+	ownerBefore := server.streamPrewarmOwners[sessionID]
+	timerBefore := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if ownerBefore != traceB || timerBefore == nil {
+		t.Fatalf("replacement grace owner=%q timer=%v, want trace B", ownerBefore, timerBefore != nil)
+	}
+	server.retainRelayViewerForPublicOpenGrace(sessionID, time.Hour, "late_run_a_close", traceA)
+	server.mu.Lock()
+	ownerAfterLateRetain := server.streamPrewarmOwners[sessionID]
+	timerAfterLateRetain := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if ownerAfterLateRetain != traceB || timerAfterLateRetain != timerBefore {
+		t.Fatalf("late retain changed grace owner=%q timer_same=%t", ownerAfterLateRetain, timerAfterLateRetain == timerBefore)
+	}
+	if server.retainRelaysForDuration(sessionID, 0, false, "release", traceA) {
+		t.Fatal("late old run released replacement grace")
+	}
+	if server.retainRelaysForDuration(sessionID, 0, false, "release", "") {
+		t.Fatal("uncorrelated socket released trace-bound grace")
+	}
+	server.mu.Lock()
+	ownerAfter := server.streamPrewarmOwners[sessionID]
+	timerAfter := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if ownerAfter != traceB || timerAfter != timerBefore {
+		t.Fatalf("late release changed grace owner=%q timer_same=%t", ownerAfter, timerAfter == timerBefore)
+	}
+	server.releaseRelayViewerPublicOpenGrace(sessionID, "test_cleanup", traceB)
+	server.removeRelayViewer(sessionID)
+}
+
+func TestReplacedRunCanReleaseItsOwnUnreplacedGrace(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	const sessionID = "shared-session"
+	traceA := server.direct.startStartupTrace(sessionID, "run_a")
+	server.addRelayViewer(sessionID)
+	server.retainRelayViewerForPublicOpenGrace(sessionID, time.Hour, "run_a_open", traceA)
+	server.direct.startStartupTrace(sessionID, "run_b")
+
+	server.releaseRelayViewerPublicOpenGrace(sessionID, "run_a_painted", traceA)
+	server.mu.Lock()
+	_, timerPresent := server.streamPrewarmTimers[sessionID]
+	_, ownerPresent := server.streamPrewarmOwners[sessionID]
+	server.mu.Unlock()
+	if timerPresent || ownerPresent {
+		t.Fatalf("replaced run's own grace remained: timer=%t owner=%t", timerPresent, ownerPresent)
+	}
+	server.removeRelayViewer(sessionID)
+}
+
+func TestTracedPrewarmLeaseKeepsLatestTraceOwner(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	const sessionID = "shared-session"
+	traceA := server.direct.startStartupTrace(sessionID, "run_a")
+	server.retainRelayViewerForPrewarm(sessionID, time.Hour, startupTraceCorrelationID(traceA), traceA)
+	traceB := server.direct.startStartupTrace(sessionID, "run_b")
+	server.retainRelayViewerForPrewarm(sessionID, time.Hour, startupTraceCorrelationID(traceB), traceB)
+
+	server.mu.Lock()
+	ownerBefore := server.streamPrewarmOwners[sessionID]
+	timerBefore := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if ownerBefore != traceB || timerBefore == nil {
+		t.Fatalf("replacement prewarm owner=%q timer=%v, want trace B", ownerBefore, timerBefore != nil)
+	}
+	if server.retainRelaysForDuration(sessionID, time.Hour, true, "prewarm", traceA) {
+		t.Fatal("late old run installed a replacement prewarm lease")
+	}
+	server.mu.Lock()
+	ownerAfter := server.streamPrewarmOwners[sessionID]
+	timerAfter := server.streamPrewarmTimers[sessionID]
+	server.mu.Unlock()
+	if ownerAfter != traceB || timerAfter != timerBefore {
+		t.Fatalf("late prewarm changed owner=%q timer_same=%t", ownerAfter, timerAfter == timerBefore)
+	}
+	if !server.retainRelaysForDuration(sessionID, 0, false, "release", traceB) {
+		t.Fatal("latest trace could not release its own prewarm lease")
+	}
+	server.removeRelayViewer(sessionID)
+}
+
+func TestPublicOpenGraceInstallCannotOutrunSiblingCompletion(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	const sessionID = "shared-session"
+	traceID := server.direct.startStartupTrace(sessionID, "shared_run")
+	server.addRelayViewer(sessionID)
+
+	// Hold the timer-state lock so retain reaches the trace CAS and pauses
+	// immediately before installation. Completion must wait for that CAS, and
+	// its subsequent release must wait until the matching relay ref is added.
+	server.mu.Lock()
+	retainDone := make(chan struct{})
+	go func() {
+		server.retainRelayViewerForPublicOpenGrace(sessionID, time.Hour, "sibling_open", traceID)
+		close(retainDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	traceLocked := false
+	for time.Now().Before(deadline) {
+		if server.direct.mu.TryLock() {
+			server.direct.mu.Unlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		traceLocked = true
+		break
+	}
+	if !traceLocked {
+		server.mu.Unlock()
+		t.Fatal("grace retain did not reach the trace CAS")
+	}
+	completionDone := make(chan struct{})
+	go func() {
+		server.direct.completeStartupTraceForTrace(traceID, "browser_first_rendered_frame", "sibling=true")
+		server.releaseRelayViewerPublicOpenGrace(sessionID, "sibling_painted", traceID)
+		close(completionDone)
+	}()
+	server.mu.Unlock()
+
+	select {
+	case <-retainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("grace retain did not finish")
+	}
+	select {
+	case <-completionDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sibling completion did not release the installed grace")
+	}
+	server.mu.Lock()
+	_, timerPresent := server.streamPrewarmTimers[sessionID]
+	_, ownerPresent := server.streamPrewarmOwners[sessionID]
+	viewerRefs := server.relayViewerRefs[sessionID]
+	server.mu.Unlock()
+	if timerPresent || ownerPresent || viewerRefs != 1 {
+		t.Fatalf("completed sibling left grace state: timer=%t owner=%t viewer_refs=%d", timerPresent, ownerPresent, viewerRefs)
+	}
+	server.removeRelayViewer(sessionID)
+}
+
 func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
 	server := newTicketSetupTestServer(t, "pixel")
-	client := &client{sessionID: "session-a"}
+	startupTraceID := server.direct.beginStartupTrace("session-a", "test_video_socket_open")
+	client := &client{sessionID: "session-a", startupTraceID: startupTraceID}
+	noteTestKeyframeWritten(client, 7, 1, time.Now())
 
 	server.addRelayViewer("session-a")
-	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
-	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameSequence\":1}"}`))
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open", startupTraceID)
+	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":7,\"frameSequence\":1}"}`))
 
 	if !client.firstVideoFrameRendered {
 		t.Fatal("client should be marked as having rendered its first video frame")
@@ -229,7 +430,9 @@ func TestFirstRenderedFrameReleasesPublicOpenGrace(t *testing.T) {
 
 func TestFirstRenderedFrameReleasesPublicOpenGraceWhenDiagnosticLimitIsFull(t *testing.T) {
 	server := newTicketSetupTestServer(t, "pixel")
-	client := &client{sessionID: "session-a"}
+	startupTraceID := server.direct.beginStartupTrace("session-a", "test_video_socket_open")
+	client := &client{sessionID: "session-a", startupTraceID: startupTraceID}
+	noteTestKeyframeWritten(client, 7, 1, time.Now())
 	now := time.Now()
 	for index := 0; index < maxBrowserClientLogsPerMinute; index++ {
 		if !client.allowClientLog(now) || !server.allowBrowserClientLog(now) {
@@ -238,8 +441,8 @@ func TestFirstRenderedFrameReleasesPublicOpenGraceWhenDiagnosticLimitIsFull(t *t
 	}
 
 	server.addRelayViewer("session-a")
-	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open")
-	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameSequence\":1}"}`))
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open", startupTraceID)
+	server.handleVideoStreamMessage(context.Background(), client, []byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":7,\"frameSequence\":1}"}`))
 
 	if !client.firstVideoFrameRendered {
 		t.Fatal("first rendered frame lifecycle acknowledgement was blocked by diagnostic rate limiting")
@@ -248,6 +451,84 @@ func TestFirstRenderedFrameReleasesPublicOpenGraceWhenDiagnosticLimitIsFull(t *t
 	if got := server.relay.Snapshot().Viewers; got != 0 {
 		t.Fatalf("relay viewers after rate-limited rendered socket closes = %d, want 0", got)
 	}
+}
+
+func TestBrowserFrameMarkersRequireMatchingSuccessfulWriterEvidence(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	startupTraceID := server.direct.beginStartupTrace("session-a", "test_video_socket_open")
+	client := &client{sessionID: "session-a", startupTraceID: startupTraceID}
+	noteTestKeyframeWritten(client, 9, 10, time.Now())
+
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Hour, "video_socket_open", startupTraceID)
+	for _, marker := range [][]byte{
+		[]byte(`{"type":"client_log","event":"browser_first_frame_decoded","detail":"{\"frameEpoch\":8,\"frameSequence\":10}"}`),
+		[]byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":9,\"frameSequence\":9}"}`),
+	} {
+		server.handleVideoStreamMessage(context.Background(), client, marker)
+	}
+
+	if client.firstVideoFrameRendered {
+		t.Fatal("mismatched browser marker was accepted without matching writer evidence")
+	}
+	trace := server.direct.startupTraceSnapshot(time.Now())
+	if trace["complete"] == true {
+		t.Fatalf("mismatched browser marker completed startup trace: %#v", trace)
+	}
+	server.mu.Lock()
+	graceRetained := server.streamPrewarmTimers["session-a"] != nil
+	server.mu.Unlock()
+	if !graceRetained {
+		t.Fatal("mismatched browser marker released public-open grace")
+	}
+
+	for _, marker := range [][]byte{
+		[]byte(`{"type":"client_log","event":"browser_first_frame_decoded","detail":"{\"frameEpoch\":9,\"frameSequence\":10}"}`),
+		[]byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":9,\"frameSequence\":10}"}`),
+	} {
+		server.handleVideoStreamMessage(context.Background(), client, marker)
+	}
+	if !client.firstVideoFrameRendered {
+		t.Fatal("matching browser marker was not accepted after successful writer evidence")
+	}
+	trace = server.direct.startupTraceSnapshot(time.Now())
+	if trace["complete"] != true {
+		t.Fatalf("matching browser marker did not complete startup trace: %#v", trace)
+	}
+	server.removeRelayViewer("session-a")
+}
+
+func TestDelayedBrowserMarkerUsesBoundedSuccessfulWriterHistory(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	startupTraceID := server.direct.beginStartupTrace("session-delayed", "test_video_socket_open")
+	client := &client{sessionID: "session-delayed", startupTraceID: startupTraceID}
+	now := time.Now()
+	noteTestKeyframeWritten(client, 9, 10, now)
+	noteTestKeyframeWritten(client, 9, 20, now.Add(time.Millisecond))
+
+	server.addRelayViewer("session-delayed")
+	server.retainRelayViewerForPublicOpenGrace("session-delayed", time.Hour, "video_socket_open", startupTraceID)
+	for _, marker := range [][]byte{
+		[]byte(`{"type":"client_log","event":"browser_first_frame_decoded","detail":"{\"frameEpoch\":9,\"frameSequence\":10}"}`),
+		[]byte(`{"type":"client_log","event":"stream_first_rendered_frame","detail":"{\"frameEpoch\":9,\"frameSequence\":10}"}`),
+	} {
+		server.handleVideoStreamMessage(context.Background(), client, marker)
+	}
+
+	if !client.firstVideoFrameRendered {
+		t.Fatal("one-shot delayed marker for an earlier successful frame was rejected")
+	}
+	trace := server.direct.startupTraceSnapshot(time.Now())
+	if trace["complete"] != true {
+		t.Fatalf("delayed successful marker did not complete startup trace: %#v", trace)
+	}
+	server.mu.Lock()
+	graceRetained := server.streamPrewarmTimers["session-delayed"] != nil
+	server.mu.Unlock()
+	if graceRetained {
+		t.Fatal("delayed successful paint marker did not release public-open grace")
+	}
+	server.removeRelayViewer("session-delayed")
 }
 
 func TestPublicHTTPRedirectsToHTTPS(t *testing.T) {
@@ -875,8 +1156,13 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if !strings.Contains(serverGo, "assetVersionValue = serverVersion") {
 		t.Fatalf("ticket asset fallback version must follow the page version so public caches cannot keep an old app.js")
 	}
-	if strings.Contains(indexHTML, `/static/spacetime-client.js`) || strings.Contains(adminHTML, `/static/spacetime-client.js`) {
-		t.Fatalf("ticket pages must not block first video frame behind the Spacetime client script")
+	if strings.Contains(indexHTML, `/static/spacetime-client.js`) {
+		t.Fatalf("ticket viewer must not block first video frame behind the Spacetime client script")
+	}
+	for _, snippet := range []string{`/static/spacetime-client.js?v={{.AssetVersion}}`, `/static/admin-schedule.js?v={{.AssetVersion}}`} {
+		if !strings.Contains(adminHTML, snippet) {
+			t.Fatalf("admin scheduled redetection must use the direct authenticated client, missing %q", snippet)
+		}
 	}
 	for _, snippet := range []string{
 		"function usesDirectSpacetimeAuth()",

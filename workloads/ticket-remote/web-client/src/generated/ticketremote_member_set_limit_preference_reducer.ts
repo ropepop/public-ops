@@ -12,10 +12,5 @@ import {
 
 export default {
   ticketId: __t.string(),
-  backendId: __t.string(),
-  interactionRevision: __t.string(),
-  controlId: __t.string(),
-  inputSequence: __t.string(),
-  inputPhase: __t.string(),
-  progress: __t.u32(),
+  obeyLimits: __t.bool(),
 };

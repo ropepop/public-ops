@@ -85,6 +85,31 @@ export const TicketremoteControlCodeRequest = __t.object("TicketremoteControlCod
 });
 export type TicketremoteControlCodeRequest = __Infer<typeof TicketremoteControlCodeRequest>;
 
+export const TicketremoteMemberLimitState = __t.object("TicketremoteMemberLimitState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  ownerPublicId: __t.string(),
+  obeyLimits: __t.bool(),
+  canBypass: __t.bool(),
+  effectiveLimited: __t.bool(),
+  registrationAllowed: __t.bool(),
+  registrationReason: __t.string(),
+  registrationCount: __t.u32(),
+  registrationLimit: __t.u32(),
+  registrationIntervalSeconds: __t.u32(),
+  registrationRetryAt: __t.string(),
+  registrationNextReleaseAt: __t.string(),
+  controlCodeAllowed: __t.bool(),
+  controlCodeReason: __t.string(),
+  controlCodeCount: __t.u32(),
+  controlCodeLimit: __t.u32(),
+  controlCodeWindowSeconds: __t.u32(),
+  controlCodeRetryAt: __t.string(),
+  updatedAt: __t.string(),
+  serverAt: __t.string(),
+});
+export type TicketremoteMemberLimitState = __Infer<typeof TicketremoteMemberLimitState>;
+
 export const TicketremotePhoneCurrentReport = __t.object("TicketremotePhoneCurrentReport", {
   id: __t.string(),
   ticketId: __t.string(),

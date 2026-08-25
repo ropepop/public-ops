@@ -225,11 +225,11 @@ The single internal schedule runs every five minutes and deletes at most 1,000
 expired rows per transaction through the expiry index. This keeps cleanup cost
 bounded. With no backlog, an expired row can remain for up to five additional
 minutes; a backlog drains at up to 12,000 rows per hour. The Ticket service
-admits at most 60 browser diagnostics per minute globally, uses no more than 64
+admits at most 60 browser diagnostics per minute globally, uses no more than 66
 fixed browser event names, and the central reducer samples every informational
 browser name by minute. Typed Ticket latency proof admits at most 1,800 rows
-per hour, while the worst-case sampled browser vocabulary adds at most 3,840.
-Their combined 5,640 rows use less than half of the 12,000-row hourly cleanup
+per hour, while the worst-case sampled browser vocabulary adds at most 3,960.
+Their combined 5,760 rows use less than half of the 12,000-row hourly cleanup
 capacity, leaving meaningful headroom for warnings and other domains. Archive
 rows use retention class `archive` and stay outside the normal cleanup range.
 

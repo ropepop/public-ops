@@ -70,16 +70,30 @@ func TestStaticClientKeepsArrowPresenceListMountedAcrossIdentifierRefresh(t *tes
 
 func TestAdminTicketSelectionIsServerRendered(t *testing.T) {
 	admin := ticketRemoteSourceFile(t, "internal", "web", "static", "admin.html.tmpl")
-	for _, required := range []string{"Latest ticket", `/api/v1/admin/ticket/reselect-latest`, "{{.RawState}}"} {
+	for _, required := range []string{"Latest ticket", `class="admin-redetect-form"`, `class="admin-schedule-form"`, `id="adminObeyMemberLimits"`, "Obey normal user limits", "{{.RawState}}"} {
 		if !strings.Contains(admin, required) {
 			t.Fatalf("server-rendered admin missing %q", required)
 		}
 	}
+	if strings.Contains(admin, `action="/api/v1/admin/ticket/reselect-latest"`) {
+		t.Fatal("immediate admin redetection must not retain the legacy POST producer")
+	}
 }
 
-func TestAdminHasNoClientHealthParser(t *testing.T) {
+func TestAdminHasOnlyScopedDirectTicketActionClient(t *testing.T) {
 	admin := ticketRemoteSourceFile(t, "internal", "web", "static", "admin.html.tmpl")
-	if strings.Contains(admin, `<script`) || strings.Contains(admin, `app.js`) {
-		t.Fatal("admin must remain a server-rendered page without a client health parser")
+	for _, required := range []string{`class="admin-redetect-form" data-direct-ticket-action-v3="true"`, `class="admin-schedule-form" data-direct-ticket-action-v3="true"`, `/static/spacetime-client.js`, `/static/admin-schedule.js`} {
+		if !strings.Contains(admin, required) {
+			t.Fatalf("admin direct Ticket action client missing %q", required)
+		}
+	}
+	if got := strings.Count(admin, `action="/api/v1/admin/ticket/reselect-latest/schedule"`); got != 1 {
+		t.Fatalf("schedule compatibility route must remain cancel-only, got %d template producers", got)
+	}
+	if !strings.Contains(admin, `data-schedule-purpose="{{.Purpose}}"`) {
+		t.Fatal("manual redetection status must expose its filtered purpose for browser verification")
+	}
+	if strings.Contains(admin, `app.js`) || strings.Contains(admin, `healthJson`) {
+		t.Fatal("admin must not load the viewer app or add a client health parser")
 	}
 }

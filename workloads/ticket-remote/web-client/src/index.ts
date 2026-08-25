@@ -1,5 +1,6 @@
 import { DbConnection } from "./generated/index";
 import { installCspSafeSpacetimeCodecs } from "./csp-safe-codecs";
+import { ticketActionV3ActionsByAuthority } from "../ticket-action-v3-core.mjs";
 
 installCspSafeSpacetimeCodecs();
 
@@ -10,6 +11,7 @@ type TicketClientConfig = {
   ticketId: string;
   sessionId: string;
   email: string;
+  backendId?: string;
 };
 
 type TicketClientHandlers = {
@@ -280,80 +282,58 @@ class TicketSpacetimeClient {
     });
   }
 
-  requestTicketReset(resetRequestId: string, reason = "ticket_reset_requested"): Promise<void> {
-    return this.callReducer("memberRequestTicketReset", {
+  setLimitPreference(obeyLimits: boolean): Promise<void> {
+    return this.callReducer("memberSetLimitPreference", {
       ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      resetRequestId,
-      reason,
+      obeyLimits: Boolean(obeyLimits),
     });
   }
 
-  requestTicketResetV2(attemptId: string, resetRequestId: string, reason = "ticket_reset_requested"): Promise<void> {
-    return this.callReducer("memberRequestTicketResetV2", {
+  refreshLimitState(): Promise<void> {
+    return this.callReducer("memberRefreshLimitState", {
       ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      resetRequestId,
-      reason,
-      attemptId,
     });
   }
 
-  activateTicketButton(args: {
-    interactionRevision: string;
-    controlId: string;
-    inputSequence: string;
+  requestTicketActionV3(args: {
+    actionId: string;
+    target: string;
+    source: string;
+    reason: string;
+    attemptId?: string;
+    expectedInteractionRevision?: string;
+    scheduleId?: string;
   }): Promise<void> {
-    return this.callReducer("memberActivateTicketButton", {
+    return this.callReducer("memberRequestTicketActionV3", {
+      version: 3,
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
-      ...args,
+      actionId: args.actionId,
+      target: args.target,
+      source: args.source,
+      reason: args.reason,
+      attemptId: args.attemptId || "",
+      expectedInteractionRevision: args.expectedInteractionRevision || "",
+      scheduleId: args.scheduleId || "",
     });
   }
 
-  activateTicketButtonV2(args: {
-    interactionRevision: string;
-    controlId: string;
-    inputSequence: string;
-    attemptId: string;
+  scheduleTicketActionV3(args: {
+    scheduleId: string;
+    scheduledAtMicros: bigint;
+    phoneLocalTime: string;
+    phoneTimeZone: string;
+    target?: string;
   }): Promise<void> {
-    return this.callReducer("memberActivateTicketButtonV2", {
+    return this.callReducer("adminScheduleTicketActionV3", {
+      version: 3,
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
-      ...args,
-    });
-  }
-
-  claimTicketSlider(args: {
-    interactionRevision: string;
-    controlId: string;
-    initialInputSequence: string;
-    holdDurationMillis: number;
-    horizontalTravelCss: number;
-    verticalTravelCss: number;
-    initialProgress: number;
-  }): Promise<void> {
-    return this.callReducer("memberClaimTicketSlider", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      ...args,
-    });
-  }
-
-  claimTicketSliderV2(args: {
-    interactionRevision: string;
-    controlId: string;
-    initialInputSequence: string;
-    holdDurationMillis: number;
-    horizontalTravelCss: number;
-    verticalTravelCss: number;
-    initialProgress: number;
-    attemptId: string;
-  }): Promise<void> {
-    return this.callReducer("memberClaimTicketSliderV2", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      ...args,
+      scheduleId: args.scheduleId,
+      scheduledAtMicros: args.scheduledAtMicros,
+      phoneLocalTime: args.phoneLocalTime,
+      phoneTimeZone: args.phoneTimeZone,
+      target: args.target || "redetect_latest",
     });
   }
 
@@ -370,18 +350,6 @@ class TicketSpacetimeClient {
         reject(new Error("activation decision timed out"));
       }, Math.max(500, timeoutMs));
       this.activationDecisionWaiters.set(cleanAttemptId, { resolve, reject, timer });
-    });
-  }
-
-  updateTicketSlider(inputSequence: string, controlId: string, interactionRevision: string, inputPhase: string, progress: number): Promise<void> {
-    return this.callReducer("memberUpdateTicketSlider", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      interactionRevision,
-      controlId,
-      inputSequence,
-      inputPhase,
-      progress,
     });
   }
 
@@ -446,6 +414,9 @@ class TicketSpacetimeClient {
         }
         this.handlers.onSnapshotApplied?.();
         this.publishFocusedState();
+        void this.refreshLimitState().catch((error) => {
+          this.handlers.onStatus?.("limit_refresh_failed", error && String(error));
+        });
       })
       .subscribe([
         `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
@@ -457,6 +428,9 @@ class TicketSpacetimeClient {
         `SELECT * FROM ticketremote_ticket_interaction WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_activation_eligibility WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_activation_decision WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+        `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+        `SELECT * FROM ticketremote_ticket_slider_region_v3 WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_member_limit_state WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       ]);
   }
 
@@ -476,6 +450,11 @@ class TicketSpacetimeClient {
       .find((row) => rowId(row) === backendRow) || null;
     const activationEligibility = tableRows(tableAccessor(db, "activation_eligibility"))
       .find((row) => rowId(row) === backendRow) || null;
+    const ticketSliderRegion = tableRows(tableAccessor(db, "ticket_slider_region_v3"))
+      .find((row) => rowId(row) === backendRow) || null;
+    const memberLimitState = tableRows(tableAccessor(db, "member_limit_state"))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId &&
+        String(row.ownerPublicId || row.owner_public_id || "") === accountPublicId(this.cfg.email)) || null;
     const activationDecisions = tableRows(tableAccessor(db, "activation_decision"))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
       .map((row) => ({
@@ -489,6 +468,27 @@ class TicketSpacetimeClient {
         interactionRevision: String(row.interactionRevision || row.interaction_revision || ""),
         updatedAt: String(row.updatedAt || row.updated_at || ""),
       }));
+    const ticketActions = ticketActionV3ActionsByAuthority(tableRows(tableAccessor(db, "ticket_action_v3"))
+      .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
+      .map((row) => ({
+        id: String(row.id || ""),
+        actionId: String(row.actionId || row.action_id || ""),
+        ticketId: String(row.ticketId || row.ticket_id || ""),
+        backendId: String(row.backendId || row.backend_id || ""),
+        target: String(row.target || ""),
+        status: String(row.status || ""),
+        phase: String(row.phase || ""),
+        currentView: String(row.currentView || row.current_view || "unknown"),
+        switchAvailable: row.switchAvailable ?? row.switch_available === true,
+        switchExpiresAt: String(row.switchExpiresAt || row.switch_expires_at || ""),
+        streamEpoch: String(row.streamEpoch || row.stream_epoch || "0"),
+        frameSequence: String(row.frameSequence || row.frame_sequence || "0"),
+        reason: String(row.reason || ""),
+        createdAt: String(row.createdAt || row.created_at || ""),
+        updatedAt: String(row.updatedAt || row.updated_at || ""),
+        completedAt: String(row.completedAt || row.completed_at || ""),
+        expiresAt: String(row.expiresAt || row.expires_at || ""),
+      })));
     this.latestActivationDecisions = activationDecisions;
     for (const decision of activationDecisions) {
       const waiter = this.activationDecisionWaiters.get(decision.attemptId);
@@ -614,7 +614,43 @@ class TicketSpacetimeClient {
         serverAt: String(activationEligibility.serverAt || activationEligibility.server_at || ""),
         updatedAt: String(activationEligibility.updatedAt || activationEligibility.updated_at || ""),
       } : null,
+      memberLimits: memberLimitState ? {
+        obeyLimits: memberLimitState.obeyLimits ?? memberLimitState.obey_limits === true,
+        canBypass: memberLimitState.canBypass ?? memberLimitState.can_bypass === true,
+        effectiveLimited: memberLimitState.effectiveLimited ?? memberLimitState.effective_limited === true,
+        registrationAllowed: memberLimitState.registrationAllowed ?? memberLimitState.registration_allowed === true,
+        registrationReason: String(memberLimitState.registrationReason || memberLimitState.registration_reason || ""),
+        registrationCount: Number(memberLimitState.registrationCount ?? memberLimitState.registration_count ?? 0),
+        registrationLimit: Number(memberLimitState.registrationLimit ?? memberLimitState.registration_limit ?? 10),
+        registrationIntervalSeconds: Number(memberLimitState.registrationIntervalSeconds ?? memberLimitState.registration_interval_seconds ?? 30),
+        registrationRetryAt: String(memberLimitState.registrationRetryAt || memberLimitState.registration_retry_at || ""),
+        registrationNextReleaseAt: String(memberLimitState.registrationNextReleaseAt || memberLimitState.registration_next_release_at || ""),
+        controlCodeCount: Number(memberLimitState.controlCodeCount ?? memberLimitState.control_code_count ?? 0),
+        controlCodeLimit: Number(memberLimitState.controlCodeLimit ?? memberLimitState.control_code_limit ?? 2),
+        controlCodeWindowSeconds: Number(memberLimitState.controlCodeWindowSeconds ?? memberLimitState.control_code_window_seconds ?? 60),
+        controlCodeRetryAt: String(memberLimitState.controlCodeRetryAt || memberLimitState.control_code_retry_at || ""),
+        controlCodeAllowed: memberLimitState.controlCodeAllowed ?? memberLimitState.control_code_allowed === true,
+        controlCodeReason: String(memberLimitState.controlCodeReason || memberLimitState.control_code_reason || ""),
+        updatedAt: String(memberLimitState.updatedAt || memberLimitState.updated_at || ""),
+        serverAt: String(memberLimitState.serverAt || memberLimitState.server_at || ""),
+      } : null,
       activationDecisions,
+      ticketActions,
+      ticketAction: ticketActions[0] || null,
+      ticketSliderRegion: ticketSliderRegion ? {
+        id: String(ticketSliderRegion.id || ""),
+        ticketId: String(ticketSliderRegion.ticketId || ticketSliderRegion.ticket_id || ""),
+        backendId: String(ticketSliderRegion.backendId || ticketSliderRegion.backend_id || ""),
+        proofActionId: String(ticketSliderRegion.proofActionId || ticketSliderRegion.proof_action_id || ""),
+        streamEpoch: String(ticketSliderRegion.streamEpoch || ticketSliderRegion.stream_epoch || "0"),
+        frameSequence: String(ticketSliderRegion.frameSequence || ticketSliderRegion.frame_sequence || "0"),
+        leftBasisPoints: Number(ticketSliderRegion.leftBasisPoints ?? ticketSliderRegion.left_basis_points ?? 0),
+        topBasisPoints: Number(ticketSliderRegion.topBasisPoints ?? ticketSliderRegion.top_basis_points ?? 0),
+        rightBasisPoints: Number(ticketSliderRegion.rightBasisPoints ?? ticketSliderRegion.right_basis_points ?? 0),
+        bottomBasisPoints: Number(ticketSliderRegion.bottomBasisPoints ?? ticketSliderRegion.bottom_basis_points ?? 0),
+        updatedAt: String(ticketSliderRegion.updatedAt || ticketSliderRegion.updated_at || ""),
+        expiresAt: String(ticketSliderRegion.expiresAt || ticketSliderRegion.expires_at || ""),
+      } : null,
       relayCurrentReport: relayReport ? {
         backendId: String(relayReport.backendId || relayReport.backend_id || ""),
         videoClients: Number(relayReport.videoClients ?? relayReport.video_clients ?? 0),
@@ -654,12 +690,12 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision"]
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_limit_state"]
       .map((name) => tableAccessor(source, name));
   }
 
   private backendId(): string {
-    return "pixel";
+    return String(this.cfg.backendId || "pixel");
   }
 
   private reducer(name: string): any {

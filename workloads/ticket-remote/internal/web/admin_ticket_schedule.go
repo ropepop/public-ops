@@ -20,6 +20,7 @@ const (
 	latestTicketScheduleMaxFormBytes = 4 * 1024
 	latestTicketScheduleHorizon      = 90 * 24 * time.Hour
 	latestTicketScheduleIDPrefix     = "latest_reselect_"
+	manualTicketRedetectPurpose      = "ticket_action_v3_redetect_latest"
 	phoneLocalMinuteLayout           = "2006-01-02T15:04"
 )
 
@@ -34,6 +35,7 @@ type latestTicketScheduleRequest struct {
 type latestTicketSchedulePageView struct {
 	ID             string
 	BackendID      string
+	Purpose        string
 	Status         string
 	CommandID      string
 	ScheduledAt    string
@@ -68,6 +70,15 @@ func (s *Server) handleAdminTicketReselectLatestSchedule(w http.ResponseWriter, 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	req, err := decodeLatestTicketScheduleRequest(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: err.Error()})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.Action), "cancel") {
+		handleRetiredTicketRoute(w)
+		return
+	}
 	if s.store == nil {
 		writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "state_unavailable", Message: "Ticket state is unavailable."})
 		return
@@ -78,75 +89,8 @@ func (s *Server) handleAdminTicketReselectLatestSchedule(w http.ResponseWriter, 
 		return
 	}
 
-	req, err := decodeLatestTicketScheduleRequest(w, r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_request", Message: err.Error()})
-		return
-	}
 	now := time.Now()
-	if strings.EqualFold(strings.TrimSpace(req.Action), "cancel") {
-		s.cancelLatestTicketReselectSchedule(w, r, id, snapshot, scheduler, req, now)
-		return
-	}
-
-	backend := s.activePhoneBackend()
-	if strings.TrimSpace(backend.ID) == "" || strings.TrimSpace(backend.BaseURL) == "" {
-		writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "phone_backend_unavailable", Message: "No usable active phone backend is configured."})
-		return
-	}
-	phoneZone := s.phoneTimeZone()
-	scheduledAt, phoneLocalTime, err := resolvePhoneLocalSchedule(req.Date, req.Time, phoneZone, now)
-	if err != nil {
-		code := "bad_schedule_time"
-		if validationError, ok := err.(latestTicketScheduleValidationError); ok {
-			code = validationError.code
-		}
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: code, Message: err.Error()})
-		return
-	}
-	member, memberOK := snapshot.Member(id.Email)
-	requestedBy := strings.TrimSpace(member.PublicID)
-	if !memberOK || requestedBy == "" || len(requestedBy) > 64 {
-		writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "requester_unavailable", Message: "The admin account does not have a usable public ID."})
-		return
-	}
-	scheduleID := latestTicketReselectScheduleID(s.cfg.TicketID, backend.ID, scheduledAt, requestedBy)
-	input := state.LatestTicketReselectScheduleInput{
-		ScheduleID:     scheduleID,
-		TicketID:       s.cfg.TicketID,
-		BackendID:      backend.ID,
-		ScheduledAt:    scheduledAt,
-		PhoneLocalTime: phoneLocalTime,
-		PhoneTimeZone:  phoneZone,
-		RequestedBy:    requestedBy,
-		Now:            now,
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), streamControlWriteTimeout)
-	defer cancel()
-	if err := scheduler.ScheduleLatestTicketReselect(ctx, input); err != nil {
-		s.recordRuntimeErrorAsync("latest_ticket_reselect_schedule_failed", scheduleID, err, map[string]any{"backendId": backend.ID})
-		writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "schedule_failed", Message: "Latest-ticket redetection could not be scheduled."})
-		return
-	}
-	s.recordAuditAsync(s.cfg.TicketID, id.Email, "latest_ticket_reselect_scheduled", map[string]any{
-		"scheduleId":     scheduleID,
-		"backendId":      backend.ID,
-		"scheduledAt":    scheduledAt.UTC().Format(time.RFC3339),
-		"phoneLocalTime": phoneLocalTime,
-		"phoneTimeZone":  phoneZone,
-		"requestedBy":    requestedBy,
-	}, now)
-	if redirectAdminForm(w, r) {
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":             true,
-		"scheduleId":     scheduleID,
-		"backendId":      backend.ID,
-		"scheduledAt":    scheduledAt.UTC().Format(time.RFC3339),
-		"phoneLocalTime": phoneLocalTime,
-		"phoneTimeZone":  phoneZone,
-	})
+	s.cancelLatestTicketReselectSchedule(w, r, id, snapshot, scheduler, req, now)
 }
 
 func (s *Server) cancelLatestTicketReselectSchedule(
@@ -166,6 +110,10 @@ func (s *Server) cancelLatestTicketReselectSchedule(
 	backendID := strings.TrimSpace(req.BackendID)
 	ticketID := s.cfg.TicketID
 	if scheduled, ok := findLatestTicketReselectSchedule(snapshot, scheduleID); ok {
+		if !isManualTicketRedetectSchedule(scheduled) {
+			writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "cancel_failed", Message: "Only a manual scheduled redetection can be cancelled."})
+			return
+		}
 		if strings.TrimSpace(scheduled.BackendID) != "" {
 			backendID = strings.TrimSpace(scheduled.BackendID)
 		}
@@ -337,6 +285,9 @@ func pendingLatestTicketReselectSchedule(snapshot state.Snapshot, backendID stri
 	var selected *latestTicketSchedulePageView
 	var selectedAt time.Time
 	for _, item := range snapshot.LatestTicketReselectSchedules {
+		if !isManualTicketRedetectSchedule(item) {
+			continue
+		}
 		status := strings.ToLower(strings.TrimSpace(item.Status))
 		if status != "pending" {
 			continue
@@ -363,6 +314,9 @@ func latestTicketReselectScheduleStatus(snapshot state.Snapshot, backendID strin
 	var selectedTime time.Time
 	found := false
 	for _, item := range snapshot.LatestTicketReselectSchedules {
+		if !isManualTicketRedetectSchedule(item) {
+			continue
+		}
 		if strings.TrimSpace(backendID) != "" && strings.TrimSpace(item.BackendID) != strings.TrimSpace(backendID) {
 			continue
 		}
@@ -400,6 +354,7 @@ func latestTicketReselectScheduleView(item state.LatestTicketReselectSchedule) *
 	return &latestTicketSchedulePageView{
 		ID:             item.ID,
 		BackendID:      item.BackendID,
+		Purpose:        item.Purpose,
 		Status:         item.Status,
 		CommandID:      item.CommandID,
 		ScheduledAt:    scheduledAt,
@@ -423,4 +378,8 @@ func findLatestTicketReselectSchedule(snapshot state.Snapshot, scheduleID string
 		}
 	}
 	return state.LatestTicketReselectSchedule{}, false
+}
+
+func isManualTicketRedetectSchedule(item state.LatestTicketReselectSchedule) bool {
+	return strings.TrimSpace(item.Purpose) == manualTicketRedetectPurpose
 }

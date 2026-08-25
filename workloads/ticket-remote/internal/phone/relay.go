@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -34,8 +35,10 @@ type RelayConfig struct {
 }
 
 type Message struct {
-	Text   []byte
-	Binary []byte
+	Text                                []byte
+	Binary                              []byte
+	StartupTraceCorrelationID           string
+	ConnectionStartupTraceCorrelationID string
 }
 
 type Health struct {
@@ -54,21 +57,24 @@ type Health struct {
 type Relay struct {
 	cfg RelayConfig
 
-	mu           sync.Mutex
-	videoWriteMu sync.Mutex
-	viewers      int
-	desired      bool
-	connected    bool
-	lastError    string
-	lastConfig   string
-	lastSeenAt   time.Time
-	videoConn    *websocket.Conn
-	cancelLoop   context.CancelFunc
-	idleStop     *time.Timer
-	idleStopping bool
-	idleStopDone chan struct{}
-	onMessage    func(Message)
-	onDisconnect func(error)
+	mu                        sync.Mutex
+	videoWriteMu              sync.Mutex
+	viewers                   int
+	desired                   bool
+	connected                 bool
+	lastError                 string
+	lastConfig                string
+	lastSeenAt                time.Time
+	videoConn                 *websocket.Conn
+	startupTraceCorrelationID string
+	dialAttemptGeneration     uint64
+	dialWebsocket             func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
+	cancelLoop                context.CancelFunc
+	idleStop                  *time.Timer
+	idleStopping              bool
+	idleStopDone              chan struct{}
+	onMessage                 func(Message)
+	onDisconnect              func(error)
 }
 
 type relayDialResult struct {
@@ -93,7 +99,10 @@ func NewRelay(cfg RelayConfig) *Relay {
 	if cfg.ReadLimit <= 0 {
 		cfg.ReadLimit = 32 << 20
 	}
-	return &Relay{cfg: cfg}
+	return &Relay{
+		cfg:           cfg,
+		dialWebsocket: websocket.Dial,
+	}
 }
 
 type Backend struct {
@@ -109,7 +118,44 @@ func (r *Relay) SetHandlers(onMessage func(Message), onDisconnect func(error)) {
 	r.onDisconnect = onDisconnect
 }
 
-func (r *Relay) AddViewer() {
+// SetStartupTraceCorrelationID refreshes the correlation used by the next
+// private video handshake without changing viewer ownership. This matters when
+// a retained viewer starts a new trace before the relay reconnects.
+func (r *Relay) SetStartupTraceCorrelationID(value string) {
+	clean := cleanStartupTraceCorrelationID(value)
+	if clean == "" {
+		return
+	}
+	r.mu.Lock()
+	r.startupTraceCorrelationID = clean
+	r.mu.Unlock()
+}
+
+func (r *Relay) StartupTraceCorrelationID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.startupTraceCorrelationID
+}
+
+func (r *Relay) ClearStartupTraceCorrelationIDIf(expected string) bool {
+	expected = cleanStartupTraceCorrelationID(expected)
+	if expected == "" {
+		return false
+	}
+	r.mu.Lock()
+	if r.startupTraceCorrelationID != expected {
+		r.mu.Unlock()
+		return false
+	}
+	r.startupTraceCorrelationID = ""
+	r.mu.Unlock()
+	return true
+}
+
+func (r *Relay) AddViewer(startupTraceCorrelationID ...string) {
+	if len(startupTraceCorrelationID) > 0 {
+		r.SetStartupTraceCorrelationID(startupTraceCorrelationID[0])
+	}
 	for {
 		r.mu.Lock()
 		if r.idleStopping {
@@ -393,8 +439,17 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, r.cfg.RequestTimeout)
 	defer cancel()
+	r.mu.Lock()
+	r.dialAttemptGeneration++
+	dialAttemptGeneration := r.dialAttemptGeneration
+	startupTraceCorrelationID := r.startupTraceCorrelationID
+	r.mu.Unlock()
+	requestHeader := http.Header{}
+	if startupTraceCorrelationID != "" {
+		requestHeader.Set("X-Ticket-Startup-Trace", startupTraceCorrelationID)
+	}
 	dialResults := make(chan relayDialResult, 1)
-	go r.dialPhoneWebsocket(dialCtx, "video", videoURL, dialResults)
+	go r.dialPhoneWebsocket(dialCtx, "video", videoURL, requestHeader, dialResults)
 
 	var videoConn *websocket.Conn
 	select {
@@ -408,9 +463,9 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 	}
 	videoConn.SetReadLimit(r.cfg.ReadLimit)
 	r.mu.Lock()
-	if !r.desired {
+	if !r.desired || r.dialAttemptGeneration != dialAttemptGeneration || ctx.Err() != nil {
 		r.mu.Unlock()
-		_ = videoConn.Close(websocket.StatusNormalClosure, "relay no longer desired")
+		_ = videoConn.CloseNow()
 		return nil
 	}
 	r.videoConn = videoConn
@@ -427,7 +482,10 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 		if wasCurrent {
 			r.connected = false
 		}
-		onDisconnect := r.onDisconnect
+		var onDisconnect func(error)
+		if wasCurrent {
+			onDisconnect = r.onDisconnect
+		}
 		r.mu.Unlock()
 		_ = videoConn.Close(websocket.StatusNormalClosure, "phone relay reconnect")
 		if onDisconnect != nil {
@@ -435,7 +493,7 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 		}
 	}()
 	errCh := make(chan error, 1)
-	go func() { errCh <- r.readLoop(ctx, videoConn) }()
+	go func() { errCh <- r.readLoop(ctx, videoConn, startupTraceCorrelationID) }()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -444,9 +502,14 @@ func (r *Relay) connectOnce(ctx context.Context) (retErr error) {
 	}
 }
 
-func (r *Relay) dialPhoneWebsocket(ctx context.Context, name string, targetURL string, results chan<- relayDialResult) {
-	conn, _, err := websocket.Dial(ctx, targetURL, &websocket.DialOptions{
+func (r *Relay) dialPhoneWebsocket(ctx context.Context, name string, targetURL string, requestHeader http.Header, results chan<- relayDialResult) {
+	dialWebsocket := r.dialWebsocket
+	if dialWebsocket == nil {
+		dialWebsocket = websocket.Dial
+	}
+	conn, _, err := dialWebsocket(ctx, targetURL, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionDisabled,
+		HTTPHeader:      requestHeader,
 	})
 	if err != nil {
 		results <- relayDialResult{name: name, err: fmt.Errorf("dial phone %s: %w", name, err)}
@@ -455,25 +518,51 @@ func (r *Relay) dialPhoneWebsocket(ctx context.Context, name string, targetURL s
 	results <- relayDialResult{name: name, conn: conn}
 }
 
-func (r *Relay) readLoop(ctx context.Context, conn *websocket.Conn) error {
+func cleanStartupTraceCorrelationID(value string) string {
+	clean := strings.TrimSpace(value)
+	if len(clean) != len("startup_")+8 || !strings.HasPrefix(clean, "startup_") {
+		return ""
+	}
+	for _, char := range strings.TrimPrefix(clean, "startup_") {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return ""
+		}
+	}
+	return clean
+}
+
+func (r *Relay) readLoop(ctx context.Context, conn *websocket.Conn, connectionStartupTraceCorrelationID string) error {
 	for {
 		msgType, data, readErr := conn.Read(ctx)
 		if readErr != nil {
 			return readErr
 		}
 		r.mu.Lock()
+		if r.videoConn != conn {
+			r.mu.Unlock()
+			return nil
+		}
 		r.lastSeenAt = time.Now()
 		if msgType == websocket.MessageText && bytes.Contains(data, []byte(`"type":"config"`)) {
 			r.lastConfig = string(data)
 		}
 		handler := r.onMessage
+		startupTraceCorrelationID := r.startupTraceCorrelationID
 		r.mu.Unlock()
 		if handler != nil {
 			switch msgType {
 			case websocket.MessageText:
-				handler(Message{Text: append([]byte(nil), data...)})
+				handler(Message{
+					Text:                                append([]byte(nil), data...),
+					StartupTraceCorrelationID:           startupTraceCorrelationID,
+					ConnectionStartupTraceCorrelationID: connectionStartupTraceCorrelationID,
+				})
 			case websocket.MessageBinary:
-				handler(Message{Binary: append([]byte(nil), data...)})
+				handler(Message{
+					Binary:                              append([]byte(nil), data...),
+					StartupTraceCorrelationID:           startupTraceCorrelationID,
+					ConnectionStartupTraceCorrelationID: connectionStartupTraceCorrelationID,
+				})
 			}
 		}
 	}

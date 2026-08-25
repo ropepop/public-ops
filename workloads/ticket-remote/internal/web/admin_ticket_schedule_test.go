@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -64,6 +63,7 @@ func (s *scheduledTestStore) ScheduleLatestTicketReselect(_ context.Context, inp
 		ScheduledAt:    input.ScheduledAt.UTC().Format(time.RFC3339),
 		PhoneLocalTime: input.PhoneLocalTime,
 		PhoneTimeZone:  input.PhoneTimeZone,
+		Purpose:        manualTicketRedetectPurpose,
 		Status:         "pending",
 		RequestedBy:    input.RequestedBy,
 		CreatedAt:      now,
@@ -106,12 +106,6 @@ func (s *scheduledTestStore) cancelInputs() []state.LatestTicketReselectSchedule
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]state.LatestTicketReselectScheduleCancelInput(nil), s.cancellations...)
-}
-
-func (s *scheduledTestStore) scheduleRows() []state.LatestTicketReselectSchedule {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]state.LatestTicketReselectSchedule(nil), s.schedules...)
 }
 
 func newScheduledAdminServer(t *testing.T) (*Server, *scheduledTestStore) {
@@ -220,7 +214,7 @@ func TestLatestTicketReselectScheduleIDIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestAdminSchedulesAndCancelsLatestTicketRedetection(t *testing.T) {
+func TestAdminLegacyScheduleProducerIsRetired(t *testing.T) {
 	server, store := newScheduledAdminServer(t)
 	location, err := time.LoadLocation(config.DefaultPhoneTimeZone)
 	if err != nil {
@@ -232,70 +226,38 @@ func TestAdminSchedulesAndCancelsLatestTicketRedetection(t *testing.T) {
 		"time": {local.Format("15:04")},
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		rec := httptest.NewRecorder()
-		server.ServeHTTP(rec, scheduledAdminFormRequest(values))
-		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/admin" {
-			t.Fatalf("schedule attempt %d status = %d location = %q body = %s", attempt, rec.Code, rec.Header().Get("Location"), rec.Body.String())
-		}
-	}
-	inputs := store.scheduleInputs()
-	if len(inputs) != 2 || inputs[0].ScheduleID == "" || inputs[0].ScheduleID != inputs[1].ScheduleID {
-		t.Fatalf("schedule inputs = %#v, want deterministic double submit", inputs)
-	}
-	if inputs[0].PhoneTimeZone != "Europe/Riga" || inputs[0].PhoneLocalTime != local.Format(phoneLocalMinuteLayout) {
-		t.Fatalf("phone-local input = %#v", inputs[0])
-	}
-	if inputs[0].RequestedBy == "" || strings.Contains(inputs[0].RequestedBy, "@") {
-		t.Fatalf("requestedBy = %q, want member public ID", inputs[0].RequestedBy)
-	}
-
-	cancelValues := url.Values{
-		"action":     {"cancel"},
-		"scheduleId": {inputs[0].ScheduleID},
-		"backendId":  {inputs[0].BackendID},
-	}
 	rec := httptest.NewRecorder()
-	server.ServeHTTP(rec, scheduledAdminFormRequest(cancelValues))
+	server.ServeHTTP(rec, scheduledAdminFormRequest(values))
+	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), `"error":"route_retired"`) {
+		t.Fatalf("legacy schedule status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if inputs := store.scheduleInputs(); len(inputs) != 0 {
+		t.Fatalf("retired schedule producer wrote inputs = %#v", inputs)
+	}
+}
+
+func TestAdminCanCancelCompatiblePendingLatestTicketSchedule(t *testing.T) {
+	server, store := newScheduledAdminServer(t)
+	scheduleID := "latest_reselect_pending"
+	store.setSchedules(state.LatestTicketReselectSchedule{
+		ID: scheduleID, TicketID: "vivi-default", BackendID: "lab-pixel", Status: "pending",
+		Purpose:     manualTicketRedetectPurpose,
+		ScheduledAt: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+	})
+	req := scheduledAdminFormRequest(url.Values{
+		"action": {"cancel"}, "scheduleId": {scheduleID}, "backendId": {"lab-pixel"},
+	})
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/admin" {
 		t.Fatalf("cancel status = %d location = %q body = %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
 	}
 	cancellations := store.cancelInputs()
-	if len(cancellations) != 1 || cancellations[0].ScheduleID != inputs[0].ScheduleID || cancellations[0].BackendID != "lab-pixel" {
+	if len(cancellations) != 1 || cancellations[0].ScheduleID != scheduleID || cancellations[0].BackendID != "lab-pixel" {
 		t.Fatalf("cancel inputs = %#v", cancellations)
 	}
-}
-
-func TestAdminCanReplacePendingLatestTicketSchedule(t *testing.T) {
-	server, store := newScheduledAdminServer(t)
-	location, _ := time.LoadLocation(config.DefaultPhoneTimeZone)
-	firstLocal := time.Now().In(location).Add(24 * time.Hour).Truncate(time.Minute)
-	secondLocal := firstLocal.Add(2 * time.Hour)
-	for _, local := range []time.Time{firstLocal, secondLocal} {
-		rec := httptest.NewRecorder()
-		server.ServeHTTP(rec, scheduledAdminFormRequest(url.Values{
-			"date": {local.Format("2006-01-02")},
-			"time": {local.Format("15:04")},
-		}))
-		if rec.Code != http.StatusSeeOther {
-			t.Fatalf("replace schedule status = %d body = %s", rec.Code, rec.Body.String())
-		}
-	}
-	rows := store.scheduleRows()
-	if len(rows) != 2 || rows[0].Status != "replaced" || rows[1].Status != "pending" {
-		t.Fatalf("replacement rows = %#v", rows)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
-	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
-	rec := httptest.NewRecorder()
-	server.ServeHTTP(rec, req)
-	body := rec.Body.String()
-	if rec.Code != http.StatusOK ||
-		!strings.Contains(body, `data-schedule-status="pending"`) ||
-		!strings.Contains(body, `class="admin-schedule-form"`) ||
-		!strings.Contains(body, `Cancel schedule`) {
-		t.Fatalf("replacement admin page status = %d body = %s", rec.Code, body)
+	if inputs := store.scheduleInputs(); len(inputs) != 0 {
+		t.Fatalf("cancel compatibility path created schedules = %#v", inputs)
 	}
 }
 
@@ -330,7 +292,7 @@ func TestAdminLatestTicketScheduleRejectsCrossOriginAndNonAdmin(t *testing.T) {
 	}
 }
 
-func TestAdminLatestTicketScheduleJSONResponse(t *testing.T) {
+func TestAdminLatestTicketScheduleJSONProducerIsRetired(t *testing.T) {
 	server, store := newScheduledAdminServer(t)
 	location, _ := time.LoadLocation(config.DefaultPhoneTimeZone)
 	local := time.Now().In(location).Add(24 * time.Hour).Truncate(time.Minute)
@@ -343,21 +305,11 @@ func TestAdminLatestTicketScheduleJSONResponse(t *testing.T) {
 
 	server.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusAccepted {
+	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), `"error":"route_retired"`) {
 		t.Fatalf("JSON schedule status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response struct {
-		OK             bool   `json:"ok"`
-		ScheduleID     string `json:"scheduleId"`
-		PhoneTimeZone  string `json:"phoneTimeZone"`
-		PhoneLocalTime string `json:"phoneLocalTime"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-	inputs := store.scheduleInputs()
-	if !response.OK || len(inputs) != 1 || response.ScheduleID != inputs[0].ScheduleID || response.PhoneTimeZone != "Europe/Riga" {
-		t.Fatalf("response = %#v inputs = %#v", response, inputs)
+	if inputs := store.scheduleInputs(); len(inputs) != 0 {
+		t.Fatalf("retired JSON producer wrote inputs = %#v", inputs)
 	}
 }
 
@@ -371,6 +323,7 @@ func TestAdminPageRendersNativeScheduleControlsAndPendingCancel(t *testing.T) {
 		ScheduledAt:    future.Format(time.RFC3339),
 		PhoneLocalTime: "2026-07-24T12:30",
 		PhoneTimeZone:  "Europe/Riga",
+		Purpose:        manualTicketRedetectPurpose,
 		Status:         "pending",
 		RequestedBy:    "A1B2",
 		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
@@ -388,6 +341,8 @@ func TestAdminPageRendersNativeScheduleControlsAndPendingCancel(t *testing.T) {
 	body := rec.Body.String()
 	for _, expected := range []string{
 		`data-schedule-status="pending"`,
+		`data-schedule-purpose="ticket_action_v3_redetect_latest"`,
+		`Latest scheduled redetection`,
 		`action="/api/v1/admin/ticket/reselect-latest/schedule"`,
 		`name="action" value="cancel"`,
 		`name="scheduleId" value="latest_reselect_pending"`,
@@ -400,6 +355,106 @@ func TestAdminPageRendersNativeScheduleControlsAndPendingCancel(t *testing.T) {
 	}
 	if !strings.Contains(body, `class="admin-schedule-form"`) {
 		t.Fatal("new schedule form must remain available so a pending schedule can be replaced")
+	}
+}
+
+func TestAdminPageExcludesAutomaticRefreshFromManualRedetectionControls(t *testing.T) {
+	server, store := newScheduledAdminServer(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	store.setSchedules(
+		state.LatestTicketReselectSchedule{
+			ID:          "activation_refresh_pending",
+			TicketID:    "vivi-default",
+			BackendID:   "lab-pixel",
+			ScheduledAt: now.Add(time.Hour).Format(time.RFC3339),
+			Purpose:     "activation_expiry_reset",
+			Status:      "pending",
+			CreatedAt:   now.Format(time.RFC3339),
+			UpdatedAt:   now.Format(time.RFC3339),
+		},
+		state.LatestTicketReselectSchedule{
+			ID:             "manual_redetect_succeeded",
+			TicketID:       "vivi-default",
+			BackendID:      "lab-pixel",
+			ScheduledAt:    now.Add(-time.Minute).Format(time.RFC3339),
+			PhoneLocalTime: "2026-07-23T12:30",
+			PhoneTimeZone:  "Europe/Riga",
+			Purpose:        manualTicketRedetectPurpose,
+			Status:         "succeeded",
+			ResultReason:   "manual-proof",
+			CreatedAt:      now.Add(-2 * time.Minute).Format(time.RFC3339),
+			UpdatedAt:      now.Add(-time.Minute).Format(time.RFC3339),
+		},
+	)
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, expected := range []string{
+		`data-schedule-status="succeeded"`,
+		`data-schedule-purpose="ticket_action_v3_redetect_latest"`,
+		`Reason: manual-proof`,
+		`class="admin-schedule-form"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("manual redetection status missing %q in %s", expected, body)
+		}
+	}
+	if strings.Contains(body, `name="scheduleId" value="activation_refresh_pending"`) ||
+		strings.Contains(body, `data-schedule-purpose="activation_expiry_reset"`) ||
+		strings.Contains(body, `Cancel schedule`) {
+		t.Fatalf("automatic refresh leaked into manual controls: %s", body)
+	}
+
+	store.setSchedules(state.LatestTicketReselectSchedule{
+		ID:          "activation_refresh_only",
+		TicketID:    "vivi-default",
+		BackendID:   "lab-pixel",
+		ScheduledAt: now.Add(time.Hour).Format(time.RFC3339),
+		Purpose:     "activation_expiry_reset",
+		Status:      "pending",
+		CreatedAt:   now.Format(time.RFC3339),
+		UpdatedAt:   now.Format(time.RFC3339),
+	})
+	req = httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	body = rec.Body.String()
+	if strings.Contains(body, `class="admin-schedule-card"`) || strings.Contains(body, `Cancel schedule`) {
+		t.Fatalf("automatic-only refresh must not render a manual status or cancel control: %s", body)
+	}
+	if !strings.Contains(body, `class="admin-schedule-form"`) {
+		t.Fatal("automatic refresh must not block scheduling an independent manual redetection")
+	}
+}
+
+func TestAdminRefusesToCancelAutomaticActivationRefresh(t *testing.T) {
+	server, store := newScheduledAdminServer(t)
+	scheduleID := "activation_refresh_pending"
+	store.setSchedules(state.LatestTicketReselectSchedule{
+		ID: scheduleID, TicketID: "vivi-default", BackendID: "lab-pixel", Status: "pending",
+		Purpose:     "activation_expiry_reset",
+		ScheduledAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+	})
+	req := scheduledAdminFormRequest(url.Values{
+		"action": {"cancel"}, "scheduleId": {scheduleID}, "backendId": {"lab-pixel"},
+	})
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"error":"cancel_failed"`) {
+		t.Fatalf("automatic refresh cancel status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if cancellations := store.cancelInputs(); len(cancellations) != 0 {
+		t.Fatalf("automatic refresh reached cancellation store = %#v", cancellations)
 	}
 }
 
@@ -416,6 +471,7 @@ func TestAdminPageKeepsLatestScheduledResultVisible(t *testing.T) {
 				ScheduledAt:    now.Add(-time.Minute).Format(time.RFC3339),
 				PhoneLocalTime: "2026-07-23T12:30",
 				PhoneTimeZone:  "Europe/Riga",
+				Purpose:        manualTicketRedetectPurpose,
 				Status:         status,
 				CommandID:      "command-" + status,
 				ResultReason:   "reason-" + status,

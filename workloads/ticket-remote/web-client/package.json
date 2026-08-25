@@ -6,6 +6,7 @@
   "scripts": {
     "build": "node ./build.mjs && node ./build-ticket-app.mjs",
     "build:ticket-app": "node ./build-ticket-app.mjs",
+    "test:ticket-actions-v3": "node --test ./ticket-action-v3-core.test.mjs",
     "check:spacetime-sdk": "node --test ./check-spacetime-sdk.test.mjs && node ./check-spacetime-sdk.mjs",
     "test:csp-codecs": "node --test ./csp-safe-codecs.test.ts"
   },

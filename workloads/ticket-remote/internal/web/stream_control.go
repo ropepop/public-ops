@@ -11,10 +11,9 @@ import (
 )
 
 const (
-	streamControlWriteTimeout      = 2 * time.Second
-	streamCommandTTL               = 2 * time.Minute
-	streamKeyframeCommandTTL       = 30 * time.Second
-	latestTicketReselectCommandTTL = 10 * time.Minute
+	streamControlWriteTimeout = 2 * time.Second
+	streamCommandTTL          = 2 * time.Minute
+	streamKeyframeCommandTTL  = 30 * time.Second
 )
 
 func (s *Server) publishStreamDesiredStateAsync(active bool, viewerCount int, reason string, source string) {
@@ -324,11 +323,11 @@ func (s *Server) streamDemandStillPresent() bool {
 	return false
 }
 
-func (s *Server) appendStreamCommandAsync(commandType string, reason string, payload map[string]any, ttl time.Duration) {
+func (s *Server) appendStreamCommandAsync(commandType string, reason string, payload map[string]any, ttl time.Duration, originatingTraceID ...string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
 		defer cancel()
-		if _, err := s.appendStreamCommand(ctx, commandType, reason, payload, ttl); err != nil {
+		if _, err := s.appendStreamCommand(ctx, commandType, reason, payload, ttl, originatingTraceID...); err != nil {
 			s.recordRuntimeErrorAsync("stream_command_publish_failed", commandType, err, map[string]any{
 				"commandType": cleanStreamControlText(commandType, "command"),
 				"reason":      cleanStreamControlText(reason, "stream_command"),
@@ -354,7 +353,7 @@ func (s *Server) appendStreamRecoveryCommandAsync(reason string) {
 	}()
 }
 
-func (s *Server) appendStreamCommand(ctx context.Context, commandType string, reason string, payload map[string]any, ttl time.Duration) (string, error) {
+func (s *Server) appendStreamCommand(ctx context.Context, commandType string, reason string, payload map[string]any, ttl time.Duration, originatingTraceID ...string) (string, error) {
 	if s.store == nil {
 		return "", nil
 	}
@@ -412,7 +411,14 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 	}
 	go s.recordProductEvent(event)
 	if err == nil && (commandType == "start" || commandType == "keyframe" || commandType == "recover_stream") {
-		s.direct.recordStartupPhase("spacetime_command_written", fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID))
+		detail := fmt.Sprintf("type=%s reason=%s id=%s", commandType, reason, commandID)
+		if len(originatingTraceID) > 0 {
+			if strings.TrimSpace(originatingTraceID[0]) != "" {
+				s.direct.recordStartupPhaseForTrace(originatingTraceID[0], "spacetime_command_written", detail)
+			}
+		} else {
+			s.direct.recordStartupPhase("spacetime_command_written", detail)
+		}
 	}
 	return commandID, err
 }

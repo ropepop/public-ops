@@ -11,9 +11,14 @@ import {
 } from "spacetimedb";
 
 export default {
+  version: __t.u32(),
   ticketId: __t.string(),
   backendId: __t.string(),
-  attemptId: __t.string(),
-  outcome: __t.string(),
+  actionId: __t.string(),
+  target: __t.string(),
+  source: __t.string(),
   reason: __t.string(),
+  attemptId: __t.string(),
+  expectedInteractionRevision: __t.string(),
+  scheduleId: __t.string(),
 };

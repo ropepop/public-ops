@@ -11,14 +11,12 @@ import {
 } from "spacetimedb";
 
 export default {
+  version: __t.u32(),
   ticketId: __t.string(),
   backendId: __t.string(),
-  interactionRevision: __t.string(),
-  controlId: __t.string(),
-  initialInputSequence: __t.string(),
-  holdDurationMillis: __t.u32(),
-  horizontalTravelCss: __t.u32(),
-  verticalTravelCss: __t.u32(),
-  initialProgress: __t.u32(),
-  attemptId: __t.string(),
+  scheduleId: __t.string(),
+  scheduledAtMicros: __t.i64(),
+  phoneLocalTime: __t.string(),
+  phoneTimeZone: __t.string(),
+  target: __t.string(),
 };

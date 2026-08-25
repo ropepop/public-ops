@@ -46,7 +46,7 @@ Cleanup runs every five minutes and deletes at most 1,000 expired rows in one
 transaction by the `expiresAt` index. With no backlog, normal deletion can lag
 expiry by up to five minutes; a backlog drains at up to 12,000 rows per hour.
 Ticket browser admission is globally capped at 60 messages per minute, has a
-fixed vocabulary of at most 64 names, and every informational browser name is
+fixed vocabulary of at most 66 names, and every informational browser name is
 sampled into one shared minute bucket. Cleanup capacity is therefore more than
 three times that browser bound. Typed Ticket latency proof is separately capped
 at 30 new phase rows per minute and eight rows per trace. Together, the maximum

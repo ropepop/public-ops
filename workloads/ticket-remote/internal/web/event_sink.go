@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"regexp"
@@ -43,6 +44,8 @@ var (
 	browserClientLogEvents = map[string]struct{}{
 		"blocked_gesture":                       {},
 		"browser_opened":                        {},
+		"browser_configured":                    {},
+		"browser_first_frame_decoded":           {},
 		"canvas_context_unavailable":            {},
 		"control_code_browser_capture_ack_sent": {},
 		"control_code_candidate_accepted":       {},
@@ -128,12 +131,23 @@ type productEventInput struct {
 }
 
 type streamStartupTracePhase struct {
-	Name   string `json:"name"`
-	Detail string `json:"detail,omitempty"`
+	Name                      string    `json:"name"`
+	Detail                    string    `json:"detail,omitempty"`
+	At                        time.Time `json:"at"`
+	ElapsedMillis             int64     `json:"elapsedMillis"`
+	SourceAtEpochMillis       *int64    `json:"sourceAtEpochMillis,omitempty"`
+	SourceAtPerformanceMillis *float64  `json:"sourceAtPerformanceMillis,omitempty"`
+}
+
+type streamStartupTraceSourceTime struct {
+	epochMillis       int64
+	performanceMillis float64
 }
 
 type streamStartupTrace struct {
 	ID, SessionID     string
+	RunOrigin         string
+	Reason            string
 	LastPhase         string
 	StartedAt, LastAt time.Time
 	Complete          bool
@@ -404,6 +418,29 @@ func safeBrowserClientLogDetail(raw string) map[string]any {
 	return out
 }
 
+func browserStartupSourceTime(detail map[string]any, now time.Time) (streamStartupTraceSourceTime, bool) {
+	epochValue, epochOK := detail["sourceAtEpochMillis"].(float64)
+	performanceValue, performanceOK := detail["sourceAtPerformanceMillis"].(float64)
+	if !epochOK || !performanceOK || math.IsNaN(epochValue) || math.IsInf(epochValue, 0) ||
+		math.IsNaN(performanceValue) || math.IsInf(performanceValue, 0) {
+		return streamStartupTraceSourceTime{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	maxClockDeltaMillis := int64((24 * time.Hour) / time.Millisecond)
+	nowMillis := now.UnixMilli()
+	if epochValue <= 0 || epochValue < float64(nowMillis-maxClockDeltaMillis) || epochValue > float64(nowMillis+maxClockDeltaMillis) ||
+		performanceValue < 0 || performanceValue > float64((7*24*time.Hour)/time.Millisecond) {
+		return streamStartupTraceSourceTime{}, false
+	}
+	epochMillis := int64(math.Round(epochValue))
+	return streamStartupTraceSourceTime{
+		epochMillis:       epochMillis,
+		performanceMillis: performanceValue,
+	}, true
+}
+
 func sanitizeBrowserClientDetailString(raw string) string {
 	var nested map[string]any
 	if err := json.Unmarshal([]byte(raw), &nested); err == nil && nested != nil {
@@ -543,22 +580,83 @@ func safeRuntimeTraceID(prefix, value string) string {
 	return fmt.Sprintf("%s_%x", cleanStreamControlText(prefix, "trace"), hash[:4])
 }
 
+// startupTraceCorrelationID is a short, opaque derivative of the in-memory
+// startup trace ID. It is safe to carry through the durable command payload and
+// Pixel trace events without exposing a browser session, ticket data, or an
+// authentication value.
+func startupTraceCorrelationID(traceID string) string {
+	return safeRuntimeTraceID("startup", traceID)
+}
+
+func newStartupRunOrigin() string {
+	return "ticket.startup." + randomID()
+}
+
+func boundedStartupRunOrigin(value string) string {
+	clean := strings.TrimSpace(value)
+	if len(clean) != len("ticket.startup.")+32 || !strings.HasPrefix(clean, "ticket.startup.") {
+		return ""
+	}
+	for _, char := range strings.TrimPrefix(clean, "ticket.startup.") {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return ""
+		}
+	}
+	return clean
+}
+
 func (h *directStreamHub) beginStartupTrace(sessionID, reason string) string {
+	return h.beginStartupTraceWithMode(sessionID, "", reason, false)
+}
+
+// startStartupTrace always begins a new navigation run. Downstream work for
+// that navigation continues to use beginStartupTrace so the authenticated
+// index, prewarm, and video socket still join one trace.
+func (h *directStreamHub) startStartupTrace(sessionID, reason string) string {
+	return h.beginStartupTraceWithMode(sessionID, "", reason, true)
+}
+
+func (h *directStreamHub) startStartupTraceForRun(sessionID, runOrigin, reason string) string {
+	return h.beginStartupTraceWithMode(sessionID, boundedStartupRunOrigin(runOrigin), reason, true)
+}
+
+func (h *directStreamHub) joinStartupTraceForRun(sessionID, runOrigin, reason string) string {
 	now := time.Now()
 	sessionID = safeRuntimeTraceID("session", sessionID)
+	runOrigin = boundedStartupRunOrigin(runOrigin)
+	if sessionID == "" || runOrigin == "" {
+		return ""
+	}
+	reason = cleanStreamControlText(reason, "stream_startup")
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	trace := &h.startupTrace
-	if trace.ID != "" && !trace.Complete && now.Sub(trace.StartedAt) <= streamStartupTraceMaxAge &&
+	if trace.ID == "" || trace.Complete || now.Sub(trace.StartedAt) > streamStartupTraceMaxAge ||
+		trace.SessionID != sessionID || trace.RunOrigin != runOrigin {
+		return ""
+	}
+	h.addStartupTracePhaseLocked(now, "startup_trace_joined", reason, false, nil)
+	return trace.ID
+}
+
+func (h *directStreamHub) beginStartupTraceWithMode(sessionID, runOrigin, reason string, replace bool) string {
+	now := time.Now()
+	sessionID = safeRuntimeTraceID("session", sessionID)
+	reason = cleanStreamControlText(reason, "stream_startup")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	if !replace && trace.ID != "" && !trace.Complete && now.Sub(trace.StartedAt) <= streamStartupTraceMaxAge &&
 		(sessionID == "" || trace.SessionID == "" || sessionID == trace.SessionID) {
-		h.addStartupTracePhaseLocked(now, "startup_trace_joined", reason, false)
+		h.addStartupTracePhaseLocked(now, "startup_trace_joined", reason, false, nil)
 		return trace.ID
 	}
 	*trace = streamStartupTrace{
 		ID:        "stream:" + now.UTC().Format("20060102T150405.000000000Z") + ":" + randomID(),
-		SessionID: trimLogField(sessionID, 96), StartedAt: now, LastAt: now,
+		SessionID: trimLogField(sessionID, 96), RunOrigin: runOrigin,
+		Reason: reason, StartedAt: now, LastAt: now,
 	}
-	h.addStartupTracePhaseLocked(now, "startup_trace_started", reason, false)
+	h.addStartupTracePhaseLocked(now, "startup_trace_started", reason, false, nil)
 	return trace.ID
 }
 
@@ -566,21 +664,164 @@ func (h *directStreamHub) recordStartupPhase(name, detail string)     { h.traceP
 func (h *directStreamHub) recordStartupPhaseOnce(name, detail string) { h.tracePhase(name, detail, 1) }
 func (h *directStreamHub) completeStartupTrace(name, detail string)   { h.tracePhase(name, detail, 3) }
 
-// tracePhase modes: 0 records, 1 deduplicates, 3 deduplicates and completes.
-func (h *directStreamHub) tracePhase(name, detail string, mode uint8) {
+func (h *directStreamHub) recordStartupPhaseForTrace(traceID, name, detail string) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return
+	}
+	h.tracePhaseForTrace(traceID, name, detail, 0, nil)
+}
+
+func (h *directStreamHub) recordStartupPhaseOnceForTrace(traceID, name, detail string) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return
+	}
+	h.tracePhaseForTrace(traceID, name, detail, 1, nil)
+}
+
+func (h *directStreamHub) recordStartupPhaseOnceForTraceWithSource(traceID, name, detail string, source streamStartupTraceSourceTime) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return
+	}
+	h.tracePhaseForTrace(traceID, name, detail, 1, &source)
+}
+
+func (h *directStreamHub) recordStartupPhaseOnceForCorrelation(correlationID, name, detail string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	if trace.ID == "" || trace.Complete || now.Sub(trace.StartedAt) > streamStartupTraceMaxAge ||
+		startupTraceCorrelationID(trace.ID) != correlationID {
+		return false
+	}
+	return h.addStartupTracePhaseLocked(now, name, detail, true, nil)
+}
+
+func (h *directStreamHub) completeStartupTraceForTrace(traceID, name, detail string) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return
+	}
+	h.tracePhaseForTrace(traceID, name, detail, 3, nil)
+}
+
+func (h *directStreamHub) completeStartupTraceForTraceWithSource(traceID, name, detail string, source streamStartupTraceSourceTime) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return
+	}
+	h.tracePhaseForTrace(traceID, name, detail, 3, &source)
+}
+
+func (h *directStreamHub) startupTraceActive(traceID string) bool {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.startupTrace.ID == traceID && !h.startupTrace.Complete && now.Sub(h.startupTrace.StartedAt) <= streamStartupTraceMaxAge
+}
+
+func (h *directStreamHub) startupTraceCurrent(traceID string) bool {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.startupTrace.ID == traceID && now.Sub(h.startupTrace.StartedAt) <= streamStartupTraceMaxAge
+}
+
+func (h *directStreamHub) startupTraceActiveForSession(sessionID string) bool {
+	sessionID = safeRuntimeTraceID("session", sessionID)
+	if sessionID == "" {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	return trace.ID != "" && !trace.Complete && trace.SessionID == sessionID &&
+		now.Sub(trace.StartedAt) <= streamStartupTraceMaxAge
+}
+
+// withActiveStartupTrace keeps validation and its bounded in-memory lease
+// mutation in one trace critical section. Without this guard, a sibling
+// browser could complete the trace after validation but before the lease was
+// installed, resurrecting a grace hold after first paint.
+func (h *directStreamHub) withActiveStartupTrace(traceID string, action func()) bool {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" || action == nil {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	if trace.ID != traceID || trace.Complete || now.Sub(trace.StartedAt) > streamStartupTraceMaxAge {
+		return false
+	}
+	action()
+	return true
+}
+
+func (h *directStreamHub) withoutActiveStartupTraceForSession(sessionID string, action func()) bool {
+	sessionID = safeRuntimeTraceID("session", sessionID)
+	if sessionID == "" || action == nil {
+		return false
+	}
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	if trace.ID != "" && !trace.Complete && trace.SessionID == sessionID &&
+		now.Sub(trace.StartedAt) <= streamStartupTraceMaxAge {
+		return false
+	}
+	action()
+	return true
+}
+
+func (h *directStreamHub) activeStartupTraceCorrelationID() string {
 	now := time.Now()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	trace := &h.startupTrace
 	if trace.ID == "" || trace.Complete || now.Sub(trace.StartedAt) > streamStartupTraceMaxAge {
+		return ""
+	}
+	return startupTraceCorrelationID(trace.ID)
+}
+
+// tracePhase modes: 0 records, 1 deduplicates, 3 deduplicates and completes.
+func (h *directStreamHub) tracePhase(name, detail string, mode uint8) {
+	h.tracePhaseForTrace("", name, detail, mode, nil)
+}
+
+func (h *directStreamHub) tracePhaseForTrace(traceID, name, detail string, mode uint8, source *streamStartupTraceSourceTime) {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trace := &h.startupTrace
+	if trace.ID == "" || (traceID != "" && trace.ID != traceID) || trace.Complete || now.Sub(trace.StartedAt) > streamStartupTraceMaxAge {
 		return
 	}
-	if h.addStartupTracePhaseLocked(now, name, detail, mode&1 != 0) && mode&2 != 0 {
+	if h.addStartupTracePhaseLocked(now, name, detail, mode&1 != 0, source) && mode&2 != 0 {
 		trace.Complete = true
 	}
 }
 
-func (h *directStreamHub) addStartupTracePhaseLocked(now time.Time, name, detail string, once bool) bool {
+func (h *directStreamHub) addStartupTracePhaseLocked(now time.Time, name, detail string, once bool, source *streamStartupTraceSourceTime) bool {
 	trace := &h.startupTrace
 	name = trimLogField(name, 96)
 	if trace.ID == "" || name == "" {
@@ -591,9 +832,17 @@ func (h *directStreamHub) addStartupTracePhaseLocked(now time.Time, name, detail
 	}) {
 		return false
 	}
-	trace.Phases = append(trace.Phases, streamStartupTracePhase{
-		Name: name, Detail: trimLogField(detail, 240),
-	})
+	phase := streamStartupTracePhase{
+		Name: name, Detail: trimLogField(detail, 240), At: now,
+		ElapsedMillis: durationMillis(max(now.Sub(trace.StartedAt), 0)),
+	}
+	if source != nil {
+		epochMillis := source.epochMillis
+		performanceMillis := source.performanceMillis
+		phase.SourceAtEpochMillis = &epochMillis
+		phase.SourceAtPerformanceMillis = &performanceMillis
+	}
+	trace.Phases = append(trace.Phases, phase)
 	if len(trace.Phases) > streamStartupTraceMaxSteps {
 		trace.Phases = trace.Phases[len(trace.Phases)-streamStartupTraceMaxSteps:]
 	}
@@ -602,17 +851,28 @@ func (h *directStreamHub) addStartupTracePhaseLocked(now time.Time, name, detail
 	return true
 }
 
-func (h *directStreamHub) startupTraceSnapshot(_ time.Time) map[string]any {
+func (h *directStreamHub) startupTraceSnapshot(now time.Time) map[string]any {
 	trace := h.startupTrace
 	if trace.ID == "" {
 		return nil
 	}
-	elapsed := max(trace.LastAt.Sub(trace.StartedAt), 0)
+	// Keep a completed trace frozen at its terminal phase, but let an active
+	// trace's elapsed time advance between phase events.  Otherwise an idle
+	// startup appears to take zero milliseconds until the next event arrives.
+	elapsedAt := trace.LastAt
+	if !trace.Complete && !now.IsZero() && now.After(elapsedAt) {
+		elapsedAt = now
+	}
+	elapsed := max(elapsedAt.Sub(trace.StartedAt), 0)
 	return map[string]any{
-		"id": trace.ID, "startedAt": timeString(trace.StartedAt),
+		"id": trace.ID, "startedAt": trace.StartedAt.UTC().Format(time.RFC3339Nano),
+		"correlationId": startupTraceCorrelationID(trace.ID),
+		"reason":        trace.Reason,
 		"elapsedMillis": durationMillis(elapsed),
 		"targetMillis":  durationMillis(streamStartupTraceTarget), "overBudget": elapsed > streamStartupTraceTarget,
 		"complete": trace.Complete, "lastPhase": trace.LastPhase,
-		"phases": append([]streamStartupTracePhase(nil), trace.Phases...),
+		"phaseOrder":           "server_receipt",
+		"sourceClockSemantics": "independent_diagnostic_clock",
+		"phases":               append([]streamStartupTracePhase(nil), trace.Phases...),
 	}
 }

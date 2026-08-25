@@ -1,0 +1,446 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { performance } from 'node:perf_hooks';
+import {
+  adminRedetectTicketActionV3Args,
+  adminScheduleTicketActionV3Args,
+  beginTicketActionV3LocalRequest,
+  dispatchTicketActionV3ForLocalGate,
+  handleTicketLocalRegisterSliderChange,
+  isTicketActionV3CurrentProofFresh,
+  isTicketActionV3RegistrationProofFresh,
+  observeTicketActionV3LocalRequest,
+  settleTicketActionV3LocalRequest,
+  shouldSubmitTicketSliderCompletion,
+  ticketActionV3ActionsByAuthority,
+  ticketCurrentProofFingerprintChanged,
+  ticketCurrentProofRequestNeeded,
+  ticketControlCodeVisualRecoveryRequired,
+  ticketActionV3ClientId,
+  ticketActionV3ExplicitResultForDisplay,
+  ticketActionV3LocalRequestBusy,
+  ticketActionV3OccupiesPhone,
+  ticketActionV3RequestArgs,
+  ticketActionV3SmartSwitchForView,
+  ticketMemberLimitBlocks,
+  ticketMemberLimitCountdown,
+  ticketActionV3ZonedLocalMillis,
+  ticketSliderRegionV3ForAction,
+  ticketSliderRegionV3Layout
+} from './ticket-action-v3-core.mjs';
+
+test('historical switch projection refresh cannot displace the newest real action', () => {
+  const historicalActionWithFreshProjection = {
+    id: 'backend:historical',
+    actionId: 'historical',
+    target: 'open_latest_unactivated',
+    status: 'succeeded',
+    currentView: 'latest_unactivated',
+    switchAvailable: true,
+    createdAt: '2026-08-25T12:00:00Z',
+    updatedAt: '2026-08-25T12:15:00Z'
+  };
+  const newestRealAction = {
+    id: 'backend:newest',
+    actionId: 'newest',
+    target: 'show_recent_activated',
+    status: 'running',
+    currentView: 'latest_unactivated',
+    switchAvailable: false,
+    createdAt: '2026-08-25T12:10:00Z',
+    updatedAt: '2026-08-25T12:10:01Z'
+  };
+
+  assert.deepEqual(
+    ticketActionV3ActionsByAuthority([historicalActionWithFreshProjection, newestRealAction]),
+    [newestRealAction, historicalActionWithFreshProjection]
+  );
+});
+
+test('current action authority preserves sub-millisecond creation order and deterministic exact ties', () => {
+  const olderFraction = {
+    id: 'backend:fraction-z', actionId: 'fraction-z',
+    createdAt: '2026-08-25T12:00:00.123001Z', updatedAt: '2026-08-25T12:30:00Z'
+  };
+  const newerFraction = {
+    id: 'backend:fraction-a', actionId: 'fraction-a',
+    createdAt: '2026-08-25T12:00:00.123999Z', updatedAt: '2026-08-25T12:00:01Z'
+  };
+  const exactTieA = {
+    id: 'backend:tie-a', actionId: 'tie-a', createdAt: '2026-08-25T12:20:00Z'
+  };
+  const exactTieZ = {
+    id: 'backend:tie-z', actionId: 'tie-z', createdAt: '2026-08-25T12:20:00Z'
+  };
+
+  assert.deepEqual(
+    ticketActionV3ActionsByAuthority([olderFraction, newerFraction]),
+    [newerFraction, olderFraction],
+    'Spacetime microsecond creation order must survive JavaScript millisecond parsing'
+  );
+  assert.deepEqual(
+    ticketActionV3ActionsByAuthority([exactTieA, exactTieZ]),
+    [exactTieZ, exactTieA],
+    'the action ID is the stable final authority for an exact creation-time tie'
+  );
+  assert.deepEqual(
+    ticketActionV3ActionsByAuthority([exactTieZ, exactTieA]),
+    [exactTieZ, exactTieA],
+    'subscription iteration order cannot change the exact-tie result'
+  );
+});
+
+test('member limit gating is projection-authoritative while countdowns are presentation-only', () => {
+  const limited = {
+    effectiveLimited: true,
+    registrationAllowed: false,
+    controlCodeAllowed: true
+  };
+  assert.equal(ticketMemberLimitBlocks(null, 'registration'), true);
+  assert.equal(ticketMemberLimitBlocks(limited, 'registration'), true);
+  assert.equal(ticketMemberLimitBlocks(limited, 'control_code'), false);
+  assert.equal(ticketMemberLimitBlocks({ ...limited, effectiveLimited: false }, 'registration'), false);
+  assert.equal(ticketMemberLimitCountdown('2026-08-25T12:00:30Z', Date.parse('2026-08-25T12:00:00Z')), 'pēc 30 s');
+  assert.equal(ticketMemberLimitCountdown('2026-08-25T12:00:00Z', Date.parse('2026-08-25T12:00:01Z')), 'gaida SpaceTime atjauninājumu');
+});
+
+test('registration authority is the exact fresh v3 visual watermark', () => {
+  const action = {
+    actionId: 'open-proof-1',
+    target: 'open_latest_unactivated',
+    status: 'succeeded',
+    currentView: 'latest_unactivated',
+    streamEpoch: '101',
+    frameSequence: '202',
+    expiresAt: '2026-08-24T12:05:00Z'
+  };
+  const now = Date.parse('2026-08-24T12:00:00Z');
+  assert.equal(isTicketActionV3RegistrationProofFresh(action, { fresh: true, epoch: 101, sequence: 205 }, now), true);
+  assert.equal(isTicketActionV3RegistrationProofFresh(action, { fresh: true, epoch: 102, sequence: 205 }, now), false);
+  assert.equal(isTicketActionV3RegistrationProofFresh({ ...action, status: 'failed' }, { fresh: true, epoch: 101, sequence: 205 }, now), false);
+  assert.equal(isTicketActionV3RegistrationProofFresh({ ...action, target: 'show_recent_activated' }, { fresh: true, epoch: 101, sequence: 205 }, now), false);
+  assert.equal(isTicketActionV3RegistrationProofFresh({ ...action, target: 'prove_current' }, { fresh: true, epoch: 101, sequence: 205 }, now), true);
+  assert.equal(isTicketActionV3RegistrationProofFresh(action, { fresh: true, epoch: 101, sequence: 205 }, Date.parse('2026-08-24T12:05:00Z')), false);
+});
+
+test('normalized slider geometry requires the exact action watermark and expiry', () => {
+  const action = {
+    actionId: 'proof-current-1', target: 'prove_current', status: 'succeeded',
+    currentView: 'latest_unactivated', streamEpoch: '101', frameSequence: '202',
+    expiresAt: '2026-08-24T12:05:00Z'
+  };
+  const region = {
+    proofActionId: 'proof-current-1', streamEpoch: '101', frameSequence: '202',
+    leftBasisPoints: 1200, topBasisPoints: 7000, rightBasisPoints: 8800, bottomBasisPoints: 7600,
+    expiresAt: '2026-08-24T12:05:00Z'
+  };
+  const stream = { fresh: true, epoch: 101, sequence: 205 };
+  assert.ok(ticketSliderRegionV3ForAction(action, region, stream, Date.parse('2026-08-24T12:00:00Z')));
+  assert.equal(ticketSliderRegionV3ForAction(action, { ...region, frameSequence: '203' }, stream, Date.parse('2026-08-24T12:00:00Z')), null);
+  assert.equal(ticketSliderRegionV3ForAction(action, { ...region, rightBasisPoints: 10001 }, stream, Date.parse('2026-08-24T12:00:00Z')), null);
+  assert.equal(ticketSliderRegionV3ForAction(action, region, stream, Date.parse('2026-08-24T12:05:00Z')), null);
+  assert.deepEqual(ticketSliderRegionV3Layout(region,
+    { left: 20, top: 30, width: 500, height: 1000 },
+    { left: 5, top: 10 }
+  ), { left: 75, top: 720, width: 380, height: 60 });
+});
+
+test('auto proof is coalesced by stream epoch and two stable change samples', () => {
+  const stream = { fresh: true, epoch: 101, sequence: 205 };
+  assert.equal(ticketCurrentProofRequestNeeded({ visible: true, stream, requestedEpoch: 0 }), true);
+  assert.equal(ticketCurrentProofRequestNeeded({ visible: true, stream, requestedEpoch: 101, stableChangeCount: 1 }), false);
+  assert.equal(ticketCurrentProofRequestNeeded({ visible: true, stream, requestedEpoch: 101, stableChangeCount: 2 }), true);
+  assert.equal(ticketCurrentProofRequestNeeded({ visible: false, stream, requestedEpoch: 0 }), false);
+  assert.equal(ticketCurrentProofRequestNeeded({ visible: true, stream, requestedEpoch: 0, action: { status: 'running' } }), false);
+  const currentProof = {
+    target: 'prove_current', status: 'succeeded', currentView: 'activated_current',
+    streamEpoch: '101', frameSequence: '202', expiresAt: '2026-08-24T12:05:00Z'
+  };
+  assert.equal(isTicketActionV3CurrentProofFresh(currentProof, stream, Date.parse('2026-08-24T12:00:00Z')), true);
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: currentProof, requestedEpoch: 101, resumed: true,
+    now: Date.parse('2026-08-24T12:00:00Z')
+  }), false, 'a visible resume must not repeat a still-fresh activated proof');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: currentProof, requestedEpoch: 101, stableChangeCount: 2,
+    now: Date.parse('2026-08-24T12:00:00Z')
+  }), true, 'two agreeing significant frame changes override a still-fresh proof');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: { target: 'prove_current', status: 'running' },
+    requestedEpoch: 101, stableChangeCount: 2,
+    now: Date.parse('2026-08-24T12:00:00Z')
+  }), false, 'the frame-change trigger remains inadmissible while the phone is busy');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, requestedEpoch: 101, stableChangeCount: 2,
+    now: Date.parse('2026-08-24T12:00:00Z')
+  }), true, 'the same retained frame-change trigger is admitted once the phone is idle');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: currentProof, requestedEpoch: 101, resumed: true,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), true, 'an expired proof is re-established on visible resume');
+  const unknownProof = { ...currentProof, status: 'failed', currentView: 'unknown' };
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: unknownProof, requestedEpoch: 0, resumed: true,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), false, 'an unknown proof in the same epoch waits for another meaningful frame change');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream, action: unknownProof, requestedEpoch: 101, stableChangeCount: 2,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), true, 'an unknown proof is retried after two agreeing significant changes');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream: { ...stream, epoch: 102 }, action: unknownProof,
+    requestedEpoch: 101, unknownAwaitingChange: true,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), false, 'a reconnect caused by this page exact unknown proof is not a retry signal');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream: { ...stream, epoch: 102 }, action: unknownProof,
+    requestedEpoch: 0, unknownAwaitingChange: false,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), true, 'a newly opened page still gets one first-frame proof in the new epoch');
+  assert.equal(ticketCurrentProofRequestNeeded({
+    visible: true, stream: { ...stream, epoch: 102 }, action: unknownProof,
+    requestedEpoch: 101, stableChangeCount: 2, unknownAwaitingChange: true,
+    now: Date.parse('2026-08-24T12:05:00Z')
+  }), true, 'two agreeing changed frames release the exact unknown-proof guard');
+  for (const trigger of [
+    { requestedEpoch: 0 },
+    { requestedEpoch: 101, resumed: true },
+    { requestedEpoch: 101, stableChangeCount: 2 }
+  ]) {
+    assert.equal(ticketCurrentProofRequestNeeded({
+      visible: true, stream, recoveryRequired: true, ...trigger
+    }), false, 'visual cleanup must suppress every automatic proof trigger');
+  }
+  assert.equal(ticketCurrentProofFingerprintChanged([10, 10, 10, 10, 10, 10], [40, 40, 40, 40, 10, 10]), true);
+  assert.equal(ticketCurrentProofFingerprintChanged([10, 10, 10, 10, 10, 10], [20, 20, 20, 20, 10, 10]), false);
+});
+
+test('control-code visual cleanup blocks automatic proof until explicit recovery', () => {
+  assert.equal(ticketControlCodeVisualRecoveryRequired([
+    { status: 'failed', cleanupPending: true, expiresAt: '2026-08-24T12:00:00Z' }
+  ]), true);
+  assert.equal(ticketControlCodeVisualRecoveryRequired([
+    { status: 'succeeded', cleanupPending: true }
+  ]), true);
+  assert.equal(ticketControlCodeVisualRecoveryRequired([
+    { status: 'running', cleanupPending: true }
+  ]), true);
+  assert.equal(ticketControlCodeVisualRecoveryRequired([
+    { status: 'failed', cleanupPending: false },
+    { status: 'closed', cleanupPending: true },
+    { status: 'expired', cleanupPending: true }
+  ]), false);
+  assert.equal(ticketControlCodeVisualRecoveryRequired(null), false);
+});
+
+test('v3 activation correlation is exact and non-activation fields stay empty', () => {
+  assert.deepEqual(ticketActionV3RequestArgs({
+    actionId: 'action-1', target: 'register_current', source: 'browser_slider', reason: 'complete',
+    expectedInteractionRevision: 'revision-1'
+  }), {
+    actionId: 'action-1', target: 'register_current', source: 'browser_slider', reason: 'complete',
+    attemptId: 'action-1', expectedInteractionRevision: 'revision-1', scheduleId: ''
+  });
+  assert.equal(ticketActionV3RequestArgs({ actionId: 'action-2', target: 'open_latest_unactivated' }).attemptId, '');
+});
+
+test('admin immediate redetection uses one authenticated v3 action contract', () => {
+  const actionId = ticketActionV3ClientId('admin redetect', 123456789, 'AbC-123');
+  assert.equal(actionId, 'ticket_action_v3_admin_redetect_123456789_abc-123');
+  assert.match(actionId, /^[a-z0-9_-]+$/);
+  assert.ok(actionId.length <= 120);
+  assert.deepEqual(adminRedetectTicketActionV3Args(actionId), {
+    actionId,
+    target: 'redetect_latest',
+    source: 'ticket_remote_admin',
+    reason: 'ticket_action_requested',
+    attemptId: '',
+    expectedInteractionRevision: '',
+    scheduleId: ''
+  });
+});
+
+test('admin scheduled redetection carries exact v3 schedule fields', () => {
+  assert.deepEqual(adminScheduleTicketActionV3Args({
+    scheduleId: 'ticket_action_v3_schedule_1',
+    scheduledAtMillis: 1_800_000_000_123,
+    phoneLocalTime: '2027-01-15T12:30',
+    phoneTimeZone: 'Europe/Riga'
+  }), {
+    scheduleId: 'ticket_action_v3_schedule_1',
+    scheduledAtMicros: 1_800_000_000_123_000n,
+    phoneLocalTime: '2027-01-15T12:30',
+    phoneTimeZone: 'Europe/Riga',
+    target: 'redetect_latest'
+  });
+  assert.throws(() => adminScheduleTicketActionV3Args({ scheduledAtMillis: 0 }), /invalid scheduled time/);
+});
+
+test('admin schedule converts an ordinary phone-local minute and rejects a missing DST minute', () => {
+  assert.equal(
+    ticketActionV3ZonedLocalMillis('2026-07-10', '15:30', 'Europe/Riga'),
+    Date.parse('2026-07-10T12:30:00Z')
+  );
+  assert.throws(
+    () => ticketActionV3ZonedLocalMillis('2026-03-29', '03:30', 'Europe/Riga'),
+    /laika joslas maiņas/
+  );
+  assert.equal(
+    ticketActionV3ZonedLocalMillis('2026-10-25', '03:30', 'Europe/Riga'),
+    Date.parse('2026-10-25T00:30:00Z'),
+    'an overlapping phone-local minute must retain the established earliest-occurrence policy'
+  );
+});
+
+test('one completed slider gesture dispatches only once', () => {
+  const pointer = { qualified: true, submitted: false };
+  assert.equal(shouldSubmitTicketSliderCompletion(pointer, 'up', 9500), true);
+  assert.equal(shouldSubmitTicketSliderCompletion(pointer, 'up', 10000), false);
+  assert.equal(pointer.submitted, true);
+});
+
+test('#ticketLocalRegisterSlider change-to-100 submits register_current exactly once', async () => {
+  const slider = { value: '100', disabled: false };
+  const state = { inFlight: false };
+  const submissions = [];
+  let releaseSubmission;
+  const submissionPending = new Promise((resolve) => { releaseSubmission = resolve; });
+  let renders = 0;
+  const options = {
+    slider,
+    state,
+    submitRegisterCurrent: (source) => {
+      submissions.push({ target: 'register_current', source });
+      return submissionPending;
+    },
+    render: () => { renders += 1; }
+  };
+
+  const first = handleTicketLocalRegisterSliderChange(options);
+  const duplicate = handleTicketLocalRegisterSliderChange(options);
+  assert.deepEqual(submissions, [{ target: 'register_current', source: 'browser_slider' }]);
+  assert.equal(state.inFlight, true);
+  assert.equal(slider.disabled, true);
+  assert.equal(await duplicate, false);
+
+  releaseSubmission();
+  assert.equal(await first, true);
+  assert.equal(state.inFlight, false);
+  assert.equal(slider.value, '0');
+  assert.equal(renders, 1);
+});
+
+test('smart switch labels map to their exact reducer targets', () => {
+  assert.deepEqual(ticketActionV3SmartSwitchForView('latest_unactivated'), {
+    label: 'Skatīt pēdējo reģistrēto biļeti',
+    target: 'show_recent_activated'
+  });
+  assert.deepEqual(ticketActionV3SmartSwitchForView('recent_activated'), {
+    label: 'Atgriezties pie nereģistrētās biļetes',
+    target: 'return_to_latest_unactivated'
+  });
+  assert.deepEqual(ticketActionV3SmartSwitchForView('unknown'), {
+    label: 'Skatīt pēdējo reģistrēto biļeti',
+    target: ''
+  });
+});
+
+test('browser phone-lane busy state includes every pending or running v3 target', () => {
+  for (const target of [
+    'open_latest_unactivated',
+    'open_latest_and_register',
+    'register_current',
+    'show_recent_activated',
+    'return_to_latest_unactivated',
+    'redetect_latest',
+    'prove_current'
+  ]) {
+    assert.equal(ticketActionV3OccupiesPhone({ target, status: 'pending' }), true);
+    assert.equal(ticketActionV3OccupiesPhone({ target, status: 'running' }), true);
+    assert.equal(ticketActionV3OccupiesPhone({ target, status: 'succeeded' }), false);
+  }
+});
+
+test('automatic current proof cannot replace the last explicit user action result', () => {
+  const explicitFailure = {
+    actionId: 'ticket_action_v3_user_open',
+    target: 'open_latest_unactivated',
+    status: 'failed',
+    reason: 'ticket_action_visual_unproved'
+  };
+  const laterAutomaticProof = {
+    actionId: 'ticket_action_v3_auto_proof',
+    target: 'prove_current',
+    status: 'succeeded',
+    currentView: 'latest_unactivated'
+  };
+
+  assert.equal(
+    ticketActionV3ExplicitResultForDisplay(
+      [laterAutomaticProof, explicitFailure],
+      explicitFailure.actionId
+    ),
+    explicitFailure,
+    'the exact explicit failure remains the user-facing result even when prove_current is newer'
+  );
+  assert.equal(
+    ticketActionV3ExplicitResultForDisplay(
+      [laterAutomaticProof],
+      explicitFailure.actionId,
+      explicitFailure
+    ),
+    explicitFailure,
+    'the remembered terminal result survives a later snapshot that no longer contains its row'
+  );
+  assert.equal(
+    ticketActionV3ExplicitResultForDisplay([laterAutomaticProof], ''),
+    null,
+    'an automatic proof is never inferred to be an explicit user result'
+  );
+});
+
+test('local v3 request remains latched after reducer acknowledgement until its exact row arrives', () => {
+  const state = { actionId: '', reducerSettled: false, observed: false };
+  assert.equal(beginTicketActionV3LocalRequest(state, 'ticket_action_v3_exact'), true);
+  assert.equal(ticketActionV3LocalRequestBusy(state), true);
+
+  assert.equal(observeTicketActionV3LocalRequest(state, {
+    actionId: 'ticket_action_v3_old',
+    status: 'succeeded'
+  }), false);
+  assert.equal(settleTicketActionV3LocalRequest(state, true), false);
+  assert.equal(ticketActionV3LocalRequestBusy(state), true);
+  assert.equal(beginTicketActionV3LocalRequest(state, 'ticket_action_v3_duplicate'), false);
+
+  assert.equal(observeTicketActionV3LocalRequest(state, {
+    actionId: 'ticket_action_v3_exact',
+    status: 'pending'
+  }), true);
+  assert.equal(ticketActionV3LocalRequestBusy(state), false);
+});
+
+test('rejected local v3 request releases its latch without an authoritative row', () => {
+  const state = { actionId: '', reducerSettled: false, observed: false };
+  assert.equal(beginTicketActionV3LocalRequest(state, 'ticket_action_v3_rejected'), true);
+  assert.equal(settleTicketActionV3LocalRequest(state, false), true);
+  assert.equal(ticketActionV3LocalRequestBusy(state), false);
+});
+
+test('local browser dispatch and acknowledgement p95 stays below 250ms', async () => {
+  const samples = [];
+  let acknowledgements = 0;
+  for (let index = 0; index < 200; index += 1) {
+    const started = performance.now();
+    await dispatchTicketActionV3ForLocalGate(
+      async () => Promise.resolve(),
+      { actionId: `action-${index}`, target: 'open_latest_unactivated', source: 'browser_button', reason: 'micro_gate' },
+      () => { acknowledgements += 1; }
+    );
+    samples.push(performance.now() - started);
+  }
+  samples.sort((left, right) => left - right);
+  const p95 = samples[Math.floor(samples.length * 0.95)];
+  console.log(`local dispatch/ack p95=${p95.toFixed(3)}ms`);
+  assert.equal(acknowledgements, 200);
+  assert.ok(p95 < 250, `local dispatch/ack p95 ${p95.toFixed(2)}ms exceeded 250ms`);
+});

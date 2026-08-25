@@ -14,7 +14,16 @@ import (
 	"ticketremote/internal/state"
 )
 
-const backgroundKeyframeMinInterval = 2500 * time.Millisecond
+const (
+	backgroundKeyframeMinInterval      = 2500 * time.Millisecond
+	backgroundKeyframeRequirementLimit = 64
+)
+
+type pendingBackgroundKeyframeRequest struct {
+	reason         string
+	requirement    string
+	startupTraceID []string
+}
 
 func (s *Server) activePhoneBackend() config.PhoneBackend {
 	s.backendMu.RLock()
@@ -216,7 +225,7 @@ func (s *Server) maybeRequestPhoneStart(data map[string]any, reason string) {
 	}, streamCommandTTL)
 }
 
-func (s *Server) wakePhoneStreamFromVideoSocketOpen(reason string) {
+func (s *Server) wakePhoneStreamFromVideoSocketOpen(reason, startupTraceCorrelationID, originatingTraceID string) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "video_socket_open"
@@ -226,23 +235,61 @@ func (s *Server) wakePhoneStreamFromVideoSocketOpen(reason string) {
 		return
 	}
 	if !relayHealth.Desired || !relayHealth.Connected {
-		s.direct.recordStartupPhase("video_socket_wake_start_queued", reason)
-		s.startPhoneSessionForPrewarm(reason)
+		s.direct.recordStartupPhaseForTrace(originatingTraceID, "video_socket_wake_start_queued", reason)
+		s.queuePrewarmStreamCommands(reason, startupTraceCorrelationID, originatingTraceID)
 		s.relay.EnsureActive("video_socket_open:" + reason)
 		return
 	}
-	if strings.TrimSpace(relayHealth.StreamState) != "live" {
-		s.direct.recordStartupPhase("video_socket_wake_keyframe_queued", reason)
-		s.requestPhoneKeyframe(reason)
+	if phoneRelayNeedsSocketWakeKeyframe(relayHealth) {
+		s.direct.recordStartupPhaseForTrace(originatingTraceID, "video_socket_wake_keyframe_queued", reason)
+		s.requestPhoneKeyframe(reason, startupTraceCorrelationID, originatingTraceID)
 	}
 }
 
-func (s *Server) requestPhoneKeyframe(reason string) {
-	if s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
+func phoneRelayNeedsSocketWakeKeyframe(relayHealth phone.Health) bool {
+	return strings.TrimSpace(relayHealth.StreamState) != "streaming"
+}
+
+func (s *Server) requestPhoneKeyframe(reason string, startupTraceID ...string) {
+	s.requestPhoneKeyframeWithRequirement(reason, "", startupTraceID...)
+}
+
+// requestPhoneConfigKeyframe gives a decoder-reset configuration one fresh
+// keyframe request even when an unrelated background nudge just ran. The
+// epoch-scoped requirement still shares the ordinary in-flight gate and
+// cooldown with repeated copies of the same configuration.
+func (s *Server) requestPhoneConfigKeyframe(streamEpoch uint64) {
+	requirement := phoneConfigKeyframeRequirement(streamEpoch)
+	s.requestPhoneKeyframeWithRequirement("phone_config_active_viewer", requirement)
+}
+
+func phoneConfigKeyframeRequirement(streamEpoch uint64) string {
+	return fmt.Sprintf("phone_config_active_viewer:%d", streamEpoch)
+}
+
+func (s *Server) requestPhoneKeyframeWithRequirement(reason, requirement string, startupTraceID ...string) {
+	if !perViewerKeyframeRequired(reason) && s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
 		return
 	}
 	background := backgroundKeyframeDedupEligible(reason)
-	if background && !s.beginBackgroundKeyframe(time.Now()) {
+	if background && strings.TrimSpace(requirement) != "" {
+		request := pendingBackgroundKeyframeRequest{
+			reason:         reason,
+			requirement:    strings.TrimSpace(requirement),
+			startupTraceID: append([]string(nil), startupTraceID...),
+		}
+		accepted, dispatchNow := s.enqueueRequiredBackgroundKeyframe(request, time.Now())
+		if !accepted {
+			s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+			return
+		}
+		s.direct.recordKeyframeRequested()
+		if dispatchNow {
+			s.dispatchBackgroundKeyframe(request)
+		}
+		return
+	}
+	if background && !s.beginBackgroundKeyframe(time.Now(), requirement) {
 		s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
 		return
 	}
@@ -251,14 +298,68 @@ func (s *Server) requestPhoneKeyframe(reason string) {
 		if background {
 			defer s.finishBackgroundKeyframe()
 		}
-		if err := s.sendPhoneKeyframe(reason); err != nil {
+		if err := s.sendPhoneKeyframe(reason, startupTraceID...); err != nil {
 			s.recordRuntimeErrorAsync("phone_keyframe_request_failed", reason, err, map[string]any{"reason": reason})
 		}
 	}()
 }
 
+func (s *Server) enqueueRequiredBackgroundKeyframe(request pendingBackgroundKeyframeRequest, now time.Time) (bool, bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	request.requirement = strings.TrimSpace(request.requirement)
+	if request.requirement == "" {
+		return false, false
+	}
+	s.backgroundKeyframeMu.Lock()
+	defer s.backgroundKeyframeMu.Unlock()
+	if s.backgroundKeyframeNeeds == nil {
+		s.backgroundKeyframeNeeds = map[string]time.Time{}
+	}
+	if s.backgroundKeyframeActive == nil {
+		s.backgroundKeyframeActive = map[string]struct{}{}
+	}
+	for key, requestedAt := range s.backgroundKeyframeNeeds {
+		if _, active := s.backgroundKeyframeActive[key]; active {
+			continue
+		}
+		if !now.Before(requestedAt) && now.Sub(requestedAt) >= backgroundKeyframeMinInterval {
+			delete(s.backgroundKeyframeNeeds, key)
+		}
+	}
+	if _, active := s.backgroundKeyframeActive[request.requirement]; active {
+		return false, false
+	}
+	if requestedAt, exists := s.backgroundKeyframeNeeds[request.requirement]; exists &&
+		(now.Before(requestedAt) || now.Sub(requestedAt) < backgroundKeyframeMinInterval) {
+		return false, false
+	}
+	if len(s.backgroundKeyframeNeeds) >= backgroundKeyframeRequirementLimit || len(s.backgroundKeyframePending) >= backgroundKeyframeRequirementLimit {
+		return false, false
+	}
+	s.backgroundKeyframeNeeds[request.requirement] = now
+	s.backgroundKeyframeActive[request.requirement] = struct{}{}
+	s.lastBackgroundKeyframeAt = now
+	if s.backgroundKeyframeInFlight {
+		s.backgroundKeyframePending = append(s.backgroundKeyframePending, request)
+		return true, false
+	}
+	s.backgroundKeyframeInFlight = true
+	return true, true
+}
+
+func (s *Server) dispatchBackgroundKeyframe(request pendingBackgroundKeyframeRequest) {
+	go func() {
+		defer s.finishBackgroundKeyframe(request.requirement)
+		if err := s.sendPhoneKeyframe(request.reason, request.startupTraceID...); err != nil {
+			s.recordRuntimeErrorAsync("phone_keyframe_request_failed", request.reason, err, map[string]any{"reason": request.reason})
+		}
+	}()
+}
+
 func (s *Server) requestPhoneKeyframeNow(reason string) error {
-	if s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
+	if !perViewerKeyframeRequired(reason) && s.liveStreamSuppressesBackgroundCommand("keyframe", reason, time.Now()) {
 		return nil
 	}
 	background := backgroundKeyframeDedupEligible(reason)
@@ -273,35 +374,97 @@ func (s *Server) requestPhoneKeyframeNow(reason string) error {
 	return s.sendPhoneKeyframe(reason)
 }
 
-func (s *Server) beginBackgroundKeyframe(now time.Time) bool {
+func (s *Server) beginBackgroundKeyframe(now time.Time, requirement ...string) bool {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	requirementKey := ""
+	if len(requirement) > 0 {
+		requirementKey = strings.TrimSpace(requirement[0])
+	}
 	s.backgroundKeyframeMu.Lock()
 	defer s.backgroundKeyframeMu.Unlock()
-	if s.backgroundKeyframeInFlight || (!s.lastBackgroundKeyframeAt.IsZero() && now.Sub(s.lastBackgroundKeyframeAt) < backgroundKeyframeMinInterval) {
+	if s.backgroundKeyframeInFlight {
 		return false
+	}
+	insideGlobalCooldown := !s.lastBackgroundKeyframeAt.IsZero() &&
+		(now.Before(s.lastBackgroundKeyframeAt) || now.Sub(s.lastBackgroundKeyframeAt) < backgroundKeyframeMinInterval)
+	if requirementKey == "" {
+		if insideGlobalCooldown {
+			return false
+		}
+	} else {
+		if s.backgroundKeyframeNeeds == nil {
+			s.backgroundKeyframeNeeds = map[string]time.Time{}
+		}
+		for key, requestedAt := range s.backgroundKeyframeNeeds {
+			if !now.Before(requestedAt) && now.Sub(requestedAt) >= backgroundKeyframeMinInterval {
+				delete(s.backgroundKeyframeNeeds, key)
+			}
+		}
+		if requestedAt, exists := s.backgroundKeyframeNeeds[requirementKey]; exists &&
+			(now.Before(requestedAt) || now.Sub(requestedAt) < backgroundKeyframeMinInterval) {
+			return false
+		}
+		if len(s.backgroundKeyframeNeeds) >= backgroundKeyframeRequirementLimit {
+			return false
+		}
 	}
 	s.backgroundKeyframeInFlight = true
 	s.lastBackgroundKeyframeAt = now
+	if requirementKey != "" {
+		s.backgroundKeyframeNeeds[requirementKey] = now
+	}
 	return true
 }
 
-func (s *Server) finishBackgroundKeyframe() {
+func (s *Server) finishBackgroundKeyframe(requirement ...string) {
+	completedRequirement := ""
+	if len(requirement) > 0 {
+		completedRequirement = strings.TrimSpace(requirement[0])
+	}
 	s.backgroundKeyframeMu.Lock()
-	s.backgroundKeyframeInFlight = false
+	if completedRequirement != "" {
+		delete(s.backgroundKeyframeActive, completedRequirement)
+	}
+	if len(s.backgroundKeyframePending) == 0 {
+		s.backgroundKeyframeInFlight = false
+		s.backgroundKeyframeMu.Unlock()
+		return
+	}
+	next := s.backgroundKeyframePending[0]
+	s.backgroundKeyframePending[0] = pendingBackgroundKeyframeRequest{}
+	s.backgroundKeyframePending = s.backgroundKeyframePending[1:]
+	if len(s.backgroundKeyframePending) == 0 {
+		s.backgroundKeyframePending = nil
+	}
 	s.backgroundKeyframeMu.Unlock()
+	s.dispatchBackgroundKeyframe(next)
+}
+
+// A newly connected browser may have missed the short-lived cached keyframe
+// even though another viewer keeps the upstream stream live. That viewer
+// still needs one decodable keyframe; the existing background gate below
+// coalesces concurrent joins so this does not become a keyframe storm.
+func perViewerKeyframeRequired(reason string) bool {
+	cleanReason := strings.ToLower(cleanStreamControlText(reason, ""))
+	switch cleanReason {
+	case "browser_warm_prewarm", "browser_video_provisional_config", "browser_video_config_needed", "phone_config_active_viewer", "frame_sequence_gap":
+		return true
+	default:
+		return strings.HasPrefix(cleanReason, "viewer_")
+	}
 }
 
 func backgroundKeyframeDedupEligible(reason string) bool {
 	cleanReason := strings.ToLower(cleanStreamControlText(reason, "keyframe"))
-	if strings.Contains(cleanReason, "control_code") || cleanReason == "phone_config_active_viewer" {
+	if strings.Contains(cleanReason, "control_code") {
 		return false
 	}
 	return backgroundStreamCommandRequiresDemand("keyframe", cleanReason)
 }
 
-func (s *Server) sendPhoneKeyframe(reason string) error {
+func (s *Server) sendPhoneKeyframe(reason string, startupTraceID ...string) error {
 	relayHealth := s.relay.Snapshot()
 	if relayHealth.Viewers > 0 && !relayHealth.Connected {
 		s.direct.recordClientTelemetry("keyframe_waiting_phone_connect", reason)
@@ -316,13 +479,35 @@ func (s *Server) sendPhoneKeyframe(reason string) error {
 			return nil
 		}
 	}
-	s.direct.recordStartupPhase("keyframe_command_queued", reason)
+	originatingTraceID := ""
+	traceContextProvided := len(startupTraceID) > 1
+	if len(startupTraceID) > 1 {
+		originatingTraceID = strings.TrimSpace(startupTraceID[1])
+	}
+	if originatingTraceID != "" {
+		s.direct.recordStartupPhaseForTrace(originatingTraceID, "keyframe_command_queued", reason)
+	} else if !traceContextProvided {
+		s.direct.recordStartupPhase("keyframe_command_queued", reason)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := s.appendStreamCommand(ctx, "keyframe", reason, map[string]any{
-		"source": "ticket_remote",
-	}, streamKeyframeCommandTTL)
+	payload := phoneKeyframeCommandPayload(reason, startupTraceID...)
+	_, err := s.appendStreamCommand(ctx, "keyframe", reason, payload, streamKeyframeCommandTTL, originatingTraceID)
 	return err
+}
+
+func phoneKeyframeCommandPayload(reason string, startupTraceID ...string) map[string]any {
+	source := "ticket_remote"
+	if perViewerKeyframeRequired(reason) {
+		source = "browser"
+	}
+	payload := map[string]any{
+		"source": source,
+	}
+	if len(startupTraceID) > 0 && strings.TrimSpace(startupTraceID[0]) != "" {
+		payload["traceId"] = startupTraceID[0]
+	}
+	return payload
 }
 
 func (s *Server) requestPhoneRecovery(reason string) {

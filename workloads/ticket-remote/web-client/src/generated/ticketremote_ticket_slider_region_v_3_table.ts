@@ -10,10 +10,17 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export default {
+export default __t.row({
+  id: __t.string().primaryKey(),
   ticketId: __t.string(),
   backendId: __t.string(),
-  resetRequestId: __t.string(),
-  reason: __t.string(),
-  attemptId: __t.string(),
-};
+  proofActionId: __t.string(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  leftBasisPoints: __t.u32(),
+  topBasisPoints: __t.u32(),
+  rightBasisPoints: __t.u32(),
+  bottomBasisPoints: __t.u32(),
+  updatedAt: __t.string(),
+  expiresAt: __t.string(),
+});

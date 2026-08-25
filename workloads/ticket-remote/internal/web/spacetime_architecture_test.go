@@ -559,7 +559,9 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 		"valid_control_code_digits(&clean_digits)",
 		"ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now)",
 		`return Err("request_in_progress".into());`,
-		"CONTROL_CODE_RATE_LIMIT",
+		`admit_member_limit_event(`,
+		`"control_code"`,
+		"if !limit_admission.allowed",
 		"insert_control_code_public_request(",
 		`"generate_control_code"`,
 		`"fastRevision": bounded_text(&expectedFastRevision, 160)`,
@@ -672,40 +674,42 @@ func removedSpacetimeMarkers() []string {
 	}
 }
 
-func TestTicketSliderFingerProgressUsesOneCurrentSample(t *testing.T) {
+func TestTicketSliderUsesShortLivedVisualGeometryWithoutAProgressProtocol(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
 	page := ticketRemoteSourceFile(t, "internal", "web", "static", "index.html.tmpl")
 	for _, required := range []string{
-		"const TICKET_SLIDER_QUALIFY_HOLD_MS: u32 = 80;",
-		"const TICKET_SLIDER_QUALIFY_TRAVEL_CSS: u32 = 10;",
-		"hold_duration_millis < TICKET_SLIDER_QUALIFY_HOLD_MS",
-		"horizontal_travel_css < TICKET_SLIDER_QUALIFY_TRAVEL_CSS",
-		"current.status == \"needs_attention\"",
+		"pub struct TicketremoteTicketSliderRegionV3",
+		"pub fn ticketremote_update_ticket_slider_region_v3",
+		"const TICKET_SLIDER_REGION_V3_TTL_MS: i64 = 5 * 60 * 1000;",
+		"right <= 10_000 && bottom <= 10_000 && left < right && top < bottom",
+		"region.proofActionId == action.actionId",
 	} {
 		if !strings.Contains(module, required) {
-			t.Fatalf("Spacetime slider claim missing %q", required)
+			t.Fatalf("Spacetime visual slider projection missing %q", required)
 		}
-	}
-	if strings.Contains(module, "holdDurationMillis < 500") || strings.Contains(module, "horizontalTravelCss < 50") {
-		t.Fatal("Spacetime slider claim still uses the slow 500ms/50px gate")
 	}
 	for _, required := range []string{
-		"const ticketSliderQualifyHoldMs = 80;",
-		"const ticketSliderQualifyTravelPx = 10;",
-		"ticketSliderProgressFromClientX",
-		"renderTicketSliderProgress",
-		"setPointerCapture(event.pointerId)",
-		"updateTicketSlider(",
-		"const livePictureReady = streamHasFreshRenderedFrame();",
-		"!livePictureReady",
+		"ticketSliderRegionV3ForAction(",
+		"ticketSliderRegionV3Layout(",
+		"handleTicketLocalRegisterSliderChange({",
+		"submitRegisterCurrent: (source) => registerCurrentTicket(source)",
+		"ticketRegisterOverlay.hidden = true",
+		"ticketRegisterOverlay.hidden = false",
 	} {
 		if !strings.Contains(browser, required) {
-			t.Fatalf("browser slider path missing %q", required)
+			t.Fatalf("browser visual slider path missing %q", required)
 		}
 	}
-	if strings.Contains(browser, "heldMs < 500") || strings.Contains(browser, "dx >= 50") {
-		t.Fatal("browser slider path still uses the slow 500ms/50px gate")
+	for _, retired := range []string{
+		"ticketSliderOverlay",
+		"updateTicketSlider(",
+		"queueTicketSliderUpdate(",
+		"claimTicketSlider",
+	} {
+		if strings.Contains(browser, retired) {
+			t.Fatalf("browser retained retired live slider protocol %q", retired)
+		}
 	}
 	if strings.Contains(page, `id="ticketSliderLocalThumb"`) || strings.Contains(page, `id="ticketSliderAppliedThumb"`) {
 		t.Fatal("ticket overlay still includes extra moving thumbs")
@@ -714,11 +718,12 @@ func TestTicketSliderFingerProgressUsesOneCurrentSample(t *testing.T) {
 		t.Fatal("browser slider path still draws extra overlay thumbs")
 	}
 	for _, required := range []string{
-		`id="ticketSliderOverlay"`,
-		`role="slider"`,
+		`id="ticketRegisterOverlay"`,
+		`id="ticketLocalRegisterSlider" type="range"`,
+		`opacity: 0.001`,
 	} {
 		if !strings.Contains(page, required) {
-			t.Fatalf("ticket overlay missing %q", required)
+			t.Fatalf("transparent over-stream slider missing %q", required)
 		}
 	}
 }
