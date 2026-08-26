@@ -210,6 +210,14 @@ macro_rules! purge_ticket_history {
         );
         purge_expired_rows!(
             $ctx,
+            ticketremote_ticket_action_v3_queued_intent,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
             ticketremote_ticket_action_v3,
             $ticket,
             $bound,
@@ -625,6 +633,39 @@ pub struct TicketremoteTicketActionV3 {
     pub createdAt: String,
     pub updatedAt: String,
     pub completedAt: String,
+    pub expiresAt: String,
+    #[default(None::<String>)]
+    pub parentActionId: Option<String>,
+    #[default(None::<String>)]
+    pub rootActionId: Option<String>,
+    #[default(0u32)]
+    pub retryOrdinal: u32,
+}
+
+/// Private one-slot waiting intent for a second browser window. Admission is
+/// intentionally deferred until promotion so stale proofs do not consume a
+/// registration quota or create activation history.
+#[spacetimedb::table(accessor = ticketremote_ticket_action_v3_queued_intent,
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteTicketActionV3QueuedIntent {
+    #[primary_key]
+    pub id: String,
+    pub ticketId: String,
+    pub backendId: String,
+    pub actionId: String,
+    pub kind: String,
+    pub target: String,
+    pub source: String,
+    pub reason: String,
+    pub attemptId: String,
+    pub expectedInteractionRevision: String,
+    pub scheduleId: String,
+    pub requestedEmail: String,
+    pub privatePayloadJson: String,
+    pub createdAt: String,
+    #[index(btree)]
     pub expiresAt: String,
 }
 
@@ -1213,6 +1254,7 @@ fn ticket_action_v3_status(value: &str) -> String {
     allowlisted(
         value,
         &[
+            "queued",
             "pending",
             "running",
             "succeeded",
@@ -1279,6 +1321,7 @@ fn ticket_action_v3_public_reason(value: &str, fallback: &str) -> String {
             "ticket_action_gesture_rejected",
             "ticket_action_gesture_completion_uncertain",
             "ticket_action_gesture_completed_no_transition",
+            "ticket_action_no_transition_retry_queued",
             "ticket_action_post_gesture_visual_unproved",
             "ticket_action_activation_visual_unproved",
             "ticket_action_registered",
@@ -1472,6 +1515,22 @@ fn ticket_action_v3_command_id(ticket_id: &str, backend_id: &str, action_id: &st
     )
 }
 
+fn ticket_action_v3_retry_child_id(parent_action_id: &str) -> String {
+    format!("{}-retry-1", parent_action_id.trim())
+}
+
+fn ticket_action_v3_no_transition_retry_allowed(action: &TicketremoteTicketActionV3) -> bool {
+    ticket_action_v3_is_activation(&action.target)
+        && matches!(action.status.as_str(), "pending" | "running")
+        && action.retryOrdinal == 0
+        && action
+            .parentActionId
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+}
+
 fn ticket_action_v3_terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "needs_attention")
 }
@@ -1590,8 +1649,25 @@ fn ticket_phone_mutation_lane_conflict(
     backend_id: &str,
     now: &str,
 ) -> Option<&'static str> {
+    ticket_phone_mutation_lane_conflict_ignoring_control_request(
+        ctx, ticket_id, backend_id, "", now,
+    )
+}
+
+fn ticket_phone_mutation_lane_conflict_ignoring_control_request(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    ignored_control_request_id: &str,
+    now: &str,
+) -> Option<&'static str> {
     let conflict = ticket_phone_mutation_lane_conflict_reason(
-        ticket_has_control_code_request_in_progress(ctx, ticket_id, now),
+        ticket_has_control_code_request_in_progress_except(
+            ctx,
+            ticket_id,
+            ignored_control_request_id,
+            now,
+        ),
         ticket_has_ticket_action_v3_in_progress(ctx, ticket_id, backend_id),
         ticket_has_ticket_registration_reset_in_progress(ctx, ticket_id, backend_id, now),
         false,
@@ -1654,6 +1730,9 @@ fn ticket_action_v3_upsert_pending(
         ticketId: clean_ticket_id(ticket_id),
         backendId: clean_backend_id(backend_id),
         target: target.into(),
+        parentActionId: None,
+        rootActionId: Some(action_id.into()),
+        retryOrdinal: 0,
         status: "pending".into(),
         phase: "queued".into(),
         currentView: "unknown".into(),
@@ -1694,6 +1773,375 @@ fn ticket_action_v3_finish_without_command(
             expiresAt: add_ms(now, HISTORY_TTL_MS),
             ..row
         });
+}
+
+fn ticket_action_v3_queue_id(ticket_id: &str, backend_id: &str) -> String {
+    phone_row_id(ticket_id, backend_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_ticket_action_v3_intent(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    action_id: &str,
+    target: &str,
+    source: &str,
+    reason: &str,
+    attempt_id: &str,
+    expected_interaction_revision: &str,
+    schedule_id: &str,
+    email: &str,
+    now: &str,
+) -> Result<(), String> {
+    let queue_id = ticket_action_v3_queue_id(ticket_id, backend_id);
+    if ctx
+        .db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .find(&queue_id)
+        .is_some_and(|row| parse_time_ms(&row.expiresAt) > parse_time_ms(now))
+    {
+        return Err("ticket_action_queue_full".into());
+    }
+    ctx.db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .delete(&queue_id);
+    let action =
+        ticket_action_v3_upsert_pending(ctx, ticket_id, backend_id, action_id, target, reason, now);
+    ctx.db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .update(TicketremoteTicketActionV3 {
+            status: "queued".into(),
+            phase: "waiting_for_phone_lane".into(),
+            reason: "ticket_action_queued".into(),
+            ..action
+        });
+    let expires_at = command_expires_at(now, TICKET_ACTIVATION_COMMAND_TTL_MS);
+    ctx.db.ticketremote_ticket_action_v3_queued_intent().insert(
+        TicketremoteTicketActionV3QueuedIntent {
+            id: queue_id,
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            actionId: action_id.into(),
+            kind: "ticket_action_v3".into(),
+            target: target.into(),
+            source: source.into(),
+            reason: reason.into(),
+            attemptId: attempt_id.into(),
+            expectedInteractionRevision: expected_interaction_revision.into(),
+            scheduleId: schedule_id.into(),
+            requestedEmail: email.into(),
+            privatePayloadJson: "{}".into(),
+            createdAt: now.into(),
+            expiresAt: expires_at.clone(),
+        },
+    );
+    let payload = serde_json::json!({
+        "version": 3,
+        "actionId": action_id,
+        "target": target,
+        "source": source,
+        "reason": "ticket_action_queued",
+        "attemptId": attempt_id,
+        "expectedInteractionRevision": expected_interaction_revision,
+        "scheduleId": schedule_id,
+        "queueSlot": 1,
+    })
+    .to_string();
+    let command_id = ticket_action_v3_command_id(ticket_id, backend_id, action_id);
+    ctx.db
+        .ticketremote_stream_command()
+        .insert(TicketremoteStreamCommand {
+            id: command_id,
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            commandType: "ticket_action_v3".into(),
+            status: "queued".into(),
+            revision: action_id.into(),
+            reason: "ticket_action_queued".into(),
+            payloadJson: safe_json_string(&payload, SAFE_JSON_MAX_BYTES),
+            createdAt: now.into(),
+            updatedAt: now.into(),
+            expiresAt: expires_at,
+        });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_control_code_intent(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    session_id: &str,
+    digits: &str,
+    expected_fast_revision: &str,
+    email: &str,
+    now: &str,
+) -> Result<(), String> {
+    let queue_id = ticket_action_v3_queue_id(ticket_id, backend_id);
+    if ctx
+        .db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .find(&queue_id)
+        .is_some_and(|row| parse_time_ms(&row.expiresAt) > parse_time_ms(now))
+    {
+        return Err("ticket_action_queue_full".into());
+    }
+    ctx.db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .delete(&queue_id);
+    let expires_at = command_expires_at(now, CONTROL_CODE_PHONE_TTL_MS);
+    let private_payload = serde_json::json!({
+        "sessionId": session_id,
+        "digits": digits,
+        "expectedFastRevision": expected_fast_revision,
+    })
+    .to_string();
+    ctx.db.ticketremote_ticket_action_v3_queued_intent().insert(
+        TicketremoteTicketActionV3QueuedIntent {
+            id: queue_id,
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            actionId: request_id.into(),
+            kind: "control_code".into(),
+            target: String::new(),
+            source: "browser_spacetime".into(),
+            reason: "control_code_queued".into(),
+            attemptId: String::new(),
+            expectedInteractionRevision: String::new(),
+            scheduleId: String::new(),
+            requestedEmail: email.into(),
+            privatePayloadJson: safe_json_string(&private_payload, SAFE_JSON_MAX_BYTES),
+            createdAt: now.into(),
+            expiresAt: expires_at.clone(),
+        },
+    );
+    insert_control_code_public_request(ctx, ticket_id, request_id, &account_public_id(email), now);
+    ctx.db
+        .ticketremote_stream_command()
+        .insert(TicketremoteStreamCommand {
+            id: format!("{}:generate_control_code", request_id),
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            commandType: "generate_control_code".into(),
+            status: "queued".into(),
+            revision: request_id.into(),
+            reason: "control_code_queued".into(),
+            payloadJson: json_object(&[("requestId", request_id), ("queueSlot", "1")]),
+            createdAt: now.into(),
+            updatedAt: now.into(),
+            expiresAt: expires_at,
+        });
+    Ok(())
+}
+
+fn finish_queued_control_code_request(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    request_id: &str,
+    requested_email: &str,
+    reason: &str,
+    now: &str,
+) {
+    insert_control_code_public_request(
+        ctx,
+        ticket_id,
+        request_id,
+        &account_public_id(requested_email),
+        now,
+    );
+    update_control_code_public_request(
+        ctx,
+        request_id,
+        ControlCodeChanges {
+            status: Some("failed".into()),
+            reason: Some(safe_token(&bounded_text(reason, 120), "request_rejected")),
+            captureRequired: Some(false),
+            cleanupPending: Some(false),
+            expiresAt: Some(command_expires_at(now, CONTROL_CODE_COMMAND_TTL_MS)),
+            ..Default::default()
+        },
+        now,
+    );
+}
+
+fn promote_ticket_action_v3_queue(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) {
+    let queue_id = ticket_action_v3_queue_id(ticket_id, backend_id);
+    let Some(intent) = ctx
+        .db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .find(&queue_id)
+    else {
+        return;
+    };
+    let ignored_control_request_id = if intent.kind == "control_code" {
+        intent.actionId.as_str()
+    } else {
+        ""
+    };
+    if ticket_phone_mutation_lane_conflict_ignoring_control_request(
+        ctx,
+        ticket_id,
+        backend_id,
+        ignored_control_request_id,
+        now,
+    )
+    .is_some()
+    {
+        return;
+    }
+    if intent.kind == "control_code" {
+        let command_id = format!("{}:generate_control_code", intent.actionId);
+        ctx.db
+            .ticketremote_ticket_action_v3_queued_intent()
+            .id()
+            .delete(&queue_id);
+        ctx.db
+            .ticketremote_stream_command()
+            .id()
+            .delete(&command_id);
+        delete_control_code_request(ctx, &intent.actionId);
+        if parse_time_ms(&intent.expiresAt) <= parse_time_ms(now) {
+            finish_queued_control_code_request(
+                ctx,
+                ticket_id,
+                &intent.actionId,
+                &intent.requestedEmail,
+                "command_expired",
+                now,
+            );
+            return;
+        }
+        if !is_member(ctx, ticket_id, &intent.requestedEmail) {
+            finish_queued_control_code_request(
+                ctx,
+                ticket_id,
+                &intent.actionId,
+                &intent.requestedEmail,
+                "membership_required",
+                now,
+            );
+            return;
+        }
+        let payload = serde_json::from_str::<serde_json::Value>(&intent.privatePayloadJson)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let session_id = payload
+            .get("sessionId")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let digits = payload
+            .get("digits")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let expected = payload
+            .get("expectedFastRevision")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if let Err(error) = admit_control_code_request_impl(
+            ctx,
+            ticket_id,
+            backend_id,
+            session_id,
+            digits,
+            expected,
+            &intent.requestedEmail,
+            Some(&intent.actionId),
+            now,
+        ) {
+            finish_queued_control_code_request(
+                ctx,
+                ticket_id,
+                &intent.actionId,
+                &intent.requestedEmail,
+                &error,
+                now,
+            );
+        }
+        return;
+    }
+    let command_id = ticket_action_v3_command_id(ticket_id, backend_id, &intent.actionId);
+    ctx.db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .delete(&queue_id);
+    ctx.db
+        .ticketremote_stream_command()
+        .id()
+        .delete(&command_id);
+    ctx.db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .delete(ticket_action_v3_row_id(
+            ticket_id,
+            backend_id,
+            &intent.actionId,
+        ));
+    if parse_time_ms(&intent.expiresAt) <= parse_time_ms(now) {
+        let row = ticket_action_v3_upsert_pending(
+            ctx,
+            ticket_id,
+            backend_id,
+            &intent.actionId,
+            &intent.target,
+            "command_expired",
+            now,
+        );
+        ticket_action_v3_finish_without_command(ctx, row, "command_expired", now);
+        return;
+    }
+    if !is_member(ctx, ticket_id, &intent.requestedEmail) {
+        let row = ticket_action_v3_upsert_pending(
+            ctx,
+            ticket_id,
+            backend_id,
+            &intent.actionId,
+            &intent.target,
+            "membership_required",
+            now,
+        );
+        ticket_action_v3_finish_without_command(ctx, row, "membership_required", now);
+        return;
+    }
+    if request_ticket_action_v3_impl(
+        ctx,
+        3,
+        ticket_id,
+        backend_id,
+        &intent.actionId,
+        &intent.target,
+        &intent.source,
+        &intent.reason,
+        &intent.attemptId,
+        &intent.expectedInteractionRevision,
+        &intent.scheduleId,
+        &intent.requestedEmail,
+        now,
+    )
+    .is_err()
+    {
+        let row = ticket_action_v3_upsert_pending(
+            ctx,
+            ticket_id,
+            backend_id,
+            &intent.actionId,
+            &intent.target,
+            "ticket_action_rejected",
+            now,
+        );
+        ticket_action_v3_finish_without_command(ctx, row, "ticket_action_rejected", now);
+    }
 }
 
 fn ticket_action_v3_rejection_plan(reason: &str) -> (String, String, String, bool) {
@@ -3511,6 +3959,15 @@ fn request_ticket_action_v3_impl(
     if !schedule_id.trim().is_empty() && !valid_schedule_identifier(schedule_id.trim()) {
         return Err("invalid_ticket_action_schedule_id".into());
     }
+    let activation_target = ticket_action_v3_is_activation(&target);
+    let attempt_id = attempt_id.trim();
+    if activation_target && attempt_id != action_id {
+        return Err("ticket_action_attempt_id_mismatch".into());
+    }
+    let expected_revision = bounded_text(expected_interaction_revision, 160);
+    if target == "register_current" && expected_revision.is_empty() {
+        return Err("ticket_action_interaction_revision_required".into());
+    }
     let row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, action_id);
     if let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&row_id) {
         return ticket_action_v3_duplicate_result(&existing.target, &target);
@@ -3521,17 +3978,23 @@ fn request_ticket_action_v3_impl(
     if let Some(conflict_reason) =
         ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, now)
     {
+        if target != "prove_current" {
+            return queue_ticket_action_v3_intent(
+                ctx,
+                &ticket.id,
+                &backend_id,
+                action_id,
+                &target,
+                &source,
+                &public_reason,
+                attempt_id,
+                &expected_revision,
+                schedule_id.trim(),
+                email,
+                now,
+            );
+        }
         return Err(conflict_reason.into());
-    }
-
-    let activation_target = ticket_action_v3_is_activation(&target);
-    let attempt_id = attempt_id.trim();
-    if activation_target && attempt_id != action_id {
-        return Err("ticket_action_attempt_id_mismatch".into());
-    }
-    let expected_revision = bounded_text(expected_interaction_revision, 160);
-    if target == "register_current" && expected_revision.is_empty() {
-        return Err("ticket_action_interaction_revision_required".into());
     }
 
     let mut interaction = current_ticket_interaction(ctx, &ticket.id, &backend_id, now);
@@ -4308,6 +4771,107 @@ member_stream_reducers! {
     ticketremote_member_recover_stream => "recover_stream", "browser_recovery", CONTROL_CODE_COMMAND_TTL_MS;
 }
 
+#[allow(clippy::too_many_arguments)]
+fn admit_control_code_request_impl(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    session_id: &str,
+    clean_digits: &str,
+    expected_fast_revision: &str,
+    requested_email: &str,
+    request_id: Option<&str>,
+    now: &str,
+) -> Result<(), String> {
+    let backend_id = clean_backend_id(backend_id);
+    let fast_state_id = control_code_fast_state_id(ticket_id, &backend_id);
+    let fast_state = ctx
+        .db
+        .ticketremote_control_code_fast_state()
+        .id()
+        .find(&fast_state_id);
+    let (cleanup_revision, cleanup_stream_epoch, cleanup_frame_sequence, stream_was_live) =
+        fast_state
+            .as_ref()
+            .map(|row| {
+                (
+                    row.revision.clone(),
+                    row.streamEpoch.clone(),
+                    row.frameSequence.clone(),
+                    row.streamLive,
+                )
+            })
+            .unwrap_or_else(|| (now.into(), String::new(), String::new(), false));
+    let request_id = request_id
+        .map(str::to_string)
+        .unwrap_or_else(|| control_code_request_id(ticket_id, session_id, now));
+    let limit_admission = admit_member_limit_event(
+        ctx,
+        ticket_id,
+        requested_email,
+        "control_code",
+        &request_id,
+        now,
+    )?;
+    if !limit_admission.allowed {
+        return Err(limit_admission.reason);
+    }
+    let owner_public_id = account_public_id(requested_email);
+    ctx.db
+        .ticketremote_control_code_owner()
+        .insert(TicketremoteControlCodeOwner {
+            id: request_id.clone(),
+            ticketId: clean_ticket_id(ticket_id),
+            sessionId: session_id.into(),
+            email: requested_email.into(),
+            digits: clean_digits.into(),
+            requestedAt: now.into(),
+            expiresAt: control_code_request_expires_at(now),
+        });
+    insert_control_code_public_request(ctx, ticket_id, &request_id, &owner_public_id, now);
+    let payload = serde_json::json!({
+        "type": "generate_control_code",
+        "owner": "ticket",
+        "app": "vivi",
+        "flow": "control_code",
+        "requestId": request_id,
+        "digits": clean_digits,
+        "source": "browser_spacetime",
+        "requester": owner_public_id,
+        "serverSentAt": now,
+        "dispatchAttempt": 1,
+        "fastRevision": bounded_text(expected_fast_revision, 160)
+    })
+    .to_string();
+    insert_stream_command(
+        ctx,
+        ticket_id,
+        &backend_id,
+        &format!("{}:generate_control_code", request_id),
+        "generate_control_code",
+        now,
+        "control_code_request",
+        &payload,
+        CONTROL_CODE_PHONE_TTL_MS,
+        now,
+    );
+    upsert_control_code_fast_state(
+        ctx,
+        ticket_id,
+        &backend_id,
+        "cleanup",
+        &cleanup_revision,
+        "control_code_request",
+        &cleanup_stream_epoch,
+        &cleanup_frame_sequence,
+        false,
+        false,
+        stream_was_live,
+        now,
+    );
+    Ok(())
+}
+
 member_reducers! {
     ticketremote_member_request_control_code(ctx; ticketId: String, backendId: String,
         sessionId: String, digits: String, expectedFastRevision: String; ticket = ticketId)
@@ -4324,87 +4888,18 @@ member_reducers! {
         return Err("request_in_progress".into());
     }
     let backend_id = clean_backend_id(&backendId);
-    if let Some(conflict_reason) =
-        ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, &now)
+    if ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, &now).is_some()
     {
-        return Err(conflict_reason.into());
+        let request_id = control_code_request_id(&ticket.id, &session_id, &now);
+        return queue_control_code_intent(
+            ctx, &ticket.id, &backend_id, &request_id, &session_id, &clean_digits,
+            &expectedFastRevision, &email, &now,
+        );
     }
-    let fast_state_id = control_code_fast_state_id(&ticket.id, &backend_id);
-    let fast_state = ctx
-        .db
-        .ticketremote_control_code_fast_state()
-        .id()
-        .find(&fast_state_id);
-    let (cleanup_revision, cleanup_stream_epoch, cleanup_frame_sequence, stream_was_live) =
-        fast_state.as_ref().map(|row| (
-            row.revision.clone(), row.streamEpoch.clone(), row.frameSequence.clone(), row.streamLive,
-        )).unwrap_or_else(|| (now.clone(), String::new(), String::new(), false));
-    let request_id = control_code_request_id(&ticket.id, &session_id, &now);
-    let limit_admission = admit_member_limit_event(
-        ctx,
-        &ticket.id,
-        &email,
-        "control_code",
-        &request_id,
-        &now,
+    admit_control_code_request_impl(
+        ctx, &ticket.id, &backend_id, &session_id, &clean_digits,
+        &expectedFastRevision, &email, None, &now,
     )?;
-    if !limit_admission.allowed {
-        return Err(limit_admission.reason);
-    }
-    let owner_public_id = account_public_id(&email);
-    let owner = TicketremoteControlCodeOwner {
-        id: request_id.clone(),
-        ticketId: ticket.id.clone(),
-        sessionId: session_id,
-        email,
-        digits: clean_digits.clone(),
-        requestedAt: now.clone(),
-        expiresAt: control_code_request_expires_at(&now),
-    };
-    ctx.db
-        .ticketremote_control_code_owner()
-        .insert(owner.clone());
-    insert_control_code_public_request(ctx, &ticket.id, &request_id, &owner_public_id, &now);
-    let payload = serde_json::json!({
-        "type": "generate_control_code",
-        "owner": "ticket",
-        "app": "vivi",
-        "flow": "control_code",
-        "requestId": request_id,
-        "digits": clean_digits,
-        "source": "browser_spacetime",
-        "requester": owner_public_id.clone(),
-        "serverSentAt": now,
-        "dispatchAttempt": 1,
-        "fastRevision": bounded_text(&expectedFastRevision, 160)
-    })
-    .to_string();
-    insert_stream_command(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        &format!("{}:generate_control_code", request_id),
-        "generate_control_code",
-        &now,
-        "control_code_request",
-        &payload,
-        CONTROL_CODE_PHONE_TTL_MS,
-        &now,
-    );
-    upsert_control_code_fast_state(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        "cleanup",
-        &cleanup_revision,
-        "control_code_request",
-        &cleanup_stream_epoch,
-        &cleanup_frame_sequence,
-        false,
-        false,
-        stream_was_live,
-        &now,
-    );
     }
 }
 
@@ -5333,6 +5828,77 @@ service_ticket_reducers! {
     }
 }
 
+/// Pixel-only control-code cleanup handoff. The request barrier and the
+/// short-lived ready watermark change in one transaction, so browsers never
+/// observe cleanup as complete while the phone lane still projects blocked.
+#[spacetimedb::reducer]
+pub fn ticketremote_complete_control_code_cleanup_ready(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    revision: String,
+    streamEpoch: String,
+    frameSequence: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let backend_id = clean_backend_id(&backendId);
+    let request_id = requestId.trim();
+    let request_key = request_id.to_string();
+    let Some(request) = ctx
+        .db
+        .ticketremote_control_code_request()
+        .id()
+        .find(&request_key)
+    else {
+        return Ok(());
+    };
+    if request.ticketId != ticket.id {
+        return Err("control_code_request_ticket_mismatch".into());
+    }
+    if !request.captureAcknowledged || !matches!(request.status.as_str(), "succeeded" | "closed") {
+        return Err("control_code_cleanup_not_authorized".into());
+    }
+    let stream_epoch = bounded_frame_ordinal(&streamEpoch);
+    let frame_sequence = bounded_frame_ordinal(&frameSequence);
+    if stream_epoch == "0" || frame_sequence == "0" {
+        return Err("control_code_cleanup_visual_proof_required".into());
+    }
+    update_control_code_public_request(
+        ctx,
+        request_id,
+        ControlCodeChanges {
+            captureRequired: Some(false),
+            cleanupPending: Some(false),
+            reason: Some("phone_visual_cleanup_complete".into()),
+            streamEpoch: Some(stream_epoch.clone()),
+            frameSequence: Some(frame_sequence.clone()),
+            expiresAt: Some(control_code_result_expires_at(&now)),
+            ..Default::default()
+        },
+        &now,
+    );
+    upsert_control_code_fast_state(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        "fast_ready",
+        &non_empty(&revision, request_id),
+        "phone_visual_cleanup_complete",
+        &stream_epoch,
+        &frame_sequence,
+        true,
+        true,
+        true,
+        &now,
+    );
+    promote_ticket_action_v3_queue(ctx, &ticket.id, &backend_id, &now);
+    Ok(())
+}
+
 #[spacetimedb::reducer]
 pub fn ticketremote_update_ticket_interaction(
     ctx: &ReducerContext,
@@ -5853,6 +6419,188 @@ pub fn ticketremote_update_ticket_action_v3_with_slider_region(
         slider_region,
         &now,
     )
+}
+
+/// Pixel-only, bounded continuation for the one safe registration failure:
+/// Accessibility reported a completed stroke and two fresh agreeing frames
+/// still prove the exact same unactivated detail. The existing admission and
+/// attempt remain authoritative; this reducer creates no quota or history row.
+#[spacetimedb::reducer]
+pub fn ticketremote_retry_ticket_action_v3_after_no_transition(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    parentActionId: String,
+    interactionRevision: String,
+    streamEpoch: String,
+    frameSequence: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let backend_id = clean_backend_id(&backendId);
+    let parent_action_id = parentActionId.trim();
+    if !valid_schedule_identifier(parent_action_id) {
+        return Err("invalid_ticket_action_id".into());
+    }
+    let child_action_id = ticket_action_v3_retry_child_id(parent_action_id);
+    if !valid_schedule_identifier(&child_action_id) {
+        return Err("invalid_ticket_action_retry_id".into());
+    }
+    let child_row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, &child_action_id);
+    if let Some(existing) = ctx
+        .db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .find(&child_row_id)
+    {
+        return if existing.parentActionId.as_deref() == Some(parent_action_id)
+            && existing.retryOrdinal == 1
+        {
+            Ok(())
+        } else {
+            Err("ticket_action_retry_id_reused".into())
+        };
+    }
+    let parent_row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, parent_action_id);
+    let Some(parent) = ctx
+        .db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .find(&parent_row_id)
+    else {
+        return Err("ticket_action_not_found".into());
+    };
+    if !ticket_action_v3_no_transition_retry_allowed(&parent) {
+        return Err("ticket_action_retry_not_allowed".into());
+    }
+    let stream_epoch = bounded_frame_ordinal(&streamEpoch);
+    let frame_sequence = bounded_frame_ordinal(&frameSequence);
+    if stream_epoch == "0" || frame_sequence == "0" {
+        return Err("ticket_action_retry_visual_proof_required".into());
+    }
+    let parent_command_id = ticket_action_v3_command_id(&ticket.id, &backend_id, parent_action_id);
+    let Some(parent_command) = ctx
+        .db
+        .ticketremote_stream_command()
+        .id()
+        .find(&parent_command_id)
+    else {
+        return Err("ticket_action_command_not_found".into());
+    };
+    if parent_command.commandType != "ticket_action_v3"
+        || !matches!(
+            parent_command.status.as_str(),
+            "pending" | "dispatched" | "running"
+        )
+        || parse_time_ms(&parent_command.expiresAt) <= parse_time_ms(&now)
+    {
+        return Err("ticket_action_retry_command_stale".into());
+    }
+    let interaction_revision = bounded_text(&interactionRevision, 160);
+    if interaction_revision.is_empty() || interaction_revision != parent_command.revision {
+        return Err("ticket_action_retry_interaction_revision_unproved".into());
+    }
+    let parent_payload = serde_json::from_str::<serde_json::Value>(&parent_command.payloadJson)
+        .map_err(|_| "ticket_action_retry_payload_invalid".to_string())?;
+    let root_action_id = non_empty(
+        parent.rootActionId.as_deref().unwrap_or(""),
+        parent_action_id,
+    );
+    let attempt_id = parent_payload
+        .get("attemptId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if attempt_id != root_action_id {
+        return Err("ticket_action_retry_attempt_mismatch".into());
+    }
+    let history = activation_history_for_attempt(ctx, &ticket.id, &root_action_id)
+        .ok_or_else(|| "activation_admission_not_found".to_string())?;
+    if history.backendId != backend_id
+        || history.admission != "admitted"
+        || history.outcome != "pending"
+    {
+        return Err("activation_admission_mismatch".into());
+    }
+    let schedule_id = parent_payload
+        .get("scheduleId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let source = parent_payload
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or("browser_button");
+
+    ctx.db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .update(TicketremoteTicketActionV3 {
+            status: "needs_attention".into(),
+            phase: "retry_queued".into(),
+            currentView: "latest_unactivated".into(),
+            streamEpoch: stream_epoch.clone(),
+            frameSequence: frame_sequence.clone(),
+            reason: "ticket_action_no_transition_retry_queued".into(),
+            switchAvailable: false,
+            switchExpiresAt: String::new(),
+            updatedAt: now.clone(),
+            completedAt: now.clone(),
+            expiresAt: add_ms(&now, HISTORY_TTL_MS),
+            ..parent.clone()
+        });
+    let child = TicketremoteTicketActionV3 {
+        id: child_row_id,
+        actionId: child_action_id.clone(),
+        ticketId: ticket.id.clone(),
+        backendId: backend_id.clone(),
+        target: "register_current".into(),
+        parentActionId: Some(parent_action_id.into()),
+        rootActionId: Some(root_action_id.clone()),
+        retryOrdinal: 1,
+        status: "pending".into(),
+        phase: "queued".into(),
+        currentView: "latest_unactivated".into(),
+        switchAvailable: false,
+        switchExpiresAt: String::new(),
+        streamEpoch: stream_epoch.clone(),
+        frameSequence: frame_sequence.clone(),
+        reason: "ticket_action_no_transition_retry_queued".into(),
+        createdAt: now.clone(),
+        updatedAt: now.clone(),
+        completedAt: String::new(),
+        expiresAt: add_ms(&now, HISTORY_TTL_MS),
+    };
+    ctx.db.ticketremote_ticket_action_v3().insert(child);
+    let payload = serde_json::json!({
+        "version": 3,
+        "actionId": child_action_id.clone(),
+        "target": "register_current",
+        "source": source,
+        "reason": "ticket_action_no_transition_retry_queued",
+        "attemptId": root_action_id.clone(),
+        "expectedInteractionRevision": interaction_revision,
+        "scheduleId": schedule_id,
+        "parentActionId": parent_action_id,
+        "rootActionId": attempt_id,
+        "retryOrdinal": 1,
+        "retryProofStreamEpoch": stream_epoch,
+        "retryProofFrameSequence": frame_sequence,
+    })
+    .to_string();
+    insert_stream_command(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        &ticket_action_v3_command_id(&ticket.id, &backend_id, &child_action_id),
+        "ticket_action_v3",
+        &parent_command.revision,
+        "ticket_action_no_transition_retry_queued",
+        &payload,
+        TICKET_ACTIVATION_COMMAND_TTL_MS,
+        &now,
+    );
+    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -8121,6 +8869,11 @@ fn fail_ticket_action_v3_for_command(
     if command.commandType != "ticket_action_v3" {
         return;
     }
+    // The parent is only a transport shell once its deterministic child exists. A lost parent
+    // acknowledgement or TTL cleanup must not revoke the child's shared admission/correlation.
+    if ticket_action_v3_retry_handoff_in_progress(ctx, command) {
+        return;
+    }
     let payload = serde_json::from_str::<serde_json::Value>(&command.payloadJson)
         .unwrap_or_else(|_| serde_json::json!({}));
     let action_id = payload
@@ -8174,6 +8927,51 @@ fn fail_ticket_action_v3_for_command(
         );
         reconcile_ticket_action_activation_terminal_interaction(ctx, command, reason, now);
     }
+}
+
+fn ticket_action_v3_retry_handoff_in_progress(
+    ctx: &ReducerContext,
+    command: &TicketremoteStreamCommand,
+) -> bool {
+    if command.commandType != "ticket_action_v3" {
+        return false;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(&command.payloadJson)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let parent_action_id = payload
+        .get("actionId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if !valid_schedule_identifier(parent_action_id) {
+        return false;
+    }
+    let child_action_id = ticket_action_v3_retry_child_id(parent_action_id);
+    let child_row_id =
+        ticket_action_v3_row_id(&command.ticketId, &command.backendId, &child_action_id);
+    let child_command_id =
+        ticket_action_v3_command_id(&command.ticketId, &command.backendId, &child_action_id);
+    ctx.db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .find(&child_row_id)
+        .is_some_and(|row| {
+            row.parentActionId.as_deref() == Some(parent_action_id)
+                && row.retryOrdinal == 1
+                && matches!(row.status.as_str(), "queued" | "pending" | "running")
+        })
+        && ctx
+            .db
+            .ticketremote_stream_command()
+            .id()
+            .find(&child_command_id)
+            .is_some_and(|row| {
+                row.commandType == "ticket_action_v3"
+                    && matches!(
+                        row.status.as_str(),
+                        "queued" | "pending" | "dispatched" | "running"
+                    )
+            })
 }
 
 fn ticket_action_v3_command_failure_projection(target: &str) -> (&'static str, &'static str) {
@@ -8248,6 +9046,7 @@ fn update_stream_command_status(
     let status = safe_token(status, "acknowledged");
     let scheduled_reselect = latest_ticket_reselect_schedule_for_command(ctx, &existing.id);
     if status == "acknowledged" {
+        let retry_handoff = ticket_action_v3_retry_handoff_in_progress(ctx, &existing);
         if existing.commandType == "ticket_action_v3" {
             let payload = serde_json::from_str::<serde_json::Value>(&existing.payloadJson)
                 .unwrap_or_else(|_| serde_json::json!({}));
@@ -8267,9 +9066,11 @@ fn update_stream_command_status(
                 // A late compatibility publication may have landed after the
                 // action's terminal projection. Re-apply exact-revision cleanup
                 // before the command row that correlates them is deleted.
-                reconcile_ticket_action_activation_terminal_interaction(
-                    ctx, &existing, reason, now,
-                );
+                if !retry_handoff {
+                    reconcile_ticket_action_activation_terminal_interaction(
+                        ctx, &existing, reason, now,
+                    );
+                }
             } else {
                 fail_ticket_action_v3_for_command(
                     ctx,
@@ -8299,6 +9100,9 @@ fn update_stream_command_status(
             &existing.revision,
             now,
         );
+        if !retry_handoff {
+            promote_ticket_action_v3_queue(ctx, &existing.ticketId, &existing.backendId, now);
+        }
         return;
     }
     if status == "dispatched" {
@@ -8407,7 +9211,7 @@ fn update_stream_command_status(
         );
     }
     let row = TicketremoteStreamCommand {
-        status,
+        status: status.clone(),
         reason: bounded_text(&non_empty(reason, &existing.reason), 240),
         payloadJson: "{}".into(),
         updatedAt: now.into(),
@@ -8428,6 +9232,9 @@ fn update_stream_command_status(
         &existing.revision,
         now,
     );
+    if matches!(status.as_str(), "failed" | "expired") {
+        promote_ticket_action_v3_queue(ctx, &existing.ticketId, &existing.backendId, now);
+    }
 }
 
 fn ticket_reset_command_is_relevant(command_type: &str, payload_json: &str) -> bool {
@@ -9456,12 +10263,22 @@ fn ticket_has_control_code_request_in_progress(
     ticket_id: &str,
     now: &str,
 ) -> bool {
+    ticket_has_control_code_request_in_progress_except(ctx, ticket_id, "", now)
+}
+
+fn ticket_has_control_code_request_in_progress_except(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    ignored_request_id: &str,
+    now: &str,
+) -> bool {
     let ticket_id = clean_ticket_id(ticket_id);
+    let ignored_request_id = ignored_request_id.trim();
     ctx.db
         .ticketremote_control_code_request()
         .ticketId()
         .filter(&ticket_id)
-        .any(|row| control_code_request_occupies_phone(&row, now))
+        .any(|row| row.id != ignored_request_id && control_code_request_occupies_phone(&row, now))
 }
 
 fn ticket_has_ticket_registration_reset_in_progress(
@@ -9699,6 +10516,9 @@ fn purge_expired_stream_commands_for_ticket(
         table.id().delete(&row.id);
     }
     refresh_touched_signals(ctx, &ticket_id, &touched, now);
+    for backend_id in &touched {
+        promote_ticket_action_v3_queue(ctx, &ticket_id, backend_id, now);
+    }
     rows.len().min(u32::MAX as usize) as u32
 }
 
@@ -10318,7 +11138,10 @@ mod tests {
         let control_code_reducer = source
             .split("ticketremote_member_request_control_code(ctx;")
             .nth(1)
-            .and_then(|body| body.split("let fast_state_id").next())
+            .and_then(|body| {
+                body.split("ticketremote_member_request_ticket_reset(ctx;")
+                    .next()
+            })
             .expect("control-code reducer body must remain inspectable");
         assert!(control_code_reducer.contains("ticket_phone_mutation_lane_conflict("));
         assert!(!control_code_reducer.contains("target =="));
@@ -10716,6 +11539,9 @@ mod tests {
             ticketId: schedule.ticketId.clone(),
             backendId: schedule.backendId.clone(),
             target: "open_latest_unactivated".into(),
+            parentActionId: None,
+            rootActionId: Some(schedule.id.clone()),
+            retryOrdinal: 0,
             status: "failed".into(),
             phase: "failed".into(),
             currentView: "unknown".into(),
@@ -10805,6 +11631,9 @@ mod tests {
             ticketId: schedule.ticketId.clone(),
             backendId: schedule.backendId.clone(),
             target: "open_latest_unactivated".into(),
+            parentActionId: None,
+            rootActionId: Some(schedule.id.clone()),
+            retryOrdinal: 0,
             status: "succeeded".into(),
             phase: "complete".into(),
             currentView: "latest_unactivated".into(),
@@ -11348,10 +12177,73 @@ mod tests {
         let control_code = source
             .split("ticketremote_member_request_control_code(ctx;")
             .nth(1)
-            .and_then(|body| body.split("insert_control_code_public_request").next())
+            .and_then(|body| {
+                body.split("ticketremote_member_request_ticket_reset(ctx;")
+                    .next()
+            })
             .expect("control-code admission must remain inspectable");
-        assert!(control_code.contains("admit_member_limit_event("));
-        assert!(control_code.contains("\"control_code\""));
+        assert!(control_code.contains("admit_control_code_request_impl("));
+        let shared_admission = source
+            .split("fn admit_control_code_request_impl(")
+            .nth(1)
+            .and_then(|body| body.split("member_reducers! {").next())
+            .expect("shared control-code admission must remain inspectable");
+        assert!(shared_admission.contains("admit_member_limit_event("));
+        assert!(shared_admission.contains("\"control_code\""));
+    }
+
+    #[test]
+    fn ticket_actions_and_control_codes_share_one_deferred_phone_lane_slot() {
+        let source = include_str!("lib.rs");
+        let ticket_queue = source
+            .split("fn queue_ticket_action_v3_intent(")
+            .nth(1)
+            .and_then(|body| body.split("fn queue_control_code_intent(").next())
+            .expect("ticket queue helper");
+        let control_queue = source
+            .split("fn queue_control_code_intent(")
+            .nth(1)
+            .and_then(|body| body.split("fn finish_queued_control_code_request(").next())
+            .expect("control-code queue helper");
+        for helper in [ticket_queue, control_queue] {
+            assert!(helper.contains("ticket_action_v3_queue_id("));
+            assert!(helper.contains("ticketremote_ticket_action_v3_queued_intent()"));
+            assert!(!helper.contains("admit_member_limit_event("));
+        }
+        assert!(control_queue.contains("privatePayloadJson"));
+        let public_command = control_queue
+            .split("ticketremote_stream_command()")
+            .nth(1)
+            .expect("queued public command");
+        assert!(!public_command.contains("digits"));
+
+        let member_control = source
+            .split("ticketremote_member_request_control_code(ctx;")
+            .nth(1)
+            .and_then(|body| {
+                body.split("ticketremote_member_request_ticket_reset(ctx;")
+                    .next()
+            })
+            .expect("member control-code reducer");
+        assert!(member_control.contains("ticket_phone_mutation_lane_conflict("));
+        assert!(member_control.contains("queue_control_code_intent("));
+        assert!(
+            member_control.find("queue_control_code_intent(").unwrap()
+                < member_control
+                    .find("admit_control_code_request_impl(")
+                    .unwrap()
+        );
+
+        let promotion = source
+            .split("fn promote_ticket_action_v3_queue(")
+            .nth(1)
+            .and_then(|body| body.split("fn ticket_action_v3_rejection_plan(").next())
+            .expect("shared queue promotion");
+        assert!(promotion.contains("intent.kind == \"control_code\""));
+        assert!(promotion.contains("admit_control_code_request_impl("));
+        assert!(promotion.contains("finish_queued_control_code_request("));
+        assert!(promotion.contains("!is_member("));
+        assert!(promotion.contains("request_ticket_action_v3_impl("));
     }
 
     #[test]
@@ -11401,6 +12293,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "return_to_latest_unactivated".into(),
+            parentActionId: None,
+            rootActionId: Some("return-1".into()),
+            retryOrdinal: 0,
             status: "succeeded".into(),
             phase: "complete".into(),
             currentView: "latest_unactivated".into(),
@@ -11629,6 +12524,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "open_latest_unactivated".into(),
+            parentActionId: None,
+            rootActionId: Some("open-proof-1".into()),
+            retryOrdinal: 0,
             status: "succeeded".into(),
             phase: "complete".into(),
             currentView: "latest_unactivated".into(),
@@ -11671,6 +12569,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "prove_current".into(),
+            parentActionId: None,
+            rootActionId: Some("proof-current-1".into()),
+            retryOrdinal: 0,
             status: "succeeded".into(),
             phase: "complete".into(),
             currentView: "latest_unactivated".into(),
@@ -11771,6 +12672,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "open_latest_unactivated".into(),
+            parentActionId: None,
+            rootActionId: Some("open-proof-2".into()),
+            retryOrdinal: 0,
             status: "succeeded".into(),
             phase: "complete".into(),
             currentView: "latest_unactivated".into(),
@@ -11832,6 +12736,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "register_current".into(),
+            parentActionId: None,
+            rootActionId: Some("register-1".into()),
+            retryOrdinal: 0,
             status: "needs_attention".into(),
             phase: "needs_attention".into(),
             currentView: "latest_unactivated".into(),
@@ -11897,6 +12804,9 @@ mod tests {
             ticketId: "vivi-default".into(),
             backendId: "pixel".into(),
             target: "open_latest_and_register".into(),
+            parentActionId: None,
+            rootActionId: Some("composite-1".into()),
+            retryOrdinal: 0,
             status: "failed".into(),
             phase: "failed".into(),
             currentView: "latest_unactivated".into(),
@@ -12020,6 +12930,143 @@ mod tests {
             ticket_action_v3_duplicate_result("register_current", "open_latest_unactivated"),
             Err("ticket_action_id_reused".into())
         );
+    }
+
+    #[test]
+    fn no_transition_retry_is_one_deterministic_register_current_child_without_readmission() {
+        let action = TicketremoteTicketActionV3 {
+            id: "row-register-1".into(),
+            actionId: "register-1".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            target: "open_latest_and_register".into(),
+            parentActionId: None,
+            rootActionId: Some("register-1".into()),
+            retryOrdinal: 0,
+            status: "running".into(),
+            phase: "registering".into(),
+            currentView: "latest_unactivated".into(),
+            switchAvailable: false,
+            switchExpiresAt: String::new(),
+            streamEpoch: "41".into(),
+            frameSequence: "52".into(),
+            reason: "ticket_action_v3_running".into(),
+            createdAt: "2026-08-26T12:00:00Z".into(),
+            updatedAt: "2026-08-26T12:00:01Z".into(),
+            completedAt: String::new(),
+            expiresAt: "2026-08-26T12:05:00Z".into(),
+        };
+        assert!(ticket_action_v3_no_transition_retry_allowed(&action));
+        assert_eq!(
+            ticket_action_v3_retry_child_id(&action.actionId),
+            "register-1-retry-1"
+        );
+
+        let mut child = action.clone();
+        child.actionId = ticket_action_v3_retry_child_id(&action.actionId);
+        child.parentActionId = Some(action.actionId.clone());
+        child.retryOrdinal = 1;
+        child.target = "register_current".into();
+        assert!(!ticket_action_v3_no_transition_retry_allowed(&child));
+
+        let body = include_str!("lib.rs")
+            .split("pub fn ticketremote_retry_ticket_action_v3_after_no_transition(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_update_ticket_slider_region_v3(")
+                    .next()
+            })
+            .expect("retry reducer body");
+        assert!(body.contains("\"target\": \"register_current\""));
+        assert!(body.contains("history.outcome != \"pending\""));
+        assert!(!body.contains("activation_admission_for_action("));
+        assert!(!body.contains("ticketremote_activation_history().insert"));
+
+        let acknowledgement = include_str!("lib.rs")
+            .split("fn update_stream_command_status(")
+            .nth(1)
+            .and_then(|body| body.split("fn ticket_reset_command_is_relevant(").next())
+            .expect("stream-command acknowledgement body");
+        assert!(acknowledgement.contains(
+            "let retry_handoff = ticket_action_v3_retry_handoff_in_progress(ctx, &existing)"
+        ));
+        assert!(acknowledgement.contains("if !retry_handoff {\n                    reconcile_ticket_action_activation_terminal_interaction"));
+        assert!(
+            acknowledgement
+                .contains("if !retry_handoff {\n            promote_ticket_action_v3_queue")
+        );
+
+        let failure_cleanup = include_str!("lib.rs")
+            .split("fn fail_ticket_action_v3_for_command(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn ticket_action_v3_retry_handoff_in_progress(")
+                    .next()
+            })
+            .expect("ticket-action failure cleanup body");
+        let handoff_guard = failure_cleanup
+            .find("ticket_action_v3_retry_handoff_in_progress(ctx, command)")
+            .expect("retry handoff failure guard");
+        let admission_failure = failure_cleanup
+            .find("finalize_ticket_activation_failure_impl(")
+            .expect("activation failure finalization");
+        assert!(handoff_guard < admission_failure);
+    }
+
+    #[test]
+    fn second_window_queue_defers_admission_and_atomic_cleanup_releases_it() {
+        assert_eq!(ticket_action_v3_status("queued"), "queued");
+        let source = include_str!("lib.rs");
+        let queue_body = source
+            .split("fn queue_ticket_action_v3_intent(")
+            .nth(1)
+            .and_then(|body| body.split("fn promote_ticket_action_v3_queue(").next())
+            .expect("queue helper body");
+        assert!(queue_body.contains("status: \"queued\""));
+        assert!(queue_body.contains("ticketremote_ticket_action_v3_queued_intent"));
+        assert!(!queue_body.contains("activation_admission_for_action("));
+
+        let cleanup_body = source
+            .split("pub fn ticketremote_complete_control_code_cleanup_ready(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_update_ticket_interaction(")
+                    .next()
+            })
+            .expect("atomic cleanup reducer body");
+        assert!(cleanup_body.contains("cleanupPending: Some(false)"));
+        assert!(cleanup_body.contains("\"fast_ready\""));
+        assert!(cleanup_body.contains("promote_ticket_action_v3_queue"));
+
+        let expiry_body = source
+            .split("fn purge_expired_stream_commands_for_ticket(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn purge_expired_stream_viewer_focus_for_ticket_backend(")
+                    .next()
+            })
+            .expect("stream-command expiry body");
+        let delete_position = expiry_body
+            .rfind("table.id().delete(&row.id)")
+            .expect("expired command deletion");
+        let promotion_position = expiry_body
+            .find("promote_ticket_action_v3_queue(ctx, &ticket_id, backend_id, now)")
+            .expect("queued action promotion after expiry");
+        assert!(promotion_position > delete_position);
+
+        let promotion = source
+            .split("fn promote_ticket_action_v3_queue(")
+            .nth(1)
+            .and_then(|body| body.split("fn ticket_action_v3_rejection_plan(").next())
+            .expect("shared queue promotion body");
+        let lane_guard = promotion
+            .find("ticket_phone_mutation_lane_conflict_ignoring_control_request(")
+            .expect("live owner guard");
+        let intent_delete = promotion
+            .find("ticketremote_ticket_action_v3_queued_intent()\n            .id()\n            .delete")
+            .expect("queued intent deletion");
+        assert!(lane_guard < intent_delete);
+        assert!(promotion.contains("ignored_control_request_id"));
     }
 
     #[test]

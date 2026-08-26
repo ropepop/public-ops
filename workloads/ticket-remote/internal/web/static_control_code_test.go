@@ -2248,6 +2248,18 @@ func TestControlCodeRecoveryQueueReasonsArePublicAndVisible(t *testing.T) {
 	}
 }
 
+func TestTicketMutationFailuresAreLocalized(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, needle := range []string{
+		"['ticket_mutation_in_progress', 'Tālrunis pabeidz iepriekšējo biļetes darbību. Mēģini vēlreiz pēc mirkļa.']",
+		"['ticket_action_interaction_revision_unproved', 'Biļetes vizuālais apstiprinājums vairs nav aktuāls. Sagaidi svaigu apstiprinājumu.']",
+	} {
+		if !strings.Contains(source, needle) {
+			t.Fatalf("Ticket mutation failure translation missing %q", needle)
+		}
+	}
+}
+
 func TestControlCodeCaptureRequiresModeSpecificPhoneAndBrowserGeneratedProof(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
@@ -3126,6 +3138,140 @@ func TestControlCodeCaptureStartsOnlyAfterGeneratedMarker(t *testing.T) {
 	}
 	if !strings.Contains(source, "requestControlCodeLowLatencyFrame(requestID, 'control_code_result_marker_low_latency');") {
 		t.Fatal("browser must request the existing low-latency marker refresh only after result publication")
+	}
+}
+
+func TestTicketViewerVisiblePageMayRecoverWithoutDOMFocus(t *testing.T) {
+	source := ticketAppSource(t)
+	predicate := substringBetween(t, source,
+		"function viewerIsForeground() {",
+		"  function serverFrameAge(status) {")
+	runTicketJavaScript(t, `
+let controlCodeActive = false;
+const document = {
+  visibilityState: 'visible',
+  hasFocus: () => { throw new Error('DOM focus must not gate visible recovery'); }
+};
+function controlCodeKeepsVideoAliveWhileHidden() { return controlCodeActive; }
+function check(value, message) { if (!value) throw new Error(message); }
+`+predicate+`
+check(viewerIsForeground(), 'a visible page must remain eligible for stream recovery');
+`)
+}
+
+func TestTicketViewerHiddenRecoveryRemainsControlCodeScoped(t *testing.T) {
+	source := ticketAppSource(t)
+	predicate := substringBetween(t, source,
+		"function viewerIsForeground() {",
+		"  function serverFrameAge(status) {")
+	runTicketJavaScript(t, `
+let controlCodeActive = false;
+const document = { visibilityState: 'hidden' };
+function controlCodeKeepsVideoAliveWhileHidden() { return controlCodeActive; }
+function check(value, message) { if (!value) throw new Error(message); }
+`+predicate+`
+check(!viewerIsForeground(), 'an ordinary hidden page must not recover video');
+controlCodeActive = true;
+check(viewerIsForeground(), 'hidden control-code capture must retain its existing keepalive');
+`)
+}
+
+func TestTicketViewerVisibleUnfocusedWatchdogReconnectsOnceWithinDebounce(t *testing.T) {
+	source := ticketAppSource(t)
+	predicate := substringBetween(t, source,
+		"function viewerIsForeground() {",
+		"  function serverFrameAge(status) {")
+	reconnect := substringBetween(t, source,
+		"function reconnectVideoForRecovery(reason) {",
+		"  function decoderStartupGraceActive(now) {")
+	watchdog := substringBetween(t, source,
+		"function chaseLiveStream() {",
+		"\n\t  function recoverAfterVisibilityResume(reason) {")
+	runTicketJavaScript(t, `
+let monotonic = 10000;
+const performance = { now: () => monotonic };
+const document = {
+  visibilityState: 'visible',
+  hasFocus: () => false
+};
+const WebSocket = { OPEN: 1, CLOSED: 3, CLOSING: 2 };
+let videoWs = { readyState: WebSocket.OPEN };
+let idleDisconnected = false;
+let streamUnsupported = false;
+let configured = true;
+let lastDecodedFrameAt = 1000;
+let lastPacketAt = 1000;
+let lastPacketSequenceAdvancedAt = 1000;
+let configuredAt = 1000;
+let latestStreamStatus = null;
+let hasRenderedFrame = true;
+let lastRecoveryVideoReconnectAt = 0;
+const recoveryVideoReconnectDebounceMs = 8000;
+const streamStaleKeyframeMs = 2500;
+const streamStaleDecoderResetMs = 5000;
+const streamStaleVideoReconnectMs = 8000;
+const streamStaleServerRecoverMs = 12000;
+const recoveryKeyframeDebounceMs = 2000;
+let reconnects = 0;
+let keyframes = 0;
+let decoderResets = 0;
+function controlCodeKeepsVideoAliveWhileHidden() { return false; }
+function freshStreamStatus() { return null; }
+function serverFrameAge() { return -1; }
+function backendLooksRecoverable() { return false; }
+function currentRenderedFreshness() {
+  return {
+    hasFrame: true,
+    visualAgeMillis: 9000,
+    browserReceiveToDecodeMillis: 0,
+    decodeToRenderMillis: 0,
+    decoderQueueDelayMillis: 0,
+    streamFreshnessState: 'STALE',
+    liveLabeled: false
+  };
+}
+function lastRenderedVisualAge() { return 9000; }
+function requestKeyframeDebounced() { keyframes += 1; return true; }
+function resetDecoderForRecovery() { decoderResets += 1; return true; }
+function requestServerRecoveryDebounced() {}
+function requestFirstFrameServerRecovery() {}
+function connectDirectVideo() {}
+function pauseHiddenStreamAfterGrace() {}
+function decoderStartupGraceActive() { return false; }
+function sendVideoClientLog() {}
+function streamRecoveryDetail(values) { return values; }
+function restartStream() { reconnects += 1; }
+function check(value, message) { if (!value) throw new Error(message); }
+`+predicate+reconnect+watchdog+`
+chaseLiveStream();
+chaseLiveStream();
+check(reconnects === 1, 'visible stale video must reconnect once inside the debounce window');
+check(keyframes >= 1 && decoderResets >= 1, 'stale watchdog must retain keyframe and decoder recovery');
+`)
+}
+
+func TestTicketViewerSocketCloseAndWatchdogShareVisibilityRecoveryPredicate(t *testing.T) {
+	source := ticketAppSource(t)
+	predicate := substringBetween(t, source,
+		"function viewerIsForeground() {",
+		"  function serverFrameAge(status) {")
+	socket := substringBetween(t, source,
+		"function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {",
+		"  function sendVideoClientLog(event, detail) {")
+	watchdog := substringBetween(t, source,
+		"function chaseLiveStream() {",
+		"\n\t  function recoverAfterVisibilityResume(reason) {")
+	if strings.Contains(predicate, "document.hasFocus") {
+		t.Fatal("DOM focus must not gate recovery for a visible page")
+	}
+	if !strings.Contains(predicate, "document.visibilityState === 'visible'") {
+		t.Fatal("recovery eligibility must follow visible-page state")
+	}
+	if !strings.Contains(socket, "if (viewerIsForeground())") {
+		t.Fatal("socket close must use the shared recovery predicate")
+	}
+	if !strings.Contains(watchdog, "if (!viewerIsForeground())") {
+		t.Fatal("stale-frame watchdog must use the shared recovery predicate")
 	}
 }
 

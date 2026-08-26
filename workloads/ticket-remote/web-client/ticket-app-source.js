@@ -1,6 +1,7 @@
 /* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
 import {
+  TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT,
   beginTicketActionV3LocalRequest,
   beginTicketLocalRegisterSliderSession,
   cancelTicketLocalRegisterSliderSession,
@@ -905,6 +906,8 @@ import {
     ['invalid_code', 'Ievadi 2-8 ciparus'],
     ['request_in_progress', 'Iepriekšējais koda pieprasījums vēl tiek pabeigts'],
     ['ticket_action_in_progress', 'Tālrunis izpilda iepriekšējo biļetes darbību'],
+    ['ticket_mutation_in_progress', 'Tālrunis pabeidz iepriekšējo biļetes darbību. Mēģini vēlreiz pēc mirkļa.'],
+    ['ticket_action_interaction_revision_unproved', 'Biļetes vizuālais apstiprinājums vairs nav aktuāls. Sagaidi svaigu apstiprinājumu.'],
     ['Spacetime connection is not ready', 'Vadības kanāls vēl savienojas. Mēģini vēlreiz.'],
     ['Spacetime connection failed', 'Neizdevās savienot vadības kanālu. Mēģini vēlreiz.'],
     ['Spacetime connection closed', 'Vadības kanāls pārtrauca savienojumu. Mēģini vēlreiz.'],
@@ -5044,7 +5047,7 @@ import {
     ticketRegisterOverlay.hidden = false;
     ticketRegisterOverlay.dataset.registrationState = 'ready';
     ticketRegisterOverlay.removeAttribute('aria-busy');
-    ticketLocalRegisterSlider.setAttribute('aria-label', 'Velc līdz galam, lai reģistrētu atvērto biļeti');
+    ticketLocalRegisterSlider.setAttribute('aria-label', 'Pavelc vismaz ceturtdaļu, lai reģistrētu atvērto biļeti');
     ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight);
     controlCodeHotspot.style.pointerEvents = 'none';
     const expiresAt = Date.parse(String(region.expiresAt || ''));
@@ -5365,6 +5368,8 @@ import {
       ticketResetDetail.textContent = 'Nesen aktivizētā biļete ir vizuāli apstiprināta.';
     } else if (statusAction && statusAction.status === 'succeeded') {
       ticketResetDetail.textContent = 'Biļetes darbība ir veiksmīgi pabeigta.';
+    } else if (statusAction && statusAction.status === 'queued') {
+      ticketResetDetail.textContent = 'Darbība gaida vienīgajā tālruņa rindas vietā…';
     } else if (statusBusy) {
       ticketResetDetail.textContent = 'Tālrunis izpilda biļetes darbību…';
     } else if (backgroundProofBusy) {
@@ -5603,6 +5608,7 @@ import {
     const proofMatches = ticketRegisterSliderProofStillMatches(session.snapshot, currentState);
     const completedProof = completeTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       pointerId: event && event.pointerId,
+      pointerClientX: event && event.clientX,
       progress: Number(ticketLocalRegisterSlider.value || 0),
       proofMatches
     });
@@ -5620,9 +5626,13 @@ import {
     if (ticketLocalRegisterSliderState.inFlight || event.isPrimary === false ||
       (event.pointerType === 'mouse' && event.button !== 0)) return;
     const snapshot = currentTicketRegisterSliderProof(currentState);
+    const sliderRect = ticketLocalRegisterSlider.getBoundingClientRect();
     if (!beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       kind: 'pointer',
       pointerId: event.pointerId,
+      pointerStartClientX: event.clientX,
+      pointerTrackLeftClientX: sliderRect.left,
+      pointerTrackWidth: sliderRect.width,
       snapshot
     })) return;
     ticketLocalRegisterSliderState.ignoreChange = true;
@@ -5661,7 +5671,9 @@ import {
   });
   ticketLocalRegisterSlider.addEventListener('change', () => {
     if (ticketLocalRegisterSliderState.ignoreChange || ticketLocalRegisterSliderState.inFlight ||
-      ticketLocalRegisterSliderState.session || Number(ticketLocalRegisterSlider.value || 0) < 95) return;
+      ticketLocalRegisterSliderState.session ||
+      Number(ticketLocalRegisterSlider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT
+    ) return;
     const snapshot = currentTicketRegisterSliderProof(currentState);
     if (!beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       kind: 'keyboard',
@@ -5840,7 +5852,7 @@ import {
 
   function viewerIsForeground() {
     return controlCodeKeepsVideoAliveWhileHidden() ||
-      (document.visibilityState === 'visible' && (typeof document.hasFocus !== 'function' || document.hasFocus()));
+      document.visibilityState === 'visible';
   }
 
   function serverFrameAge(status) {

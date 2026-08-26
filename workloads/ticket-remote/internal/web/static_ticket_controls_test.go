@@ -26,6 +26,9 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 	if !strings.Contains(page, `id="ticketLocalRegisterSlider" type="range"`) {
 		t.Fatal("the over-stream registration control must remain a native keyboard-focusable range input")
 	}
+	if !strings.Contains(page, `aria-label="Pavelc vismaz ceturtdaļu, lai reģistrētu atvērto biļeti"`) {
+		t.Fatal("the registration slider must explain its quarter-track completion threshold")
+	}
 	stageStart := strings.Index(page, `<div class="stage">`)
 	overlayIndex := strings.Index(page, `id="ticketRegisterOverlay"`)
 	panelStart := strings.Index(page, `<aside id="panel"`)
@@ -226,7 +229,7 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"ticketLocalRegisterSlider.addEventListener('change'",
 		"ticketLocalRegisterSlider.addEventListener('blur'",
 		"window.addEventListener('blur'",
-		"Number(ticketLocalRegisterSlider.value || 0) < 95",
+		"Number(ticketLocalRegisterSlider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT",
 		"Slīdņa apstiprinājums vairs nav svaigs.",
 		"clientLog('ticket_slider_cancelled', 'change_session_unavailable')",
 	} {
@@ -253,10 +256,13 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 	core := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.mjs")
 	coreTest := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.test.mjs")
 	for _, required := range []string{
+		"export const TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT = 25",
 		"export async function handleTicketLocalRegisterSliderChange",
 		"submitRegisterCurrent('browser_slider', stableActionId, proofSnapshot)",
-		"slider completion rejects 94%, accepts 95%",
-		"pointer and keyboard completion share one 95% exactly-once gate",
+		"slider completion rejects 24%, accepts 25%",
+		"pointer and keyboard completion share one 25% exactly-once gate",
+		"a zero-distance range tap never counts as 25% pointer movement",
+		"slider change stays idle below the shared 25% threshold",
 		"a false reducer outcome is not submitted",
 		"accepted slider stays at 100 until its exact durable action is terminal",
 		"export function ticketActionV3SmartSwitchAction",

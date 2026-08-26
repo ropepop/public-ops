@@ -24,6 +24,9 @@ pub struct TicketremoteTicketActionV3 {
     pub updated_at: String,
     pub completed_at: String,
     pub expires_at: String,
+    pub parent_action_id: Option<String>,
+    pub root_action_id: Option<String>,
+    pub retry_ordinal: u32,
 }
 
 impl __sdk::InModule for TicketremoteTicketActionV3 {
@@ -51,6 +54,9 @@ pub struct TicketremoteTicketActionV3Cols {
     pub updated_at: __sdk::__query_builder::Col<TicketremoteTicketActionV3, String>,
     pub completed_at: __sdk::__query_builder::Col<TicketremoteTicketActionV3, String>,
     pub expires_at: __sdk::__query_builder::Col<TicketremoteTicketActionV3, String>,
+    pub parent_action_id: __sdk::__query_builder::Col<TicketremoteTicketActionV3, Option<String>>,
+    pub root_action_id: __sdk::__query_builder::Col<TicketremoteTicketActionV3, Option<String>>,
+    pub retry_ordinal: __sdk::__query_builder::Col<TicketremoteTicketActionV3, u32>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteTicketActionV3 {
@@ -74,6 +80,9 @@ impl __sdk::__query_builder::HasCols for TicketremoteTicketActionV3 {
             updated_at: __sdk::__query_builder::Col::new(table_name, "updated_at"),
             completed_at: __sdk::__query_builder::Col::new(table_name, "completed_at"),
             expires_at: __sdk::__query_builder::Col::new(table_name, "expires_at"),
+            parent_action_id: __sdk::__query_builder::Col::new(table_name, "parent_action_id"),
+            root_action_id: __sdk::__query_builder::Col::new(table_name, "root_action_id"),
+            retry_ordinal: __sdk::__query_builder::Col::new(table_name, "retry_ordinal"),
         }
     }
 }

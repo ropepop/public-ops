@@ -27,8 +27,8 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "fad6ef3696bad15bb15049bc67d552a75b3eeb09c4079beffcc0a2379c10bb7e",
-      "size": 1940
+      "sha256": "29114a58235e5bd00fe7c87322c904d8b921e2edd6df076e8eabf259b6c5fe58",
+      "size": 1967
     },
     "etc/arbuzas/env/meshcentral-config.json": {
       "mode": 420,
@@ -152,5 +152,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1787270958
+  "updatedEpochSeconds": 1787766905
 }

@@ -28,4 +28,7 @@ export default __t.row({
   updatedAt: __t.string(),
   completedAt: __t.string(),
   expiresAt: __t.string(),
+  parentActionId: __t.option(__t.string()),
+  rootActionId: __t.option(__t.string()),
+  retryOrdinal: __t.u32(),
 });

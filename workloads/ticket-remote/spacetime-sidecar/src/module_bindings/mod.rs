@@ -22,6 +22,7 @@ pub mod ticketremote_cancel_latest_ticket_reselect_reducer;
 pub mod ticketremote_cleanup_expired_reducer;
 pub mod ticketremote_cleanup_schedule_type;
 pub mod ticketremote_commit_ticket_activation_reducer;
+pub mod ticketremote_complete_control_code_cleanup_ready_reducer;
 pub mod ticketremote_control_code_fast_state_table;
 pub mod ticketremote_control_code_fast_state_type;
 pub mod ticketremote_control_code_owner_type;
@@ -65,6 +66,7 @@ pub mod ticketremote_register_service_identity_reducer;
 pub mod ticketremote_relay_current_report_table;
 pub mod ticketremote_relay_current_report_type;
 pub mod ticketremote_remove_member_reducer;
+pub mod ticketremote_retry_ticket_action_v_3_after_no_transition_reducer;
 pub mod ticketremote_safe_operational_log_type;
 pub mod ticketremote_schedule_activation_expiry_reset_reducer;
 pub mod ticketremote_schedule_latest_ticket_reselect_reducer;
@@ -89,6 +91,7 @@ pub mod ticketremote_stream_desired_state_table;
 pub mod ticketremote_stream_desired_state_type;
 pub mod ticketremote_stream_viewer_focus_table;
 pub mod ticketremote_stream_viewer_focus_type;
+pub mod ticketremote_ticket_action_v_3_queued_intent_type;
 pub mod ticketremote_ticket_action_v_3_table;
 pub mod ticketremote_ticket_action_v_3_type;
 pub mod ticketremote_ticket_interaction_table;
@@ -125,6 +128,7 @@ pub use ticketremote_cancel_latest_ticket_reselect_reducer::ticketremote_cancel_
 pub use ticketremote_cleanup_expired_reducer::ticketremote_cleanup_expired;
 pub use ticketremote_cleanup_schedule_type::TicketremoteCleanupSchedule;
 pub use ticketremote_commit_ticket_activation_reducer::ticketremote_commit_ticket_activation;
+pub use ticketremote_complete_control_code_cleanup_ready_reducer::ticketremote_complete_control_code_cleanup_ready;
 pub use ticketremote_control_code_fast_state_table::*;
 pub use ticketremote_control_code_fast_state_type::TicketremoteControlCodeFastState;
 pub use ticketremote_control_code_owner_type::TicketremoteControlCodeOwner;
@@ -168,6 +172,7 @@ pub use ticketremote_register_service_identity_reducer::ticketremote_register_se
 pub use ticketremote_relay_current_report_table::*;
 pub use ticketremote_relay_current_report_type::TicketremoteRelayCurrentReport;
 pub use ticketremote_remove_member_reducer::ticketremote_remove_member;
+pub use ticketremote_retry_ticket_action_v_3_after_no_transition_reducer::ticketremote_retry_ticket_action_v_3_after_no_transition;
 pub use ticketremote_safe_operational_log_type::TicketremoteSafeOperationalLog;
 pub use ticketremote_schedule_activation_expiry_reset_reducer::ticketremote_schedule_activation_expiry_reset;
 pub use ticketremote_schedule_latest_ticket_reselect_reducer::ticketremote_schedule_latest_ticket_reselect;
@@ -192,6 +197,7 @@ pub use ticketremote_stream_desired_state_table::*;
 pub use ticketremote_stream_desired_state_type::TicketremoteStreamDesiredState;
 pub use ticketremote_stream_viewer_focus_table::*;
 pub use ticketremote_stream_viewer_focus_type::TicketremoteStreamViewerFocus;
+pub use ticketremote_ticket_action_v_3_queued_intent_type::TicketremoteTicketActionV3QueuedIntent;
 pub use ticketremote_ticket_action_v_3_table::*;
 pub use ticketremote_ticket_action_v_3_type::TicketremoteTicketActionV3;
 pub use ticketremote_ticket_interaction_table::*;
@@ -274,6 +280,15 @@ pub enum Reducer {
         attempt_id: String,
         interaction_revision: String,
         activation_revision: String,
+    },
+    TicketremoteCompleteControlCodeCleanupReady {
+        ticket_id: String,
+        backend_id: String,
+        request_id: String,
+        revision: String,
+        stream_epoch: String,
+        frame_sequence: String,
+        now_arg: String,
     },
     TicketremoteFinalizeTicketActivationAttempt {
         ticket_id: String,
@@ -436,6 +451,15 @@ pub enum Reducer {
         ticket_id: String,
         actor_email: String,
         email: String,
+        now_arg: String,
+    },
+    TicketremoteRetryTicketActionV3AfterNoTransition {
+        ticket_id: String,
+        backend_id: String,
+        parent_action_id: String,
+        interaction_revision: String,
+        stream_epoch: String,
+        frame_sequence: String,
         now_arg: String,
     },
     TicketremoteScheduleActivationExpiryReset {
@@ -648,6 +672,9 @@ impl __sdk::Reducer for Reducer {
             Reducer::TicketremoteCommitTicketActivation { .. } => {
                 "ticketremote_commit_ticket_activation"
             }
+            Reducer::TicketremoteCompleteControlCodeCleanupReady { .. } => {
+                "ticketremote_complete_control_code_cleanup_ready"
+            }
             Reducer::TicketremoteFinalizeTicketActivationAttempt { .. } => {
                 "ticketremote_finalize_ticket_activation_attempt"
             }
@@ -712,6 +739,9 @@ impl __sdk::Reducer for Reducer {
                 "ticketremote_register_service_identity"
             }
             Reducer::TicketremoteRemoveMember { .. } => "ticketremote_remove_member",
+            Reducer::TicketremoteRetryTicketActionV3AfterNoTransition { .. } => {
+                "ticketremote_retry_ticket_action_v3_after_no_transition"
+            }
             Reducer::TicketremoteScheduleActivationExpiryReset { .. } => {
                 "ticketremote_schedule_activation_expiry_reset"
             }
@@ -859,6 +889,23 @@ impl __sdk::Reducer for Reducer {
                 attempt_id: attempt_id.clone(),
                 interaction_revision: interaction_revision.clone(),
                 activation_revision: activation_revision.clone(),
+}),
+            Reducer::TicketremoteCompleteControlCodeCleanupReady{
+                ticket_id,
+                backend_id,
+                request_id,
+                revision,
+                stream_epoch,
+                frame_sequence,
+                now_arg,
+}             => __sats::bsatn::to_vec(&ticketremote_complete_control_code_cleanup_ready_reducer::TicketremoteCompleteControlCodeCleanupReadyArgs {
+                ticket_id: ticket_id.clone(),
+                backend_id: backend_id.clone(),
+                request_id: request_id.clone(),
+                revision: revision.clone(),
+                stream_epoch: stream_epoch.clone(),
+                frame_sequence: frame_sequence.clone(),
+                now_arg: now_arg.clone(),
 }),
             Reducer::TicketremoteFinalizeTicketActivationAttempt{
                 ticket_id,
@@ -1160,6 +1207,23 @@ impl __sdk::Reducer for Reducer {
                 ticket_id: ticket_id.clone(),
                 actor_email: actor_email.clone(),
                 email: email.clone(),
+                now_arg: now_arg.clone(),
+}),
+            Reducer::TicketremoteRetryTicketActionV3AfterNoTransition{
+                ticket_id,
+                backend_id,
+                parent_action_id,
+                interaction_revision,
+                stream_epoch,
+                frame_sequence,
+                now_arg,
+}             => __sats::bsatn::to_vec(&ticketremote_retry_ticket_action_v_3_after_no_transition_reducer::TicketremoteRetryTicketActionV3AfterNoTransitionArgs {
+                ticket_id: ticket_id.clone(),
+                backend_id: backend_id.clone(),
+                parent_action_id: parent_action_id.clone(),
+                interaction_revision: interaction_revision.clone(),
+                stream_epoch: stream_epoch.clone(),
+                frame_sequence: frame_sequence.clone(),
                 now_arg: now_arg.clone(),
 }),
             Reducer::TicketremoteScheduleActivationExpiryReset{

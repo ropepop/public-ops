@@ -5,6 +5,9 @@ const REGISTRATION_PROOF_TARGETS = new Set([
   'redetect_latest',
   'prove_current'
 ]);
+export const TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT = 25;
+export const TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX = 8;
+export const TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PERCENT = 3;
 
 export function ticketActionV3ClientId(scope, now = Date.now(), entropy = Math.random().toString(36).slice(2, 10)) {
   const cleanScope = String(scope || 'action').toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 32) || 'action';
@@ -75,7 +78,9 @@ export function ticketActionV3ZonedLocalMillis(dateValue, timeValue, timeZone) {
 }
 
 export function shouldSubmitTicketSliderCompletion(pointer, phase, progress) {
-  if (!pointer || pointer.submitted || phase !== 'up' || pointer.qualified !== true || Number(progress) < 9500) return false;
+  if (!pointer || pointer.submitted || phase !== 'up' || pointer.qualified !== true ||
+    Number(progress) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT * 100
+  ) return false;
   pointer.submitted = true;
   return true;
 }
@@ -143,10 +148,20 @@ export function beginTicketLocalRegisterSliderSession(state, input) {
   if (!snapshot || !String(snapshot.proofActionId || '').trim()) return false;
   const kind = String(input && input.kind || 'pointer');
   const pointerId = kind === 'pointer' ? Number(input && input.pointerId) : null;
-  if (kind === 'pointer' && !Number.isFinite(pointerId)) return false;
+  const pointerStartClientX = kind === 'pointer' ? Number(input && input.pointerStartClientX) : null;
+  const pointerTrackLeftClientX = kind === 'pointer' ? Number(input && input.pointerTrackLeftClientX) : null;
+  const pointerTrackWidth = kind === 'pointer' ? Number(input && input.pointerTrackWidth) : null;
+  if (kind === 'pointer' && (
+    !Number.isFinite(pointerId) || !Number.isFinite(pointerStartClientX) ||
+    !Number.isFinite(pointerTrackLeftClientX) ||
+    !Number.isFinite(pointerTrackWidth) || pointerTrackWidth <= 0
+  )) return false;
   state.session = {
     kind,
     pointerId,
+    pointerStartClientX,
+    pointerTrackLeftClientX,
+    pointerTrackWidth,
     snapshot,
     qualified: true,
     submitted: false
@@ -161,6 +176,22 @@ export function cancelTicketLocalRegisterSliderSession(state, pointerId = null) 
   return true;
 }
 
+function ticketLocalRegisterSliderPointerCompletes(session, endClientX) {
+  const start = Number(session && session.pointerStartClientX);
+  const left = Number(session && session.pointerTrackLeftClientX);
+  const width = Number(session && session.pointerTrackWidth);
+  const end = Number(endClientX);
+  if (![start, left, width, end].every(Number.isFinite) || width <= 0 || end <= start) return false;
+  const travel = end - start;
+  const fullQuarter = width * TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT / 100;
+  const remainingToRightEdge = Math.max(0, left + width - start);
+  const antiTapFloor = Math.max(
+    TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX,
+    width * TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PERCENT / 100
+  );
+  return travel >= Math.max(antiTapFloor, Math.min(fullQuarter, remainingToRightEdge));
+}
+
 export function completeTicketLocalRegisterSliderSession(state, input) {
   if (!state || !state.session || state.inFlight) return null;
   const session = state.session;
@@ -169,11 +200,14 @@ export function completeTicketLocalRegisterSliderSession(state, input) {
     state.session = null;
     return null;
   }
-  const completed = shouldSubmitTicketSliderCompletion(
-    session,
-    'up',
-    Math.max(0, Math.min(10000, Math.round(Number(input && input.progress || 0) * 100)))
-  );
+  const completed = session.kind === 'pointer'
+    ? ticketLocalRegisterSliderPointerCompletes(session, input && input.pointerClientX) &&
+      shouldSubmitTicketSliderCompletion(session, 'up', 10000)
+    : shouldSubmitTicketSliderCompletion(
+      session,
+      'up',
+      Math.max(0, Math.min(10000, Math.round(Number(input && input.progress || 0) * 100)))
+    );
   state.session = null;
   return completed ? session.snapshot : null;
 }
@@ -188,18 +222,25 @@ export function resetTicketLocalRegisterSliderState(state) {
   return changed;
 }
 
+function ticketActionV3Family(actions, rootActionId) {
+  return ticketActionV3ActionsByAuthority((Array.isArray(actions) ? actions : []).filter((action) =>
+    [action && action.actionId, action && action.rootActionId].some((id) => String(id || '').trim() === rootActionId)
+  ));
+}
+
 export function releaseTicketLocalRegisterSliderOnTerminal(state, actions) {
   if (!state || !state.inFlight || !String(state.actionId || '').trim()) return null;
-  const exact = (Array.isArray(actions) ? actions : []).find((action) =>
-    String(action && action.actionId || '').trim() === String(state.actionId || '').trim()
-  );
+  const rootActionId = String(state.actionId || '').trim();
+  const family = ticketActionV3Family(actions, rootActionId);
+  if (family.some((action) => ticketActionV3OccupiesPhone(action))) return null;
+  const exact = family[0];
   if (!exact || !['succeeded', 'failed', 'needs_attention'].includes(String(exact.status || ''))) return null;
   resetTicketLocalRegisterSliderState(state);
   return exact;
 }
 
 export function ticketActionV3OccupiesPhone(action) {
-  return Boolean(action && ['pending', 'running'].includes(String(action.status || '')));
+  return Boolean(action && ['queued', 'pending', 'running'].includes(String(action.status || '')));
 }
 
 function ticketActionV3CreatedOrder(action) {
@@ -232,9 +273,7 @@ export function ticketActionV3ActionsByAuthority(actions) {
 export function ticketActionV3ExplicitResultForDisplay(actions, actionId, rememberedAction = null) {
   const stableActionId = String(actionId || '').trim();
   if (!stableActionId) return null;
-  const exactAction = (Array.isArray(actions) ? actions : []).find((action) =>
-    String(action && action.actionId || '').trim() === stableActionId
-  );
+  const exactAction = ticketActionV3Family(actions, stableActionId)[0];
   if (exactAction) return exactAction;
   return String(rememberedAction && rememberedAction.actionId || '').trim() === stableActionId
     ? rememberedAction
@@ -399,7 +438,9 @@ export async function handleTicketLocalRegisterSliderChange({
   render
 }) {
   const stableActionId = String(actionId || '').trim();
-  if (!slider || !state || state.inFlight || !stableActionId || !proofSnapshot || Number(slider.value || 0) < 95) return false;
+  if (!slider || !state || state.inFlight || !stableActionId || !proofSnapshot ||
+    Number(slider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT
+  ) return false;
   state.inFlight = true;
   state.actionId = stableActionId;
   state.latchedProof = proofSnapshot;

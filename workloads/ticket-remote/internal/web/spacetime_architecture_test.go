@@ -544,7 +544,7 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 			t.Fatalf("live phone suppression fallback missing %q", required)
 		}
 	}
-	if !strings.Contains(module, `"fastRevision": bounded_text(&expectedFastRevision, 160)`) {
+	if !strings.Contains(module, `"fastRevision": bounded_text(expected_fast_revision, 160)`) {
 		t.Fatalf("the durable request must carry only the browser's fast-state handoff revision")
 	}
 }
@@ -554,20 +554,32 @@ func TestSpacetimeControlCodeQueuesColdRequestsAndSerializesPhoneWork(t *testing
 	reducer := substringBetween(t, module,
 		"ticketremote_member_request_control_code(ctx;",
 		"ticketremote_member_confirm_control_code_browser_capture(ctx;")
+	admission := substringBetween(t, module,
+		"fn admit_control_code_request_impl(",
+		"ticketremote_member_request_control_code(ctx;")
 	for _, required := range []string{
 		"let session_id = non_empty(&sessionId, &connection_session_id(ctx));",
 		"valid_control_code_digits(&clean_digits)",
 		"ticket_has_control_code_request_in_progress(ctx, &ticket.id, &now)",
 		`return Err("request_in_progress".into());`,
+		"ticket_phone_mutation_lane_conflict(",
+		"queue_control_code_intent(",
+		"admit_control_code_request_impl(",
+	} {
+		if !strings.Contains(reducer, required) {
+			t.Fatalf("queue-first control-code reducer missing %q", required)
+		}
+	}
+	for _, required := range []string{
 		`admit_member_limit_event(`,
 		`"control_code"`,
 		"if !limit_admission.allowed",
 		"insert_control_code_public_request(",
 		`"generate_control_code"`,
-		`"fastRevision": bounded_text(&expectedFastRevision, 160)`,
+		`"fastRevision": bounded_text(expected_fast_revision, 160)`,
 	} {
-		if !strings.Contains(reducer, required) {
-			t.Fatalf("queue-first control-code reducer missing %q", required)
+		if !strings.Contains(admission, required) {
+			t.Fatalf("shared control-code admission missing %q", required)
 		}
 	}
 	if strings.Contains(reducer, `return Err("fast_not_ready".into());`) {

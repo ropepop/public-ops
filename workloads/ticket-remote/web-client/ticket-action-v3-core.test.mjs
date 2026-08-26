@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { performance } from 'node:perf_hooks';
 import {
+  TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT,
   adminRedetectTicketActionV3Args,
   adminScheduleTicketActionV3Args,
   beginTicketActionV3LocalRequest,
@@ -472,15 +473,16 @@ test('admin schedule converts an ordinary phone-local minute and rejects a missi
   );
 });
 
-test('slider completion rejects 94%, accepts 95%, and never submits duplicate release events', () => {
-  const pointerAt94 = { qualified: true, submitted: false };
-  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt94, 'up', 9499), false);
-  assert.equal(pointerAt94.submitted, false);
+test('slider completion rejects 24%, accepts 25%, and never submits duplicate release events', () => {
+  assert.equal(TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT, 25);
+  const pointerAt24 = { qualified: true, submitted: false };
+  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt24, 'up', 2499), false);
+  assert.equal(pointerAt24.submitted, false);
 
-  const pointerAt95 = { qualified: true, submitted: false };
-  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt95, 'up', 9500), true);
-  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt95, 'up', 10000), false);
-  assert.equal(pointerAt95.submitted, true);
+  const pointerAt25 = { qualified: true, submitted: false };
+  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt25, 'up', 2500), true);
+  assert.equal(shouldSubmitTicketSliderCompletion(pointerAt25, 'up', 10000), false);
+  assert.equal(pointerAt25.submitted, true);
 });
 
 test('slider session binds exact proof, stream epoch, frame, region, viewport, and visual revisions', () => {
@@ -523,14 +525,20 @@ test('slider session binds exact proof, stream epoch, frame, region, viewport, a
 test('pointer capture loss, blur, and incomplete release cancel without submission', () => {
   const snapshot = { proofActionId: 'proof-1' };
   const state = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(state, { kind: 'pointer', pointerId: 8, snapshot }), true);
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 8, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
+    pointerTrackWidth: 400, snapshot
+  }), true);
   assert.equal(cancelTicketLocalRegisterSliderSession(state, 9), false);
   assert.equal(cancelTicketLocalRegisterSliderSession(state, 8), true, 'lost pointer capture cancels the matching pointer');
   assert.equal(state.session, null);
 
-  assert.equal(beginTicketLocalRegisterSliderSession(state, { kind: 'pointer', pointerId: 10, snapshot }), true);
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 10, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
+    pointerTrackWidth: 400, snapshot
+  }), true);
   assert.equal(completeTicketLocalRegisterSliderSession(state, {
-    pointerId: 10, progress: 94, proofMatches: true
+    pointerId: 10, pointerClientX: 199.6, progress: 100, proofMatches: true
   }), null, 'an incomplete pointer release submits nothing');
   assert.equal(state.session, null);
 
@@ -538,26 +546,94 @@ test('pointer capture loss, blur, and incomplete release cancel without submissi
   assert.equal(cancelTicketLocalRegisterSliderSession(state), true, 'blur cancels a keyboard or assistive session');
 });
 
-test('pointer and keyboard completion share one 95% exactly-once gate', () => {
+test('pointer and keyboard completion share one 25% exactly-once gate', () => {
   const snapshot = { proofActionId: 'proof-1' };
   const pointerState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(pointerState, { kind: 'pointer', pointerId: 5, snapshot }), true);
+  assert.equal(beginTicketLocalRegisterSliderSession(pointerState, {
+    kind: 'pointer', pointerId: 5, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
+    pointerTrackWidth: 400, snapshot
+  }), true);
   assert.equal(completeTicketLocalRegisterSliderSession(pointerState, {
-    pointerId: 5, progress: 95, proofMatches: true
+    pointerId: 5, pointerClientX: 200, progress: 25, proofMatches: true
   }), snapshot);
   assert.equal(completeTicketLocalRegisterSliderSession(pointerState, {
-    pointerId: 5, progress: 100, proofMatches: true
+    pointerId: 5, pointerClientX: 500, progress: 100, proofMatches: true
   }), null, 'input/change after pointer-up cannot reuse the consumed session');
 
   const keyboardState = { inFlight: false, session: null };
   assert.equal(beginTicketLocalRegisterSliderSession(keyboardState, { kind: 'keyboard', snapshot }), true);
   assert.equal(completeTicketLocalRegisterSliderSession(keyboardState, {
-    progress: 100, proofMatches: true
+    progress: 25, proofMatches: true
   }), snapshot, 'keyboard completion uses the same authorization path');
 });
 
+test('a zero-distance range tap never counts as 25% pointer movement', () => {
+  const snapshot = { proofActionId: 'proof-1' };
+  const state = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 12, pointerStartClientX: 250, pointerTrackLeftClientX: 0,
+    pointerTrackWidth: 1000, snapshot
+  }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(state, {
+    pointerId: 12, pointerClientX: 250, progress: 100, proofMatches: true
+  }), null, 'the native range value cannot substitute for actual rightward pointer travel');
+  assert.equal(state.session, null);
+
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 13, pointerStartClientX: 250, pointerTrackLeftClientX: 0,
+    pointerTrackWidth: 1000, snapshot
+  }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(state, {
+    pointerId: 13, progress: 100, proofMatches: true
+  }), null, 'a missing pointer-up position fails closed');
+  assert.equal(state.session, null);
+});
+
+test('a near-edge start completes at the edge but still rejects a tap-sized movement', () => {
+  const snapshot = { proofActionId: 'proof-1' };
+  const completeState = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(completeState, {
+    kind: 'pointer', pointerId: 20, pointerStartClientX: 470, pointerTrackLeftClientX: 100,
+    pointerTrackWidth: 400, snapshot
+  }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(completeState, {
+    pointerId: 20, pointerClientX: 500, progress: 100, proofMatches: true
+  }), snapshot, 'reaching the right edge from inside the last quarter is enough');
+
+  const tapState = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(tapState, {
+    kind: 'pointer', pointerId: 21, pointerStartClientX: 496, pointerTrackLeftClientX: 100,
+    pointerTrackWidth: 400, snapshot
+  }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(tapState, {
+    pointerId: 21, pointerClientX: 500, progress: 100, proofMatches: true
+  }), null, 'four pixels at the edge is below the anti-tap floor');
+});
+
+test('slider change stays idle below the shared 25% threshold', async () => {
+  const slider = { value: '24', disabled: false };
+  const state = { inFlight: false, session: null, actionId: '', latchedProof: null };
+  let submissions = 0;
+  const accepted = await handleTicketLocalRegisterSliderChange({
+    slider,
+    state,
+    actionId: 'register-below-threshold',
+    proofSnapshot: { proofActionId: 'proof-1' },
+    submitRegisterCurrent: async () => {
+      submissions += 1;
+      return true;
+    }
+  });
+  assert.equal(accepted, false);
+  assert.equal(submissions, 0);
+  assert.equal(state.inFlight, false);
+  assert.equal(state.actionId, '');
+  assert.equal(slider.value, '24');
+  assert.equal(slider.disabled, false);
+});
+
 test('a false reducer outcome is not submitted and releases the browser latch', async () => {
-  const slider = { value: '95', disabled: false };
+  const slider = { value: '25', disabled: false };
   const state = { inFlight: false, session: null, actionId: '', latchedProof: null };
   let renders = 0;
   const accepted = await handleTicketLocalRegisterSliderChange({
@@ -577,7 +653,7 @@ test('a false reducer outcome is not submitted and releases the browser latch', 
 });
 
 test('accepted slider stays at 100 until its exact durable action is terminal', async () => {
-  const slider = { value: '95', disabled: false };
+  const slider = { value: '25', disabled: false };
   const state = { inFlight: false, session: null, actionId: '', latchedProof: null };
   const submissions = [];
   const accepted = await handleTicketLocalRegisterSliderChange({
@@ -612,9 +688,17 @@ test('accepted slider stays at 100 until its exact durable action is terminal', 
     { actionId: 'register-exact', status: 'running' }
   ]), null);
   assert.equal(state.inFlight, true);
+  assert.equal(releaseTicketLocalRegisterSliderOnTerminal(state, [
+    { actionId: 'register-exact', rootActionId: 'register-exact', status: 'needs_attention', createdAt: '2026-08-26T12:00:00Z' },
+    { actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'queued', createdAt: '2026-08-26T12:00:01Z' }
+  ]), null, 'the parent terminal result cannot release the slider while its one child waits');
+  assert.equal(state.inFlight, true);
   assert.deepEqual(releaseTicketLocalRegisterSliderOnTerminal(state, [
-    { actionId: 'register-exact', status: 'succeeded' }
-  ]), { actionId: 'register-exact', status: 'succeeded' });
+    { actionId: 'register-exact', rootActionId: 'register-exact', status: 'needs_attention', createdAt: '2026-08-26T12:00:00Z' },
+    { actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'succeeded', createdAt: '2026-08-26T12:00:01Z' }
+  ]), {
+    actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'succeeded', createdAt: '2026-08-26T12:00:01Z'
+  });
   assert.equal(state.inFlight, false);
   assert.equal(state.actionId, '');
   assert.equal(resetTicketLocalRegisterSliderState(state), false);
@@ -723,7 +807,7 @@ test('expired, unavailable, nonterminal, and incomplete switch rows keep the con
   assert.equal(ticketActionV3SmartSwitchAction(rows, Date.parse('2026-08-26T12:05:00Z')), null);
 });
 
-test('browser phone-lane busy state includes every pending or running v3 target', () => {
+test('browser phone-lane busy state includes every queued, pending, or running v3 target', () => {
   for (const target of [
     'open_latest_unactivated',
     'open_latest_and_register',
@@ -733,6 +817,7 @@ test('browser phone-lane busy state includes every pending or running v3 target'
     'redetect_latest',
     'prove_current'
   ]) {
+    assert.equal(ticketActionV3OccupiesPhone({ target, status: 'queued' }), true);
     assert.equal(ticketActionV3OccupiesPhone({ target, status: 'pending' }), true);
     assert.equal(ticketActionV3OccupiesPhone({ target, status: 'running' }), true);
     assert.equal(ticketActionV3OccupiesPhone({ target, status: 'succeeded' }), false);
@@ -774,6 +859,20 @@ test('automatic current proof cannot replace the last explicit user action resul
     ticketActionV3ExplicitResultForDisplay([laterAutomaticProof], ''),
     null,
     'an automatic proof is never inferred to be an explicit user result'
+  );
+  const retryChild = {
+    actionId: `${explicitFailure.actionId}-retry-1`,
+    rootActionId: explicitFailure.actionId,
+    status: 'running',
+    createdAt: '2026-08-26T12:00:01Z'
+  };
+  assert.equal(
+    ticketActionV3ExplicitResultForDisplay(
+      [{ ...explicitFailure, createdAt: '2026-08-26T12:00:00Z' }, retryChild],
+      explicitFailure.actionId
+    ),
+    retryChild,
+    'the browser follows the deterministic child as the same explicit user action'
   );
 });
 
