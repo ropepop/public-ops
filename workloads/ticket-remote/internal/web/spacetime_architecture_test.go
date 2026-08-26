@@ -674,7 +674,7 @@ func removedSpacetimeMarkers() []string {
 	}
 }
 
-func TestTicketSliderUsesShortLivedVisualGeometryWithoutAProgressProtocol(t *testing.T) {
+func TestTicketSliderUsesVisibleShortLivedVisualGeometryWithoutAProgressProtocol(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	browser := ticketRemoteSourceFile(t, "web-client", "ticket-app-source.js")
 	page := ticketRemoteSourceFile(t, "internal", "web", "static", "index.html.tmpl")
@@ -693,9 +693,11 @@ func TestTicketSliderUsesShortLivedVisualGeometryWithoutAProgressProtocol(t *tes
 		"ticketSliderRegionV3ForAction(",
 		"ticketSliderRegionV3Layout(",
 		"handleTicketLocalRegisterSliderChange({",
-		"submitRegisterCurrent: (source) => registerCurrentTicket(source)",
+		"submitRegisterCurrent: (source, exactActionId, exactProof) => registerCurrentTicket(source, {",
 		"ticketRegisterOverlay.hidden = true",
 		"ticketRegisterOverlay.hidden = false",
+		"ticketRegisterOverlay.dataset.registrationState = 'registering'",
+		"Biļetes reģistrācija notiek tālrunī",
 	} {
 		if !strings.Contains(browser, required) {
 			t.Fatalf("browser visual slider path missing %q", required)
@@ -720,10 +722,28 @@ func TestTicketSliderUsesShortLivedVisualGeometryWithoutAProgressProtocol(t *tes
 	for _, required := range []string{
 		`id="ticketRegisterOverlay"`,
 		`id="ticketLocalRegisterSlider" type="range"`,
-		`opacity: 0.001`,
+		`#ticketLocalRegisterSlider::-webkit-slider-thumb`,
+		`--ticket-register-orange: #ff9500`,
+		`background: rgba(255, 149, 0, 0.05)`,
+		`min-height: 44px`,
+		`background: transparent`,
+		`#ticketRegisterOverlay[data-registration-state="registering"]`,
+		`border-color: rgba(255, 149, 0, 0.36)`,
+		`background: rgba(255, 149, 0, 0.09)`,
+		`#ticketRegisterOverlay[data-registration-state="registering"]::after`,
+		`background: rgba(255, 149, 0, 0.82)`,
 	} {
 		if !strings.Contains(page, required) {
-			t.Fatalf("transparent over-stream slider missing %q", required)
+			t.Fatalf("faint over-stream slider missing %q", required)
+		}
+	}
+	for _, retired := range []string{
+		`background-image: url("data:image/svg+xml`,
+		`linear-gradient(90deg, rgba(139, 181, 255`,
+		`background-color: rgba(12, 30, 54`,
+	} {
+		if strings.Contains(page, retired) {
+			t.Fatalf("native range must not obscure the streamed ViVi slider, found %q", retired)
 		}
 	}
 }

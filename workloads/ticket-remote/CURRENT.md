@@ -10,7 +10,7 @@ The phone shows ViVi. The page shows that picture and exposes one durable visual
 1. Open the signed-in page and get a live ticket picture quickly.
 2. Use **Atvērt jaunāko nereģistrēto biļeti** to visually select and prove the newest current-or-upcoming unused ticket.
 3. Use **Atvērt jaunāko biļeti un reģistrēt** for the same selection followed by one bounded held phone drag, or use **Reģistrēt atvērto biļeti** after a fresh slider proof.
-4. The browser slider is a transparent local authorization control placed directly over ViVi's visible slider. It submits that same register action once at completion and does not maintain its own phone-control protocol.
+4. The browser slider is a visible local authorization control aligned directly over ViVi's visible slider. It submits that same register action once at completion and does not maintain its own phone-control protocol.
 5. For 15 minutes after a proven registration, and only after a newer unused ticket is visually proven, use the context-aware button to move directly between the two Aztec-detail views. The ticket list is a transitional phone view, never a successful resting state.
 6. Request a control code when needed. The requester page freezes its own live picture of the result. The phone must not send a screenshot of that result.
 
@@ -44,6 +44,7 @@ Those folders are backups. Open them only when a task explicitly asks for old Ti
 - Spacetime decides whether and when: it owns account quotas, the admin preference, switch availability/expiry, delayed refresh/re-detection schedules, and the sanitized usage projection. Pixel executes one admitted command and proves the visual result. Phone-local clocks and restart jobs must not create product actions.
 - `ticketremote_ticket_action_v3` is the browser authority for visual proof and terminal state. The older interaction row is compatibility state only: a newer V3 visual proof fences stale `needs_attention`, and a V3 registration failure keeps the exact command revision instead of creating a replayable retry revision.
 - The browser requests non-mutating `prove_current` after the first fresh frame of a stream epoch, after two agreeing significant picture changes, and when a visible page resumes with a stale proof. Requests are coalesced per backend and epoch, and an unknown result waits for another meaningful picture change. A five-minute normalized slider region is usable only when its action ID, epoch, and frame sequence exactly match the current proof.
+- A healthy visible-page resume keeps its live Spacetime subscription. `prove_current` is read-only, does not own the phone mutation lane or panel-dark action lease, and may be safely superseded by an explicit user Ticket action; it never supersedes another mutating action.
 - The signed-in browser client exposes only the V3 Ticket action producer. Legacy reducers and table shape remain temporarily in the module for old in-flight rows and sidecar compatibility; remove that schema only after its production TTL and migration checks pass.
 - Keep the existing signed-in browser session. Do not clear cookies or log out.
 - Updating the phone app does not update the public page, and the reverse is also true.

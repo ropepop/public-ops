@@ -1307,6 +1307,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"decoderQueueDelayMillis:",
 		"streamFreshnessState:",
 		"liveLabeled:",
+		"streamFreshnessState === 'DEGRADED'",
 		"LIVE_FRESH",
 		"LIVE_OK",
 		"DEGRADED",

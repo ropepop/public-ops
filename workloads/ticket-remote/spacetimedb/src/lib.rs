@@ -1271,11 +1271,15 @@ fn ticket_action_v3_public_reason(value: &str, fallback: &str) -> String {
             "ticket_action_slider_geometry_invalid",
             "ticket_action_interaction_proof_invalid",
             "ticket_action_interaction_revision_unproved",
+            "ticket_action_detail_identity_conflict",
             "ticket_action_accessibility_unavailable",
             "ticket_action_activation_dispatch_uncertain",
             "ticket_action_gesture_start_uncertain",
             "ticket_action_gesture_start_rejected",
+            "ticket_action_gesture_rejected",
             "ticket_action_gesture_completion_uncertain",
+            "ticket_action_gesture_completed_no_transition",
+            "ticket_action_post_gesture_visual_unproved",
             "ticket_action_activation_visual_unproved",
             "ticket_action_registered",
             "ticket_view_switch_unavailable",
@@ -1493,6 +1497,72 @@ fn ticket_has_ticket_action_v3_in_progress(
                 .next()
                 .is_some()
         })
+}
+
+/// Background current-view proofs are read-only. A newly admitted explicit V3 action may retire
+/// them transactionally before checking the physical phone lane, allowing the user command to be
+/// inserted immediately while leaving every mutating action mutually exclusive.
+fn supersede_read_only_ticket_actions_for_mutation(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    now: &str,
+) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    let proofs = ticket_action_v3_phone_lane_statuses()
+        .into_iter()
+        .flat_map(|status| {
+            ctx.db
+                .ticketremote_ticket_action_v3()
+                .ticketBackendStatus()
+                .filter((&ticket_id, &backend_id, status))
+        })
+        .filter(|row| row.target == "prove_current")
+        .collect::<Vec<_>>();
+    for proof in proofs {
+        let command_id = ticket_action_v3_command_id(&ticket_id, &backend_id, &proof.actionId);
+        if ctx
+            .db
+            .ticketremote_stream_command()
+            .id()
+            .find(&command_id)
+            .is_some()
+        {
+            update_stream_command_status(
+                ctx,
+                &command_id,
+                "failed",
+                "ticket_action_v3_superseded",
+                now,
+            );
+            if let Some(retired) = ctx.db.ticketremote_ticket_action_v3().id().find(&proof.id) {
+                ctx.db
+                    .ticketremote_ticket_action_v3()
+                    .id()
+                    .update(TicketremoteTicketActionV3 {
+                        phase: "superseded".into(),
+                        expiresAt: add_ms(now, TICKET_SLIDER_REGION_V3_TTL_MS),
+                        ..retired
+                    });
+            }
+        } else {
+            ctx.db
+                .ticketremote_ticket_action_v3()
+                .id()
+                .update(TicketremoteTicketActionV3 {
+                    status: "failed".into(),
+                    phase: "superseded".into(),
+                    reason: "ticket_action_v3_superseded".into(),
+                    switchAvailable: false,
+                    switchExpiresAt: String::new(),
+                    updatedAt: now.into(),
+                    completedAt: now.into(),
+                    expiresAt: add_ms(now, TICKET_SLIDER_REGION_V3_TTL_MS),
+                    ..proof
+                });
+        }
+    }
 }
 
 fn ticket_phone_mutation_lane_conflict_reason(
@@ -3031,6 +3101,11 @@ fn note_ticket_switch_visual_result(
             .ticketremote_ticket_switch_anchor()
             .id()
             .update(updated);
+        // The anchor and every public switch projection must change in the same
+        // transaction. Otherwise an older row for the opposite view can remain
+        // switchAvailable after a successful round trip and compete with the
+        // current view in browser subscriptions.
+        refresh_ticket_switch_action_projections(ctx, &action.ticketId, &action.backendId, now);
     }
 }
 
@@ -3056,6 +3131,7 @@ fn refresh_ticket_switch_action_projections(
 ) {
     let ticket_id = clean_ticket_id(ticket_id);
     let backend_id = clean_backend_id(backend_id);
+    let anchor = live_ticket_switch_anchor(ctx, &ticket_id, &backend_id, now);
     let rows: Vec<_> = ctx
         .db
         .ticketremote_ticket_action_v3()
@@ -3063,10 +3139,7 @@ fn refresh_ticket_switch_action_projections(
         .filter(|row| row.ticketId == ticket_id && row.backendId == backend_id)
         .collect();
     for row in rows {
-        let anchor =
-            ticket_switch_projection_for_view(ctx, &ticket_id, &backend_id, &row.currentView, now);
-        let available = row.status == "succeeded" && anchor.is_some();
-        let expires_at = anchor.map(|value| value.expiresAt).unwrap_or_default();
+        let (available, expires_at) = ticket_switch_projection_values(&row, anchor.as_ref());
         if row.switchAvailable != available || row.switchExpiresAt != expires_at {
             ctx.db
                 .ticketremote_ticket_action_v3()
@@ -3078,6 +3151,25 @@ fn refresh_ticket_switch_action_projections(
                     ..row
                 });
         }
+    }
+}
+
+fn ticket_switch_projection_values(
+    row: &TicketremoteTicketActionV3,
+    anchor: Option<&TicketremoteTicketSwitchAnchor>,
+) -> (bool, String) {
+    let authorized_anchor = anchor.filter(|value| {
+        row.status == "succeeded"
+            && ticket_switch_anchor_has_later_unactivated_proof(value)
+            && value.currentView == row.currentView
+            && matches!(
+                row.currentView.as_str(),
+                "latest_unactivated" | "recent_activated"
+            )
+    });
+    match authorized_anchor {
+        Some(value) => (true, value.expiresAt.clone()),
+        None => (false, String::new()),
     }
 }
 
@@ -3422,6 +3514,9 @@ fn request_ticket_action_v3_impl(
     let row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, action_id);
     if let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&row_id) {
         return ticket_action_v3_duplicate_result(&existing.target, &target);
+    }
+    if target != "prove_current" {
+        supersede_read_only_ticket_actions_for_mutation(ctx, &ticket.id, &backend_id, now);
     }
     if let Some(conflict_reason) =
         ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, now)
@@ -5471,6 +5566,197 @@ pub fn ticketremote_update_ticket_interaction(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct TicketSliderRegionV3Input {
+    left_basis_points: u32,
+    top_basis_points: u32,
+    right_basis_points: u32,
+    bottom_basis_points: u32,
+}
+
+fn ticket_slider_region_v3_row_for_action(
+    ticket_id: &str,
+    backend_id: &str,
+    action: &TicketremoteTicketActionV3,
+    input: TicketSliderRegionV3Input,
+    now: &str,
+) -> Result<TicketremoteTicketSliderRegionV3, String> {
+    if !ticket_slider_region_v3_bounds_valid(
+        input.left_basis_points,
+        input.top_basis_points,
+        input.right_basis_points,
+        input.bottom_basis_points,
+    ) {
+        return Err("invalid_ticket_slider_region_bounds".into());
+    }
+    if !matches!(
+        action.target.as_str(),
+        "open_latest_unactivated"
+            | "return_to_latest_unactivated"
+            | "redetect_latest"
+            | "prove_current"
+    ) || action.status != "succeeded"
+        || action.currentView != "latest_unactivated"
+        || action.streamEpoch == "0"
+        || action.frameSequence == "0"
+        || parse_time_ms(&action.expiresAt) <= parse_time_ms(now)
+    {
+        return Err("ticket_slider_region_proof_mismatch".into());
+    }
+    Ok(TicketremoteTicketSliderRegionV3 {
+        id: ticket_slider_region_v3_id(ticket_id, backend_id),
+        ticketId: ticket_id.into(),
+        backendId: backend_id.into(),
+        proofActionId: action.actionId.clone(),
+        streamEpoch: action.streamEpoch.clone(),
+        frameSequence: action.frameSequence.clone(),
+        leftBasisPoints: input.left_basis_points,
+        topBasisPoints: input.top_basis_points,
+        rightBasisPoints: input.right_basis_points,
+        bottomBasisPoints: input.bottom_basis_points,
+        updatedAt: now.into(),
+        expiresAt: add_ms(now, TICKET_SLIDER_REGION_V3_TTL_MS),
+    })
+}
+
+fn update_ticket_action_v3_projection(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    action_id: &str,
+    target: &str,
+    status: &str,
+    phase: &str,
+    current_view: &str,
+    stream_epoch: &str,
+    frame_sequence: &str,
+    reason: &str,
+    completed_at: &str,
+    slider_region: Option<TicketSliderRegionV3Input>,
+    now: &str,
+) -> Result<(), String> {
+    if !valid_schedule_identifier(action_id) {
+        return Err("invalid_ticket_action_id".into());
+    }
+    let clean_target = ticket_action_v3_target(target);
+    let clean_status = ticket_action_v3_status(status);
+    if clean_target.is_empty() || clean_status.is_empty() {
+        return Err("invalid_ticket_action_update".into());
+    }
+    let id = ticket_action_v3_row_id(ticket_id, backend_id, action_id);
+    let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&id) else {
+        return Err("ticket_action_not_found".into());
+    };
+    if existing.target != clean_target {
+        return Err("ticket_action_target_mismatch".into());
+    }
+    if ticket_action_v3_terminal(&existing.status) {
+        if existing.status != clean_status {
+            return Err("ticket_action_already_terminal".into());
+        }
+        if let Some(input) = slider_region {
+            let row = ticket_slider_region_v3_row_for_action(
+                ticket_id, backend_id, &existing, input, now,
+            )?;
+            upsert_row!(ctx, ticketremote_ticket_slider_region_v3, row);
+        }
+        return Ok(());
+    }
+    let current_view = ticket_action_v3_view(current_view);
+    let terminal = ticket_action_v3_terminal(&clean_status);
+    let completed_at = if terminal {
+        non_empty(completed_at, now)
+    } else {
+        String::new()
+    };
+    let command_revision = ctx
+        .db
+        .ticketremote_stream_command()
+        .id()
+        .find(ticket_action_v3_command_id(
+            ticket_id, backend_id, action_id,
+        ))
+        .map(|command| command.revision);
+    let mut updated = TicketremoteTicketActionV3 {
+        status: clean_status,
+        phase: bounded_text(&safe_token(phase, "running"), 80),
+        currentView: current_view,
+        switchAvailable: false,
+        switchExpiresAt: String::new(),
+        streamEpoch: bounded_frame_ordinal(stream_epoch),
+        frameSequence: bounded_frame_ordinal(frame_sequence),
+        reason: ticket_action_v3_public_reason(reason, "ticket_action_updated"),
+        updatedAt: now.into(),
+        completedAt: bounded_text(&completed_at, 80),
+        expiresAt: add_ms(
+            now,
+            if clean_target == "prove_current" {
+                TICKET_SLIDER_REGION_V3_TTL_MS
+            } else {
+                HISTORY_TTL_MS
+            },
+        ),
+        ..existing
+    };
+    ctx.db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .update(updated.clone());
+    note_ticket_switch_visual_result(ctx, &updated, now);
+    let switch_anchor = if updated.status == "succeeded" {
+        ticket_switch_projection_for_view(ctx, ticket_id, backend_id, &updated.currentView, now)
+    } else {
+        None
+    };
+    if let Some(anchor) = switch_anchor {
+        updated.switchAvailable = true;
+        updated.switchExpiresAt = anchor.expiresAt;
+        ctx.db
+            .ticketremote_ticket_action_v3()
+            .id()
+            .update(updated.clone());
+    }
+    let interaction_id = ticket_interaction_id(ticket_id, backend_id);
+    let reconciled = ctx
+        .db
+        .ticketremote_ticket_interaction()
+        .id()
+        .find(&interaction_id)
+        .and_then(|current| {
+            reconcile_legacy_interaction_after_ticket_action_v3(
+                &current,
+                &updated,
+                command_revision.as_deref(),
+                now,
+            )
+        });
+    if let Some(reconciled) = reconciled {
+        upsert_ticket_interaction(ctx, reconciled);
+    }
+    if terminal
+        && !(updated.status == "succeeded"
+            && updated.currentView == "latest_unactivated"
+            && matches!(
+                updated.target.as_str(),
+                "open_latest_unactivated"
+                    | "return_to_latest_unactivated"
+                    | "redetect_latest"
+                    | "prove_current"
+            ))
+    {
+        ctx.db
+            .ticketremote_ticket_slider_region_v3()
+            .id()
+            .delete(ticket_slider_region_v3_id(ticket_id, backend_id));
+    }
+    if let Some(input) = slider_region {
+        let row =
+            ticket_slider_region_v3_row_for_action(ticket_id, backend_id, &updated, input, now)?;
+        upsert_row!(ctx, ticketremote_ticket_slider_region_v3, row);
+    }
+    Ok(())
+}
+
 #[spacetimedb::reducer]
 pub fn ticketremote_update_ticket_action_v3(
     ctx: &ReducerContext,
@@ -5493,124 +5779,80 @@ pub fn ticketremote_update_ticket_action_v3(
     let now = now_or(ctx, &nowArg);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let backend_id = clean_backend_id(&backendId);
-    let action_id = actionId.trim();
-    if !valid_schedule_identifier(action_id) {
-        return Err("invalid_ticket_action_id".into());
-    }
-    let clean_target = ticket_action_v3_target(&target);
-    let clean_status = ticket_action_v3_status(&status);
-    if clean_target.is_empty() || clean_status.is_empty() {
-        return Err("invalid_ticket_action_update".into());
-    }
-    let id = ticket_action_v3_row_id(&ticket.id, &backend_id, action_id);
-    let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&id) else {
-        return Err("ticket_action_not_found".into());
-    };
-    if existing.target != clean_target {
-        return Err("ticket_action_target_mismatch".into());
-    }
-    if ticket_action_v3_terminal(&existing.status) {
-        return if existing.status == clean_status {
-            Ok(())
-        } else {
-            Err("ticket_action_already_terminal".into())
-        };
-    }
-    let current_view = ticket_action_v3_view(&currentView);
-    let terminal = ticket_action_v3_terminal(&clean_status);
     // Compatibility parameters are deliberately ignored. Pixel proves the
     // visual view; only the Spacetime anchor decides availability and expiry.
     let _ = (switchAvailable, &switchExpiresAt);
-    let completed_at = if terminal {
-        non_empty(&completedAt, &now)
-    } else {
-        String::new()
-    };
-    let command_revision = ctx
-        .db
-        .ticketremote_stream_command()
-        .id()
-        .find(ticket_action_v3_command_id(
-            &ticket.id,
-            &backend_id,
-            action_id,
-        ))
-        .map(|command| command.revision);
-    let mut updated = TicketremoteTicketActionV3 {
-        status: clean_status,
-        phase: bounded_text(&safe_token(&phase, "running"), 80),
-        currentView: current_view,
-        switchAvailable: false,
-        switchExpiresAt: String::new(),
-        streamEpoch: bounded_frame_ordinal(&streamEpoch),
-        frameSequence: bounded_frame_ordinal(&frameSequence),
-        reason: ticket_action_v3_public_reason(&reason, "ticket_action_updated"),
-        updatedAt: now.clone(),
-        completedAt: bounded_text(&completed_at, 80),
-        expiresAt: add_ms(
-            &now,
-            if clean_target == "prove_current" {
-                TICKET_SLIDER_REGION_V3_TTL_MS
-            } else {
-                HISTORY_TTL_MS
-            },
-        ),
-        ..existing
-    };
-    ctx.db
-        .ticketremote_ticket_action_v3()
-        .id()
-        .update(updated.clone());
-    note_ticket_switch_visual_result(ctx, &updated, &now);
-    if updated.status == "succeeded" {
-        if let Some(anchor) = ticket_switch_projection_for_view(
-            ctx,
-            &ticket.id,
-            &backend_id,
-            &updated.currentView,
-            &now,
-        ) {
-            updated.switchAvailable = true;
-            updated.switchExpiresAt = anchor.expiresAt;
-            ctx.db
-                .ticketremote_ticket_action_v3()
-                .id()
-                .update(updated.clone());
-        }
+    update_ticket_action_v3_projection(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        actionId.trim(),
+        &target,
+        &status,
+        &phase,
+        &currentView,
+        &streamEpoch,
+        &frameSequence,
+        &reason,
+        &completedAt,
+        None,
+        &now,
+    )
+}
+
+/// Additive Pixel-only path. The terminal action projection and its optional
+/// normalized slider geometry commit in one database transaction, so members
+/// never observe a successful proof without the matching hit region.
+#[spacetimedb::reducer]
+pub fn ticketremote_update_ticket_action_v3_with_slider_region(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    actionId: String,
+    target: String,
+    status: String,
+    phase: String,
+    currentView: String,
+    streamEpoch: String,
+    frameSequence: String,
+    reason: String,
+    completedAt: String,
+    hasSliderRegion: bool,
+    leftBasisPoints: u32,
+    topBasisPoints: u32,
+    rightBasisPoints: u32,
+    bottomBasisPoints: u32,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    if !ticket_action_v3_terminal(&ticket_action_v3_status(&status)) {
+        return Err("ticket_action_terminal_projection_required".into());
     }
-    let interaction_id = ticket_interaction_id(&ticket.id, &backend_id);
-    if let Some(current) = ctx
-        .db
-        .ticketremote_ticket_interaction()
-        .id()
-        .find(&interaction_id)
-    {
-        if let Some(reconciled) = reconcile_legacy_interaction_after_ticket_action_v3(
-            &current,
-            &updated,
-            command_revision.as_deref(),
-            &now,
-        ) {
-            upsert_ticket_interaction(ctx, reconciled);
-        }
-    }
-    if terminal
-        && !(updated.status == "succeeded"
-            && updated.currentView == "latest_unactivated"
-            && matches!(
-                updated.target.as_str(),
-                "open_latest_unactivated"
-                    | "return_to_latest_unactivated"
-                    | "redetect_latest"
-                    | "prove_current"
-            ))
-    {
-        ctx.db
-            .ticketremote_ticket_slider_region_v3()
-            .id()
-            .delete(ticket_slider_region_v3_id(&ticket.id, &backend_id));
-    }
-    Ok(())
+    let now = now_or(ctx, &nowArg);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let backend_id = clean_backend_id(&backendId);
+    let slider_region = hasSliderRegion.then_some(TicketSliderRegionV3Input {
+        left_basis_points: leftBasisPoints,
+        top_basis_points: topBasisPoints,
+        right_basis_points: rightBasisPoints,
+        bottom_basis_points: bottomBasisPoints,
+    });
+    update_ticket_action_v3_projection(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        actionId.trim(),
+        &target,
+        &status,
+        &phase,
+        &currentView,
+        &streamEpoch,
+        &frameSequence,
+        &reason,
+        &completedAt,
+        slider_region,
+        &now,
+    )
 }
 
 #[spacetimedb::reducer]
@@ -6000,6 +6242,7 @@ expression_functions! {
         if ttl <= 0 || ttl > HISTORY_TTL_MS { HISTORY_TTL_MS } else { ttl });
     fn clean_control_code_result_proof(value: &str) -> String = allowlisted(value,
         &["phone_root", "phone_visual", "phone_visual_root_confirmed",
+        "phone_visual_generated_inline", "phone_visual_generated_with_close",
         "phone_visual_raw_ticket_after_submit", "phone_root_image", "browser_frame"], "");
     fn bounded_frame_ordinal(value: &str) -> String = non_empty(
         &value.chars().filter(|c| c.is_ascii_digit()).take(24).collect::<String>(), "0");
@@ -10686,7 +10929,10 @@ mod tests {
         let cancel = source
             .split("fn cancel_latest_ticket_reselect(")
             .nth(1)
-            .and_then(|body| body.split("fn latest_ticket_reselect_admin_cancellable(").next())
+            .and_then(|body| {
+                body.split("fn latest_ticket_reselect_admin_cancellable(")
+                    .next()
+            })
             .expect("cancel reducer body must remain inspectable");
         let purpose_gate = cancel
             .find("if !latest_ticket_reselect_admin_cancellable(&existing)")
@@ -11134,6 +11380,86 @@ mod tests {
     }
 
     #[test]
+    fn switch_projection_values_enable_only_the_anchor_current_view() {
+        let anchor = TicketremoteTicketSwitchAnchor {
+            id: "vivi-default:pixel".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            activationAttemptId: "attempt-1".into(),
+            activationRevision: "activation-1".into(),
+            activationAt: "2026-08-25T12:00:00Z".into(),
+            expiresAt: "2026-08-25T12:15:00Z".into(),
+            latestUnactivatedProofActionId: "proof-1".into(),
+            latestUnactivatedProofAt: "2026-08-25T12:00:00.001Z".into(),
+            currentView: "latest_unactivated".into(),
+            policyRevision: "switch-policy-1".into(),
+            updatedAt: "2026-08-25T12:00:00.001Z".into(),
+        };
+        let row = TicketremoteTicketActionV3 {
+            id: "vivi-default:pixel:return-1".into(),
+            actionId: "return-1".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            target: "return_to_latest_unactivated".into(),
+            status: "succeeded".into(),
+            phase: "complete".into(),
+            currentView: "latest_unactivated".into(),
+            switchAvailable: false,
+            switchExpiresAt: String::new(),
+            streamEpoch: "101".into(),
+            frameSequence: "202".into(),
+            reason: "ticket_action_target_visible".into(),
+            createdAt: "2026-08-25T12:01:00Z".into(),
+            updatedAt: "2026-08-25T12:01:00Z".into(),
+            completedAt: "2026-08-25T12:01:00Z".into(),
+            expiresAt: "2026-08-25T13:01:00Z".into(),
+        };
+
+        assert_eq!(
+            ticket_switch_projection_values(&row, Some(&anchor)),
+            (true, anchor.expiresAt.clone())
+        );
+        assert_eq!(
+            ticket_switch_projection_values(&row, None),
+            (false, String::new())
+        );
+
+        let mut opposite_view = row.clone();
+        opposite_view.currentView = "recent_activated".into();
+        assert_eq!(
+            ticket_switch_projection_values(&opposite_view, Some(&anchor)),
+            (false, String::new())
+        );
+
+        let mut nonterminal = row;
+        nonterminal.status = "running".into();
+        assert_eq!(
+            ticket_switch_projection_values(&nonterminal, Some(&anchor)),
+            (false, String::new())
+        );
+    }
+
+    #[test]
+    fn switch_anchor_view_change_refreshes_all_public_action_projections() {
+        let source = include_str!("lib.rs");
+        let note = source
+            .split("fn note_ticket_switch_visual_result(")
+            .nth(1)
+            .and_then(|body| body.split("fn ticket_switch_projection_for_view(").next())
+            .expect("switch visual result handler must remain inspectable");
+        let anchor_update = note
+            .find(".update(updated);")
+            .expect("switch result must update the durable anchor");
+        let projection_refresh = note
+            .find("refresh_ticket_switch_action_projections(")
+            .expect("anchor change must sanitize every public switch projection");
+        assert!(
+            anchor_update < projection_refresh,
+            "public projections must refresh only after the new anchor view is durable"
+        );
+    }
+
+    #[test]
     fn every_v3_payload_carries_spacetime_switch_policy_fields() {
         let source = include_str!("lib.rs");
         let immediate = source
@@ -11145,15 +11471,23 @@ mod tests {
         assert!(immediate.contains("\"policyRevision\""));
         assert!(immediate.contains("ticket_action_v3_switch_authority("));
         let update = source
+            .split("fn update_ticket_action_v3_projection(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_update_ticket_action_v3(")
+                    .next()
+            })
+            .expect("shared V3 projection path must remain inspectable");
+        assert!(update.contains("ticket_switch_projection_for_view("));
+        let compatibility = source
             .split("pub fn ticketremote_update_ticket_action_v3(")
             .nth(1)
             .and_then(|body| {
-                body.split("pub fn ticketremote_update_ticket_slider_region_v3(")
+                body.split("pub fn ticketremote_update_ticket_action_v3_with_slider_region(")
                     .next()
             })
-            .expect("V3 update path must remain inspectable");
-        assert!(update.contains("Compatibility parameters are deliberately ignored"));
-        assert!(update.contains("ticket_switch_projection_for_view("));
+            .expect("compatibility V3 update path must remain inspectable");
+        assert!(compatibility.contains("Compatibility parameters are deliberately ignored"));
     }
 
     #[test]
@@ -11222,6 +11556,10 @@ mod tests {
             "ticket_action_selected_anchor_missing",
             "ticket_action_transition_anchor_missing",
             "ticket_action_selected_anchor_conflict",
+            "ticket_action_detail_identity_conflict",
+            "ticket_action_gesture_rejected",
+            "ticket_action_gesture_completed_no_transition",
+            "ticket_action_post_gesture_visual_unproved",
         ] {
             assert_eq!(
                 ticket_action_v3_public_reason(reason, "ticket_action_updated"),
@@ -11246,6 +11584,40 @@ mod tests {
         assert_eq!(reason, "slider_proof_stale");
         assert!(!emit_command);
         assert!(ticket_action_v3_committed_rejection().is_ok());
+    }
+
+    #[test]
+    fn explicit_v3_action_supersedes_read_only_proof_before_phone_lane_admission() {
+        let source = include_str!("lib.rs");
+        let request = source
+            .split("fn request_ticket_action_v3_impl(")
+            .nth(1)
+            .and_then(|body| body.split("fn request_ticket_reset_impl(").next())
+            .expect("immediate V3 request path must remain inspectable");
+        let supersede = request
+            .find("supersede_read_only_ticket_actions_for_mutation(")
+            .expect("explicit action must retire background proof");
+        let lane = request
+            .find("ticket_phone_mutation_lane_conflict(")
+            .expect("mutating action must still use the shared phone lane");
+        assert!(request.contains("if target != \"prove_current\""));
+        assert!(supersede < lane);
+        let helper = source
+            .split("fn supersede_read_only_ticket_actions_for_mutation(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn ticket_phone_mutation_lane_conflict_reason(")
+                    .next()
+            })
+            .expect("proof supersession helper must remain inspectable");
+        assert!(helper.contains("row.target == \"prove_current\""));
+        assert!(helper.contains("ticket_action_v3_superseded"));
+        assert_eq!(
+            helper.matches("phase: \"superseded\".into()").count(),
+            2,
+            "proof supersession must publish the same phase whether or not its command row still exists"
+        );
+        assert!(!helper.contains("ticket_action_v3_is_activation"));
     }
 
     #[test]
@@ -11339,6 +11711,45 @@ mod tests {
             &region, &action, now
         ));
         assert!(!ticket_slider_region_v3_bounds_valid(100, 200, 100, 300));
+        let atomic = ticket_slider_region_v3_row_for_action(
+            "vivi-default",
+            "pixel",
+            &action,
+            TicketSliderRegionV3Input {
+                left_basis_points: 1200,
+                top_basis_points: 7000,
+                right_basis_points: 8800,
+                bottom_basis_points: 7600,
+            },
+            now,
+        )
+        .expect("matching terminal proof and geometry must form one atomic row");
+        assert_eq!(atomic.proofActionId, "proof-current-1");
+        assert_eq!(atomic.streamEpoch, "101");
+        assert_eq!(atomic.frameSequence, "202");
+        assert_eq!(
+            parse_time_ms(&atomic.expiresAt) - parse_time_ms(now),
+            TICKET_SLIDER_REGION_V3_TTL_MS
+        );
+    }
+
+    #[test]
+    fn pixel_terminal_projection_has_additive_atomic_reducer_and_keeps_legacy_fallback() {
+        let source = include_str!("lib.rs");
+        let atomic = source
+            .split("pub fn ticketremote_update_ticket_action_v3_with_slider_region(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_update_ticket_slider_region_v3(")
+                    .next()
+            })
+            .expect("atomic Pixel reducer must remain present");
+        assert!(atomic.contains("require_service(ctx)?"));
+        assert!(atomic.contains("ticket_action_terminal_projection_required"));
+        assert!(atomic.contains("update_ticket_action_v3_projection("));
+        assert!(atomic.contains("hasSliderRegion.then_some"));
+        assert!(source.contains("pub fn ticketremote_update_ticket_action_v3("));
+        assert!(source.contains("pub fn ticketremote_update_ticket_slider_region_v3("));
     }
 
     #[test]
@@ -11664,5 +12075,21 @@ mod tests {
             "2026-08-24T12:15:00.001Z",
             now
         ));
+    }
+
+    #[test]
+    fn control_code_result_proof_accepts_only_mode_specific_generated_tokens() {
+        assert_eq!(
+            clean_control_code_result_proof("phone_visual_generated_inline"),
+            "phone_visual_generated_inline"
+        );
+        assert_eq!(
+            clean_control_code_result_proof("phone_visual_generated_with_close"),
+            "phone_visual_generated_with_close"
+        );
+        assert_eq!(
+            clean_control_code_result_proof("phone_visual_generated_unknown"),
+            ""
+        );
     }
 }

@@ -205,42 +205,51 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	}
 }
 
-func TestTrustedPhoneChangedMarkerFrameCanBridgeGeneratedDetectorDesignDrift(t *testing.T) {
+func TestTrustedPhoneMarkerRequiresItsModeSpecificGeneratedDetector(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateBody := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
 		"  function noteControlCodeCandidateRejected(proof) {")
 
 	markerGuardIndex := strings.Index(candidateBody, "if (markerEpoch && markerSequence && (renderedEpoch !== markerEpoch || renderedSequence < markerSequence))")
-	fallbackIndex := strings.Index(candidateBody, "const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof")
+	markerIndex := strings.Index(candidateBody, "const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof")
 	changedIndex := strings.Index(candidateBody, "const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint")
-	bridgeIndex := strings.Index(candidateBody, "const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&")
-	resultIndex := strings.Index(candidateBody, "const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||")
+	visualIndex := strings.Index(candidateBody, "const browserTrustedGeneratedVisible = Boolean(")
+	resultIndex := strings.Index(candidateBody, "const browserTrustedResultVisible = browserTrustedGeneratedVisible;")
 	rejectIndex := strings.Index(candidateBody, "if (!proof.browserTrustedResultVisible) {")
 	rejectedIndex := strings.Index(candidateBody, "proof.generatedMarkerOnlyRejected = true;")
-	if markerGuardIndex < 0 || changedIndex < 0 || fallbackIndex < 0 || bridgeIndex < 0 || resultIndex < 0 || rejectIndex < 0 || rejectedIndex < 0 {
-		t.Fatalf("trusted phone changed marker-frame bridge or its rejection diagnostics are missing")
+	if markerGuardIndex < 0 || changedIndex < 0 || markerIndex < 0 || visualIndex < 0 || resultIndex < 0 || rejectIndex < 0 || rejectedIndex < 0 {
+		t.Fatalf("strict phone/generated marker proof or its rejection diagnostics are missing")
 	}
-	if markerGuardIndex > fallbackIndex {
+	if markerGuardIndex > markerIndex {
 		t.Fatalf("trusted phone marker-frame diagnostics must run only after the frame-at-or-after-marker guard")
 	}
-	if changedIndex > bridgeIndex || fallbackIndex > bridgeIndex || bridgeIndex > resultIndex || resultIndex > rejectIndex {
-		t.Fatalf("trusted phone changed marker-frame bridge must be built after its guards and before result rejection")
+	if changedIndex > visualIndex || visualIndex > resultIndex || markerIndex > rejectIndex || resultIndex > rejectIndex {
+		t.Fatalf("generated visual proof must be built after its guards and before result rejection")
 	}
-	if strings.Contains(candidateBody, "proof.generatedVisibleByPhoneMarker = true;") ||
-		strings.Contains(candidateBody, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
-		t.Fatalf("trusted phone marker alone must not bypass browser changed-frame proof")
+	for _, forbidden := range []string{
+		"trustedPhoneChangedMarkerFrame",
+		"candidate_frame_at_or_after_trusted_phone_marker_and_changed_visual",
+		"proof.generatedVisibleByPhoneMarker",
+	} {
+		if strings.Contains(candidateBody, forbidden) {
+			t.Fatalf("trusted phone marker must not bridge browser generated proof: found %q", forbidden)
+		}
 	}
 	for _, needle := range []string{
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
 		"frameChangedFromBaseline",
-		"trustedPhoneMarkerFrame &&",
-		"browserTrustedGeneratedVisible ||",
+		"phoneGeneratedProofKind === 'inline'",
+		"generatedProof.generatedCodeVisible &&",
+		"!generatedProof.generatedChipVisible",
+		"phoneGeneratedProofKind === 'with_close'",
+		"generatedProof.generatedVisible &&",
+		"generatedProof.generatedChipVisible",
 		"proof.generatedMarkerOnlyRejected = true;",
 	} {
-		if !strings.Contains(candidateBody[changedIndex:rejectIndex], needle) && !strings.Contains(candidateBody[fallbackIndex:rejectIndex], needle) {
-			t.Fatalf("trusted phone changed marker-frame bridge missing guard %q", needle)
+		if !strings.Contains(candidateBody[changedIndex:rejectIndex], needle) && !strings.Contains(candidateBody[markerIndex:rejectIndex], needle) {
+			t.Fatalf("strict generated marker proof missing guard %q", needle)
 		}
 	}
 	for _, needle := range []string{
@@ -248,8 +257,8 @@ func TestTrustedPhoneChangedMarkerFrameCanBridgeGeneratedDetectorDesignDrift(t *
 		"proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold",
 		"proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold",
 	} {
-		if !strings.Contains(candidateBody[changedIndex:bridgeIndex], needle) {
-			t.Fatalf("trusted phone bridge must require a changed pre-request baseline, missing %q", needle)
+		if !strings.Contains(candidateBody[changedIndex:visualIndex], needle) {
+			t.Fatalf("generated proof must require a changed pre-request baseline, missing %q", needle)
 		}
 	}
 	if !strings.Contains(candidateBody, "request.status !== 'succeeded'") {
@@ -793,6 +802,8 @@ let recoveryRuns = 0;
 let keyframeRequests = 0;
 let exhaustedRecoveries = 0;
 let idleResumes = 0;
+let limitRefreshes = 0;
+const ticketCurrentProofVisualState = { resumePending: false };
 let scheduled = [];
 function check(value, message) { if (!value) throw new Error(message); }
 function safeResumeLabel(value, fallback) { return String(value || fallback); }
@@ -805,6 +816,7 @@ function requestServerRecoveryDebounced(reason) { if (String(reason).includes('e
 function connectSpacetimeState() { return Promise.resolve(); }
 function clientLog() {}
 function publishCurrentStreamFocus() {}
+function refreshMemberLimitProjection() { limitRefreshes += 1; }
 function mediaSessionStuckOnPreservedFrame() { return false; }
 function connectDirectVideo() {}
 function requestKeyframeDebounced() { keyframeRequests += 1; return true; }
@@ -861,6 +873,7 @@ handlers.pageshow({ persisted: true, isTrusted: true });
 handlers.focus();
 check(recoveryRuns === 2, 'persisted pageshow then focus must run one recovery');
 check(exhaustedRecoveries === 0, 'persisted restore must not inherit an exhausted hidden budget');
+check(limitRefreshes === 1, 'the visibility resume must refresh the database-backed limits once');
 
 activeResumeFlow = null;
 idleDisconnected = true;
@@ -990,6 +1003,7 @@ let idleDisconnected = false;
 let streamUnsupported = false;
 let fallbackFrameAvailable = true;
 let screenEngaged = false;
+const ticketCurrentProofVisualState = { resumePending: false };
 let activationReconnectBurstTimer = null;
 let activeResumeFlow = null;
 let lastRecoveryVideoReconnectSeq = -1;
@@ -1050,6 +1064,7 @@ function redrawPreservedFrame() {}
 function requestScreenWakeLock() {}
 function keepFirstScreenPinned() {}
 function refreshSpacetimeState() { return Promise.resolve(); }
+function refreshSpacetimeStateAfterResume() { return Promise.resolve(false); }
 function streamHasFreshRenderedFrame() { return false; }
 function finishActivationResumeFlow(reason, flow) { flow.done = true; if (flow === activeResumeFlow) activeResumeFlow = null; }
 function connectSpacetimeState() { return Promise.resolve(); }
@@ -1948,7 +1963,6 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"control_popup_keyboard_frame",
 		"generated_frame_not_visible",
 		"candidate_frame_at_or_after_phone_marker_and_generated_visual",
-		"candidate_frame_at_or_after_trusted_phone_marker_and_changed_visual",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("control-code freeze proof missing %q", needle)
@@ -1979,11 +1993,16 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		"const popupProof = controlCodePopupFrameProof();",
 		"if (popupProof.popupVisible)",
 		"const generatedProof = controlCodeGeneratedFrameProof();",
-		"const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||",
+		"const browserTrustedGeneratedVisible = Boolean(",
 		"const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof",
 		"const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint",
-		"const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&",
-		"const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||",
+		"phoneGeneratedProofKind === 'inline'",
+		"generatedProof.generatedCodeVisible &&",
+		"!generatedProof.generatedChipVisible",
+		"phoneGeneratedProofKind === 'with_close'",
+		"generatedProof.generatedVisible &&",
+		"generatedProof.generatedChipVisible",
+		"const browserTrustedResultVisible = browserTrustedGeneratedVisible;",
 		"if (!browserTrustedResultVisible && trustedPhoneMarkerFrame)",
 		"proof.generatedMarkerOnlyRejected = true;",
 		"if (!proof.browserTrustedResultVisible)",
@@ -2014,8 +2033,8 @@ func TestControlCodeResultCaptureRequiresBrowserFrameProof(t *testing.T) {
 		t.Fatalf("candidate frame must reject marker-only proof before accepting a generated frame")
 	}
 	if strings.Contains(candidateProof, "proof.generatedVisibleByPhoneMarker") ||
-		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
-		t.Fatalf("candidate frame must not accept marker-only phone proof without a changed browser frame")
+		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame") {
+		t.Fatalf("candidate frame must not accept marker-only phone proof")
 	}
 	baselineRejectIndex := strings.Index(candidateProof, "proof.candidateRejectedReason = 'candidate_matches_pre_request_frame';")
 	if baselineRejectIndex < 0 || baselineRejectIndex < generatedIndex {
@@ -2229,27 +2248,32 @@ func TestControlCodeRecoveryQueueReasonsArePublicAndVisible(t *testing.T) {
 	}
 }
 
-func TestControlCodeCaptureTrustsPhoneProofOnlyWithExactMarkerAndChangedBrowserFrame(t *testing.T) {
+func TestControlCodeCaptureRequiresModeSpecificPhoneAndBrowserGeneratedProof(t *testing.T) {
 	source := ticketAppSource(t)
 	candidateProof := substringBetween(t, source,
 		"function controlCodeCandidateFrameProof(request) {",
 		"  function noteControlCodeCandidateRejected(proof) {")
 
 	for _, needle := range []string{
-		"function controlCodeTrustedPhonePostSubmitProof(resultProof) {",
-		"resultProof === 'phone_visual_root_confirmed'",
-		"resultProof === 'phone_visual'",
-		"const trustedPhonePostSubmitProof = controlCodeTrustedPhonePostSubmitProof(proof.resultProof);",
+		"function controlCodePhoneGeneratedProofKind(resultProof) {",
+		"resultProof === 'phone_visual_generated_inline'",
+		"resultProof === 'phone_visual_generated_with_close'",
+		"const phoneGeneratedProofKind = controlCodePhoneGeneratedProofKind(proof.resultProof);",
+		"const trustedPhonePostSubmitProof = Boolean(phoneGeneratedProofKind);",
 		"if (trustedPhonePostSubmitProof) {",
 		"proof.trustedPhonePostSubmitProof = true;",
-		"const browserTrustedGeneratedVisible = generatedProof.generatedVisible ||",
+		"const browserTrustedGeneratedVisible = Boolean(",
 		"trustedPhonePostSubmitProof &&",
-		"generatedProof.generatedChipVisible &&",
+		"phoneGeneratedProofKind === 'inline'",
+		"generatedProof.generatedCodeVisible &&",
+		"!generatedProof.generatedChipVisible",
+		"phoneGeneratedProofKind === 'with_close'",
+		"generatedProof.generatedVisible &&",
+		"generatedProof.generatedChipVisible",
 		"proof.browserTrustedGeneratedVisible = browserTrustedGeneratedVisible;",
 		"const trustedPhoneMarkerFrame = Boolean(trustedPhonePostSubmitProof",
 		"const frameChangedFromBaseline = Boolean(controlCodeBaselineFrameFingerprint",
-		"const trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame &&",
-		"const browserTrustedResultVisible = Boolean(browserTrustedGeneratedVisible ||",
+		"const browserTrustedResultVisible = browserTrustedGeneratedVisible;",
 		"proof.browserTrustedResultVisible = browserTrustedResultVisible;",
 		"renderedEpoch === markerEpoch",
 		"renderedSequence >= markerSequence",
@@ -2264,8 +2288,9 @@ func TestControlCodeCaptureTrustsPhoneProofOnlyWithExactMarkerAndChangedBrowserF
 	}
 	if strings.Contains(candidateProof, "proof.acceptedReason = `candidate_frame_at_or_after_${proof.resultProof}`;") ||
 		strings.Contains(candidateProof, "proof.generatedVisibleByPhoneMarker") ||
+		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame") ||
 		strings.Contains(source, "resultProof === 'phone_visual_raw_ticket_after_submit'") {
-		t.Fatalf("phone post-submit proof must not bypass exact marker or changed browser-frame proof")
+		t.Fatalf("phone post-submit proof must not bypass exact marker and generated browser proof")
 	}
 
 	popupRejectIndex := strings.Index(candidateProof, "if (popupProof.popupVisible)")
@@ -2279,10 +2304,10 @@ func TestControlCodeCaptureTrustsPhoneProofOnlyWithExactMarkerAndChangedBrowserF
 	}
 	if !strings.Contains(candidateProof, "proof.fingerprintDifferenceScore >= controlCodeFingerprintDifferenceThreshold") ||
 		!strings.Contains(candidateProof, "proof.fingerprintChangedCells >= controlCodeFingerprintChangedCellsThreshold") {
-		t.Fatalf("phone post-submit proof may assist only when the browser frame changed from the pre-request baseline")
+		t.Fatalf("generated proof must also require a changed pre-request baseline")
 	}
 	if strings.Contains(candidateProof, "browserTrustedGeneratedVisible = trustedPhonePostSubmitProof") ||
-		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame = Boolean(trustedPhoneMarkerFrame);") {
+		strings.Contains(candidateProof, "trustedPhoneChangedMarkerFrame") {
 		t.Fatalf("phone post-submit proof must not be the sole generated-frame trust signal")
 	}
 }
@@ -3055,6 +3080,36 @@ func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	}
 }
 
+func TestControlCodeCleanupBarrierClearsWhenAuthoritativeRequestDisappears(t *testing.T) {
+	source := ticketAppSource(t)
+	reconcileBody := substringBetween(t, source,
+		"function reconcileControlCodeCleanupBarrier(state) {",
+		"  function renderState() {")
+	renderBody := substringBetween(t, source,
+		"function renderState() {",
+		"  function ticketInteractionPreparingIsStale(")
+
+	for _, required := range []string{
+		"const pendingRequestID = String(controlCodeCleanupPendingRequestID || '').trim();",
+		"const requests = Array.isArray(state && state.controlCodeRequests) ? state.controlCodeRequests : null;",
+		"const authoritativeRequestStillPresent = requests.some((request) =>",
+		"String(request.requestId || '').trim() === pendingRequestID",
+		"controlCodeCleanupPendingRequestID = '';",
+		"clientLog('control_code_cleanup_barrier_cleared', 'authoritative_request_absent');",
+	} {
+		if !strings.Contains(reconcileBody, required) {
+			t.Fatalf("orphaned cleanup barrier reconciliation is missing %q", required)
+		}
+	}
+	if !strings.Contains(renderBody, "reconcileControlCodeCleanupBarrier(state);") {
+		t.Fatal("authoritative control-code snapshots must reconcile a locally orphaned cleanup barrier")
+	}
+	if strings.Contains(reconcileBody, "controlCodeRequestIsStillRelevant(request)") ||
+		strings.Contains(reconcileBody, "locallyClosedControlCodeRequestIDs.has") {
+		t.Fatal("local result dismissal must not clear the cleanup barrier while its authoritative request still exists")
+	}
+}
+
 func TestControlCodeCaptureStartsOnlyAfterGeneratedMarker(t *testing.T) {
 	source := ticketAppSource(t)
 	captureBody := substringBetween(t, source,
@@ -3173,6 +3228,152 @@ func TestTicketViewerResumeRecoveryWaitsForLiveFrameAndReusesFreshSocket(t *test
 	if liveBranch < 0 || finish < liveBranch {
 		t.Fatalf("only a live-labeled frame may finish the activation recovery burst")
 	}
+}
+
+func TestTicketViewerBoundsPresentationLiveGraceWithoutRelaxingProof(t *testing.T) {
+	source := ticketAppSource(t)
+	freshnessBody := substringBetween(t, source,
+		"function clearStreamLiveStaleGrace() {",
+		"  function controlCodeFastStateExpiryMillis(state) {")
+	showEmptyBody := substringBetween(t, source,
+		"function showEmpty(message, showStart) {",
+		"  function showStreamWaiting(message) {")
+	resetBody := substringBetween(t, source,
+		"function resetStreamState(options) {",
+		"  function restartStream(reason, options) {")
+
+	if !strings.Contains(showEmptyBody, "clearStreamLiveStaleGrace();") ||
+		!strings.Contains(resetBody, "clearStreamLiveStaleGrace();") {
+		t.Fatal("hard unavailable and stream-reset paths must cancel the presentation-live grace")
+	}
+	if !strings.Contains(source, "return currentRenderedFreshness(performance.now()).liveLabeled;") {
+		t.Fatal("proof freshness must remain strict and must not consume the presentation-only grace")
+	}
+
+	runTicketJavaScript(t, `
+let monotonic = 1000;
+const performance = { now: () => monotonic };
+const WebSocket = { OPEN: 1, CLOSED: 3 };
+const document = { body: { dataset: { streamLive: 'true', streamReady: 'true' } } };
+let idleDisconnected = false;
+let streamUnsupported = false;
+let foreground = true;
+let videoWs = { readyState: WebSocket.OPEN };
+let latestStreamStatus = {
+  phoneDesired: true,
+  phoneConnected: true,
+  phoneStreamState: 'streaming',
+  activeVideoClients: 1,
+  lastFrameAgoMillis: 2100
+};
+let freshStatus = latestStreamStatus;
+let streamLiveStaleGraceTimer = null;
+const streamLiveStaleGraceMs = 500;
+let timerID = 0;
+const timers = new Map();
+function setTimeout(callback, delay) {
+  const id = ++timerID;
+  timers.set(id, { callback, delay });
+  return id;
+}
+function clearTimeout(id) { timers.delete(id); }
+function viewerIsForeground() { return foreground; }
+function freshStreamStatus() { return freshStatus; }
+function backendLooksRecoverable(status) {
+  if (!status || status.phoneDesired === false) return false;
+  if (status.phoneConnected === false) return true;
+  const state = String(status.phoneStreamState || '');
+  return state !== '' && state !== 'streaming';
+}
+function streamStatusStale(status) {
+  return Boolean(status && status.activeVideoClients > 0 && Number(status.lastFrameAgoMillis) > 2500);
+}
+let freshness = { hasFrame: true, liveLabeled: false, streamFreshnessState: 'STALE' };
+function currentRenderedFreshness() { return freshness; }
+let spinnerShows = 0;
+let spinnerHides = 0;
+function showStreamResumeSpinner() { spinnerShows += 1; }
+function hideStreamResumeSpinner() { spinnerHides += 1; }
+function updateControlCodeSubmitAvailability() {}
+let activeResumeFlow = null;
+function finishActivationResumeFlow() {}
+let hasRenderedFrame = true;
+function check(value, message) { if (!value) throw new Error(message); }
+`+freshnessBody+`
+
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamFreshness === 'STALE', 'stale label must be immediate');
+check(document.body.dataset.streamLive === 'true', 'one healthy connected transition may retain presentation-live');
+check(document.body.dataset.streamReady === 'true', 'freshness updates must not change stream readiness');
+check(spinnerShows === 1, 'the recovery spinner must appear immediately during the grace');
+check(timers.size === 1, 'the grace must have one bounded expiry');
+const expiry = [...timers.values()][0];
+check(expiry.delay === 500, 'the presentation-live grace must remain narrowly bounded');
+timers.clear();
+expiry.callback();
+check(document.body.dataset.streamLive === 'false', 'an unchanged stale frame must become unavailable at expiry');
+check(streamLiveStaleGraceTimer === null && timers.size === 0, 'expiry must not re-arm its own grace');
+
+freshness = { hasFrame: true, liveLabeled: true, streamFreshnessState: 'LIVE_OK' };
+updateStreamFreshnessStatus('frame_rendered');
+check(document.body.dataset.streamLive === 'true', 'a fresh frame must restore presentation-live');
+check(spinnerHides === 1, 'a fresh frame must hide recovery feedback');
+
+freshness = { hasFrame: true, liveLabeled: false, streamFreshnessState: 'STALE' };
+latestStreamStatus.phoneConnected = false;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a disconnected phone must bypass the grace immediately');
+
+latestStreamStatus.phoneConnected = true;
+document.body.dataset.streamLive = 'true';
+latestStreamStatus.phoneDesired = false;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'an intentionally stopped phone stream must bypass the grace immediately');
+
+latestStreamStatus.phoneDesired = true;
+document.body.dataset.streamLive = 'true';
+freshStatus = null;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a missing fresh relay status must bypass the grace immediately');
+
+freshStatus = latestStreamStatus;
+document.body.dataset.streamLive = 'true';
+latestStreamStatus.phoneStreamState = 'preparing_phone';
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a non-streaming phone state must bypass the grace immediately');
+
+latestStreamStatus.phoneStreamState = 'streaming';
+document.body.dataset.streamLive = 'true';
+latestStreamStatus.activeVideoClients = 0;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'an inactive relay must bypass the grace immediately');
+
+latestStreamStatus.activeVideoClients = 1;
+document.body.dataset.streamLive = 'true';
+foreground = false;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a hidden or unfocused viewer must bypass the grace immediately');
+
+foreground = true;
+document.body.dataset.streamLive = 'true';
+videoWs.readyState = WebSocket.CLOSED;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a closed video socket must bypass the grace immediately');
+
+videoWs.readyState = WebSocket.OPEN;
+document.body.dataset.streamLive = 'true';
+latestStreamStatus.lastFrameAgoMillis = 2600;
+updateStreamFreshnessStatus('stream_status');
+check(document.body.dataset.streamLive === 'false' && timers.size === 0,
+  'a server-confirmed stale stream must bypass the grace immediately');
+`)
 }
 
 func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {

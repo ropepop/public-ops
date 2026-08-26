@@ -2,6 +2,7 @@ const ACTIVATION_TARGETS = new Set(['open_latest_and_register', 'register_curren
 const REGISTRATION_PROOF_TARGETS = new Set([
   'open_latest_unactivated',
   'return_to_latest_unactivated',
+  'redetect_latest',
   'prove_current'
 ]);
 
@@ -77,6 +78,124 @@ export function shouldSubmitTicketSliderCompletion(pointer, phase, progress) {
   if (!pointer || pointer.submitted || phase !== 'up' || pointer.qualified !== true || Number(progress) < 9500) return false;
   pointer.submitted = true;
   return true;
+}
+
+export function ticketLocalRegisterSliderProofSnapshot(
+  action,
+  region,
+  stream,
+  layoutRevision = 0,
+  visualRevision = 0,
+  now = Date.now()
+) {
+  const currentRegion = ticketSliderRegionV3ForAction(action, region, stream, now);
+  if (!currentRegion) return null;
+  return {
+    proofActionId: String(currentRegion.proofActionId || ''),
+    streamEpoch: Number(currentRegion.streamEpoch || 0),
+    frameSequence: Number(currentRegion.frameSequence || 0),
+    expiresAt: String(currentRegion.expiresAt || ''),
+    leftBasisPoints: Number(currentRegion.leftBasisPoints),
+    topBasisPoints: Number(currentRegion.topBasisPoints),
+    rightBasisPoints: Number(currentRegion.rightBasisPoints),
+    bottomBasisPoints: Number(currentRegion.bottomBasisPoints),
+    layoutRevision: Math.max(0, Math.trunc(Number(layoutRevision) || 0)),
+    visualRevision: Math.max(0, Math.trunc(Number(visualRevision) || 0))
+  };
+}
+
+export function ticketLocalRegisterSliderProofMatches(
+  snapshot,
+  action,
+  region,
+  stream,
+  layoutRevision = 0,
+  visualRevision = 0,
+  now = Date.now()
+) {
+  if (!snapshot) return false;
+  const current = ticketLocalRegisterSliderProofSnapshot(
+    action,
+    region,
+    stream,
+    layoutRevision,
+    visualRevision,
+    now
+  );
+  if (!current) return false;
+  return [
+    'proofActionId',
+    'streamEpoch',
+    'frameSequence',
+    'expiresAt',
+    'leftBasisPoints',
+    'topBasisPoints',
+    'rightBasisPoints',
+    'bottomBasisPoints',
+    'layoutRevision',
+    'visualRevision'
+  ].every((field) => current[field] === snapshot[field]);
+}
+
+export function beginTicketLocalRegisterSliderSession(state, input) {
+  if (!state || state.inFlight || state.session) return false;
+  const snapshot = input && input.snapshot;
+  if (!snapshot || !String(snapshot.proofActionId || '').trim()) return false;
+  const kind = String(input && input.kind || 'pointer');
+  const pointerId = kind === 'pointer' ? Number(input && input.pointerId) : null;
+  if (kind === 'pointer' && !Number.isFinite(pointerId)) return false;
+  state.session = {
+    kind,
+    pointerId,
+    snapshot,
+    qualified: true,
+    submitted: false
+  };
+  return true;
+}
+
+export function cancelTicketLocalRegisterSliderSession(state, pointerId = null) {
+  if (!state || !state.session || state.inFlight) return false;
+  if (pointerId != null && state.session.kind === 'pointer' && Number(pointerId) !== state.session.pointerId) return false;
+  state.session = null;
+  return true;
+}
+
+export function completeTicketLocalRegisterSliderSession(state, input) {
+  if (!state || !state.session || state.inFlight) return null;
+  const session = state.session;
+  if (session.kind === 'pointer' && Number(input && input.pointerId) !== session.pointerId) return null;
+  if (input && input.proofMatches !== true) {
+    state.session = null;
+    return null;
+  }
+  const completed = shouldSubmitTicketSliderCompletion(
+    session,
+    'up',
+    Math.max(0, Math.min(10000, Math.round(Number(input && input.progress || 0) * 100)))
+  );
+  state.session = null;
+  return completed ? session.snapshot : null;
+}
+
+export function resetTicketLocalRegisterSliderState(state) {
+  if (!state) return false;
+  const changed = Boolean(state.inFlight || state.session || state.actionId || state.latchedProof);
+  state.inFlight = false;
+  state.session = null;
+  state.actionId = '';
+  state.latchedProof = null;
+  return changed;
+}
+
+export function releaseTicketLocalRegisterSliderOnTerminal(state, actions) {
+  if (!state || !state.inFlight || !String(state.actionId || '').trim()) return null;
+  const exact = (Array.isArray(actions) ? actions : []).find((action) =>
+    String(action && action.actionId || '').trim() === String(state.actionId || '').trim()
+  );
+  if (!exact || !['succeeded', 'failed', 'needs_attention'].includes(String(exact.status || ''))) return null;
+  resetTicketLocalRegisterSliderState(state);
+  return exact;
 }
 
 export function ticketActionV3OccupiesPhone(action) {
@@ -177,6 +296,19 @@ export function observeTicketActionV3LocalRequest(state, action) {
   return finishTicketActionV3LocalRequestIfReady(state);
 }
 
+export function ticketActionV3SmartSwitchAction(actions, now = Date.now()) {
+  const currentMillis = Number(now);
+  if (!Number.isFinite(currentMillis)) return null;
+  return ticketActionV3ActionsByAuthority(actions).find((action) => {
+    if (!action || action.switchAvailable !== true ||
+      String(action.status || '') !== 'succeeded' || String(action.phase || '') !== 'complete'
+    ) return false;
+    if (!['latest_unactivated', 'recent_activated'].includes(String(action.currentView || ''))) return false;
+    const expiresAt = Date.parse(String(action.switchExpiresAt || ''));
+    return Number.isFinite(expiresAt) && expiresAt > currentMillis;
+  }) || null;
+}
+
 export function ticketActionV3SmartSwitchForView(currentView) {
   if (String(currentView || '') === 'latest_unactivated') {
     return {
@@ -215,22 +347,79 @@ export function ticketMemberLimitCountdown(targetAt, now = Date.now()) {
   return seconds ? `pēc ${minutes} min ${seconds} s` : `pēc ${minutes} min`;
 }
 
+function ticketMemberLimitProjectionOrder(limits) {
+  const updatedAtText = String(limits && limits.updatedAt || '').trim();
+  const serverAtText = String(limits && limits.serverAt || '').trim();
+  const updatedAt = Date.parse(updatedAtText);
+  const serverAt = Date.parse(serverAtText);
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(serverAt)) return null;
+  return { updatedAtText, serverAtText, updatedAt, serverAt };
+}
+
+function compareTicketMemberLimitProjectionOrder(left, right) {
+  if (left.updatedAt !== right.updatedAt) return left.updatedAt - right.updatedAt;
+  const updatedTextOrder = left.updatedAtText.localeCompare(right.updatedAtText);
+  if (updatedTextOrder) return updatedTextOrder;
+  if (left.serverAt !== right.serverAt) return left.serverAt - right.serverAt;
+  return left.serverAtText.localeCompare(right.serverAtText);
+}
+
+export function ticketMemberLimitClockNow(clock, monotonicNow) {
+  if (!clock) return Number.NaN;
+  const now = Number(monotonicNow);
+  const anchoredAt = Number(clock.monotonicAt);
+  const serverAt = Number(clock.serverAt);
+  if (![now, anchoredAt, serverAt].every(Number.isFinite)) return Number.NaN;
+  return serverAt + Math.max(0, now - anchoredAt);
+}
+
+export function updateTicketMemberLimitClock(clock, limits, monotonicNow) {
+  const projection = ticketMemberLimitProjectionOrder(limits);
+  const now = Number(monotonicNow);
+  if (!projection || !Number.isFinite(now)) return clock || null;
+  if (clock && compareTicketMemberLimitProjectionOrder(projection, clock.projection) <= 0) {
+    return clock;
+  }
+  const previousNow = ticketMemberLimitClockNow(clock, now);
+  return {
+    projection,
+    monotonicAt: now,
+    serverAt: Number.isFinite(previousNow)
+      ? Math.max(previousNow, projection.serverAt)
+      : projection.serverAt
+  };
+}
+
 export async function handleTicketLocalRegisterSliderChange({
   slider,
   state,
+  actionId,
+  proofSnapshot,
   submitRegisterCurrent,
   render
 }) {
-  if (!slider || !state || state.inFlight || Number(slider.value || 0) < 100) return false;
+  const stableActionId = String(actionId || '').trim();
+  if (!slider || !state || state.inFlight || !stableActionId || !proofSnapshot || Number(slider.value || 0) < 95) return false;
   state.inFlight = true;
+  state.actionId = stableActionId;
+  state.latchedProof = proofSnapshot;
   slider.disabled = true;
+  slider.value = '100';
+  if (typeof render === 'function') render();
   try {
-    await submitRegisterCurrent('browser_slider');
-    return true;
-  } finally {
+    const accepted = await submitRegisterCurrent('browser_slider', stableActionId, proofSnapshot);
+    if (accepted === true) return true;
+    resetTicketLocalRegisterSliderState(state);
     slider.value = '0';
-    state.inFlight = false;
+    slider.disabled = false;
     if (typeof render === 'function') render();
+    return false;
+  } catch (error) {
+    resetTicketLocalRegisterSliderState(state);
+    slider.value = '0';
+    slider.disabled = false;
+    if (typeof render === 'function') render();
+    throw error;
   }
 }
 
@@ -289,6 +478,36 @@ export function ticketCurrentProofFingerprintChanged(previous, current, threshol
   return changed >= Math.max(4, Math.ceil(current.length * 0.18));
 }
 
+export function rebaseTicketCurrentProofDetectorFromAction(state, input) {
+  if (!state || !input) return false;
+  const action = input.action;
+  const stream = input.stream;
+  const sample = input.sample;
+  const currentRegion = ticketSliderRegionV3ForAction(
+    action,
+    input.region,
+    stream,
+    input.now == null ? Date.now() : input.now
+  );
+  const actionId = String(action && action.actionId || '').trim();
+  if (!currentRegion || String(action && action.phase || '') !== 'complete' ||
+    !actionId || actionId === String(state.rebasedActionId || '').trim() ||
+    !sample || !Array.isArray(sample.values) || sample.values.length === 0
+  ) return false;
+  const proofEpoch = Number(currentRegion.streamEpoch || 0);
+  const proofSequence = Number(currentRegion.frameSequence || 0);
+  const sampleEpoch = Number(sample.epoch || 0);
+  const sampleSequence = Number(sample.sequence || 0);
+  if (!(proofEpoch > 0) || sampleEpoch !== proofEpoch || sampleSequence < proofSequence) return false;
+  state.rebasedActionId = actionId;
+  state.fingerprint = sample;
+  state.candidateFingerprint = null;
+  state.stableChangeCount = 0;
+  state.changePending = false;
+  state.resumePending = false;
+  return true;
+}
+
 export function isTicketActionV3CurrentProofFresh(action, stream, now = Date.now()) {
   if (!action || String(action.target || '') !== 'prove_current' ||
     !['succeeded', 'failed', 'needs_attention'].includes(String(action.status || '')) ||
@@ -312,6 +531,7 @@ export function ticketCurrentProofRequestNeeded({
   requestedEpoch = 0,
   stableChangeCount = 0,
   resumed = false,
+  renewBeforeMs = 0,
   recoveryRequired = false,
   unknownAwaitingChange = false
 }) {
@@ -320,9 +540,13 @@ export function ticketCurrentProofRequestNeeded({
   if (ticketActionV3OccupiesPhone(action)) return false;
   if (stableChangeCount >= 2) return true;
   if (unknownAwaitingChange === true) return false;
-  if (isTicketActionV3CurrentProofFresh(action, stream, now)) return false;
   const freshRegion = ticketSliderRegionV3ForAction(action, region, stream, now);
-  if (freshRegion) return false;
+  if (freshRegion) {
+    const expiresAt = Date.parse(String(freshRegion.expiresAt || ''));
+    const renewalWindow = Math.max(0, Number(renewBeforeMs) || 0);
+    return renewalWindow > 0 && Number.isFinite(expiresAt) && expiresAt - Number(now) <= renewalWindow;
+  }
+  if (isTicketActionV3CurrentProofFresh(action, stream, now)) return false;
   const priorUnknownInThisEpoch = action && String(action.target || '') === 'prove_current' &&
     ['succeeded', 'failed', 'needs_attention'].includes(String(action.status || '')) &&
     String(action.currentView || '') === 'unknown' &&

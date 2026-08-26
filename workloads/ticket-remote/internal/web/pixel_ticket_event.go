@@ -54,6 +54,7 @@ func controlCodePhasesFromMessage(raw any) map[string]int64 {
 func cleanControlCodeResultProof(value string) string {
 	switch strings.TrimSpace(value) {
 	case "phone_root", "phone_visual", "phone_visual_root_confirmed",
+		"phone_visual_generated_inline", "phone_visual_generated_with_close",
 		"phone_visual_raw_ticket_after_submit", "phone_root_image", "browser_frame":
 		return strings.TrimSpace(value)
 	default:

@@ -104,6 +104,7 @@ pub mod ticketremote_update_phone_current_report_reducer;
 pub mod ticketremote_update_phone_reducer;
 pub mod ticketremote_update_relay_current_report_reducer;
 pub mod ticketremote_update_ticket_action_v_3_reducer;
+pub mod ticketremote_update_ticket_action_v_3_with_slider_region_reducer;
 pub mod ticketremote_update_ticket_interaction_reducer;
 pub mod ticketremote_update_ticket_slider_region_v_3_reducer;
 pub mod ticketremote_upsert_member_reducer;
@@ -206,6 +207,7 @@ pub use ticketremote_update_phone_current_report_reducer::ticketremote_update_ph
 pub use ticketremote_update_phone_reducer::ticketremote_update_phone;
 pub use ticketremote_update_relay_current_report_reducer::ticketremote_update_relay_current_report;
 pub use ticketremote_update_ticket_action_v_3_reducer::ticketremote_update_ticket_action_v_3;
+pub use ticketremote_update_ticket_action_v_3_with_slider_region_reducer::ticketremote_update_ticket_action_v_3_with_slider_region;
 pub use ticketremote_update_ticket_interaction_reducer::ticketremote_update_ticket_interaction;
 pub use ticketremote_update_ticket_slider_region_v_3_reducer::ticketremote_update_ticket_slider_region_v_3;
 pub use ticketremote_upsert_member_reducer::ticketremote_upsert_member;
@@ -558,6 +560,25 @@ pub enum Reducer {
         completed_at: String,
         now_arg: String,
     },
+    TicketremoteUpdateTicketActionV3WithSliderRegion {
+        ticket_id: String,
+        backend_id: String,
+        action_id: String,
+        target: String,
+        status: String,
+        phase: String,
+        current_view: String,
+        stream_epoch: String,
+        frame_sequence: String,
+        reason: String,
+        completed_at: String,
+        has_slider_region: bool,
+        left_basis_points: u32,
+        top_basis_points: u32,
+        right_basis_points: u32,
+        bottom_basis_points: u32,
+        now_arg: String,
+    },
     TicketremoteUpdateTicketInteraction {
         ticket_id: String,
         backend_id: String,
@@ -719,6 +740,9 @@ impl __sdk::Reducer for Reducer {
             }
             Reducer::TicketremoteUpdateTicketActionV3 { .. } => {
                 "ticketremote_update_ticket_action_v3"
+            }
+            Reducer::TicketremoteUpdateTicketActionV3WithSliderRegion { .. } => {
+                "ticketremote_update_ticket_action_v3_with_slider_region"
             }
             Reducer::TicketremoteUpdateTicketInteraction { .. } => {
                 "ticketremote_update_ticket_interaction"
@@ -1369,6 +1393,43 @@ impl __sdk::Reducer for Reducer {
                 frame_sequence: frame_sequence.clone(),
                 reason: reason.clone(),
                 completed_at: completed_at.clone(),
+                now_arg: now_arg.clone(),
+}),
+            Reducer::TicketremoteUpdateTicketActionV3WithSliderRegion{
+                ticket_id,
+                backend_id,
+                action_id,
+                target,
+                status,
+                phase,
+                current_view,
+                stream_epoch,
+                frame_sequence,
+                reason,
+                completed_at,
+                has_slider_region,
+                left_basis_points,
+                top_basis_points,
+                right_basis_points,
+                bottom_basis_points,
+                now_arg,
+}             => __sats::bsatn::to_vec(&ticketremote_update_ticket_action_v_3_with_slider_region_reducer::TicketremoteUpdateTicketActionV3WithSliderRegionArgs {
+                ticket_id: ticket_id.clone(),
+                backend_id: backend_id.clone(),
+                action_id: action_id.clone(),
+                target: target.clone(),
+                status: status.clone(),
+                phase: phase.clone(),
+                current_view: current_view.clone(),
+                stream_epoch: stream_epoch.clone(),
+                frame_sequence: frame_sequence.clone(),
+                reason: reason.clone(),
+                completed_at: completed_at.clone(),
+                has_slider_region: has_slider_region.clone(),
+                left_basis_points: left_basis_points.clone(),
+                top_basis_points: top_basis_points.clone(),
+                right_basis_points: right_basis_points.clone(),
+                bottom_basis_points: bottom_basis_points.clone(),
                 now_arg: now_arg.clone(),
 }),
             Reducer::TicketremoteUpdateTicketInteraction{

@@ -10,6 +10,17 @@ import (
 	"ticketremote/internal/phone"
 )
 
+func TestCleanControlCodeResultProofAcceptsGeneratedVisualModes(t *testing.T) {
+	for _, proof := range []string{"phone_visual_generated_inline", "phone_visual_generated_with_close"} {
+		if got := cleanControlCodeResultProof(proof); got != proof {
+			t.Fatalf("generated proof %q was rejected as %q", proof, got)
+		}
+	}
+	if got := cleanControlCodeResultProof("phone_visual_same_detail"); got != "" {
+		t.Fatalf("unsafe generated proof unexpectedly accepted: %q", got)
+	}
+}
+
 func TestPixelTicketStateEventUpdatesHealthAndRejectsStaleEvents(t *testing.T) {
 	store := newTicketMemoryStore(t, "http://phone.test")
 	server := newTicketWebServer(t, store, phone.NewRelay(phone.RelayConfig{BaseURL: "http://phone.test"}), "http://phone.test")

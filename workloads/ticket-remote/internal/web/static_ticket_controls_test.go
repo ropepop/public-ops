@@ -38,9 +38,9 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 	}
 	ordered := []string{
 		`>Pieprasīt kontroles kodu<`,
-		`>Atvērt jaunāko nereģistrēto biļeti<`,
-		`>Atvērt jaunāko biļeti un reģistrēt<`,
 		`>Reģistrēt atvērto biļeti<`,
+		`>Atvērt jaunāko biļeti un reģistrēt<`,
+		`>Atvērt jaunāko nereģistrēto biļeti<`,
 		`>Skatīt pēdējo reģistrēto biļeti<`,
 		`re-register immediately after inspection, for convenience of other users`,
 		`id="ticketLimitPanel"`,
@@ -55,10 +55,72 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 		}
 		last = index
 	}
-	for _, id := range []string{`id="activateTicket"`, `id="requestTicketResetAndActivate"`} {
+	for _, id := range []string{`id="activateTicket"`, `id="requestTicketResetAndActivate"`, `id="requestTicketReset"`} {
 		button := strings.Index(page, id)
 		if button < 0 || !strings.Contains(page[button:], `disabled`) {
 			t.Fatalf("activation action %q must start disabled", id)
+		}
+	}
+}
+
+func TestTicketPanelControlsAreVisibleAsSoonAsThePanelIsReached(t *testing.T) {
+	page := ticketIndexTemplate(t)
+	source := ticketAppSource(t)
+	for _, required := range []string{
+		`<aside id="panel" class="panel" aria-label="Biļetes darbības" aria-hidden="false">`,
+		`body:not(.details-visible) .panel > *`,
+		`visibility: visible`,
+		`pointer-events: auto`,
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("naturally reached Ticket controls must be visible, missing %q", required)
+		}
+	}
+	reveal := substringBetween(t, source,
+		"function updateDetailsReveal() {",
+		"  function keepFirstScreenPinned(force) {")
+	if !strings.Contains(reveal, "panel.setAttribute('aria-hidden', 'false')") ||
+		strings.Contains(reveal, "revealed ? 'false' : 'true'") {
+		t.Fatal("the 82-percent stream presentation threshold must not hide or disable the lower controls")
+	}
+}
+
+func TestHealthyVisibilityResumePreservesTheLiveSpacetimeSubscription(t *testing.T) {
+	source := ticketAppSource(t)
+	resume := substringBetween(t, source,
+		"function refreshSpacetimeStateAfterResume(reason) {",
+		"  async function runSpacetimeMutation(action, reason) {")
+	runTicketJavaScript(t, `
+let spacetimeClient = {};
+let spacetimeStateFresh = true;
+let spacetimeClientStatus = 'live';
+let renders = 0;
+let reconnects = 0;
+function renderState() { renders += 1; }
+function clientLog() {}
+function refreshSpacetimeState() { reconnects += 1; return Promise.resolve(); }
+`+resume+`
+(async () => {
+  await refreshSpacetimeStateAfterResume('healthy_resume');
+  if (renders !== 1 || reconnects !== 0) throw new Error('healthy resume rebuilt the subscription');
+  spacetimeClientStatus = 'offline';
+  await refreshSpacetimeStateAfterResume('offline_resume');
+  if (reconnects !== 1) throw new Error('offline resume did not recover the subscription');
+})().catch((error) => { console.error(error); process.exit(1); });
+`)
+}
+
+func TestExplicitTicketActionsCanSupersedeBackgroundVisualProof(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, required := range []string{
+		"const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy()",
+		"const blockingBusy = busy && !backgroundProofBusy;",
+		"spacetimeStateFresh && !blockingBusy && !controlBusy",
+		"ticketActionV3Busy(currentAction) && !backgroundProofBusy",
+		"Pašreizējais skats tiek pārbaudīts fonā; atvēršanas darbības ir pieejamas.",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("explicit Ticket actions must remain available while read-only proof is supersedable, missing %q", required)
 		}
 	}
 }
@@ -77,7 +139,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"statusView === 'recent_activated'",
 		"Atvērtā biļete ir veiksmīgi reģistrēta un vizuāli apstiprināta.",
 		"(panel && panel.contains(target))",
-		"renderTicketRegisterOverlay(state, busy, controlBusy, registerReady && Boolean(region))",
+		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy, registerReady && Boolean(region))",
 		"ticketSliderRegionV3ForAction(",
 		"ticketSliderRegionV3Layout(",
 	} {
@@ -99,7 +161,8 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 	}
 	core := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.mjs")
 	if !strings.Contains(source, "handleTicketLocalRegisterSliderChange({") ||
-		!strings.Contains(core, "state.inFlight = true") || !strings.Contains(core, "submitRegisterCurrent('browser_slider')") {
+		!strings.Contains(core, "state.inFlight = true") ||
+		!strings.Contains(core, "submitRegisterCurrent('browser_slider', stableActionId, proofSnapshot)") {
 		t.Fatal("slider completion must latch and dispatch through the single register_current path")
 	}
 	client, err := os.ReadFile("static/spacetime-client.js")
@@ -147,14 +210,25 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 	source := ticketAppSource(t)
 	panelSlider := substringBetween(t, source,
-		"ticketLocalRegisterSlider.addEventListener('change'",
+		"async function submitCompletedTicketRegisterSlider(proofSnapshot)",
 		"  ticketViewSwitchButton.addEventListener('click'")
 	for _, required := range []string{
 		"handleTicketLocalRegisterSliderChange({",
 		"slider: ticketLocalRegisterSlider",
 		"state: ticketLocalRegisterSliderState",
-		"submitRegisterCurrent: (source) => registerCurrentTicket(source)",
+		"submitRegisterCurrent: (source, exactActionId, exactProof) => registerCurrentTicket(source, {",
+		"ticketLocalRegisterSlider.addEventListener('pointerdown'",
+		"ticketLocalRegisterSlider.addEventListener('pointerup'",
 		"ticketLocalRegisterSlider.addEventListener('pointercancel'",
+		"ticketLocalRegisterSlider.addEventListener('lostpointercapture'",
+		"ticketLocalRegisterSlider.addEventListener('keydown'",
+		"ticketLocalRegisterSlider.addEventListener('keyup'",
+		"ticketLocalRegisterSlider.addEventListener('change'",
+		"ticketLocalRegisterSlider.addEventListener('blur'",
+		"window.addEventListener('blur'",
+		"Number(ticketLocalRegisterSlider.value || 0) < 95",
+		"Slīdņa apstiprinājums vairs nav svaigs.",
+		"clientLog('ticket_slider_cancelled', 'change_session_unavailable')",
 	} {
 		if !strings.Contains(panelSlider, required) {
 			t.Fatalf("panel slider must use the direct single-submit handler, missing %q", required)
@@ -165,7 +239,9 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"function renderTicketActionV3Controls(state = currentState) {",
 		"  async function requestTicketActionV3(")
 	for _, required := range []string{
-		"const smartSwitch = ticketActionV3SmartSwitchForView(currentView)",
+		"const switchAction = ticketActionV3SmartSwitchAction(",
+		"Date.now() + serverClockSkewMs",
+		"const smartSwitch = ticketActionV3SmartSwitchForView(switchCurrentView)",
 		"ticketViewSwitchButton.textContent = smartSwitch.label",
 		"ticketViewSwitchButton.dataset.target = smartSwitch.target",
 	} {
@@ -178,10 +254,15 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 	coreTest := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.test.mjs")
 	for _, required := range []string{
 		"export async function handleTicketLocalRegisterSliderChange",
-		"submitRegisterCurrent('browser_slider')",
+		"submitRegisterCurrent('browser_slider', stableActionId, proofSnapshot)",
+		"slider completion rejects 94%, accepts 95%",
+		"pointer and keyboard completion share one 95% exactly-once gate",
+		"a false reducer outcome is not submitted",
+		"accepted slider stays at 100 until its exact durable action is terminal",
+		"export function ticketActionV3SmartSwitchAction",
 		"export function ticketActionV3SmartSwitchForView",
-		"#ticketLocalRegisterSlider change-to-100 submits register_current exactly once",
 		"smart switch labels map to their exact reducer targets",
+		"newest automatic activated proof does not hide the database-authorized Return switch",
 	} {
 		if !strings.Contains(core+coreTest, required) {
 			t.Fatalf("direct browser-control test contract missing %q", required)
@@ -246,7 +327,7 @@ func TestTicketActionV3KeepsTheExactLocalLatchUntilItsAuthoritativeRowArrives(t 
 	source := ticketAppSource(t)
 	request := substringBetween(t, source,
 		"async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {",
-		"  async function registerCurrentTicket(source) {")
+		"  async function registerCurrentTicket(source, options = {}) {")
 	renderState := substringBetween(t, source,
 		"function renderState() {",
 		"  function ticketInteractionPreparingIsStale(interaction, now) {")
@@ -319,7 +400,7 @@ func TestTicketButtonActivationUsesSingleDurableReducerCalls(t *testing.T) {
 		"requestTicketResetAndActivateButton.addEventListener('click', () => requestTicketActionV3(",
 		"'open_latest_and_register', 'browser_button'",
 		"activateTicketButton.addEventListener('click', () => registerCurrentTicket('browser_button'))",
-		"return requestTicketActionV3('register_current', source",
+		"return requestTicketActionV3(",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("v3 ticket button flow missing %q", required)
@@ -428,7 +509,11 @@ func TestTicketActivationPolicyIsEnabledOnlyBySpacetimeProjection(t *testing.T) 
 			t.Fatalf("browser registration gate must not infer authority from its own clock, found %q", forbidden)
 		}
 	}
-	if !strings.Contains(source, "requestTicketActionV3('register_current'") {
+	registration := substringBetween(t, source,
+		"async function registerCurrentTicket(source, options = {}) {",
+		"  function selectServerClockSample(state) {")
+	if !strings.Contains(registration, "return requestTicketActionV3(") ||
+		!strings.Contains(registration, "'register_current'") {
 		t.Fatal("browser activation must use the single durable V3 action reducer")
 	}
 }
@@ -473,8 +558,10 @@ func TestTicketLimitCountdownTimerIsPresentationOnly(t *testing.T) {
 	for _, required := range []string{
 		"clearTimeout(ticketLimitPresentationTimer)",
 		"ticketLimitPresentationTimer = null;",
+		"updateTicketMemberLimitClock(",
+		"ticketMemberLimitClockNow(ticketMemberLimitClock, performance.now())",
 		"ticketMemberLimitCountdown(",
-		"Math.min(1000, Math.max(100, nearest - now))",
+		"}, 1000);",
 		"renderMemberLimits(currentState);",
 	} {
 		if !strings.Contains(body, required) {
@@ -484,6 +571,19 @@ func TestTicketLimitCountdownTimerIsPresentationOnly(t *testing.T) {
 	for _, forbidden := range []string{"renderTicketActionV3Controls", ".disabled =", "registrationAllowed = true", "registrationAllowed: true"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("countdown presentation must never grant eligibility, found %q", forbidden)
+		}
+	}
+}
+
+func TestTicketLimitProjectionRefreshesFromSpacetimeOnVisibleResume(t *testing.T) {
+	source := ticketAppSource(t)
+	for _, required := range []string{
+		"function refreshMemberLimitProjection(reason)",
+		"client.refreshLimitState()",
+		"refreshMemberLimitProjection('visibility_resume_limit_refresh')",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("member limit resume refresh missing %q", required)
 		}
 	}
 }
@@ -499,15 +599,28 @@ func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
 		"controlCodeHotspot.style.pointerEvents = ''",
 		"controlCodeHotspot.style.pointerEvents = 'none'",
 		"function observeTicketCurrentProofFrame()",
-		"ticketCurrentProofStableChangeCount >= 2",
-		"ticketCurrentProofChangePending = true",
+		"ticketCurrentProofVisualState.stableChangeCount >= 2",
+		"ticketCurrentProofVisualState.changePending = true",
 		"'prove_current'",
 		"'browser_auto_proof'",
-		"ticketCurrentProofResumePending = true",
+		"ticketCurrentProofVisualState.resumePending = true",
 		"const proofScope = `${String(cfg.backendId || 'pixel')}:${Number(stream.epoch || 0)}`",
 		"requestedEpoch: ticketCurrentProofRequestedScope === proofScope ? Number(stream.epoch || 0) : 0",
 		"ticketCurrentProofRequestedScope = proofScope",
+		"renewBeforeMs: ticketCurrentProofRenewBeforeMs",
+		"slider_region_renewal",
+		"currentTicketRegisterSliderProof(state = currentState)",
+		"ticketRegisterSliderProofStillMatches(snapshot, state = currentState)",
+		"cancelTicketRegisterSliderSession('viewport_changed')",
+		"cancelTicketRegisterSliderSession('stream_reset')",
+		"ticketLocalRegisterSlider.addEventListener('lostpointercapture'",
+		"ticketLocalRegisterSlider.addEventListener('blur'",
+		"window.addEventListener('blur'",
+		"ticketRegisterOverlay.dataset.registrationState = 'registering'",
+		"releaseTicketLocalRegisterSliderOnTerminal(",
+		"row >= 1 && row <= 5 && column >= 2 && column <= 5",
 		"backendId: cfg.backendId || 'pixel'",
+		"rebaseTicketCurrentProofDetectorFromAction(",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("visual proof/over-stream slider contract missing %q", required)
@@ -522,9 +635,49 @@ func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
 		"expiresAt <= Number(now)",
 		"two agreeing significant frame changes override a still-fresh proof",
 		"the same retained frame-change trigger is admitted once the phone is idle",
+		"slider session binds exact proof, stream epoch, frame, region, viewport, and visual revisions",
+		"pointer capture loss, blur, and incomplete release cancel without submission",
 	} {
 		if !strings.Contains(core+coreTest, required) {
 			t.Fatalf("exact auto-proof test contract missing %q", required)
+		}
+	}
+}
+
+func TestTicketSliderCancelsImmediatelyOnConfirmedVisualChange(t *testing.T) {
+	source := ticketAppSource(t)
+	observe := substringBetween(t, source,
+		"function observeTicketCurrentProofFrame() {",
+		"  async function maybeRequestTicketCurrentProof(reason) {")
+	for _, required := range []string{
+		"ticketCurrentProofVisualState.stableChangeCount >= 2",
+		"ticketSliderVisualRevision += 1",
+		"cancelTicketRegisterSliderSession('visual_view_changed')",
+		"maybeRequestTicketCurrentProof('frame_observed')",
+	} {
+		if !strings.Contains(observe, required) {
+			t.Fatalf("confirmed visual-change slider fence missing %q", required)
+		}
+	}
+	if strings.Index(observe, "cancelTicketRegisterSliderSession('visual_view_changed')") >
+		strings.Index(observe, "maybeRequestTicketCurrentProof('frame_observed')") {
+		t.Fatal("the active slider must cancel before any cooldown-delayed proof request")
+	}
+	if strings.Count(source, "ticketSliderVisualRevision,") < 2 {
+		t.Fatal("pointer-down snapshot and pointer-up match must bind the same visual revision")
+	}
+
+	change := substringBetween(t, source,
+		"ticketLocalRegisterSlider.addEventListener('change'",
+		"  ticketLocalRegisterSlider.addEventListener('blur'")
+	for _, required := range []string{
+		"if (!beginTicketLocalRegisterSliderSession(",
+		"ticketLocalRegisterSlider.value = '0'",
+		"change_session_unavailable",
+		"renderTicketActionV3Controls(currentState)",
+	} {
+		if !strings.Contains(change, required) {
+			t.Fatalf("failed change fallback must reset and surface safely, missing %q", required)
 		}
 	}
 }
@@ -538,13 +691,16 @@ func TestTicketStateFailsClosedUntilFreshSnapshotAndNeverShowsOldActivation(t *t
 		"function markSpacetimeStateFresh() {",
 		"onSnapshotApplied: () => {",
 		"markSpacetimeStateFresh();",
-		"refreshSpacetimeState(reason || 'visibility_resume')",
+		"function refreshSpacetimeStateAfterResume(reason)",
+		"refreshSpacetimeStateAfterResume(reason || 'visibility_resume')",
+		"const liveSubscription = Boolean(spacetimeClient && spacetimeStateFresh",
+		"clientLog('spacetime_resume_reused'",
 		"if (spacetimeClient && typeof spacetimeClient.refresh === 'function')",
 		"renderTicketInteraction(spacetimeStateFresh ? state.ticketInteraction : null);",
 		"const proofReady = spacetimeStateFresh && ticketActionV3RegistrationProofIsFresh(action);",
 		"const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);",
-		"activateTicketButton.disabled = busy || controlBusy || !registerReady;",
-		"renderTicketRegisterOverlay(state, busy, controlBusy, registerReady && Boolean(region));",
+		"setTicketButtonGate(activateTicketButton, !blockingBusy && !controlBusy && registerReady, registerReason);",
+		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy, registerReady && Boolean(region));",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("Ticket state freshness guard missing %q", required)
