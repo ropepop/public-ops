@@ -43,7 +43,7 @@ ALLOW_NONPRIVATE_ADB_TARGET=0
 PIXEL_JAVA_HOME=""
 PIXEL_ANDROID_SDK_ROOT=""
 
-TICKET_SERVICES="train_bot,train_tunnel,ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_remote,ticket_remote_tunnel"
+TICKET_SERVICES="train_bot,train_tunnel,ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_hdr_transformer,ticket_remote,ticket_remote_tunnel"
 TICKET_MIRROR_PROFILE="ticket-recovery"
 TICKET_MIRROR_PATHS=(
   etc/arbuzas/env/ticket-remote.env
@@ -797,7 +797,7 @@ set -u
 arbuzas_root="$(cd "$2" && pwd -P)"
 current_link="${arbuzas_root}/current"
 expected_target="${arbuzas_root}/releases/$1"
-services='train_bot train_tunnel ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel'
+services='train_bot train_tunnel ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_hdr_transformer ticket_remote ticket_remote_tunnel'
 current_before="$(readlink -f "${current_link}" 2>/dev/null || true)"
 if [[ -n "${current_before}" && "${current_before}" != "${expected_target}" ]]; then
   echo "first-install cleanup refused unexpected current target: ${current_before}" >&2

@@ -11,6 +11,7 @@ type TicketClientConfig = {
   ticketId: string;
   sessionId: string;
   email: string;
+  accountScopeId: string;
   backendId?: string;
 };
 
@@ -48,6 +49,14 @@ function accountPublicId(email: string): string {
     hash = Math.imul(hash, 16777619) >>> 0;
   }
   return hash.toString(36).padStart(4, "0").slice(0, 4);
+}
+
+function validAccountScopeId(value: string): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error("account scope is unavailable");
+  }
+  return normalized;
 }
 
 function tableRows(table: any): any[] {
@@ -289,6 +298,19 @@ class TicketSpacetimeClient {
     });
   }
 
+  setHDRPreference(enabled: boolean): Promise<void> {
+    return this.callReducer("memberSetHdrPreference", {
+      ticketId: this.cfg.ticketId,
+      enabled: Boolean(enabled),
+    });
+  }
+
+  refreshHDRState(): Promise<void> {
+    return this.callReducer("memberRefreshHdrState", {
+      ticketId: this.cfg.ticketId,
+    });
+  }
+
   refreshLimitState(): Promise<void> {
     return this.callReducer("memberRefreshLimitState", {
       ticketId: this.cfg.ticketId,
@@ -405,6 +427,7 @@ class TicketSpacetimeClient {
     const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);
     const backendId = sqlString(this.backendId());
     const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
+    const accountScopeId = sqlString(validAccountScopeId(this.cfg.accountScopeId));
     let applied = false;
     this.subscription = connection.subscriptionBuilder()
       .onApplied(() => {
@@ -416,6 +439,9 @@ class TicketSpacetimeClient {
         this.publishFocusedState();
         void this.refreshLimitState().catch((error) => {
           this.handlers.onStatus?.("limit_refresh_failed", error && String(error));
+        });
+        void this.refreshHDRState().catch((error) => {
+          this.handlers.onStatus?.("hdr_refresh_failed", error && String(error));
         });
       })
       .subscribe([
@@ -430,6 +456,7 @@ class TicketSpacetimeClient {
         `SELECT * FROM ticketremote_activation_decision WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_ticket_slider_region_v3 WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_member_hdr_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
         `SELECT * FROM ticketremote_member_limit_state WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       ]);
   }
@@ -455,6 +482,9 @@ class TicketSpacetimeClient {
     const memberLimitState = tableRows(tableAccessor(db, "member_limit_state"))
       .find((row) => rowTicketId(row) === this.cfg.ticketId &&
         String(row.ownerPublicId || row.owner_public_id || "") === accountPublicId(this.cfg.email)) || null;
+    const memberHDRState = tableRows(tableAccessor(db, "member_hdr_state"))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId &&
+        String(row.accountScopeId || row.account_scope_id || "") === validAccountScopeId(this.cfg.accountScopeId)) || null;
     const activationDecisions = tableRows(tableAccessor(db, "activation_decision"))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
       .map((row) => ({
@@ -637,6 +667,11 @@ class TicketSpacetimeClient {
         updatedAt: String(memberLimitState.updatedAt || memberLimitState.updated_at || ""),
         serverAt: String(memberLimitState.serverAt || memberLimitState.server_at || ""),
       } : null,
+      memberHDR: memberHDRState ? {
+        enabled: memberHDRState.enabled === true,
+        updatedAt: String(memberHDRState.updatedAt || memberHDRState.updated_at || ""),
+        serverAt: String(memberHDRState.serverAt || memberHDRState.server_at || ""),
+      } : null,
       activationDecisions,
       ticketActions,
       ticketAction: ticketActions[0] || null,
@@ -693,7 +728,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_limit_state"]
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_limit_state"]
       .map((name) => tableAccessor(source, name));
   }
 

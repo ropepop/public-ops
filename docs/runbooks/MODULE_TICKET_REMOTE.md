@@ -10,17 +10,19 @@ This runbook is for start, stop, health, and deploy. It is not the first product
 
 ```bash
 ../../tools/arbuzas/deploy.sh deploy \
-  --services ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_remote,ticket_remote_tunnel \
+  --services ticket_remote \
   --ssh-host kitty-gration \
   --ssh-user ropepop
 
 ../../tools/arbuzas/deploy.sh validate \
-  --services ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_remote,ticket_remote_tunnel \
+  --services ticket_remote \
   --ssh-host kitty-gration \
   --ssh-user ropepop
 ```
 
-Use an explicit `--release-id` for traceable deploys when cutting a known user-facing change.
+The `ticket_remote` selector expands to the bridge, Spacetime sidecar, private
+HDR transformer, web service, and tunnel. Use an explicit `--release-id` for
+traceable deploys when cutting a known user-facing change.
 
 ## Browser UI Standard
 
@@ -32,7 +34,9 @@ Immediate signed-in Ticket controls use the member `ticket_action_v3` reducer di
 
 Spacetime owns every Ticket business clock and delayed product action. Registration is limited per authenticated account to one admitted action per 30 seconds and ten counted admissions per rolling hour; control codes remain two per rolling minute. Admins/owners obey limits by default and can persist an account-wide unlimited testing preference. The public member projection carries authoritative allow/deny booleans, usage, and next boundary times; browser countdowns are presentation-only. Smart switching is authorized for 15 minutes by a durable Spacetime anchor after activation plus a later unactivated-detail proof. Pixel may reject an already-expired command as a fail-safe, but it must not compute policy windows or schedule a future refresh, re-detection, or switch.
 
-When Pixel proves an unused ticket, it may publish `ticketremote_ticket_slider_region_v3`: a five-minute normalized rectangle bound to the exact proof action ID, stream epoch, and frame sequence. The page maps that rectangle to the displayed canvas after resize and places one native range input over ViVi's visible slider. Pointer-down snapshots that exact proof, stream, geometry, layout, and starting position; pointer-up after at least 25% rightward movement across the overlay submits `register_current` once. Keyboard completion uses the same 25% threshold. Taps and incomplete, duplicate, stale, resized, restarted-stream, lost-capture, blurred, blocked, or busy gestures submit nothing. After reducer acceptance the slider remains latched at completion until that exact action becomes terminal. There is no independent slider claim, lease, progress, or heartbeat command stream. Raw device coordinates, pixels, ticket text, and recognized dates remain phone-private.
+When Pixel proves an unused ticket, it may publish `ticketremote_ticket_slider_region_v3`: a five-minute normalized rectangle bound to the exact proof action ID, stream epoch, and frame sequence. The page maps that rectangle to the displayed canvas after resize and places one native range input over ViVi's visible slider. Pointer-down may begin anywhere and snapshots that exact proof, stream, geometry, layout, and starting position; pointer-up submits `register_current` once only after deliberate rightward movement reaches either 25% of the overlay width or the native terminal end. A touch beginning at the endpoint must still make the small intentional rightward anti-tap movement. Keyboard completion keeps the existing 25% threshold. Taps, short non-terminal or reverse drags, second pointers, scrolling, and incomplete, duplicate, stale, resized, restarted-stream, lost-capture, blurred, blocked, or busy gestures submit nothing. After reducer acceptance the slider remains latched at completion until that exact action becomes terminal. There is no independent slider claim, lease, progress, or heartbeat command stream. Raw device coordinates, pixels, ticket text, and recognized dates remain phone-private.
+
+Every active authenticated Ticket member may opt into the bounded HDR image socket. The private account preference defaults off and is restored through the existing direct Spacetime session on any browser or device. The original SDR stream remains authoritative and live underneath. The browser decodes each replacement before atomically swapping HDR surfaces; unsupported capability, stale input, invalid output, socket failure, or sustained transform failure clears HDR and exposes SDR immediately. The phone capture, encoder, bridge, relay input, and media retention boundary are unchanged, and no image bytes are stored in SpacetimeDB.
 
 V3 registration establishes Accessibility readiness before its final two-frame proof, saves the at-most-once dispatch checkpoint, and sends one uninterrupted 800 ms stroke through the proven geometry. It never hands the gesture between segments. A completed Android gesture that two fresh agreeing frames prove left the exact same unactivated detail may request one deterministic Spacetime `register_current` child; that child shares the root admission/history and cannot create another child. An unknown or conflicting post-gesture picture ends as `ticket_action_post_gesture_visual_unproved` and must never be replayed.
 
@@ -41,14 +45,14 @@ Spacetime retains at most one private waiting intent behind the active phone mut
 ## Health Checks
 
 ```bash
-curl -fsS http://127.0.0.1:9338/api/v1/health | jq '.serverVersion, .phone, .directStream'
+ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/release.env -f /etc/arbuzas/current/infra/arbuzas/docker/compose.yml exec -T ticket_remote curl -fsS http://127.0.0.1:9338/api/v1/livez' | jq '.serverVersion, .assetVersion, .ok'
 cloudflared access curl https://ticket.jolkins.id.lv/api/v1/health | jq '.serverVersion, .phone, .directStream'
 cloudflared access curl -I https://ticket.jolkins.id.lv/ | rg -i 'cache-control|cdn-cache-control|cf-cache-status|clear-site-data'
 ```
 
-Production normally uses SpacetimeAuth on the page. Cloudflare Access remains a supported fallback mode; when it is selected, a plain request may redirect to Access login. Use the authenticated browser for user-facing checks and local container health for origin checks.
+Production normally uses SpacetimeAuth on the page. `/api/v1/livez` is the unauthenticated origin identity check; detailed `/api/v1/health` data requires an authenticated active Ticket member. Cloudflare Access remains a supported fallback mode; when it is selected, a plain request may redirect to Access login. Use the authenticated browser for user-facing and detailed-health checks and local container health for origin checks.
 
-To confirm the newest page is live, compare the page's embedded version with `/api/v1/health` `serverVersion`, then check that response headers are no-store/dynamic instead of a stale cached response.
+To confirm the newest page is live, compare the page's embedded version with `/api/v1/livez` `assetVersion` and `serverVersion`, then check that response headers are no-store/dynamic instead of a stale cached response.
 
 The sidecar health response also reports the configured central logging host/database and the last central write attempt, success, and error. That section is informational: check it explicitly when validating logging instead of relying only on the top-level Ticket database status.
 
@@ -70,7 +74,7 @@ ssh kitty-gration 'docker compose -p arbuzas --env-file /etc/arbuzas/current/rel
 
 New Ticket diagnostics share one destination. The browser sends bounded `client_log` messages over its authenticated video WebSocket, `ticket_remote` validates and sanitizes them, `Store.AppendSafeOperationalLog` calls the private sidecar route, and the sidecar invokes `operationallog_append_ticket_event` in `operational-logging-prod`. Server, relay, and audit events use that Store/sidecar path. Pixel ticket diagnostics write the same central reducer directly from the verified Pixel runtime; they do not pass through the Ticket Store or sidecar.
 
-Browser event names come from a fixed 66-name list, per-socket and global admission are capped at 60 messages per minute, and every informational browser event is sampled into a shared minute bucket. Details remain capped at 1 KiB, private keys and private-looking values are removed, and central Ticket rows expire after six hours. Central cleanup removes up to 1,000 expired rows every five minutes, safely above bounded browser ingestion. Browser delivery is intentionally best-effort: the queue waits for an open authenticated video socket, then releases an event after WebSocket send acceptance rather than a database acknowledgement. The server ignores browser-supplied correlation and hashes the authenticated session instead. Audit writes use a separate short asynchronous deadline, so a logging delay cannot hold up a successful Ticket state change.
+Browser event names come from a fixed 69-name list, per-socket and global admission are capped at 60 messages per minute, and every informational browser event is sampled into a shared minute bucket. Details remain capped at 1 KiB, private keys and private-looking values are removed, and central Ticket rows expire after six hours. Central cleanup removes up to 1,000 expired rows every five minutes, safely above bounded browser ingestion. Browser delivery is intentionally best-effort: the queue waits for an open authenticated video socket, then releases an event after WebSocket send acceptance rather than a database acknowledgement. The server ignores browser-supplied correlation and hashes the authenticated session instead. Audit writes use a separate short asynchronous deadline, so a logging delay cannot hold up a successful Ticket state change.
 
 Run the combined product-state and central-log trace locally with:
 

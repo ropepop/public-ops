@@ -334,6 +334,23 @@ func (h *directStreamHub) warmStart() (config []byte, keyFrame []byte) {
 	return append([]byte(nil), h.lastConfig...), append([]byte(nil), h.lastKeyFrame...)
 }
 
+// experimentalWarmStart keeps the real encoder epoch in the independent-image
+// configuration even when the cached keyframe is too old to replay. Unlike the
+// normal decoder, the HDR image path can wait for the next keyframe without a
+// provisional zero-epoch decoder configuration.
+func (h *directStreamHub) experimentalWarmStart() (config []byte, keyFrame []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.streamEpoch == 0 || len(h.lastConfig) == 0 {
+		return nil, nil
+	}
+	config = append([]byte(nil), h.lastConfig...)
+	if h.warmKeyFrameAllowedLocked(time.Now()) {
+		keyFrame = append([]byte(nil), h.lastKeyFrame...)
+	}
+	return config, keyFrame
+}
+
 // warmEncoderReusable proves that prewarm is joining the same live encoder,
 // even when its short-lived cached keyframe is already too old to replay. The
 // browser still needs a fresh keyframe, but writing another start command first

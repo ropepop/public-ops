@@ -26,8 +26,8 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 	if !strings.Contains(page, `id="ticketLocalRegisterSlider" type="range"`) {
 		t.Fatal("the over-stream registration control must remain a native keyboard-focusable range input")
 	}
-	if !strings.Contains(page, `aria-label="Pavelc vismaz ceturtdaļu, lai reģistrētu atvērto biļeti"`) {
-		t.Fatal("the registration slider must explain its quarter-track completion threshold")
+	if !strings.Contains(page, `aria-label="Turi un velc pa labi vismaz ceturtdaļu vai līdz galam, lai reģistrētu atvērto biļeti"`) {
+		t.Fatal("the registration slider must explain its held rightward quarter-or-terminal completion threshold")
 	}
 	stageStart := strings.Index(page, `<div class="stage">`)
 	overlayIndex := strings.Index(page, `id="ticketRegisterOverlay"`)
@@ -176,6 +176,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"requestTicketActionV3", "memberRequestTicketActionV3", "ticketremote_ticket_action_v3",
 		"ticketremote_ticket_slider_region_v_3",
 		"ticketremote_member_limit_state", "memberRefreshLimitState", "memberSetLimitPreference",
+		"ticketremote_member_hdr_state", "memberRefreshHdrState", "memberSetHdrPreference",
 	} {
 		if !strings.Contains(string(client), required) {
 			t.Fatalf("built direct client missing %q; run make web-client-build", required)
@@ -229,6 +230,11 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"ticketLocalRegisterSlider.addEventListener('change'",
 		"ticketLocalRegisterSlider.addEventListener('blur'",
 		"window.addEventListener('blur'",
+		"event.isPrimary === false",
+		"cancelTicketRegisterSliderSession('secondary_pointer_down')",
+		"event.pointerType === 'mouse' && event.button !== 0",
+		"Number(event && event.pointerId) !== session.pointerId",
+		"progress: Number(ticketLocalRegisterSlider.value || 0)",
 		"Number(ticketLocalRegisterSlider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT",
 		"Slīdņa apstiprinājums vairs nav svaigs.",
 		"clientLog('ticket_slider_cancelled', 'change_session_unavailable')",
@@ -236,6 +242,13 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		if !strings.Contains(panelSlider, required) {
 			t.Fatalf("panel slider must use the direct single-submit handler, missing %q", required)
 		}
+	}
+	secondaryPointer := substringBetween(t, panelSlider,
+		"if (event.isPrimary === false) {",
+		"    if (event.pointerType === 'mouse' && event.button !== 0) {")
+	if !strings.Contains(secondaryPointer, "cancelTicketRegisterSliderSession('secondary_pointer_down');") ||
+		!strings.Contains(secondaryPointer, "return;") {
+		t.Fatal("a secondary pointer must cancel and reset the primary slider session before native range progress can be trusted")
 	}
 
 	render := substringBetween(t, source,
@@ -262,6 +275,12 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"slider completion rejects 24%, accepts 25%",
 		"pointer and keyboard completion share one 25% exactly-once gate",
 		"a zero-distance range tap never counts as 25% pointer movement",
+		"a middle start requires a full quarter of directed travel",
+		"native terminal progress completes inside the outer rect but progress 99 does not",
+		"tap, tiny travel, wrong direction, and missing coordinates fail closed",
+		"an endpoint start needs an intentional anti-tap overshoot",
+		"pointer geometry is finite, start is clamped, and terminal progress is bounded",
+		"a second pointer and stale pointer events cannot consume the primary session",
 		"slider change stays idle below the shared 25% threshold",
 		"a false reducer outcome is not submitted",
 		"accepted slider stays at 100 until its exact durable action is terminal",
@@ -618,6 +637,7 @@ func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
 		"currentTicketRegisterSliderProof(state = currentState)",
 		"ticketRegisterSliderProofStillMatches(snapshot, state = currentState)",
 		"cancelTicketRegisterSliderSession('viewport_changed')",
+		"cancelTicketRegisterSliderSession('window_scrolled')",
 		"cancelTicketRegisterSliderSession('stream_reset')",
 		"ticketLocalRegisterSlider.addEventListener('lostpointercapture'",
 		"ticketLocalRegisterSlider.addEventListener('blur'",
@@ -652,6 +672,16 @@ func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
 
 func TestTicketSliderCancelsImmediatelyOnConfirmedVisualChange(t *testing.T) {
 	source := ticketAppSource(t)
+	scroll := substringBetween(t, source,
+		"window.addEventListener('scroll'",
+		"  if (window.visualViewport) {")
+	if !strings.Contains(scroll, "cancelTicketRegisterSliderSession('window_scrolled')") ||
+		!strings.Contains(scroll, "updateDetailsReveal();") {
+		t.Fatal("ordinary window scroll must cancel an active slider before updating the scrolled layout")
+	}
+	if strings.Index(scroll, "cancelTicketRegisterSliderSession('window_scrolled')") > strings.Index(scroll, "updateDetailsReveal();") {
+		t.Fatal("ordinary window scroll must cancel before the stage can move away from the held pointer")
+	}
 	observe := substringBetween(t, source,
 		"function observeTicketCurrentProofFrame() {",
 		"  async function maybeRequestTicketCurrentProof(reason) {")

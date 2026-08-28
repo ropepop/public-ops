@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -32,18 +33,20 @@ import (
 var staticFS embed.FS
 
 type Server struct {
-	cfg       config.Config
-	store     state.Store
-	relay     *phone.Relay
-	auth      *auth.Validator
-	direct    *directStreamHub
-	static    fs.FS
-	indexTmpl *template.Template
-	adminTmpl *template.Template
-	authTmpl  *template.Template
+	cfg          config.Config
+	store        state.Store
+	relay        *phone.Relay
+	auth         *auth.Validator
+	direct       *directStreamHub
+	experimental *experimentalMediaHub
+	static       fs.FS
+	indexTmpl    *template.Template
+	adminTmpl    *template.Template
+	authTmpl     *template.Template
 
 	mu                  sync.Mutex
 	clients             map[*client]struct{}
+	experimentalClients map[*client]struct{}
 	relayViewerRefs     map[string]int
 	streamPrewarmTimers map[string]*time.Timer
 	streamPrewarmOwners map[string]string
@@ -199,7 +202,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-07-11-painted-browser-captured-control-code-v120"
+	serverVersion                 = "ticket-remote-2026-08-27-painted-browser-captured-control-code-account-hdr-preference-slider-end-hdr-metrics-v123"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -239,6 +242,7 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		adminTmpl:                template.Must(template.New("admin").Parse(adminHTML)),
 		authTmpl:                 template.Must(template.New("auth").Parse(authRedirectHTML)),
 		clients:                  map[*client]struct{}{},
+		experimentalClients:      map[*client]struct{}{},
 		relayViewerRefs:          map[string]int{},
 		streamPrewarmTimers:      map[string]*time.Timer{},
 		streamPrewarmOwners:      map[string]string{},
@@ -247,6 +251,12 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		relayReportCancel:        relayReportCancel,
 		relayReportDone:          make(chan struct{}),
 	}
+	s.experimental = newExperimentalMediaHub(
+		cfg.ExperimentalMedia.HDRTransformerURL,
+		cfg.ExperimentalMedia.TransformTimeout,
+		s.broadcastExperimentalFrame,
+		s.failExperimentalClients,
+	)
 	relay.SetHandlers(s.handlePhoneMessage, s.handlePhoneDisconnect)
 	// Pixel owns Spacetime command execution. The server writes durable commands
 	// and uses the direct bridge relay only for video transport.
@@ -256,6 +266,9 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 
 func (s *Server) Close() {
 	s.cancelIdleStreamDesiredRelease()
+	if s.experimental != nil {
+		s.experimental.Close()
+	}
 	if s.relayReportCancel != nil {
 		s.relayReportCancel()
 		select {
@@ -307,6 +320,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		handleRetiredTicketRoute(w)
 	case path == "/api/v1/stream":
 		s.handleBrowserSocket(w, r)
+	case path == "/api/v1/experimental-media/capability":
+		s.withMember(w, r, s.handleExperimentalMediaCapability)
+	case path == "/api/v1/experimental-media/stream":
+		s.handleExperimentalMediaSocket(w, r)
 	case path == "/api/v1/stream/prewarm":
 		s.withMember(w, r, s.handleStreamPrewarmHTTP)
 	case path == "/api/v1/internal/service-events":
@@ -446,6 +463,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot s
 		"phone":               phoneHealth,
 		"activePhoneBackend":  s.activePhoneBackend(),
 		"directStream":        s.direct.snapshot(streamNow, phoneHealth),
+		"experimentalMedia":   s.experimental.snapshot(),
 	})
 }
 
@@ -782,6 +800,8 @@ func (s *Server) snapshotWithCache(ctx context.Context, now time.Time, phoneHeal
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot, startupRun string) {
 	nonce := randomID()
 	config := s.publicBrowserConfig(id, sessionID, snapshot, true)
+	_, active := snapshot.Member(id.Email)
+	config["experimentalMediaCandidate"] = active
 	if startupRun = boundedStartupRunOrigin(startupRun); startupRun != "" {
 		config["startupRunOrigin"] = startupRun
 	}
@@ -796,17 +816,22 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Ide
 
 func (s *Server) publicBrowserConfig(id auth.Identity, sessionID string, snapshot state.Snapshot, authenticated bool) map[string]any {
 	email := id.Email
+	accountScopeID := ""
+	if authenticated && strings.TrimSpace(email) != "" {
+		accountScopeID = ticketAccountScopeID(email)
+	}
 	authMode := s.publicAuthMode()
 	return map[string]any{
-		"publicBaseUrl": s.cfg.PublicBaseURL,
-		"authenticated": authenticated,
-		"email":         email,
-		"sessionId":     sessionID,
-		"stateBackend":  snapshot.StateBackend,
-		"ticketId":      s.cfg.TicketID,
-		"backendId":     s.activePhoneBackend().ID,
-		"pageVersion":   serverVersion,
-		"assetVersion":  assetVersion(),
+		"publicBaseUrl":  s.cfg.PublicBaseURL,
+		"authenticated":  authenticated,
+		"email":          email,
+		"accountScopeId": accountScopeID,
+		"sessionId":      sessionID,
+		"stateBackend":   snapshot.StateBackend,
+		"ticketId":       s.cfg.TicketID,
+		"backendId":      s.activePhoneBackend().ID,
+		"pageVersion":    serverVersion,
+		"assetVersion":   assetVersion(),
 		"auth": map[string]any{
 			"mode":           authMode,
 			"issuer":         strings.TrimRight(s.cfg.Access.OIDCIssuer, "/"),
@@ -823,6 +848,17 @@ func (s *Server) publicBrowserConfig(id auth.Identity, sessionID string, snapsho
 			"database": s.cfg.State.SpacetimeDatabase,
 		},
 	}
+}
+
+func ticketAccountScopeID(email string) string {
+	normalized := []byte(strings.TrimSpace(email))
+	for index, value := range normalized {
+		if value >= 'A' && value <= 'Z' {
+			normalized[index] = value + ('a' - 'A')
+		}
+	}
+	sum := sha256.Sum256(normalized)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
@@ -1661,6 +1697,9 @@ func (s *Server) handlePhoneMessage(msg phone.Message) {
 				}
 			}
 			s.broadcastFrame(frame)
+			if s.experimental != nil && s.experimental.HasClients() {
+				s.experimental.Enqueue(frame)
+			}
 			s.publishAdaptiveStreamCadence("video_frame_delivery")
 		}
 	}
@@ -1728,6 +1767,7 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 				needsFreshKeyFrame = true
 			}
 		}
+		s.broadcastExperimentalConfig(raw, cachedKeyFrame)
 		if needsFreshKeyFrame {
 			streamEpoch := controlCodeInt64FromMessage(msg["streamEpoch"])
 			if streamEpoch < 0 {

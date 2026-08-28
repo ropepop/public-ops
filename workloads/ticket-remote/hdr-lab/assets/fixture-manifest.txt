@@ -1,0 +1,16 @@
+fixture=synthetic-ultrahdr-4x.jpg
+privacy=synthetic-only-no-ticket-or-user-pixels
+dimensions=768x512
+sdr_intent=8-bit-rgba-srgb-bt709
+hdr_intent=16-bit-half-float-linear-bt709
+linear_content_boost=4.0
+gain_map_downsample=2
+gain_map_expected_dimensions=384x256
+encoder=ultrahdr_app-v2.0.2
+ultrahdr_sha256=39b20f098a6d44e54b102ddb727b0bae5472f7205dc70f5ff3f9c57b68280289
+ordinary_sdr_sha256=1cea233737e5822e51f536d0df7a0609e2ef5f53b2b6542ca3bab153ec0a6c78
+compile_ms=273.530
+raster_generation_ms=363.429
+sdr_jpeg_encode_ms=63.897
+ultrahdr_encode_ms=47.726
+ultrahdr_probe_ms=9.577

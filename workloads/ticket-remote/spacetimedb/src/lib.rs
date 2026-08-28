@@ -4,10 +4,19 @@
 #![allow(clippy::too_many_arguments)]
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use spacetimedb::{
     CaseConversionPolicy, Identity, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp,
     ViewContext,
 };
+
+fn account_scope_id(email: &str) -> String {
+    let normalized = email.trim().to_ascii_lowercase();
+    Sha256::digest(normalized.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 const DEFAULT_TICKET_ID: &str = "vivi-default";
 const DEFAULT_TICKET_NAME: &str = "ViVi timed ticket";
@@ -821,6 +830,25 @@ pub struct TicketremoteMemberLimitPreference {
     pub updatedAt: String,
 }
 
+/// Private durable presentation choice for one authenticated Ticket account.
+/// Missing rows mean the safe default: HDR is disabled. Email stays private.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_preference,
+    index(accessor = ticketEmail, btree(columns = [ticketId, email]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDRPreference {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub email: String,
+    pub enabled: bool,
+    pub createdAt: String,
+    pub updatedAt: String,
+}
+
 /// Private durable admission audit shared by registration and control-code
 /// policy. Consequential admin bypasses are retained with counted=false so
 /// they are auditable without consuming a later enforced quota.
@@ -884,6 +912,27 @@ pub struct TicketremoteMemberLimitState {
     pub controlCodeLimit: u32,
     pub controlCodeWindowSeconds: u32,
     pub controlCodeRetryAt: String,
+    pub updatedAt: String,
+    pub serverAt: String,
+}
+
+/// Sanitized browser projection for one authenticated account's HDR choice.
+/// The browser subscribes only to its opaque account key; no email, media,
+/// device data, ticket content, or capability decision is stored here.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_state,
+    public,
+    index(accessor = ticketAccount, btree(columns = [ticketId, accountScopeId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDRState {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub accountScopeId: String,
+    pub enabled: bool,
     pub updatedAt: String,
     pub serverAt: String,
 }
@@ -2524,6 +2573,52 @@ fn member_limit_preference(
         .ticketremote_member_limit_preference()
         .id()
         .find(member_id(ticket_id, email))
+}
+
+fn member_hdr_state_id(ticket_id: &str, email: &str) -> String {
+    format!(
+        "{}:{}:member-hdr",
+        clean_ticket_id(ticket_id),
+        account_scope_id(email)
+    )
+}
+
+fn member_hdr_preference(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+) -> Option<TicketremoteMemberHDRPreference> {
+    ctx.db
+        .ticketremote_member_hdr_preference()
+        .id()
+        .find(member_id(ticket_id, email))
+}
+
+fn refresh_member_hdr_state(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let email = clean_email(email);
+    let id = member_hdr_state_id(&ticket_id, &email);
+    let table = ctx.db.ticketremote_member_hdr_state();
+    if !is_member(ctx, &ticket_id, &email) {
+        table.id().delete(id);
+        return;
+    }
+    let enabled = member_hdr_preference(ctx, &ticket_id, &email)
+        .map(|row| row.enabled)
+        .unwrap_or(false);
+    let row = TicketremoteMemberHDRState {
+        id,
+        ticketId: ticket_id,
+        accountScopeId: account_scope_id(&email),
+        enabled,
+        updatedAt: now.into(),
+        serverAt: now.into(),
+    };
+    if table.id().find(&row.id).is_some() {
+        table.id().update(row);
+    } else {
+        table.insert(row);
+    }
 }
 
 fn member_limit_effective_config(
@@ -4609,6 +4704,7 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
     let email = client_email_from_auth(ctx, DEFAULT_TICKET_ID)?;
     let now = now(ctx);
     refresh_member_limit_state(ctx, DEFAULT_TICKET_ID, &email, &now);
+    refresh_member_hdr_state(ctx, DEFAULT_TICKET_ID, &email, &now);
     Ok(())
 }
 
@@ -4656,6 +4752,49 @@ pub fn ticketremote_member_refresh_limit_state(
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
     refresh_member_limit_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_set_hdr_preference(
+    ctx: &ReducerContext,
+    ticketId: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let id = member_id(&ticket.id, &email);
+    let table = ctx.db.ticketremote_member_hdr_preference();
+    if let Some(existing) = table.id().find(&id) {
+        table.id().update(TicketremoteMemberHDRPreference {
+            enabled,
+            updatedAt: now.clone(),
+            ..existing
+        });
+    } else {
+        table.insert(TicketremoteMemberHDRPreference {
+            id,
+            ticketId: ticket.id.clone(),
+            email: email.clone(),
+            enabled,
+            createdAt: now.clone(),
+            updatedAt: now.clone(),
+        });
+    }
+    refresh_member_hdr_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_refresh_hdr_state(
+    ctx: &ReducerContext,
+    ticketId: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    refresh_member_hdr_state(ctx, &ticket.id, &email, &now);
     Ok(())
 }
 
@@ -5285,6 +5424,7 @@ pub fn ticketremote_service_bootstrap(
     }
     if !email.is_empty() && is_member(ctx, &ticket.id, &email) {
         refresh_member_limit_state(ctx, &ticket.id, &email, &now);
+        refresh_member_hdr_state(ctx, &ticket.id, &email, &now);
     }
     if !phoneBackendId.trim().is_empty() {
         let backend_id = clean_backend_id(&phoneBackendId);
@@ -7446,6 +7586,7 @@ fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &
     };
     table.insert(row);
     refresh_member_limit_state(ctx, ticket_id, &email, now);
+    refresh_member_hdr_state(ctx, ticket_id, &email, now);
 }
 
 fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
@@ -7462,6 +7603,10 @@ fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now
         .ticketremote_member_limit_state()
         .id()
         .delete(member_limit_state_id(ticket_id, email));
+    ctx.db
+        .ticketremote_member_hdr_state()
+        .id()
+        .delete(member_hdr_state_id(ticket_id, email));
     delete_policy_boundary_timers(ctx, ticket_id, "member", &clean_email(email));
 }
 
@@ -12159,6 +12304,99 @@ mod tests {
         assert!(production.contains("refresh_member_limit_state(ctx, DEFAULT_TICKET_ID"));
         assert!(production.contains("ticketremote_member_refresh_limit_state"));
         assert!(production.contains("ticketremote_scheduled_policy_boundary"));
+    }
+
+    #[test]
+    fn member_hdr_preference_is_private_default_off_and_account_scoped() {
+        // These two synthetic accounts deliberately collide under Ticket's
+        // existing four-character display ID. The durable setting must not.
+        let first = member_hdr_state_id("vivi-default", "synthetic-review-247@example.invalid");
+        let second = member_hdr_state_id("vivi-default", "synthetic-review-259@example.invalid");
+        assert_ne!(first, second);
+        assert!(!first.contains("synthetic-review-247@example.invalid"));
+        assert!(!second.contains("synthetic-review-259@example.invalid"));
+        assert_eq!(
+            account_scope_id(" Scope-Vector@Example.Invalid "),
+            "801e6852dd9ec833c6627a23f54faa19d507556ff3de6378756503a1b6bb627b"
+        );
+
+        let source = include_str!("lib.rs");
+        let private_schema = source
+            .split("accessor = ticketremote_member_hdr_preference")
+            .nth(1)
+            .and_then(|body| body.split("pub struct TicketremoteMemberLimitEvent").next())
+            .expect("private HDR preference schema must remain inspectable");
+        assert!(!private_schema.contains("public,"));
+        assert!(private_schema.contains("pub email: String"));
+        assert!(private_schema.contains("pub enabled: bool"));
+
+        let public_declaration = source
+            .split("accessor = ticketremote_member_hdr_state")
+            .nth(1)
+            .and_then(|body| body.split("#[derive(Clone)]").next())
+            .expect("public HDR state declaration must remain inspectable");
+        assert!(public_declaration.contains("public,"));
+        let public_schema = source
+            .split("pub struct TicketremoteMemberHDRState")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub struct TicketremoteTicketSwitchAnchor")
+                    .next()
+            })
+            .expect("public HDR state schema must remain inspectable");
+        assert!(!public_schema.contains("pub email:"));
+        assert!(public_schema.contains("pub accountScopeId: String"));
+        assert!(public_schema.contains("pub enabled: bool"));
+
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let preference_lookup = production
+            .split("fn refresh_member_hdr_state(")
+            .nth(1)
+            .and_then(|body| body.split("fn member_limit_effective_config(").next())
+            .expect("HDR state refresh must remain inspectable");
+        assert!(preference_lookup.contains(".unwrap_or(false)"));
+        assert!(preference_lookup.contains("if !is_member"));
+        assert!(preference_lookup.contains("ticketremote_member_hdr_state()"));
+    }
+
+    #[test]
+    fn member_hdr_reducer_derives_the_authenticated_account_and_role_changes_refresh_state() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let reducer = production
+            .split("pub fn ticketremote_member_set_hdr_preference(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_member_refresh_hdr_state(")
+                    .next()
+            })
+            .expect("HDR preference reducer must remain inspectable");
+        assert!(reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(!reducer.contains("email: String"));
+        assert!(!reducer.contains("require_admin"));
+        assert!(reducer.contains("refresh_member_hdr_state"));
+
+        let membership = production
+            .split("fn upsert_member_row(")
+            .nth(1)
+            .and_then(|body| body.split("fn schedule_latest_ticket_reselect(").next())
+            .expect("member lifecycle must remain inspectable");
+        assert!(membership.contains("refresh_member_hdr_state"));
+        assert!(membership.contains("ticketremote_member_hdr_state()"));
+        assert!(membership.contains("delete(member_hdr_state_id"));
+        let deactivate = membership
+            .split("fn deactivate_member_row(")
+            .nth(1)
+            .expect("member deactivation must remain inspectable");
+        assert!(!deactivate.contains("ticketremote_member_hdr_preference()"));
+        assert!(production.contains("refresh_member_hdr_state(ctx, DEFAULT_TICKET_ID"));
+        assert!(production.contains("ticketremote_member_refresh_hdr_state"));
     }
 
     #[test]

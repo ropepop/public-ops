@@ -70,6 +70,9 @@ var (
 		"direct_video_websocket_error":          {},
 		"early_video_connecting_grace":          {},
 		"early_video_connecting_grace_skipped":  {},
+		"experimental_hdr_decode_sample":        {},
+		"experimental_hdr_first_image_shown":    {},
+		"experimental_media_fallback":           {},
 		"fullscreen_failed":                     {},
 		"fullscreen_requested":                  {},
 		"fullscreen_unavailable":                {},
@@ -471,7 +474,7 @@ func browserClientDetailKeyIsSensitive(key string) bool {
 	if key == "webcodecs" {
 		return false
 	}
-	if key == "code" || key == "image" || key == "payload" || key == "raw" {
+	if key == "accountscopeid" || key == "code" || key == "image" || key == "payload" || key == "raw" {
 		return true
 	}
 	return operationalLogDetailKeyIsSensitive(key)

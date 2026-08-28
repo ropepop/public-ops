@@ -627,6 +627,32 @@ func TestDirectStreamWarmStartSendsProvisionalConfigBeforeFreshKeyFrame(t *testi
 	}
 }
 
+func TestDirectStreamExperimentalWarmStartKeepsRealEpochWhileWaitingForKeyFrame(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":1000}`))
+
+	config, keyFrame := hub.experimentalWarmStart()
+	if !strings.Contains(string(config), `"streamEpoch":7`) || strings.Contains(string(config), `"provisional":true`) || len(keyFrame) != 0 {
+		t.Fatalf("experimental warm start without a fresh keyframe should keep the real config only: config=%q key=%x", string(config), keyFrame)
+	}
+
+	key := testTSF2FrameWithTimestamp(7, 1, true, 1000)
+	hub.recordFrame(key)
+	config, keyFrame = hub.experimentalWarmStart()
+	if !strings.Contains(string(config), `"streamEpoch":7`) || parseTSF2(keyFrame).sequence != 1 {
+		t.Fatalf("experimental warm start with a fresh keyframe should return the real config and keyframe")
+	}
+
+	hub.mu.Lock()
+	hub.lastFrameAt = time.Now().Add(-10 * time.Second)
+	hub.lastKeyFrameAt = time.Now().Add(-10 * time.Second)
+	hub.mu.Unlock()
+	config, keyFrame = hub.experimentalWarmStart()
+	if !strings.Contains(string(config), `"streamEpoch":7`) || strings.Contains(string(config), `"provisional":true`) || len(keyFrame) != 0 {
+		t.Fatalf("experimental warm start with a stale keyframe should keep the real config only: config=%q key=%x", string(config), keyFrame)
+	}
+}
+
 func TestDirectStreamWarmEncoderReusableRequiresFreshSameEpochStream(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))

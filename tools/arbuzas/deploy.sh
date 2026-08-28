@@ -149,6 +149,7 @@ ALL_SERVICES=(
   satiksme_bot
   ticket_phone_bridge
   ticket_remote_spacetime_sidecar
+  ticket_hdr_transformer
   ticket_remote
   train_tunnel
   satiksme_tunnel
@@ -1599,7 +1600,7 @@ Options:
 
 Services:
   train_bot, train_tunnel, satiksme_bot, satiksme_tunnel, ticket_phone_bridge,
-  ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel,
+  ticket_remote_spacetime_sidecar, ticket_hdr_transformer, ticket_remote, ticket_remote_tunnel,
   qbittorrent, qbittorrent_housekeeper,
   jellyfin,
   tiny_vless (separate Compose project; explicit selection required to recreate)
@@ -1726,6 +1727,7 @@ mark_validation_group() {
       VALIDATE_TICKET_REMOTE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
       append_unique DIAGNOSTIC_SERVICES ticket_remote_spacetime_sidecar
+      append_unique DIAGNOSTIC_SERVICES ticket_hdr_transformer
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
       ;;
@@ -1788,12 +1790,21 @@ resolve_requested_services() {
         ;;
       ticket_remote)
         if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+          append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
           append_unique COMPOSE_TARGET_SERVICES ticket_remote
         else
           append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
           append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
+          append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
           append_unique COMPOSE_TARGET_SERVICES ticket_remote
           append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
+        fi
+        mark_validation_group ticket_remote
+        ;;
+      ticket_hdr_transformer)
+        append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
+        if [[ "${VALIDATION_PROFILE}" != "fast" ]]; then
+          append_unique COMPOSE_TARGET_SERVICES ticket_remote
         fi
         mark_validation_group ticket_remote
         ;;
@@ -1897,6 +1908,7 @@ compose_all_service_args() {
     satiksme_bot
     ticket_phone_bridge
     ticket_remote_spacetime_sidecar
+    ticket_hdr_transformer
     ticket_remote
     qbittorrent
     qbittorrent_housekeeper
@@ -3256,7 +3268,7 @@ prepare_local_fast_release_overlay() {
         copy_tree_into_fast_release_overlay "workloads/shared-go"
         copy_tree_into_fast_release_overlay "workloads/satiksme-bot"
         ;;
-      ticket_remote_spacetime_sidecar|ticket_remote)
+      ticket_remote_spacetime_sidecar|ticket_hdr_transformer|ticket_remote)
         copy_tree_into_fast_release_overlay "workloads/ticket-remote"
         ;;
       qbittorrent|qbittorrent_housekeeper)
@@ -4710,6 +4722,7 @@ remote_compose_up() {
           satiksme_bot=arbuzas/satiksme-bot \
           ticket_phone_bridge=arbuzas/ticket-phone-bridge \
           ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
+          ticket_hdr_transformer=arbuzas/ticket-hdr-transformer \
           ticket_remote=arbuzas/ticket-remote \
           qbittorrent=arbuzas/qbittorrent \
           qbittorrent_housekeeper=arbuzas/qbittorrent-housekeeper; do
@@ -7487,20 +7500,48 @@ validate_remote_meshcentral_workload_health() {
 
 validate_remote_ticket_remote_workload_health() {
   local remote_release_dir="$1"
+  local ticket_hdr_declared=0
+  local ticket_declared_services=''
+  local ticket_required_services=(ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel)
 
-  validate_remote_running_services "${remote_release_dir}" "expected services running" ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+  if ! ticket_declared_services="$(remote_shell "
+    docker compose --project-name arbuzas \
+      --env-file '${remote_release_dir}/release.env' \
+      -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' \
+      config --services
+  ")"; then
+    log "Validation failed: Ticket Compose service discovery"
+    mark_remote_validation_failed
+    collect_remote_validation_diagnostics "${remote_release_dir}" ticket_remote
+    return 1
+  fi
+  if printf '%s\n' "${ticket_declared_services}" | grep -Fxq ticket_hdr_transformer; then
+    ticket_hdr_declared=1
+    ticket_required_services+=(ticket_hdr_transformer)
+  fi
+
+  validate_remote_running_services "${remote_release_dir}" "expected services running" "${ticket_required_services[@]}"
   validate_remote_probe "${remote_release_dir}" "ticket-phone-bridge local health" \
     "wait_until_ok compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    "${ticket_required_services[@]}"
   validate_remote_probe "${remote_release_dir}" "ticket-remote direct bridge health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://ticket_phone_bridge:9388/api/v1/health >/dev/null 2>/dev/null'" \
     ticket_phone_bridge ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote Spacetime sidecar health" \
     "wait_until_ok compose exec -T ticket_remote_spacetime_sidecar sh -lc 'curl -fsS http://127.0.0.1:9346/healthz | grep -F \"\\\"status\\\":\\\"ok\\\"\" >/dev/null'" \
     ticket_remote_spacetime_sidecar ticket_remote
+  if (( ticket_hdr_declared == 1 )); then
+    validate_remote_probe "${remote_release_dir}" "ticket HDR transformer health" \
+      "wait_until_ok compose exec -T ticket_hdr_transformer sh -lc 'curl -fsS http://127.0.0.1:9352/healthz | grep -F \"\\\"output\\\":\\\"jpeg-iso-21496-gainmap\\\"\" >/dev/null'" \
+      ticket_hdr_transformer ticket_remote
+  else
+    validate_remote_host_probe "${remote_release_dir}" "retired Ticket HDR transformer is absent" \
+      "test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=ticket_hdr_transformer')\"" \
+      ticket_remote
+  fi
   validate_remote_probe "${remote_release_dir}" "ticket-remote local health" \
     "wait_until_ok compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null 2>/dev/null'" \
-    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    "${ticket_required_services[@]}"
   validate_remote_probe "${remote_release_dir}" "ticket-remote production state backend" \
     "ticket_state_backend_ok() {
       file_backend=\$(sed -n 's/^TICKET_REMOTE_STATE_BACKEND=//p' /etc/arbuzas/env/ticket-remote.env | tail -1)
@@ -7521,10 +7562,10 @@ validate_remote_ticket_remote_workload_health() {
       compose exec -T ticket_remote sh -lc 'test \"\${TICKET_REMOTE_PHONE_BACKEND_ID}\" = pixel && test \"\${TICKET_REMOTE_PHONE_BASE_URL}\" = \"http://ticket_phone_bridge:9388\" && curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'
     }
     wait_until_ok active_configured_backend_ok" \
-    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote
+    "${ticket_required_services[@]}"
   validate_remote_probe "${remote_release_dir}" "ticket-remote public login shell" \
     "wait_until_ok sh -lc 'code=\$(curl -sS -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${code}\" in 200|302) exit 0 ;; *) exit 1 ;; esac'" \
-    ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel
+    "${ticket_required_services[@]}"
   validate_remote_probe "${remote_release_dir}" "ticket-remote public HTTP redirects to HTTPS" \
     "wait_until_ok sh -lc 'result=\$(curl -sS -o /dev/null -w \"%{http_code} %{redirect_url}\" http://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${result}\" in \"301 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*|\"308 https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/\"*) exit 0 ;; *) printf \"%s\\n\" \"\${result}\" >&2; exit 1 ;; esac'" \
     ticket_remote ticket_remote_tunnel
@@ -7677,6 +7718,7 @@ validate_remote_selected_smoke_health() {
     }
 
     smoke_ready() {
+      local declared_services=''
       local running=''
       local service_name=''
 
@@ -7686,8 +7728,16 @@ validate_remote_selected_smoke_health() {
         [[ \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" == \"\$(readlink -f '${remote_release_dir}')\" ]] || return 1
       fi
 
+      declared_services=\$(compose config --services) || return 1
       running=\$(compose ps --services --status running | tr '\n' ' ') || return 1
       for service_name in${selected_service_args}; do
+        if ! printf '%s\\n' \"\${declared_services}\" | grep -Fxq \"\${service_name}\"; then
+          if [[ \"\${service_name}\" == ticket_hdr_transformer ]]; then
+            test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=ticket_hdr_transformer')\" || return 1
+            continue
+          fi
+          return 1
+        fi
         case \" \${running} \" in
           *\" \${service_name} \"*) ;;
           *) return 1 ;;
@@ -7737,9 +7787,17 @@ validate_remote_selected_smoke_health() {
             *) return 1 ;;
           esac
         done
+        if printf '%s\\n' \"\${declared_services}\" | grep -Fxq ticket_hdr_transformer; then
+          case \" \${running} \" in *' ticket_hdr_transformer '*) ;; *) return 1 ;; esac
+        else
+          test -z \"\$(docker ps -aq --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.service=ticket_hdr_transformer')\" || return 1
+        fi
         start_ticket_smoke_probe 'ticket phone bridge local health' \"compose exec -T ticket_phone_bridge sh -lc '/usr/local/bin/ticket-phone-bridge-health >/dev/null'\" || return 1
         start_ticket_smoke_probe 'Ticket Remote direct bridge health' \"compose exec -T ticket_remote sh -lc 'curl -fsS http://ticket_phone_bridge:9388/api/v1/health >/dev/null'\" || return 1
         start_ticket_smoke_probe 'Ticket Remote Spacetime sidecar health' \"compose exec -T ticket_remote_spacetime_sidecar sh -lc 'curl -fsS http://127.0.0.1:9346/healthz | grep -F \\\"status\\\" >/dev/null'\" || return 1
+        if printf '%s\\n' \"\${declared_services}\" | grep -Fxq ticket_hdr_transformer; then
+          start_ticket_smoke_probe 'Ticket HDR transformer health' \"compose exec -T ticket_hdr_transformer sh -lc 'curl -fsS http://127.0.0.1:9352/healthz | grep -F \\\"jpeg-iso-21496-gainmap\\\" >/dev/null'\" || return 1
+        fi
         start_ticket_smoke_probe 'Ticket Remote livez' \"compose exec -T ticket_remote sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TICKET_REMOTE_PORT}/api/v1/livez >/dev/null'\" || return 1
         start_ticket_smoke_probe 'Ticket Remote public page' 'public_code=\$(curl -sS --connect-timeout 2 --max-time 4 -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/ 2>/dev/null || true); case \"\${public_code}\" in 200|302) ;; *) echo \"expected Ticket Remote public page status 200 or 302, got \${public_code}\" >&2; exit 1 ;; esac' || return 1
         start_ticket_smoke_probe 'Ticket Remote public health authorization' 'public_code=\$(curl -sS --connect-timeout 2 --max-time 4 -o /dev/null -w \"%{http_code}\" https://${ARBUZAS_TICKET_REMOTE_HOSTNAME}/api/v1/health 2>/dev/null || true); [[ \"\${public_code}\" == 401 ]] || { echo \"expected Ticket Remote health status 401, got \${public_code}\" >&2; exit 1; }' || return 1
@@ -8114,7 +8172,30 @@ rollback_remote_release() {
   fi
   remote_shell "
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing release bundle: ${remote_release_dir}' >&2; exit 1; }
-    cd '${remote_release_dir}'
+    [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback Compose file: ${remote_release_dir}' >&2; exit 1; }
+    target_compose_args=(docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml')
+    declared_services=\$("\${target_compose_args[@]}" config --services)
+    rollback_services=()
+    rollback_tunnel_services=()
+    absent_rollback_services=()
+    for rollback_service in${rollback_service_args}; do
+      if printf '%s\\n' \"\${declared_services}\" | grep -Fxq \"\${rollback_service}\"; then
+        rollback_services+=(\"\${rollback_service}\")
+      else
+        case \"\${rollback_service}\" in
+          ticket_hdr_transformer) absent_rollback_services+=(\"\${rollback_service}\") ;;
+          *) echo \"rollback release is missing required selected service: \${rollback_service}\" >&2; exit 1 ;;
+        esac
+      fi
+    done
+    for rollback_service in${rollback_tunnel_service_args}; do
+      if printf '%s\\n' \"\${declared_services}\" | grep -Fxq \"\${rollback_service}\"; then
+        rollback_tunnel_services+=(\"\${rollback_service}\")
+      else
+        echo \"rollback release is missing required selected tunnel: \${rollback_service}\" >&2
+        exit 1
+      fi
+    done
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     compose_args=(docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml')
@@ -8131,14 +8212,23 @@ rollback_remote_release() {
       fi
     done
     if [[ '${TARGETED_MODE}' == '1' ]]; then
-      if [[ -n '${rollback_service_args}' ]]; then
-        \"\${compose_args[@]}\" up -d --build --force-recreate --no-deps${rollback_service_args}
+      if (( \${#rollback_services[@]} > 0 )); then
+        \"\${compose_args[@]}\" up -d --build --force-recreate --no-deps \"\${rollback_services[@]}\"
       fi
-      if [[ -n '${rollback_tunnel_service_args}' ]]; then
-        \"\${compose_args[@]}\" up -d --force-recreate --no-deps${rollback_tunnel_service_args}
+      if (( \${#rollback_tunnel_services[@]} > 0 )); then
+        \"\${compose_args[@]}\" up -d --force-recreate --no-deps \"\${rollback_tunnel_services[@]}\"
       fi
+      for absent_service in \"\${absent_rollback_services[@]}\"; do
+        absent_container_ids=\$(docker ps -aq \
+          --filter 'label=com.docker.compose.project=arbuzas' \
+          --filter \"label=com.docker.compose.service=\${absent_service}\")
+        if [[ -n \"\${absent_container_ids}\" ]]; then
+          echo \"removing selected service absent from rollback release: \${absent_service}\" >&2
+          docker rm -f \${absent_container_ids}
+        fi
+      done
     else
-      \"\${compose_args[@]}\" up -d --remove-orphans${rollback_service_args}
+      \"\${compose_args[@]}\" up -d --remove-orphans \"\${rollback_services[@]}\"
     fi
   " || return $?
   stabilize_remote_declared_docker_no_swap_limits

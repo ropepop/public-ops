@@ -1,6 +1,11 @@
 /* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
 import {
+  ExperimentalHDRImageSwitcher,
+  advanceExperimentalHDRReplacementFailure
+} from './experimental-hdr-image-switcher.mjs';
+import { ExperimentalHDRPreferenceController } from './experimental-hdr-preference.mjs';
+import {
   TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT,
   beginTicketActionV3LocalRequest,
   beginTicketLocalRegisterSliderSession,
@@ -212,6 +217,13 @@ import {
   const emptyMessage = requireElement('#emptyMessage', 'emptyMessage');
   if (!emptyState || !startStreamButton || !emptyMessage) return;
   const streamResumeSpinner = document.getElementById('streamResumeSpinner');
+  const experimentalMediaCanvas = document.getElementById('experimentalMediaCanvas');
+  const experimentalMediaHDRImage = document.getElementById('experimentalMediaHDRImage');
+  const experimentalMediaHDRImageBuffer = document.getElementById('experimentalMediaHDRImageBuffer');
+  const experimentalMediaHDRSwitcher = experimentalMediaHDRImage && experimentalMediaHDRImageBuffer
+    ? new ExperimentalHDRImageSwitcher([experimentalMediaHDRImage, experimentalMediaHDRImageBuffer])
+    : null;
+  const experimentalMediaMount = document.getElementById('experimentalMediaMount');
   const connectionState = requireElement('#connectionState', 'connectionState');
   const statusLine = requireElement('#statusLine', 'statusLine');
   if (!connectionState || !statusLine) return;
@@ -256,6 +268,47 @@ import {
   let presenceMounted = false;
 
   let videoWs = null;
+  const experimentalMediaState = reactive({
+    enabled: false,
+    status: 'Izslēgts',
+    preferenceStatus: 'Saglabātais HDR iestatījums: izslēgts.',
+    label: 'Spilgtāks skats (eksperimentāls)'
+  });
+  let experimentalMediaMounted = false;
+  let experimentalMediaCapabilityReady = false;
+  let experimentalMediaSocket = null;
+  let experimentalMediaDecoder = null;
+  let experimentalMediaDecoderGeneration = 0;
+  let experimentalMediaConfigureGeneration = 0;
+  let experimentalMediaConfig = null;
+  let experimentalMediaEpoch = 0;
+  let experimentalMediaSequence = 0;
+  let experimentalMediaNeedsKeyframe = true;
+  let experimentalMediaSps = null;
+  let experimentalMediaPps = null;
+  let experimentalMediaDescription = null;
+  let experimentalMediaMessageChain = Promise.resolve();
+  let experimentalMediaPipeline = '';
+  let experimentalMediaHDRRenderGeneration = 0;
+  let experimentalMediaHDRReplacementFailures = 0;
+  const experimentalMediaHDRMaxConsecutiveReplacementFailures = 3;
+  let experimentalMediaHDREnabledAt = 0;
+  let experimentalMediaHDRFirstShown = false;
+  let experimentalMediaHDRShownFrames = 0;
+  const experimentalMediaPreferenceController = new ExperimentalHDRPreferenceController({
+    applyEnabled: (enabled) => applyExperimentalMediaPreference(enabled),
+    persistEnabled: (enabled) => runSpacetimeMutation(
+      (client) => client.setHDRPreference(Boolean(enabled)),
+      'hdr_preference_write'
+    ),
+    onStatus: (snapshot) => {
+      experimentalMediaState.preferenceStatus = experimentalHDRPreferenceStatus(snapshot);
+      if (document.body) document.body.dataset.hdrPreference = String(snapshot && snapshot.phase || 'default');
+    },
+    onFailure: (failure) => {
+      clientLog('state_failed', String(failure && failure.code || 'hdr_preference_write_failed'));
+    }
+  });
   const activeVideoSockets = new Set();
   let reconnectTimer = null;
   let hiddenVideoCloseTimer = null;
@@ -895,6 +948,416 @@ import {
     }
   }
 
+  function experimentalMediaURL() {
+    const url = new URL('/api/v1/experimental-media/stream', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.toString();
+  }
+
+  function setExperimentalMediaStatus(status) {
+    experimentalMediaState.status = String(status || 'Izslēgts');
+  }
+
+  function experimentalHDRPreferenceStatus(snapshot) {
+    const enabled = Boolean(snapshot && snapshot.enabled);
+    switch (String(snapshot && snapshot.phase || 'default')) {
+    case 'saving':
+      return 'Saglabā HDR izvēli kontā…';
+    case 'saved':
+      return 'HDR izvēle saglabāta; gaida konta apstiprinājumu.';
+    case 'failed':
+      return 'HDR izvēle darbojas šajā sesijā, bet kontā netika saglabāta.';
+    case 'synced':
+      return `Saglabātais HDR iestatījums: ${enabled ? 'ieslēgts' : 'izslēgts'}.`;
+    default:
+      return 'Saglabātais HDR iestatījums: izslēgts.';
+    }
+  }
+
+  function applyExperimentalMediaPreference(enabled) {
+    const shouldEnable = Boolean(enabled && experimentalMediaCapabilityReady);
+    if (!shouldEnable) {
+      if (experimentalMediaState.enabled || experimentalMediaSocket || experimentalMediaDecoder) {
+        closeExperimentalMedia({ status: 'Izslēgts' });
+      } else {
+        experimentalMediaState.enabled = false;
+      }
+      return;
+    }
+    if (!experimentalMediaState.enabled) {
+      experimentalMediaHDREnabledAt = performance.now();
+      experimentalMediaHDRFirstShown = false;
+      experimentalMediaHDRShownFrames = 0;
+    }
+    experimentalMediaState.enabled = true;
+    connectExperimentalMedia();
+  }
+
+  function hideExperimentalMediaCanvas() {
+    if (experimentalMediaCanvas) {
+      experimentalMediaCanvas.hidden = true;
+      experimentalMediaCanvas.setAttribute('aria-hidden', 'true');
+    }
+    if (experimentalMediaHDRSwitcher) experimentalMediaHDRSwitcher.clear();
+    experimentalMediaHDRReplacementFailures = 0;
+    if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
+  }
+
+  function closeExperimentalMedia(options) {
+    options = options || {};
+    const socket = experimentalMediaSocket;
+    experimentalMediaSocket = null;
+    experimentalMediaConfigureGeneration += 1;
+    experimentalMediaDecoderGeneration += 1;
+    experimentalMediaHDRRenderGeneration += 1;
+    if (experimentalMediaDecoder) {
+      try { experimentalMediaDecoder.close(); } catch (_) {}
+      experimentalMediaDecoder = null;
+    }
+    experimentalMediaConfig = null;
+    experimentalMediaEpoch = 0;
+    experimentalMediaSequence = 0;
+    experimentalMediaNeedsKeyframe = true;
+    experimentalMediaSps = null;
+    experimentalMediaPps = null;
+    experimentalMediaDescription = null;
+    experimentalMediaPipeline = '';
+    experimentalMediaHDREnabledAt = 0;
+    experimentalMediaHDRFirstShown = false;
+    experimentalMediaHDRShownFrames = 0;
+    experimentalMediaHDRReplacementFailures = 0;
+    hideExperimentalMediaCanvas();
+    if (socket) {
+      try { socket.close(1000, 'experimental_media_closed'); } catch (_) {}
+    }
+    if (!options.keepEnabled) experimentalMediaState.enabled = false;
+    setExperimentalMediaStatus(options.status || 'Izslēgts');
+  }
+
+  function failExperimentalMedia(reason) {
+    clientLog('experimental_media_fallback', safeString(reason).slice(0, 180));
+    closeExperimentalMedia({ status: 'Parastā straume — eksperiments nav pieejams.' });
+  }
+
+  function parseExperimentalFrameEnvelope(raw) {
+    if (!(raw instanceof ArrayBuffer) || raw.byteLength < FRAME_ENVELOPE_HEADER_BYTES) return null;
+    const view = new DataView(raw);
+    if (view.getUint32(0) !== FRAME_ENVELOPE_MAGIC) return null;
+    const flags = view.getUint8(4);
+    return {
+      kind: (flags & 1) === 1 ? 'key' : 'delta',
+      epoch: readUint64(view, 5),
+      sequence: readUint64(view, 13),
+      timestamp: readUint64(view, 21),
+      data: new Uint8Array(raw).slice(FRAME_ENVELOPE_HEADER_BYTES)
+    };
+  }
+
+  function rememberExperimentalParameterSets(units) {
+    for (const unit of units || []) {
+      if (!unit.length) continue;
+      const type = unit[0] & 0x1f;
+      if (type === 7) experimentalMediaSps = unit;
+      if (type === 8) experimentalMediaPps = unit;
+    }
+    if (!experimentalMediaDescription && experimentalMediaSps && experimentalMediaPps) {
+      experimentalMediaDescription = avcDescriptionFromParameterSets(experimentalMediaSps, experimentalMediaPps);
+    }
+    return experimentalMediaDescription;
+  }
+
+  function createExperimentalMediaDecoder(config, decoderConfig) {
+    const generation = ++experimentalMediaDecoderGeneration;
+    if (experimentalMediaDecoder) {
+      try { experimentalMediaDecoder.close(); } catch (_) {}
+    }
+    experimentalMediaDecoder = new VideoDecoder({
+      output: (frame) => {
+        if (generation !== experimentalMediaDecoderGeneration || !experimentalMediaState.enabled) {
+          try { frame.close(); } catch (_) {}
+          return;
+        }
+        try {
+          const preview = experimentalMediaCanvas && experimentalMediaCanvas.getContext('2d', { alpha: false });
+          if (!preview) throw new Error('preview canvas unavailable');
+          preview.filter = 'brightness(1.18) contrast(1.06) saturate(1.04)';
+          preview.drawImage(frame, 0, 0, experimentalMediaCanvas.width, experimentalMediaCanvas.height);
+          experimentalMediaCanvas.hidden = false;
+          experimentalMediaCanvas.setAttribute('aria-hidden', 'false');
+          if (document.body) document.body.dataset.experimentalMedia = 'bright-sdr-preview';
+          setExperimentalMediaStatus('Eksperimentālais spilgtuma priekšskatījums');
+        } catch (error) {
+          failExperimentalMedia(error && error.message || 'preview draw failed');
+        } finally {
+          try { frame.close(); } catch (_) {}
+        }
+      },
+      error: (error) => {
+        if (generation !== experimentalMediaDecoderGeneration) return;
+        failExperimentalMedia(error && error.message || 'preview decode failed');
+      }
+    });
+    experimentalMediaDecoder.configure(decoderConfig);
+    experimentalMediaConfig = config;
+  }
+
+  async function configureExperimentalMedia(config) {
+    if (!experimentalMediaState.enabled) return;
+    const configureGeneration = ++experimentalMediaConfigureGeneration;
+    const pipeline = String(config && config.experimentalPipeline || '');
+    const hdrGainMap = pipeline === 'iso-gainmap-keyframe-v1';
+    const brightSDR = pipeline === 'relay-copy-v1';
+    if (!config || (!brightSDR && !hdrGainMap)) {
+      throw new Error('experimental relay contract mismatch');
+    }
+    if (brightSDR && config.experimentalVisualMode !== 'bright-sdr-preview-v1') {
+	  throw new Error('experimental SDR visual contract mismatch');
+	}
+	if (hdrGainMap && (config.experimentalVisualMode !== 'hdr-gainmap-img-edr-v1' || config.transport !== 'independent-image' || config.mimeType !== 'image/jpeg')) {
+	  throw new Error('experimental HDR visual contract mismatch');
+	}
+    if (brightSDR && (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window))) {
+      throw new Error('WebCodecs unavailable');
+    }
+    const width = Number(config.width || 0);
+    const height = Number(config.height || 0);
+    const codec = String(config.codec || '');
+	if (!width || !height || (brightSDR && !codec.startsWith('avc1')) || (hdrGainMap && codec !== 'jpeg-iso-21496-gainmap')) {
+	  throw new Error('experimental media config invalid');
+	}
+	experimentalMediaHDRRenderGeneration += 1;
+	hideExperimentalMediaCanvas();
+	experimentalMediaPipeline = pipeline;
+    experimentalMediaEpoch = Number(config.streamEpoch || 0);
+    experimentalMediaSequence = 0;
+    experimentalMediaNeedsKeyframe = true;
+    experimentalMediaSps = null;
+    experimentalMediaPps = null;
+    experimentalMediaDescription = null;
+    if (experimentalMediaCanvas) {
+      experimentalMediaCanvas.width = width;
+      experimentalMediaCanvas.height = height;
+    }
+    if (experimentalMediaHDRSwitcher) experimentalMediaHDRSwitcher.setDimensions(width, height);
+	if (hdrGainMap) {
+	  experimentalMediaConfig = config;
+	  setExperimentalMediaStatus('Gaida HDR attēlu…');
+	  return;
+	}
+    if (isAppleWebKit()) {
+      if (experimentalMediaDecoder) {
+        experimentalMediaDecoderGeneration += 1;
+        try { experimentalMediaDecoder.close(); } catch (_) {}
+        experimentalMediaDecoder = null;
+      }
+      experimentalMediaConfig = config;
+      setExperimentalMediaStatus('Gaida eksperimentālo kadru…');
+      return;
+    }
+    const decoderConfig = { codec, codedWidth: width, codedHeight: height, avc: { format: 'annexb' }, optimizeForLatency: true };
+    const support = await VideoDecoder.isConfigSupported(decoderConfig);
+    if (configureGeneration !== experimentalMediaConfigureGeneration || !experimentalMediaState.enabled) return;
+    if (!support || !support.supported) throw new Error('experimental H.264 decoder unsupported');
+    createExperimentalMediaDecoder(config, decoderConfig);
+    setExperimentalMediaStatus('Gaida eksperimentālo kadru…');
+  }
+
+  async function renderExperimentalHDRFrame(frame) {
+    if (!experimentalMediaHDRSwitcher || frame.kind !== 'key') throw new Error('HDR image frame invalid');
+    const generation = ++experimentalMediaHDRRenderGeneration;
+    const decodeStartedAt = performance.now();
+    const result = await experimentalMediaHDRSwitcher.present(
+      new Blob([frame.data], { type: 'image/jpeg' }),
+      {
+        isCurrent: () => generation === experimentalMediaHDRRenderGeneration &&
+          experimentalMediaState.enabled &&
+          experimentalMediaPipeline === 'iso-gainmap-keyframe-v1'
+      }
+    );
+    if (result.status === 'stale') return;
+    const replacementDecision = advanceExperimentalHDRReplacementFailure(
+      experimentalMediaHDRReplacementFailures,
+      result.status,
+      experimentalMediaHDRSwitcher.hasActive(),
+      experimentalMediaHDRMaxConsecutiveReplacementFailures
+    );
+    experimentalMediaHDRReplacementFailures = replacementDecision.failures;
+    if (result.status === 'failed') {
+      if (!replacementDecision.fallback) return;
+      throw result.error || new Error('HDR replacement decode failed');
+    }
+    if (experimentalMediaCanvas) experimentalMediaCanvas.hidden = true;
+    if (document.body) document.body.dataset.experimentalMedia = 'hdr-gainmap-preview';
+    setExperimentalMediaStatus('HDR attēla priekšskatījums');
+    const shownAt = performance.now();
+    const decodeMillis = Math.max(0, Math.round(shownAt - decodeStartedAt));
+    experimentalMediaHDRShownFrames += 1;
+    if (!experimentalMediaHDRFirstShown) {
+      experimentalMediaHDRFirstShown = true;
+      const firstShownMillis = experimentalMediaHDREnabledAt > 0 ? Math.max(0, Math.round(shownAt - experimentalMediaHDREnabledAt)) : 0;
+      clientHDRMeasurement('experimental_hdr_first_image_shown', firstShownMillis, decodeMillis);
+    } else if (experimentalMediaHDRShownFrames % 30 === 0) {
+      clientHDRMeasurement('experimental_hdr_decode_sample', undefined, decodeMillis);
+    }
+  }
+
+  async function decodeExperimentalMediaFrame(raw) {
+    if (!experimentalMediaState.enabled || !experimentalMediaConfig) return;
+    const frame = parseExperimentalFrameEnvelope(raw);
+    if (!frame || !frame.epoch || !frame.sequence) throw new Error('experimental frame invalid');
+    if (experimentalMediaEpoch && frame.epoch !== experimentalMediaEpoch) {
+      hideExperimentalMediaCanvas();
+      experimentalMediaNeedsKeyframe = true;
+      return;
+    }
+    if (frame.sequence <= experimentalMediaSequence) return;
+    if (experimentalMediaPipeline === 'iso-gainmap-keyframe-v1') {
+	  if (frame.kind !== 'key') throw new Error('HDR preview requires an independent image');
+	  experimentalMediaSequence = frame.sequence;
+	  await renderExperimentalHDRFrame(frame);
+	  return;
+	}
+    if (frame.kind !== 'key' && (experimentalMediaNeedsKeyframe || (experimentalMediaSequence && frame.sequence !== experimentalMediaSequence + 1))) {
+      hideExperimentalMediaCanvas();
+      experimentalMediaNeedsKeyframe = true;
+      setExperimentalMediaStatus('Parastā straume — gaida eksperimentālo atslēgkadru…');
+      return;
+    }
+    if (frame.kind === 'key') experimentalMediaNeedsKeyframe = false;
+    experimentalMediaSequence = frame.sequence;
+    let data = frame.data;
+    if (isAppleWebKit()) {
+      const converted = annexBToAvcSample(frame.data);
+      if (!converted) throw new Error('experimental AVC conversion failed');
+      if (frame.kind === 'key') rememberExperimentalParameterSets(converted.units);
+      if (!experimentalMediaDecoder) {
+        if (frame.kind !== 'key' || !experimentalMediaDescription) {
+          experimentalMediaNeedsKeyframe = true;
+          return;
+        }
+        createExperimentalMediaDecoder(experimentalMediaConfig, {
+          codec: String(experimentalMediaConfig.codec || 'avc1.42C028'),
+          codedWidth: Number(experimentalMediaConfig.width || 0),
+          codedHeight: Number(experimentalMediaConfig.height || 0),
+          description: experimentalMediaDescription,
+          optimizeForLatency: true
+        });
+      }
+      data = converted.sample;
+    }
+    if (!experimentalMediaDecoder) throw new Error('experimental decoder unavailable');
+    experimentalMediaDecoder.decode(new EncodedVideoChunk({ type: frame.kind, timestamp: frame.timestamp, data }));
+  }
+
+  function connectExperimentalMedia() {
+    if (!experimentalMediaState.enabled || experimentalMediaSocket) return;
+    hideExperimentalMediaCanvas();
+    setExperimentalMediaStatus('Savieno eksperimentālo straumi…');
+    const socket = safeWebSocket(experimentalMediaURL(), 'experimental-media', ['ticket.experimental-media.v1']);
+    if (!socket) {
+      failExperimentalMedia('experimental socket unavailable');
+      return;
+    }
+    experimentalMediaSocket = socket;
+    experimentalMediaMessageChain = Promise.resolve();
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
+      if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
+        setExperimentalMediaStatus('Gaida eksperimentālo straumi…');
+      }
+    };
+    socket.onmessage = (event) => {
+      experimentalMediaMessageChain = experimentalMediaMessageChain.then(async () => {
+        if (experimentalMediaSocket !== socket || !experimentalMediaState.enabled) return;
+        if (typeof event.data === 'string') {
+          const message = JSON.parse(event.data);
+          if (message.type === 'config') await configureExperimentalMedia(message);
+          return;
+        }
+        await decodeExperimentalMediaFrame(event.data);
+      }).catch((error) => {
+        if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
+          failExperimentalMedia(error && error.message || 'experimental media failed');
+        }
+      });
+    };
+    socket.onerror = () => {
+      if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
+        failExperimentalMedia('experimental socket error');
+      }
+    };
+    socket.onclose = () => {
+      if (experimentalMediaSocket !== socket) return;
+      experimentalMediaSocket = null;
+      if (experimentalMediaState.enabled) failExperimentalMedia('experimental socket closed');
+    };
+  }
+
+  function mountExperimentalMediaControl() {
+    if (!experimentalMediaMount || experimentalMediaMounted) return;
+    experimentalMediaMount.hidden = false;
+    experimentalMediaMount.textContent = '';
+    html`
+      <section class="experimental-media-control" aria-label="Eksperimentāls video skats">
+        <label class="experimental-media-toggle">
+          <input id="experimentalMediaToggle" type="checkbox" checked="${() => experimentalMediaState.enabled}">
+          <span>${() => experimentalMediaState.label}</span>
+        </label>
+        <p class="experimental-media-detail" aria-live="polite">${() => experimentalMediaState.status}</p>
+        <p class="experimental-media-detail" data-hdr-preference-status>${() => experimentalMediaState.preferenceStatus}</p>
+      </section>
+    `(experimentalMediaMount);
+    const toggle = document.getElementById('experimentalMediaToggle');
+    if (toggle) {
+      toggle.addEventListener('change', () => {
+        experimentalMediaPreferenceController.choose(Boolean(toggle.checked));
+      });
+    }
+    experimentalMediaMounted = true;
+  }
+
+  async function probeExperimentalHDRFixture(url) {
+	if (!experimentalMediaHDRImage || !url) return false;
+	if (!window.matchMedia || !window.matchMedia('(dynamic-range: high)').matches) return false;
+	if (!window.CSS || typeof CSS.supports !== 'function' || !CSS.supports('dynamic-range-limit', 'no-limit')) return false;
+	const response = await fetch(url, { cache: 'no-store' });
+	if (!response.ok || response.headers.get('Content-Type') !== 'image/jpeg') return false;
+	const blob = await response.blob();
+	const objectURL = URL.createObjectURL(blob);
+	const probe = new Image();
+	probe.style.setProperty('dynamic-range-limit', 'no-limit');
+	probe.src = objectURL;
+	try {
+	  await probe.decode();
+	  return probe.naturalWidth > 0 && probe.naturalHeight > 0;
+	} finally {
+	  URL.revokeObjectURL(objectURL);
+	}
+  }
+
+  async function discoverExperimentalMediaCapability() {
+    if (!experimentalMediaMount || !experimentalMediaCanvas || !experimentalMediaHDRSwitcher) return;
+    try {
+      const response = await fetch('/api/v1/experimental-media/capability', { cache: 'no-store' });
+      const payload = await response.json().catch(() => ({}));
+	  if (!response.ok || !payload.allowed) return;
+	  if (payload.requiresHDR === true) {
+		if (payload.pipelineVersion !== 'iso-gainmap-keyframe-v1' || payload.visualMode !== 'hdr-gainmap-img-edr-v1' || payload.mimeType !== 'image/jpeg') return;
+		if (!await probeExperimentalHDRFixture(payload.fixtureURL)) return;
+		experimentalMediaState.label = 'HDR skats (eksperimentāls)';
+	  } else if (payload.pipelineVersion !== 'relay-copy-v1') {
+		return;
+	  }
+      experimentalMediaCapabilityReady = true;
+      mountExperimentalMediaControl();
+      applyExperimentalMediaPreference(experimentalMediaPreferenceController.enabled);
+    } catch (_) {
+      // Fail closed: no authenticated capability response means no visible control.
+    }
+  }
+
+  if (cfg.experimentalMediaCandidate === true) discoverExperimentalMediaCapability();
+
   const publicMessageTranslations = new Map([
     ['Ticket server is starting', 'Biļetes serveris startējas'],
     ['Ticket server is stopped', 'Biļetes serveris ir apturēts'],
@@ -1095,6 +1558,23 @@ import {
 
   function clientLog(event, detail) {
     reportClientFault(event, detail);
+  }
+
+  function clientHDRMeasurement(event, firstShownMillis, decodeMillis) {
+    const detail = {
+      pageVersion,
+      assetVersion,
+      visibility: document.visibilityState,
+      webCodecs: 'VideoDecoder' in window
+    };
+    if (Number.isFinite(firstShownMillis)) detail.firstShownMillis = Math.max(0, Math.round(firstShownMillis));
+    if (Number.isFinite(decodeMillis)) detail.decodeMillis = Math.max(0, Math.round(decodeMillis));
+    enqueueClientLog({
+      level: 'info',
+      event: String(event || '').slice(0, 80),
+      detailJson: safeString(detail).slice(0, 1000),
+      at: Date.now()
+    });
   }
 
   const navigationEntry = performance.getEntriesByType('navigation')[0];
@@ -3005,11 +3485,15 @@ import {
         ticketId: cfg.ticketId || 'vivi-default',
         backendId: cfg.backendId || 'pixel',
         sessionId: cfg.sessionId || '',
-        email: cfg.email || ''
+        email: cfg.email || '',
+        accountScopeId: cfg.accountScopeId || ''
       }, {
         onState: (state) => {
           currentState = state;
           rememberServerClock(currentState);
+          if (spacetimeStateFresh) {
+            experimentalMediaPreferenceController.observe(state && state.memberHDR ? state.memberHDR.enabled : null);
+          }
           renderState();
         },
         onSnapshotApplied: () => {
@@ -3017,6 +3501,10 @@ import {
         },
         onStatus: (status, detail) => {
           if (client !== spacetimeClient) return;
+          if (status === 'hdr_refresh_failed') {
+            clientLog('state_failed', 'hdr_preference_refresh_failed');
+            return;
+          }
           if (status === 'connecting' || status === 'reconnecting' || status === 'offline') {
             markSpacetimeStateUnconfirmed(`spacetime_${status}`);
           }
@@ -5047,7 +5535,7 @@ import {
     ticketRegisterOverlay.hidden = false;
     ticketRegisterOverlay.dataset.registrationState = 'ready';
     ticketRegisterOverlay.removeAttribute('aria-busy');
-    ticketLocalRegisterSlider.setAttribute('aria-label', 'Pavelc vismaz ceturtdaļu, lai reģistrētu atvērto biļeti');
+    ticketLocalRegisterSlider.setAttribute('aria-label', 'Turi un velc pa labi vismaz ceturtdaļu vai līdz galam, lai reģistrētu atvērto biļeti');
     ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight);
     controlCodeHotspot.style.pointerEvents = 'none';
     const expiresAt = Date.parse(String(region.expiresAt || ''));
@@ -5623,8 +6111,15 @@ import {
   }
 
   ticketLocalRegisterSlider.addEventListener('pointerdown', (event) => {
-    if (ticketLocalRegisterSliderState.inFlight || event.isPrimary === false ||
-      (event.pointerType === 'mouse' && event.button !== 0)) return;
+    if (ticketLocalRegisterSliderState.inFlight) return;
+    if (event.isPrimary === false) {
+      cancelTicketRegisterSliderSession('secondary_pointer_down');
+      return;
+    }
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      cancelTicketRegisterSliderSession('non_primary_mouse_button');
+      return;
+    }
     const snapshot = currentTicketRegisterSliderProof(currentState);
     const sliderRect = ticketLocalRegisterSlider.getBoundingClientRect();
     if (!beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
@@ -6286,7 +6781,10 @@ import {
 	  }
 
   window.addEventListener('resize', resizeCanvasBox);
-  window.addEventListener('scroll', updateDetailsReveal, { passive: true });
+  window.addEventListener('scroll', () => {
+    cancelTicketRegisterSliderSession('window_scrolled');
+    updateDetailsReveal();
+  }, { passive: true });
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', resizeCanvasBox);
     window.visualViewport.addEventListener('scroll', resizeCanvasBox);
@@ -6294,6 +6792,9 @@ import {
   document.addEventListener('visibilitychange', () => {
     scheduleStreamFeedback('visibility_change');
     if (document.visibilityState === 'visible') {
+	      if (typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled && typeof connectExperimentalMedia === 'function') {
+	        connectExperimentalMedia();
+	      }
 	      hiddenDecoderTransientLogged = false;
       refreshMemberLimitProjection('visibility_resume_limit_refresh');
       ticketCurrentProofVisualState.resumePending = true;
@@ -6304,6 +6805,9 @@ import {
       }
       recoverAfterVisibilityResume('visibility_resume');
 	    } else if (document.visibilityState === 'hidden') {
+	      if (typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled && typeof closeExperimentalMedia === 'function') {
+	        closeExperimentalMedia({ keepEnabled: true, status: 'Eksperimentālais skats apturēts fonā.' });
+	      }
 	      hiddenDecoderTransientLogged = false;
 	      const flow = pauseActivationResumeLifecycle('visibility_hidden', 'visibility_hidden');
 	      logResumeCheckpoint('activation_visibility_hidden', { reason: 'hidden' }, flow);
@@ -6341,6 +6845,10 @@ import {
 	    followActivationResumeLifecycle('focus', 'focus');
 	  });
 	  window.addEventListener('pagehide', (event) => {
+	    if (typeof closeExperimentalMedia === 'function') closeExperimentalMedia({
+	      keepEnabled: Boolean(event && event.persisted),
+	      status: event && event.persisted ? 'Eksperimentālais skats apturēts fonā.' : 'Izslēgts'
+	    });
 	    const flow = pauseActivationResumeLifecycle(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide');
 	    logResumeCheckpoint('activation_pagehide', {
 	      cache: resumeBooleanLabel(Boolean(event && event.persisted))

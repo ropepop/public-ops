@@ -41,11 +41,15 @@ pub mod ticketremote_member_claim_ticket_slider_reducer;
 pub mod ticketremote_member_claim_ticket_slider_v_2_reducer;
 pub mod ticketremote_member_close_control_code_reducer;
 pub mod ticketremote_member_confirm_control_code_browser_capture_reducer;
+pub mod ticketremote_member_hdr_preference_type;
+pub mod ticketremote_member_hdr_state_table;
+pub mod ticketremote_member_hdr_state_type;
 pub mod ticketremote_member_limit_event_type;
 pub mod ticketremote_member_limit_preference_type;
 pub mod ticketremote_member_limit_state_table;
 pub mod ticketremote_member_limit_state_type;
 pub mod ticketremote_member_recover_stream_reducer;
+pub mod ticketremote_member_refresh_hdr_state_reducer;
 pub mod ticketremote_member_refresh_limit_state_reducer;
 pub mod ticketremote_member_remove_member_reducer;
 pub mod ticketremote_member_request_control_code_reducer;
@@ -53,6 +57,7 @@ pub mod ticketremote_member_request_keyframe_reducer;
 pub mod ticketremote_member_request_ticket_action_v_3_reducer;
 pub mod ticketremote_member_request_ticket_reset_reducer;
 pub mod ticketremote_member_request_ticket_reset_v_2_reducer;
+pub mod ticketremote_member_set_hdr_preference_reducer;
 pub mod ticketremote_member_set_limit_preference_reducer;
 pub mod ticketremote_member_set_stream_focus_reducer;
 pub mod ticketremote_member_update_ticket_slider_reducer;
@@ -147,11 +152,15 @@ pub use ticketremote_member_claim_ticket_slider_reducer::ticketremote_member_cla
 pub use ticketremote_member_claim_ticket_slider_v_2_reducer::ticketremote_member_claim_ticket_slider_v_2;
 pub use ticketremote_member_close_control_code_reducer::ticketremote_member_close_control_code;
 pub use ticketremote_member_confirm_control_code_browser_capture_reducer::ticketremote_member_confirm_control_code_browser_capture;
+pub use ticketremote_member_hdr_preference_type::TicketremoteMemberHdrPreference;
+pub use ticketremote_member_hdr_state_table::*;
+pub use ticketremote_member_hdr_state_type::TicketremoteMemberHdrState;
 pub use ticketremote_member_limit_event_type::TicketremoteMemberLimitEvent;
 pub use ticketremote_member_limit_preference_type::TicketremoteMemberLimitPreference;
 pub use ticketremote_member_limit_state_table::*;
 pub use ticketremote_member_limit_state_type::TicketremoteMemberLimitState;
 pub use ticketremote_member_recover_stream_reducer::ticketremote_member_recover_stream;
+pub use ticketremote_member_refresh_hdr_state_reducer::ticketremote_member_refresh_hdr_state;
 pub use ticketremote_member_refresh_limit_state_reducer::ticketremote_member_refresh_limit_state;
 pub use ticketremote_member_remove_member_reducer::ticketremote_member_remove_member;
 pub use ticketremote_member_request_control_code_reducer::ticketremote_member_request_control_code;
@@ -159,6 +168,7 @@ pub use ticketremote_member_request_keyframe_reducer::ticketremote_member_reques
 pub use ticketremote_member_request_ticket_action_v_3_reducer::ticketremote_member_request_ticket_action_v_3;
 pub use ticketremote_member_request_ticket_reset_reducer::ticketremote_member_request_ticket_reset;
 pub use ticketremote_member_request_ticket_reset_v_2_reducer::ticketremote_member_request_ticket_reset_v_2;
+pub use ticketremote_member_set_hdr_preference_reducer::ticketremote_member_set_hdr_preference;
 pub use ticketremote_member_set_limit_preference_reducer::ticketremote_member_set_limit_preference;
 pub use ticketremote_member_set_stream_focus_reducer::ticketremote_member_set_stream_focus;
 pub use ticketremote_member_update_ticket_slider_reducer::ticketremote_member_update_ticket_slider;
@@ -371,6 +381,9 @@ pub enum Reducer {
         backend_id: String,
         reason: String,
     },
+    TicketremoteMemberRefreshHdrState {
+        ticket_id: String,
+    },
     TicketremoteMemberRefreshLimitState {
         ticket_id: String,
     },
@@ -414,6 +427,10 @@ pub enum Reducer {
         reset_request_id: String,
         reason: String,
         attempt_id: String,
+    },
+    TicketremoteMemberSetHdrPreference {
+        ticket_id: String,
+        enabled: bool,
     },
     TicketremoteMemberSetLimitPreference {
         ticket_id: String,
@@ -703,6 +720,9 @@ impl __sdk::Reducer for Reducer {
                 "ticketremote_member_confirm_control_code_browser_capture"
             }
             Reducer::TicketremoteMemberRecoverStream { .. } => "ticketremote_member_recover_stream",
+            Reducer::TicketremoteMemberRefreshHdrState { .. } => {
+                "ticketremote_member_refresh_hdr_state"
+            }
             Reducer::TicketremoteMemberRefreshLimitState { .. } => {
                 "ticketremote_member_refresh_limit_state"
             }
@@ -721,6 +741,9 @@ impl __sdk::Reducer for Reducer {
             }
             Reducer::TicketremoteMemberRequestTicketResetV2 { .. } => {
                 "ticketremote_member_request_ticket_reset_v2"
+            }
+            Reducer::TicketremoteMemberSetHdrPreference { .. } => {
+                "ticketremote_member_set_hdr_preference"
             }
             Reducer::TicketremoteMemberSetLimitPreference { .. } => {
                 "ticketremote_member_set_limit_preference"
@@ -1059,6 +1082,11 @@ impl __sdk::Reducer for Reducer {
                 backend_id: backend_id.clone(),
                 reason: reason.clone(),
 }),
+            Reducer::TicketremoteMemberRefreshHdrState{
+                ticket_id,
+}             => __sats::bsatn::to_vec(&ticketremote_member_refresh_hdr_state_reducer::TicketremoteMemberRefreshHdrStateArgs {
+                ticket_id: ticket_id.clone(),
+}),
             Reducer::TicketremoteMemberRefreshLimitState{
                 ticket_id,
 }             => __sats::bsatn::to_vec(&ticketremote_member_refresh_limit_state_reducer::TicketremoteMemberRefreshLimitStateArgs {
@@ -1139,6 +1167,13 @@ impl __sdk::Reducer for Reducer {
                 reset_request_id: reset_request_id.clone(),
                 reason: reason.clone(),
                 attempt_id: attempt_id.clone(),
+}),
+            Reducer::TicketremoteMemberSetHdrPreference{
+                ticket_id,
+                enabled,
+}             => __sats::bsatn::to_vec(&ticketremote_member_set_hdr_preference_reducer::TicketremoteMemberSetHdrPreferenceArgs {
+                ticket_id: ticket_id.clone(),
+                enabled: enabled.clone(),
 }),
             Reducer::TicketremoteMemberSetLimitPreference{
                 ticket_id,
@@ -1597,6 +1632,7 @@ pub struct DbUpdate {
     ticketremote_control_code_fast_state: __sdk::TableUpdate<TicketremoteControlCodeFastState>,
     ticketremote_control_code_request: __sdk::TableUpdate<TicketremoteControlCodeRequest>,
     ticketremote_latency_link_v_1: __sdk::TableUpdate<TicketremoteLatencyLinkV1>,
+    ticketremote_member_hdr_state: __sdk::TableUpdate<TicketremoteMemberHdrState>,
     ticketremote_member_limit_state: __sdk::TableUpdate<TicketremoteMemberLimitState>,
     ticketremote_phone_current_report: __sdk::TableUpdate<TicketremotePhoneCurrentReport>,
     ticketremote_relay_current_report: __sdk::TableUpdate<TicketremoteRelayCurrentReport>,
@@ -1626,6 +1662,7 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
     "ticketremote_control_code_fast_state" => db_update.ticketremote_control_code_fast_state.append(ticketremote_control_code_fast_state_table::parse_table_update(table_update)?),
     "ticketremote_control_code_request" => db_update.ticketremote_control_code_request.append(ticketremote_control_code_request_table::parse_table_update(table_update)?),
     "ticketremote_latency_link_v1" => db_update.ticketremote_latency_link_v_1.append(ticketremote_latency_link_v_1_table::parse_table_update(table_update)?),
+    "ticketremote_member_hdr_state" => db_update.ticketremote_member_hdr_state.append(ticketremote_member_hdr_state_table::parse_table_update(table_update)?),
     "ticketremote_member_limit_state" => db_update.ticketremote_member_limit_state.append(ticketremote_member_limit_state_table::parse_table_update(table_update)?),
     "ticketremote_phone_current_report" => db_update.ticketremote_phone_current_report.append(ticketremote_phone_current_report_table::parse_table_update(table_update)?),
     "ticketremote_relay_current_report" => db_update.ticketremote_relay_current_report.append(ticketremote_relay_current_report_table::parse_table_update(table_update)?),
@@ -1693,6 +1730,12 @@ impl __sdk::DbUpdate for DbUpdate {
             .apply_diff_to_table::<TicketremoteLatencyLinkV1>(
                 "ticketremote_latency_link_v1",
                 &self.ticketremote_latency_link_v_1,
+            )
+            .with_updates_by_pk(|row| &row.id);
+        diff.ticketremote_member_hdr_state = cache
+            .apply_diff_to_table::<TicketremoteMemberHdrState>(
+                "ticketremote_member_hdr_state",
+                &self.ticketremote_member_hdr_state,
             )
             .with_updates_by_pk(|row| &row.id);
         diff.ticketremote_member_limit_state = cache
@@ -1801,6 +1844,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_latency_link_v1" => db_update
                     .ticketremote_latency_link_v_1
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "ticketremote_member_hdr_state" => db_update
+                    .ticketremote_member_hdr_state
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "ticketremote_member_limit_state" => db_update
                     .ticketremote_member_limit_state
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
@@ -1871,6 +1917,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "ticketremote_latency_link_v1" => db_update
                     .ticketremote_latency_link_v_1
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "ticketremote_member_hdr_state" => db_update
+                    .ticketremote_member_hdr_state
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "ticketremote_member_limit_state" => db_update
                     .ticketremote_member_limit_state
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -1935,6 +1984,7 @@ pub struct AppliedDiff<'r> {
         __sdk::TableAppliedDiff<'r, TicketremoteControlCodeFastState>,
     ticketremote_control_code_request: __sdk::TableAppliedDiff<'r, TicketremoteControlCodeRequest>,
     ticketremote_latency_link_v_1: __sdk::TableAppliedDiff<'r, TicketremoteLatencyLinkV1>,
+    ticketremote_member_hdr_state: __sdk::TableAppliedDiff<'r, TicketremoteMemberHdrState>,
     ticketremote_member_limit_state: __sdk::TableAppliedDiff<'r, TicketremoteMemberLimitState>,
     ticketremote_phone_current_report: __sdk::TableAppliedDiff<'r, TicketremotePhoneCurrentReport>,
     ticketremote_relay_current_report: __sdk::TableAppliedDiff<'r, TicketremoteRelayCurrentReport>,
@@ -1989,6 +2039,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<TicketremoteLatencyLinkV1>(
             "ticketremote_latency_link_v1",
             &self.ticketremote_latency_link_v_1,
+            event,
+        );
+        callbacks.invoke_table_row_callbacks::<TicketremoteMemberHdrState>(
+            "ticketremote_member_hdr_state",
+            &self.ticketremote_member_hdr_state,
             event,
         );
         callbacks.invoke_table_row_callbacks::<TicketremoteMemberLimitState>(
@@ -2726,6 +2781,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         ticketremote_control_code_fast_state_table::register_table(client_cache);
         ticketremote_control_code_request_table::register_table(client_cache);
         ticketremote_latency_link_v_1_table::register_table(client_cache);
+        ticketremote_member_hdr_state_table::register_table(client_cache);
         ticketremote_member_limit_state_table::register_table(client_cache);
         ticketremote_phone_current_report_table::register_table(client_cache);
         ticketremote_relay_current_report_table::register_table(client_cache);
@@ -2747,6 +2803,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "ticketremote_control_code_fast_state",
         "ticketremote_control_code_request",
         "ticketremote_latency_link_v1",
+        "ticketremote_member_hdr_state",
         "ticketremote_member_limit_state",
         "ticketremote_phone_current_report",
         "ticketremote_relay_current_report",

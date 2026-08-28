@@ -1,8 +1,11 @@
-.PHONY: test build tidy spacetime-install spacetime-build spacetime-test activation-report spacetime-sidecar-bindings spacetime-sidecar-bindings-check spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build docker-image-build clean-local
+.PHONY: test build tidy spacetime-install spacetime-build spacetime-test activation-report spacetime-sidecar-bindings spacetime-sidecar-bindings-check spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build hdr-lab docker-image-build clean-local
 
 SPACETIME ?= $(HOME)/.local/bin/spacetime
 
 test: spacetime-sidecar-bindings-check spacetime-test
+	cd ./web-client && npm run test:experimental-hdr
+	cd ./web-client && npm run test:experimental-hdr-preference
+	cd ./web-client && npm run test:ticket-actions-v3
 	go test ./...
 	cd ./spacetime-sidecar && cargo test
 
@@ -44,6 +47,9 @@ web-client-install:
 
 web-client-build:
 	cd ./web-client && PATH="$(HOME)/.local/bin:$(PATH)" npm run build
+
+hdr-lab:
+	./hdr-lab/generate_fixture.sh
 
 docker-image-build:
 	docker build -f ../../infra/arbuzas/docker/images/ticket-remote.Dockerfile -t arbuzas/ticket-remote:dev ../../

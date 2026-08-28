@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark">
+    <title>Ticket synthetic Ultra HDR lab</title>
+    <style>
+      :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #08090b; color: #f4f6f8; }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: max(20px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom)); }
+      main { max-width: 1040px; margin: auto; }
+      h1 { margin: 0 0 6px; font-size: clamp(1.55rem, 5vw, 2.5rem); }
+      p { color: #c4c9d0; }
+      .notice { border: 1px solid #4b5360; border-radius: 12px; padding: 12px 14px; background: #11151a; }
+      .comparison { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); margin-top: 20px; }
+      figure { margin: 0; border: 1px solid #343a43; border-radius: 14px; overflow: hidden; background: #101318; }
+      img { display: block; width: 100%; height: auto; background: #050608; }
+      .standard img { dynamic-range-limit: standard; }
+      .no-limit img { dynamic-range-limit: no-limit; }
+      figcaption { padding: 11px 13px 13px; }
+      figcaption strong { display: block; }
+      figcaption span { color: #aab1bb; font-size: .9rem; }
+      dl { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(8rem, 2fr); gap: 7px 14px; padding: 14px; border-radius: 12px; background: #11151a; }
+      dt { color: #9ca5b1; }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      code { font-size: .88em; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Synthetic Ultra HDR comparison</h1>
+      <p class="notice">This page uses one synthetic ISO 21496-1 gain-map JPEG in two direct <code>&lt;img&gt;</code> elements. It contains no Ticket or user pixels. A screenshot cannot prove EDR luminance, and this page cannot move the device brightness slider.</p>
+
+      <section class="comparison" aria-label="Dynamic range comparison">
+        <figure class="standard">
+          <img id="standard-image" src="assets/synthetic-ultrahdr-4x.jpg" alt="Synthetic HDR test chart, limited to standard dynamic range" decoding="async">
+          <figcaption><strong>Standard</strong><span><code>dynamic-range-limit: standard</code></span></figcaption>
+        </figure>
+        <figure class="no-limit">
+          <img id="no-limit-image" src="assets/synthetic-ultrahdr-4x.jpg" alt="Synthetic HDR test chart, with no author dynamic-range limit" decoding="async">
+          <figcaption><strong>No author limit</strong><span><code>dynamic-range-limit: no-limit</code></span></figcaption>
+        </figure>
+      </section>
+
+      <h2>Runtime diagnostics</h2>
+      <dl id="diagnostics" aria-live="polite"><dt>Status</dt><dd>Measuring image decode…</dd></dl>
+    </main>
+    <script>
+      (() => {
+        const diagnostics = document.querySelector('#diagnostics');
+        const rows = [];
+        const add = (name, value) => rows.push([name, String(value)]);
+        const yesNo = value => value ? 'yes' : 'no';
+
+        add('High dynamic-range media query', yesNo(matchMedia('(dynamic-range: high)').matches));
+        add('Display P3 media query', yesNo(matchMedia('(color-gamut: p3)').matches));
+        add('dynamic-range-limit: no-limit', yesNo(CSS.supports('dynamic-range-limit', 'no-limit')));
+        add('Image decode API', yesNo('decode' in HTMLImageElement.prototype));
+        add('Screen color depth', `${screen.colorDepth} bits`);
+        add('Device pixel ratio', devicePixelRatio);
+        add('User agent', navigator.userAgent);
+
+        const decode = async image => {
+          const started = performance.now();
+          try {
+            await image.decode();
+            return `${(performance.now() - started).toFixed(2)} ms (${image.naturalWidth}×${image.naturalHeight})`;
+          } catch (error) {
+            return `failed: ${error.name || 'decode error'}`;
+          }
+        };
+
+        Promise.all([
+          decode(document.querySelector('#standard-image')),
+          decode(document.querySelector('#no-limit-image')),
+        ]).then(([standard, noLimit]) => {
+          add('Standard image decode', standard);
+          add('No-limit image decode', noLimit);
+          const resource = performance.getEntriesByName(document.querySelector('#no-limit-image').currentSrc).at(-1);
+          add('Transferred bytes', resource && resource.transferSize ? resource.transferSize : 'not exposed');
+          diagnostics.replaceChildren(...rows.flatMap(([name, value]) => {
+            const dt = document.createElement('dt');
+            const dd = document.createElement('dd');
+            dt.textContent = name;
+            dd.textContent = value;
+            return [dt, dd];
+          }));
+        });
+      })();
+    </script>
+  </body>
+</html>

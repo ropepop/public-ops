@@ -10,10 +10,12 @@ import TicketremoteAdminScheduleTicketActionV3Reducer from "../ticketremote_admi
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberRecoverStreamReducer from "../ticketremote_member_recover_stream_reducer";
+import TicketremoteMemberRefreshHdrStateReducer from "../ticketremote_member_refresh_hdr_state_reducer";
 import TicketremoteMemberRefreshLimitStateReducer from "../ticketremote_member_refresh_limit_state_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "../ticketremote_member_request_control_code_reducer";
 import TicketremoteMemberRequestKeyframeReducer from "../ticketremote_member_request_keyframe_reducer";
 import TicketremoteMemberRequestTicketActionV3Reducer from "../ticketremote_member_request_ticket_action_v_3_reducer";
+import TicketremoteMemberSetHdrPreferenceReducer from "../ticketremote_member_set_hdr_preference_reducer";
 import TicketremoteMemberSetLimitPreferenceReducer from "../ticketremote_member_set_limit_preference_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_stream_focus_reducer";
 
@@ -21,10 +23,12 @@ export type TicketremoteAdminScheduleTicketActionV3Params = __Infer<typeof Ticke
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
 export type TicketremoteMemberRecoverStreamParams = __Infer<typeof TicketremoteMemberRecoverStreamReducer>;
+export type TicketremoteMemberRefreshHdrStateParams = __Infer<typeof TicketremoteMemberRefreshHdrStateReducer>;
 export type TicketremoteMemberRefreshLimitStateParams = __Infer<typeof TicketremoteMemberRefreshLimitStateReducer>;
 export type TicketremoteMemberRequestControlCodeParams = __Infer<typeof TicketremoteMemberRequestControlCodeReducer>;
 export type TicketremoteMemberRequestKeyframeParams = __Infer<typeof TicketremoteMemberRequestKeyframeReducer>;
 export type TicketremoteMemberRequestTicketActionV3Params = __Infer<typeof TicketremoteMemberRequestTicketActionV3Reducer>;
+export type TicketremoteMemberSetHdrPreferenceParams = __Infer<typeof TicketremoteMemberSetHdrPreferenceReducer>;
 export type TicketremoteMemberSetLimitPreferenceParams = __Infer<typeof TicketremoteMemberSetLimitPreferenceReducer>;
 export type TicketremoteMemberSetStreamFocusParams = __Infer<typeof TicketremoteMemberSetStreamFocusReducer>;
 
