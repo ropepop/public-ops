@@ -35,6 +35,7 @@ import {
   ticketMemberLimitCountdown,
   ticketLocalRegisterSliderProofMatches,
   ticketLocalRegisterSliderProofSnapshot,
+  updateTicketLocalRegisterSliderPointerDirection,
   updateTicketMemberLimitClock,
   ticketActionV3ZonedLocalMillis,
   ticketSliderRegionV3ForAction,
@@ -522,218 +523,150 @@ test('slider session binds exact proof, stream epoch, frame, region, viewport, a
     'stale proof cancels the session');
 });
 
-test('pointer capture loss, blur, and incomplete release cancel without submission', () => {
+test('slider-local direction gate permanently reserves 45-degree movement for scrolling', () => {
   const snapshot = { proofActionId: 'proof-1' };
-  const state = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 8, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(cancelTicketLocalRegisterSliderSession(state, 9), false);
-  assert.equal(cancelTicketLocalRegisterSliderSession(state, 8), true, 'lost pointer capture cancels the matching pointer');
-  assert.equal(state.session, null);
+  const begin = (pointerId) => {
+    const state = { inFlight: false, session: null };
+    assert.equal(beginTicketLocalRegisterSliderSession(state, {
+      kind: 'pointer', pointerId, pointerStartClientX: 100, pointerStartClientY: 200,
+      pointerTrackLeftClientX: 0, pointerTrackWidth: 400, snapshot
+    }), true);
+    return state;
+  };
 
-  assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 10, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(state, {
-    pointerId: 10, pointerClientX: 199.6, progress: 99, proofMatches: true
-  }), null, 'an incomplete pointer release submits nothing');
-  assert.equal(state.session, null);
+  const right = begin(1);
+  assert.equal(updateTicketLocalRegisterSliderPointerDirection(right, {
+    pointerId: 1, pointerClientX: 108, pointerClientY: 207.9
+  }), 'slider', 'motion just inside 45 degrees stays a slider gesture');
 
-  assert.equal(beginTicketLocalRegisterSliderSession(state, { kind: 'keyboard', snapshot }), true);
-  assert.equal(cancelTicketLocalRegisterSliderSession(state), true, 'blur cancels a keyboard or assistive session');
+  const exactDiagonal = begin(2);
+  assert.equal(updateTicketLocalRegisterSliderPointerDirection(exactDiagonal, {
+    pointerId: 2, pointerClientX: 108, pointerClientY: 208
+  }), 'scroll', 'exactly 45 degrees is reserved for page scrolling');
+  assert.equal(updateTicketLocalRegisterSliderPointerDirection(exactDiagonal, {
+    pointerId: 2, pointerClientX: 140, pointerClientY: 200
+  }), 'inactive', 'a scroll decision is permanent for the gesture');
+  assert.equal(completeTicketLocalRegisterSliderSession(exactDiagonal, {
+    pointerId: 2, pointerClientX: 140, pointerClientY: 200, progress: 100, proofMatches: true
+  }), null, 'a rejected direction cannot later activate on a horizontal release');
+
+  const vertical = begin(3);
+  assert.equal(updateTicketLocalRegisterSliderPointerDirection(vertical, {
+    pointerId: 3, pointerClientX: 103, pointerClientY: 209
+  }), 'scroll');
+
+  const pending = begin(4);
+  assert.equal(updateTicketLocalRegisterSliderPointerDirection(pending, {
+    pointerId: 4, pointerClientX: 107, pointerClientY: 200
+  }), 'pending', 'sub-8px movement stays neutral');
 });
 
-test('pointer and keyboard completion share one 25% exactly-once gate', () => {
+test('pointer completion accepts 8px rightward from any start and keyboard still requires 25%', () => {
   const snapshot = { proofActionId: 'proof-1' };
-  const pointerState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(pointerState, {
-    kind: 'pointer', pointerId: 5, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
+  for (const [pointerId, startX] of [[10, 0], [11, 250], [12, 500]]) {
+    const state = { inFlight: false, session: null };
+    assert.equal(beginTicketLocalRegisterSliderSession(state, {
+      kind: 'pointer', pointerId, pointerStartClientX: startX, pointerStartClientY: 100,
+      pointerTrackLeftClientX: 0, pointerTrackWidth: 500, snapshot
+    }), true);
+    assert.equal(completeTicketLocalRegisterSliderSession(state, {
+      pointerId, pointerClientX: startX + 8, pointerClientY: 100, progress: 0, proofMatches: true
+    }), snapshot);
+  }
+
+  const insideFortyFiveDegrees = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(insideFortyFiveDegrees, {
+    kind: 'pointer', pointerId: 13, pointerStartClientX: 100, pointerStartClientY: 100,
+    pointerTrackLeftClientX: 0, pointerTrackWidth: 500, snapshot
   }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(pointerState, {
-    pointerId: 5, pointerClientX: 200, progress: 25, proofMatches: true
-  }), snapshot);
-  assert.equal(completeTicketLocalRegisterSliderSession(pointerState, {
-    pointerId: 5, pointerClientX: 500, progress: 100, proofMatches: true
-  }), null, 'input/change after pointer-up cannot reuse the consumed session');
+  assert.equal(completeTicketLocalRegisterSliderSession(insideFortyFiveDegrees, {
+    pointerId: 13, pointerClientX: 108, pointerClientY: 107.9, progress: 0, proofMatches: true
+  }), snapshot, 'motion just inside 45 degrees activates on release');
+
+  const upwardInsideFortyFiveDegrees = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(upwardInsideFortyFiveDegrees, {
+    kind: 'pointer', pointerId: 14, pointerStartClientX: 100, pointerStartClientY: 100,
+    pointerTrackLeftClientX: 0, pointerTrackWidth: 500, snapshot
+  }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(upwardInsideFortyFiveDegrees, {
+    pointerId: 14, pointerClientX: 108, pointerClientY: 92.1, progress: 0, proofMatches: true
+  }), snapshot, 'upward motion just inside 45 degrees also activates on release');
 
   const keyboardState = { inFlight: false, session: null };
   assert.equal(beginTicketLocalRegisterSliderSession(keyboardState, { kind: 'keyboard', snapshot }), true);
   assert.equal(completeTicketLocalRegisterSliderSession(keyboardState, {
+    progress: 24, proofMatches: true
+  }), null);
+  assert.equal(beginTicketLocalRegisterSliderSession(keyboardState, { kind: 'keyboard', snapshot }), true);
+  assert.equal(completeTicketLocalRegisterSliderSession(keyboardState, {
     progress: 25, proofMatches: true
-  }), snapshot, 'keyboard completion uses the same authorization path');
+  }), snapshot);
 });
 
-test('a zero-distance range tap never counts as 25% pointer movement', () => {
-  const snapshot = { proofActionId: 'proof-1' };
-  const state = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 12, pointerStartClientX: 250, pointerTrackLeftClientX: 0,
-    pointerTrackWidth: 1000, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(state, {
-    pointerId: 12, pointerClientX: 250, progress: 100, proofMatches: true
-  }), null, 'the native range value cannot substitute for actual rightward pointer travel');
-  assert.equal(state.session, null);
-
-  assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 13, pointerStartClientX: 250, pointerTrackLeftClientX: 0,
-    pointerTrackWidth: 1000, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(state, {
-    pointerId: 13, progress: 100, proofMatches: true
-  }), null, 'a missing pointer-up position fails closed');
-  assert.equal(state.session, null);
-});
-
-test('a middle start requires a full quarter of directed travel', () => {
-  const snapshot = { proofActionId: 'proof-1' };
-  const shortState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(shortState, {
-    kind: 'pointer', pointerId: 18, pointerStartClientX: 300, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(shortState, {
-    pointerId: 18, pointerClientX: 399.9, progress: 99, proofMatches: true
-  }), null, '99.9 pixels is short of a 100-pixel quarter');
-
-  const exactState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(exactState, {
-    kind: 'pointer', pointerId: 19, pointerStartClientX: 300, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(exactState, {
-    pointerId: 19, pointerClientX: 400, progress: 99, proofMatches: true
-  }), snapshot, 'a middle start completes at exactly one quarter of the full track');
-});
-
-test('native terminal progress completes inside the outer rect but progress 99 does not', () => {
-  const snapshot = { proofActionId: 'proof-1' };
-  const completeState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(completeState, {
-    kind: 'pointer', pointerId: 20, pointerStartClientX: 440, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(completeState, {
-    pointerId: 20, pointerClientX: 475, progress: 100, proofMatches: true
-  }), snapshot, 'native terminal is enough after intentional motion even when the pointer is inside rect.right');
-
-  const incompleteState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(incompleteState, {
-    kind: 'pointer', pointerId: 21, pointerStartClientX: 440, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(incompleteState, {
-    pointerId: 21, pointerClientX: 475, progress: 99, proofMatches: true
-  }), null, 'the same sub-quarter motion cannot complete before native terminal');
-});
-
-test('tap, tiny travel, wrong direction, and missing coordinates fail closed', () => {
+test('pointer completion rejects taps, 7px, leftward, and 45-degree motion', () => {
   const snapshot = { proofActionId: 'proof-1' };
   const cases = [
-    { pointerId: 22, start: 250, end: 250, progress: 100, label: 'tap' },
-    { pointerId: 23, start: 496, end: 500, progress: 100, label: 'tiny terminal nudge' },
-    { pointerId: 24, start: 300, end: 250, progress: 100, label: 'wrong direction' },
-    { pointerId: 25, start: 300, end: undefined, progress: 100, label: 'missing release coordinate' }
+    { pointerId: 20, endX: 100, endY: 100, label: 'tap' },
+    { pointerId: 21, endX: 107, endY: 100, label: '7px' },
+    { pointerId: 22, endX: 90, endY: 100, label: 'leftward' },
+    { pointerId: 23, endX: 108, endY: 108, label: '45-degree' },
+    { pointerId: 24, endX: 108, endY: 92, label: 'upward 45-degree' },
+    { pointerId: 25, endX: undefined, endY: 100, label: 'missing coordinate' }
   ];
   for (const current of cases) {
     const state = { inFlight: false, session: null };
     assert.equal(beginTicketLocalRegisterSliderSession(state, {
-      kind: 'pointer', pointerId: current.pointerId, pointerStartClientX: current.start,
-      pointerTrackLeftClientX: 100, pointerTrackWidth: 400, snapshot
-    }), true, current.label);
+      kind: 'pointer', pointerId: current.pointerId, pointerStartClientX: 100, pointerStartClientY: 100,
+      pointerTrackLeftClientX: 0, pointerTrackWidth: 400, snapshot
+    }), true);
     assert.equal(completeTicketLocalRegisterSliderSession(state, {
-      pointerId: current.pointerId, pointerClientX: current.end,
-      progress: current.progress, proofMatches: true
+      pointerId: current.pointerId, pointerClientX: current.endX, pointerClientY: current.endY,
+      progress: 100, proofMatches: true
     }), null, current.label);
   }
+
 });
 
-test('an endpoint start needs an intentional anti-tap overshoot', () => {
+test('pointer cancellation and second pointers fail closed', () => {
   const snapshot = { proofActionId: 'proof-1' };
-  const completeState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(completeState, {
-    kind: 'pointer', pointerId: 26, pointerStartClientX: 500, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
+  const state = { inFlight: false, session: null };
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 40, pointerStartClientX: 100, pointerStartClientY: 100,
+    pointerTrackLeftClientX: 0, pointerTrackWidth: 400, snapshot
   }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(completeState, {
-    pointerId: 26, pointerClientX: 512, progress: 100, proofMatches: true
-  }), snapshot, 'a held 3%-track rightward overshoot is intentional even from the terminal endpoint');
-
-  const tapState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(tapState, {
-    kind: 'pointer', pointerId: 27, pointerStartClientX: 500, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(tapState, {
-    pointerId: 27, pointerClientX: 508, progress: 100, proofMatches: true
-  }), null, 'eight pixels is below the 12-pixel anti-tap floor');
+  assert.equal(beginTicketLocalRegisterSliderSession(state, {
+    kind: 'pointer', pointerId: 41, pointerStartClientX: 100, pointerStartClientY: 100,
+    pointerTrackLeftClientX: 0, pointerTrackWidth: 400, snapshot
+  }), false);
+  assert.equal(completeTicketLocalRegisterSliderSession(state, {
+    pointerId: 41, pointerClientX: 200, pointerClientY: 100, proofMatches: true
+  }), null);
+  assert.equal(state.session.pointerId, 40);
+  assert.equal(cancelTicketLocalRegisterSliderSession(state, 41), false);
+  assert.equal(cancelTicketLocalRegisterSliderSession(state, 40), true);
+  assert.equal(state.session, null);
 });
 
-test('pointer geometry is finite, start is clamped, and terminal progress is bounded', () => {
+test('pointer geometry requires finite x and y coordinates and clamps horizontal start', () => {
   const snapshot = { proofActionId: 'proof-1' };
   for (const input of [
-    { pointerId: 28, pointerStartClientX: 0, pointerTrackLeftClientX: 0, pointerTrackWidth: 0 },
-    { pointerId: 29, pointerStartClientX: 0, pointerTrackLeftClientX: Number.NaN, pointerTrackWidth: 100 },
-    { pointerId: 30, pointerStartClientX: Number.POSITIVE_INFINITY, pointerTrackLeftClientX: 0, pointerTrackWidth: 100 },
-    { pointerId: 31, pointerStartClientX: 0, pointerTrackLeftClientX: Number.MAX_VALUE, pointerTrackWidth: Number.MAX_VALUE }
+    { pointerId: 50, pointerStartClientX: 0, pointerStartClientY: 0, pointerTrackLeftClientX: 0, pointerTrackWidth: 0 },
+    { pointerId: 51, pointerStartClientX: 0, pointerStartClientY: Number.NaN, pointerTrackLeftClientX: 0, pointerTrackWidth: 100 },
+    { pointerId: 52, pointerStartClientX: Number.POSITIVE_INFINITY, pointerStartClientY: 0, pointerTrackLeftClientX: 0, pointerTrackWidth: 100 }
   ]) {
     assert.equal(beginTicketLocalRegisterSliderSession({ inFlight: false, session: null }, {
       kind: 'pointer', ...input, snapshot
     }), false);
   }
-
-  const clampedState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(clampedState, {
-    kind: 'pointer', pointerId: 32, pointerStartClientX: -50, pointerTrackLeftClientX: 0,
-    pointerTrackWidth: 100, snapshot
-  }), true);
-  assert.equal(clampedState.session.pointerStartClientX, 0);
-  assert.equal(completeTicketLocalRegisterSliderSession(clampedState, {
-    pointerId: 32, pointerClientX: 25, progress: -10, proofMatches: true
-  }), snapshot, 'clamped initial endpoint still completes at exactly one quarter');
-
-  const overState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(overState, {
-    kind: 'pointer', pointerId: 33, pointerStartClientX: 70, pointerTrackLeftClientX: 0,
-    pointerTrackWidth: 100, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(overState, {
-    pointerId: 33, pointerClientX: 78, progress: 125, proofMatches: true
-  }), snapshot, 'finite progress above max is clamped to terminal');
-
-  const nonFiniteState = { inFlight: false, session: null };
-  assert.equal(beginTicketLocalRegisterSliderSession(nonFiniteState, {
-    kind: 'pointer', pointerId: 34, pointerStartClientX: 70, pointerTrackLeftClientX: 0,
-    pointerTrackWidth: 100, snapshot
-  }), true);
-  assert.equal(completeTicketLocalRegisterSliderSession(nonFiniteState, {
-    pointerId: 34, pointerClientX: 78, progress: Number.POSITIVE_INFINITY, proofMatches: true
-  }), null, 'non-finite progress cannot claim terminal');
-});
-
-test('a second pointer and stale pointer events cannot consume the primary session', () => {
-  const snapshot = { proofActionId: 'proof-1' };
   const state = { inFlight: false, session: null };
   assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 40, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
+    kind: 'pointer', pointerId: 53, pointerStartClientX: -50, pointerStartClientY: 10,
+    pointerTrackLeftClientX: 0, pointerTrackWidth: 100, snapshot
   }), true);
-  assert.equal(beginTicketLocalRegisterSliderSession(state, {
-    kind: 'pointer', pointerId: 41, pointerStartClientX: 100, pointerTrackLeftClientX: 100,
-    pointerTrackWidth: 400, snapshot
-  }), false, 'a second pointer cannot replace the primary session');
+  assert.equal(state.session.pointerStartClientX, 0);
   assert.equal(completeTicketLocalRegisterSliderSession(state, {
-    pointerId: 41, pointerClientX: 500, progress: 100, proofMatches: true
-  }), null);
-  assert.equal(state.session.pointerId, 40, 'wrong-pointer release leaves the primary session intact');
-  assert.equal(cancelTicketLocalRegisterSliderSession(state, 41), false);
-  assert.equal(state.session.pointerId, 40, 'wrong-pointer cancellation leaves the primary session intact');
-  assert.equal(cancelTicketLocalRegisterSliderSession(state, 40), true);
-  assert.equal(state.session, null);
+    pointerId: 53, pointerClientX: 8, pointerClientY: 10, proofMatches: true
+  }), snapshot);
 });
 
 test('slider change stays idle below the shared 25% threshold', async () => {

@@ -11,12 +11,23 @@ import time
 from pathlib import Path
 
 DEFAULT_GRACE_SECONDS = 7 * 24 * 60 * 60
-DEFAULT_BUILD_CACHE_UNTIL = "24h"
+DEFAULT_BUILD_CACHE_UNTIL = "168h"
 DEFAULT_RELEASE_KEEP_PER_FAMILY = 10
+DEFAULT_LIST_LIMIT = 20
 
 
 def warn(message: str) -> None:
     print(f"docker_gc: {message}", file=sys.stderr)
+
+
+def print_bounded_list(label: str, values: list[str], limit: int) -> None:
+    ordered = sorted(values)
+    shown = ordered[:limit]
+    if shown:
+        print(f"docker_gc: {label}={','.join(shown)}")
+    omitted = len(ordered) - len(shown)
+    if omitted:
+        print(f"docker_gc: {label}_omitted={omitted}")
 
 
 def run_command(args: list[str]) -> str:
@@ -87,7 +98,7 @@ def release_family(release_name: str) -> str:
     if prefixed_hyphen_date:
         return prefixed_hyphen_date.group(1).strip("-") or release_name
 
-    return release_name
+    return "legacy"
 
 
 def list_release_dirs(releases_root: Path) -> list[Path]:
@@ -107,16 +118,16 @@ def path_matches(path: Path, protected_paths: set[Path]) -> bool:
     return path in protected_paths or resolved in protected_paths
 
 
-def prune_release_dirs(
+def select_release_dirs(
     releases_root: Path,
     current_target: Path | None,
     current_release_id: str,
     rollback_release_path: Path | None,
     keep_per_family: int,
-) -> tuple[list[str], list[str]]:
+) -> list[Path]:
     release_dirs = list_release_dirs(releases_root)
     if not release_dirs:
-        return [], []
+        return []
 
     protected_paths: set[Path] = set()
     protected_names = {name for name in {current_release_id} if name}
@@ -139,8 +150,7 @@ def prune_release_dirs(
             if resolved is not None:
                 kept_paths.add(resolved)
 
-    deleted_release_ids: list[str] = []
-    errors: list[str] = []
+    selected: list[Path] = []
     for release_dir in sorted(release_dirs, key=lambda path: path.stat().st_mtime):
         if release_dir.name in protected_names:
             continue
@@ -148,6 +158,15 @@ def prune_release_dirs(
             continue
         if path_matches(release_dir, kept_paths):
             continue
+        selected.append(release_dir)
+
+    return selected
+
+
+def delete_release_dirs(release_dirs: list[Path]) -> tuple[list[str], list[str]]:
+    deleted_release_ids: list[str] = []
+    errors: list[str] = []
+    for release_dir in release_dirs:
         try:
             shutil.rmtree(release_dir)
         except OSError as exc:
@@ -255,14 +274,20 @@ def prune_builder_cache(until_filter: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Apply the Arbuzas Docker image retention policy.")
+    parser = argparse.ArgumentParser(description="Preview or apply the Arbuzas Docker retention policy.")
     parser.add_argument("--current-link", default="/etc/arbuzas/current")
     parser.add_argument("--releases-root", default="/etc/arbuzas/releases")
     parser.add_argument("--state-file", default="/etc/arbuzas/docker-gc/state.json")
     parser.add_argument("--grace-seconds", type=int, default=DEFAULT_GRACE_SECONDS)
     parser.add_argument("--build-cache-until", default=DEFAULT_BUILD_CACHE_UNTIL)
     parser.add_argument("--release-keep-per-family", type=int, default=DEFAULT_RELEASE_KEEP_PER_FAMILY)
+    parser.add_argument("--list-limit", type=int, default=DEFAULT_LIST_LIMIT)
     parser.add_argument("--now", type=int)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Select cleanup candidates without deleting, writing state, or pruning build cache.",
+    )
     return parser
 
 
@@ -275,6 +300,7 @@ def main() -> int:
     state_path = Path(args.state_file)
     grace_seconds = max(0, int(args.grace_seconds))
     release_keep_per_family = max(0, int(args.release_keep_per_family))
+    list_limit = max(0, int(args.list_limit))
 
     current_target = safe_resolve(current_link)
     current_release_id = resolve_current_release_id(current_link, current_target)
@@ -293,21 +319,29 @@ def main() -> int:
     newly_tracked_image_ids: list[str] = []
     errors: list[str] = []
 
-    deleted_release_ids, release_errors = prune_release_dirs(
+    selected_release_paths = select_release_dirs(
         releases_root,
         current_target,
         current_release_id,
         rollback_release_path,
         release_keep_per_family,
     )
-    errors.extend(release_errors)
+    selected_release_ids = [path.name for path in selected_release_paths]
+    deleted_release_ids: list[str] = []
+    if not args.dry_run:
+        deleted_release_ids, release_errors = delete_release_dirs(selected_release_paths)
+        errors.extend(release_errors)
 
+    selected_image_ids: list[str] = []
     for image_id in eligible_image_ids:
         first_seen_unused_at = existing_state.get(image_id, now)
         age_seconds = max(0, now - first_seen_unused_at)
         if image_id not in existing_state:
             newly_tracked_image_ids.append(image_id)
         if image_id in existing_state and age_seconds >= grace_seconds:
+            selected_image_ids.append(image_id)
+            if args.dry_run:
+                continue
             try:
                 delete_image(image_id)
             except RuntimeError as exc:
@@ -318,35 +352,41 @@ def main() -> int:
             continue
         next_state[image_id] = first_seen_unused_at
 
-    try:
-        write_state(state_path, next_state, now)
-    except OSError as exc:
-        errors.append(f"failed to write state file {state_path}: {exc}")
+    if not args.dry_run:
+        try:
+            write_state(state_path, next_state, now)
+        except OSError as exc:
+            errors.append(f"failed to write state file {state_path}: {exc}")
 
-    try:
-        prune_builder_cache(args.build_cache_until)
-    except RuntimeError as exc:
-        errors.append(str(exc))
+        try:
+            prune_builder_cache(args.build_cache_until)
+        except RuntimeError as exc:
+            errors.append(str(exc))
 
     print(
         "docker_gc: "
+        f"mode={'preview' if args.dry_run else 'apply'} "
         f"current_release={current_release_id or '-'} "
         f"rollback_release={rollback_release_id or '-'} "
         f"used_images={len(used_image_ids)} "
         f"protected_images={len(protected_image_ids)} "
         f"eligible_images={len(eligible_image_ids)} "
         f"tracked_images={len(next_state)} "
+        f"selected_image_count={len(selected_image_ids)} "
         f"deleted_images={len(deleted_image_ids)} "
         f"release_keep_per_family={release_keep_per_family} "
+        f"selected_release_count={len(selected_release_ids)} "
         f"deleted_releases={len(deleted_release_ids)}"
     )
-    if newly_tracked_image_ids:
-        print(f"docker_gc: newly_tracked={','.join(sorted(newly_tracked_image_ids))}")
-    if deleted_image_ids:
-        print(f"docker_gc: deleted={','.join(sorted(deleted_image_ids))}")
-    if deleted_release_ids:
-        print(f"docker_gc: deleted_releases={','.join(sorted(deleted_release_ids))}")
-    print(f"docker_gc: build_cache_pruned=until={args.build_cache_until}")
+    print_bounded_list("newly_tracked", newly_tracked_image_ids, list_limit)
+    print_bounded_list("deleted", deleted_image_ids, list_limit)
+    print_bounded_list("selected_images", selected_image_ids, list_limit)
+    print_bounded_list("selected_releases", selected_release_ids, list_limit)
+    print_bounded_list("deleted_releases", deleted_release_ids, list_limit)
+    if args.dry_run:
+        print(f"docker_gc: build_cache_preview=until={args.build_cache_until}")
+    else:
+        print(f"docker_gc: build_cache_pruned=until={args.build_cache_until}")
 
     for error in errors:
         warn(error)

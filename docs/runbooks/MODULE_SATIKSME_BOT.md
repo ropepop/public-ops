@@ -38,5 +38,6 @@ make docker-image-build
 - `/app` loads Telegram's Mini App bridge and exchanges `Telegram.WebApp.initData` for the normal website session through `/api/v1/auth/telegram/complete`; `/` and `/incidents` do not preload the Mini App bridge.
 - BotFather Web Login must allow `https://kontrole.info`; the browser sign-in path uses Telegram's current Login library and verifies the returned `id_token` on the server.
 - Browser pages no longer use direct Spacetime auth. Keep `SATIKSME_RUNTIME_SPACETIME_ENABLED=true` for the backend data plane, and leave `SATIKSME_WEB_SPACETIME_ENABLED=false`.
+- Keep `SATIKSME_CHAT_ANALYZER_ENABLED=false` unless the Telegram session and the three managed Telegram/Google private files are deliberately restored. Disabled deployments neither require nor pass those credentials; Google uses its single key for discovery and model calls when re-enabled.
 - Interactive browser UI must use ArrowJS for changing map, incident list, detail, and status areas. After deploy, verify `document.documentElement.dataset.satiksmeUi === "arrow"` on the served page and check for new browser console errors.
 - The active path is the repo-level Docker deploy flow, not workload-local Pixel helpers.

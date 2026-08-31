@@ -449,10 +449,10 @@ func (s *Server) finishBackgroundKeyframe(requirement ...string) {
 func perViewerKeyframeRequired(reason string) bool {
 	cleanReason := strings.ToLower(cleanStreamControlText(reason, ""))
 	switch cleanReason {
-	case "browser_warm_prewarm", "browser_video_provisional_config", "browser_video_config_needed", "phone_config_active_viewer", "frame_sequence_gap":
+	case "browser_warm_prewarm", "browser_video_provisional_config", "browser_video_config_needed", "phone_config_active_viewer":
 		return true
 	default:
-		return strings.HasPrefix(cleanReason, "viewer_")
+		return false
 	}
 }
 

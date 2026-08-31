@@ -20,6 +20,7 @@ write_fake() {
 write_fake ssh \
   '#!/usr/bin/env bash' \
   'sleep "${DEPLOYMENT_REPORTING_TEST_SSH_SLEEP_SECONDS:-0}"' \
+  'printf "%s\n" "/srv/arbuzas/tiny-vless/config-rollbacks/pending.test"' \
   'exit "${DEPLOYMENT_REPORTING_TEST_SSH_EXIT:-0}"'
 write_fake scp \
   '#!/usr/bin/env bash' \
@@ -36,7 +37,7 @@ write_fake curl \
 write_fake spacetime \
   '#!/usr/bin/env bash' \
   'printf "%s\n" "$*" >> "${DEPLOYMENT_REPORTING_TEST_CAPTURE:?}"' \
-  'exit 0'
+  'exit "${DEPLOYMENT_REPORTING_TEST_SPACETIME_EXIT:-0}"'
 
 wait_for_calls() {
   local wanted="$1"
@@ -68,6 +69,24 @@ assert_exact_calls() {
   fi
 }
 
+assert_capture_contains() {
+  local wanted="$1"
+  if ! grep -F -- "${wanted}" "${capture}" >/dev/null; then
+    printf 'missing deployment reporting call content: %s\n' "${wanted}" >&2
+    sed -n '1,20p' "${capture}" >&2
+    exit 1
+  fi
+}
+
+assert_phase_bundle() {
+  local status="$1"
+  if ! grep -E -- "\\\"deploy_config=${status}=[0-9]+=[0-9]+\\\"" "${capture}" >/dev/null; then
+    printf 'missing completed-run deploy_config phase with status %s\n' "${status}" >&2
+    sed -n '1,20p' "${capture}" >&2
+    exit 1
+  fi
+}
+
 reported_env=(
   "DEPLOYMENT_REPORTING_TEST_CAPTURE=${capture}"
   "OPERATIONAL_LOGGING_TEST_CAPTURE=${capture}"
@@ -87,8 +106,10 @@ env "${reported_env[@]}" \
 wait_for_calls 2
 assert_exact_calls 2
 config_completed="$(grep -F 'operationallog_append_deployment_completed_run' "${capture}")"
-if [[ "${config_completed}" != *'"deploy-config"'* || "${config_completed}" != *'"current"'* ]]; then
-  printf 'config-only reporting lost its action or honest current-release label\n' >&2
+if [[ "${config_completed}" != *'"deploy-config"'* || \
+      "${config_completed}" != *'"current"'* || \
+      "${config_completed}" != *'"timing-test-host:all"'* ]]; then
+  printf 'config-only reporting lost its action, release label, or all-services target\n' >&2
   sed -n '1,20p' "${capture}" >&2
   exit 1
 fi
@@ -109,6 +130,44 @@ if (( phase_total_millis < phase_duration_millis )); then
   exit 1
 fi
 
+# A failed reporting write must remain detached from a healthy operation. Both
+# attempted events should still contain the successful operation outcome.
+: > "${capture}"
+env "${reported_env[@]}" \
+  DEPLOYMENT_REPORTING_TEST_SPACETIME_EXIT=7 \
+  bash "${DEPLOY_SCRIPT}" deploy-config \
+    --ssh-host timing-test-host --ssh-user timing-test-user >/dev/null
+wait_for_calls 2
+assert_exact_calls 2
+assert_capture_contains 'operational-logging-prod'
+assert_capture_contains 'operationallog_append_deployment_run'
+assert_capture_contains 'operationallog_append_deployment_completed_run'
+assert_capture_contains '"deploy-config"'
+assert_capture_contains '"started"'
+assert_capture_contains '"ok"'
+assert_phase_bundle ok
+
+# A real operation failure must keep the failing phase's exit code and report
+# that failure, independently of the detached reporter path.
+: > "${capture}"
+set +e
+env "${reported_env[@]}" \
+  DEPLOYMENT_REPORTING_TEST_PYTHON_EXIT=7 \
+  bash "${DEPLOY_SCRIPT}" deploy-config \
+    --ssh-host timing-test-host --ssh-user timing-test-user >/dev/null 2>&1
+failed_operation_status=$?
+set -e
+if [[ "${failed_operation_status}" != "7" ]]; then
+  printf 'deploy-config did not preserve the failed phase exit code: %s\n' "${failed_operation_status}" >&2
+  exit 1
+fi
+wait_for_calls 2
+assert_exact_calls 2
+assert_capture_contains 'operationallog_append_deployment_run'
+assert_capture_contains 'operationallog_append_deployment_completed_run'
+assert_capture_contains '"failed"'
+assert_phase_bundle failed
+
 # Rollback is a first-class reported action with the requested release id.
 : > "${capture}"
 env "${reported_env[@]}" \
@@ -118,8 +177,10 @@ env "${reported_env[@]}" \
 wait_for_calls 2
 assert_exact_calls 2
 rollback_completed="$(grep -F 'operationallog_append_deployment_completed_run' "${capture}")"
-if [[ "${rollback_completed}" != *'"rollback"'* || "${rollback_completed}" != *'"rollback-test-release"'* ]]; then
-  printf 'rollback completion lost its action or requested release id\n' >&2
+if [[ "${rollback_completed}" != *'"rollback"'* || \
+      "${rollback_completed}" != *'"rollback-test-release"'* || \
+      "${rollback_completed}" != *'"timing-test-host:train_bot"'* ]]; then
+  printf 'rollback completion lost its action, release id, or selected-service target\n' >&2
   sed -n '1,20p' "${capture}" >&2
   exit 1
 fi

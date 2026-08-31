@@ -38,6 +38,20 @@ def is_history(path: Path) -> bool:
     return ".bak" in name or ".before-" in name or ".retired-" in name or name.endswith("~")
 
 
+def retired_model_settings(assignments: dict[str, str]) -> list[str]:
+    retired = {
+        "SATIKSME_CHAT_ANALYZER_MODEL_API_KEY",
+        "SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE",
+    }
+    return sorted(key for key in retired if key in assignments)
+
+
+if retired_model_settings(
+    {"SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE": "/retired/model-api-key.secret"}
+) != ["SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE"]:
+    raise SystemExit("retired analyzer model-key policy regression")
+
+
 tracked = subprocess.run(
     ["git", "-C", str(repo_root), "ls-files", "infra/arbuzas/host-mirror/etc/arbuzas/env"],
     check=True,
@@ -59,18 +73,31 @@ if satiksme_env.exists():
             continue
         key, value = raw.split("=", 1)
         assignments[key.strip()] = value.strip()
+    remaining_retired = retired_model_settings(assignments)
+    if remaining_retired:
+        raise SystemExit(
+            "retired analyzer model-key settings remain: " + ", ".join(remaining_retired)
+        )
     direct = {
         "SATIKSME_CHAT_ANALYZER_API_ID",
         "SATIKSME_CHAT_ANALYZER_API_HASH",
         "SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY",
-        "SATIKSME_CHAT_ANALYZER_MODEL_API_KEY",
     }
     remaining = sorted(key for key in direct if assignments.get(key))
     if remaining:
         raise SystemExit("inline analyzer credentials remain: " + ", ".join(remaining))
-    missing_files = sorted(f"{key}_FILE" for key in direct if not assignments.get(f"{key}_FILE"))
-    if missing_files:
-        raise SystemExit("file-backed analyzer settings are missing: " + ", ".join(missing_files))
+    enabled = assignments.get("SATIKSME_CHAT_ANALYZER_ENABLED")
+    if enabled not in {"true", "false"}:
+        raise SystemExit("SATIKSME_CHAT_ANALYZER_ENABLED must be explicitly true or false")
+    if enabled == "true":
+        required_files = {
+            "SATIKSME_CHAT_ANALYZER_API_ID_FILE",
+            "SATIKSME_CHAT_ANALYZER_API_HASH_FILE",
+            "SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE",
+        }
+        missing_files = sorted(key for key in required_files if not assignments.get(key))
+        if missing_files:
+            raise SystemExit("enabled analyzer file settings are missing: " + ", ".join(missing_files))
 
 private_roots = [
     mirror_root / "etc/arbuzas/env",

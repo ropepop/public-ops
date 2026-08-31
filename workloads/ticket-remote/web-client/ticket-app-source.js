@@ -1,10 +1,20 @@
 /* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
-import {
-  ExperimentalHDRImageSwitcher,
-  advanceExperimentalHDRReplacementFailure
-} from './experimental-hdr-image-switcher.mjs';
 import { ExperimentalHDRPreferenceController } from './experimental-hdr-preference.mjs';
+import { ClientHDRBoostPreferenceController } from './client-hdr-boost-preference.mjs';
+import {
+  CLIENT_HDR_DISPLAY_BOOSTS,
+  CLIENT_HDR_ENGINE,
+  CLIENT_HDR_PIPELINE,
+  CLIENT_HDR_PRESENTATION_KIND,
+  CLIENT_HDR_TARGET_DISPLAY_BOOST,
+  ClientHDRController,
+  clientHDRCapability,
+  clientHDREngineProjectionDecision,
+  normalizeClientHDRDisplayBoost,
+  offerClientHDRCanvasFrame,
+  resolveCapabilityHDREngine
+} from './client-hdr-core.mjs';
 import {
   TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT,
   beginTicketActionV3LocalRequest,
@@ -32,6 +42,7 @@ import {
   ticketMemberLimitCountdown,
   ticketLocalRegisterSliderProofMatches,
   ticketLocalRegisterSliderProofSnapshot,
+  updateTicketLocalRegisterSliderPointerDirection,
   updateTicketMemberLimitClock,
   ticketSliderRegionV3ForAction,
   ticketSliderRegionV3Layout
@@ -41,6 +52,7 @@ import {
   const cfg = window.TICKET_REMOTE_CONFIG || {};
   const pageVersion = cfg.pageVersion || 'ticket-remote-dev';
   const assetVersion = String(cfg.assetVersion || pageVersion || '').trim();
+  let serverVersionReloadTarget = '';
   const startupRunOrigin = /^ticket\.startup\.[0-9a-f]{32}$/.test(String(cfg.startupRunOrigin || '').trim())
     ? String(cfg.startupRunOrigin).trim()
     : '';
@@ -204,6 +216,7 @@ import {
   }
 
   const stage = requireElement('.stage', 'stage');
+  const stagePage = stage && stage.closest ? stage.closest('.stage-page') : null;
   const canvas = requireElement('#screen', 'screen');
   if (!stage || !canvas || typeof canvas.getContext !== 'function') return;
   const ctx = canvas.getContext('2d', { alpha: false });
@@ -217,12 +230,7 @@ import {
   const emptyMessage = requireElement('#emptyMessage', 'emptyMessage');
   if (!emptyState || !startStreamButton || !emptyMessage) return;
   const streamResumeSpinner = document.getElementById('streamResumeSpinner');
-  const experimentalMediaCanvas = document.getElementById('experimentalMediaCanvas');
-  const experimentalMediaHDRImage = document.getElementById('experimentalMediaHDRImage');
-  const experimentalMediaHDRImageBuffer = document.getElementById('experimentalMediaHDRImageBuffer');
-  const experimentalMediaHDRSwitcher = experimentalMediaHDRImage && experimentalMediaHDRImageBuffer
-    ? new ExperimentalHDRImageSwitcher([experimentalMediaHDRImage, experimentalMediaHDRImageBuffer])
-    : null;
+  let experimentalMediaCanvas = document.getElementById('experimentalMediaCanvas');
   const experimentalMediaMount = document.getElementById('experimentalMediaMount');
   const connectionState = requireElement('#connectionState', 'connectionState');
   const statusLine = requireElement('#statusLine', 'statusLine');
@@ -272,31 +280,74 @@ import {
     enabled: false,
     status: 'Izslēgts',
     preferenceStatus: 'Saglabātais HDR iestatījums: izslēgts.',
-    label: 'Spilgtāks skats (eksperimentāls)'
+    label: 'HDR skats',
+    engine: CLIENT_HDR_ENGINE,
+    engineStatus: 'HDR apstrāde: šī pārlūkprogramma.',
+    boostSelectorAllowed: false,
+    engineSaving: false,
+    displayBoost: CLIENT_HDR_TARGET_DISPLAY_BOOST,
+    boostStatus: `Pārlūka HDR spilgtums: ${CLIENT_HDR_TARGET_DISPLAY_BOOST}×.`,
+    boostSaving: false
   });
   let experimentalMediaMounted = false;
   let experimentalMediaCapabilityReady = false;
-  let experimentalMediaSocket = null;
-  let experimentalMediaDecoder = null;
-  let experimentalMediaDecoderGeneration = 0;
-  let experimentalMediaConfigureGeneration = 0;
-  let experimentalMediaConfig = null;
-  let experimentalMediaEpoch = 0;
-  let experimentalMediaSequence = 0;
-  let experimentalMediaNeedsKeyframe = true;
-  let experimentalMediaSps = null;
-  let experimentalMediaPps = null;
-  let experimentalMediaDescription = null;
-  let experimentalMediaMessageChain = Promise.resolve();
+  let experimentalClientCapabilityAllowed = false;
+  let experimentalMediaEngineProjectionObserved = false;
+  let experimentalMediaBoostProjectionObserved = false;
+  let experimentalMediaOwnerProjectionAvailable = false;
+  let experimentalMediaAccountProjectionAvailable = false;
+  let experimentalClientCapability = clientHDRCapability(window);
+  let experimentalClientHDRController = null;
+  let experimentalClientHDRFailed = false;
+  let experimentalMediaResumeRetryArmed = false;
+  let experimentalMediaLifecycleGeneration = 0;
+  let experimentalMediaLifecycleArmed = false;
+  let experimentalMediaLifecycleResumeAttemptID = 0;
+  let experimentalMediaForegroundPulseWallAt = Date.now();
+  let experimentalMediaForegroundSuspensionGap = false;
+  let experimentalMediaForegroundRecoverySequence = 0;
+  let experimentalMediaForegroundRecovery = null;
+  let experimentalMediaForegroundRecoveryTimer = null;
+  let experimentalMediaForegroundRecoveryDeadlineTimer = null;
+  let experimentalMediaForegroundRecoveredGeneration = -1;
+  let experimentalMediaForegroundReturnConfirmationTimer = null;
+  let experimentalMediaForegroundReturnConfirmationSequence = 0;
+  let experimentalMediaLifecycleLastResumeWallAt = 0;
+  let experimentalMediaPresentationRegionBlocked = false;
+  let experimentalMediaPresentationRegionGeneration = 0;
+  let experimentalMediaPresentationRecoveryPending = false;
+  let experimentalMediaPresentationRecoveryReason = '';
+  let experimentalMediaCanvasGeneration = 0;
+  let experimentalMediaCanvasResetGeneration = -1;
+  let experimentalMediaStartGeneration = 0;
+  let experimentalMediaStartPending = null;
+  let experimentalMediaCapabilityRetryTimer = null;
+  let experimentalMediaRendererRetryTimer = null;
+  let experimentalMediaActiveFailureRecoveryTimer = null;
+  let experimentalMediaCapabilityDiscoveryPromise = null;
+  let experimentalMediaCapabilityDiscoveryRetryTimer = null;
+  let experimentalMediaCapabilityDiscoveryAttempt = 0;
+  let experimentalMediaDynamicRangeRecoveryQuery = null;
+  let experimentalMediaDynamicRangeRecoveryListener = null;
+  let experimentalMediaLastStartReason = 'initial';
+  let experimentalClientHDRMetricFrames = 0;
+  let experimentalClientHDRGPUCompletionFrames = 0;
+  let experimentalClientHDRPaintWaitFailures = 0;
+  let experimentalClientHDRCloneFailures = 0;
+  let experimentalMediaCanvasContextKind = '';
   let experimentalMediaPipeline = '';
-  let experimentalMediaHDRRenderGeneration = 0;
-  let experimentalMediaHDRReplacementFailures = 0;
-  const experimentalMediaHDRMaxConsecutiveReplacementFailures = 3;
-  let experimentalMediaHDREnabledAt = 0;
-  let experimentalMediaHDRFirstShown = false;
-  let experimentalMediaHDRShownFrames = 0;
+  const experimentalMediaVisibleSettleFrames = 2;
+  const experimentalMediaVisibleSettleTimeoutMillis = 250;
+  const experimentalMediaForegroundSuspensionGapMillis = 2500;
+  const experimentalMediaLifecycleReturnClusterMillis = 250;
+  const experimentalMediaForegroundReturnConfirmationMillis = 500;
+  const experimentalMediaForegroundCanvasStabilityMillis = 1000;
+  const experimentalMediaCapabilityFetchTimeoutMillis = 3000;
+  const experimentalMediaCapabilityRetryDelays = Object.freeze([250, 1000]);
+  const experimentalMediaForegroundRecoveryWindowMillis = 12000;
+  const experimentalMediaForegroundRecoveryRetryDelays = Object.freeze([0, 250, 750, 1500, 3000]);
   const experimentalMediaPreferenceController = new ExperimentalHDRPreferenceController({
-    applyEnabled: (enabled) => applyExperimentalMediaPreference(enabled),
+    applyEnabled: (enabled, meta) => applyExperimentalMediaPreference(enabled, meta),
     persistEnabled: (enabled) => runSpacetimeMutation(
       (client) => client.setHDRPreference(Boolean(enabled)),
       'hdr_preference_write'
@@ -309,6 +360,21 @@ import {
       clientLog('state_failed', String(failure && failure.code || 'hdr_preference_write_failed'));
     }
   });
+  const experimentalHDRBoostPreferenceController = new ClientHDRBoostPreferenceController({
+    applyBoost: (boost, meta) => applyExperimentalHDRBoost(boost, meta),
+    persistBoost: (boost) => runSpacetimeMutation(
+      (client) => client.setHDRDisplayBoost(boost),
+      'hdr_boost_write'
+    ),
+    onStatus: (snapshot) => {
+      experimentalMediaState.boostSaving = Boolean(snapshot && snapshot.inFlight);
+      experimentalMediaState.boostStatus = experimentalHDRBoostStatus(snapshot);
+      if (document.body) document.body.dataset.hdrBoostPreference = String(snapshot && snapshot.phase || 'default');
+    },
+    onFailure: (failure) => {
+      clientLog('state_failed', String(failure && failure.code || 'hdr_boost_write_failed'));
+    }
+  });
   const activeVideoSockets = new Set();
   let reconnectTimer = null;
   let hiddenVideoCloseTimer = null;
@@ -319,7 +385,6 @@ import {
   let currentState = null;
   let serverClockSkewMs = 0;
   let serverClockHasLiveSample = false;
-  let pointerStart = null;
   const ticketActionV3LocalRequestState = { actionId: '', reducerSettled: false, observed: false };
   let ticketActionV3LastUserActionId = '';
   let ticketActionV3LastUserAction = null;
@@ -354,7 +419,7 @@ import {
     resumePending: true
   };
   const ticketCurrentProofSampleIntervalMs = 1000;
-  const ticketCurrentProofRequestCooldownMs = 2500;
+  const ticketCurrentProofRequestCooldownMs = 3000;
   const ticketCurrentProofFingerprintCanvas = document.createElement('canvas');
   ticketCurrentProofFingerprintCanvas.width = 8;
   ticketCurrentProofFingerprintCanvas.height = 12;
@@ -381,7 +446,11 @@ import {
   let lastRenderedFrameVisualAgeMillis = 0;
   let lastRenderedFrameEpoch = 0;
   let lastRenderedFrameSequence = 0;
-  let lastRenderedKeyframeSequence = 0;
+  let lastRenderedPresentationOrdinal = 0;
+  // Unlike the stream-local presentation ordinal, this watermark deliberately
+  // survives decoder/socket resets so a foreground admission can prove that
+  // the authoritative SDR canvas was painted after the return boundary.
+  let authoritativeSDRRenderSerial = 0;
   let lastRenderedFrameTimestamp = 0;
   let lastRestartAt = 0;
   let lastRecoveryKeyframeAt = 0;
@@ -472,28 +541,16 @@ import {
   let videoSocketOpenSeq = 0;
   let lastHiddenWallAt = 0;
   let stableViewport = null;
-  let screenEngaged = false;
-  let screenWakeLock = null;
-  let screenWakeLockRequesting = false;
-  let screenWakeLockUnavailableLogged = false;
-  let ticketFullscreenAttempted = false;
   let idleDisconnected = false;
   let idleDisconnectTimer = null;
   let streamLiveStaleGraceTimer = null;
   const intentionallyClosedVideoSockets = new WeakSet();
-  let lastTouchEndAt = 0;
-  let lastTouchEndX = 0;
-  let lastTouchEndY = 0;
-  const maxTapDurationMs = 450;
-  const maxTapTravelPx = 14;
-  const streamVerticalPanThresholdPx = 6;
-  const streamVerticalPanDominance = 1.1;
   const streamFirstFrameKeyframeMs = 2000;
-  const streamLiveFreshMaxAgeMs = 1000;
-  const streamLiveOkMaxAgeMs = 1500;
-  const streamDegradedMaxAgeMs = 2000;
+  const streamLiveFreshMaxAgeMs = 1250;
+  const streamLiveOkMaxAgeMs = 2000;
+  const streamDegradedMaxAgeMs = 3000;
   const streamLiveStaleGraceMs = 500;
-  const streamStaleKeyframeMs = 2500;
+  const streamStaleKeyframeMs = 3000;
   const streamStaleDecoderResetMs = 5000;
   const streamStaleVideoReconnectMs = 8000;
   const streamStaleServerRecoverMs = 12000;
@@ -523,10 +580,10 @@ import {
   const controlCodeFingerprintDifferenceThreshold = 14;
   const controlCodeFingerprintChangedCellsThreshold = 14;
   const controlCodeCapturePollMs = 100;
-  const controlCodeResultInitialKeyframeDelayMs = 1200;
+  const controlCodeResultInitialKeyframeDelayMs = 1250;
   const controlCodeCaptureKeyframeRetryMs = 5000;
   const controlCodeCaptureKeyframeRetryLimit = 2;
-  const controlCodeLowLatencyVisualAgeMs = 750;
+  const controlCodeLowLatencyVisualAgeMs = 1250;
   const controlCodeLowLatencyDecodeQueueLimit = 1;
   const controlCodeResultImageReadyTimeoutMs = 1200;
   const controlCodeResultPaintFrameTimeoutMs = 500;
@@ -542,13 +599,9 @@ import {
   const streamFeedbackVersion = 1;
   const streamFeedbackIntervalMs = 500;
   const streamFeedbackHiddenIntervalMs = 2000;
-  const streamDecoderQueueSoftLimit = 2;
   const streamDecoderQueueHardLimit = 4;
-  const streamIngressFrameMaxAgeMs = 2000;
+  const streamIngressFrameMaxAgeMs = 1250;
   const streamIngressMetadataLimit = 32;
-  const streamPresentationFrameTimeoutMs = 1000;
-  const doubleTapSuppressMs = 420;
-  const doubleTapSuppressPx = 28;
 
   function closeEarlyVideo(reason) {
     const early = window.TICKET_EARLY_VIDEO;
@@ -566,13 +619,13 @@ import {
   function claimableEarlyVideoQueue(early) {
     const queued = Array.isArray(early && early.queue) ? early.queue.slice() : [];
     if (!queued.length) return queued;
-    const keyframe = queued[0];
-    const metadata = keyframe && keyframe.meta;
-    const receivedAt = Number(keyframe && keyframe.receivedAt);
-    const maxAgeMillis = Math.max(0, Number(early && early.maxKeyframeAgeMs || 1500));
+    const independentFrame = queued[queued.length - 1];
+    const metadata = independentFrame && independentFrame.meta;
+    const receivedAt = Number(independentFrame && independentFrame.receivedAt);
+    const maxAgeMillis = Math.max(0, Number(early && early.maxFrameAgeMs || 1250));
     const receivedAgeMillis = Number.isFinite(receivedAt) ? Math.max(0, performance.now() - receivedAt) : Number.POSITIVE_INFINITY;
-    if (!metadata || !metadata.key || receivedAgeMillis > maxAgeMillis) return [];
-    return queued;
+    if (!metadata || !metadata.key || !independentFrame.data || independentFrame.data.byteLength > 2 * 1024 * 1024 || receivedAgeMillis > maxAgeMillis) return [];
+    return [independentFrame];
   }
 
   function claimEarlyVideoSocket() {
@@ -648,7 +701,6 @@ import {
       spacetimeClient.close();
     }
     spacetimeClient = null;
-    releaseScreenWakeLock('idle_disconnect');
     setConnected('Apturēts');
     setStatus('Straume apturēta pēc 15 minūtēm bez darbības.');
     showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pieskaries Sākt, lai turpinātu.', true);
@@ -660,6 +712,8 @@ import {
   function resumeFromIdleDisconnect(reason) {
     if (!idleDisconnected || streamUnsupported) return false;
     if (document.visibilityState === 'hidden' && !controlCodeKeepsVideoAliveWhileHidden()) return false;
+    lastHiddenAt = 0;
+    lastHiddenWallAt = 0;
     idleDisconnected = false;
     document.body.dataset.streamFreshness = 'RECOVERING';
     setConnected('Savienojas');
@@ -755,127 +809,44 @@ import {
   function updateDetailsReveal() {
     if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;
     const height = viewportHeight();
-    const engagedOffset = screenEngaged ? Math.round(Math.min(96, Math.max(24, height * 0.12))) : 0;
-    const revealed = window.scrollY >= Math.max(1, engagedOffset + height * 0.82);
+    const revealed = window.scrollY >= Math.max(1, height * 0.82);
+    const wasRevealed = document.body.classList.contains('details-visible');
     document.body.classList.toggle('details-visible', revealed);
+    if (revealed !== wasRevealed) {
+      synchronizeExperimentalHDRSurfaceRegion(
+        !experimentalHDRSurfacePresentationAllowed(),
+        revealed ? 'details_visible' : 'details_hidden',
+        { foregroundConfirmed: !revealed }
+      );
+    }
     // The panel naturally follows the full-height stream. Its contents must
     // remain available as soon as the user scrolls to them; details-visible is
     // only a stream-stage presentation state, never an accessibility gate.
     if (panel) panel.setAttribute('aria-hidden', 'false');
+    updateControlCodeSubmitAvailability();
   }
 
   function keepFirstScreenPinned(force) {
     if (force) {
+      const detailsWereVisible = document.body.classList.contains('details-visible');
       document.body.classList.remove('details-visible');
+      if (detailsWereVisible) {
+        synchronizeExperimentalHDRSurfaceRegion(
+          !experimentalHDRSurfacePresentationAllowed(),
+          'details_hidden'
+        );
+      }
       if (panel) panel.setAttribute('aria-hidden', 'false');
     }
     updateDetailsReveal();
-  }
-
-  async function requestScreenWakeLock(reason) {
-    if (!screenEngaged || document.visibilityState === 'hidden' || screenWakeLock || screenWakeLockRequesting) return;
-    if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') {
-      if (!screenWakeLockUnavailableLogged) {
-        screenWakeLockUnavailableLogged = true;
-        clientLog('wake_lock_unavailable', reason || 'unsupported');
-      }
-      return;
-    }
-    screenWakeLockRequesting = true;
-    try {
-      const lock = await navigator.wakeLock.request('screen');
-      screenWakeLock = lock;
-      clientLog('wake_lock_acquired', reason || 'gesture');
-      if (lock && typeof lock.addEventListener === 'function') {
-        lock.addEventListener('release', () => {
-          if (screenWakeLock === lock) {
-            screenWakeLock = null;
-          }
-          clientLog('wake_lock_released', 'browser');
-        });
-      }
-    } catch (error) {
-      clientLog('wake_lock_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`);
-    } finally {
-      screenWakeLockRequesting = false;
-    }
-  }
-
-  function releaseScreenWakeLock(reason) {
-    if (!screenWakeLock) return;
-    const lock = screenWakeLock;
-    screenWakeLock = null;
-    if (!lock || typeof lock.release !== 'function') return;
-    try {
-      Promise.resolve(lock.release()).then(
-        () => clientLog('wake_lock_released', reason || 'release'),
-        (error) => clientLog('wake_lock_release_failed', `${reason || 'release'}:${error && error.message || 'release failed'}`)
-      );
-    } catch (error) {
-      clientLog('wake_lock_release_failed', `${reason || 'release'}:${error && error.message || 'release failed'}`);
-    }
-  }
-
-  function requestTicketFullscreen(reason) {
-    if (ticketFullscreenAttempted || document.fullscreenElement) return;
-    ticketFullscreenAttempted = true;
-    const target = stage || document.documentElement;
-    const requestFullscreen = target.requestFullscreen
-      ? target.requestFullscreen.bind(target)
-      : (target.webkitRequestFullscreen ? target.webkitRequestFullscreen.bind(target) : null);
-    if (!requestFullscreen) {
-      clientLog('fullscreen_unavailable', reason || 'unsupported');
-      return;
-    }
-    try {
-      const result = target.requestFullscreen ? requestFullscreen({ navigationUI: 'hide' }) : requestFullscreen();
-      Promise.resolve(result).then(
-        () => clientLog('fullscreen_requested', reason || 'gesture'),
-        (error) => clientLog('fullscreen_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`)
-      );
-    } catch (error) {
-      clientLog('fullscreen_failed', `${reason || 'gesture'}:${error && error.message || 'request failed'}`);
-    }
-  }
-
-  function engageTicketScreen(reason) {
-    const firstEngagement = !screenEngaged;
-    if (firstEngagement) {
-      screenEngaged = true;
-      document.body.classList.add('screen-engaged');
-      updateViewportVars();
-      clientLog('screen_engaged', reason || 'gesture');
-    }
-    requestTicketFullscreen(reason || 'gesture');
-    requestScreenWakeLock(reason || 'gesture');
-  }
-
-  function isControlCodeUiEventTarget(target) {
-    if (!target || target === document || target === window) return false;
-    return Boolean(
-      (panel && panel.contains(target)) ||
-      controlCodeHotspot.contains(target) ||
-      requestCodeButton.contains(target) ||
-      codeDialog.contains(target) ||
-      codeResultArea.contains(target)
-    );
-  }
-
-  function handleScreenEngagementEvent(event) {
-    if (event && event.type === 'keydown' && (event.metaKey || event.ctrlKey || event.altKey)) return;
-    if (event && event.isTrusted === false) return;
-    if (event && isControlCodeUiEventTarget(event.target)) return;
-    engageTicketScreen(event && event.type || 'gesture');
-  }
-
-  for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown']) {
-    document.addEventListener(eventName, handleScreenEngagementEvent, { capture: true, passive: true });
   }
 
   function checkServerVersion(payload) {
     const serverVersion = payload && payload.serverVersion;
     const serverAssetVersion = String(payload && payload.assetVersion || '').trim();
     if (serverAssetVersion && assetVersion && serverAssetVersion !== assetVersion) {
+      if (serverVersionReloadTarget) return false;
+      serverVersionReloadTarget = serverAssetVersion;
       const next = new URL(location.href);
       next.searchParams.set('v', serverAssetVersion);
       location.replace(next.toString());
@@ -883,6 +854,8 @@ import {
     }
     if (!serverVersion || serverVersion === pageVersion) return true;
     if (!String(serverVersion).startsWith('ticket-remote-')) return true;
+    if (serverVersionReloadTarget) return false;
+    serverVersionReloadTarget = String(serverVersion);
     const next = new URL(location.href);
     next.searchParams.set('v', serverVersion);
     location.replace(next.toString());
@@ -948,12 +921,6 @@ import {
     }
   }
 
-  function experimentalMediaURL() {
-    const url = new URL('/api/v1/experimental-media/stream', location.href);
-    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return url.toString();
-  }
-
   function setExperimentalMediaStatus(status) {
     experimentalMediaState.status = String(status || 'Izslēgts');
   }
@@ -974,323 +941,1376 @@ import {
     }
   }
 
-  function applyExperimentalMediaPreference(enabled) {
+  function experimentalHDREngineStatus(engine, options) {
+    options = options || {};
+    if (options.saving) return 'Saglabā HDR apstrādes vietu kontā…';
+    if (engine === CLIENT_HDR_ENGINE) {
+      if (!experimentalClientCapabilityAllowed) return 'Pārlūka HDR šim kontam nav pieejams.';
+      if (!experimentalClientCapability.supported) return 'Pārlūka HDR šajā ierīcē nav pieejams; redzama parastā straume.';
+      return `HDR apstrāde: šī pārlūkprogramma (WebGPU, ${experimentalMediaState.displayBoost}×).`;
+    }
+    return 'HDR apstrāde: šī pārlūkprogramma.';
+  }
+
+  function experimentalHDRBoostStatus(snapshot) {
+    const boost = normalizeClientHDRDisplayBoost(snapshot && snapshot.boost);
+    switch (String(snapshot && snapshot.phase || 'default')) {
+    case 'saving':
+      return `Saglabā pārlūka HDR ${boost}× spilgtumu kontā…`;
+    case 'saved':
+      return `Pārlūka HDR ${boost}× saglabāts; gaida konta apstiprinājumu.`;
+    case 'failed':
+      return `Pārlūka HDR paliek ${boost}× šajā sesijā, bet kontā netika saglabāts.`;
+    case 'synced':
+      return `Saglabātais pārlūka HDR spilgtums: ${boost}×.`;
+    default:
+      return `Pārlūka HDR spilgtums: ${boost}×.`;
+    }
+  }
+
+  const clientHDRDiagnosticMetricEvents = new Set([
+    'settlement_started',
+    'settlement_deadline_exceeded',
+    'compositor_settlement_started',
+    'compositor_settlement_result',
+    'gpu_completion_timeout'
+  ]);
+
+  function reportClientHDRMetric(event, detail) {
+    const recoveryAttempt = foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)
+      ? experimentalMediaForegroundRecovery
+      : null;
+    const controllerSnapshot = experimentalClientHDRController &&
+      typeof experimentalClientHDRController.snapshot === 'function'
+      ? experimentalClientHDRController.snapshot()
+      : null;
+    const metric = Object.assign({
+      assetVersion,
+      engine: CLIENT_HDR_ENGINE,
+      pipeline: CLIENT_HDR_PIPELINE,
+      lifecycleGeneration: experimentalMediaLifecycleGeneration,
+      canvasGeneration: experimentalMediaCanvasGeneration,
+      rendererGeneration: Number(controllerSnapshot && controllerSnapshot.rendererGeneration || 0),
+      attemptId: Number(recoveryAttempt && recoveryAttempt.id || 0),
+      recoveryPhase: String(recoveryAttempt && recoveryAttempt.phase || '').slice(0, 40),
+      triggerSet: String(recoveryAttempt && recoveryAttempt.triggers && recoveryAttempt.triggers.join(',') || '').slice(0, 120),
+      streamEpoch: Number(lastRenderedFrameEpoch || 0),
+      streamSequence: Number(lastRenderedFrameSequence || 0),
+      retryOrdinal: Number(recoveryAttempt && recoveryAttempt.retryOrdinal || 0),
+      startReason: String(experimentalMediaLastStartReason || 'unknown').slice(0, 80)
+    }, detail || {});
+    if (typeof performance !== 'undefined' && performance.memory && Number.isFinite(Number(performance.memory.usedJSHeapSize))) {
+      metric.jsHeapBytes = Math.max(0, Math.round(Number(performance.memory.usedJSHeapSize)));
+    }
+    if (event === 'fallback') {
+      clientHDRMeasurement('experimental_media_fallback', undefined, undefined,
+        Object.assign({ phase: event, engine: CLIENT_HDR_ENGINE }, metric, {
+          reason: String(metric.reason || 'client_hdr_failed').slice(0, 80)
+        }));
+      return;
+    }
+    if (event === 'first_presented') {
+      if (!completeExperimentalMediaForegroundRecovery('first_presented')) {
+        // The renderer may finish after a suspended attempt's wall budget or
+        // after its authority was superseded. Never leave that unowned canvas
+        // visible and never report it as a successful foreground recovery.
+        const unownedSnapshot = experimentalClientHDRController &&
+          typeof experimentalClientHDRController.snapshot === 'function'
+          ? experimentalClientHDRController.snapshot()
+          : null;
+        if (unownedSnapshot && unownedSnapshot.active) {
+          closeExperimentalMedia({
+            keepEnabled: true,
+            status: 'Parastā straume — HDR atjaunošana pārsniedza termiņu.'
+          });
+          experimentalMediaState.enabled = true;
+        }
+        return;
+      }
+      experimentalMediaResumeRetryArmed = false;
+      if (experimentalMediaRendererRetryTimer) {
+        clearTimeout(experimentalMediaRendererRetryTimer);
+        experimentalMediaRendererRetryTimer = null;
+      }
+      clientHDRMeasurement(
+        'experimental_hdr_first_image_shown',
+        metric.firstShownMillis,
+        metric.displayReadyMillis,
+        Object.assign({ phase: event }, metric)
+      );
+      return;
+    }
+    if (event === 'presented') {
+      experimentalClientHDRMetricFrames += 1;
+      if (experimentalClientHDRMetricFrames % 30 !== 0) return;
+    }
+    if (event === 'gpu_completion') {
+      experimentalClientHDRGPUCompletionFrames += 1;
+      if (experimentalClientHDRGPUCompletionFrames % 30 !== 0) return;
+    }
+    if (event === 'paint_wait_timeout' || event === 'paint_wait_failed' || event === 'renderer_init_timeout') {
+      experimentalClientHDRPaintWaitFailures += 1;
+      if (experimentalClientHDRPaintWaitFailures !== 1 && experimentalClientHDRPaintWaitFailures % 30 !== 0) return;
+      clientHDRMeasurement('experimental_hdr_diagnostic', undefined, undefined,
+        Object.assign({ phase: event, engine: CLIENT_HDR_ENGINE }, metric));
+      return;
+    }
+    if (event === 'frame_clone_failed') {
+      experimentalClientHDRCloneFailures += 1;
+      if (experimentalClientHDRCloneFailures !== 1 && experimentalClientHDRCloneFailures % 30 !== 0) return;
+      clientHDRMeasurement('experimental_hdr_diagnostic', undefined, undefined,
+        Object.assign({ phase: event, engine: CLIENT_HDR_ENGINE }, metric));
+      return;
+    }
+    if (clientHDRDiagnosticMetricEvents.has(event)) {
+      if (event === 'settlement_started' && recoveryAttempt) {
+        reportExperimentalMediaForegroundRecovery(recoveryAttempt, 'settling', event);
+      }
+      clientHDRMeasurement('experimental_hdr_diagnostic', undefined, metric.displayReadyMillis,
+        Object.assign({ phase: event, engine: CLIENT_HDR_ENGINE }, metric));
+      return;
+    }
+    const metricEvent = {
+      edr_activation_presented: 'experimental_hdr_activation_presented',
+      renderer_ready: 'experimental_hdr_renderer_ready',
+      presented: 'experimental_hdr_presented',
+      session_summary: 'experimental_hdr_session_summary',
+      surface_transition: 'experimental_hdr_surface_transition',
+      surface_reset: 'experimental_hdr_surface_reset',
+      boost_changed: 'experimental_hdr_boost_changed',
+      boost_change_failed: 'experimental_hdr_boost_failed',
+      gpu_completion: 'experimental_hdr_gpu_completion'
+    }[event];
+    if (metricEvent) clientHDRMeasurement(metricEvent, undefined, metric.displayReadyMillis, Object.assign({ phase: event }, metric));
+  }
+
+  function refreshExperimentalClientCapability() {
+    experimentalClientCapability = clientHDRCapability(window);
+    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
+    return experimentalClientCapability;
+  }
+
+  function prepareExperimentalMediaCanvas(width, height, contextKind, options) {
+    if (!experimentalMediaCanvas || !experimentalMediaCanvas.parentNode) return null;
+    options = options || {};
+    const requestedKind = String(contextKind || '');
+    const replaceForKind = experimentalMediaCanvasContextKind && requestedKind &&
+      experimentalMediaCanvasContextKind !== requestedKind;
+    const replaceForLifecycle = Boolean(options.forceCanvasReset) &&
+      experimentalMediaCanvasResetGeneration !== experimentalMediaLifecycleGeneration;
+    if (replaceForKind || replaceForLifecycle) {
+      const replacement = experimentalMediaCanvas.cloneNode(false);
+      if (replacement.style && typeof replacement.style.removeProperty === 'function') {
+        replacement.style.removeProperty('dynamic-range-limit');
+      }
+      replacement.hidden = true;
+      delete replacement.dataset.clientHdrSurface;
+      delete replacement.dataset.clientHdrSurfaceReason;
+      replacement.setAttribute('aria-hidden', 'true');
+      experimentalMediaCanvas.replaceWith(replacement);
+      experimentalMediaCanvas = replacement;
+      experimentalMediaCanvasGeneration += 1;
+      experimentalMediaCanvasContextKind = '';
+      if (replaceForLifecycle) experimentalMediaCanvasResetGeneration = experimentalMediaLifecycleGeneration;
+      reportClientHDRMetric('surface_reset', {
+        reason: String(options.reason || (replaceForLifecycle ? 'lifecycle' : 'context_kind')).slice(0, 80),
+        canvasReplaced: true
+      });
+    }
+    experimentalMediaCanvas.width = Math.max(1, Math.round(Number(width || canvas.width || 1)));
+    experimentalMediaCanvas.height = Math.max(1, Math.round(Number(height || canvas.height || 1)));
+    if (requestedKind) experimentalMediaCanvasContextKind = requestedKind;
+    return experimentalMediaCanvas;
+  }
+
+  function showExperimentalClientHDRSurface(visible, reason) {
+    if (!experimentalMediaCanvas) return;
+    const current = experimentalMediaState.enabled && experimentalMediaState.engine === CLIENT_HDR_ENGINE;
+    if (!current) {
+      experimentalMediaCanvas.hidden = true;
+      delete experimentalMediaCanvas.dataset.clientHdrSurface;
+      delete experimentalMediaCanvas.dataset.clientHdrSurfaceReason;
+      experimentalMediaCanvas.setAttribute('aria-hidden', 'true');
+      return;
+    }
+    experimentalMediaCanvas.hidden = false;
+    experimentalMediaCanvas.dataset.clientHdrSurface = visible ? 'visible' : 'standby';
+    experimentalMediaCanvas.dataset.clientHdrSurfaceReason = String(reason || (visible ? 'fresh' : 'fallback')).slice(0, 80);
+    experimentalMediaCanvas.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  }
+
+  function experimentalHDRSurfacePresentationAllowed() {
+    if (!document.body || !document.body.classList) return false;
+    return !document.body.classList.contains('details-visible') &&
+      !document.body.classList.contains('control-code-result-visible');
+  }
+
+  function experimentalMediaDocumentHasFocus() {
+    if (document.visibilityState !== 'visible') return false;
+    if (typeof document.hasFocus !== 'function') return true;
+    try {
+      return document.hasFocus();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function requestExperimentalHDRPresentationRegionRecovery(reason, options) {
+    options = options || {};
+    if (!experimentalMediaPreferenceController.enabled ||
+      experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return false;
+    experimentalMediaPresentationRecoveryPending = true;
+    experimentalMediaPresentationRecoveryReason = String(
+      reason || experimentalMediaPresentationRecoveryReason || 'stream_region_visible'
+    ).slice(0, 80);
+    if (experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() ||
+      document.visibilityState !== 'visible' ||
+      controlCodePresentationPriorityActive()) return false;
+    experimentalMediaPresentationRecoveryPending = false;
+    experimentalMediaState.enabled = true;
+    experimentalMediaResumeRetryArmed = true;
+    return beginExperimentalMediaForegroundRecovery(
+      experimentalMediaPresentationRecoveryReason,
+      {
+        forceCanvasReset: true,
+        foregroundConfirmed: Boolean(options.foregroundConfirmed)
+      }
+    );
+  }
+
+  function synchronizeExperimentalHDRSurfaceRegion(blocked, reason, options) {
+    options = options || {};
+    const nextBlocked = Boolean(blocked || controlCodePresentationPriorityActive());
+    const regionReason = String(
+      reason || (nextBlocked ? 'hdr_surface_occluded' : 'stream_region_visible')
+    ).slice(0, 80);
+    if (nextBlocked) {
+      experimentalMediaPresentationRecoveryPending = Boolean(
+        experimentalMediaPreferenceController.enabled &&
+        experimentalMediaState.engine === CLIENT_HDR_ENGINE
+      );
+      experimentalMediaPresentationRecoveryReason = regionReason;
+      if (experimentalMediaPresentationRegionBlocked) return true;
+      experimentalMediaPresentationRegionBlocked = true;
+      experimentalMediaPresentationRegionGeneration += 1;
+      invalidateExperimentalMediaForegroundRecovery('presentation_region_blocked');
+      if (experimentalMediaState.enabled && experimentalMediaState.engine === CLIENT_HDR_ENGINE) {
+        closeExperimentalMedia({
+          keepEnabled: true,
+          status: 'Parastā straume — HDR apturēts, kamēr biļete nav redzama.'
+        });
+        experimentalMediaState.enabled = true;
+      }
+      return true;
+    }
+    const wasBlocked = experimentalMediaPresentationRegionBlocked;
+    if (!wasBlocked && !experimentalMediaPresentationRecoveryPending) return false;
+    if (wasBlocked) {
+      experimentalMediaPresentationRegionBlocked = false;
+      experimentalMediaPresentationRegionGeneration += 1;
+    }
+    return requestExperimentalHDRPresentationRegionRecovery(regionReason, {
+      // Only an explicit scroll/dismissal caller may supply foreground
+      // evidence. Automatic control-priority or server-state transitions must
+      // still wait for focus or the bounded paint confirmation.
+      foregroundConfirmed: Boolean(wasBlocked && options.foregroundConfirmed)
+    });
+  }
+
+  function ensureExperimentalClientHDRController() {
+    if (experimentalClientHDRController) return experimentalClientHDRController;
+    experimentalClientHDRController = new ClientHDRController({
+      maxSequenceLag: 1,
+      maxAgeDeltaMillis: 250,
+      canRevealSurface: () => Boolean(
+        experimentalMediaState.enabled &&
+        experimentalMediaState.engine === CLIENT_HDR_ENGINE &&
+        !experimentalMediaPresentationRegionBlocked &&
+        !experimentalMediaPresentationRecoveryPending &&
+        experimentalHDRSurfacePresentationAllowed() &&
+        !controlCodePresentationPriorityActive()
+      ),
+      onSurface: (visible, _presented, reason) => {
+        if (!experimentalMediaCanvas) return;
+        const current = experimentalMediaState.enabled && experimentalMediaState.engine === CLIENT_HDR_ENGINE;
+        showExperimentalClientHDRSurface(visible, reason);
+        if (visible && current) {
+          if (document.body) document.body.dataset.experimentalMedia = 'hdr-client-webgpu-preview';
+          setExperimentalMediaStatus(`HDR pārlūkā — ${experimentalMediaState.displayBoost}× WebGPU`);
+        } else if (current && document.body) {
+          document.body.dataset.experimentalMedia = 'fallback-sdr';
+          setExperimentalMediaStatus('Parastā straume — gaida svaigu HDR kadru…');
+        }
+      },
+      onStatus: (status, reason) => {
+        if (status === 'starting') setExperimentalMediaStatus('Sagatavo HDR pārlūkā…');
+        if (status === 'ready') {
+          setExperimentalMediaStatus('Gaida svaigu HDR kadru pārlūkā…');
+          if (hasRenderedFrame && typeof streamHasFreshRenderedFrame === 'function' && streamHasFreshRenderedFrame()) {
+            offerCurrentSDRFrameToClientHDR('renderer_ready_sdr_seed');
+          }
+        }
+        if (status === 'failed') {
+          experimentalClientHDRFailed = true;
+          setExperimentalMediaStatus('Parastā straume — pārlūka HDR nav pieejams.');
+          if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
+          // A failure inside an in-progress recovery consumes that attempt's
+          // one fresh-surface retry. A device loss after first_presented no
+          // longer has an owning attempt, so start a new bounded coordinator
+          // attempt instead of waiting for an unrelated lifecycle event.
+          if (!scheduleExperimentalMediaActiveFailureRecovery(reason || 'renderer_failed')) {
+            scheduleExperimentalMediaRendererRetry(reason || 'renderer_failed');
+          }
+        }
+      },
+      onRecoveryRequest: (reason) => {
+        if (reason === 'paint_wait_timeout') offerCurrentSDRFrameToClientHDR(reason);
+      },
+      onMetric: reportClientHDRMetric
+    });
+    return experimentalClientHDRController;
+  }
+
+  function connectExperimentalClientHDR(options) {
+    options = options || {};
+    if (!experimentalMediaState.enabled || experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return false;
+    if (document.visibilityState !== 'visible' || experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() || controlCodePresentationPriorityActive()) return false;
+    const existingController = experimentalClientHDRController;
+    const existingSnapshot = existingController && existingController.snapshot();
+    if (existingSnapshot && existingSnapshot.active) {
+      existingController.setDocumentVisible(true);
+      return true;
+    }
+    hideExperimentalMediaCanvas();
+    experimentalMediaPipeline = CLIENT_HDR_PIPELINE;
+    refreshExperimentalClientCapability();
+    if (!experimentalClientCapabilityAllowed || !experimentalClientCapability.supported) {
+      setExperimentalMediaStatus('Parastā straume — pārlūka HDR šajā ierīcē nav pieejams.');
+      if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
+      return false;
+    }
+    if (experimentalClientHDRFailed) {
+      setExperimentalMediaStatus('Parastā straume — izslēdz un ieslēdz HDR, lai mēģinātu vēlreiz.');
+      return false;
+    }
+    const width = Math.max(1, Number(canvas.width || streamSize.width || 1));
+    const height = Math.max(1, Number(canvas.height || streamSize.height || 1));
+    const hdrCanvas = prepareExperimentalMediaCanvas(width, height, 'webgpu', {
+      forceCanvasReset: Boolean(options.forceCanvasReset),
+      reason: options.reason
+    });
+    if (!hdrCanvas) {
+      experimentalClientHDRFailed = true;
+      setExperimentalMediaStatus('Parastā straume — HDR virsma nav pieejama.');
+      scheduleExperimentalMediaRendererRetry('hdr_canvas_unavailable');
+      return false;
+    }
+    experimentalClientHDRMetricFrames = 0;
+    experimentalClientHDRGPUCompletionFrames = 0;
+    experimentalClientHDRPaintWaitFailures = 0;
+    experimentalClientHDRCloneFailures = 0;
+    ensureExperimentalClientHDRController().setDocumentVisible(document.visibilityState === 'visible');
+    return ensureExperimentalClientHDRController().start({
+      canvas: hdrCanvas,
+      width,
+      height,
+      boost: experimentalMediaState.displayBoost
+    });
+  }
+
+  function offerCurrentSDRFrameToClientHDR(reason) {
+    const controller = experimentalClientHDRController;
+    if (!controller || !controller.snapshot().active || !hasRenderedFrame ||
+      canvas.width <= 0 || canvas.height <= 0 || typeof VideoFrame !== 'function' ||
+      experimentalMediaPresentationRegionBlocked || experimentalMediaPresentationRecoveryPending ||
+      !experimentalHDRSurfacePresentationAllowed() ||
+      controlCodePresentationPriorityActive() ||
+      typeof streamHasFreshRenderedFrame !== 'function' || !streamHasFreshRenderedFrame() ||
+      !(Number(lastRenderedFrameEpoch || 0) > 0) || !(Number(lastRenderedFrameSequence || 0) > 0) ||
+      !(Number(lastRenderedPresentationOrdinal || 0) > 0)) return false;
+    const offeredAt = performance.now();
+    const timestamp = Math.max(0, Math.round(Number(lastRenderedFrameTimestamp || Date.now() * 1000)));
+    const metadata = {
+      epoch: Number(lastRenderedFrameEpoch || currentStreamEpoch || 0),
+      sequence: Number(lastRenderedFrameSequence || 0),
+      presentationOrdinal: Number(lastRenderedPresentationOrdinal || 0),
+      timestamp,
+      visualAgeMillis: Math.max(0, lastRenderedVisualAge(offeredAt)),
+      renderedAt: offeredAt,
+      offeredAt,
+      offeredWallMillis: Date.now(),
+      redrawReason: String(reason || 'boost_changed')
+    };
+    const offered = offerClientHDRCanvasFrame(controller, canvas, metadata, window);
+    if (!offered) {
+      clientLog('state_failed', 'hdr_boost_redraw_failed');
+    }
+    return offered;
+  }
+
+  function syncExperimentalMediaSelectors() {
+    const engine = document.getElementById('experimentalMediaEngine');
+    if (engine && engine.value !== experimentalMediaState.engine) {
+      engine.value = experimentalMediaState.engine;
+    }
+    const boost = document.getElementById('experimentalMediaHDRBoost');
+    const displayBoost = String(experimentalMediaState.displayBoost);
+    if (boost && boost.value !== displayBoost) {
+      boost.value = displayBoost;
+    }
+  }
+
+  function applyExperimentalHDRBoost(value, meta) {
+    const next = normalizeClientHDRDisplayBoost(value);
+    experimentalMediaState.displayBoost = next;
+    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
+    syncExperimentalMediaSelectors();
+    if (!experimentalClientHDRController) return;
+    const applied = experimentalClientHDRController.setDisplayBoost(next);
+    const snapshot = experimentalClientHDRController.snapshot();
+    if (applied && snapshot.active && hasRenderedFrame &&
+      String(meta && meta.reason || '') !== 'default') {
+      offerCurrentSDRFrameToClientHDR(meta && meta.reason);
+    }
+  }
+
+  function observeExperimentalHDREngine(state) {
+    const projection = state && state.memberHDREngine;
+    const decision = clientHDREngineProjectionDecision(projection, experimentalMediaOwnerProjectionAvailable);
+    const next = decision.engine;
+    experimentalMediaEngineProjectionObserved = decision.ownerProjectionAvailable;
+    experimentalMediaOwnerProjectionAvailable = decision.ownerProjectionAvailable;
+    const changed = next !== experimentalMediaState.engine;
+    experimentalMediaState.engineSaving = false;
+    experimentalMediaState.engineStatus = experimentalHDREngineStatus(next);
+    if (!changed) {
+      syncExperimentalMediaSelectors();
+      return;
+    }
+    const keepEnabled = experimentalMediaState.enabled;
+    closeExperimentalMedia({ keepEnabled, status: keepEnabled ? 'Maina HDR apstrādes vietu…' : 'Izslēgts' });
+    experimentalMediaState.engine = next;
+    syncExperimentalMediaSelectors();
+    if (keepEnabled) {
+      experimentalMediaState.enabled = true;
+      beginExperimentalMediaForegroundRecovery('engine_projection_changed', {
+        forceCanvasReset: true
+      });
+    }
+  }
+
+  function observeExperimentalHDRBoost(state) {
+    const projection = state && state.memberHDRBoost;
+    const accountProjectionAvailable = Boolean(projection && projection.accountProjectionAvailable);
+    experimentalMediaBoostProjectionObserved = accountProjectionAvailable;
+    experimentalMediaAccountProjectionAvailable = accountProjectionAvailable;
+    experimentalMediaState.boostSelectorAllowed = accountProjectionAvailable;
+    if (!accountProjectionAvailable) {
+      return;
+    }
+    experimentalHDRBoostPreferenceController.observe(projection.selectedDisplayBoost);
+  }
+
+  function chooseExperimentalHDRBoost(value) {
+    if (!experimentalMediaState.boostSelectorAllowed || experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return;
+    experimentalHDRBoostPreferenceController.choose(value);
+  }
+
+  function applyExperimentalMediaPreference(enabled, meta) {
     const shouldEnable = Boolean(enabled && experimentalMediaCapabilityReady);
     if (!shouldEnable) {
-      if (experimentalMediaState.enabled || experimentalMediaSocket || experimentalMediaDecoder) {
+      if (!enabled) invalidateExperimentalMediaForegroundRecovery('preference_disabled');
+      experimentalMediaResumeRetryArmed = false;
+      clearExperimentalMediaDynamicRangeRecovery();
+      cancelExperimentalMediaStart();
+      if (experimentalMediaState.enabled) {
         closeExperimentalMedia({ status: 'Izslēgts' });
       } else {
         experimentalMediaState.enabled = false;
       }
       return;
     }
-    if (!experimentalMediaState.enabled) {
-      experimentalMediaHDREnabledAt = performance.now();
-      experimentalMediaHDRFirstShown = false;
-      experimentalMediaHDRShownFrames = 0;
-    }
+    if (experimentalMediaState.enabled) return;
+    experimentalClientHDRFailed = false;
+    experimentalMediaResumeRetryArmed = true;
+    // A real OFF -> ON transition owns a new WebKit presentation surface even
+    // when it happens without a page lifecycle. Matching account projections
+    // do not reach this branch because the preference is already enabled.
+    experimentalMediaCanvasResetGeneration = -1;
     experimentalMediaState.enabled = true;
-    connectExperimentalMedia();
+    const preferenceReason = String(meta && meta.reason || 'projection');
+    const startReason = preferenceReason === 'user'
+      ? 'preference_user_enable'
+      : 'preference_projection_restore';
+    beginExperimentalMediaForegroundRecovery(startReason, { forceCanvasReset: true });
   }
 
   function hideExperimentalMediaCanvas() {
     if (experimentalMediaCanvas) {
       experimentalMediaCanvas.hidden = true;
+      delete experimentalMediaCanvas.dataset.clientHdrSurface;
+      delete experimentalMediaCanvas.dataset.clientHdrSurfaceReason;
       experimentalMediaCanvas.setAttribute('aria-hidden', 'true');
     }
-    if (experimentalMediaHDRSwitcher) experimentalMediaHDRSwitcher.clear();
-    experimentalMediaHDRReplacementFailures = 0;
     if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
   }
 
   function closeExperimentalMedia(options) {
     options = options || {};
-    const socket = experimentalMediaSocket;
-    experimentalMediaSocket = null;
-    experimentalMediaConfigureGeneration += 1;
-    experimentalMediaDecoderGeneration += 1;
-    experimentalMediaHDRRenderGeneration += 1;
-    if (experimentalMediaDecoder) {
-      try { experimentalMediaDecoder.close(); } catch (_) {}
-      experimentalMediaDecoder = null;
+    cancelExperimentalMediaStart();
+    if (experimentalMediaActiveFailureRecoveryTimer) {
+      clearTimeout(experimentalMediaActiveFailureRecoveryTimer);
+      experimentalMediaActiveFailureRecoveryTimer = null;
     }
-    experimentalMediaConfig = null;
-    experimentalMediaEpoch = 0;
-    experimentalMediaSequence = 0;
-    experimentalMediaNeedsKeyframe = true;
-    experimentalMediaSps = null;
-    experimentalMediaPps = null;
-    experimentalMediaDescription = null;
+    if (experimentalMediaRendererRetryTimer) {
+      clearTimeout(experimentalMediaRendererRetryTimer);
+      experimentalMediaRendererRetryTimer = null;
+    }
+    if (experimentalClientHDRController) experimentalClientHDRController.dispose(options.status || 'disabled');
     experimentalMediaPipeline = '';
-    experimentalMediaHDREnabledAt = 0;
-    experimentalMediaHDRFirstShown = false;
-    experimentalMediaHDRShownFrames = 0;
-    experimentalMediaHDRReplacementFailures = 0;
     hideExperimentalMediaCanvas();
-    if (socket) {
-      try { socket.close(1000, 'experimental_media_closed'); } catch (_) {}
+    if (!options.keepEnabled) {
+      experimentalMediaState.enabled = false;
+      experimentalMediaResumeRetryArmed = false;
     }
-    if (!options.keepEnabled) experimentalMediaState.enabled = false;
     setExperimentalMediaStatus(options.status || 'Izslēgts');
   }
 
-  function failExperimentalMedia(reason) {
-    clientLog('experimental_media_fallback', safeString(reason).slice(0, 180));
-    closeExperimentalMedia({ status: 'Parastā straume — eksperiments nav pieejams.' });
-  }
-
-  function parseExperimentalFrameEnvelope(raw) {
-    if (!(raw instanceof ArrayBuffer) || raw.byteLength < FRAME_ENVELOPE_HEADER_BYTES) return null;
-    const view = new DataView(raw);
-    if (view.getUint32(0) !== FRAME_ENVELOPE_MAGIC) return null;
-    const flags = view.getUint8(4);
-    return {
-      kind: (flags & 1) === 1 ? 'key' : 'delta',
-      epoch: readUint64(view, 5),
-      sequence: readUint64(view, 13),
-      timestamp: readUint64(view, 21),
-      data: new Uint8Array(raw).slice(FRAME_ENVELOPE_HEADER_BYTES)
-    };
-  }
-
-  function rememberExperimentalParameterSets(units) {
-    for (const unit of units || []) {
-      if (!unit.length) continue;
-      const type = unit[0] & 0x1f;
-      if (type === 7) experimentalMediaSps = unit;
-      if (type === 8) experimentalMediaPps = unit;
-    }
-    if (!experimentalMediaDescription && experimentalMediaSps && experimentalMediaPps) {
-      experimentalMediaDescription = avcDescriptionFromParameterSets(experimentalMediaSps, experimentalMediaPps);
-    }
-    return experimentalMediaDescription;
-  }
-
-  function createExperimentalMediaDecoder(config, decoderConfig) {
-    const generation = ++experimentalMediaDecoderGeneration;
-    if (experimentalMediaDecoder) {
-      try { experimentalMediaDecoder.close(); } catch (_) {}
-    }
-    experimentalMediaDecoder = new VideoDecoder({
-      output: (frame) => {
-        if (generation !== experimentalMediaDecoderGeneration || !experimentalMediaState.enabled) {
-          try { frame.close(); } catch (_) {}
-          return;
+  function cancelExperimentalMediaStart() {
+    const pending = experimentalMediaStartPending;
+    experimentalMediaStartPending = null;
+    experimentalMediaStartGeneration += 1;
+    if (pending) {
+      pending.cancelled = true;
+      if (pending.fallbackTimer) clearTimeout(pending.fallbackTimer);
+      const cancelPaint = window && window.cancelAnimationFrame;
+      if (typeof cancelPaint === 'function') {
+        for (const handle of pending.frameHandles) {
+          try { cancelPaint(handle); } catch (_) {}
         }
-        try {
-          const preview = experimentalMediaCanvas && experimentalMediaCanvas.getContext('2d', { alpha: false });
-          if (!preview) throw new Error('preview canvas unavailable');
-          preview.filter = 'brightness(1.18) contrast(1.06) saturate(1.04)';
-          preview.drawImage(frame, 0, 0, experimentalMediaCanvas.width, experimentalMediaCanvas.height);
-          experimentalMediaCanvas.hidden = false;
-          experimentalMediaCanvas.setAttribute('aria-hidden', 'false');
-          if (document.body) document.body.dataset.experimentalMedia = 'bright-sdr-preview';
-          setExperimentalMediaStatus('Eksperimentālais spilgtuma priekšskatījums');
-        } catch (error) {
-          failExperimentalMedia(error && error.message || 'preview draw failed');
-        } finally {
-          try { frame.close(); } catch (_) {}
-        }
-      },
-      error: (error) => {
-        if (generation !== experimentalMediaDecoderGeneration) return;
-        failExperimentalMedia(error && error.message || 'preview decode failed');
       }
-    });
-    experimentalMediaDecoder.configure(decoderConfig);
-    experimentalMediaConfig = config;
-  }
-
-  async function configureExperimentalMedia(config) {
-    if (!experimentalMediaState.enabled) return;
-    const configureGeneration = ++experimentalMediaConfigureGeneration;
-    const pipeline = String(config && config.experimentalPipeline || '');
-    const hdrGainMap = pipeline === 'iso-gainmap-keyframe-v1';
-    const brightSDR = pipeline === 'relay-copy-v1';
-    if (!config || (!brightSDR && !hdrGainMap)) {
-      throw new Error('experimental relay contract mismatch');
     }
-    if (brightSDR && config.experimentalVisualMode !== 'bright-sdr-preview-v1') {
-	  throw new Error('experimental SDR visual contract mismatch');
-	}
-	if (hdrGainMap && (config.experimentalVisualMode !== 'hdr-gainmap-img-edr-v1' || config.transport !== 'independent-image' || config.mimeType !== 'image/jpeg')) {
-	  throw new Error('experimental HDR visual contract mismatch');
-	}
-    if (brightSDR && (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window))) {
-      throw new Error('WebCodecs unavailable');
-    }
-    const width = Number(config.width || 0);
-    const height = Number(config.height || 0);
-    const codec = String(config.codec || '');
-	if (!width || !height || (brightSDR && !codec.startsWith('avc1')) || (hdrGainMap && codec !== 'jpeg-iso-21496-gainmap')) {
-	  throw new Error('experimental media config invalid');
-	}
-	experimentalMediaHDRRenderGeneration += 1;
-	hideExperimentalMediaCanvas();
-	experimentalMediaPipeline = pipeline;
-    experimentalMediaEpoch = Number(config.streamEpoch || 0);
-    experimentalMediaSequence = 0;
-    experimentalMediaNeedsKeyframe = true;
-    experimentalMediaSps = null;
-    experimentalMediaPps = null;
-    experimentalMediaDescription = null;
-    if (experimentalMediaCanvas) {
-      experimentalMediaCanvas.width = width;
-      experimentalMediaCanvas.height = height;
-    }
-    if (experimentalMediaHDRSwitcher) experimentalMediaHDRSwitcher.setDimensions(width, height);
-	if (hdrGainMap) {
-	  experimentalMediaConfig = config;
-	  setExperimentalMediaStatus('Gaida HDR attēlu…');
-	  return;
-	}
-    if (isAppleWebKit()) {
-      if (experimentalMediaDecoder) {
-        experimentalMediaDecoderGeneration += 1;
-        try { experimentalMediaDecoder.close(); } catch (_) {}
-        experimentalMediaDecoder = null;
-      }
-      experimentalMediaConfig = config;
-      setExperimentalMediaStatus('Gaida eksperimentālo kadru…');
-      return;
-    }
-    const decoderConfig = { codec, codedWidth: width, codedHeight: height, avc: { format: 'annexb' }, optimizeForLatency: true };
-    const support = await VideoDecoder.isConfigSupported(decoderConfig);
-    if (configureGeneration !== experimentalMediaConfigureGeneration || !experimentalMediaState.enabled) return;
-    if (!support || !support.supported) throw new Error('experimental H.264 decoder unsupported');
-    createExperimentalMediaDecoder(config, decoderConfig);
-    setExperimentalMediaStatus('Gaida eksperimentālo kadru…');
-  }
-
-  async function renderExperimentalHDRFrame(frame) {
-    if (!experimentalMediaHDRSwitcher || frame.kind !== 'key') throw new Error('HDR image frame invalid');
-    const generation = ++experimentalMediaHDRRenderGeneration;
-    const decodeStartedAt = performance.now();
-    const result = await experimentalMediaHDRSwitcher.present(
-      new Blob([frame.data], { type: 'image/jpeg' }),
-      {
-        isCurrent: () => generation === experimentalMediaHDRRenderGeneration &&
-          experimentalMediaState.enabled &&
-          experimentalMediaPipeline === 'iso-gainmap-keyframe-v1'
-      }
-    );
-    if (result.status === 'stale') return;
-    const replacementDecision = advanceExperimentalHDRReplacementFailure(
-      experimentalMediaHDRReplacementFailures,
-      result.status,
-      experimentalMediaHDRSwitcher.hasActive(),
-      experimentalMediaHDRMaxConsecutiveReplacementFailures
-    );
-    experimentalMediaHDRReplacementFailures = replacementDecision.failures;
-    if (result.status === 'failed') {
-      if (!replacementDecision.fallback) return;
-      throw result.error || new Error('HDR replacement decode failed');
-    }
-    if (experimentalMediaCanvas) experimentalMediaCanvas.hidden = true;
-    if (document.body) document.body.dataset.experimentalMedia = 'hdr-gainmap-preview';
-    setExperimentalMediaStatus('HDR attēla priekšskatījums');
-    const shownAt = performance.now();
-    const decodeMillis = Math.max(0, Math.round(shownAt - decodeStartedAt));
-    experimentalMediaHDRShownFrames += 1;
-    if (!experimentalMediaHDRFirstShown) {
-      experimentalMediaHDRFirstShown = true;
-      const firstShownMillis = experimentalMediaHDREnabledAt > 0 ? Math.max(0, Math.round(shownAt - experimentalMediaHDREnabledAt)) : 0;
-      clientHDRMeasurement('experimental_hdr_first_image_shown', firstShownMillis, decodeMillis);
-    } else if (experimentalMediaHDRShownFrames % 30 === 0) {
-      clientHDRMeasurement('experimental_hdr_decode_sample', undefined, decodeMillis);
+    if (experimentalMediaCapabilityRetryTimer) {
+      clearTimeout(experimentalMediaCapabilityRetryTimer);
+      experimentalMediaCapabilityRetryTimer = null;
     }
   }
 
-  async function decodeExperimentalMediaFrame(raw) {
-    if (!experimentalMediaState.enabled || !experimentalMediaConfig) return;
-    const frame = parseExperimentalFrameEnvelope(raw);
-    if (!frame || !frame.epoch || !frame.sequence) throw new Error('experimental frame invalid');
-    if (experimentalMediaEpoch && frame.epoch !== experimentalMediaEpoch) {
-      hideExperimentalMediaCanvas();
-      experimentalMediaNeedsKeyframe = true;
-      return;
-    }
-    if (frame.sequence <= experimentalMediaSequence) return;
-    if (experimentalMediaPipeline === 'iso-gainmap-keyframe-v1') {
-	  if (frame.kind !== 'key') throw new Error('HDR preview requires an independent image');
-	  experimentalMediaSequence = frame.sequence;
-	  await renderExperimentalHDRFrame(frame);
-	  return;
-	}
-    if (frame.kind !== 'key' && (experimentalMediaNeedsKeyframe || (experimentalMediaSequence && frame.sequence !== experimentalMediaSequence + 1))) {
-      hideExperimentalMediaCanvas();
-      experimentalMediaNeedsKeyframe = true;
-      setExperimentalMediaStatus('Parastā straume — gaida eksperimentālo atslēgkadru…');
-      return;
-    }
-    if (frame.kind === 'key') experimentalMediaNeedsKeyframe = false;
-    experimentalMediaSequence = frame.sequence;
-    let data = frame.data;
-    if (isAppleWebKit()) {
-      const converted = annexBToAvcSample(frame.data);
-      if (!converted) throw new Error('experimental AVC conversion failed');
-      if (frame.kind === 'key') rememberExperimentalParameterSets(converted.units);
-      if (!experimentalMediaDecoder) {
-        if (frame.kind !== 'key' || !experimentalMediaDescription) {
-          experimentalMediaNeedsKeyframe = true;
-          return;
-        }
-        createExperimentalMediaDecoder(experimentalMediaConfig, {
-          codec: String(experimentalMediaConfig.codec || 'avc1.42C028'),
-          codedWidth: Number(experimentalMediaConfig.width || 0),
-          codedHeight: Number(experimentalMediaConfig.height || 0),
-          description: experimentalMediaDescription,
-          optimizeForLatency: true
-        });
-      }
-      data = converted.sample;
-    }
-    if (!experimentalMediaDecoder) throw new Error('experimental decoder unavailable');
-    experimentalMediaDecoder.decode(new EncodedVideoChunk({ type: frame.kind, timestamp: frame.timestamp, data }));
+  function clearExperimentalMediaDynamicRangeRecovery() {
+    const query = experimentalMediaDynamicRangeRecoveryQuery;
+    const listener = experimentalMediaDynamicRangeRecoveryListener;
+    experimentalMediaDynamicRangeRecoveryQuery = null;
+    experimentalMediaDynamicRangeRecoveryListener = null;
+    if (!query || !listener) return;
+    try {
+      if (typeof query.removeEventListener === 'function') query.removeEventListener('change', listener);
+      else if (typeof query.removeListener === 'function') query.removeListener(listener);
+    } catch (_) {}
   }
 
-  function connectExperimentalMedia() {
-    if (!experimentalMediaState.enabled || experimentalMediaSocket) return;
-    hideExperimentalMediaCanvas();
-    setExperimentalMediaStatus('Savieno eksperimentālo straumi…');
-    const socket = safeWebSocket(experimentalMediaURL(), 'experimental-media', ['ticket.experimental-media.v1']);
-    if (!socket) {
-      failExperimentalMedia('experimental socket unavailable');
-      return;
-    }
-    experimentalMediaSocket = socket;
-    experimentalMediaMessageChain = Promise.resolve();
-    socket.binaryType = 'arraybuffer';
-    socket.onopen = () => {
-      if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
-        setExperimentalMediaStatus('Gaida eksperimentālo straumi…');
+  function armExperimentalMediaDynamicRangeRecovery(options) {
+    options = options || {};
+    if (experimentalMediaDynamicRangeRecoveryListener) return true;
+    if (!window || typeof window.matchMedia !== 'function') return false;
+    let query;
+    try { query = window.matchMedia('(dynamic-range: high)'); } catch (_) { return false; }
+    if (!query) return false;
+    const listener = (event) => {
+      if ((!experimentalMediaPreferenceController.enabled && !experimentalMediaState.enabled) ||
+        document.visibilityState !== 'visible') return;
+      const available = Boolean(event && typeof event.matches === 'boolean'
+        ? event.matches
+        : query.matches);
+      const trigger = available
+        ? 'dynamic_range_capability_available'
+        : 'dynamic_range_capability_unavailable';
+      const attempt = experimentalMediaForegroundRecovery;
+      if (!available && foregroundRecoveryCurrent(attempt)) {
+        // A disappearing local HDR capability immediately revokes the current
+        // surface and attempt. The replacement attempt may keep probing until
+        // its bounded foreground deadline, but SDR remains authoritative.
+        invalidateExperimentalMediaForegroundRecovery('dynamic_range_capability_unavailable');
       }
-    };
-    socket.onmessage = (event) => {
-      experimentalMediaMessageChain = experimentalMediaMessageChain.then(async () => {
-        if (experimentalMediaSocket !== socket || !experimentalMediaState.enabled) return;
-        if (typeof event.data === 'string') {
-          const message = JSON.parse(event.data);
-          if (message.type === 'config') await configureExperimentalMedia(message);
-          return;
-        }
-        await decodeExperimentalMediaFrame(event.data);
-      }).catch((error) => {
-        if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
-          failExperimentalMedia(error && error.message || 'experimental media failed');
-        }
+      beginExperimentalMediaForegroundRecovery(trigger, {
+        forceCanvasReset: true
       });
     };
-    socket.onerror = () => {
-      if (experimentalMediaSocket === socket && experimentalMediaState.enabled) {
-        failExperimentalMedia('experimental socket error');
+    experimentalMediaDynamicRangeRecoveryQuery = query;
+    experimentalMediaDynamicRangeRecoveryListener = listener;
+    try {
+      if (typeof query.addEventListener === 'function') query.addEventListener('change', listener);
+      else if (typeof query.addListener === 'function') query.addListener(listener);
+      else {
+        clearExperimentalMediaDynamicRangeRecovery();
+        return false;
       }
+    } catch (_) {
+      clearExperimentalMediaDynamicRangeRecovery();
+      return false;
+    }
+    if (query.matches && !options.onlyFutureChange) listener(query);
+    return true;
+  }
+
+  function reportExperimentalMediaForegroundRecovery(attempt, phase, reason) {
+    if (!attempt) return;
+    const nextPhase = String(phase || 'unknown').slice(0, 40);
+    const nextReason = String(reason || attempt.reason || 'foreground').slice(0, 80);
+    if (attempt.reportedPhase === nextPhase && attempt.reportedReason === nextReason) return;
+    attempt.phase = nextPhase;
+    attempt.reportedPhase = nextPhase;
+    attempt.reportedReason = nextReason;
+    const snapshot = experimentalClientHDRController &&
+      typeof experimentalClientHDRController.snapshot === 'function'
+      ? experimentalClientHDRController.snapshot()
+      : null;
+    clientHDRMeasurement('experimental_hdr_diagnostic', undefined, undefined, {
+      assetVersion,
+      engine: CLIENT_HDR_ENGINE,
+      pipeline: CLIENT_HDR_PIPELINE,
+      phase: 'foreground_recovery',
+      attemptId: Number(attempt.id || 0),
+      recoveryPhase: nextPhase,
+      triggerSet: String(attempt.triggers && attempt.triggers.join(',') || attempt.reason || '').slice(0, 120),
+      reason: nextReason,
+      versionOutcome: String(attempt.versionOutcome || 'pending').slice(0, 40),
+      capabilityOutcome: String(attempt.capabilityOutcome || 'pending').slice(0, 40),
+      streamEpoch: Number(lastRenderedFrameEpoch || 0),
+      streamSequence: Number(lastRenderedFrameSequence || 0),
+      baselineSDRRenderSerial: Number(attempt.baselineSDRRenderSerial || 0),
+      sdrRenderSerial: Number(authoritativeSDRRenderSerial || 0),
+      lifecycleGeneration: attempt.lifecycleGeneration,
+      presentationRegionGeneration: attempt.presentationRegionGeneration,
+      presentationRegionBlocked: experimentalMediaPresentationRegionBlocked,
+      presentationRecoveryPending: experimentalMediaPresentationRecoveryPending,
+      foregroundPaintConfirmed: Boolean(attempt.foregroundPaintConfirmed),
+      foregroundStabilityWaitMillis: Math.max(
+        0,
+        Number(attempt.canvasNotBeforeWallAt || 0) - Date.now()
+      ),
+      canvasGeneration: experimentalMediaCanvasGeneration,
+      rendererGeneration: Number(snapshot && snapshot.rendererGeneration || 0),
+      presentationState: String(snapshot && snapshot.presentationState || '').slice(0, 40),
+      surfaceVisible: Boolean(snapshot && snapshot.surfaceVisible),
+      retryOrdinal: Number(attempt.retryOrdinal || 0),
+      recoveryElapsedMillis: Math.max(0, Date.now() - Number(attempt.startedWallAt || Date.now())),
+      recoveryRemainingMillis: Math.max(0, Number(attempt.deadlineWallAt || 0) - Date.now()),
+      startReason: String(attempt.reason || 'foreground').slice(0, 80)
+    });
+  }
+
+  function clearExperimentalMediaForegroundRecoveryTimer() {
+    if (!experimentalMediaForegroundRecoveryTimer) return;
+    clearTimeout(experimentalMediaForegroundRecoveryTimer);
+    experimentalMediaForegroundRecoveryTimer = null;
+  }
+
+  function clearExperimentalMediaForegroundRecoveryDeadlineTimer() {
+    if (!experimentalMediaForegroundRecoveryDeadlineTimer) return;
+    clearTimeout(experimentalMediaForegroundRecoveryDeadlineTimer);
+    experimentalMediaForegroundRecoveryDeadlineTimer = null;
+  }
+
+  function armExperimentalMediaForegroundRecoveryDeadline(attempt) {
+    clearExperimentalMediaForegroundRecoveryDeadlineTimer();
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    const remaining = Math.max(0, Number(attempt.deadlineWallAt || 0) - Date.now());
+    experimentalMediaForegroundRecoveryDeadlineTimer = setTimeout(() => {
+      experimentalMediaForegroundRecoveryDeadlineTimer = null;
+      if (!foregroundRecoveryCurrent(attempt)) return;
+      failExperimentalMediaForegroundRecovery(attempt, 'foreground_deadline_exhausted');
+    }, remaining);
+    return true;
+  }
+
+  function foregroundRecoveryCurrent(attempt) {
+    return Boolean(attempt && experimentalMediaForegroundRecovery === attempt &&
+      attempt.id === experimentalMediaForegroundRecoverySequence && !attempt.cancelled &&
+      attempt.presentationRegionGeneration === experimentalMediaPresentationRegionGeneration);
+  }
+
+  function invalidateExperimentalMediaForegroundRecovery(reason) {
+    const attempt = experimentalMediaForegroundRecovery;
+    clearExperimentalMediaForegroundRecoveryTimer();
+    clearExperimentalMediaForegroundRecoveryDeadlineTimer();
+    experimentalMediaForegroundRecovery = null;
+    experimentalMediaForegroundRecoverySequence += 1;
+    if (!attempt) return;
+    attempt.cancelled = true;
+    if (attempt.versionAbortController) {
+      try { attempt.versionAbortController.abort(); } catch (_) {}
+      attempt.versionAbortController = null;
+    }
+    reportExperimentalMediaForegroundRecovery(
+      attempt,
+      reason === 'lifecycle_backgrounded' ? 'backgrounded' : 'cancelled',
+      reason || 'superseded'
+    );
+  }
+
+  function completeExperimentalMediaForegroundRecovery(reason) {
+    const attempt = experimentalMediaForegroundRecovery;
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    if (Date.now() >= Number(attempt.deadlineWallAt || 0)) {
+      failExperimentalMediaForegroundRecovery(attempt, 'foreground_deadline_exhausted_before_present');
+      return false;
+    }
+    reportExperimentalMediaForegroundRecovery(attempt, 'active', reason || 'presented');
+    experimentalMediaForegroundRecoveredGeneration = attempt.lifecycleGeneration;
+    experimentalMediaForegroundSuspensionGap = false;
+    clearExperimentalMediaForegroundRecoveryTimer();
+    clearExperimentalMediaForegroundRecoveryDeadlineTimer();
+    experimentalMediaForegroundRecovery = null;
+    attempt.cancelled = true;
+    return true;
+  }
+
+  function failExperimentalMediaForegroundRecovery(attempt, reason) {
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    reportExperimentalMediaForegroundRecovery(attempt, 'safe_sdr', reason || 'foreground_recovery_failed');
+    clearExperimentalMediaForegroundRecoveryTimer();
+    clearExperimentalMediaForegroundRecoveryDeadlineTimer();
+    if (attempt.versionAbortController) {
+      try { attempt.versionAbortController.abort(); } catch (_) {}
+      attempt.versionAbortController = null;
+    }
+    experimentalMediaForegroundRecovery = null;
+    attempt.cancelled = true;
+    closeExperimentalMedia({
+      keepEnabled: true,
+      status: 'Parastā straume — HDR atjaunošana neizdevās.'
+    });
+    experimentalMediaState.enabled = true;
+    armExperimentalMediaDynamicRangeRecovery({ onlyFutureChange: true });
+    return true;
+  }
+
+  function foregroundAttemptHasFreshSDR(attempt) {
+    const renderedEpoch = Number(lastRenderedFrameEpoch || 0);
+    const activeEpoch = Number(currentStreamEpoch || 0);
+    return Boolean(
+      foregroundRecoveryCurrent(attempt) &&
+      hasRenderedFrame &&
+      Number(authoritativeSDRRenderSerial || 0) > Number(attempt.baselineSDRRenderSerial || 0) &&
+      renderedEpoch > 0 &&
+      activeEpoch > 0 &&
+      renderedEpoch === activeEpoch &&
+      Number(lastRenderedFrameSequence || 0) > 0 &&
+      typeof streamHasFreshRenderedFrame === 'function' && streamHasFreshRenderedFrame()
+    );
+  }
+
+  function foregroundRecoveryRetryDelay(attempt) {
+    const index = Math.min(
+      Math.max(0, Number(attempt && attempt.retryIndex || 0)),
+      experimentalMediaForegroundRecoveryRetryDelays.length - 1
+    );
+    if (attempt) attempt.retryIndex = index + 1;
+    return experimentalMediaForegroundRecoveryRetryDelays[index];
+  }
+
+  function queueExperimentalMediaForegroundRecovery(attempt, delay) {
+    if (!foregroundRecoveryCurrent(attempt) || experimentalMediaForegroundRecoveryTimer) return false;
+    const remaining = Math.max(0, attempt.deadlineWallAt - Date.now());
+    const boundedDelay = Math.min(remaining, Math.max(0, Number(delay || 0)));
+    experimentalMediaForegroundRecoveryTimer = setTimeout(() => {
+      experimentalMediaForegroundRecoveryTimer = null;
+      reconcileExperimentalMediaForegroundRecovery(attempt);
+    }, boundedDelay);
+    return true;
+  }
+
+  async function checkExperimentalMediaForegroundVersion(attempt) {
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    attempt.versionAbortController = controller;
+    let timeout = null;
+    try {
+      const versionRequest = fetch('/api/v1/livez', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined
+      });
+      const timeoutRequest = new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          try { if (controller) controller.abort(); } catch (_) {}
+          reject(new Error('version_check_timeout'));
+        }, experimentalMediaCapabilityFetchTimeoutMillis);
+      });
+      const response = await Promise.race([versionRequest, timeoutRequest]);
+      if (!response.ok) {
+        attempt.versionOutcome = 'server_unavailable';
+        reportExperimentalMediaForegroundRecovery(attempt, 'version_check', 'version_server_unavailable');
+        return false;
+      }
+      const payload = await response.json();
+      if (!foregroundRecoveryCurrent(attempt)) return false;
+      const serverAssetVersion = String(payload && payload.assetVersion || '').trim();
+      const serverVersion = String(payload && payload.serverVersion || '').trim();
+      const mismatchVersion = serverAssetVersion && assetVersion && serverAssetVersion !== assetVersion
+        ? serverAssetVersion
+        : (serverVersion && serverVersion !== pageVersion && serverVersion.startsWith('ticket-remote-')
+          ? serverVersion
+          : '');
+      if (mismatchVersion) {
+        attempt.versionOutcome = 'mismatch';
+        let alreadyReloadedForVersion = false;
+        try {
+          alreadyReloadedForVersion = new URL(location.href).searchParams.get('v') === mismatchVersion;
+        } catch (_) {}
+        if (alreadyReloadedForVersion) {
+          reportExperimentalMediaForegroundRecovery(attempt, 'safe_sdr', 'asset_version_mismatch_after_reload');
+          invalidateExperimentalMediaForegroundRecovery('asset_version_mismatch_after_reload');
+          return false;
+        }
+      }
+      if (!checkServerVersion(payload)) {
+        attempt.reloadRequested = true;
+        invalidateExperimentalMediaForegroundRecovery('asset_version_mismatch');
+        return false;
+      }
+      attempt.versionOutcome = 'match';
+      attempt.versionChecked = true;
+      return true;
+    } catch (_) {
+      if (foregroundRecoveryCurrent(attempt)) {
+        attempt.versionOutcome = 'request_failed';
+        reportExperimentalMediaForegroundRecovery(attempt, 'version_check', 'version_request_failed');
+      }
+      return false;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (attempt.versionAbortController === controller) attempt.versionAbortController = null;
+    }
+  }
+
+  async function reconcileExperimentalMediaForegroundRecovery(attempt) {
+    if (!foregroundRecoveryCurrent(attempt) || attempt.reconcileRunning) return false;
+    if (document.visibilityState !== 'visible' || !experimentalMediaPreferenceController.enabled) return false;
+    if (experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() ||
+      controlCodePresentationPriorityActive()) return false;
+    if (Date.now() >= attempt.deadlineWallAt) {
+      failExperimentalMediaForegroundRecovery(attempt, 'foreground_deadline_exhausted');
+      return false;
+    }
+    attempt.reconcileRunning = true;
+    try {
+      const activeController = experimentalClientHDRController;
+      if (activeController && typeof activeController.checkSettlementDeadline === 'function') {
+        activeController.checkSettlementDeadline('foreground_recovery');
+      }
+      if (!attempt.versionChecked) {
+        reportExperimentalMediaForegroundRecovery(attempt, 'version_check', attempt.reason);
+        if (!await checkExperimentalMediaForegroundVersion(attempt)) return false;
+      }
+      if (!foregroundRecoveryCurrent(attempt)) return false;
+      if (!attempt.serverCapabilityChecked || !experimentalMediaCapabilityReady) {
+        attempt.capabilityOutcome = 'server_pending';
+        reportExperimentalMediaForegroundRecovery(attempt, 'capability_wait', 'server_capability');
+        let capabilityResponse = null;
+        try {
+          capabilityResponse = await fetchExperimentalMediaCapability();
+        } catch (_) {}
+        if (!foregroundRecoveryCurrent(attempt)) return false;
+        if (!capabilityResponse || !applyExperimentalMediaCapabilityPayload(
+            capabilityResponse.response,
+            capabilityResponse.payload,
+            attempt.id
+          )) {
+          attempt.capabilityOutcome = 'server_unavailable';
+          reportExperimentalMediaForegroundRecovery(attempt, 'capability_wait', 'server_capability_unavailable');
+          return false;
+        }
+        attempt.capabilityOutcome = 'server_ready';
+        attempt.serverCapabilityChecked = true;
+      }
+      const capability = refreshExperimentalClientCapability();
+      if (!experimentalClientCapabilityAllowed || !capability.supported) {
+        attempt.capabilityOutcome = 'browser_unavailable';
+        reportExperimentalMediaForegroundRecovery(
+          attempt,
+          'capability_wait',
+          'browser_capability_unavailable'
+        );
+        // WebKit can temporarily report any part of the local HDR stack as
+        // absent while a suspended PWA is waking. Re-probe the complete local
+        // contract until this attempt's wall deadline instead of latching one
+        // early observation as a permanent failure.
+        return false;
+      }
+      attempt.capabilityOutcome = 'ready';
+      if (!foregroundAttemptHasFreshSDR(attempt)) {
+        reportExperimentalMediaForegroundRecovery(attempt, 'fresh_sdr_wait', attempt.reason);
+        return false;
+      }
+      if ((!experimentalMediaDocumentHasFocus() && !attempt.foregroundPaintConfirmed) ||
+        Date.now() < Number(attempt.canvasNotBeforeWallAt || 0)) {
+        reportExperimentalMediaForegroundRecovery(attempt, 'capability_wait', 'foreground_stability_wait');
+        return false;
+      }
+      attempt.freshSDREpoch = Number(lastRenderedFrameEpoch || 0);
+      attempt.freshSDRSequence = Number(lastRenderedFrameSequence || 0);
+      const snapshot = experimentalClientHDRController && experimentalClientHDRController.snapshot();
+      if (snapshot && snapshot.active) {
+        reportExperimentalMediaForegroundRecovery(
+          attempt,
+          snapshot.presentationState === 'settling' ? 'settling' : 'initializing',
+          attempt.reason
+        );
+        return true;
+      }
+      if (!attempt.canvasStarted) {
+        attempt.canvasStarted = true;
+        experimentalClientHDRFailed = false;
+        experimentalMediaResumeRetryArmed = true;
+        experimentalMediaCanvasResetGeneration = -1;
+        reportExperimentalMediaForegroundRecovery(attempt, 'initializing', attempt.reason);
+        scheduleExperimentalMediaStart(`foreground_recovery:${attempt.reason}`, {
+          forceCanvasReset: true
+        });
+      } else if (experimentalClientHDRFailed && !experimentalMediaRendererRetryTimer &&
+        !experimentalMediaStartPending) {
+        failExperimentalMediaForegroundRecovery(attempt, 'renderer_retry_exhausted');
+      } else if (!experimentalMediaStartPending && !experimentalMediaCapabilityRetryTimer &&
+        !experimentalMediaRendererRetryTimer && !attempt.restartUsed) {
+        attempt.restartUsed = true;
+        attempt.canvasStarted = false;
+        experimentalMediaCanvasResetGeneration = -1;
+        reportExperimentalMediaForegroundRecovery(attempt, 'capability_wait', 'settled_start_retry');
+      }
+      return true;
+    } finally {
+      attempt.reconcileRunning = false;
+      if (foregroundRecoveryCurrent(attempt)) {
+        queueExperimentalMediaForegroundRecovery(attempt, foregroundRecoveryRetryDelay(attempt));
+      }
+    }
+  }
+
+  function beginExperimentalMediaForegroundRecovery(reason, options) {
+    options = options || {};
+    if (!experimentalMediaPreferenceController.enabled || document.visibilityState !== 'visible') return false;
+    if (experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() ||
+      controlCodePresentationPriorityActive()) {
+      experimentalMediaPresentationRecoveryPending = true;
+      experimentalMediaPresentationRecoveryReason = String(reason || 'foreground_region_wait').slice(0, 80);
+      return false;
+    }
+    const current = experimentalMediaForegroundRecovery;
+    if (foregroundRecoveryCurrent(current) && current.lifecycleGeneration === experimentalMediaLifecycleGeneration) {
+      experimentalMediaForegroundSuspensionGap = false;
+      const triggerWallAt = Date.now();
+      current.reason = String(reason || current.reason || 'foreground').slice(0, 80);
+      current.lastTriggerWallAt = triggerWallAt;
+      if (!current.canvasStarted) {
+        current.canvasNotBeforeWallAt = Math.max(
+          Number(current.canvasNotBeforeWallAt || 0),
+          triggerWallAt + experimentalMediaForegroundCanvasStabilityMillis
+        );
+      }
+      if (options.foregroundConfirmed) current.foregroundPaintConfirmed = true;
+      if (!Array.isArray(current.triggers)) current.triggers = [];
+      if (reason && !current.triggers.includes(String(reason))) {
+        current.triggers.push(String(reason).slice(0, 80));
+      }
+      queueExperimentalMediaForegroundRecovery(current, 0);
+      return true;
+    }
+    invalidateExperimentalMediaForegroundRecovery('new_foreground_attempt');
+    const startedWallAt = Date.now();
+    const attempt = {
+      id: ++experimentalMediaForegroundRecoverySequence,
+      lifecycleGeneration: experimentalMediaLifecycleGeneration,
+      presentationRegionGeneration: experimentalMediaPresentationRegionGeneration,
+      baselineSDRRenderSerial: Number(authoritativeSDRRenderSerial || 0),
+      startedWallAt,
+      lastTriggerWallAt: startedWallAt,
+      canvasNotBeforeWallAt: startedWallAt + experimentalMediaForegroundCanvasStabilityMillis,
+      deadlineWallAt: startedWallAt + experimentalMediaForegroundRecoveryWindowMillis,
+      reason: String(reason || 'foreground').slice(0, 80),
+      triggers: [String(reason || 'foreground').slice(0, 80)],
+      phase: 'version_check',
+      reportedPhase: '',
+      reportedReason: '',
+      versionChecked: false,
+      versionOutcome: 'pending',
+      serverCapabilityChecked: false,
+      capabilityOutcome: 'pending',
+      versionAbortController: null,
+      reloadRequested: false,
+      canvasStarted: false,
+      restartUsed: false,
+      retryOrdinal: 0,
+      retryIndex: 0,
+      foregroundPaintConfirmed: Boolean(
+        options.foregroundConfirmed || experimentalMediaDocumentHasFocus()
+      ),
+      reconcileRunning: false,
+      cancelled: false
     };
-    socket.onclose = () => {
-      if (experimentalMediaSocket !== socket) return;
-      experimentalMediaSocket = null;
-      if (experimentalMediaState.enabled) failExperimentalMedia('experimental socket closed');
+    experimentalMediaPresentationRecoveryPending = false;
+    experimentalMediaForegroundRecovery = attempt;
+    armExperimentalMediaForegroundRecoveryDeadline(attempt);
+    experimentalMediaForegroundSuspensionGap = false;
+    experimentalMediaState.enabled = true;
+    if (options.forceCanvasReset) experimentalMediaCanvasResetGeneration = -1;
+    cancelExperimentalMediaStart();
+    armExperimentalMediaDynamicRangeRecovery({ onlyFutureChange: true });
+    // A restored page must re-admit the current release rather than inheriting
+    // a capability verdict from the pre-suspension WebKit process.
+    experimentalMediaCapabilityReady = false;
+    experimentalClientCapabilityAllowed = false;
+    if (experimentalClientHDRController) {
+      closeExperimentalMedia({ keepEnabled: true, status: 'Sagatavo svaigu HDR virsmu…' });
+      experimentalMediaState.enabled = true;
+    }
+    reportExperimentalMediaForegroundRecovery(attempt, 'version_check', attempt.reason);
+    queueExperimentalMediaForegroundRecovery(attempt, 0);
+    return true;
+  }
+
+  function noteExperimentalMediaForegroundFrame() {
+    if (experimentalMediaPresentationRecoveryPending) {
+      requestExperimentalHDRPresentationRegionRecovery('presentation_region_fresh_sdr');
+    }
+    const attempt = experimentalMediaForegroundRecovery;
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    return queueExperimentalMediaForegroundRecovery(attempt, 0);
+  }
+
+  function scheduleExperimentalMediaForegroundReturnConfirmation(reason) {
+    if (!experimentalMediaPreferenceController.enabled) return false;
+    const sequence = ++experimentalMediaForegroundReturnConfirmationSequence;
+    const observedLifecycleGeneration = experimentalMediaLifecycleGeneration;
+    const confirmationReason = String(reason || 'foreground_return').slice(0, 64);
+    if (experimentalMediaForegroundReturnConfirmationTimer) {
+      clearTimeout(experimentalMediaForegroundReturnConfirmationTimer);
+      experimentalMediaForegroundReturnConfirmationTimer = null;
+    }
+    experimentalMediaForegroundReturnConfirmationTimer = setTimeout(() => {
+      experimentalMediaForegroundReturnConfirmationTimer = null;
+      if (sequence !== experimentalMediaForegroundReturnConfirmationSequence ||
+        !experimentalMediaPreferenceController.enabled ||
+        document.visibilityState !== 'visible' ||
+        experimentalMediaPresentationRegionBlocked ||
+        !experimentalHDRSurfacePresentationAllowed() ||
+        controlCodePresentationPriorityActive()) return;
+      const requestPaint = window && window.requestAnimationFrame;
+      if (typeof requestPaint !== 'function') return;
+      try {
+        requestPaint(() => {
+          if (sequence !== experimentalMediaForegroundReturnConfirmationSequence ||
+            !experimentalMediaPreferenceController.enabled ||
+            document.visibilityState !== 'visible' ||
+            experimentalMediaPresentationRegionBlocked ||
+            !experimentalHDRSurfacePresentationAllowed() ||
+            controlCodePresentationPriorityActive()) return;
+          if (experimentalMediaLifecycleArmed ||
+            experimentalMediaLifecycleGeneration !== observedLifecycleGeneration) {
+            resumeExperimentalMediaForLifecycle(`return_confirm:${confirmationReason}`);
+          }
+          if (experimentalMediaPresentationRecoveryPending) {
+            requestExperimentalHDRPresentationRegionRecovery(`return_confirm:${confirmationReason}`);
+          }
+          const current = experimentalMediaForegroundRecovery;
+          if (!foregroundRecoveryCurrent(current)) return;
+          current.foregroundPaintConfirmed = true;
+          queueExperimentalMediaForegroundRecovery(current, 0);
+        });
+      } catch (_) {}
+    }, experimentalMediaForegroundReturnConfirmationMillis);
+    return true;
+  }
+
+  function noteExperimentalMediaForegroundPulse() {
+    if (document.visibilityState !== 'visible') return false;
+    const now = Date.now();
+    const previousPulseWallAt = experimentalMediaForegroundPulseWallAt;
+    const detectedGap = now - previousPulseWallAt >= experimentalMediaForegroundSuspensionGapMillis;
+    if (detectedGap) {
+      experimentalMediaForegroundSuspensionGap = true;
+    }
+    experimentalMediaForegroundPulseWallAt = now;
+    const controller = experimentalClientHDRController;
+    if (controller && typeof controller.checkSettlementDeadline === 'function') {
+      controller.checkSettlementDeadline('foreground_pulse');
+    }
+    const currentAttempt = experimentalMediaForegroundRecovery;
+    if (detectedGap && foregroundRecoveryCurrent(currentAttempt)) {
+      const attemptPredatesSuspension = now - Number(currentAttempt.startedWallAt || 0) >=
+        now - Number(previousPulseWallAt || 0);
+      if (!attemptPredatesSuspension) {
+        // An explicit visibility/pageshow return created this attempt after the
+        // last pre-suspension pulse. Consume the duplicate gap signal into it.
+        experimentalMediaForegroundSuspensionGap = false;
+        queueExperimentalMediaForegroundRecovery(currentAttempt, 0);
+        return false;
+      }
+      // No lifecycle event arrived before this pulse. The surviving attempt
+      // predates the suspension and therefore cannot own a trustworthy WebGPU
+      // surface or capability response; fence it and start a new generation.
+      armExperimentalMediaLifecycleResume();
+      closeExperimentalMedia({ keepEnabled: true, status: 'HDR skats atjaunojas.' });
+      resumeExperimentalMediaForLifecycle('foreground_pulse_gap');
+      return false;
+    }
+    if (detectedGap && experimentalMediaPreferenceController.enabled && !experimentalMediaLifecycleArmed &&
+      !foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) {
+      armExperimentalMediaLifecycleResume();
+      closeExperimentalMedia({ keepEnabled: true, status: 'HDR skats atjaunojas.' });
+      resumeExperimentalMediaForLifecycle('foreground_pulse_gap');
+    }
+    if (experimentalMediaLifecycleArmed && experimentalMediaPreferenceController.enabled &&
+      experimentalMediaDocumentHasFocus()) {
+      resumeExperimentalMediaForLifecycle('foreground_pulse_armed');
+    }
+    if (experimentalMediaPresentationRecoveryPending) {
+      requestExperimentalHDRPresentationRegionRecovery('foreground_pulse_region');
+    }
+    return experimentalMediaForegroundSuspensionGap;
+  }
+
+  function scheduleExperimentalMediaCapabilityRetry(reason, attempt, forceCanvasReset) {
+    if (experimentalMediaCapabilityRetryTimer) return false;
+    if (attempt >= experimentalMediaCapabilityRetryDelays.length) {
+      armExperimentalMediaDynamicRangeRecovery();
+      return false;
+    }
+    const delay = experimentalMediaCapabilityRetryDelays[attempt];
+    const foregroundRecoveryID = experimentalMediaForegroundRecovery &&
+      experimentalMediaForegroundRecovery.id;
+    experimentalMediaCapabilityRetryTimer = setTimeout(() => {
+      experimentalMediaCapabilityRetryTimer = null;
+      if (foregroundRecoveryID && (!experimentalMediaForegroundRecovery ||
+        experimentalMediaForegroundRecovery.id !== foregroundRecoveryID)) return;
+      scheduleExperimentalMediaStart(reason || 'capability_retry', {
+        capabilityAttempt: attempt + 1,
+        forceCanvasReset: Boolean(forceCanvasReset)
+      });
+    }, delay);
+    return true;
+  }
+
+  function scheduleExperimentalMediaRendererRetry(reason) {
+    if (!experimentalMediaResumeRetryArmed || experimentalMediaRendererRetryTimer ||
+      !experimentalMediaState.enabled || document.visibilityState !== 'visible' ||
+      experimentalMediaPresentationRegionBlocked || !experimentalHDRSurfacePresentationAllowed() ||
+      controlCodePresentationPriorityActive()) return false;
+    experimentalMediaResumeRetryArmed = false;
+    const foregroundAttempt = foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)
+      ? experimentalMediaForegroundRecovery
+      : null;
+    const foregroundRecoveryID = foregroundAttempt && foregroundAttempt.id;
+    if (foregroundAttempt) {
+      foregroundAttempt.retryOrdinal += 1;
+      reportExperimentalMediaForegroundRecovery(
+        foregroundAttempt,
+        'initializing',
+        `surface_retry_scheduled:${String(reason || 'failed').slice(0, 48)}`
+      );
+    }
+    experimentalMediaRendererRetryTimer = setTimeout(() => {
+      experimentalMediaRendererRetryTimer = null;
+      if (foregroundRecoveryID && (!experimentalMediaForegroundRecovery ||
+        experimentalMediaForegroundRecovery.id !== foregroundRecoveryID)) return;
+      if (!experimentalMediaState.enabled || document.visibilityState !== 'visible' ||
+        experimentalMediaPresentationRegionBlocked || !experimentalHDRSurfacePresentationAllowed() ||
+        controlCodePresentationPriorityActive()) return;
+      experimentalClientHDRFailed = false;
+      // The only automatic renderer retry must not reuse the surface that just
+      // failed. Reset the lifecycle marker so the existing one-per-attempt
+      // replacement gate creates one new WebKit compositor association.
+      experimentalMediaCanvasResetGeneration = -1;
+      scheduleExperimentalMediaStart(`renderer_retry:${String(reason || 'failed').slice(0, 48)}`, {
+        forceCanvasReset: true
+      });
+    }, 250);
+    return true;
+  }
+
+  function scheduleExperimentalMediaActiveFailureRecovery(reason) {
+    if (!experimentalMediaPreferenceController.enabled || !experimentalMediaState.enabled ||
+      document.visibilityState !== 'visible' || experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() || controlCodePresentationPriorityActive()) return false;
+    if (foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) return false;
+    if (experimentalMediaActiveFailureRecoveryTimer) return true;
+    experimentalMediaActiveFailureRecoveryTimer = setTimeout(() => {
+      experimentalMediaActiveFailureRecoveryTimer = null;
+      if (!experimentalMediaPreferenceController.enabled || !experimentalMediaState.enabled ||
+        document.visibilityState !== 'visible' ||
+        experimentalMediaPresentationRegionBlocked || !experimentalHDRSurfacePresentationAllowed() ||
+        controlCodePresentationPriorityActive() ||
+        foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) return;
+      experimentalMediaResumeRetryArmed = true;
+      beginExperimentalMediaForegroundRecovery('renderer_failure', {
+        forceCanvasReset: true
+      });
+    }, 0);
+    return true;
+  }
+
+  function scheduleExperimentalMediaStart(reason, options) {
+    options = options || {};
+    if (!experimentalMediaState.enabled || !experimentalMediaCapabilityReady ||
+      document.visibilityState !== 'visible' || experimentalMediaPresentationRegionBlocked ||
+      !experimentalHDRSurfacePresentationAllowed() || controlCodePresentationPriorityActive()) return false;
+    const controller = experimentalClientHDRController;
+    const snapshot = controller && controller.snapshot();
+    if (snapshot && snapshot.active) {
+      controller.setDocumentVisible(true);
+      return true;
+    }
+    if (experimentalMediaStartPending) return true;
+
+    const generation = ++experimentalMediaStartGeneration;
+    const pending = {
+      generation,
+      reason: String(reason || 'connect').slice(0, 80),
+      capabilityAttempt: Math.max(0, Number(options.capabilityAttempt || 0)),
+      forceCanvasReset: Boolean(options.forceCanvasReset),
+      frameHandles: [],
+      fallbackTimer: null,
+      cancelled: false
     };
+    experimentalMediaStartPending = pending;
+
+    const settle = () => {
+      if (experimentalMediaStartPending !== pending || pending.cancelled || generation !== experimentalMediaStartGeneration) return;
+      experimentalMediaStartPending = null;
+      if (pending.fallbackTimer) {
+        clearTimeout(pending.fallbackTimer);
+        pending.fallbackTimer = null;
+      }
+      if (!experimentalMediaState.enabled || document.visibilityState !== 'visible') return;
+      const capability = refreshExperimentalClientCapability();
+      if (!experimentalClientCapabilityAllowed || !capability.supported) {
+        setExperimentalMediaStatus('Parastā straume — gaida pārlūka HDR iespēju.');
+        if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
+        const transientDynamicRange = capability.videoFrame && capability.mainThreadCanvas && capability.webgpu &&
+          capability.dynamicRangeLimit && !capability.highDynamicRange;
+        if (transientDynamicRange) {
+          scheduleExperimentalMediaCapabilityRetry(
+            pending.reason,
+            pending.capabilityAttempt,
+            pending.forceCanvasReset
+          );
+        }
+        return;
+      }
+      experimentalMediaLastStartReason = pending.reason;
+      const lifecycleReset = experimentalMediaLifecycleGeneration > 0 &&
+        experimentalMediaCanvasResetGeneration !== experimentalMediaLifecycleGeneration;
+      connectExperimentalClientHDR({
+        forceCanvasReset: pending.forceCanvasReset || lifecycleReset,
+        reason: pending.reason
+      });
+    };
+
+    const waitVisibleFrames = (remaining) => {
+      if (experimentalMediaStartPending !== pending || pending.cancelled || generation !== experimentalMediaStartGeneration) return;
+      if (!experimentalMediaState.enabled || document.visibilityState !== 'visible') {
+        cancelExperimentalMediaStart();
+        return;
+      }
+      if (remaining <= 0) {
+        settle();
+        return;
+      }
+      const requestPaint = window && window.requestAnimationFrame;
+      if (typeof requestPaint !== 'function') return;
+      try {
+        const handle = requestPaint(() => waitVisibleFrames(remaining - 1));
+        pending.frameHandles.push(handle);
+      } catch (_) {}
+    };
+
+    pending.fallbackTimer = setTimeout(settle, experimentalMediaVisibleSettleTimeoutMillis);
+    waitVisibleFrames(experimentalMediaVisibleSettleFrames);
+    return true;
+  }
+
+  function connectExperimentalMedia(reason, options) {
+    if (!experimentalMediaState.enabled) return false;
+    return scheduleExperimentalMediaStart(reason || 'connect', options);
+  }
+
+  function armExperimentalMediaLifecycleResume() {
+    if (experimentalMediaPreferenceController.enabled || experimentalMediaState.enabled) {
+      if (!experimentalMediaLifecycleArmed) {
+        experimentalMediaLifecycleGeneration += 1;
+        experimentalMediaLifecycleArmed = true;
+        experimentalMediaLifecycleResumeAttemptID = 0;
+        experimentalMediaLifecycleLastResumeWallAt = 0;
+      }
+      experimentalMediaForegroundPulseWallAt = Date.now();
+      invalidateExperimentalMediaForegroundRecovery('lifecycle_backgrounded');
+      experimentalMediaResumeRetryArmed = true;
+      cancelExperimentalMediaStart();
+      if (experimentalMediaRendererRetryTimer) {
+        clearTimeout(experimentalMediaRendererRetryTimer);
+        experimentalMediaRendererRetryTimer = null;
+      }
+    }
+  }
+
+  function resumeExperimentalMediaForLifecycle(reason) {
+    const resumesArmedLifecycle = experimentalMediaLifecycleArmed;
+    if (document.visibilityState === 'visible') {
+      experimentalMediaLifecycleArmed = false;
+    }
+    if (!experimentalMediaPreferenceController.enabled) {
+      experimentalMediaLifecycleResumeAttemptID = 0;
+      experimentalMediaResumeRetryArmed = false;
+      cancelExperimentalMediaStart();
+      return false;
+    }
+    if (document.visibilityState !== 'visible') return false;
+    experimentalMediaLifecycleLastResumeWallAt = Date.now();
+    experimentalMediaState.enabled = true;
+    if (foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) {
+      queueExperimentalMediaForegroundRecovery(experimentalMediaForegroundRecovery, 0);
+      return true;
+    }
+    const controller = experimentalClientHDRController;
+    const snapshot = controller && controller.snapshot();
+    if (snapshot && snapshot.active &&
+      experimentalMediaForegroundRecoveredGeneration === experimentalMediaLifecycleGeneration) {
+      controller.setDocumentVisible(true);
+      return true;
+    }
+    if (experimentalClientHDRFailed) {
+      if (!experimentalMediaResumeRetryArmed) return false;
+      experimentalClientHDRFailed = false;
+    }
+    const started = beginExperimentalMediaForegroundRecovery(reason || 'lifecycle_resume', {
+      forceCanvasReset: true
+    });
+    if (started && resumesArmedLifecycle &&
+      foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) {
+      experimentalMediaLifecycleResumeAttemptID = experimentalMediaForegroundRecovery.id;
+    }
+    return started;
+  }
+
+  function recoverExperimentalMediaForFocusOnlyLifecycle() {
+    if (document.visibilityState !== 'visible' || !experimentalMediaPreferenceController.enabled ||
+      experimentalMediaLifecycleArmed) return false;
+    if (foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)) return false;
+    const now = Date.now();
+    if (experimentalMediaLifecycleLastResumeWallAt > 0 &&
+      now - experimentalMediaLifecycleLastResumeWallAt <= experimentalMediaLifecycleReturnClusterMillis) {
+      return false;
+    }
+    experimentalMediaForegroundSuspensionGap = false;
+    armExperimentalMediaLifecycleResume();
+    if (typeof closeExperimentalMedia === 'function') {
+      closeExperimentalMedia({ keepEnabled: true, status: 'HDR skats apturēts fonā.' });
+    }
+    return true;
   }
 
   function mountExperimentalMediaControl() {
@@ -1298,13 +2318,21 @@ import {
     experimentalMediaMount.hidden = false;
     experimentalMediaMount.textContent = '';
     html`
-      <section class="experimental-media-control" aria-label="Eksperimentāls video skats">
+      <section class="experimental-media-control" aria-label="HDR skats">
         <label class="experimental-media-toggle">
           <input id="experimentalMediaToggle" type="checkbox" checked="${() => experimentalMediaState.enabled}">
           <span>${() => experimentalMediaState.label}</span>
         </label>
+        <label class="experimental-media-engine" hidden="${() => !experimentalMediaState.boostSelectorAllowed}">
+          <span>Pārlūka spilgtums</span>
+          <select id="experimentalMediaHDRBoost">
+            ${CLIENT_HDR_DISPLAY_BOOSTS.map((boost) => html`<option value="${boost}">${boost}×</option>`.key(boost))}
+          </select>
+        </label>
         <p class="experimental-media-detail" aria-live="polite">${() => experimentalMediaState.status}</p>
         <p class="experimental-media-detail" data-hdr-preference-status>${() => experimentalMediaState.preferenceStatus}</p>
+        <p class="experimental-media-detail" data-hdr-engine-status>${() => experimentalMediaState.engineStatus}</p>
+        <p class="experimental-media-detail" data-hdr-boost-status hidden="${() => experimentalMediaState.engine !== CLIENT_HDR_ENGINE}">${() => experimentalMediaState.boostStatus}</p>
       </section>
     `(experimentalMediaMount);
     const toggle = document.getElementById('experimentalMediaToggle');
@@ -1313,46 +2341,118 @@ import {
         experimentalMediaPreferenceController.choose(Boolean(toggle.checked));
       });
     }
+    const boost = document.getElementById('experimentalMediaHDRBoost');
+    if (boost) {
+      boost.addEventListener('change', () => {
+        chooseExperimentalHDRBoost(boost.value);
+      });
+    }
+    syncExperimentalMediaSelectors();
     experimentalMediaMounted = true;
   }
 
-  async function probeExperimentalHDRFixture(url) {
-	if (!experimentalMediaHDRImage || !url) return false;
-	if (!window.matchMedia || !window.matchMedia('(dynamic-range: high)').matches) return false;
-	if (!window.CSS || typeof CSS.supports !== 'function' || !CSS.supports('dynamic-range-limit', 'no-limit')) return false;
-	const response = await fetch(url, { cache: 'no-store' });
-	if (!response.ok || response.headers.get('Content-Type') !== 'image/jpeg') return false;
-	const blob = await response.blob();
-	const objectURL = URL.createObjectURL(blob);
-	const probe = new Image();
-	probe.style.setProperty('dynamic-range-limit', 'no-limit');
-	probe.src = objectURL;
-	try {
-	  await probe.decode();
-	  return probe.naturalWidth > 0 && probe.naturalHeight > 0;
-	} finally {
-	  URL.revokeObjectURL(objectURL);
-	}
+  function fetchExperimentalMediaCapability() {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const request = { cache: 'no-store' };
+    if (controller) request.signal = controller.signal;
+    let timeout = null;
+    const deadline = new Promise((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        if (controller) {
+          try { controller.abort(); } catch (_) {}
+        }
+        reject(new Error('capability_fetch_timeout'));
+      }, experimentalMediaCapabilityFetchTimeoutMillis);
+    });
+    const operation = (async () => {
+      const response = await fetch('/api/v1/experimental-media/capability', request);
+      const payload = await response.json();
+      return { response, payload };
+    })();
+    return Promise.race([operation, deadline]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
   }
 
-  async function discoverExperimentalMediaCapability() {
-    if (!experimentalMediaMount || !experimentalMediaCanvas || !experimentalMediaHDRSwitcher) return;
+  function applyExperimentalMediaCapabilityPayload(response, payload, foregroundAttemptID) {
+    if (foregroundAttemptID && (!experimentalMediaForegroundRecovery ||
+      experimentalMediaForegroundRecovery.id !== foregroundAttemptID)) return false;
+    if (!response || !response.ok || !payload || !payload.allowed) return false;
+    const advertisedEngines = Array.isArray(payload.allowedEngines) ? payload.allowedEngines : [];
+    const advertisedBoosts = Array.isArray(payload.allowedDisplayBoosts)
+      ? payload.allowedDisplayBoosts.map(Number)
+      : [];
+    const boostContractMatches = CLIENT_HDR_DISPLAY_BOOSTS.every((boost, index) => advertisedBoosts[index] === boost) &&
+      advertisedBoosts.length === CLIENT_HDR_DISPLAY_BOOSTS.length;
+    experimentalClientCapabilityAllowed = advertisedEngines.includes(CLIENT_HDR_ENGINE) &&
+      payload.clientPipeline === CLIENT_HDR_PIPELINE &&
+      payload.presentationKind === CLIENT_HDR_PRESENTATION_KIND &&
+      Number(payload.targetDisplayBoost) === CLIENT_HDR_TARGET_DISPLAY_BOOST &&
+      boostContractMatches;
+    experimentalMediaState.boostSelectorAllowed = experimentalMediaAccountProjectionAvailable;
+    if (!experimentalMediaEngineProjectionObserved) {
+      experimentalMediaState.engine = resolveCapabilityHDREngine(advertisedEngines, payload.selectedEngine);
+    }
+    if (!experimentalMediaBoostProjectionObserved) {
+      experimentalHDRBoostPreferenceController.observe(payload.selectedDisplayBoost);
+    }
+    experimentalMediaCapabilityReady = experimentalClientCapabilityAllowed;
+    if (!experimentalMediaCapabilityReady) return false;
+    experimentalMediaCapabilityDiscoveryAttempt = 0;
+    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
+    mountExperimentalMediaControl();
+    applyExperimentalMediaPreference(experimentalMediaPreferenceController.enabled, { reason: 'projection' });
+    return true;
+  }
+
+  async function discoverExperimentalMediaCapability(options) {
+    options = options || {};
+    if (!experimentalMediaMount || !experimentalMediaCanvas) return;
+    if (experimentalMediaCapabilityDiscoveryPromise) return experimentalMediaCapabilityDiscoveryPromise;
+    if (experimentalMediaCapabilityDiscoveryRetryTimer) {
+      if (!options.forceImmediate) return;
+      clearTimeout(experimentalMediaCapabilityDiscoveryRetryTimer);
+      experimentalMediaCapabilityDiscoveryRetryTimer = null;
+    }
+    const attempt = Math.max(0, Number(options.attempt !== undefined
+      ? options.attempt
+      : experimentalMediaCapabilityDiscoveryAttempt));
+    let shouldRetry = false;
+    const operation = (async () => {
+      const capability = await fetchExperimentalMediaCapability();
+      const response = capability.response;
+      const payload = capability.payload;
+      if (!response.ok) {
+        shouldRetry = true;
+        return;
+      }
+      applyExperimentalMediaCapabilityPayload(response, payload, Number(options.foregroundAttemptID || 0));
+    })();
+    experimentalMediaCapabilityDiscoveryPromise = operation;
     try {
-      const response = await fetch('/api/v1/experimental-media/capability', { cache: 'no-store' });
-      const payload = await response.json().catch(() => ({}));
-	  if (!response.ok || !payload.allowed) return;
-	  if (payload.requiresHDR === true) {
-		if (payload.pipelineVersion !== 'iso-gainmap-keyframe-v1' || payload.visualMode !== 'hdr-gainmap-img-edr-v1' || payload.mimeType !== 'image/jpeg') return;
-		if (!await probeExperimentalHDRFixture(payload.fixtureURL)) return;
-		experimentalMediaState.label = 'HDR skats (eksperimentāls)';
-	  } else if (payload.pipelineVersion !== 'relay-copy-v1') {
-		return;
-	  }
-      experimentalMediaCapabilityReady = true;
-      mountExperimentalMediaControl();
-      applyExperimentalMediaPreference(experimentalMediaPreferenceController.enabled);
+      await operation;
     } catch (_) {
-      // Fail closed: no authenticated capability response means no visible control.
+      shouldRetry = true;
+    } finally {
+      if (experimentalMediaCapabilityDiscoveryPromise === operation) {
+        experimentalMediaCapabilityDiscoveryPromise = null;
+      }
+      if (shouldRetry &&
+        attempt < experimentalMediaCapabilityRetryDelays.length &&
+        document.visibilityState === 'visible') {
+        experimentalMediaCapabilityDiscoveryAttempt = attempt + 1;
+        experimentalMediaCapabilityDiscoveryRetryTimer = setTimeout(() => {
+          experimentalMediaCapabilityDiscoveryRetryTimer = null;
+          discoverExperimentalMediaCapability({
+            reason: options.reason || 'capability_fetch_retry',
+            attempt: attempt + 1
+          });
+        }, experimentalMediaCapabilityRetryDelays[attempt]);
+      } else if (shouldRetry && attempt >= experimentalMediaCapabilityRetryDelays.length) {
+        // Keep later lifecycle/online triggers eligible for a fresh bounded
+        // discovery budget without continuing a background retry loop.
+        experimentalMediaCapabilityDiscoveryAttempt = 0;
+      }
     }
   }
 
@@ -1560,19 +2660,188 @@ import {
     reportClientFault(event, detail);
   }
 
-  function clientHDRMeasurement(event, firstShownMillis, decodeMillis) {
-    const detail = {
+  const clientHDRFieldsByPhase = {
+    first_presented: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'canvasEncoding', 'configurationColorSpace',
+      'toneMappingMode', 'configurationDynamicRangeLimit', 'mappingModel', 'colorExpansionExponent',
+      'sourceColorSpace', 'continuousSurface', 'selectedDisplayBoost', 'intendedOutputPeak',
+      'edrRequestPatchIntended', 'intendedRequestPatchPeak', 'intendedRequestPatchEdge',
+      'gpuCompleted', 'compositorOpportunitiesCompleted', 'postPresentSource',
+      'postPresentOpportunityCount', 'firstShownMillis', 'queueDelayMillis',
+      'decodedFrameToSubmitMillis', 'completionMillis', 'displayReadyMillis',
+      'decodedFrameToDisplayReadyMillis', 'epoch', 'sequence', 'sequenceLag',
+      'ageDeltaMillis', 'coalesced', 'dropped', 'failures', 'lifecycleGeneration',
+      'canvasGeneration', 'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    presented: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'canvasEncoding', 'configurationColorSpace',
+      'configurationDynamicRangeLimit', 'mappingModel', 'colorExpansionExponent', 'sourceColorSpace',
+      'continuousSurface', 'selectedDisplayBoost', 'intendedOutputPeak', 'gpuCompleted',
+      'compositorOpportunitiesCompleted', 'postPresentSource', 'postPresentOpportunityCount',
+      'queueDelayMillis',
+      'decodedFrameToSubmitMillis', 'decodedFrameToDisplayReadyMillis', 'epoch',
+      'sequence', 'sequenceLag', 'ageDeltaMillis', 'coalesced', 'failures'
+    ],
+    session_summary: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'targetDisplayBoost', 'selectedDisplayBoost', 'offered', 'rendered',
+      'coalesced', 'dropped', 'failures', 'rendererActive', 'ownedFrameCount',
+      'pending', 'inFlight', 'surfaceVisible', 'canvasEncoding', 'presentationState',
+      'paintPending', 'paintWaitTimeoutMillis', 'paintWaitTimeoutPending',
+      'paintRecoveryRequested', 'surfaceTransitions', 'reason', 'lifecycleGeneration',
+      'canvasGeneration', 'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    foreground_recovery: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'reason', 'versionOutcome', 'capabilityOutcome', 'streamEpoch', 'streamSequence',
+      'baselineSDRRenderSerial', 'sdrRenderSerial', 'lifecycleGeneration', 'canvasGeneration',
+      'presentationRegionGeneration', 'presentationRegionBlocked', 'presentationRecoveryPending',
+      'foregroundPaintConfirmed', 'foregroundStabilityWaitMillis',
+      'rendererGeneration', 'presentationState', 'surfaceVisible', 'retryOrdinal',
+      'recoveryElapsedMillis', 'recoveryRemainingMillis', 'startReason'
+    ],
+    renderer_ready: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'targetDisplayBoost', 'selectedDisplayBoost',
+      'intendedOutputPeak', 'mappingModel', 'colorExpansionExponent', 'continuousSurface', 'active', 'ready',
+      'edrRequestPatchIntended', 'intendedRequestPatchPeak', 'intendedRequestPatchEdge',
+      'canvasEncoding', 'configurationColorSpace', 'toneMappingMode', 'configurationDynamicRangeLimit',
+      'lifecycleGeneration', 'canvasGeneration', 'rendererGeneration', 'attemptId', 'recoveryPhase',
+      'triggerSet', 'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    renderer_init_timeout: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'rendererInitTimeoutMillis',
+      'rendererInitElapsedMillis', 'rendererInitCheckSource', 'active', 'ready',
+      'rendererActive', 'surfaceVisible', 'lifecycleGeneration', 'canvasGeneration', 'rendererGeneration',
+      'attemptId', 'recoveryPhase', 'triggerSet', 'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    surface_reset: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'reason', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'canvasReplaced', 'continuousSurface', 'attemptId', 'recoveryPhase',
+      'triggerSet', 'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    surface_transition: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'toSurface', 'reason',
+      'presentationState', 'recoveryFreshStreak', 'surfaceTransitions', 'sequenceLag',
+      'ageDeltaMillis', 'fallbackDurationMillis', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet', 'streamEpoch',
+      'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    boost_changed: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'previousDisplayBoost',
+      'canvasEncoding', 'surfaceVisible', 'presentationState'
+    ],
+    boost_change_failed: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'requestedDisplayBoost',
+      'canvasEncoding', 'surfaceVisible', 'reason'
+    ],
+    gpu_completion: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'intendedOutputPeak',
+      'canvasEncoding', 'configurationColorSpace', 'configurationDynamicRangeLimit', 'mappingModel',
+      'colorExpansionExponent', 'sourceColorSpace', 'continuousSurface', 'gpuCompleted',
+      'edrRequestPatchIntended', 'intendedRequestPatchPeak', 'intendedRequestPatchEdge',
+      'completionMillis', 'sequence', 'failures', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet', 'streamEpoch',
+      'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    settlement_started: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'selectedDisplayBoost', 'streamEpoch', 'streamSequence', 'lifecycleGeneration',
+      'canvasGeneration', 'rendererGeneration', 'settlementTimeoutMillis', 'settlementElapsedMillis',
+      'settlementPending', 'presentationState', 'surfaceVisible', 'epoch', 'sequence', 'retryOrdinal',
+      'startReason'
+    ],
+    compositor_settlement_started: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'selectedDisplayBoost', 'streamEpoch', 'streamSequence', 'lifecycleGeneration',
+      'canvasGeneration', 'rendererGeneration', 'settlementDeadlineMillis',
+      'postPresentOpportunityTarget', 'presentationState', 'surfaceVisible', 'retryOrdinal', 'startReason'
+    ],
+    settlement_deadline_exceeded: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'reason', 'streamEpoch', 'streamSequence', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'settlementTimeoutMillis', 'settlementElapsedMillis',
+      'settlementCheckSource', 'settlementPending', 'presentationState', 'surfaceVisible',
+      'epoch', 'sequence', 'retryOrdinal', 'startReason'
+    ],
+    compositor_settlement_result: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'streamEpoch', 'streamSequence', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'settlementDeadlineMillis', 'settlementTimedOut', 'postPresentSource',
+      'postPresentOpportunityCount', 'compositorOpportunitiesCompleted', 'presentationState',
+      'surfaceVisible', 'retryOrdinal', 'startReason'
+    ],
+    gpu_completion_timeout: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'attemptId', 'recoveryPhase', 'triggerSet',
+      'streamEpoch', 'streamSequence', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'gpuCompletionTimeoutMillis', 'epoch', 'sequence',
+      'presentationOrdinal', 'retryOrdinal', 'startReason'
+    ],
+    paint_wait_timeout: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'canvasEncoding',
+      'paintWaitTimeoutMillis', 'epoch', 'sequence', 'presentationOrdinal',
+      'pending', 'inFlight', 'paintPending', 'surfaceVisible', 'presentationState',
+      'rendered', 'dropped', 'failures', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet', 'streamEpoch',
+      'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    paint_wait_failed: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'canvasEncoding',
+      'paintWaitTimeoutMillis', 'epoch', 'sequence', 'presentationOrdinal',
+      'pending', 'inFlight', 'paintPending', 'surfaceVisible', 'presentationState',
+      'rendered', 'dropped', 'failures', 'lifecycleGeneration', 'canvasGeneration',
+      'rendererGeneration', 'attemptId', 'recoveryPhase', 'triggerSet', 'streamEpoch',
+      'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    frame_clone_failed: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'selectedDisplayBoost', 'pending', 'inFlight',
+      'surfaceVisible', 'presentationState', 'offered', 'dropped', 'failures',
+      'lifecycleGeneration', 'canvasGeneration', 'rendererGeneration', 'attemptId',
+      'recoveryPhase', 'triggerSet', 'streamEpoch', 'streamSequence', 'retryOrdinal', 'startReason'
+    ],
+    fallback: [
+      'assetVersion', 'engine', 'pipeline', 'phase', 'canvasEncoding', 'selectedDisplayBoost',
+      'rendererActive', 'ownedFrameCount', 'pending', 'inFlight', 'failures', 'reason',
+      'lifecycleGeneration', 'canvasGeneration', 'rendererGeneration', 'attemptId', 'recoveryPhase',
+      'triggerSet', 'streamEpoch', 'streamSequence', 'retryOrdinal', 'settlementPending',
+      'settlementElapsedMillis', 'startReason'
+    ]
+  };
+
+  function boundedClientLogJSON(detail, maximumBytes) {
+    const entries = Object.entries(detail || {});
+    while (entries.length) {
+      const encoded = JSON.stringify(Object.fromEntries(entries));
+      if (encoded.length <= maximumBytes) return encoded;
+      entries.pop();
+    }
+    return '{}';
+  }
+
+  function clientHDRMeasurement(event, firstShownMillis, decodeMillis, measurements) {
+    const measured = Object.assign({}, measurements && typeof measurements === 'object' ? measurements : {});
+    if (Number.isFinite(firstShownMillis)) measured.firstShownMillis = Math.max(0, Math.round(firstShownMillis));
+    if (Number.isFinite(decodeMillis)) measured.decodeMillis = Math.max(0, Math.round(decodeMillis));
+    const phase = String(measured.phase || '');
+    const phaseFields = measured.engine === CLIENT_HDR_ENGINE && clientHDRFieldsByPhase[phase];
+    const detail = phaseFields ? { assetVersion } : {
       pageVersion,
       assetVersion,
       visibility: document.visibilityState,
-      webCodecs: 'VideoDecoder' in window
+      webCodecs: 'VideoDecoder' in window,
+      webgpu: Boolean(navigator && navigator.gpu)
     };
-    if (Number.isFinite(firstShownMillis)) detail.firstShownMillis = Math.max(0, Math.round(firstShownMillis));
-    if (Number.isFinite(decodeMillis)) detail.decodeMillis = Math.max(0, Math.round(decodeMillis));
+    if (phaseFields) {
+      for (const key of phaseFields) {
+        if (Object.prototype.hasOwnProperty.call(measured, key)) detail[key] = measured[key];
+      }
+    } else {
+      Object.assign(detail, measured);
+    }
     enqueueClientLog({
       level: 'info',
       event: String(event || '').slice(0, 80),
-      detailJson: safeString(detail).slice(0, 1000),
+      detailJson: boundedClientLogJSON(detail, 1000),
       at: Date.now()
     });
   }
@@ -1713,6 +2982,7 @@ import {
   function showUnsupported(message) {
     streamUnsupported = true;
     configured = false;
+    updateStreamFreshnessStatus('stream_unsupported');
     showEmpty(message, false);
     setStatus(message);
     clientLog('h264_unsupported', message);
@@ -1727,10 +2997,11 @@ import {
     const scale = Math.min(maxWidth / streamSize.width, maxHeight / streamSize.height);
     const displayWidth = Math.max(1, Math.floor(streamSize.width * scale));
     const displayHeight = Math.max(1, Math.floor(streamSize.height * scale));
-    stage.style.setProperty('--stream-width', `${displayWidth}px`);
-    stage.style.setProperty('--stream-height', `${displayHeight}px`);
-    stage.style.setProperty('--stream-left', `${Math.max(0, Math.floor((maxWidth - displayWidth) / 2))}px`);
-    stage.style.setProperty('--stream-top', `${Math.max(0, Math.floor((maxHeight - displayHeight) / 2))}px`);
+    const streamLayout = stagePage || stage;
+    streamLayout.style.setProperty('--stream-width', `${displayWidth}px`);
+    streamLayout.style.setProperty('--stream-height', `${displayHeight}px`);
+    streamLayout.style.setProperty('--stream-left', `${Math.max(0, Math.floor((maxWidth - displayWidth) / 2))}px`);
+    streamLayout.style.setProperty('--stream-top', `${Math.max(0, Math.floor((maxHeight - displayHeight) / 2))}px`);
     if (currentState) renderTicketActionV3Controls(currentState);
   }
 
@@ -2052,7 +3323,7 @@ import {
     lastRenderedFrameVisualAgeMillis = 0;
     lastRenderedFrameEpoch = 0;
     lastRenderedFrameSequence = 0;
-    lastRenderedKeyframeSequence = 0;
+    lastRenderedPresentationOrdinal = 0;
     lastRenderedFrameTimestamp = 0;
     lastDecodedFrameSequence = 0;
     firstRenderedTraceSent = false;
@@ -2337,25 +3608,10 @@ import {
     clientLog(event, safeDetail);
   }
 
-  function feedbackState() {
-    if (needsKeyFrame) return 'awaiting_keyframe';
-    if (decoder && Number(decoder.decodeQueueSize || 0) > streamDecoderQueueSoftLimit) return 'congested_awaiting_keyframe';
-    if (lastRenderedFrameAt > 0 && Number(currentRenderedFreshness(performance.now()).visualAgeMillis || 0) > 1000) return 'congested_awaiting_keyframe';
-    return 'flowing';
-  }
-
   function clampFeedbackNumber(value, max) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric) || numeric < 0) return 0;
     return Math.min(max, Math.round(numeric));
-  }
-
-  function approvedFeedbackFPS(value) {
-    const numeric = clampFeedbackNumber(value, 30);
-    for (const tier of [1, 2, 5, 10, 15, 20, 30]) {
-      if (numeric <= tier) return tier;
-    }
-    return 30;
   }
 
   function sendStreamFeedback(reason, immediate) {
@@ -2372,7 +3628,10 @@ import {
       receivedSequence: Number(lastAcceptedFrameSequence || lastPacketSequence || 0),
       decodedSequence: Number(lastDecodedFrameSequence || lastRenderedFrameSequence || 0),
       renderedSequence: Number(lastRenderedFrameSequence || 0),
-      renderedKeyframeSequence: Number(lastRenderedKeyframeSequence || 0),
+      // Keep the legacy field on the wire during the rolling upgrade. Every
+      // accepted frame is now independently decodable, so the rendered frame
+      // sequence is also the latest rendered keyframe sequence.
+      renderedKeyframeSequence: Number(lastRenderedFrameSequence || 0),
       decoderQueueSize: decoderQueue,
       renderedVisualAgeMillis: clampFeedbackNumber(freshness.visualAgeMillis, 60000),
       visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible'
@@ -2441,13 +3700,12 @@ import {
   function liveStreamSuppressesBackgroundRequest(reason) {
     const cleanReason = String(reason || '').toLowerCase();
     if (cleanReason.includes('control_code')) return false;
-    if (cleanReason.includes('frame_sequence_gap')) return false;
     return streamHasFreshRenderedFrame();
   }
 
   function initialLoadDefersBrowserKeyframe(reason) {
     const cleanReason = String(reason || '').toLowerCase();
-    if (cleanReason.includes('control_code') || cleanReason.includes('frame_sequence_gap')) return false;
+    if (cleanReason.includes('control_code')) return false;
     const flow = activeResumeFlow;
     if (!flow || flow.done || flow.trigger !== 'initial_load' || hasRenderedFrame) return false;
     const startedAt = Number(flow.startedAt);
@@ -2683,6 +3941,7 @@ import {
       codec: decoderConfigured ? 'h264' : '',
       decoderMode,
       currentStreamEpoch,
+      frameDependencyMode: String(lastDecoderConfig && lastDecoderConfig.frameDependencyMode || ''),
       lastPacketAt,
       lastDecodedFrameAt,
       lastPacketSequence,
@@ -2692,8 +3951,8 @@ import {
       lastRenderedFrameSequence,
       lastRenderedFrameTimestamp,
       feedbackVersion: streamFeedbackVersion,
-      sourceFps: Number(lastDecoderConfig && (lastDecoderConfig.sourceFps || lastDecoderConfig.fps) || 10),
-      keyframeIntervalFrames: Number(lastDecoderConfig && lastDecoderConfig.keyframeIntervalFrames || 10),
+      sourceFps: Number(lastDecoderConfig && (lastDecoderConfig.sourceFps || lastDecoderConfig.fps) || 1),
+      keyframeIntervalFrames: Number(lastDecoderConfig && lastDecoderConfig.keyframeIntervalFrames || 1),
       decoderQueue: Number(decoder && decoder.decodeQueueSize || 0),
       visualAgeMillis: Math.round(Number(lastRenderedFrameVisualAgeMillis || 0)),
       presentationCoalescedFrames,
@@ -2874,32 +4133,46 @@ import {
     if (currentStreamEpoch && frame.epoch && frame.epoch !== currentStreamEpoch) {
       return false;
     }
+    const frameDependencyMode = String(lastDecoderConfig && lastDecoderConfig.frameDependencyMode || '').toLowerCase();
+    const allIntraConfigValid = frameDependencyMode === 'all_intra' &&
+      Number(lastDecoderConfig && lastDecoderConfig.fps) === 1 &&
+      Number(lastDecoderConfig && lastDecoderConfig.sourceFps) === 1 &&
+      Number(lastDecoderConfig && lastDecoderConfig.keyframeIntervalFrames) === 1;
+    if (!allIntraConfigValid) {
+      needsKeyFrame = true;
+      sendVideoClientLog('invalid_tsf2_frame', {
+        reason: 'all_intra_config_rejected',
+        epoch: Number(frame.epoch || 0),
+        sequence: Number(frame.sequence || 0)
+      });
+      requestKeyframeDebounced('all_intra_config_rejected', recoveryKeyframeDebounceMs, false);
+      scheduleStreamFeedback('all_intra_config_rejected');
+      return false;
+    }
+    if (frame.kind !== 'key') {
+      needsKeyFrame = true;
+      sendVideoClientLog('invalid_tsf2_frame', {
+        reason: 'all_intra_delta_rejected',
+        epoch: Number(frame.epoch || 0),
+        sequence: Number(frame.sequence || 0)
+      });
+      requestKeyframeDebounced('all_intra_delta_rejected', recoveryKeyframeDebounceMs, false);
+      scheduleStreamFeedback('all_intra_delta_rejected');
+      return false;
+    }
     if (frame.sequence && frame.sequence <= lastAcceptedFrameSequence) {
       return false;
     }
-    if (frame.kind !== 'key' && frame.sequence && lastAcceptedFrameSequence && frame.sequence !== lastAcceptedFrameSequence + 1) {
-      needsKeyFrame = true;
-      requestKeyframeDebounced('frame_sequence_gap', recoveryKeyframeDebounceMs, false);
-      scheduleStreamFeedback('frame_sequence_gap');
-      return false;
-    }
-    if (needsKeyFrame && frame.kind !== 'key') {
-      return false;
-    }
-    if (frame.kind === 'key') {
-      const frameEpoch = Number(frame.epoch || 0);
-      if (!currentStreamEpoch && frameEpoch > 0) {
-        // A warm join can intentionally receive a provisional decoder config
-        // with epoch 0 while the server waits for a fresh keyframe. Bind that
-        // decoder to the first independently decodable frame so feedback and
-        // all later epoch checks describe the stream that is actually shown.
-        currentStreamEpoch = frameEpoch;
-        if (lastDecoderConfig && Number(lastDecoderConfig.streamEpoch || 0) === 0) {
-          lastDecoderConfig = { ...lastDecoderConfig, streamEpoch: frameEpoch, provisional: false };
-        }
+    const frameEpoch = Number(frame.epoch || 0);
+    if (!currentStreamEpoch && frameEpoch > 0) {
+      // A warm join can intentionally receive a provisional decoder config
+      // with epoch 0 while the server waits for a fresh independent frame.
+      currentStreamEpoch = frameEpoch;
+      if (lastDecoderConfig && Number(lastDecoderConfig.streamEpoch || 0) === 0) {
+        lastDecoderConfig = { ...lastDecoderConfig, streamEpoch: frameEpoch, provisional: false };
       }
-      needsKeyFrame = false;
     }
+    needsKeyFrame = false;
     if (frame.sequence) lastAcceptedFrameSequence = frame.sequence;
     if (frame.timestamp) lastAcceptedFrameTimestamp = frame.timestamp;
     const captureWallMillis = frame.timestamp ? frame.timestamp / 1000 : 0;
@@ -2981,6 +4254,7 @@ import {
   }
 
   function controlCodePresentationPriorityActive() {
+    if (controlCodeSubmitInFlight) return true;
     const request = codeRequest;
     if (!request) return false;
     const status = String(request.status || '');
@@ -3144,27 +4418,122 @@ import {
     publishStreamDebug();
   }
 
+  function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {
+    const captureWallMillis = Number(frameMetadata && frameMetadata.timestamp || 0) / 1000;
+    const metadataAge = frameMetadata && frameMetadata.visualAgeKnown
+      ? Math.max(0, Number(frameMetadata.visualAgeMillis || 0))
+      : (captureWallMillis > 0 && serverClockHasLiveSample
+        ? Math.max(0, Date.now() + serverClockSkewMs - captureWallMillis)
+        : 0);
+    const receivedAt = Number(frameMetadata && frameMetadata.receivedAt || lastAcceptedFrameReceivedAt || renderedAt);
+    return {
+      epoch: Number(frameMetadata && frameMetadata.epoch || 0),
+      sequence: Number(frameMetadata && frameMetadata.sequence || 0),
+      presentationOrdinal: Number(presentationOrdinal || 0),
+      timestamp: Number(frameMetadata && frameMetadata.timestamp || 0),
+      visualAgeMillis: metadataAge + Math.max(0, renderedAt - receivedAt),
+      renderedAt,
+      offeredAt: renderedAt,
+      offeredWallMillis: Date.now()
+    };
+  }
+
+  function clientHDRCanCoordinateDecodedFrame() {
+    return Boolean(
+      experimentalClientHDRController && experimentalMediaState.enabled &&
+      experimentalMediaState.engine === CLIENT_HDR_ENGINE &&
+      !experimentalMediaPresentationRegionBlocked && !experimentalMediaPresentationRecoveryPending &&
+      experimentalHDRSurfacePresentationAllowed() &&
+      !controlCodePresentationPriorityActive() &&
+      typeof experimentalClientHDRController.canCoordinateSDRFrame === 'function' &&
+      experimentalClientHDRController.canCoordinateSDRFrame()
+    );
+  }
+
+  function coordinatedDecodedFrameCanCommit(candidate) {
+    const epoch = Number(candidate && candidate.epoch || 0);
+    const sequence = Number(candidate && candidate.sequence || 0);
+    const activeEpoch = Number(currentStreamEpoch || epoch);
+    if (!(epoch > 0) || !(sequence > 0) || (activeEpoch > 0 && activeEpoch !== epoch)) return false;
+    if (Number(lastRenderedFrameEpoch || 0) === epoch && Number(lastRenderedFrameSequence || 0) >= sequence) return false;
+    return true;
+  }
+
   function renderDecodedFrame(frame, source) {
     const frameMetadata = (arguments.length > 2 && arguments[2]) || shiftFrameMetadata(frame && frame.timestamp);
+    const renderOptions = (arguments.length > 3 && arguments[3]) || {};
+    const closeFrameWhenDone = renderOptions.closeFrame !== false;
+    const controlCodePriority = controlCodePresentationPriorityActive();
+    const clientHDRSelected = Boolean(
+      typeof experimentalClientHDRController !== 'undefined' && experimentalClientHDRController &&
+      typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled &&
+      experimentalMediaState.engine === CLIENT_HDR_ENGINE
+    );
+    if (controlCodePriority && clientHDRSelected) {
+      experimentalClientHDRController.markSDRStale('control_code_priority');
+    }
+    if (!renderOptions.coordinatedCommit && !controlCodePriority && clientHDRCanCoordinateDecodedFrame()) {
+      const offeredAt = performance.now();
+      const coordinatedDecoderGeneration = decoderGeneration;
+      const hdrMetadata = decodedFrameHDRMetadata(
+        frameMetadata,
+        Number(lastRenderedPresentationOrdinal || 0) + 1,
+        offeredAt
+      );
+      const accepted = experimentalClientHDRController.offerFrame(frame, hdrMetadata, {
+        commitSDR: (ownedFrame, candidate) => {
+          if (coordinatedDecoderGeneration !== decoderGeneration) return false;
+          if (!coordinatedDecodedFrameCanCommit(candidate)) return false;
+          const committed = renderDecodedFrame(ownedFrame, source, frameMetadata, {
+            coordinatedCommit: true,
+            closeFrame: false
+          });
+          if (!committed || typeof committed !== 'object') return false;
+          if (controlCodePresentationPriorityActive()) committed.skipHDRCommit = true;
+          Object.assign(candidate, committed);
+          return committed;
+        }
+      });
+      if (accepted) {
+        try { frame.close(); } catch (_) {}
+        return hdrMetadata;
+      }
+    }
     try {
       ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      lastRenderedPresentationOrdinal += 1;
+      authoritativeSDRRenderSerial += 1;
       lastFrameAt = performance.now();
       lastDecodedFrameAt = lastFrameAt;
       lastDecodedFrameSequence = Number(frameMetadata.sequence || lastAcceptedFrameSequence || 0);
       lastRenderedFrameReceivedAt = Number(frameMetadata.receivedAt || lastAcceptedFrameReceivedAt || lastFrameAt);
       lastRenderedFrameQueuedAt = Number(frameMetadata.queuedAt || lastAcceptedFrameQueuedAt || lastFrameAt);
       lastRenderedFrameRenderedAt = lastFrameAt;
-      const captureWallMillis = Number(frameMetadata.timestamp || 0) / 1000;
-      const metadataAge = frameMetadata.visualAgeKnown
-        ? Math.max(0, Number(frameMetadata.visualAgeMillis || 0))
-        : (captureWallMillis > 0 && serverClockHasLiveSample
-          ? Math.max(0, Date.now() + serverClockSkewMs - captureWallMillis)
-          : 0);
-      lastRenderedFrameVisualAgeMillis = metadataAge + Math.max(0, lastFrameAt - lastRenderedFrameReceivedAt);
       lastRenderedFrameEpoch = Number(frameMetadata.epoch || 0);
       lastRenderedFrameSequence = Number(frameMetadata.sequence || 0);
-      if (frameMetadata.keyFrame) lastRenderedKeyframeSequence = lastRenderedFrameSequence;
       lastRenderedFrameTimestamp = Number(frameMetadata.timestamp || 0);
+      const hdrMetadata = decodedFrameHDRMetadata(frameMetadata, lastRenderedPresentationOrdinal, lastFrameAt);
+      if (renderOptions.coordinatedCommit && controlCodePriority) hdrMetadata.skipHDRCommit = true;
+      lastRenderedFrameVisualAgeMillis = hdrMetadata.visualAgeMillis;
+      if (typeof experimentalClientHDRController !== 'undefined' && experimentalClientHDRController &&
+        typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled &&
+        experimentalMediaState.engine === CLIENT_HDR_ENGINE &&
+        !experimentalMediaPresentationRegionBlocked && !experimentalMediaPresentationRecoveryPending &&
+        experimentalHDRSurfacePresentationAllowed()) {
+        if (!renderOptions.coordinatedCommit && !controlCodePriority) {
+          const hdrOffered = experimentalClientHDRController.offerFrame(frame, hdrMetadata);
+          if (hdrOffered) {
+            experimentalClientHDRController.noteSDRFrame(hdrMetadata);
+          } else if (experimentalClientHDRController.snapshot().active) {
+            offerClientHDRCanvasFrame(
+              experimentalClientHDRController,
+              canvas,
+              hdrMetadata,
+              window
+            );
+          }
+        }
+      }
       firstFrameReceived = true;
       hasRenderedFrame = true;
       resetFirstFrameServerRecovery();
@@ -3186,25 +4555,44 @@ import {
       maybeCaptureControlCodeResultImage();
       hideEmpty();
       updateStreamFreshnessStatus('frame_rendered');
+      noteExperimentalMediaForegroundFrame();
       renderTicketInteraction(currentState && currentState.ticketInteraction);
       observeTicketCurrentProofFrame();
       updateControlCodeSubmitAvailability();
       publishStreamDebug();
       scheduleStreamFeedback('frame_presented');
+      return hdrMetadata;
     } catch (error) {
       sendVideoClientLog('decoded_frame_render_failed', `${source || 'decoder'}:${error && error.message || 'draw failed'}`);
       needsKeyFrame = true;
       preserveCurrentFrame('decoded_frame_render_failed');
       showStreamRecovery();
       requestKeyframe('decoded_frame_render_failed');
+      if (renderOptions.coordinatedCommit && experimentalClientHDRController) {
+        experimentalClientHDRController.markSDRStale('coordinated_sdr_commit_failed');
+      }
+      return false;
     } finally {
-      try { frame.close(); } catch (_) {}
+      if (closeFrameWhenDone) {
+        try { frame.close(); } catch (_) {}
+      }
     }
   }
 
   async function configureDecoder(config, options) {
     options = options || {};
     const configureGeneration = ++decoderConfigureGeneration;
+    const frameDependencyMode = String(config.frameDependencyMode || '').toLowerCase();
+    if (frameDependencyMode !== 'all_intra' || Number(config.fps) !== 1 ||
+      Number(config.sourceFps) !== 1 || Number(config.keyframeIntervalFrames) !== 1) {
+      lastDecoderConfig = { ...config, frameDependencyMode };
+      needsKeyFrame = true;
+      sendVideoClientLog('invalid_tsf2_frame', { reason: 'all_intra_config_rejected' });
+      closeDecoder();
+      showStreamRecovery();
+      scheduleStreamFeedback('all_intra_config_rejected');
+      return;
+    }
     if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
       showUnsupported('Šī pārlūkprogramma neatbalsta H.264 video dekodēšanu šajā lapā.');
       return;
@@ -3250,7 +4638,7 @@ import {
     if (shouldPreserveFrame) {
       preserveCurrentFrame('configure_decoder');
     }
-    lastDecoderConfig = { ...config };
+    lastDecoderConfig = { ...config, frameDependencyMode: 'all_intra' };
     closeDecoder();
     decoderMode = preferAvc ? 'avc' : 'annexb';
     if (preferAvc) {
@@ -3277,7 +4665,6 @@ import {
     lastAcceptedFrameTimestamp = options.preserveSequence ? previousTimestamp : 0;
     clearFrameMetadata();
     lastDecodedFrameSequence = options.preserveSequence ? previousSequence : 0;
-    if (!options.preserveSequence) lastRenderedKeyframeSequence = 0;
     needsKeyFrame = true;
     configured = true;
     configuredAt = performance.now();
@@ -3492,6 +4879,8 @@ import {
           currentState = state;
           rememberServerClock(currentState);
           if (spacetimeStateFresh) {
+            observeExperimentalHDREngine(state);
+            observeExperimentalHDRBoost(state);
             experimentalMediaPreferenceController.observe(state && state.memberHDR ? state.memberHDR.enabled : null);
           }
           renderState();
@@ -3503,6 +4892,14 @@ import {
           if (client !== spacetimeClient) return;
           if (status === 'hdr_refresh_failed') {
             clientLog('state_failed', 'hdr_preference_refresh_failed');
+            return;
+          }
+          if (status === 'hdr_engine_refresh_failed') {
+            clientLog('state_failed', 'hdr_engine_refresh_failed');
+            return;
+          }
+          if (status === 'hdr_boost_refresh_failed') {
+            clientLog('state_failed', 'hdr_boost_refresh_failed');
             return;
           }
           if (status === 'connecting' || status === 'reconnecting' || status === 'offline') {
@@ -3657,7 +5054,12 @@ import {
   }
 
   function setControlCodeResultVisible(visible) {
+    const wasVisible = document.body.classList.contains('control-code-result-visible');
     if (visible) {
+      // A result or failure overlay always belongs to the authoritative SDR
+      // path. The shared presentation-region owner retires either a settling
+      // surface or established HDR before the overlay can enter the next
+      // compositor frame, then requires a fresh surface after dismissal.
       // The controls live below the full-height stream stage. A control-code
       // request can therefore finish while that stage is above the viewport.
       // Move the stage back into view in the same task that reveals the local
@@ -3668,6 +5070,13 @@ import {
     }
     codeResultArea.hidden = !visible;
     document.body.classList.toggle('control-code-result-visible', Boolean(visible));
+    if (Boolean(visible) !== wasVisible) {
+      synchronizeExperimentalHDRSurfaceRegion(
+        !experimentalHDRSurfacePresentationAllowed(),
+        visible ? 'control_code_result_visible' : 'control_code_result_hidden',
+        { foregroundConfirmed: !visible }
+      );
+    }
     updateControlCodeSubmitAvailability();
   }
 
@@ -3694,6 +5103,10 @@ import {
     clearControlCodePreparedCapture();
     codeResultImage.hidden = true;
     codeResultImage.removeAttribute('src');
+    synchronizeExperimentalHDRSurfaceRegion(
+      !experimentalHDRSurfacePresentationAllowed(),
+      'control_code_capture_cleared'
+    );
     publishStreamDebug();
   }
 
@@ -4775,6 +6188,7 @@ import {
       if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
       controlCodeResultCaptureRequestID = requestID;
+      synchronizeExperimentalHDRSurfaceRegion(true, 'control_code_priority');
       controlCodeResultCaptureStartedAt = performance.now();
       lastControlCodeMarkerReceivedLogKey = '';
       lastControlCodeMarkerWaitingLogKey = '';
@@ -4887,6 +6301,11 @@ import {
     const renderSignature = normalizedControlCodeRequestSignature(nextRequest);
     codeRequest = nextRequest;
     updateControlCodeSubmitAvailability();
+    const controlCodePriority = controlCodePresentationPriorityActive();
+    synchronizeExperimentalHDRSurfaceRegion(
+      controlCodePriority || !experimentalHDRSurfacePresentationAllowed(),
+      controlCodePriority ? 'control_code_priority' : 'control_code_priority_cleared'
+    );
     if (renderSignature === lastRenderedControlCodeRequestSignature) return;
     lastRenderedControlCodeRequestSignature = renderSignature;
     const current = codeRequest;
@@ -4957,7 +6376,16 @@ import {
   }
 
   function setDetailsPanelVisible(visible) {
-    document.body.classList.toggle('details-visible', Boolean(visible));
+    const revealed = Boolean(visible);
+    const wasRevealed = document.body.classList.contains('details-visible');
+    document.body.classList.toggle('details-visible', revealed);
+    if (revealed !== wasRevealed) {
+      synchronizeExperimentalHDRSurfaceRegion(
+        !experimentalHDRSurfacePresentationAllowed(),
+        revealed ? 'details_visible' : 'details_hidden',
+        { foregroundConfirmed: !revealed }
+      );
+    }
     if (panel) panel.setAttribute('aria-hidden', visible ? 'false' : 'true');
   }
 
@@ -5022,6 +6450,26 @@ import {
     settleCodeDialogScrollUnlock();
   }
 
+  function ticketRegisterOverlayOccupiesHotspot() {
+    if (ticketRegisterOverlay.hidden) return false;
+    const sliderRect = ticketRegisterOverlay.getBoundingClientRect();
+    const hotspotRect = controlCodeHotspot.getBoundingClientRect();
+    return sliderRect.width > 0 && sliderRect.height > 0 &&
+      hotspotRect.width > 0 && hotspotRect.height > 0 &&
+      sliderRect.left < hotspotRect.right && sliderRect.right > hotspotRect.left &&
+      sliderRect.top < hotspotRect.bottom && sliderRect.bottom > hotspotRect.top;
+  }
+
+  function requestControlCodeFromHotspot(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden || ticketRegisterOverlayOccupiesHotspot()) return;
+    if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;
+    openControlCodeDialog();
+  }
+
   async function submitControlCodeRequest() {
     const digits = sanitizeControlDigits(codeDigits.value);
     codeDigits.value = digits;
@@ -5039,6 +6487,7 @@ import {
     codeError.textContent = '';
     controlCodeSubmitInFlight = true;
     updateControlCodeSubmitAvailability();
+    revealAuthoritativeSDRForControlCodeRequest();
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
     const submittedAt = performance.now();
     try {
@@ -5068,6 +6517,10 @@ import {
       codeError.textContent = localizePublicMessage(error && error.message || 'Pieprasījums neizdevās');
     } finally {
       controlCodeSubmitInFlight = false;
+      synchronizeExperimentalHDRSurfaceRegion(
+        !experimentalHDRSurfacePresentationAllowed(),
+        'control_code_submit_settled'
+      );
       updateControlCodeSubmitAvailability();
     }
   }
@@ -5110,20 +6563,6 @@ import {
       clientLog('control_code_close_local_only', 'not_owned');
     }
     if (openNext) openControlCodeDialog();
-  }
-
-  function requestControlCodeFromHotspot(event) {
-    if (event) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-    if (codeDialogOpen) return;
-    if (!codeResultArea.hidden) {
-      closeCurrentControlCode(false);
-      return;
-    }
-    if (controlCodeMutationLaneBusy()) return;
-    openControlCodeDialog();
   }
 
   function relayReportToStreamStatus(report) {
@@ -5411,6 +6850,16 @@ import {
     };
   }
 
+  function revealAuthoritativeSDRForConsequentialControl() {
+    if (!experimentalClientHDRController || !experimentalMediaState.enabled || experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return;
+    const stream = ticketActionV3StreamSnapshot();
+    experimentalClientHDRController.ensureExactProof(stream.epoch, stream.sequence);
+  }
+
+  function revealAuthoritativeSDRForControlCodeRequest() {
+    synchronizeExperimentalHDRSurfaceRegion(true, 'control_code_request_priority');
+  }
+
   function currentTicketSliderRegion(state = currentState) {
     return ticketSliderRegionV3ForAction(
       state && state.ticketAction || null,
@@ -5443,16 +6892,6 @@ import {
     );
   }
 
-  function releaseTicketRegisterSliderPointerCapture(session) {
-    if (!session || session.kind !== 'pointer' || typeof ticketLocalRegisterSlider.releasePointerCapture !== 'function') return;
-    try {
-      if (typeof ticketLocalRegisterSlider.hasPointerCapture !== 'function' ||
-        ticketLocalRegisterSlider.hasPointerCapture(session.pointerId)) {
-        ticketLocalRegisterSlider.releasePointerCapture(session.pointerId);
-      }
-    } catch (_) {}
-  }
-
   function suppressTicketRegisterSliderChangeForPointerEvent() {
     ticketLocalRegisterSliderState.ignoreChange = true;
     setTimeout(() => {
@@ -5462,9 +6901,7 @@ import {
 
   function cancelTicketRegisterSliderSession(reason, pointerId = null) {
     if (ticketLocalRegisterSliderState.inFlight) return false;
-    const session = ticketLocalRegisterSliderState.session;
     if (!cancelTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, pointerId)) return false;
-    releaseTicketRegisterSliderPointerCapture(session);
     suppressTicketRegisterSliderChangeForPointerEvent();
     ticketLocalRegisterSlider.value = '0';
     clientLog('ticket_slider_cancelled', reason || 'cancelled');
@@ -5494,7 +6931,6 @@ import {
     for (const property of ['left', 'top', 'width', 'height']) {
       ticketRegisterOverlay.style.removeProperty(property);
     }
-    controlCodeHotspot.style.pointerEvents = '';
   }
 
   function renderTicketRegisterOverlay(state, busy, controlBusy, registerReady) {
@@ -5513,7 +6949,6 @@ import {
       ticketLocalRegisterSlider.disabled = true;
       ticketLocalRegisterSlider.value = '100';
       ticketLocalRegisterSlider.setAttribute('aria-label', 'Biļetes reģistrācija notiek tālrunī');
-      controlCodeHotspot.style.pointerEvents = 'none';
       return ticketLocalRegisterSliderState.latchedProof;
     }
     const region = currentTicketSliderRegion(state);
@@ -5535,9 +6970,8 @@ import {
     ticketRegisterOverlay.hidden = false;
     ticketRegisterOverlay.dataset.registrationState = 'ready';
     ticketRegisterOverlay.removeAttribute('aria-busy');
-    ticketLocalRegisterSlider.setAttribute('aria-label', 'Turi un velc pa labi vismaz ceturtdaļu vai līdz galam, lai reģistrētu atvērto biļeti');
+    ticketLocalRegisterSlider.setAttribute('aria-label', 'Velc pa labi vismaz 8 pikseļus mazāk nekā 45 grādu leņķī, lai reģistrētu atvērto biļeti; velc uz augšu vai leju, lai ritinātu lapu');
     ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight);
-    controlCodeHotspot.style.pointerEvents = 'none';
     const expiresAt = Date.parse(String(region.expiresAt || ''));
     const delay = expiresAt - (Date.now() + serverClockSkewMs);
     if (Number.isFinite(delay) && delay > 0) {
@@ -5874,6 +7308,7 @@ import {
   }
 
   async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {
+    if (target !== 'prove_current') revealAuthoritativeSDRForConsequentialControl();
     const currentAction = currentState && currentState.ticketAction;
     const backgroundProofBusy = ticketActionV3Busy(currentAction) &&
       String(currentAction && currentAction.target || '') === 'prove_current';
@@ -6065,6 +7500,7 @@ import {
     }, 80);
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
+  controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
   requestTicketResetButton.addEventListener('click', () => requestTicketActionV3(
     'open_latest_unactivated', 'browser_button', 'ticket_open_latest_unactivated'
   ));
@@ -6097,20 +7533,22 @@ import {
     const completedProof = completeTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       pointerId: event && event.pointerId,
       pointerClientX: event && event.clientX,
+      pointerClientY: event && event.clientY,
       progress: Number(ticketLocalRegisterSlider.value || 0),
       proofMatches
     });
-    releaseTicketRegisterSliderPointerCapture(session);
     if (kind === 'pointer') suppressTicketRegisterSliderChangeForPointerEvent();
     if (!completedProof) {
       ticketLocalRegisterSlider.value = '0';
       if (!proofMatches) clientLog('ticket_slider_cancelled', 'proof_changed_before_completion');
       return false;
     }
+    ticketLocalRegisterSlider.value = '100';
     return submitCompletedTicketRegisterSlider(completedProof);
   }
 
   ticketLocalRegisterSlider.addEventListener('pointerdown', (event) => {
+    revealAuthoritativeSDRForConsequentialControl();
     if (ticketLocalRegisterSliderState.inFlight) return;
     if (event.isPrimary === false) {
       cancelTicketRegisterSliderSession('secondary_pointer_down');
@@ -6126,15 +7564,22 @@ import {
       kind: 'pointer',
       pointerId: event.pointerId,
       pointerStartClientX: event.clientX,
+      pointerStartClientY: event.clientY,
       pointerTrackLeftClientX: sliderRect.left,
       pointerTrackWidth: sliderRect.width,
       snapshot
     })) return;
     ticketLocalRegisterSliderState.ignoreChange = true;
-    if (typeof ticketLocalRegisterSlider.setPointerCapture === 'function') {
-      try { ticketLocalRegisterSlider.setPointerCapture(event.pointerId); } catch (_) {}
-    }
   });
+  ticketLocalRegisterSlider.addEventListener('pointermove', (event) => {
+    if (updateTicketLocalRegisterSliderPointerDirection(ticketLocalRegisterSliderState, {
+      pointerId: event.pointerId,
+      pointerClientX: event.clientX,
+      pointerClientY: event.clientY
+    }) === 'scroll') {
+      clientLog('ticket_slider_cancelled', 'page_scroll_direction');
+    }
+  }, { passive: true });
   ticketLocalRegisterSlider.addEventListener('input', () => {
     // The local range authorizes one durable action only after release. Never
     // turn progress events into a second phone-control protocol.
@@ -6147,10 +7592,8 @@ import {
   ticketLocalRegisterSlider.addEventListener('pointercancel', (event) => {
     cancelTicketRegisterSliderSession('pointer_cancelled', event.pointerId);
   });
-  ticketLocalRegisterSlider.addEventListener('lostpointercapture', (event) => {
-    cancelTicketRegisterSliderSession('pointer_capture_lost', event.pointerId);
-  });
   ticketLocalRegisterSlider.addEventListener('keydown', (event) => {
+    revealAuthoritativeSDRForConsequentialControl();
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key) ||
       ticketLocalRegisterSliderState.inFlight || ticketLocalRegisterSliderState.session) return;
     beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
@@ -6190,7 +7633,6 @@ import {
     const target = String(ticketViewSwitchButton.dataset.target || '');
     if (target) requestTicketActionV3(target, 'browser_smart_switch', `ticket_${target}`);
   });
-  controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
     if (event.target === codeDialog) closeControlCodeDialog();
@@ -6228,108 +7670,6 @@ import {
   for (const eventName of ['pointerdown', 'touchend', 'click', 'keydown', 'scroll', 'focus']) {
     const target = eventName === 'focus' ? window : document;
     target.addEventListener(eventName, (event) => noteViewerActivity(event, eventName), { capture: true, passive: true });
-  }
-
-  function point(event) {
-    const rect = canvas.getBoundingClientRect();
-    const width = canvas.width;
-    const height = canvas.height;
-    return {
-      x: Math.round(((event.clientX - rect.left) / rect.width) * width),
-      y: Math.round(((event.clientY - rect.top) / rect.height) * height)
-    };
-  }
-
-  function releaseCanvasPointer(pointerId) {
-    if (typeof canvas.releasePointerCapture !== 'function') return;
-    try {
-      canvas.releasePointerCapture(pointerId);
-    } catch (_) {}
-  }
-
-  canvas.addEventListener('pointerdown', (event) => {
-    if (!configured) return;
-    if (event.button != null && event.button !== 0) return;
-    const start = point(event);
-    pointerStart = {
-      ...start,
-      clientX: event.clientX,
-      clientY: event.clientY,
-      pointerId: event.pointerId,
-      pointerType: event.pointerType || 'mouse',
-      at: performance.now()
-    };
-    if (event.pointerType !== 'touch' && event.cancelable) {
-      event.preventDefault();
-    }
-    if (typeof canvas.setPointerCapture === 'function') {
-      try {
-        canvas.setPointerCapture(event.pointerId);
-      } catch (_) {}
-    }
-  });
-
-  canvas.addEventListener('pointermove', (event) => {
-    if (!pointerStart || pointerStart.pointerId !== event.pointerId) return;
-    if (pointerStart.pointerType === 'mouse') return;
-    const dx = event.clientX - pointerStart.clientX;
-    const dy = event.clientY - pointerStart.clientY;
-    if (Math.abs(dy) >= streamVerticalPanThresholdPx && Math.abs(dy) > Math.abs(dx) * streamVerticalPanDominance) {
-      releaseCanvasPointer(event.pointerId);
-      pointerStart = null;
-      clientLog('stream_vertical_scroll', 'allowed');
-    }
-  });
-
-  canvas.addEventListener('pointerup', (event) => {
-    if (!pointerStart || !configured) return;
-    if (pointerStart.pointerId !== event.pointerId) return;
-    const end = point(event);
-    const distance = Math.hypot(end.x - pointerStart.x, end.y - pointerStart.y);
-    const heldMs = performance.now() - pointerStart.at;
-    if (distance < maxTapTravelPx && heldMs <= maxTapDurationMs) {
-      event.preventDefault();
-      setStatus('Kontroles kodu pieprasi ar pogu zem biļetes.');
-    } else {
-      if (event.cancelable) event.preventDefault();
-      clientLog('blocked_gesture', distance < maxTapTravelPx ? 'long_press' : 'swipe');
-    }
-    releaseCanvasPointer(event.pointerId);
-    pointerStart = null;
-  });
-
-  canvas.addEventListener('pointercancel', (event) => {
-    if (pointerStart && pointerStart.pointerId === event.pointerId) {
-      releaseCanvasPointer(event.pointerId);
-    }
-    if (!pointerStart || pointerStart.pointerId === event.pointerId) {
-      pointerStart = null;
-    }
-  });
-  canvas.addEventListener('dblclick', (event) => event.preventDefault());
-  function blockStreamGesture(event) {
-    if (event.cancelable) {
-      event.preventDefault();
-    }
-  }
-  function blockDoubleTapZoom(event) {
-    if (event.changedTouches && event.changedTouches.length > 0) {
-      const touch = event.changedTouches[0];
-      const now = performance.now();
-      const nearLastTouch = now - lastTouchEndAt < doubleTapSuppressMs
-        && Math.hypot(touch.clientX - lastTouchEndX, touch.clientY - lastTouchEndY) < doubleTapSuppressPx;
-      if (nearLastTouch && event.cancelable) {
-        event.preventDefault();
-      }
-      lastTouchEndAt = now;
-      lastTouchEndX = touch.clientX;
-      lastTouchEndY = touch.clientY;
-    }
-  }
-  canvas.addEventListener('touchend', blockDoubleTapZoom, { passive: false });
-  for (const eventName of ['gesturestart', 'gesturechange', 'gestureend']) {
-    canvas.addEventListener(eventName, blockStreamGesture, { passive: false });
-    document.addEventListener(eventName, blockStreamGesture, { passive: false });
   }
 
   function freshStreamStatus(now) {
@@ -6440,9 +7780,29 @@ import {
     return true;
   }
 
+  function clientHDRSDRUnavailable(freshness, reason) {
+    if (!freshness || !freshness.hasFrame) return true;
+    if (idleDisconnected || streamUnsupported || !viewerIsForeground()) return true;
+    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return true;
+    const status = freshStreamStatus(performance.now());
+    if (!status) return reason === 'stream_status';
+    if (status.phoneDesired === false || status.phoneConnected === false) return true;
+    if (String(status.phoneStreamState || '') !== 'streaming') return true;
+    return Number(status.activeVideoClients || 0) <= 0;
+  }
+
   function updateStreamFreshnessStatus(reason) {
     const freshness = currentRenderedFreshness(performance.now());
     const presentationLive = streamPresentationLive(freshness, reason);
+    const hdrFallbackReason = clientHDRSDRUnavailable(freshness, reason)
+      ? 'sdr_stream_unavailable'
+      : (!presentationLive ? 'sdr_stream_not_live' : '');
+    if (hdrFallbackReason &&
+      typeof experimentalClientHDRController !== 'undefined' && experimentalClientHDRController &&
+      typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled &&
+      experimentalMediaState.engine === CLIENT_HDR_ENGINE) {
+      experimentalClientHDRController.markSDRStale(hdrFallbackReason);
+    }
     document.body.dataset.streamFreshness = freshness.streamFreshnessState;
 	    document.body.dataset.streamLive = presentationLive ? 'true' : 'false';
 	    if (!freshness.liveLabeled && (reason || hasRenderedFrame)) {
@@ -6553,7 +7913,8 @@ import {
       codeSubmit.removeAttribute('aria-busy');
     }
     requestCodeButton.disabled = busy || limitBlocked;
-    const hotspotUnavailable = (busy || limitBlocked) && codeResultArea.hidden;
+    const sliderOwnsHotspot = ticketRegisterOverlayOccupiesHotspot();
+    const hotspotUnavailable = busy || limitBlocked || sliderOwnsHotspot || codeDialogOpen || !codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
   }
@@ -6745,9 +8106,6 @@ import {
       redrawPreservedFrame();
       if (longHidden || videoStale) showStreamRecovery();
     }
-    if (screenEngaged) {
-      requestScreenWakeLock(reason || 'visibility_visible');
-    }
     keepFirstScreenPinned(false);
     refreshSpacetimeStateAfterResume(reason || 'visibility_resume').catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     publishCurrentStreamFocus(reason || 'visibility_visible');
@@ -6757,7 +8115,7 @@ import {
 	    }
 	    if (hardRestore) {
 	      recoverFreshMediaSession(reason || 'visibility_resume', 'old_tab_resume', {
-	        forceReconnect: cacheRestored && !reusePersistedSocket,
+	        forceReconnect: connectingTooLong || (cacheRestored && !reusePersistedSocket),
 	        skipEarlyGrace: true,
 	        keyframeReason: `${reason || 'resume'}_cached_keyframe`
 	      });
@@ -6782,18 +8140,18 @@ import {
 
   window.addEventListener('resize', resizeCanvasBox);
   window.addEventListener('scroll', () => {
-    cancelTicketRegisterSliderSession('window_scrolled');
     updateDetailsReveal();
   }, { passive: true });
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', resizeCanvasBox);
-    window.visualViewport.addEventListener('scroll', resizeCanvasBox);
+    window.visualViewport.addEventListener('scroll', updateViewportVars, { passive: true });
   }
   document.addEventListener('visibilitychange', () => {
     scheduleStreamFeedback('visibility_change');
     if (document.visibilityState === 'visible') {
-	      if (typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled && typeof connectExperimentalMedia === 'function') {
-	        connectExperimentalMedia();
+	      if (typeof resumeExperimentalMediaForLifecycle === 'function') resumeExperimentalMediaForLifecycle('visibility_resume');
+	      if (typeof scheduleExperimentalMediaForegroundReturnConfirmation === 'function') {
+	        scheduleExperimentalMediaForegroundReturnConfirmation('visibility_resume');
 	      }
 	      hiddenDecoderTransientLogged = false;
       refreshMemberLimitProjection('visibility_resume_limit_refresh');
@@ -6805,8 +8163,9 @@ import {
       }
       recoverAfterVisibilityResume('visibility_resume');
 	    } else if (document.visibilityState === 'hidden') {
+	      if (typeof armExperimentalMediaLifecycleResume === 'function') armExperimentalMediaLifecycleResume();
 	      if (typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled && typeof closeExperimentalMedia === 'function') {
-	        closeExperimentalMedia({ keepEnabled: true, status: 'Eksperimentālais skats apturēts fonā.' });
+	        closeExperimentalMedia({ keepEnabled: true, status: 'HDR skats apturēts fonā.' });
 	      }
 	      hiddenDecoderTransientLogged = false;
 	      const flow = pauseActivationResumeLifecycle('visibility_hidden', 'visibility_hidden');
@@ -6814,19 +8173,31 @@ import {
 	      lastHiddenAt = performance.now();
 	      lastHiddenWallAt = Date.now();
 	      clearActivationReconnectBurst();
-	      releaseScreenWakeLock('visibility_hidden');
-	      pauseHiddenStreamAfterGrace('visibility_hidden');
+      pauseHiddenStreamAfterGrace('visibility_hidden');
 	      if (!hasRenderedFrame || !streamHasFreshRenderedFrame()) {
 	        logResumeCheckpoint('activation_visibility_hidden_cold_shutdown', { reason: 'cold_open' }, flow);
 	      }
 	    }
-	  });
-	  window.addEventListener('pageshow', (event) => {
+  });
+  window.addEventListener('pageshow', (event) => {
+	    const foregroundAttempt = typeof foregroundRecoveryCurrent === 'function' &&
+	      foregroundRecoveryCurrent(experimentalMediaForegroundRecovery)
+	      ? experimentalMediaForegroundRecovery
+	      : null;
+	    const returnAlreadyClustered = Boolean(foregroundAttempt &&
+	      Number(foregroundAttempt.id || 0) === Number(experimentalMediaLifecycleResumeAttemptID || 0));
+	    if (!experimentalMediaLifecycleArmed && !returnAlreadyClustered &&
+	      typeof armExperimentalMediaLifecycleResume === 'function') {
+	      armExperimentalMediaLifecycleResume();
+	    }
+	    if (typeof resumeExperimentalMediaForLifecycle === 'function') {
+	      resumeExperimentalMediaForLifecycle(event && event.persisted ? 'pageshow_persisted' : 'pageshow');
+	    }
+	    if (typeof scheduleExperimentalMediaForegroundReturnConfirmation === 'function') {
+	      scheduleExperimentalMediaForegroundReturnConfirmation(event && event.persisted ? 'pageshow_persisted' : 'pageshow');
+	    }
 	    ticketCurrentProofVisualState.resumePending = true;
 	    const resumedFromIdle = noteViewerActivity(event, 'pageshow');
-	    if (screenEngaged) {
-	      requestScreenWakeLock('pageshow');
-	    }
     keepFirstScreenPinned(true);
     const restored = event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true);
     if (!resumedFromIdle) {
@@ -6838,16 +8209,48 @@ import {
     }
     chaseLiveStream();
   });
+  window.addEventListener('online', () => {
+    if (!experimentalMediaPreferenceController.enabled) return;
+    beginExperimentalMediaForegroundRecovery('network_online', { forceCanvasReset: true });
+  });
+  window.addEventListener('blur', () => {
+    // Some iOS standalone-PWA returns deliver blur/focus without a matching
+    // visibility transition. Treat the blur as the lifecycle boundary so a
+    // later focus cannot reuse a stale WebGPU compositor surface.
+    if (typeof armExperimentalMediaLifecycleResume === 'function') armExperimentalMediaLifecycleResume();
+    if (typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled &&
+      typeof closeExperimentalMedia === 'function') {
+      closeExperimentalMedia({ keepEnabled: true, status: 'HDR skats apturēts fonā.' });
+    }
+  });
   window.addEventListener('focus', () => {
-	    if (noteViewerActivity(null, 'focus')) return;
-	    chaseLiveStream();
-	    publishCurrentStreamFocus('focus');
-	    followActivationResumeLifecycle('focus', 'focus');
-	  });
+    noteExperimentalMediaForegroundPulse();
+    if (typeof recoverExperimentalMediaForFocusOnlyLifecycle === 'function') {
+      recoverExperimentalMediaForFocusOnlyLifecycle();
+    }
+    if (typeof resumeExperimentalMediaForLifecycle === 'function') resumeExperimentalMediaForLifecycle('focus');
+    if (typeof scheduleExperimentalMediaForegroundReturnConfirmation === 'function') {
+      scheduleExperimentalMediaForegroundReturnConfirmation('focus');
+    }
+    if (noteViewerActivity(null, 'focus')) return;
+    const focusRestored = document.visibilityState === 'visible' && (
+      lastHiddenAt > 0 ||
+      lastHiddenWallAt > 0
+    );
+    if (focusRestored) {
+      ticketCurrentProofVisualState.resumePending = true;
+      recoverAfterVisibilityResume('focus');
+      return;
+    }
+    chaseLiveStream();
+    publishCurrentStreamFocus('focus');
+    followActivationResumeLifecycle('focus', 'focus');
+  });
 	  window.addEventListener('pagehide', (event) => {
+	    if (typeof armExperimentalMediaLifecycleResume === 'function') armExperimentalMediaLifecycleResume();
 	    if (typeof closeExperimentalMedia === 'function') closeExperimentalMedia({
-	      keepEnabled: Boolean(event && event.persisted),
-	      status: event && event.persisted ? 'Eksperimentālais skats apturēts fonā.' : 'Izslēgts'
+	      keepEnabled: true,
+	      status: 'HDR skats apturēts fonā.'
 	    });
 	    const flow = pauseActivationResumeLifecycle(event && event.persisted ? 'pagehide_cached' : 'pagehide', 'pagehide');
 	    logResumeCheckpoint('activation_pagehide', {
@@ -6881,7 +8284,10 @@ import {
     }
   }, 15000);
   feedbackTimer = setInterval(() => sendStreamFeedback('interval', false), 500);
-  setInterval(chaseLiveStream, 1000);
+  setInterval(() => {
+    noteExperimentalMediaForegroundPulse();
+    chaseLiveStream();
+  }, 1000);
   updateViewportVars();
   keepFirstScreenPinned(true);
   updateDetailsReveal();

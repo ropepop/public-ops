@@ -7,7 +7,6 @@ const REGISTRATION_PROOF_TARGETS = new Set([
 ]);
 export const TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT = 25;
 export const TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX = 8;
-export const TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PERCENT = 3;
 
 export function ticketActionV3ClientId(scope, now = Date.now(), entropy = Math.random().toString(36).slice(2, 10)) {
   const cleanScope = String(scope || 'action').toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 32) || 'action';
@@ -149,11 +148,12 @@ export function beginTicketLocalRegisterSliderSession(state, input) {
   const kind = String(input && input.kind || 'pointer');
   const pointerId = kind === 'pointer' ? Number(input && input.pointerId) : null;
   const pointerStartClientX = kind === 'pointer' ? Number(input && input.pointerStartClientX) : null;
+  const pointerStartClientY = kind === 'pointer' ? Number(input && input.pointerStartClientY) : null;
   const pointerTrackLeftClientX = kind === 'pointer' ? Number(input && input.pointerTrackLeftClientX) : null;
   const pointerTrackWidth = kind === 'pointer' ? Number(input && input.pointerTrackWidth) : null;
   const pointerTrackRightClientX = kind === 'pointer' ? pointerTrackLeftClientX + pointerTrackWidth : null;
   if (kind === 'pointer' && (
-    !Number.isFinite(pointerId) || !Number.isFinite(pointerStartClientX) ||
+    !Number.isFinite(pointerId) || !Number.isFinite(pointerStartClientX) || !Number.isFinite(pointerStartClientY) ||
     !Number.isFinite(pointerTrackLeftClientX) ||
     !Number.isFinite(pointerTrackWidth) || pointerTrackWidth <= 0 ||
     !Number.isFinite(pointerTrackRightClientX)
@@ -164,9 +164,11 @@ export function beginTicketLocalRegisterSliderSession(state, input) {
     pointerStartClientX: kind === 'pointer'
       ? Math.max(pointerTrackLeftClientX, Math.min(pointerTrackRightClientX, pointerStartClientX))
       : null,
+    pointerStartClientY,
     pointerTrackLeftClientX,
     pointerTrackWidth,
     snapshot,
+    directionRejected: false,
     qualified: true,
     submitted: false
   };
@@ -180,20 +182,32 @@ export function cancelTicketLocalRegisterSliderSession(state, pointerId = null) 
   return true;
 }
 
-function ticketLocalRegisterSliderPointerCompletes(session, endClientX, progress) {
+export function updateTicketLocalRegisterSliderPointerDirection(state, input) {
+  const session = state && state.session;
+  if (!session || session.kind !== 'pointer' || state.inFlight || session.directionRejected) return 'inactive';
+  if (Number(input && input.pointerId) !== session.pointerId) return 'inactive';
+  const deltaX = Number(input && input.pointerClientX) - Number(session.pointerStartClientX);
+  const deltaY = Number(input && input.pointerClientY) - Number(session.pointerStartClientY);
+  if (![deltaX, deltaY].every(Number.isFinite) || Math.max(Math.abs(deltaX), Math.abs(deltaY)) < TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX) {
+    return 'pending';
+  }
+  if (deltaX <= 0 || Math.abs(deltaY) >= deltaX) {
+    session.directionRejected = true;
+    return 'scroll';
+  }
+  return 'slider';
+}
+
+function ticketLocalRegisterSliderPointerCompletes(session, endClientX, endClientY) {
   const start = Number(session && session.pointerStartClientX);
-  const width = Number(session && session.pointerTrackWidth);
+  const startY = Number(session && session.pointerStartClientY);
   const end = Number(endClientX);
-  if (![start, width, end].every(Number.isFinite) || width <= 0 || end <= start) return false;
-  const travel = end - start;
-  const fullQuarter = width * TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT / 100;
-  const antiTapFloor = Math.max(
-    TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX,
-    width * TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PERCENT / 100
-  );
-  const rawProgress = Number(progress);
-  const terminalProgress = Number.isFinite(rawProgress) ? Math.max(0, Math.min(100, rawProgress)) : 0;
-  return travel >= antiTapFloor && (travel >= fullQuarter || terminalProgress >= 100);
+  const endY = Number(endClientY);
+  if (session && session.directionRejected) return false;
+  if (![start, startY, end, endY].every(Number.isFinite)) return false;
+  const travelX = end - start;
+  const travelY = Math.abs(endY - startY);
+  return travelX >= TICKET_LOCAL_REGISTER_SLIDER_MIN_POINTER_PX && travelY < travelX;
 }
 
 export function completeTicketLocalRegisterSliderSession(state, input) {
@@ -205,7 +219,11 @@ export function completeTicketLocalRegisterSliderSession(state, input) {
     return null;
   }
   const completed = session.kind === 'pointer'
-    ? ticketLocalRegisterSliderPointerCompletes(session, input && input.pointerClientX, input && input.progress) &&
+    ? ticketLocalRegisterSliderPointerCompletes(
+      session,
+      input && input.pointerClientX,
+      input && input.pointerClientY
+    ) &&
       shouldSubmitTicketSliderCompletion(session, 'up', 10000)
     : shouldSubmitTicketSliderCompletion(
       session,

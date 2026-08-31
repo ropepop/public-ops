@@ -36,7 +36,7 @@ This is the detailed operator runbook for the active kitty-gration runtime.
   database does not: it remains application state under `/opt/tiny-vless/db`
   and uses SQLite-safe backups under `/srv/arbuzas/tiny-vless/backups`.
 - Do not create `.bak`, `.before-*`, `.retired-*`, or editor backup copies under `/etc/arbuzas/env` or its local mirror. Mirror operations ignore these files, deploy removes old copies from the host, and full validation rejects any that remain.
-- Satiksme chat-analyzer Telegram and Google credentials belong under `infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/`, not inline in `satiksme-bot.env`. The directory is intentionally ignored by Git. The service environment contains only the matching `*_FILE` paths.
+- Satiksme chat-analyzer Telegram and Google credentials belong under `infra/arbuzas/host-mirror/etc/arbuzas/secrets/satiksme-chat-analyzer/`, not inline in `satiksme-bot.env`. The directory is intentionally ignored by Git. When `SATIKSME_CHAT_ANALYZER_ENABLED=false`, those files are optional and are not passed into the application. When enabled, the managed Google key also supplies the model client; there is no second model-key file.
 
 Migrate an existing local Satiksme environment without displaying its values:
 
@@ -54,7 +54,7 @@ pbpaste | python3 tools/arbuzas/migrate_satiksme_analyzer_secrets.py \
   --set-google-key-stdin
 ```
 
-The replacement command writes both Google/model key files atomically as `0600` and prints only a generic confirmation. Follow either change with `mirror-audit`, then `deploy-config` or the normal deploy flow. Never copy the secret value into a report, terminal command, or tracked file.
+The replacement command writes the Google key atomically as `0600` and prints only a generic confirmation. Follow either change with `mirror-audit`, then `deploy-config` or the normal deploy flow. Never copy the secret value into a report, terminal command, or tracked file.
 
 ## Normal Release Flow
 
@@ -87,7 +87,7 @@ Use an explicit validation profile for targeted iteration:
 
 Notes for targeted updates:
 
-- `--services` is available only for `deploy` and `validate`.
+- `--services` is available only for `deploy`, `validate`, and `rollback`.
 - Service names normally use the Compose service names from
   `infra/arbuzas/docker/compose.yml`. `tiny_vless` is the deliberate exception:
   it is a first-class umbrella selector for the existing separate Compose
@@ -96,8 +96,8 @@ Notes for targeted updates:
 - `site-notifications` is kept in the repo for reference and testing, but it is not part of the active kitty-gration deploy set.
 - Targeted validation checks the slice you touched instead of forcing a full-stack validation pass.
 - `fast` is the inner iteration lane. It requires `--services`, reuses the unchanged release content, restarts only the selected slice, runs bounded readiness probes concurrently, and defers remote Docker/release cleanup. It still prunes expired local release artifacts after successful validation.
-- `standard` is the targeted confidence lane. It validates the selected workload more deeply while still avoiding unrelated full-stack checks.
-- `full` is the release lane and remains the default for unscoped deploys. It validates the complete host and performs release and image cleanup.
+- `standard` is the targeted confidence lane. It validates the selected workload more deeply while still avoiding unrelated full-stack checks. After success it may run the same remote retention policy as full, at most once per 24 hours.
+- `full` is the release lane and remains the default for unscoped deploys. It validates the complete host and is also eligible for the once-per-24-hour retention policy.
 - An unscoped deploy validates tiny-VLESS health but does not restart its
   separate project. Recreating the VPN always requires an explicit
   `--services tiny_vless` selection.
@@ -130,6 +130,12 @@ Run the cleanup policy without deploying:
 
 ```bash
 ./tools/arbuzas/deploy.sh cleanup-docker --ssh-host kitty-gration --ssh-user "$USER"
+```
+
+That command is a read-only preview. Apply exactly the displayed policy with:
+
+```bash
+./tools/arbuzas/deploy.sh cleanup-docker --apply --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
 Report the corrected host memory pressure without deploying or flushing cache:
@@ -324,19 +330,19 @@ Re-run the fan-controller checks without reinstalling it:
 
 - prepares a minimal release bundle under `/etc/arbuzas/releases/<release-id>`
 - renders Cloudflare tunnel configs inside that release bundle
-- updates `/etc/arbuzas/current`
-- runs `docker compose -p arbuzas up -d --build`
+- validates the new release's Compose configuration and fetches any missing selected external images before changing the active link
+- prepares unchanged fast-profile image aliases when needed
+- builds the selected images against the new release while `/etc/arbuzas/current` still points at the working release
+- checks private Satiksme configuration before any Satiksme recreation
+- updates `/etc/arbuzas/current`, recreates the selected services without rebuilding, and applies declared no-swap limits
 - when `--services` is set, rebuilds and restarts only the requested services instead of the full stack
 - when `--services tiny_vless` is set, updates only the existing external VPN
   project after taking its guarded recovery snapshot; an unscoped deploy only
   validates that project and leaves it running
 - validates the apps, tunnels, and standalone Docker baseline
 - after every successful validation profile, prunes expired local bundles under `output/arbuzas/releases` while protecting the deployed release
-- prunes unused Docker images after they have stayed unprotected for 7 days
-- prunes old release bundles beyond the newest 10 per release family
-- prunes Docker build cache older than 7 days
-- runs gentle host cache cleanup for package caches, narrow old `/tmp` scratch, and journals
-- flushes reclaimable Linux memory cache after cleanup so provider memory graphs fall back quickly
+- after a successful standard/full deployment, applies the remote image, release, and seven-day build-cache policy only when its last automatic pass is at least 24 hours old
+- installs a persistent `100M` systemd-journal limit and performs one initial bounded vacuum only when that policy is first installed or changed
 
 The normal Docker release flow does not install or update Netdata. Netdata is a separate host-maintenance action.
 The corrected memory report service is also a separate host-maintenance action.
@@ -350,7 +356,7 @@ umbrella, but remains outside the main `arbuzas` Compose project.
 ./tools/arbuzas/deploy.sh rollback --release-id "<previous-release-id>" --ssh-host kitty-gration --ssh-user "$USER"
 ```
 
-Rollback re-runs the same post-validation cleanup policy after the host is healthy again.
+Rollback prunes only expired local release artifacts after the host is healthy again. It never triggers remote image, release, or build-cache cleanup.
 
 Before a targeted VPN rollout, the deploy path creates a consistent SQLite
 backup and snapshots the host integration state it may change. If that rollout
@@ -364,8 +370,8 @@ new database or client identities as an implicit rollback.
 The deployment workflow applies cleanup in three ways:
 
 - local release cleanup after every successful `deploy` profile and successful `rollback`
-- full remote cleanup after a successful `full` deploy or rollback
-- manual remote cleanup through `./tools/arbuzas/deploy.sh cleanup-docker`
+- remote cleanup after a successful `standard` or `full` deploy, only when the previous automatic pass is at least 24 hours old
+- manual read-only preview through `./tools/arbuzas/deploy.sh cleanup-docker`, with explicit `--apply` for deletion
 
 Local release cleanup is separate from remote Docker cleanup. It considers only direct child directories of `output/arbuzas/releases`, protects the deployed or rolled-back release id, and defaults to a 72-hour window with at most 10 releases per family. A release is selected when it is expired or exceeds the family limit. Files and symbolic links in that root are ignored, and evidence, state, secrets, databases, browser sessions, and workload paths are outside the managed root.
 
@@ -375,26 +381,20 @@ What the cleanup protects:
 - all `arbuzas/*:<release-id>` images for the current release
 - all `arbuzas/*:<release-id>` images for one rollback slot: the newest non-current release directory under `/etc/arbuzas/releases`
 - the current release bundle and newest rollback release bundle
-- the newest 10 release bundles per release family under `/etc/arbuzas/releases`
+- the newest 10 release bundles per recognized family under `/etc/arbuzas/releases`; unrecognized historical names share one bounded `legacy` family
 
 What the cleanup removes:
 
 - any other unused image only after it has stayed unused and unprotected for 7 days
 - older release bundles beyond the protected current, rollback, and newest 10 per family set
 - Docker build cache older than 7 days
-- package-manager cache through `apt-get clean`
-- old kitty-gration scratch files in `/tmp` that match narrow known patterns
-- systemd journals beyond the configured cap, default `100M`
-- reclaimable in-memory Linux page, directory, and inode cache through `drop_caches=3`
-
-Dropping reclaimable memory cache affects provider memory charts and warm file reads, not live application memory.
-The host may rebuild cache naturally after Docker builds, validation, or busy app traffic.
 
 What the cleanup does not touch:
 
 - containers
 - volumes
 - networks
+- package-manager caches, `/tmp`, and the kernel's reclaimable memory cache
 - the restricted Portainer retirement archives under `/srv/arbuzas/portainer-backups/`
 - application state under `/srv/arbuzas/*`
 
@@ -404,12 +404,10 @@ Implementation notes for operators:
 - Set `ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN=true` to preview deploy-time local cleanup without deleting bundles.
 - Cleanup state is tracked under `/etc/arbuzas/docker-gc/state.json`.
 - Release bundle retention defaults to `DOCKER_GC_RELEASE_KEEP_PER_FAMILY=10`.
-- Host scratch retention defaults to `ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS=7`.
 - Journal cleanup defaults to `ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE=100M`.
-- Reclaimable memory cache flushing defaults to enabled; set `ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false` to skip it for one run.
 - If the cleanup state file is missing or corrupted, kitty-gration recreates it and starts a fresh 7-day countdown instead of deleting newly eligible images immediately.
-- If automatic cleanup fails after a successful deploy or rollback, the release still stays successful and the cleanup failure is logged as a warning.
-- Manual `cleanup-docker` fails loudly if the cleanup itself cannot complete.
+- If automatic cleanup fails after a successful standard/full deploy, the release still stays successful and the cleanup failure is logged as a warning.
+- Preview does not delete, update cleanup state, or prune build cache. `cleanup-docker --apply` fails loudly if cleanup cannot complete.
 
 ## Memory Reporting
 

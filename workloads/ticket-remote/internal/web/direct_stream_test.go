@@ -16,17 +16,37 @@ import (
 	"ticketremote/internal/state"
 )
 
+func testAllIntraConfig(raw []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	payload["frameDependencyMode"] = frameDependencyModeAllIntra
+	payload["fps"] = 1
+	payload["sourceFps"] = 1
+	payload["keyframeIntervalFrames"] = 1
+	strict, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return strict
+}
+
+func setTestAllIntraConfig(hub *directStreamHub, raw []byte) bool {
+	return hub.setConfig(testAllIntraConfig(raw))
+}
+
 func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
-	delta := testTSF2FrameWithTimestamp(1, 2, false, 1001)
+	second := testTSF2FrameWithTimestamp(1, 2, true, 1001)
 	if !hub.recordFrame(key) {
 		t.Fatal("keyframe should be accepted for latest-frame broadcast")
 	}
-	if !hub.recordFrame(delta) {
-		t.Fatal("delta frame should be accepted for live latest-frame broadcast")
+	if !hub.recordFrame(second) {
+		t.Fatal("second independent frame should be accepted for live latest-frame broadcast")
 	}
 	hub.recordClientTelemetry("h264_decoder_error", "bad keyframe")
 
@@ -40,8 +60,8 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	}
 	if snapshot["activeVideoClients"] != 1 ||
 		snapshot["framesForwarded"] != uint64(2) ||
-		snapshot["keyframesForwarded"] != uint64(1) ||
-		snapshot["deltaFramesForwarded"] != uint64(1) ||
+		snapshot["keyframesForwarded"] != uint64(2) ||
+		snapshot["deltaFramesForwarded"] != uint64(0) ||
 		snapshot["sourceFramesReceived"] != uint64(2) ||
 		snapshot["droppedStaleFrames"] != uint64(0) {
 		t.Fatalf("unexpected counters %#v", snapshot)
@@ -59,7 +79,7 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	if !strings.Contains(string(config), `"transport":"h264-annexb"`) {
 		t.Fatalf("warm config missing: %q", string(config))
 	}
-	if meta := parseTSF2(keyFrame); !meta.ok || meta.epoch != 1 || meta.sequence != 1 || !meta.keyFrame {
+	if meta := parseTSF2(keyFrame); !meta.ok || meta.epoch != 1 || meta.sequence != 2 || !meta.keyFrame {
 		t.Fatalf("warm keyframe mismatch: %x", keyFrame)
 	}
 }
@@ -128,7 +148,7 @@ func TestDirectStreamStartupTraceRecordsAndCompletes(t *testing.T) {
 func TestForwardedFrameDoesNotCompleteStartupTraceBeforeBrowserPaint(t *testing.T) {
 	hub := newDirectStreamHub()
 	traceID := hub.beginStartupTrace("session-a", "video_socket_open")
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	server := &Server{direct: hub, clients: map[*client]struct{}{}}
 	server.handlePhoneMessage(phone.Message{
 		Binary:                    testTSF2FrameWithTimestamp(1, 1, true, 1000),
@@ -167,7 +187,7 @@ func TestRelayKeyframeReceiptCannotCrossStartupTraceCorrelation(t *testing.T) {
 	correlationA := startupTraceCorrelationID(traceA)
 	traceB := hub.startStartupTrace("session-b", "replacement_navigation")
 	correlationB := startupTraceCorrelationID(traceB)
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	server := &Server{direct: hub, clients: map[*client]struct{}{}}
 
 	server.handlePhoneMessage(phone.Message{
@@ -594,7 +614,7 @@ func TestPendingStartupTraceElapsedUsesSnapshotTime(t *testing.T) {
 func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
 	hub.recordFrame(key)
 	hub.recordClientTelemetry("h264_decoder_mode", "avc_adapter_configured")
@@ -612,7 +632,7 @@ func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 func TestDirectStreamWarmStartSendsProvisionalConfigBeforeFreshKeyFrame(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 
 	config, keyFrame := hub.warmStart()
 	if !strings.Contains(string(config), `"streamEpoch":0`) || !strings.Contains(string(config), `"provisional":true`) || len(keyFrame) != 0 {
@@ -627,36 +647,10 @@ func TestDirectStreamWarmStartSendsProvisionalConfigBeforeFreshKeyFrame(t *testi
 	}
 }
 
-func TestDirectStreamExperimentalWarmStartKeepsRealEpochWhileWaitingForKeyFrame(t *testing.T) {
-	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":1000}`))
-
-	config, keyFrame := hub.experimentalWarmStart()
-	if !strings.Contains(string(config), `"streamEpoch":7`) || strings.Contains(string(config), `"provisional":true`) || len(keyFrame) != 0 {
-		t.Fatalf("experimental warm start without a fresh keyframe should keep the real config only: config=%q key=%x", string(config), keyFrame)
-	}
-
-	key := testTSF2FrameWithTimestamp(7, 1, true, 1000)
-	hub.recordFrame(key)
-	config, keyFrame = hub.experimentalWarmStart()
-	if !strings.Contains(string(config), `"streamEpoch":7`) || parseTSF2(keyFrame).sequence != 1 {
-		t.Fatalf("experimental warm start with a fresh keyframe should return the real config and keyframe")
-	}
-
-	hub.mu.Lock()
-	hub.lastFrameAt = time.Now().Add(-10 * time.Second)
-	hub.lastKeyFrameAt = time.Now().Add(-10 * time.Second)
-	hub.mu.Unlock()
-	config, keyFrame = hub.experimentalWarmStart()
-	if !strings.Contains(string(config), `"streamEpoch":7`) || strings.Contains(string(config), `"provisional":true`) || len(keyFrame) != 0 {
-		t.Fatalf("experimental warm start with a stale keyframe should keep the real config only: config=%q key=%x", string(config), keyFrame)
-	}
-}
-
 func TestDirectStreamWarmEncoderReusableRequiresFreshSameEpochStream(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
-	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, false, 10000)) {
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 		t.Fatal("fresh same-epoch frame was not accepted")
 	}
 	livePhone := phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"}
@@ -665,7 +659,7 @@ func TestDirectStreamWarmEncoderReusableRequiresFreshSameEpochStream(t *testing.
 	}
 
 	hub.mu.Lock()
-	hub.lastFrameAt = time.Now().Add(-3 * time.Second)
+	hub.lastFrameAt = time.Now().Add(-3100 * time.Millisecond)
 	hub.mu.Unlock()
 	if hub.warmEncoderReusable(time.Now(), livePhone) {
 		t.Fatal("stale encoder evidence must not skip the ordered cold start")
@@ -681,11 +675,11 @@ func TestDirectStreamWarmEncoderConfigMustArriveDuringReconnectProbe(t *testing.
 	if hub.warmEncoderConfigReceivedAfter(baseline) {
 		t.Fatal("empty stream must not satisfy the reconnect probe")
 	}
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":0,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":0,"phoneUptimeMillis":10000}`))
 	if hub.warmEncoderConfigReceivedAfter(baseline) {
 		t.Fatal("provisional zero-epoch config must not satisfy the reconnect probe")
 	}
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":9,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":9,"phoneUptimeMillis":10000}`))
 	if !hub.warmEncoderConfigReceivedAfter(baseline) {
 		t.Fatal("new positive-epoch config should prove an active warm reconnect")
 	}
@@ -697,7 +691,7 @@ func TestDirectStreamWarmEncoderConfigMustArriveDuringReconnectProbe(t *testing.
 func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
 	hub.recordFrame(key)
 	for _, event := range []string{
@@ -724,7 +718,7 @@ func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
 
 func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
 	hub.recordFrame(key)
 
@@ -740,7 +734,7 @@ func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
 
 func TestDirectStreamWarmStartRejectsStoppedStream(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":0}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":0}`))
 	hub.recordFrame(testTSF2KeyFrameWithEpoch(0, 1, true))
 
 	if config, keyFrame := hub.warmStart(); len(config) > 0 || len(keyFrame) > 0 {
@@ -750,11 +744,10 @@ func TestDirectStreamWarmStartRejectsStoppedStream(t *testing.T) {
 
 func TestDirectStreamWarmStartKeepsStaleKeyFrameOutButStillPreconfiguresDecoder(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
 	hub.recordFrame(testTSF2KeyFrameWithEpoch(7, 1, true))
 	hub.mu.Lock()
 	hub.lastFrameAt = time.Now().Add(-10 * time.Second)
-	hub.lastKeyFrameAt = time.Now().Add(-10 * time.Second)
 	hub.mu.Unlock()
 
 	config, keyFrame := hub.warmStart()
@@ -765,35 +758,33 @@ func TestDirectStreamWarmStartKeepsStaleKeyFrameOutButStillPreconfiguresDecoder(
 
 func TestDirectStreamDoesNotWarmStartKeyFramePastForwardAgeBudget(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 	hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000))
 	hub.mu.Lock()
-	hub.lastFrameAt = time.Now().Add(-800 * time.Millisecond)
-	hub.lastKeyFrameAt = time.Now().Add(-800 * time.Millisecond)
+	hub.lastFrameAt = time.Now().Add(-1300 * time.Millisecond)
 	hub.mu.Unlock()
 
 	config, keyFrame := hub.warmStart()
 	if !strings.Contains(string(config), `"streamEpoch":0`) || len(keyFrame) > 0 {
-		t.Fatalf("warm start must not replay a keyframe older than the 750ms forward budget: config=%q key=%x", string(config), keyFrame)
+		t.Fatalf("warm start must not replay a keyframe older than the 1250ms forward budget: config=%q key=%x", string(config), keyFrame)
 	}
 }
 
-func TestDirectStreamVerdictNeverLabelsOverTwoSecondsAsLive(t *testing.T) {
+func TestDirectStreamVerdictNeverLabelsOverThreeSecondsAsLive(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 	hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000))
 	now := time.Now()
 	hub.mu.Lock()
-	hub.lastFrameAt = now.Add(-2100 * time.Millisecond)
-	hub.lastKeyFrameAt = now.Add(-2100 * time.Millisecond)
-	hub.lastFrameVisualAgeMillis = int64((2100 * time.Millisecond) / time.Millisecond)
+	hub.lastFrameAt = now.Add(-3100 * time.Millisecond)
+	hub.lastFrameVisualAgeMillis = int64((3100 * time.Millisecond) / time.Millisecond)
 	hub.lastFrameVisualAgeKnown = true
 	hub.mu.Unlock()
 
 	snapshot := hub.snapshot(now, phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
 	if snapshot["streamVerdict"] == "live" {
-		t.Fatalf("frames older than 2s must not be labeled live: %#v", snapshot)
+		t.Fatalf("frames older than 3s must not be labeled live: %#v", snapshot)
 	}
 }
 
@@ -804,27 +795,26 @@ func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 		wantFreshness string
 		wantLive      bool
 	}{
-		{name: "fresh", visualAge: 1000 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true},
-		{name: "ok", visualAge: 1500 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: true},
-		{name: "degraded", visualAge: 2000 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: true},
-		{name: "stale", visualAge: 2001 * time.Millisecond, wantFreshness: "STALE", wantLive: false},
+		{name: "fresh", visualAge: 1250 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true},
+		{name: "fresh_plus_one", visualAge: 1251 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: true},
+		{name: "ok", visualAge: 2000 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: true},
+		{name: "ok_plus_one", visualAge: 2001 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: true},
+		{name: "degraded", visualAge: 3000 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: true},
+		{name: "stale", visualAge: 3001 * time.Millisecond, wantFreshness: "STALE", wantLive: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hub := newDirectStreamHub()
 			hub.addVideoClient()
-			hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+			setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 			if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 				t.Fatal("fresh calibrated frame should be forwarded")
 			}
 			now := time.Now()
 			hub.mu.Lock()
 			hub.lastFrameAt = now
-			hub.lastKeyFrameAt = now
 			hub.lastFrameVisualAgeMillis = int64(tc.visualAge / time.Millisecond)
-			hub.lastKeyFrameVisualAgeMillis = int64(tc.visualAge / time.Millisecond)
 			hub.lastFrameVisualAgeKnown = true
-			hub.lastKeyFrameVisualAgeKnown = true
 			hub.mu.Unlock()
 
 			status := hub.streamStatus(now, phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
@@ -841,6 +831,56 @@ func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 				t.Fatalf("stale frame must not be live, got %#v", status)
 			}
 		})
+	}
+}
+
+func TestDirectStreamRequiresStrictAllIntraAndRejectsDelta(t *testing.T) {
+	allIntra := newDirectStreamHub()
+	allIntra.addVideoClient()
+	if !allIntra.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+		t.Fatal("valid all-intra config was rejected")
+	}
+	if !allIntra.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
+		t.Fatal("all-intra keyframe should be forwarded")
+	}
+	if allIntra.recordFrame(testTSF2FrameWithTimestamp(7, 2, false, 10000)) {
+		t.Fatal("advertised all-intra delta must be rejected by the relay")
+	}
+	status := allIntra.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+	if status["frameDependencyMode"] != frameDependencyModeAllIntra || status["fps"] != 1 || status["sourceFps"] != 1 || status["keyframeIntervalFrames"] != 1 || status["allIntraConfigAdvertised"] != true || status["allIntraConfigValid"] != true {
+		t.Fatalf("all-intra status contract is incomplete: %#v", status)
+	}
+	if status["framesForwarded"] != uint64(1) || status["deltaFramesForwarded"] != uint64(0) || status["droppedUnexpectedDeltaFrames"] != uint64(1) {
+		t.Fatalf("unexpected all-intra delta accounting: %#v", status)
+	}
+	dropReasons, ok := status["dropReasons"].(map[string]uint64)
+	if !ok || dropReasons["unexpected_delta"] != uint64(1) {
+		t.Fatalf("unexpected-delta reason is missing: %#v", status)
+	}
+
+	missingMode := newDirectStreamHub()
+	if missingMode.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+		t.Fatal("config without the explicit all-intra mode was accepted")
+	}
+	if missingMode.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
+		t.Fatal("frame escaped a missing dependency contract")
+	}
+	missingStatus := missingMode.snapshot(time.Now(), phone.Health{})
+	if missingStatus["frameDependencyMode"] != "" || missingStatus["allIntraConfigValid"] != false || missingStatus["deltaFramesForwarded"] != uint64(0) {
+		t.Fatalf("missing dependency mode did not fail closed: %#v", missingStatus)
+	}
+
+	unknown := newDirectStreamHub()
+	unknown.addVideoClient()
+	if unknown.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"frameDependencyMode":"gop","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+		t.Fatal("unknown nonempty dependency mode must be rejected instead of receiving legacy compatibility")
+	}
+	if unknown.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
+		t.Fatal("frames from an unknown dependency contract must fail closed")
+	}
+	unknownStatus := unknown.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+	if unknownStatus["frameDependencyMode"] != "gop" || unknownStatus["allIntraConfigValid"] != false || unknownStatus["streamVerdict"] != "invalid_source_config" || unknownStatus["allIntraConfigMismatchCount"] != uint64(1) || unknownStatus["droppedAllIntraConfigFrames"] != uint64(1) {
+		t.Fatalf("unknown dependency mode was not visibly rejected: %#v", unknownStatus)
 	}
 }
 
@@ -867,7 +907,7 @@ func TestDirectStreamStatusServerTimeKeepsSubsecondPrecision(t *testing.T) {
 func TestDirectStreamDoesNotForwardFramesWithoutPhoneClockCalibration(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
 
 	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 		t.Fatal("frame without current phone clock calibration must not be forwarded as live media")
@@ -882,10 +922,10 @@ func TestDirectStreamDoesNotForwardFramesWithoutPhoneClockCalibration(t *testing
 func TestDirectStreamDropsPhoneFramesPastForwardAgeBudget(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 
-	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 9000)) {
-		t.Fatal("bridge must drop phone frames older than the 750ms forwarding budget")
+	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 8700)) {
+		t.Fatal("bridge must drop phone frames older than the 1250ms forwarding budget")
 	}
 
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
@@ -904,7 +944,7 @@ func TestDirectStreamDropsPhoneFramesPastForwardAgeBudget(t *testing.T) {
 func TestDirectStreamTracksUncalibratedFrameDrops(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7}`))
 
 	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 		t.Fatal("uncalibrated phone frame must not be forwarded")
@@ -923,7 +963,7 @@ func TestDirectStreamTracksUncalibratedFrameDrops(t *testing.T) {
 func TestDirectStreamTracksTimestampFrameDrops(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 
 	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 0)) {
 		t.Fatal("frame without a phone capture timestamp must not be forwarded")
@@ -942,7 +982,7 @@ func TestDirectStreamTracksTimestampFrameDrops(t *testing.T) {
 func TestDirectStreamRefreshesPhoneClockCalibrationFromAcceptedFrames(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 		t.Fatal("initial calibrated frame should be forwarded")
 	}
@@ -950,7 +990,7 @@ func TestDirectStreamRefreshesPhoneClockCalibrationFromAcceptedFrames(t *testing
 	hub.lastPhoneClockCalibrationAt = time.Now().Add(-(phoneClockCalibrationMaxAge + time.Second))
 	hub.mu.Unlock()
 
-	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 2, false, 10001)) {
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 2, true, 10001)) {
 		t.Fatal("continuous accepted frames should refresh phone clock calibration instead of going uncalibrated")
 	}
 
@@ -963,7 +1003,7 @@ func TestDirectStreamRefreshesPhoneClockCalibrationFromAcceptedFrames(t *testing
 func TestDirectStreamRecalibratesFromTimestampedFrameAfterGap(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 	hub.mu.Lock()
 	hub.lastPhoneClockCalibrationAt = time.Now().Add(-(phoneClockCalibrationMaxAge + time.Second))
 	hub.lastFrameAt = time.Time{}
@@ -986,7 +1026,7 @@ func TestDirectStreamRecalibratesFromTimestampedFrameAfterGap(t *testing.T) {
 func TestDirectStreamAdjustsBoundedFutureClockSkewInsteadOfDroppingFreshFrames(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 
 	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 11000)) {
 		t.Fatal("bounded future skew should adjust clock calibration and forward the fresh frame")
@@ -1004,7 +1044,7 @@ func TestDirectStreamAdjustsBoundedFutureClockSkewInsteadOfDroppingFreshFrames(t
 func TestDirectStreamRewritesFrameTimestampToEstimatedCaptureWallClock(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 
 	forwarded, ok := hub.recordFrameForBroadcast(testTSF2FrameWithTimestamp(7, 1, true, 10000))
 	if !ok {
@@ -1020,78 +1060,22 @@ func TestDirectStreamRewritesFrameTimestampToEstimatedCaptureWallClock(t *testin
 	}
 }
 
-func TestDirectStreamTracksLatestFrameSequenceAndForwardsDeltas(t *testing.T) {
+func TestDirectStreamTracksLatestIndependentFrameAcrossSequenceGap(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"hardware-h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":41000}`))
+	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"hardware-h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":41000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))
 	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 41, true, 41000)) {
-		t.Fatal("keyframe should be accepted")
+		t.Fatal("first independent frame should be accepted")
 	}
-	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 42, false, 41001)) {
-		t.Fatal("delta frame should be forwarded")
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 99, true, 41001)) {
+		t.Fatal("independent source sequence gap should be accepted")
 	}
 
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
-	if snapshot["lastFrameSequence"] != uint64(42) ||
-		snapshot["lastKeyFrameSequence"] != uint64(41) ||
-		snapshot["deltaFramesForwarded"] != uint64(1) ||
+	if snapshot["lastFrameSequence"] != uint64(99) ||
+		snapshot["lastKeyFrameSequence"] != uint64(99) ||
+		snapshot["deltaFramesForwarded"] != uint64(0) ||
 		snapshot["droppedStaleFrames"] != uint64(0) {
 		t.Fatalf("latest frame sequences missing: %#v", snapshot)
-	}
-}
-
-func TestLatestVideoPendingFramePrefersQueuedKeyFrameOverNewerDelta(t *testing.T) {
-	key := testTSF2KeyFrameWithEpoch(7, 41, true)
-	delta := testTSF2KeyFrameWithEpoch(7, 42, false)
-
-	frame, keyFrame := chooseLatestPendingVideoFrame(key, true, delta, false)
-	if string(frame) != string(key) || !keyFrame {
-		t.Fatalf("queued keyframe should not be replaced by a delta frame")
-	}
-
-	frame, keyFrame = chooseLatestPendingVideoFrame(delta, false, key, true)
-	if string(frame) != string(key) || !keyFrame {
-		t.Fatalf("new keyframe should replace a queued delta frame")
-	}
-}
-
-func TestSlowViewerDropsDeltaBacklogUntilNextKeyFrame(t *testing.T) {
-	now := time.Now()
-	viewer := &client{
-		videoWriteActive:   true,
-		videoReadyForDelta: true,
-		videoReadyEpoch:    7,
-	}
-	firstDelta := testTSF2FrameWithTimestamp(7, 42, false, 41042)
-	secondDelta := testTSF2FrameWithTimestamp(7, 43, false, 41043)
-	nextKey := testTSF2FrameWithTimestamp(7, 44, true, 41044)
-
-	viewer.videoMu.Lock()
-	viewer.queuePendingVideoFrameLocked(firstDelta, false, now)
-	if len(viewer.videoPendingFrame) == 0 || viewer.videoPendingKeyFrame {
-		viewer.videoMu.Unlock()
-		t.Fatal("first delta should be the only pending frame while a slow viewer write is active")
-	}
-	viewer.queuePendingVideoFrameLocked(secondDelta, false, now.Add(10*time.Millisecond))
-	if len(viewer.videoPendingFrame) != 0 || viewer.videoReadyForDelta || viewer.videoReadyEpoch != 0 {
-		viewer.videoMu.Unlock()
-		t.Fatalf("second queued delta must clear backlog and require a fresh keyframe: pending=%d ready=%v epoch=%d", len(viewer.videoPendingFrame), viewer.videoReadyForDelta, viewer.videoReadyEpoch)
-	}
-	viewer.noteVideoKeyFrameLocked(parseTSF2(nextKey))
-	viewer.queuePendingVideoFrameLocked(nextKey, true, now.Add(20*time.Millisecond))
-	if len(viewer.videoPendingFrame) == 0 || !viewer.videoPendingKeyFrame || !viewer.videoReadyForDelta || viewer.videoReadyEpoch != 7 {
-		viewer.videoMu.Unlock()
-		t.Fatalf("next keyframe should restart the slow viewer from a decodable point: pending=%d key=%v ready=%v epoch=%d", len(viewer.videoPendingFrame), viewer.videoPendingKeyFrame, viewer.videoReadyForDelta, viewer.videoReadyEpoch)
-	}
-	viewer.videoMu.Unlock()
-}
-
-func TestVideoPendingFrameAgeBudgetIsHardCapped(t *testing.T) {
-	now := time.Now()
-	if videoPendingFrameStale(now.Add(-249*time.Millisecond), now) {
-		t.Fatal("pending frame just under the 250ms hard cap should still be usable")
-	}
-	if !videoPendingFrameStale(now.Add(-251*time.Millisecond), now) {
-		t.Fatal("pending frame over the 250ms hard cap must be dropped")
 	}
 }
 

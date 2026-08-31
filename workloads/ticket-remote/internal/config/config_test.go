@@ -70,34 +70,6 @@ func TestConfigHasNoPublicMediaPortConfig(t *testing.T) {
 	}
 }
 
-func TestExperimentalHDRTransformerIsPrivateOptionalConfig(t *testing.T) {
-	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
-	t.Setenv("TICKET_REMOTE_HDR_TRANSFORMER_URL", "http://ticket_hdr_transformer:9352/")
-	t.Setenv("TICKET_REMOTE_HDR_TRANSFORM_TIMEOUT", "1200ms")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.ExperimentalMedia.HDRTransformerURL != "http://ticket_hdr_transformer:9352" {
-		t.Fatalf("HDR transformer URL = %q", cfg.ExperimentalMedia.HDRTransformerURL)
-	}
-	if cfg.ExperimentalMedia.TransformTimeout != 1200*time.Millisecond {
-		t.Fatalf("HDR transformer timeout = %s", cfg.ExperimentalMedia.TransformTimeout)
-	}
-	if strings.Contains(cfg.ExperimentalMedia.HDRTransformerURL, "ticket.jolkins.id.lv") {
-		t.Fatal("HDR transformer must not reuse the public Ticket origin")
-	}
-}
-
-func TestExperimentalHDRTransformerTimeoutIsBounded(t *testing.T) {
-	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
-	t.Setenv("TICKET_REMOTE_HDR_TRANSFORM_TIMEOUT", "30s")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TICKET_REMOTE_HDR_TRANSFORM_TIMEOUT") {
-		t.Fatalf("expected bounded HDR transform timeout error, got %v", err)
-	}
-}
-
 func TestLoadUsesDirectPhoneBridgeAndIgnoresRetiredBrokerSetting(t *testing.T) {
 	t.Setenv("TICKET_REMOTE_AUTH_MODE", "dev")
 	t.Setenv("TICKET_REMOTE_PHONE_BACKENDS", "pixel|Pixel|http://ticket_phone_bridge:9388")

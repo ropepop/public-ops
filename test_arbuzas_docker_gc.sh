@@ -378,4 +378,82 @@ if ! grep -Fq "state reset because" "${tmpdir}/run3.err"; then
   exit 1
 fi
 
+# Preview and apply must select the same candidates. Preview may not mutate
+# releases, images, tracking state, or build cache, and unknown historical
+# names share one bounded legacy family.
+rm -rf "${RELEASES_ROOT:?}"/*
+: > "${FAKE_DOCKER_LOG}"
+mkdir -p "${RELEASES_ROOT}/${CURRENT_RELEASE_ID}"
+ln -sfn "${RELEASES_ROOT}/${CURRENT_RELEASE_ID}" "${CURRENT_LINK}"
+cat > "${RELEASES_ROOT}/${CURRENT_RELEASE_ID}/release.env" <<EOF
+ARBUZAS_RELEASE_ID=${CURRENT_RELEASE_ID}
+EOF
+set_release_mtime 2000 \
+  "${RELEASES_ROOT}/${CURRENT_RELEASE_ID}" \
+  "${RELEASES_ROOT}/${CURRENT_RELEASE_ID}/release.env"
+for index in $(seq 1 12); do
+  release_id="$(printf 'unclassified-release-%02d' "${index}")"
+  mkdir -p "${RELEASES_ROOT}/${release_id}"
+  set_release_mtime "$(( 1000 + index ))" "${RELEASES_ROOT}/${release_id}"
+done
+cat > "${IMAGES_FILE}" <<EOF
+sha256:current	arbuzas/train-bot	${CURRENT_RELEASE_ID}
+sha256:rollback	arbuzas/train-bot	unclassified-release-12
+sha256:preview-delete	external/preview	latest
+EOF
+: > "${CONTAINERS_FILE}"
+PREVIEW_STATE_FILE="${tmpdir}/preview/state.json"
+mkdir -p "$(dirname "${PREVIEW_STATE_FILE}")"
+cat > "${PREVIEW_STATE_FILE}" <<'EOF'
+{
+  "version": 1,
+  "updated_at": 1,
+  "images": {
+    "sha256:preview-delete": {"first_seen_unused_at": 1}
+  }
+}
+EOF
+preview_state_before="$(shasum -a 256 "${PREVIEW_STATE_FILE}")"
+
+python3 "${SCRIPT}" \
+  --current-link "${CURRENT_LINK}" \
+  --releases-root "${RELEASES_ROOT}" \
+  --state-file "${PREVIEW_STATE_FILE}" \
+  --grace-seconds 604800 \
+  --build-cache-until 168h \
+  --release-keep-per-family 2 \
+  --list-limit 2 \
+  --now 700000 \
+  --dry-run > "${tmpdir}/preview.out"
+
+[[ "$(shasum -a 256 "${PREVIEW_STATE_FILE}")" == "${preview_state_before}" ]]
+assert_has_image "sha256:preview-delete"
+assert_has_release "unclassified-release-01"
+assert_log_not_contains "IMAGE_RM"
+assert_log_not_contains "BUILDER_PRUNE"
+grep -Fq 'mode=preview' "${tmpdir}/preview.out"
+grep -Fq 'selected_image_count=1' "${tmpdir}/preview.out"
+grep -Fq 'selected_release_count=10' "${tmpdir}/preview.out"
+grep -Fq 'selected_images=sha256:preview-delete' "${tmpdir}/preview.out"
+grep -Fq 'selected_releases=unclassified-release-01' "${tmpdir}/preview.out"
+grep -Fq 'selected_releases_omitted=8' "${tmpdir}/preview.out"
+
+python3 "${SCRIPT}" \
+  --current-link "${CURRENT_LINK}" \
+  --releases-root "${RELEASES_ROOT}" \
+  --state-file "${PREVIEW_STATE_FILE}" \
+  --grace-seconds 604800 \
+  --build-cache-until 168h \
+  --release-keep-per-family 2 \
+  --now 700000 > "${tmpdir}/apply.out"
+
+assert_missing_image "sha256:preview-delete"
+assert_missing_release "unclassified-release-01"
+assert_has_release "unclassified-release-11"
+assert_has_release "unclassified-release-12"
+grep -Fq 'mode=apply' "${tmpdir}/apply.out"
+grep -Fq 'deleted=sha256:preview-delete' "${tmpdir}/apply.out"
+grep -Fq 'deleted_releases=unclassified-release-01' "${tmpdir}/apply.out"
+assert_log_contains "BUILDER_PRUNE until=168h"
+
 echo "PASS: Arbuzas Docker GC preserves protected images, prunes old release families, and applies the 7-day grace policy"

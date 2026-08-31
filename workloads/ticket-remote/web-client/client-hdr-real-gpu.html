@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ticket Browser HDR real-GPU test</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 24px; font: 15px/1.45 system-ui, sans-serif; background: #10151d; color: #eef3fa; }
+    canvas { display: block; width: min(720px, 100%); height: 96px; margin: 12px 0; background: #000; dynamic-range-limit: no-limit; }
+    pre { padding: 14px; overflow: auto; border-radius: 8px; background: #080b10; }
+    [data-result="passed"] { color: #77dd9b; }
+    [data-result="failed"] { color: #ff8d8d; }
+    [data-result="unsupported"] { color: #ffd479; }
+  </style>
+</head>
+<body>
+  <h1>Ticket Browser HDR real-GPU test</h1>
+  <p>This developer test sends realistic Ticket red, orange, green, blue, gray, near-black, and black alongside RGB primaries, CMY secondaries, mixed color, and white through the production shader at every supported boost, then reads the real <code>rgba16float</code> WebGPU output back.</p>
+  <div id="surfaces"></div>
+  <pre id="result" aria-live="polite">Running…</pre>
+  <script type="module" src="./client-hdr-real-gpu.mjs"></script>
+</body>
+</html>

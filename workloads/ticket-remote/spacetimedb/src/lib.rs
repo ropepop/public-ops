@@ -849,6 +849,46 @@ pub struct TicketremoteMemberHDRPreference {
     pub updatedAt: String,
 }
 
+/// Compatibility tombstone for the retired HDR engine selector. Browser HDR
+/// is now the only runtime engine. Existing values are normalized to v2 during
+/// an authenticated owner refresh; email remains private.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_engine_preference,
+    index(accessor = ticketEmail, btree(columns = [ticketId, email]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDREnginePreference {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub email: String,
+    pub engine: String,
+    pub createdAt: String,
+    pub updatedAt: String,
+}
+
+/// Private durable HDR display-boost choice for one authenticated Ticket
+/// account. Missing or unrecognized values safely select the 4x presentation
+/// target. The email and retained choice never appear in a public table.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_boost_preference,
+    index(accessor = ticketEmail, btree(columns = [ticketId, email]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDRBoostPreference {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub email: String,
+    pub selectedDisplayBoost: u32,
+    pub createdAt: String,
+    pub updatedAt: String,
+}
+
 /// Private durable admission audit shared by registration and control-code
 /// policy. Consequential admin bypasses are retained with counted=false so
 /// they are auditable without consuming a later enforced quota.
@@ -933,6 +973,48 @@ pub struct TicketremoteMemberHDRState {
     #[index(btree)]
     pub accountScopeId: String,
     pub enabled: bool,
+    pub updatedAt: String,
+    pub serverAt: String,
+}
+
+/// Sanitized browser projection of the active owner's HDR processing choice.
+/// Demoted and inactive accounts have no row; their private preference is
+/// retained for possible later owner restoration.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_engine_state,
+    public,
+    index(accessor = ticketAccount, btree(columns = [ticketId, accountScopeId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDREngineState {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub accountScopeId: String,
+    pub engine: String,
+    pub updatedAt: String,
+    pub serverAt: String,
+}
+
+/// Sanitized browser projection of an active member's HDR display-boost
+/// choice. Inactive accounts have no row; their private preference is retained
+/// for possible later membership restoration.
+#[spacetimedb::table(
+    accessor = ticketremote_member_hdr_boost_state,
+    public,
+    index(accessor = ticketAccount, btree(columns = [ticketId, accountScopeId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberHDRBoostState {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub accountScopeId: String,
+    pub selectedDisplayBoost: u32,
     pub updatedAt: String,
     pub serverAt: String,
 }
@@ -2611,6 +2693,150 @@ fn refresh_member_hdr_state(ctx: &ReducerContext, ticket_id: &str, email: &str, 
         ticketId: ticket_id,
         accountScopeId: account_scope_id(&email),
         enabled,
+        updatedAt: now.into(),
+        serverAt: now.into(),
+    };
+    if table.id().find(&row.id).is_some() {
+        table.id().update(row);
+    } else {
+        table.insert(row);
+    }
+}
+
+fn member_hdr_engine_state_id(ticket_id: &str, email: &str) -> String {
+    format!(
+        "{}:{}:member-hdr-engine",
+        clean_ticket_id(ticket_id),
+        account_scope_id(email)
+    )
+}
+
+fn member_hdr_engine_preference(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+) -> Option<TicketremoteMemberHDREnginePreference> {
+    ctx.db
+        .ticketremote_member_hdr_engine_preference()
+        .id()
+        .find(member_id(ticket_id, email))
+}
+
+fn migrate_legacy_member_hdr_engine_preference(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+    now: &str,
+) {
+    let id = member_id(ticket_id, email);
+    let table = ctx.db.ticketremote_member_hdr_engine_preference();
+    if let Some(existing) = table.id().find(&id) {
+        if existing.engine.trim() == "client_webgpu_v2" {
+            return;
+        }
+        table.id().update(TicketremoteMemberHDREnginePreference {
+            engine: "client_webgpu_v2".into(),
+            updatedAt: now.into(),
+            ..existing
+        });
+    } else {
+        table.insert(TicketremoteMemberHDREnginePreference {
+            id,
+            ticketId: clean_ticket_id(ticket_id),
+            email: clean_email(email),
+            engine: "client_webgpu_v2".into(),
+            createdAt: now.into(),
+            updatedAt: now.into(),
+        });
+    }
+}
+
+fn refresh_member_hdr_engine_state(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let email = clean_email(email);
+    let id = member_hdr_engine_state_id(&ticket_id, &email);
+    let table = ctx.db.ticketremote_member_hdr_engine_state();
+    if !is_owner(ctx, &ticket_id, &email) {
+        table.id().delete(id);
+        return;
+    }
+    let engine = member_hdr_engine_preference(ctx, &ticket_id, &email)
+        .map(|row| clean_hdr_engine(&row.engine))
+        .unwrap_or_else(|| "client_webgpu_v2".into());
+    let row = TicketremoteMemberHDREngineState {
+        id,
+        ticketId: ticket_id,
+        accountScopeId: account_scope_id(&email),
+        engine,
+        updatedAt: now.into(),
+        serverAt: now.into(),
+    };
+    if table.id().find(&row.id).is_some() {
+        table.id().update(row);
+    } else {
+        table.insert(row);
+    }
+}
+
+fn member_hdr_boost_state_id(ticket_id: &str, email: &str) -> String {
+    format!(
+        "{}:{}:member-hdr-boost",
+        clean_ticket_id(ticket_id),
+        account_scope_id(email)
+    )
+}
+
+fn member_hdr_boost_preference(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+) -> Option<TicketremoteMemberHDRBoostPreference> {
+    ctx.db
+        .ticketremote_member_hdr_boost_preference()
+        .id()
+        .find(member_id(ticket_id, email))
+}
+
+fn migrate_legacy_member_hdr_boost_preference(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+    now: &str,
+) {
+    let id = member_id(ticket_id, email);
+    let table = ctx.db.ticketremote_member_hdr_boost_preference();
+    let Some(existing) = table.id().find(&id) else {
+        return;
+    };
+    let selected_display_boost = clean_hdr_display_boost(existing.selectedDisplayBoost);
+    if existing.selectedDisplayBoost == selected_display_boost {
+        return;
+    }
+    table.id().update(TicketremoteMemberHDRBoostPreference {
+        selectedDisplayBoost: selected_display_boost,
+        updatedAt: now.into(),
+        ..existing
+    });
+}
+
+fn refresh_member_hdr_boost_state(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let email = clean_email(email);
+    let id = member_hdr_boost_state_id(&ticket_id, &email);
+    let table = ctx.db.ticketremote_member_hdr_boost_state();
+    if !is_member(ctx, &ticket_id, &email) {
+        table.id().delete(id);
+        return;
+    }
+    migrate_legacy_member_hdr_boost_preference(ctx, &ticket_id, &email, now);
+    let selected_display_boost = member_hdr_boost_preference(ctx, &ticket_id, &email)
+        .map(|row| clean_hdr_display_boost(row.selectedDisplayBoost))
+        .unwrap_or(4);
+    let row = TicketremoteMemberHDRBoostState {
+        id,
+        ticketId: ticket_id,
+        accountScopeId: account_scope_id(&email),
+        selectedDisplayBoost: selected_display_boost,
         updatedAt: now.into(),
         serverAt: now.into(),
     };
@@ -4705,6 +4931,8 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
     let now = now(ctx);
     refresh_member_limit_state(ctx, DEFAULT_TICKET_ID, &email, &now);
     refresh_member_hdr_state(ctx, DEFAULT_TICKET_ID, &email, &now);
+    refresh_member_hdr_engine_state(ctx, DEFAULT_TICKET_ID, &email, &now);
+    refresh_member_hdr_boost_state(ctx, DEFAULT_TICKET_ID, &email, &now);
     Ok(())
 }
 
@@ -4795,6 +5023,98 @@ pub fn ticketremote_member_refresh_hdr_state(
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
     refresh_member_hdr_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_set_hdr_engine(
+    ctx: &ReducerContext,
+    ticketId: String,
+    engine: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    require_owner(ctx, &ticket.id, &email)?;
+    let engine = clean_hdr_engine(&engine);
+    let id = member_id(&ticket.id, &email);
+    let table = ctx.db.ticketremote_member_hdr_engine_preference();
+    if let Some(existing) = table.id().find(&id) {
+        table.id().update(TicketremoteMemberHDREnginePreference {
+            engine,
+            updatedAt: now.clone(),
+            ..existing
+        });
+    } else {
+        table.insert(TicketremoteMemberHDREnginePreference {
+            id,
+            ticketId: ticket.id.clone(),
+            email: email.clone(),
+            engine,
+            createdAt: now.clone(),
+            updatedAt: now.clone(),
+        });
+    }
+    refresh_member_hdr_engine_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_refresh_hdr_engine_state(
+    ctx: &ReducerContext,
+    ticketId: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    if is_owner(ctx, &ticket.id, &email) {
+        migrate_legacy_member_hdr_engine_preference(ctx, &ticket.id, &email, &now);
+    }
+    refresh_member_hdr_engine_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_set_hdr_display_boost(
+    ctx: &ReducerContext,
+    ticketId: String,
+    selectedDisplayBoost: u32,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let selected_display_boost = clean_hdr_display_boost(selectedDisplayBoost);
+    let id = member_id(&ticket.id, &email);
+    let table = ctx.db.ticketremote_member_hdr_boost_preference();
+    if let Some(existing) = table.id().find(&id) {
+        table.id().update(TicketremoteMemberHDRBoostPreference {
+            selectedDisplayBoost: selected_display_boost,
+            updatedAt: now.clone(),
+            ..existing
+        });
+    } else {
+        table.insert(TicketremoteMemberHDRBoostPreference {
+            id,
+            ticketId: ticket.id.clone(),
+            email: email.clone(),
+            selectedDisplayBoost: selected_display_boost,
+            createdAt: now.clone(),
+            updatedAt: now.clone(),
+        });
+    }
+    refresh_member_hdr_boost_state(ctx, &ticket.id, &email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_refresh_hdr_boost_state(
+    ctx: &ReducerContext,
+    ticketId: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    refresh_member_hdr_boost_state(ctx, &ticket.id, &email, &now);
     Ok(())
 }
 
@@ -5425,6 +5745,8 @@ pub fn ticketremote_service_bootstrap(
     if !email.is_empty() && is_member(ctx, &ticket.id, &email) {
         refresh_member_limit_state(ctx, &ticket.id, &email, &now);
         refresh_member_hdr_state(ctx, &ticket.id, &email, &now);
+        refresh_member_hdr_engine_state(ctx, &ticket.id, &email, &now);
+        refresh_member_hdr_boost_state(ctx, &ticket.id, &email, &now);
     }
     if !phoneBackendId.trim().is_empty() {
         let backend_id = clean_backend_id(&phoneBackendId);
@@ -7087,6 +7409,10 @@ expression_functions! {
         ctx.db.ticketremote_ticket_member().id().find(member_id(ticket, email))
             .map(|row| row.active && matches!(row.role.as_str(), "owner" | "admin"))
             .unwrap_or(false);
+    fn is_owner(ctx: &ReducerContext, ticket: &str, email: &str) -> bool =
+        ctx.db.ticketremote_ticket_member().id().find(member_id(ticket, email))
+            .map(|row| row.active && row.role == "owner")
+            .unwrap_or(false);
     fn stream_desired_core_equal(row: &TicketremoteStreamDesiredState,
         active: bool, viewers: u32) -> bool = row.desiredActive == active && row.viewerCount == viewers;
     fn control_code_cleanup_preserves_terminal_failure(existing: &TicketremoteControlCodeRequest,
@@ -7115,6 +7441,11 @@ expression_functions! {
         .and_then(|raw| raw.as_str()).map(|raw| raw.trim().to_ascii_lowercase())
         .unwrap_or_default();
     fn clean_role(value: &str) -> String = allowlisted(value, &["owner", "admin"], "member");
+    fn clean_hdr_engine(_value: &str) -> String = "client_webgpu_v2".into();
+    fn clean_hdr_display_boost(value: u32) -> u32 = match value {
+        2 | 3 | 4 | 5 | 6 => value,
+        _ => 4,
+    };
     fn non_empty(value: &str, fallback: &str) -> String = {
         let value = value.trim();
         if value.is_empty() { fallback.into() } else { value.into() }
@@ -7194,6 +7525,8 @@ expression_functions! {
     };
     fn require_admin(ctx: &ReducerContext, ticket: &str, email: &str) -> Result<(), String> =
         is_admin(ctx, ticket, email).then_some(()).ok_or_else(|| "forbidden".into());
+    fn require_owner(ctx: &ReducerContext, ticket: &str, email: &str) -> Result<(), String> =
+        is_owner(ctx, ticket, email).then_some(()).ok_or_else(|| "owner role required".into());
     fn jwt_audience_includes(payload: &serde_json::Value, expected: &str) -> bool = {
         let expected = expected.trim();
         if expected.is_empty() { return false; }
@@ -7587,6 +7920,8 @@ fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &
     table.insert(row);
     refresh_member_limit_state(ctx, ticket_id, &email, now);
     refresh_member_hdr_state(ctx, ticket_id, &email, now);
+    refresh_member_hdr_engine_state(ctx, ticket_id, &email, now);
+    refresh_member_hdr_boost_state(ctx, ticket_id, &email, now);
 }
 
 fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
@@ -7607,6 +7942,14 @@ fn deactivate_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, now
         .ticketremote_member_hdr_state()
         .id()
         .delete(member_hdr_state_id(ticket_id, email));
+    ctx.db
+        .ticketremote_member_hdr_engine_state()
+        .id()
+        .delete(member_hdr_engine_state_id(ticket_id, email));
+    ctx.db
+        .ticketremote_member_hdr_boost_state()
+        .id()
+        .delete(member_hdr_boost_state_id(ticket_id, email));
     delete_policy_boundary_timers(ctx, ticket_id, "member", &clean_email(email));
 }
 
@@ -12397,6 +12740,272 @@ mod tests {
         assert!(!deactivate.contains("ticketremote_member_hdr_preference()"));
         assert!(production.contains("refresh_member_hdr_state(ctx, DEFAULT_TICKET_ID"));
         assert!(production.contains("ticketremote_member_refresh_hdr_state"));
+    }
+
+    #[test]
+    fn member_hdr_engine_is_owner_only_sanitized_and_normalizes_to_browser_v2() {
+        assert_eq!(clean_hdr_engine("server_gainmap_v1"), "client_webgpu_v2");
+        assert_eq!(clean_hdr_engine("client_webgpu_v1"), "client_webgpu_v2");
+        assert_eq!(clean_hdr_engine("client_webgpu_v2"), "client_webgpu_v2");
+        assert_eq!(clean_hdr_engine("unexpected"), "client_webgpu_v2");
+
+        let source = include_str!("lib.rs");
+        let private_declaration = source
+            .split("accessor = ticketremote_member_hdr_engine_preference")
+            .nth(1)
+            .and_then(|body| body.split("#[derive(Clone)]").next())
+            .expect("private HDR engine declaration must remain inspectable");
+        assert!(!private_declaration.contains("public,"));
+
+        let public_declaration = source
+            .split("accessor = ticketremote_member_hdr_engine_state")
+            .nth(1)
+            .and_then(|body| body.split("#[derive(Clone)]").next())
+            .expect("public HDR engine declaration must remain inspectable");
+        assert!(public_declaration.contains("public,"));
+        let public_schema = source
+            .split("pub struct TicketremoteMemberHDREngineState")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub struct TicketremoteTicketSwitchAnchor")
+                    .next()
+            })
+            .expect("public HDR engine state must remain inspectable");
+        assert!(!public_schema.contains("pub email:"));
+        assert!(public_schema.contains("pub accountScopeId: String"));
+        assert!(public_schema.contains("pub engine: String"));
+
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let refresh = production
+            .split("fn refresh_member_hdr_engine_state(")
+            .nth(1)
+            .and_then(|body| body.split("fn member_limit_effective_config(").next())
+            .expect("HDR engine refresh must remain inspectable");
+        assert!(refresh.contains("if !is_owner"));
+        assert!(refresh.contains("client_webgpu_v2"));
+        assert!(refresh.contains("clean_hdr_engine(&row.engine)"));
+        assert!(refresh.contains("ticketremote_member_hdr_engine_state()"));
+    }
+
+    #[test]
+    fn member_hdr_engine_reducer_derives_account_and_lifecycle_retains_private_choice() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let reducer = production
+            .split("pub fn ticketremote_owner_set_hdr_engine(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_member_refresh_hdr_engine_state(")
+                    .next()
+            })
+            .expect("owner HDR engine reducer must remain inspectable");
+        assert!(reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(reducer.contains("require_owner(ctx, &ticket.id, &email)?"));
+        assert!(!reducer.contains("email: String"));
+
+        let refresh_reducer = production
+            .split("pub fn ticketremote_member_refresh_hdr_engine_state(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_scheduled_policy_boundary(")
+                    .next()
+            })
+            .expect("HDR engine refresh reducer must remain inspectable");
+        assert!(refresh_reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(refresh_reducer.contains("if is_owner(ctx, &ticket.id, &email)"));
+        assert!(refresh_reducer.contains("migrate_legacy_member_hdr_engine_preference"));
+
+        let migration = production
+            .split("fn migrate_legacy_member_hdr_engine_preference(")
+            .nth(1)
+            .and_then(|body| body.split("fn refresh_member_hdr_engine_state(").next())
+            .expect("legacy HDR engine migration must remain inspectable");
+        assert!(migration.contains("existing.engine.trim() == \"client_webgpu_v2\""));
+        assert!(migration.contains("engine: \"client_webgpu_v2\".into()"));
+        assert!(migration.contains("ticketremote_member_hdr_engine_preference()"));
+        assert!(migration.contains("table.insert(TicketremoteMemberHDREnginePreference"));
+        assert!(migration.contains("createdAt: now.into()"));
+
+        let membership = production
+            .split("fn upsert_member_row(")
+            .nth(1)
+            .and_then(|body| body.split("fn schedule_latest_ticket_reselect(").next())
+            .expect("member lifecycle must remain inspectable");
+        assert!(membership.contains("refresh_member_hdr_engine_state"));
+        assert!(membership.contains("delete(member_hdr_engine_state_id"));
+        let deactivate = membership
+            .split("fn deactivate_member_row(")
+            .nth(1)
+            .expect("member deactivation must remain inspectable");
+        assert!(!deactivate.contains("ticketremote_member_hdr_engine_preference()"));
+        assert!(production.contains("refresh_member_hdr_engine_state(ctx, DEFAULT_TICKET_ID"));
+    }
+
+    #[test]
+    fn member_hdr_boost_is_member_available_sanitized_and_defaults_to_four() {
+        for boost in [2, 3, 4, 5, 6] {
+            assert_eq!(clean_hdr_display_boost(boost), boost);
+        }
+        for boost in [0, 1, 7, 8, 10, 12, 14, 16, 17, u32::MAX] {
+            assert_eq!(clean_hdr_display_boost(boost), 4);
+        }
+
+        let source = include_str!("lib.rs");
+        let private_declaration = source
+            .split("accessor = ticketremote_member_hdr_boost_preference")
+            .nth(1)
+            .and_then(|body| body.split("#[derive(Clone)]").next())
+            .expect("private HDR boost declaration must remain inspectable");
+        assert!(!private_declaration.contains("public,"));
+        let private_schema = source
+            .split("pub struct TicketremoteMemberHDRBoostPreference")
+            .nth(1)
+            .and_then(|body| body.split("pub struct TicketremoteMemberLimitEvent").next())
+            .expect("private HDR boost schema must remain inspectable");
+        assert!(private_schema.contains("pub email: String"));
+        assert!(private_schema.contains("pub selectedDisplayBoost: u32"));
+
+        let public_declaration = source
+            .split("accessor = ticketremote_member_hdr_boost_state")
+            .nth(1)
+            .and_then(|body| body.split("#[derive(Clone)]").next())
+            .expect("public HDR boost declaration must remain inspectable");
+        assert!(public_declaration.contains("public,"));
+        let public_schema = source
+            .split("pub struct TicketremoteMemberHDRBoostState")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub struct TicketremoteTicketSwitchAnchor")
+                    .next()
+            })
+            .expect("public HDR boost state must remain inspectable");
+        assert!(!public_schema.contains("pub email:"));
+        assert!(public_schema.contains("pub accountScopeId: String"));
+        assert!(public_schema.contains("pub selectedDisplayBoost: u32"));
+
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let refresh = production
+            .split("fn refresh_member_hdr_boost_state(")
+            .nth(1)
+            .and_then(|body| body.split("fn member_limit_effective_config(").next())
+            .expect("HDR boost refresh must remain inspectable");
+        assert!(refresh.contains("if !is_member"));
+        assert!(refresh.contains("migrate_legacy_member_hdr_boost_preference"));
+        assert!(refresh.contains("clean_hdr_display_boost(row.selectedDisplayBoost)"));
+        assert!(refresh.contains(".unwrap_or(4)"));
+        assert!(refresh.contains("ticketremote_member_hdr_boost_state()"));
+    }
+
+    #[test]
+    fn member_hdr_boost_reducer_allows_active_member_admin_and_owner_accounts() {
+        for role in ["member", "admin", "owner"] {
+            assert_eq!(clean_role(role), role);
+        }
+
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let reducer = production
+            .split("pub fn ticketremote_owner_set_hdr_display_boost(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_member_refresh_hdr_boost_state(")
+                    .next()
+            })
+            .expect("legacy-named HDR boost reducer must remain inspectable");
+        assert!(reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(!reducer.contains("require_owner"));
+        assert!(!reducer.contains("require_admin"));
+        assert!(reducer.contains("clean_hdr_display_boost(selectedDisplayBoost)"));
+        assert!(reducer.contains("ticketremote_member_hdr_boost_preference()"));
+        assert!(!reducer.contains("email: String"));
+
+        let member_check = production
+            .split("fn is_member(")
+            .nth(1)
+            .and_then(|body| body.split("fn is_admin(").next())
+            .expect("active membership check must remain inspectable");
+        assert!(member_check.contains(".map(|row| row.active)"));
+        assert!(!member_check.contains("row.role"));
+
+        let auth = production
+            .split("fn client_email_from_auth(")
+            .nth(1)
+            .and_then(|body| body.split("fn ensure_ticket(").next())
+            .expect("member authentication must remain inspectable");
+        assert!(auth.contains("if !is_member(ctx, ticket_id, &email)"));
+        assert!(auth.contains("ticket membership required"));
+
+        let refresh_reducer = production
+            .split("pub fn ticketremote_member_refresh_hdr_boost_state(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_scheduled_policy_boundary(")
+                    .next()
+            })
+            .expect("HDR boost refresh reducer must remain inspectable");
+        assert!(refresh_reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(refresh_reducer.contains("refresh_member_hdr_boost_state"));
+
+        let membership = production
+            .split("fn upsert_member_row(")
+            .nth(1)
+            .and_then(|body| body.split("fn schedule_latest_ticket_reselect(").next())
+            .expect("member lifecycle must remain inspectable");
+        assert!(membership.contains("refresh_member_hdr_boost_state"));
+        assert!(membership.contains("delete(member_hdr_boost_state_id"));
+        let deactivate = membership
+            .split("fn deactivate_member_row(")
+            .nth(1)
+            .expect("member deactivation must remain inspectable");
+        assert!(!deactivate.contains("ticketremote_member_hdr_boost_preference()"));
+        assert!(production.contains("refresh_member_hdr_boost_state(ctx, DEFAULT_TICKET_ID"));
+    }
+
+    #[test]
+    fn member_hdr_boost_refresh_migrates_retired_values_before_projection() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let migration = production
+            .split("fn migrate_legacy_member_hdr_boost_preference(")
+            .nth(1)
+            .and_then(|body| body.split("fn refresh_member_hdr_boost_state(").next())
+            .expect("legacy HDR boost migration must remain inspectable");
+        assert!(migration.contains("ticketremote_member_hdr_boost_preference()"));
+        assert!(migration.contains("clean_hdr_display_boost(existing.selectedDisplayBoost)"));
+        assert!(migration.contains("selectedDisplayBoost: selected_display_boost"));
+        assert!(migration.contains("updatedAt: now.into()"));
+        assert!(!migration.contains("table.insert("));
+
+        let refresh = production
+            .split("fn refresh_member_hdr_boost_state(")
+            .nth(1)
+            .and_then(|body| body.split("fn member_limit_effective_config(").next())
+            .expect("HDR boost refresh must remain inspectable");
+        let migrate_at = refresh
+            .find("migrate_legacy_member_hdr_boost_preference")
+            .expect("refresh must migrate retained preferences");
+        let project_at = refresh
+            .find("let row = TicketremoteMemberHDRBoostState")
+            .expect("refresh must publish a sanitized projection");
+        assert!(migrate_at < project_at);
+        assert!(refresh.contains(".unwrap_or(4)"));
+        assert!(refresh.contains("if !is_member"));
+        assert!(refresh.contains("table.id().delete(id)"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ the same umbrella.
 
 Use the deployment script for deploys, validation, rollback, cleanup, and routine service changes. For direct inspection, SSH to kitty-gration and run Docker Compose against `/etc/arbuzas/current/release.env` and `/etc/arbuzas/current/infra/arbuzas/docker/compose.yml`, always keeping the Compose project name `arbuzas`.
 
+`cleanup-docker` is a read-only preview by default. Add `--apply` only after reviewing its bounded release/image candidate summary. Successful standard/full deploys may apply the same policy automatically at most once per 24 hours; fast deploys and rollbacks never do.
+
 Use the external selector for VPN-only work:
 
 ```bash

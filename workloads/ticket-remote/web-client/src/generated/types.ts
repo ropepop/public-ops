@@ -85,6 +85,26 @@ export const TicketremoteControlCodeRequest = __t.object("TicketremoteControlCod
 });
 export type TicketremoteControlCodeRequest = __Infer<typeof TicketremoteControlCodeRequest>;
 
+export const TicketremoteMemberHdrBoostState = __t.object("TicketremoteMemberHdrBoostState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  accountScopeId: __t.string(),
+  selectedDisplayBoost: __t.u32(),
+  updatedAt: __t.string(),
+  serverAt: __t.string(),
+});
+export type TicketremoteMemberHdrBoostState = __Infer<typeof TicketremoteMemberHdrBoostState>;
+
+export const TicketremoteMemberHdrEngineState = __t.object("TicketremoteMemberHdrEngineState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  accountScopeId: __t.string(),
+  engine: __t.string(),
+  updatedAt: __t.string(),
+  serverAt: __t.string(),
+});
+export type TicketremoteMemberHdrEngineState = __Infer<typeof TicketremoteMemberHdrEngineState>;
+
 export const TicketremoteMemberHdrState = __t.object("TicketremoteMemberHdrState", {
   id: __t.string(),
   ticketId: __t.string(),

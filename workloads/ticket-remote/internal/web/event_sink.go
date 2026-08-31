@@ -32,11 +32,79 @@ const (
 )
 
 var (
-	sensitiveEventText   = regexp.MustCompile(`(?i)https?://[^\s"']+|\b(?:bearer|token|password|secret|cookie|authorization|prompt)\b|\b\d{2,}\b`)
-	sensitiveClientToken = regexp.MustCompile(`[A-Za-z0-9+/=_-]{32,}`)
-	sensitiveEmail       = regexp.MustCompile(`(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}`)
-	sensitiveIPAddress   = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
-	sensitivePrivatePath = regexp.MustCompile(`(?i)(?:/Users/|/home/|/root/|[A-Z]:\\Users\\)[^\s"']*`)
+	sensitiveEventText           = regexp.MustCompile(`(?i)https?://[^\s"']+|\b(?:bearer|token|password|secret|cookie|authorization|prompt)\b|\b\d{2,}\b`)
+	sensitiveClientToken         = regexp.MustCompile(`[A-Za-z0-9+/=_-]{32,}`)
+	sensitiveEmail               = regexp.MustCompile(`(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}`)
+	sensitiveIPAddress           = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
+	sensitivePrivatePath         = regexp.MustCompile(`(?i)(?:/Users/|/home/|/root/|[A-Z]:\\Users\\)[^\s"']*`)
+	safeBrowserAssetVersion      = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[a-z0-9][a-z0-9._-]{0,95}$`)
+	safeBrowserHDRMapping        = regexp.MustCompile(`^(?:sdr_preserving_(?:highlight_shoulder_v1|chromatic_highlight_shoulder_v2)|black_anchored_hue_expansion_v3|sdr_identity_request_patch_v1)$`)
+	safeBrowserHDRRecoveryPhases = map[string]struct{}{
+		"active": {}, "backgrounded": {}, "cancelled": {}, "capability_wait": {},
+		"fresh_sdr_wait": {}, "initializing": {}, "safe_sdr": {}, "settling": {},
+		"version_check": {},
+	}
+	safeBrowserHDRVersionOutcomes = map[string]struct{}{
+		"match": {}, "mismatch": {}, "pending": {}, "request_failed": {}, "server_unavailable": {},
+	}
+	safeBrowserHDRCapabilityOutcomes = map[string]struct{}{
+		"browser_unavailable": {}, "pending": {}, "ready": {}, "server_pending": {},
+		"server_ready": {}, "server_unavailable": {},
+	}
+	safeBrowserHDRRecoveryTriggers = map[string]struct{}{
+		"dynamic_range_capability_available": {}, "dynamic_range_capability_unavailable": {},
+		"engine_projection_changed": {}, "focus": {}, "foreground": {}, "foreground_pulse_gap": {},
+		"lifecycle_resume": {}, "network_online": {}, "pageshow": {}, "pageshow_persisted": {},
+		"preference_projection_restore": {}, "preference_user_enable": {}, "projection": {},
+		"renderer_failure": {}, "visibility_resume": {},
+	}
+	safeBrowserHDRReasons = map[string]struct{}{
+		"activation_copied": {}, "age_delta": {}, "asset_version_mismatch": {}, "asset_version_mismatch_after_reload": {},
+		"browser_capability_unavailable": {}, "client_hdr_failed": {}, "control_code_priority": {},
+		"coordinated_frame_superseded": {}, "coordinated_hdr_bypassed": {}, "device_lost": {},
+		"disabled": {}, "document_hidden": {}, "dynamic_range_capability_available": {},
+		"dynamic_range_capability_unavailable": {}, "engine_projection_changed": {}, "epoch_mismatch": {},
+		"failed": {}, "fallback": {}, "first_presented": {}, "focus": {}, "foreground": {},
+		"foreground_deadline_exhausted": {}, "foreground_deadline_exhausted_before_present": {},
+		"foreground_pulse_gap": {}, "foreground_recovery_failed": {},
+		"frame_clone_failed": {}, "fresh": {}, "gpu_completion_cancelled": {}, "gpu_completion_failed": {},
+		"gpu_completion_timeout": {}, "gpu_completion_watchdog_failed": {}, "hdr_boost_invalid": {},
+		"hdr_canvas_extended_mode_unavailable": {}, "hdr_no_limit_dynamic_range_unavailable": {},
+		"hdr_presented_display_refresh_cancelled": {}, "hdr_presented_display_refresh_failed": {},
+		"hdr_presented_display_refresh_timeout": {}, "hdr_presented_display_refresh_unavailable": {},
+		"lifecycle_backgrounded": {}, "lifecycle_resume": {},
+		"main_thread_canvas_unavailable": {}, "missing_watermark": {}, "network_online": {},
+		"new_foreground_attempt": {}, "pageshow": {}, "pageshow_persisted": {}, "paint_failed": {},
+		"paint_recovery_exhausted": {}, "paint_wait_failed": {}, "paint_wait_timeout": {},
+		"preference_disabled": {}, "preference_projection_restore": {}, "preference_user_enable": {},
+		"prepared_boost_superseded": {}, "present_completion_failed": {}, "present_completion_timeout": {},
+		"present_submit_failed": {}, "present_validation_failed": {}, "presentation_authority_revoked": {},
+		"presented": {}, "presented_boost_superseded": {}, "proof_mismatch": {}, "render_failed": {},
+		"render_submit_failed": {}, "render_validation_failed": {}, "renderer_compositor_opportunities_unavailable": {},
+		"renderer_disposed": {}, "renderer_frame_not_prepared": {}, "renderer_frame_not_presented": {},
+		"renderer_init_failed": {}, "renderer_init_timeout": {}, "renderer_init_watchdog_failed": {},
+		"renderer_not_ready": {}, "renderer_present_completion_unavailable": {},
+		"renderer_present_completion_unconfirmed": {}, "renderer_present_required": {},
+		"renderer_present_unavailable": {}, "renderer_retry_exhausted": {}, "renderer_start_failed": {},
+		"renderer_failure": {},
+		"sdr_stale":        {}, "sequence_lag": {}, "server_capability": {}, "server_capability_unavailable": {},
+		"settled_start_retry": {}, "settlement_deadline_exceeded": {}, "settlement_started": {},
+		"settlement_watchdog_failed": {}, "shader_compilation_failed": {}, "soft_recovery_deferred": {},
+		"soft_recovery_stale": {}, "starting": {}, "superseded": {}, "surface_reveal_blocked": {},
+		"target_copied": {}, "uncaptured_gpu_error": {}, "version_request_failed": {},
+		"version_server_unavailable": {}, "visibility_resume": {}, "visual_age": {},
+		"webgpu_adapter_unavailable": {}, "webgpu_canvas_unavailable": {}, "webgpu_unavailable": {},
+		"webgpu_usage_constants_unavailable": {},
+	}
+	safeBrowserHDRSettlementSources = map[string]struct{}{
+		"activation_compositor_completion": {}, "compositor_completion": {}, "external": {},
+		"foreground_pulse": {}, "foreground_recovery": {}, "foreground_return": {},
+		"sdr_frame": {}, "target_compositor_completion": {}, "target_copy_completion": {},
+		"target_gpu_completion": {}, "timer": {},
+	}
+	safeBrowserHDRPostPresentSources = map[string]struct{}{
+		"animation_frame": {}, "cancelled": {}, "failed": {}, "timeout": {}, "unavailable": {},
+	}
 
 	// The browser compacts its raw diagnostics to this fixed vocabulary before
 	// sending. Exact admission prevents a client from minting unique event names
@@ -71,7 +139,19 @@ var (
 		"early_video_connecting_grace":          {},
 		"early_video_connecting_grace_skipped":  {},
 		"experimental_hdr_decode_sample":        {},
+		"experimental_hdr_analysis":             {},
+		"experimental_hdr_calibration":          {},
+		"experimental_hdr_activation_presented": {},
+		"experimental_hdr_diagnostic":           {},
 		"experimental_hdr_first_image_shown":    {},
+		"experimental_hdr_presented":            {},
+		"experimental_hdr_renderer_ready":       {},
+		"experimental_hdr_session_summary":      {},
+		"experimental_hdr_surface_reset":        {},
+		"experimental_hdr_surface_transition":   {},
+		"experimental_hdr_boost_changed":        {},
+		"experimental_hdr_boost_failed":         {},
+		"experimental_hdr_gpu_completion":       {},
 		"experimental_media_fallback":           {},
 		"fullscreen_failed":                     {},
 		"fullscreen_requested":                  {},
@@ -376,7 +456,7 @@ func decodeBrowserClientLog(data []byte) (string, map[string]any, string, bool) 
 	if _, allowed := browserClientLogEvents[event]; !allowed || len(input.Detail) > state.SafeOperationalLogDetailMaxBytes {
 		return "", nil, "", false
 	}
-	detail := safeBrowserClientLogDetail(input.Detail)
+	detail := safeBrowserClientLogDetail(event, input.Detail)
 	body, err := json.Marshal(detail)
 	if err != nil {
 		return "", nil, "", false
@@ -384,7 +464,7 @@ func decodeBrowserClientLog(data []byte) (string, map[string]any, string, bool) 
 	return event, detail, safeRuntimeLogText(string(body)), true
 }
 
-func safeBrowserClientLogDetail(raw string) map[string]any {
+func safeBrowserClientLogDetail(event, raw string) map[string]any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return map[string]any{}
@@ -394,7 +474,8 @@ func safeBrowserClientLogDetail(raw string) map[string]any {
 		return map[string]any{"detail": redactBrowserClientText(raw)}
 	}
 	out := make(map[string]any, min(len(input), 16))
-	for key, value := range input {
+	for _, key := range browserClientDetailKeyOrder(event, input) {
+		value := input[key]
 		if len(out) == 16 || key == "detail" || browserClientDetailKeyIsSensitive(key) {
 			continue
 		}
@@ -403,12 +484,16 @@ func safeBrowserClientLogDetail(raw string) map[string]any {
 		case nil, bool, float64, json.Number:
 			out[cleanKey] = typed
 		case string:
-			out[cleanKey] = redactBrowserClientText(typed)
+			if observable, handled := safeBrowserClientHDRObservableText(input, key, typed); handled {
+				out[cleanKey] = observable
+			} else {
+				out[cleanKey] = safeBrowserClientObservableText(key, typed)
+			}
 		default:
 			out[cleanKey] = "present"
 		}
 	}
-	if value, ok := input["detail"]; ok {
+	if value, ok := input["detail"]; ok && len(out) < 16 {
 		switch typed := value.(type) {
 		case string:
 			out["detail"] = sanitizeBrowserClientDetailString(typed)
@@ -419,6 +504,160 @@ func safeBrowserClientLogDetail(raw string) map[string]any {
 		}
 	}
 	return out
+}
+
+func browserClientDetailKeyOrder(event string, input map[string]any) []string {
+	phase, _ := input["phase"].(string)
+	priority := []string{}
+	engine, _ := input["engine"].(string)
+	if engine == "client_webgpu_v1" || engine == "client_webgpu_v2" {
+		switch {
+		case event == "experimental_hdr_first_image_shown" || phase == "first_presented":
+			priority = []string{
+				"assetVersion", "phase", "attemptId", "recoveryPhase", "selectedDisplayBoost",
+				"intendedOutputPeak", "canvasEncoding", "configurationDynamicRangeLimit",
+				"continuousSurface", "gpuCompleted", "compositorOpportunitiesCompleted",
+				"postPresentSource", "postPresentOpportunityCount",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+			}
+		case event == "experimental_hdr_activation_presented" || phase == "edr_activation_presented":
+			priority = []string{
+				"assetVersion", "phase", "attemptId", "recoveryPhase", "triggerSet",
+				"mappingModel", "activationFrame", "activationIntendedOutputPeak",
+				"edrRequestPatchIntended", "intendedRequestPatchPeak",
+				"gpuCompleted", "postPresentSource", "postPresentOpportunityCount",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+			}
+		case phase == "presented":
+			priority = []string{
+				"assetVersion", "phase", "mappingModel", "selectedDisplayBoost",
+				"sourceColorSpace", "canvasEncoding", "configurationColorSpace",
+				"configurationDynamicRangeLimit", "gpuCompleted", "compositorOpportunitiesCompleted",
+				"postPresentSource", "postPresentOpportunityCount",
+				"canvasGeneration", "sequence", "sequenceLag", "ageDeltaMillis",
+			}
+		case phase == "session_summary":
+			priority = []string{
+				"assetVersion", "phase", "engine", "pipeline", "selectedDisplayBoost",
+				"offered", "rendered", "dropped", "failures", "rendererActive", "surfaceVisible",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration", "startReason", "reason",
+			}
+		case phase == "renderer_ready" || phase == "worker_ready":
+			priority = []string{
+				"assetVersion", "phase", "mappingModel", "colorExpansionExponent", "selectedDisplayBoost", "intendedOutputPeak",
+				"edrRequestPatchIntended",
+				"canvasEncoding", "configurationColorSpace", "toneMappingMode",
+				"configurationDynamicRangeLimit", "continuousSurface", "lifecycleGeneration", "canvasGeneration",
+				"rendererGeneration", "startReason",
+			}
+		case phase == "surface_reset":
+			priority = []string{
+				"assetVersion", "phase", "engine", "pipeline", "reason", "lifecycleGeneration",
+				"canvasGeneration", "rendererGeneration", "canvasReplaced", "continuousSurface", "startReason", "retryOrdinal",
+			}
+		case phase == "renderer_init_timeout":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "triggerSet",
+				"rendererInitTimeoutMillis", "rendererInitElapsedMillis", "rendererInitCheckSource",
+				"surfaceVisible", "lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+				"retryOrdinal", "startReason", "reason",
+			}
+		case phase == "surface_transition":
+			priority = []string{
+				"assetVersion", "phase", "engine", "pipeline", "selectedDisplayBoost", "toSurface", "reason",
+				"presentationState", "surfaceTransitions", "sequenceLag", "ageDeltaMillis", "fallbackDurationMillis",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration", "startReason",
+			}
+		case phase == "boost_changed":
+			priority = []string{
+				"assetVersion", "phase", "engine", "pipeline", "mappingModel", "selectedDisplayBoost",
+				"previousDisplayBoost", "intendedOutputPeak", "canvasEncoding",
+				"configurationDynamicRangeLimit", "continuousSurface", "surfaceVisible", "presentationState",
+				"lifecycleGeneration", "canvasGeneration",
+			}
+		case phase == "boost_change_failed":
+			priority = []string{
+				"assetVersion", "phase", "engine", "pipeline", "selectedDisplayBoost", "requestedDisplayBoost",
+				"canvasEncoding", "configurationDynamicRangeLimit", "continuousSurface", "surfaceVisible",
+				"reason", "lifecycleGeneration", "canvasGeneration",
+			}
+		case phase == "gpu_completion":
+			priority = []string{
+				"assetVersion", "phase", "mappingModel", "selectedDisplayBoost", "canvasEncoding",
+				"edrRequestPatchIntended", "intendedRequestPatchPeak", "sourceColorSpace",
+				"gpuCompleted", "completionMillis", "lifecycleGeneration", "canvasGeneration",
+				"rendererGeneration", "startReason", "sequence", "ageDeltaMillis",
+			}
+		case phase == "foreground_recovery":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "triggerSet",
+				"reason", "versionOutcome", "capabilityOutcome", "streamEpoch",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration", "retryOrdinal",
+				"presentationRegionGeneration", "presentationRegionBlocked", "presentationRecoveryPending",
+				"foregroundPaintConfirmed", "foregroundStabilityWaitMillis",
+				"surfaceVisible", "presentationState",
+			}
+		case phase == "settlement_started":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "triggerSet",
+				"streamEpoch", "lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+				"retryOrdinal", "settlementTimeoutMillis", "settlementElapsedMillis",
+				"settlementPending", "presentationState", "surfaceVisible",
+			}
+		case phase == "compositor_settlement_started":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "triggerSet",
+				"streamEpoch", "lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+				"retryOrdinal", "settlementDeadlineMillis", "postPresentOpportunityTarget",
+				"presentationState", "surfaceVisible", "startReason",
+			}
+		case phase == "settlement_deadline_exceeded":
+			priority = []string{
+				"assetVersion", "phase", "attemptId", "recoveryPhase", "triggerSet", "reason",
+				"streamEpoch", "lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+				"retryOrdinal", "settlementTimeoutMillis", "settlementElapsedMillis",
+				"settlementCheckSource", "settlementTimedOut", "surfaceVisible",
+			}
+		case phase == "compositor_settlement_result":
+			priority = []string{
+				"assetVersion", "phase", "attemptId", "recoveryPhase", "triggerSet", "streamEpoch",
+				"lifecycleGeneration", "canvasGeneration", "rendererGeneration", "retryOrdinal",
+				"settlementDeadlineMillis", "settlementTimedOut", "postPresentSource",
+				"postPresentOpportunityCount", "compositorOpportunitiesCompleted", "surfaceVisible",
+			}
+		case phase == "gpu_completion_timeout":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "triggerSet",
+				"streamEpoch", "lifecycleGeneration", "canvasGeneration", "rendererGeneration",
+				"retryOrdinal", "gpuCompletionTimeoutMillis", "epoch", "sequence",
+				"presentationOrdinal", "startReason",
+			}
+		case phase == "fallback":
+			priority = []string{
+				"assetVersion", "phase", "engine", "attemptId", "recoveryPhase", "reason",
+				"surfaceVisible", "presentationState", "failures", "lifecycleGeneration",
+				"canvasGeneration", "rendererGeneration", "retryOrdinal", "settlementPending",
+				"settlementElapsedMillis", "startReason",
+			}
+		}
+	}
+	ordered := make([]string, 0, len(input))
+	seen := make(map[string]struct{}, len(input))
+	for _, key := range priority {
+		if _, ok := input[key]; !ok {
+			continue
+		}
+		ordered = append(ordered, key)
+		seen[key] = struct{}{}
+	}
+	remaining := make([]string, 0, len(input)-len(ordered))
+	for key := range input {
+		if _, ok := seen[key]; !ok {
+			remaining = append(remaining, key)
+		}
+	}
+	slices.Sort(remaining)
+	return append(ordered, remaining...)
 }
 
 func browserStartupSourceTime(detail map[string]any, now time.Time) (streamStartupTraceSourceTime, bool) {
@@ -518,6 +757,162 @@ func safeRuntimeLogKey(value string) string {
 
 func redactBrowserClientText(value string) string {
 	return redactOperationalLogText(value)
+}
+
+func safeBrowserEnum(value string, allowed map[string]struct{}) string {
+	value = strings.TrimSpace(value)
+	if _, ok := allowed[value]; ok {
+		return value
+	}
+	return "[redacted]"
+}
+
+func safeBrowserHDRTriggerSet(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	parts := strings.Split(value, ",")
+	if len(parts) == 0 || len(parts) > 8 {
+		return "[redacted]"
+	}
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		if part != strings.TrimSpace(part) {
+			return "[redacted]"
+		}
+		if _, ok := safeBrowserHDRRecoveryTriggers[part]; !ok {
+			return "[redacted]"
+		}
+		if _, duplicate := seen[part]; duplicate {
+			return "[redacted]"
+		}
+		seen[part] = struct{}{}
+	}
+	return strings.Join(parts, ",")
+}
+
+func safeBrowserHDRReason(value string) string {
+	value = strings.TrimSpace(value)
+	if _, ok := safeBrowserHDRReasons[value]; ok {
+		return value
+	}
+	const retryPrefix = "surface_retry_scheduled:"
+	if strings.HasPrefix(value, retryPrefix) {
+		if _, ok := safeBrowserHDRReasons[strings.TrimPrefix(value, retryPrefix)]; ok {
+			return value
+		}
+	}
+	return "[redacted]"
+}
+
+func safeBrowserHDRStartReason(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "unknown" || value == "connect" || value == "capability_retry" {
+		return value
+	}
+	if _, ok := safeBrowserHDRRecoveryTriggers[value]; ok {
+		return value
+	}
+	const foregroundPrefix = "foreground_recovery:"
+	if strings.HasPrefix(value, foregroundPrefix) {
+		if _, ok := safeBrowserHDRRecoveryTriggers[strings.TrimPrefix(value, foregroundPrefix)]; ok {
+			return value
+		}
+		return "[redacted]"
+	}
+	const rendererRetryPrefix = "renderer_retry:"
+	if strings.HasPrefix(value, rendererRetryPrefix) {
+		if _, ok := safeBrowserHDRReasons[strings.TrimPrefix(value, rendererRetryPrefix)]; ok {
+			return value
+		}
+		return "[redacted]"
+	}
+	return "[redacted]"
+}
+
+func safeBrowserClientHDRObservableText(input map[string]any, key, value string) (string, bool) {
+	engine, _ := input["engine"].(string)
+	if engine != "client_webgpu_v1" && engine != "client_webgpu_v2" {
+		return "", false
+	}
+	switch key {
+	case "recoveryPhase":
+		return safeBrowserEnum(value, safeBrowserHDRRecoveryPhases), true
+	case "versionOutcome":
+		return safeBrowserEnum(value, safeBrowserHDRVersionOutcomes), true
+	case "capabilityOutcome":
+		return safeBrowserEnum(value, safeBrowserHDRCapabilityOutcomes), true
+	case "triggerSet":
+		return safeBrowserHDRTriggerSet(value), true
+	case "reason":
+		return safeBrowserHDRReason(value), true
+	case "startReason":
+		return safeBrowserHDRStartReason(value), true
+	case "settlementCheckSource":
+		return safeBrowserEnum(value, safeBrowserHDRSettlementSources), true
+	case "postPresentSource":
+		return safeBrowserEnum(value, safeBrowserHDRPostPresentSources), true
+	default:
+		return "", false
+	}
+}
+
+func safeBrowserClientObservableText(key, value string) string {
+	value = strings.TrimSpace(value)
+	switch key {
+	case "assetVersion":
+		if safeBrowserAssetVersion.MatchString(value) {
+			return value
+		}
+		return redactBrowserClientText(value)
+	case "mappingModel":
+		value = strings.ToLower(value)
+		if safeBrowserHDRMapping.MatchString(value) {
+			return value
+		}
+		return "[redacted]"
+	case "sourceColorSpace":
+		// Continue below with a field-specific standards vocabulary.
+	default:
+		return redactBrowserClientText(value)
+	}
+	// VideoFrame.colorSpace uses a small standards-defined vocabulary. Preserve
+	// those tokens as an observable rendering fact, but reject arbitrary client
+	// text so this diagnostic cannot become a channel for private values.
+	parts := strings.Split(strings.ToLower(value), ";")
+	if len(parts) != 4 {
+		return "[redacted]"
+	}
+	allowed := map[string]map[string]struct{}{
+		"primaries": {
+			"bt709": {}, "bt470bg": {}, "smpte170m": {}, "smpte240m": {}, "film": {},
+			"bt2020": {}, "smpte-st-428-1": {}, "smpte-rp-431-2": {}, "smpte-eg-432-1": {},
+			"ebu3213e": {}, "unknown": {},
+		},
+		"transfer": {
+			"bt709": {}, "smpte170m": {}, "smpte240m": {}, "linear": {},
+			"iec61966-2-4": {}, "bt1361-ecg": {}, "iec61966-2-1": {}, "bt2020-10": {},
+			"bt2020-12": {}, "smpte-st-2084": {}, "smpte-st-428-1": {}, "arib-std-b67": {},
+			"pq": {}, "hlg": {}, "unknown": {},
+		},
+		"matrix": {
+			"rgb": {}, "bt709": {}, "fcc": {}, "bt470bg": {}, "smpte170m": {}, "smpte240m": {},
+			"ycgco": {}, "bt2020-ncl": {}, "bt2020-cl": {}, "smpte2085": {},
+			"chroma-derived-ncl": {}, "chroma-derived-cl": {}, "ictcp": {}, "unknown": {},
+		},
+		"range": {"full": {}, "limited": {}, "unknown": {}},
+	}
+	for index, name := range []string{"primaries", "transfer", "matrix", "range"} {
+		pair := strings.SplitN(parts[index], "=", 2)
+		if len(pair) != 2 || pair[0] != name {
+			return "[redacted]"
+		}
+		if _, ok := allowed[name][pair[1]]; !ok {
+			return "[redacted]"
+		}
+	}
+	return strings.Join(parts, ";")
 }
 
 func redactOperationalLogText(value string) string {

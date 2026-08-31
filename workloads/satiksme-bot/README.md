@@ -46,7 +46,7 @@ Validate the current session without starting login or writing anything back to 
 go run ./cmd/chat-analyzer-session -validate-only -list-dialogs=false
 ```
 
-Analyzer credentials may be loaded from private files with `SATIKSME_CHAT_ANALYZER_API_ID_FILE`, `SATIKSME_CHAT_ANALYZER_API_HASH_FILE`, `SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE`, and `SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE`. A direct environment value takes precedence when both forms are present.
+Analyzer credentials may be loaded from private files with `SATIKSME_CHAT_ANALYZER_API_ID_FILE`, `SATIKSME_CHAT_ANALYZER_API_HASH_FILE`, and `SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE`. For the managed Google provider, that Google key also supplies the model client. Disabled analyzer deployments do not require or pass these private files. A direct environment value takes precedence when both forms are present.
 
 The loopback-only `/api/v1/internal/health` response includes a sanitized `chatAnalyzer` section with session state, collection and processing timestamps, the selected model, circuit state, and interrupted-batch recovery count. It never includes chat text or credentials.
 

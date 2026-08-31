@@ -34,15 +34,6 @@ type Config struct {
 	State               state.StoreConfig
 	Phone               PhoneConfig
 	ServiceEvents       ServiceEventsConfig
-	ExperimentalMedia   ExperimentalMediaConfig
-}
-
-// ExperimentalMediaConfig is intentionally separate from the authenticated
-// Ticket relay. An empty transformer URL preserves the deployed SDR preview;
-// a configured private URL enables the independently fail-closed HDR path.
-type ExperimentalMediaConfig struct {
-	HDRTransformerURL string
-	TransformTimeout  time.Duration
 }
 
 type ServiceEventsConfig struct {
@@ -155,10 +146,6 @@ func Load() (Config, error) {
 		ServiceEvents: ServiceEventsConfig{
 			Token: getenv("TICKET_REMOTE_SERVICE_EVENT_TOKEN", ""),
 		},
-		ExperimentalMedia: ExperimentalMediaConfig{
-			HDRTransformerURL: strings.TrimRight(getenv("TICKET_REMOTE_HDR_TRANSFORMER_URL", ""), "/"),
-			TransformTimeout:  getenvDuration("TICKET_REMOTE_HDR_TRANSFORM_TIMEOUT", 1500*time.Millisecond),
-		},
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PORT out of range: %d", cfg.Port)
@@ -196,9 +183,6 @@ func Load() (Config, error) {
 	}
 	if cfg.Phone.BaseURL == "" {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_BASE_URL is required")
-	}
-	if cfg.ExperimentalMedia.TransformTimeout < 100*time.Millisecond || cfg.ExperimentalMedia.TransformTimeout > 5*time.Second {
-		return Config{}, fmt.Errorf("TICKET_REMOTE_HDR_TRANSFORM_TIMEOUT must be between 100ms and 5s")
 	}
 	if _, err := time.LoadLocation(cfg.Phone.TimeZone); err != nil {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PHONE_TIME_ZONE is invalid: %w", err)

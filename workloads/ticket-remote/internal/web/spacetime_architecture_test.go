@@ -739,15 +739,18 @@ func TestTicketSliderUsesVisibleShortLivedVisualGeometryWithoutAProgressProtocol
 		`background: rgba(255, 149, 0, 0.05)`,
 		`min-height: 44px`,
 		`background: transparent`,
+		`opacity: 0`,
+		`touch-action: pan-y`,
 		`#ticketRegisterOverlay[data-registration-state="registering"]`,
 		`border-color: rgba(255, 149, 0, 0.36)`,
 		`background: rgba(255, 149, 0, 0.09)`,
-		`#ticketRegisterOverlay[data-registration-state="registering"]::after`,
-		`background: rgba(255, 149, 0, 0.82)`,
 	} {
 		if !strings.Contains(page, required) {
 			t.Fatalf("faint over-stream slider missing %q", required)
 		}
+	}
+	if strings.Contains(page, `#ticketRegisterOverlay[data-registration-state="registering"]::after`) {
+		t.Fatal("browser registration overlay must not draw a dot inside the slider")
 	}
 	for _, retired := range []string{
 		`background-image: url("data:image/svg+xml`,

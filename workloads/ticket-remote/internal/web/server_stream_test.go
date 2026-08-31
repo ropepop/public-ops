@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -189,8 +188,8 @@ func TestWarmPrewarmSkipsRedundantStartAndQueuesOneEarlyKeyframe(t *testing.T) {
 	relay.AddViewer()
 	defer relay.RemoveViewer()
 	server := newTicketWebServer(t, store, relay, phoneServer.URL)
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
-	if !server.direct.recordFrame(testTSF2FrameWithTimestamp(7, 1, false, 10000)) {
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	if !server.direct.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
 		t.Fatal("fresh same-epoch frame was not accepted")
 	}
 	server.backgroundKeyframeMu.Lock()
@@ -236,7 +235,7 @@ func TestWarmReconnectConfigSkipsStartAndQueuesOneEarlyKeyframe(t *testing.T) {
 	baselineGeneration := server.direct.configGenerationSnapshot()
 	go func() {
 		time.Sleep(25 * time.Millisecond)
-		server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":8,"phoneUptimeMillis":10000}`))
+		setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":8,"phoneUptimeMillis":10000}`))
 	}()
 	server.queuePrewarmStreamCommandsForHealth(
 		"warm_reconnect_test",
@@ -269,7 +268,7 @@ func TestWarmReconnectSocketBeforeConfigQueuesOneDurableKeyframe(t *testing.T) {
 		phone.Health{Connected: false, Desired: true, Viewers: 1, StreamState: "connecting"},
 		baselineGeneration,
 	)
-	server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":12,"phoneUptimeMillis":10000}`))
+	server.handlePhoneText(testAllIntraConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":12,"phoneUptimeMillis":10000}`)))
 
 	waitForPhoneMessage(t, phoneSignals, `"type":"keyframe"`)
 	if extras := countPhoneSignalTypesWithin(phoneSignals, 250*time.Millisecond); extras["start"] != 0 || extras["keyframe"] != 0 {
@@ -283,7 +282,7 @@ func TestWarmReconnectConnectedBeforeConfigQueuesOneDurableKeyframe(t *testing.T
 
 	go func() {
 		time.Sleep(25 * time.Millisecond)
-		server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":13,"phoneUptimeMillis":10000}`))
+		server.handlePhoneText(testAllIntraConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":13,"phoneUptimeMillis":10000}`)))
 	}()
 	server.queuePrewarmStreamCommandsForHealth(
 		"warm_connected_before_config",
@@ -311,7 +310,7 @@ func TestWarmRelayReconnectConfigUsesKeyframeOnlyPath(t *testing.T) {
 			return
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "test complete")
-		config := []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":11,"phoneUptimeMillis":10000}`)
+		config := testAllIntraConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":11,"phoneUptimeMillis":10000}`))
 		if err := conn.Write(r.Context(), websocket.MessageText, config); err != nil {
 			return
 		}
@@ -1356,7 +1355,7 @@ func TestVideoWarmStartKeyFrameIsShared(t *testing.T) {
 	defer relay.Close()
 
 	keyFrame := testTSF2FrameWithTimestamp(1, 1, true, 10000)
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 	server.direct.recordFrame(keyFrame)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1376,7 +1375,7 @@ func TestProvisionalWarmConfigIsSentWithoutStaleKeyframeWhileRelayDisconnected(t
 	defer ticketServer.Close()
 	defer relay.Close()
 
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1}`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1414,7 +1413,7 @@ func TestVideoClientLogsAreAcceptedAndSanitizedOnAuthenticatedVideoSocket(t *tes
 	defer ticketServer.Close()
 	defer relay.Close()
 
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":7}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":7}`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1536,7 +1535,7 @@ func TestLiveFramesAreShared(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1666,11 +1665,11 @@ func TestLiveFramesAreShared(t *testing.T) {
 	}
 }
 
-func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
+func TestIndependentFramesAcceptSourceGapAndRejectDelta(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
-	server.handlePhoneText([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+	server.handlePhoneText(testAllIntraConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`)))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1685,7 +1684,7 @@ func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
 			break
 		}
 		if typ == websocket.MessageBinary {
-			t.Fatal("delta frame should not be delivered before the viewer has a keyframe")
+			t.Fatal("unexpected delta frame reached a viewer")
 		}
 	}
 	readCancel()
@@ -1711,15 +1710,15 @@ func TestDeltaFramesWaitForKeyframeThenStayLive(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	keyFrame := testTSF2FrameWithTimestamp(1, 79, true, 10001)
-	deltaFrame := testTSF2FrameWithTimestamp(1, 80, false, 10002)
-	server.handlePhoneMessage(phone.Message{Binary: keyFrame})
+	firstFrame := testTSF2FrameWithTimestamp(1, 79, true, 10001)
+	gapFrame := testTSF2FrameWithTimestamp(1, 95, true, 10002)
+	server.handlePhoneMessage(phone.Message{Binary: firstFrame})
 	if got := readNextBinaryFrame(t, ctx, viewerConn); parseTSF2(got).sequence != 79 || !parseTSF2(got).keyFrame {
-		t.Fatalf("viewer keyframe = %x", got)
+		t.Fatalf("viewer independent frame = %x", got)
 	}
-	server.handlePhoneMessage(phone.Message{Binary: deltaFrame})
-	if got := readNextTSF2Sequence(t, ctx, viewerConn, 80); parseTSF2(got).keyFrame {
-		t.Fatalf("viewer delta frame = %x", got)
+	server.handlePhoneMessage(phone.Message{Binary: gapFrame})
+	if got := readNextTSF2Sequence(t, ctx, viewerConn, 95); !parseTSF2(got).keyFrame {
+		t.Fatalf("viewer source-gap frame = %x", got)
 	}
 }
 
@@ -1728,7 +1727,7 @@ func TestVideoStreamDoesNotSendStreamStatus(t *testing.T) {
 	defer ticketServer.Close()
 	defer relay.Close()
 
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 	server.direct.recordFrame(testTSF2FrameWithTimestamp(1, 1, true, 10000))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -1749,7 +1748,7 @@ func TestLiveKeyframeCannotReachBrowserBeforeStartupConfigIsQueued(t *testing.T)
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
-	server.direct.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"streamEpoch":1,"phoneUptimeMillis":10000}`))
 
 	server.startupRunMu.Lock()
 	locked := true
@@ -2206,38 +2205,31 @@ func TestStartupRecoveryDoesNotRestartConnectingRelay(t *testing.T) {
 func TestPhoneConfigForActiveViewerRequestsFreshKeyframe(t *testing.T) {
 	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
 	now := time.Now()
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000}`))
 	server.direct.mu.Lock()
 	server.direct.streamEpoch = 7
 	server.direct.lastFrameAt = now
-	server.direct.lastKeyFrameAt = now
 	server.direct.lastFrameEpoch = 7
-	server.direct.lastKeyFrameEpoch = 7
 	server.direct.lastFrameSequence = 77
-	server.direct.lastKeyFrameSequence = 70
 	server.direct.lastFrameVisualAgeMillis = 100
-	server.direct.lastKeyFrameVisualAgeMillis = 100
 	server.direct.lastFrameVisualAgeKnown = true
-	server.direct.lastKeyFrameVisualAgeKnown = true
 	server.direct.mu.Unlock()
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 
-	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42}`)
+	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
 	server.handlePhoneText(config)
 	server.handlePhoneText(config)
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "phone config viewer-required keyframe")
 	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
 		t.Fatalf("repeated phone configs bypassed keyframe coalescing: %d extra requests", got)
 	}
-	newEpochConfig := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":43}`)
+	newEpochConfig := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":43,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
 	server.handlePhoneText(newEpochConfig)
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "new config epoch viewer-required keyframe")
 }
 
 func TestViewerRequiredKeyframePayloadUsesExistingRequesterScope(t *testing.T) {
 	for _, reason := range []string{
-		"viewer_sequence_gap",
-		"viewer_source_stall",
-		"frame_sequence_gap",
 		"phone_config_active_viewer",
 		"browser_video_provisional_config",
 		"browser_video_config_needed",
@@ -2258,44 +2250,18 @@ func TestViewerRequiredKeyframePayloadUsesExistingRequesterScope(t *testing.T) {
 	}
 }
 
-func TestStreamFeedbackSourceStallTransitionsOnceAndRecovers(t *testing.T) {
+func TestStreamFeedbackTransitionsAreDiagnosticOnly(t *testing.T) {
 	hub := newDirectStreamHub()
-	requests := make(chan string, 2)
-	viewer := &client{
-		videoEpoch:          7,
-		videoDeliveryMode:   videoDeliveryFull,
-		videoLastWrittenSeq: 120,
-		videoReadyForDelta:  true,
-		videoReadyEpoch:     7,
-		onVideoKeyframeNeeded: func(reason string, _ uint64) {
-			requests <- reason
-		},
-	}
+	viewer := &client{videoEpoch: 7, videoLastWrittenSeq: 120}
 	server := &Server{
 		direct:  hub,
 		clients: map[*client]struct{}{viewer: {}},
 	}
 	now := time.Unix(1_700_000_000, 0)
 	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 100), now)
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 2_100), now.Add(500*time.Millisecond))
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 2_600), now.Add(time.Second))
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 3_100), now.Add(1500*time.Millisecond))
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 126, 125, 120, 1, 6, 3_100), now.Add(500*time.Millisecond))
 
-	select {
-	case reason := <-requests:
-		if reason != "source_stall" {
-			t.Fatalf("source-stall request reason=%q", reason)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("handler did not request a source-stall keyframe")
-	}
-	select {
-	case reason := <-requests:
-		t.Fatalf("handler requested a duplicate source-stall keyframe: %q", reason)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	adaptiveEvents := func() []clientTelemetryEvent {
+	feedbackEvents := func() []clientTelemetryEvent {
 		t.Helper()
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
@@ -2307,102 +2273,21 @@ func TestStreamFeedbackSourceStallTransitionsOnceAndRecovers(t *testing.T) {
 		}
 		return events
 	}
-	events := adaptiveEvents()
-	if len(events) != 1 || !strings.Contains(events[0].Detail, "cause=upstream_or_delivery_stall") ||
-		!strings.Contains(events[0].Detail, "action=keyframe_requested") ||
-		!strings.Contains(events[0].Detail, "from=full to=full") {
-		t.Fatalf("source-stall transition telemetry=%#v", events)
+	events := feedbackEvents()
+	if len(events) != 1 || !strings.Contains(events[0].Detail, "cause=decoder_queue_hard") ||
+		!strings.Contains(events[0].Detail, "state=congested") {
+		t.Fatalf("diagnostic pressure transition telemetry=%#v", events)
 	}
-	server.streamCadenceMu.Lock()
-	demand, maxFPS := server.lastStreamCadenceDemand, server.lastStreamCadenceMaxFPS
-	server.streamCadenceMu.Unlock()
-	if demand != "full" || maxFPS != 10 {
-		t.Fatalf("source stall changed source demand=%q maxFps=%d, want full/10", demand, maxFPS)
-	}
-
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 121, 121, 121, 121, 0, 100), now.Add(2*time.Second))
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 122, 122, 122, 121, 0, 100), now.Add(2500*time.Millisecond))
-	events = adaptiveEvents()
-	if len(events) != 2 || !strings.Contains(events[1].Detail, "cause=healthy") ||
-		!strings.Contains(events[1].Detail, "action=recovered") {
-		t.Fatalf("source-stall recovery telemetry=%#v", events)
-	}
-}
-
-func TestStreamFeedbackKeyframeOnlyHealthySampleIsStabilizingNotRecovered(t *testing.T) {
-	hub := newDirectStreamHub()
-	now := time.Unix(1_700_000_000, 0)
-	viewer := &client{
-		videoEpoch:                   7,
-		videoDeliveryMode:            videoDeliveryKeyframeOnly,
-		feedbackCount:                1,
-		lastFeedbackAt:               now.Add(-feedbackMinInterval),
-		lastFeedbackEpoch:            7,
-		lastFeedbackReceived:         120,
-		lastFeedbackDecoded:          120,
-		lastFeedbackRendered:         120,
-		lastFeedbackRenderedKeyframe: 111,
-		feedbackState:                "congested_awaiting_keyframe",
-		feedbackCause:                "browser_render_stall",
-		feedbackKeyframeStreak:       0,
-		feedbackHealthyStreak:        0,
-		feedbackSourceStallStreak:    0,
-		feedbackSourceStallRequested: false,
-	}
-	server := &Server{direct: hub, clients: map[*client]struct{}{viewer: {}}}
-	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 121, 121, 121, 111, 0, 100), now)
-
-	hub.mu.Lock()
-	defer hub.mu.Unlock()
-	var transitions []clientTelemetryEvent
-	for _, event := range hub.recentBrowserEvents {
-		if event.Event == "stream_feedback_transition" {
-			transitions = append(transitions, event)
-		}
-	}
-	if len(transitions) != 1 || !strings.Contains(transitions[0].Detail, "action=stabilizing") ||
-		strings.Contains(transitions[0].Detail, "action=recovered") ||
-		!strings.Contains(transitions[0].Detail, "to=keyframe_only") {
-		t.Fatalf("keyframe-only healthy telemetry=%#v", transitions)
-	}
-}
-
-func TestSecondViewerGapInsideCooldownRequestsFreshKeyframe(t *testing.T) {
-	server, phoneSignals, _ := newTicketVideoStreamTestServer(t)
-	var viewer *client
-	deadline := time.Now().Add(time.Second)
-	for viewer == nil {
-		for _, candidate := range server.clientSnapshot() {
-			viewer = candidate
-			break
-		}
-		if viewer != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("browser viewer was not registered for the gap recovery fixture")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
 	viewer.videoMu.Lock()
-	viewer.videoEpoch = 7
-	viewer.videoDeliveryMode = videoDeliveryFull
-	viewer.videoLastWrittenSeq = 10
-	viewer.videoKeyframeRequestPending = false
-	viewer.videoKeyframeRequestSequence = 0
+	if len(viewer.videoQueue) != 0 || len(viewer.controlQueue) != 0 || viewer.videoLastWrittenSeq != 120 {
+		viewer.videoMu.Unlock()
+		t.Fatal("feedback changed fixed all-intra delivery")
+	}
 	viewer.videoMu.Unlock()
-	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 12, false, 12000))
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "first broken GOP keyframe")
-
-	noteTestKeyframeWritten(viewer, 7, 20, time.Now())
-	viewer.setVideoDeliveryMode(videoDeliveryFull)
-	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 22, false, 22000))
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "second broken GOP keyframe inside cooldown")
-
-	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 23, false, 23000))
-	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
-		t.Fatalf("repeated deltas in the same broken GOP scheduled %d extra keyframes", got)
+	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 127, 127, 127, 0, 0, 100), now.Add(time.Second))
+	events = feedbackEvents()
+	if len(events) != 2 || !strings.Contains(events[1].Detail, "cause=healthy") || !strings.Contains(events[1].Detail, "state=flowing") {
+		t.Fatalf("diagnostic recovery telemetry=%#v", events)
 	}
 }
 
@@ -2413,9 +2298,9 @@ func TestRequiredKeyframeWaitsBehindFinishingRequest(t *testing.T) {
 	server.backgroundKeyframeInFlight = true
 	server.backgroundKeyframeMu.Unlock()
 
-	const requirement = "viewer_999_sequence_gap:2"
-	server.requestPhoneKeyframeWithRequirement("frame_sequence_gap", requirement)
-	server.requestPhoneKeyframeWithRequirement("frame_sequence_gap", requirement)
+	const requirement = "phone_config_active_viewer:42"
+	server.requestPhoneKeyframeWithRequirement("phone_config_active_viewer", requirement)
+	server.requestPhoneKeyframeWithRequirement("phone_config_active_viewer", requirement)
 
 	server.backgroundKeyframeMu.Lock()
 	pending := len(server.backgroundKeyframePending)
@@ -2447,7 +2332,7 @@ func TestPhoneConfigReplaysMatchingCachedKeyframeToEveryViewer(t *testing.T) {
 			viewerB: {},
 		},
 	}
-	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"phoneUptimeMillis":10000}`)
+	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"phoneUptimeMillis":10000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
 	hub.setConfig(config)
 	keyframe := testTSF2FrameWithTimestamp(42, 77, true, 10000)
 	if !hub.recordFrame(keyframe) {
@@ -2539,11 +2424,11 @@ func TestBackgroundKeyframeQueueCoalescesAcrossReconnectingViewers(t *testing.T)
 	if backgroundStreamCommandRequiresDemand("keyframe", "control_code_result_marker_low_latency") {
 		t.Fatal("interactive control-code keyframes must bypass the background gate")
 	}
-	if !perViewerKeyframeRequired("phone_config_active_viewer") || !perViewerKeyframeRequired("frame_sequence_gap") || !perViewerKeyframeRequired("viewer_sequence_gap") {
-		t.Fatal("per-viewer decoder gaps must bypass only global live suppression")
+	if !perViewerKeyframeRequired("phone_config_active_viewer") || perViewerKeyframeRequired("frame_sequence_gap") || perViewerKeyframeRequired("viewer_sequence_gap") {
+		t.Fatal("only configuration recovery should bypass global live suppression")
 	}
-	if !backgroundKeyframeDedupEligible("phone_config_active_viewer") || !backgroundKeyframeDedupEligible("frame_sequence_gap") {
-		t.Fatal("per-viewer decoder gaps must retain global request coalescing")
+	if !backgroundKeyframeDedupEligible("phone_config_active_viewer") {
+		t.Fatal("configuration recovery must retain global request coalescing")
 	}
 
 	server = &Server{}
@@ -2560,41 +2445,6 @@ func TestBackgroundKeyframeQueueCoalescesAcrossReconnectingViewers(t *testing.T)
 	}
 	if !server.beginBackgroundKeyframe(now.Add(3*time.Millisecond), "phone_config_active_viewer:43") {
 		t.Fatal("new config epoch did not supersede the previous epoch cooldown")
-	}
-	server.finishBackgroundKeyframe()
-	if !server.beginBackgroundKeyframe(now.Add(4*time.Millisecond), "viewer_sequence_gap:1") {
-		t.Fatal("first broken GOP requirement was suppressed by the config cooldown")
-	}
-	server.finishBackgroundKeyframe()
-	if !server.beginBackgroundKeyframe(now.Add(5*time.Millisecond), "viewer_sequence_gap:2") {
-		t.Fatal("second broken GOP requirement was suppressed by the first GOP cooldown")
-	}
-	server.finishBackgroundKeyframe()
-
-	server = &Server{clients: map[*client]struct{}{}}
-	viewerA := &client{sessionID: "viewer-a", email: "viewer-a@example.test"}
-	viewerB := &client{sessionID: "viewer-b", email: "viewer-b@example.test"}
-	if !server.tryAddClient(viewerA) || !server.tryAddClient(viewerB) {
-		t.Fatal("distinct viewer fixtures were rejected")
-	}
-	if viewerA.videoKeyframeRequirementID == 0 || viewerA.videoKeyframeRequirementID == viewerB.videoKeyframeRequirementID {
-		t.Fatalf("viewer keyframe owners are not distinct: a=%d b=%d", viewerA.videoKeyframeRequirementID, viewerB.videoKeyframeRequirementID)
-	}
-	viewerARequirement := fmt.Sprintf("viewer_%d_sequence_gap:1", viewerA.videoKeyframeRequirementID)
-	viewerBRequirement := fmt.Sprintf("viewer_%d_sequence_gap:1", viewerB.videoKeyframeRequirementID)
-	if !server.beginBackgroundKeyframe(now, viewerARequirement) {
-		t.Fatal("viewer A gap should acquire a fresh gate")
-	}
-	server.finishBackgroundKeyframe()
-	if !server.beginBackgroundKeyframe(now.Add(time.Millisecond), viewerBRequirement) {
-		t.Fatal("viewer B gap collided with viewer A request generation")
-	}
-	server.finishBackgroundKeyframe()
-	if server.beginBackgroundKeyframe(now.Add(2*time.Millisecond), viewerARequirement) {
-		t.Fatal("A-B-A request pattern bypassed viewer A cooldown")
-	}
-	if !server.beginBackgroundKeyframe(now.Add(backgroundKeyframeMinInterval), viewerARequirement) {
-		t.Fatal("viewer A requirement did not expire after the cooldown")
 	}
 	server.finishBackgroundKeyframe()
 }
@@ -2614,18 +2464,14 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	}
 
 	now := time.Now()
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000}`))
 	server.direct.mu.Lock()
 	server.direct.streamEpoch = 7
 	server.direct.lastFrameAt = now
-	server.direct.lastKeyFrameAt = now
 	server.direct.lastFrameEpoch = 7
-	server.direct.lastKeyFrameEpoch = 7
 	server.direct.lastFrameSequence = 42
-	server.direct.lastKeyFrameSequence = 42
 	server.direct.lastFrameVisualAgeMillis = 100
-	server.direct.lastKeyFrameVisualAgeMillis = 100
 	server.direct.lastFrameVisualAgeKnown = true
-	server.direct.lastKeyFrameVisualAgeKnown = true
 	server.direct.lastBrowserMediaError = ""
 	server.direct.mu.Unlock()
 	server.backgroundKeyframeMu.Lock()
@@ -2645,15 +2491,15 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	if got := countPhoneSignalsWithin(phoneSignals, "recover_stream", 250*time.Millisecond); got != 0 {
 		t.Fatalf("live stream allowed background recovery commands: %d", got)
 	}
-	if err := server.requestPhoneKeyframeNow("frame_sequence_gap"); err != nil {
-		t.Fatalf("viewer-required sequence-gap keyframe returned error: %v", err)
+	if err := server.requestPhoneKeyframeNow("phone_config_active_viewer"); err != nil {
+		t.Fatalf("configuration-required keyframe returned error: %v", err)
 	}
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "viewer-required sequence-gap keyframe")
-	if err := server.requestPhoneKeyframeNow("frame_sequence_gap"); err != nil {
-		t.Fatalf("coalesced sequence-gap keyframe returned error: %v", err)
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "configuration-required keyframe")
+	if err := server.requestPhoneKeyframeNow("phone_config_active_viewer"); err != nil {
+		t.Fatalf("coalesced configuration keyframe returned error: %v", err)
 	}
 	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
-		t.Fatalf("viewer-required sequence gap bypassed keyframe coalescing: %d", got)
+		t.Fatalf("configuration keyframe bypassed request coalescing: %d", got)
 	}
 	server.backgroundKeyframeMu.Lock()
 	server.backgroundKeyframeInFlight = false

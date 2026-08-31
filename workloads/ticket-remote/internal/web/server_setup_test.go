@@ -633,7 +633,7 @@ func TestHTTPSResponsesIncludeSafetyHeaders(t *testing.T) {
 		}
 	}
 	csp := rec.Header().Get("Content-Security-Policy")
-	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'nonce-", "style-src 'self' 'nonce-", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self'"} {
+	for _, snippet := range []string{"default-src 'self'", "script-src 'self' 'nonce-", "worker-src 'none'", "style-src 'self' 'nonce-", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "connect-src 'self'"} {
 		if !strings.Contains(csp, snippet) {
 			t.Fatalf("CSP missing %q: %s", snippet, csp)
 		}
@@ -845,7 +845,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"ownerPublicId:localPublicID",
 		"codeResultArea.addEventListener('click'",
-		"setStatus('Kontroles kodu pieprasi ar pogu zem biļetes.')",
 		"window.TicketSpacetime.create",
 		"/api/v1/auth/session",
 		"/api/v1/auth/start",
@@ -860,23 +859,15 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"decoded_frame_render_failed",
 		"location.pathname==='/auth/callback'",
 		"location.replace('/')",
-		"screenEngaged=false",
-		"screenWakeLock=null",
-		"function engageTicketScreen(reason)",
-		"function requestScreenWakeLock(reason)",
-		"navigator.wakeLock.request('screen')",
-		"if(!screenWakeLock)return;const lock=screenWakeLock",
 		"function openControlCodeDialog()",
 		"document.exitFullscreen().catch",
 		"function layoutViewportRect()",
-		"const engagedOffset=screenEngaged?Math.round(Math.min(96,Math.max(24,height*.12))):0",
 		"function activeViewers(viewers)",
 		"function preserveCurrentFrame(reason)",
 		"function redrawPreservedFrame()",
 		"function streamStatusStale(status)",
 		"preserveCurrentFrame('stream_status_stale')",
 		"preserveCurrentFrame('configure_decoder')",
-		"Math.abs(dy)>=streamVerticalPanThresholdPx&&Math.abs(dy)>Math.abs(dx)*streamVerticalPanDominance",
 		"invalid_tsf2_frame",
 		"function findStartCode(data,from)",
 		"function configureDecoder(config, options)",
@@ -908,7 +899,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"lastPacketAt=0",
 		"lastDecodedFrameAt=0",
 		"latestStreamStatus=null",
-		"function handleScreenEngagementEvent(event)",
 		"relayReportToStreamStatus(state.relayCurrentReport)",
 		"function resetDecoderForRecovery(reason)",
 		"requestReason:reason",
@@ -920,8 +910,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"publishCurrentStreamFocus('public_connected')",
 		"spacetimeClient.heartbeat(active,active?'browser_stream_heartbeat':'browser_no_stream_heartbeat')",
 		"window.visualViewport",
-		"clientLog('stream_vertical_scroll', 'allowed')",
-		"canvas.addEventListener('dblclick'",
 		"idleDisconnected=false",
 		"idleDisconnectTimer=null",
 		"function expireViewerIdle(reason)",
@@ -940,6 +928,28 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	} {
 		if !staticContains(js, snippet) {
 			t.Fatalf("ticket viewer JS missing %q", snippet)
+		}
+	}
+	for _, forbidden := range []string{
+		"function handleScreenEngagementEvent(event)",
+		"function engageTicketScreen(reason)",
+		"navigator.wakeLock.request('screen')",
+		"requestTicketFullscreen",
+		"requestFullscreen(",
+		"webkitRequestFullscreen",
+		"function blockStreamGesture(event)",
+		"canvas.addEventListener('pointerdown'",
+		"canvas.addEventListener('pointermove'",
+		"canvas.addEventListener('pointerup'",
+		"canvas.addEventListener('pointercancel'",
+		"canvas.addEventListener('touchend'",
+		"canvas.addEventListener('dblclick'",
+		"gesturestart",
+		"gesturechange",
+		"gestureend",
+	} {
+		if staticContains(js, forbidden) {
+			t.Fatalf("ticket stream and document must not own custom gestures: found %q", forbidden)
 		}
 	}
 	foundFirstFrameSignals := false
@@ -987,8 +997,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	for _, snippet := range []string{
 		"touch-action:pan-y",
 		"scroll-snap-type:y proximity",
-		"body.screen-engaged",
-		"scroll-snap-type:none",
 		".shell{width:100%;min-height:var(--ticket-stage-height)",
 		".stage-page{width:100%;min-height:var(--ticket-stage-height)",
 		".stage{position:relative;z-index:1;width:100%;min-height:var(--ticket-stage-height)",
@@ -1003,7 +1011,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"-webkit-touch-callout:none",
 		"-webkit-tap-highlight-color:transparent",
 		".stream-resume-spinner",
-		".control-code-hotspot",
 		".control-code-result",
 		".code-dialog",
 		".code-dialog-field input",
@@ -1031,25 +1038,32 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			t.Fatalf("ticket viewer stream resume spinner should use top-left quick-spinner styling, found %q", snippet)
 		}
 	}
-	for _, snippet := range []string{
-		`id="controlCodeHotspot" class="control-code-hotspot"`,
-		`aria-label="Pieprasīt kontroles kodu"></button>`,
-		`background: rgba(0, 0, 0, 0.001);`,
-		`color: transparent;`,
-		`font-size: 0;`,
-		`top: 0;`,
-		`left: 0;`,
-		`width: var(--ticket-hotspot-width, 50vw);`,
-		`height: var(--ticket-hotspot-height, 25vh);`,
-		`.control-code-hotspot:focus-visible`,
-		`outline: 3px solid #8bb5ff;`,
+	for _, forbidden := range []string{
+		`control-code-close-hotspot`,
+		`screen-engaged`,
 	} {
-		if !strings.Contains(indexHTML, snippet) {
-			t.Fatalf("invisible control-code hotspot missing %q", snippet)
+		if strings.Contains(indexHTML, forbidden) || staticContains(js, forbidden) || strings.Contains(css, forbidden) {
+			t.Fatalf("ticket stream must not restore retired close or global engagement surfaces: found %q", forbidden)
 		}
 	}
-	if strings.Contains(indexHTML, `id="controlCodeHotspot" class="control-code-hotspot" type="button" aria-label="Pieprasīt kontroles kodu" tabindex="-1"`) {
-		t.Fatalf("visible control-code action must remain keyboard focusable")
+	if !strings.Contains(indexHTML, `<button id="controlCodeHotspot" class="control-code-hotspot" type="button" aria-label="Pieprasīt kontroles kodu"></button>`) {
+		t.Fatal("ticket viewer must expose an accessible top-left control-code start button")
+	}
+	for _, required := range []string{
+		`.control-code-hotspot { position: fixed`,
+		`top: 0`,
+		`left: 0`,
+		`width: var(--ticket-hotspot-width, 50vw)`,
+		`height: var(--ticket-hotspot-height, 25vh)`,
+		`border: 0`,
+		`color: transparent`,
+		`font-size: 0`,
+		`.control-code-hotspot:disabled`,
+		`pointer-events: none`,
+	} {
+		if !staticCSSContains(indexHTML, required) && !staticCSSContains(css, required) {
+			t.Fatalf("ticket viewer must expose the invisible accessible top-left control-code start surface, missing %q", required)
+		}
 	}
 	for _, visible := range []string{
 		`aria-label="Pieprasīt kontroles kodu">Kods</button>`,
@@ -1058,7 +1072,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`box-shadow: 0 4px 18px`,
 	} {
 		if strings.Contains(indexHTML, visible) {
-			t.Fatalf("control-code hotspot must not expose the old visible pill: %q", visible)
+			t.Fatalf("control-code start surface must remain visually invisible: %q", visible)
 		}
 	}
 	for _, snippet := range []string{
@@ -1066,7 +1080,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`id="streamResumeSpinner"`,
 		`id="controlCodeResultArea"`,
 		`class="control-code-result"`,
-		`id="controlCodeHotspot"`,
 		`id="requestControlCode"`,
 		`id="controlCodeDialog"`,
 		`id="controlCodeForm"`,
@@ -1139,19 +1152,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if !strings.Contains(indexHTML, `<script nonce="{{.Nonce}}" defer src="/static/app.js?v={{.AssetVersion}}"></script>`) {
 		t.Fatalf("ticket viewer must keep the app script versioned and cacheable")
 	}
-	for _, snippet := range []string{
-		`<style nonce="{{.Nonce}}">`,
-		`.control-code-hotspot`,
-		`.control-code-hotspot:focus-visible`,
-		`background: rgba(0, 0, 0, 0.001);`,
-		`color: transparent;`,
-		`opacity: 1;`,
-		`width: var(--ticket-hotspot-width, 50vw);`,
-		`height: var(--ticket-hotspot-height, 25vh);`,
-	} {
-		if !strings.Contains(indexHTML, snippet) {
-			t.Fatalf("ticket viewer HTML must preserve the invisible control-code hotspot, missing %q", snippet)
-		}
+	if !strings.Contains(indexHTML, `<style nonce="{{.Nonce}}">`) {
+		t.Fatal("ticket viewer HTML must keep its nonce-protected inline slider styles")
 	}
 	if !strings.Contains(serverGo, "assetVersionValue = serverVersion") {
 		t.Fatalf("ticket asset fallback version must follow the page version so public caches cannot keep an old app.js")
@@ -1293,9 +1295,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		}
 	}
 	for _, snippet := range []string{
-		"const streamLiveFreshMaxAgeMs = 1e3",
-		"const streamLiveOkMaxAgeMs = 1500",
-		"const streamDegradedMaxAgeMs = 2e3",
+		"const streamLiveFreshMaxAgeMs = 1250",
+		"const streamLiveOkMaxAgeMs = 2e3",
+		"const streamDegradedMaxAgeMs = 3e3",
 		"function freshnessStateForVisualAge(ageMs)",
 		"function currentRenderedFreshness(now)",
 		"function updateStreamFreshnessStatus(reason)",
@@ -1417,10 +1419,9 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"publicPresence=Array.isArray(state&&state.viewerPresence)",
 		"activeViewers(state&&state.viewers||[])",
-		"controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot)",
+		"requestCodeButton.addEventListener('click',()=>openControlCodeDialog())",
+		"controlCodeHotspot.addEventListener('click',requestControlCodeFromHotspot)",
 		"codeResultClose.addEventListener('click'",
-		"controlCodeHotspot.disabled=hotspotUnavailable",
-		"controlCodeHotspot.setAttribute('aria-disabled',hotspotUnavailable?'true':'false')",
 		"codeDialog.addEventListener('click'",
 		"event.key==='Escape'",
 	} {
@@ -1428,26 +1429,23 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 			t.Fatalf("control-code request flow missing %q", snippet)
 		}
 	}
-	hotspotStart := strings.Index(js, "function requestControlCodeFromHotspot(event)")
-	if hotspotStart < 0 {
-		t.Fatalf("control-code request hotspot handler missing")
-	}
-	hotspotEnd := strings.Index(js[hotspotStart:], "function relayReportToStreamStatus(report)")
-	if hotspotEnd < 0 {
-		t.Fatalf("control-code request hotspot handler boundary missing")
-	}
-	hotspotHandler := js[hotspotStart : hotspotStart+hotspotEnd]
-	if !strings.Contains(hotspotHandler, "closeCurrentControlCode(false)") {
-		t.Fatalf("top-left hotspot should close visible result without immediately opening a new request")
-	}
 	if strings.Contains(js, `refreshControlCodeReadiness("control_code_dialog_background_warmup")`) {
 		t.Fatalf("opening the control-code dialog must not launch preparation")
 	}
 	if strings.Contains(js, `reconnectVideoForRecovery("control_code_dialog_stream_warmup")`) {
 		t.Fatalf("opening the control-code dialog must not launch a second local video recovery")
 	}
-	if strings.Contains(hotspotHandler, "closeCurrentControlCode(true)") {
-		t.Fatalf("top-left hotspot should not immediately reopen the request dialog after closing a visible result")
+	for _, snippet := range []string{
+		"function requestControlCodeFromHotspot(event)",
+		"if(codeDialogOpen||!codeDialog.hidden||!codeResultArea.hidden||ticketRegisterOverlayOccupiesHotspot())return",
+		"if(controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
+		"const sliderOwnsHotspot=ticketRegisterOverlayOccupiesHotspot()",
+		"const hotspotUnavailable=busy||limitBlocked||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
+		"controlCodeHotspot.disabled=hotspotUnavailable",
+	} {
+		if !staticContains(js, snippet) {
+			t.Fatalf("control-code hotspot must be start-only and unavailable during busy/quota/slider/result states, missing %q", snippet)
+		}
 	}
 	resultClickStart := strings.Index(js, `codeResultArea.addEventListener("click"`)
 	if resultClickStart < 0 {

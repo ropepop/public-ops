@@ -11,18 +11,18 @@ import (
 )
 
 const (
-	liveFrameMaxAge             = 2000 * time.Millisecond
-	liveFreshMaxAge             = 1000 * time.Millisecond
-	liveOKMaxAge                = 1500 * time.Millisecond
-	warmStartFrameFreshness     = 750 * time.Millisecond
-	warmStartKeyFreshness       = 750 * time.Millisecond
-	bridgeForwardFrameMaxAge    = 750 * time.Millisecond
+	liveFrameMaxAge             = 3000 * time.Millisecond
+	liveFreshMaxAge             = 1250 * time.Millisecond
+	liveOKMaxAge                = 2000 * time.Millisecond
+	warmStartFrameFreshness     = 1250 * time.Millisecond
+	warmStartKeyFreshness       = 1250 * time.Millisecond
+	bridgeForwardFrameMaxAge    = 1250 * time.Millisecond
 	phoneClockCalibrationMaxAge = 5 * time.Second
 	phoneClockFutureTolerance   = 250 * time.Millisecond
 	phoneClockFutureAdjustMax   = 2 * time.Second
 	phoneClockUncertainty       = 100 * time.Millisecond
 	streamStartupGrace          = 8 * time.Second
-	latestFrameMode             = "live_latest_after_keyframe"
+	latestFrameMode             = "live_latest_all_intra"
 	tsf2HeaderBytes             = 29
 	tsf2Magic                   = uint32(0x54534632)
 	tsf2FlagKeyframe            = 1
@@ -30,6 +30,7 @@ const (
 	freshnessLiveOK             = "LIVE_OK"
 	freshnessDegraded           = "DEGRADED"
 	freshnessStale              = "STALE"
+	frameDependencyModeAllIntra = "all_intra"
 )
 
 var (
@@ -56,41 +57,42 @@ type directStreamHub struct {
 	phoneReconnects    uint64
 	phoneStartTimeouts uint64
 
-	codec            string
-	transport        string
-	width            int
-	height           int
-	rootCapture      bool
-	streamEpoch      uint64
-	configGeneration uint64
+	codec                  string
+	transport              string
+	width                  int
+	height                 int
+	rootCapture            bool
+	streamEpoch            uint64
+	configGeneration       uint64
+	frameDependencyMode    string
+	fps                    int
+	sourceFPS              int
+	keyframeIntervalFrames int
+	allIntraConfigValid    bool
 
 	lastConfig []byte
 
-	framesForwarded             uint64
-	keyframesForwarded          uint64
-	deltaFramesForwarded        uint64
-	sourceFramesReceived        uint64
-	droppedStaleFrames          uint64
-	droppedInvalidFrames        uint64
-	droppedWrongEpochFrames     uint64
-	droppedUncalibratedFrames   uint64
-	droppedForwardAgeFrames     uint64
-	droppedTimestampFrames      uint64
-	droppedFutureClockFrames    uint64
-	lastConfigAt                time.Time
-	lastFrameAt                 time.Time
-	lastKeyFrameAt              time.Time
-	lastVideoClientAt           time.Time
-	lastFrameEpoch              uint64
-	lastKeyFrameEpoch           uint64
-	lastFrameSequence           uint64
-	lastKeyFrameSequence        uint64
-	lastFrame                   []byte
-	lastKeyFrame                []byte
-	lastFrameVisualAgeMillis    int64
-	lastKeyFrameVisualAgeMillis int64
-	lastFrameVisualAgeKnown     bool
-	lastKeyFrameVisualAgeKnown  bool
+	framesForwarded              uint64
+	keyframesForwarded           uint64
+	sourceFramesReceived         uint64
+	droppedStaleFrames           uint64
+	droppedInvalidFrames         uint64
+	droppedWrongEpochFrames      uint64
+	droppedUncalibratedFrames    uint64
+	droppedForwardAgeFrames      uint64
+	droppedTimestampFrames       uint64
+	droppedFutureClockFrames     uint64
+	droppedUnexpectedDeltaFrames uint64
+	allIntraConfigMismatches     uint64
+	droppedAllIntraConfigFrames  uint64
+	lastConfigAt                 time.Time
+	lastFrameAt                  time.Time
+	lastVideoClientAt            time.Time
+	lastFrameEpoch               uint64
+	lastFrameSequence            uint64
+	lastFrame                    []byte
+	lastFrameVisualAgeMillis     int64
+	lastFrameVisualAgeKnown      bool
 
 	lastPhoneUptimeMillis       int64
 	lastPhoneClockBridgeAt      time.Time
@@ -194,19 +196,23 @@ func (h *directStreamHub) recordPhoneStartFailure(err error) {
 	h.lastPhoneStartErrorAt = time.Now()
 }
 
-func (h *directStreamHub) setConfig(raw []byte) {
+func (h *directStreamHub) setConfig(raw []byte) bool {
 	var payload struct {
-		Type              string `json:"type"`
-		Codec             string `json:"codec"`
-		Transport         string `json:"transport"`
-		Width             int    `json:"width"`
-		Height            int    `json:"height"`
-		RootCapture       bool   `json:"rootCapture"`
-		StreamEpoch       uint64 `json:"streamEpoch"`
-		PhoneUptimeMillis int64  `json:"phoneUptimeMillis"`
+		Type                   string `json:"type"`
+		Codec                  string `json:"codec"`
+		Transport              string `json:"transport"`
+		Width                  int    `json:"width"`
+		Height                 int    `json:"height"`
+		RootCapture            bool   `json:"rootCapture"`
+		StreamEpoch            uint64 `json:"streamEpoch"`
+		PhoneUptimeMillis      int64  `json:"phoneUptimeMillis"`
+		FrameDependencyMode    string `json:"frameDependencyMode"`
+		FPS                    int    `json:"fps"`
+		SourceFPS              int    `json:"sourceFps"`
+		KeyframeIntervalFrames int    `json:"keyframeIntervalFrames"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil || payload.Type != "config" {
-		return
+		return false
 	}
 	now := time.Now()
 	h.mu.Lock()
@@ -217,12 +223,29 @@ func (h *directStreamHub) setConfig(raw []byte) {
 	h.height = payload.Height
 	h.rootCapture = payload.RootCapture
 	h.streamEpoch = payload.StreamEpoch
+	h.frameDependencyMode = strings.ToLower(strings.TrimSpace(payload.FrameDependencyMode))
+	h.fps = payload.FPS
+	h.sourceFPS = payload.SourceFPS
+	h.keyframeIntervalFrames = payload.KeyframeIntervalFrames
+	h.allIntraConfigValid = h.frameDependencyMode == frameDependencyModeAllIntra &&
+		payload.FPS == 1 && payload.SourceFPS == 1 && payload.KeyframeIntervalFrames == 1
 	h.configGeneration++
-	h.lastConfig = append(h.lastConfig[:0], raw...)
 	h.lastConfigAt = now
 	if payload.PhoneUptimeMillis > 0 {
 		h.recordPhoneClockLocked(payload.PhoneUptimeMillis, now)
 	}
+	if !h.allIntraConfigValid {
+		h.allIntraConfigMismatches++
+		h.lastConfig = nil
+		h.lastFrame = nil
+		h.lastFrameAt = time.Time{}
+		h.lastFrameEpoch = 0
+		h.lastFrameSequence = 0
+		h.lastFrameVisualAgeKnown = false
+		return false
+	}
+	h.lastConfig = append(h.lastConfig[:0], raw...)
+	return true
 }
 
 func (h *directStreamHub) recordPhoneClock(phoneUptimeMillis int64, receivedAt time.Time) {
@@ -260,7 +283,6 @@ func (h *directStreamHub) recordFrameForBroadcast(frame []byte) ([]byte, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	meta := parseTSF2(frame)
-	keyFrame := frameIsKeyframe(frame)
 	h.sourceFramesReceived++
 	if !meta.ok {
 		h.dropFrameLocked("invalid")
@@ -268,6 +290,14 @@ func (h *directStreamHub) recordFrameForBroadcast(frame []byte) ([]byte, bool) {
 	}
 	if meta.ok && h.streamEpoch != 0 && meta.epoch != h.streamEpoch {
 		h.dropFrameLocked("wrong_epoch")
+		return nil, false
+	}
+	if !h.allIntraConfigValid {
+		h.dropFrameLocked("all_intra_config_mismatch")
+		return nil, false
+	}
+	if !meta.keyFrame {
+		h.dropFrameLocked("unexpected_delta")
 		return nil, false
 	}
 	captureWall, visualAgeMillis, dropReason, ok := h.estimateFrameCaptureWallLocked(meta, now)
@@ -288,17 +318,7 @@ func (h *directStreamHub) recordFrameForBroadcast(frame []byte) ([]byte, bool) {
 	h.lastFrameVisualAgeMillis = visualAgeMillis
 	h.lastFrameVisualAgeKnown = true
 	h.lastFrame = append(h.lastFrame[:0], forwarded...)
-	if keyFrame {
-		h.keyframesForwarded++
-		h.lastKeyFrameAt = now
-		h.lastKeyFrameEpoch = meta.epoch
-		h.lastKeyFrameSequence = meta.sequence
-		h.lastKeyFrameVisualAgeMillis = visualAgeMillis
-		h.lastKeyFrameVisualAgeKnown = true
-		h.lastKeyFrame = append(h.lastKeyFrame[:0], forwarded...)
-	} else {
-		h.deltaFramesForwarded++
-	}
+	h.keyframesForwarded++
 	h.lastBrowserMediaError = ""
 	return forwarded, true
 }
@@ -318,6 +338,10 @@ func (h *directStreamHub) dropFrameLocked(reason string) {
 		h.droppedTimestampFrames++
 	case "future_clock":
 		h.droppedFutureClockFrames++
+	case "unexpected_delta":
+		h.droppedUnexpectedDeltaFrames++
+	case "all_intra_config_mismatch":
+		h.droppedAllIntraConfigFrames++
 	}
 }
 
@@ -331,24 +355,7 @@ func (h *directStreamHub) warmStart() (config []byte, keyFrame []byte) {
 	if !h.warmKeyFrameAllowedLocked(now) {
 		return h.provisionalConfigLocked(), nil
 	}
-	return append([]byte(nil), h.lastConfig...), append([]byte(nil), h.lastKeyFrame...)
-}
-
-// experimentalWarmStart keeps the real encoder epoch in the independent-image
-// configuration even when the cached keyframe is too old to replay. Unlike the
-// normal decoder, the HDR image path can wait for the next keyframe without a
-// provisional zero-epoch decoder configuration.
-func (h *directStreamHub) experimentalWarmStart() (config []byte, keyFrame []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.streamEpoch == 0 || len(h.lastConfig) == 0 {
-		return nil, nil
-	}
-	config = append([]byte(nil), h.lastConfig...)
-	if h.warmKeyFrameAllowedLocked(time.Now()) {
-		keyFrame = append([]byte(nil), h.lastKeyFrame...)
-	}
-	return config, keyFrame
+	return append([]byte(nil), h.lastConfig...), append([]byte(nil), h.lastFrame...)
 }
 
 // warmEncoderReusable proves that prewarm is joining the same live encoder,
@@ -459,15 +466,12 @@ func (h *directStreamHub) warmKeyFrameAllowedLocked(now time.Time) bool {
 		return false
 	}
 	frameVisualAgeMillis, frameVisualAgeKnown := h.currentFrameVisualAgeMillisLocked(now)
-	keyFrameVisualAgeMillis, keyFrameVisualAgeKnown := h.currentKeyFrameVisualAgeMillisLocked(now)
 	return now.Sub(h.lastFrameAt) <= warmStartFrameFreshness &&
 		frameVisualAgeKnown &&
 		time.Duration(frameVisualAgeMillis)*time.Millisecond <= warmStartFrameFreshness &&
-		len(h.lastKeyFrame) > 0 &&
-		h.lastKeyFrameEpoch == h.streamEpoch &&
-		now.Sub(h.lastKeyFrameAt) <= warmStartKeyFreshness &&
-		keyFrameVisualAgeKnown &&
-		time.Duration(keyFrameVisualAgeMillis)*time.Millisecond <= warmStartKeyFreshness
+		len(h.lastFrame) > 0 &&
+		h.lastFrameEpoch == h.streamEpoch &&
+		time.Duration(frameVisualAgeMillis)*time.Millisecond <= warmStartKeyFreshness
 }
 
 func (h *directStreamHub) estimateFrameCaptureWallLocked(meta tsf2Metadata, now time.Time) (time.Time, int64, string, bool) {
@@ -524,7 +528,7 @@ func (h *directStreamHub) currentFrameVisualAgeMillisLocked(now time.Time) (int6
 }
 
 func (h *directStreamHub) currentKeyFrameVisualAgeMillisLocked(now time.Time) (int64, bool) {
-	return currentVisualAgeMillis(now, h.lastKeyFrameAt, h.lastKeyFrameVisualAgeMillis, h.lastKeyFrameVisualAgeKnown)
+	return h.currentFrameVisualAgeMillisLocked(now)
 }
 
 func currentVisualAgeMillis(now time.Time, observedAt time.Time, observedAgeMillis int64, known bool) (int64, bool) {
@@ -612,13 +616,20 @@ func (h *directStreamHub) snapshot(now time.Time, phoneHealth phone.Health) map[
 	status["width"] = h.width
 	status["height"] = h.height
 	status["rootCapture"] = h.rootCapture
+	status["frameDependencyMode"] = h.frameDependencyMode
+	status["fps"] = h.fps
+	status["sourceFps"] = h.sourceFPS
+	status["keyframeIntervalFrames"] = h.keyframeIntervalFrames
+	status["allIntraConfigAdvertised"] = h.frameDependencyMode == frameDependencyModeAllIntra
+	status["allIntraConfigValid"] = h.allIntraConfigValid
+	status["allIntraConfigMismatchCount"] = h.allIntraConfigMismatches
 	status["videoConnections"] = h.videoConnections
 	status["phoneReconnects"] = h.phoneReconnects
 	setTelemetryTimeFields(status, now, "lastConfigAt", h.lastConfigAt)
 	setTelemetryTimeFields(status, now, "lastFrameAt", h.lastFrameAt)
 	status["lastFrameSequence"] = h.lastFrameSequence
-	setTelemetryTimeFields(status, now, "lastKeyFrameAt", h.lastKeyFrameAt)
-	status["lastKeyFrameSequence"] = h.lastKeyFrameSequence
+	setTelemetryTimeFields(status, now, "lastKeyFrameAt", h.lastFrameAt)
+	status["lastKeyFrameSequence"] = h.lastFrameSequence
 	setTelemetryTimeFields(status, now, "lastVideoClientAt", h.lastVideoClientAt)
 	status["warmConfigSends"] = h.warmConfigSends
 	status["warmKeyFrameSends"] = h.warmKeyFrameSends
@@ -649,6 +660,13 @@ func (h *directStreamHub) streamStatusPayloadLocked(now time.Time, phoneHealth p
 	live := verdict == "live" && frameVisualAgeKnown && freshnessState != freshnessStale
 	return map[string]any{
 		"mode":                            latestFrameMode,
+		"frameDependencyMode":             h.frameDependencyMode,
+		"fps":                             h.fps,
+		"sourceFps":                       h.sourceFPS,
+		"keyframeIntervalFrames":          h.keyframeIntervalFrames,
+		"allIntraConfigAdvertised":        h.frameDependencyMode == frameDependencyModeAllIntra,
+		"allIntraConfigValid":             h.allIntraConfigValid,
+		"allIntraConfigMismatchCount":     h.allIntraConfigMismatches,
 		"streamVerdict":                   verdict,
 		"freshnessState":                  freshnessState,
 		"live":                            live,
@@ -663,7 +681,7 @@ func (h *directStreamHub) streamStatusPayloadLocked(now time.Time, phoneHealth p
 		"futureClockAdjustments":          h.phoneClockFutureAdjustments,
 		"framesForwarded":                 h.framesForwarded,
 		"keyframesForwarded":              h.keyframesForwarded,
-		"deltaFramesForwarded":            h.deltaFramesForwarded,
+		"deltaFramesForwarded":            uint64(0),
 		"sourceFramesReceived":            h.sourceFramesReceived,
 		"droppedStaleFrames":              h.droppedStaleFrames,
 		"droppedInvalidFrames":            h.droppedInvalidFrames,
@@ -672,15 +690,17 @@ func (h *directStreamHub) streamStatusPayloadLocked(now time.Time, phoneHealth p
 		"droppedForwardAgeFrames":         h.droppedForwardAgeFrames,
 		"droppedTimestampFrames":          h.droppedTimestampFrames,
 		"droppedFutureClockFrames":        h.droppedFutureClockFrames,
+		"droppedUnexpectedDeltaFrames":    h.droppedUnexpectedDeltaFrames,
+		"droppedAllIntraConfigFrames":     h.droppedAllIntraConfigFrames,
 		"dropReasons":                     h.dropReasonsLocked(),
 		"lastFrameAgoMillis":              ageSinceMillis(now, h.lastFrameAt),
-		"lastKeyFrameAgoMillis":           ageSinceMillis(now, h.lastKeyFrameAt),
+		"lastKeyFrameAgoMillis":           ageSinceMillis(now, h.lastFrameAt),
 		"lastFrameVisualAgeKnown":         frameVisualAgeKnown,
 		"lastFrameVisualAgeMillis":        frameVisualAgeMillis,
 		"lastKeyFrameVisualAgeKnown":      keyFrameVisualAgeKnown,
 		"lastKeyFrameVisualAgeMillis":     keyFrameVisualAgeMillis,
 		"lastFrameSequence":               h.lastFrameSequence,
-		"lastKeyFrameSequence":            h.lastKeyFrameSequence,
+		"lastKeyFrameSequence":            h.lastFrameSequence,
 		"activeVideoClients":              h.activeVideoClients,
 		"streamEpoch":                     h.streamEpoch,
 		"phoneConnected":                  phoneHealth.Connected,
@@ -706,23 +726,27 @@ func (h *directStreamHub) streamStatus(now time.Time, phoneHealth phone.Health) 
 
 func (h *directStreamHub) dropReasonsLocked() map[string]uint64 {
 	return map[string]uint64{
-		"invalid":      h.droppedInvalidFrames,
-		"wrong_epoch":  h.droppedWrongEpochFrames,
-		"uncalibrated": h.droppedUncalibratedFrames,
-		"forward_age":  h.droppedForwardAgeFrames,
-		"timestamp":    h.droppedTimestampFrames,
-		"future_clock": h.droppedFutureClockFrames,
+		"invalid":                   h.droppedInvalidFrames,
+		"wrong_epoch":               h.droppedWrongEpochFrames,
+		"uncalibrated":              h.droppedUncalibratedFrames,
+		"forward_age":               h.droppedForwardAgeFrames,
+		"timestamp":                 h.droppedTimestampFrames,
+		"future_clock":              h.droppedFutureClockFrames,
+		"unexpected_delta":          h.droppedUnexpectedDeltaFrames,
+		"all_intra_config_mismatch": h.droppedAllIntraConfigFrames,
 	}
 }
 
 func (h *directStreamHub) streamVerdictLocked(now time.Time, phoneHealth phone.Health) string {
 	frameAge := ageSinceMillis(now, h.lastFrameAt)
-	keyFrameAge := ageSinceMillis(now, h.lastKeyFrameAt)
+	keyFrameAge := ageSinceMillis(now, h.lastFrameAt)
 	hasMediaError := strings.TrimSpace(h.lastBrowserMediaError) != ""
 	frameVisualAgeMillis, frameVisualAgeKnown := h.currentFrameVisualAgeMillisLocked(now)
 	hasFreshVisual := frameVisualAgeKnown &&
 		time.Duration(frameVisualAgeMillis)*time.Millisecond <= liveFrameMaxAge
 	switch {
+	case !h.allIntraConfigValid:
+		return "invalid_source_config"
 	case h.activeVideoClients == 0 && hasFreshVisual && phoneHealth.Desired && phoneHealth.Connected && phoneHealth.StreamState == "streaming":
 		return "live"
 	case h.activeVideoClients == 0:
@@ -761,13 +785,6 @@ func freshnessStateForVisualAgeMillis(visualAgeMillis int64, known bool) string 
 	}
 }
 
-func frameIsKeyframe(frame []byte) bool {
-	if meta := parseTSF2(frame); meta.ok {
-		return meta.keyFrame
-	}
-	return len(frame) > 0 && frame[0] == 1
-}
-
 func parseTSF2(frame []byte) tsf2Metadata {
 	if len(frame) < tsf2HeaderBytes || binary.BigEndian.Uint32(frame[0:4]) != tsf2Magic {
 		return tsf2Metadata{}
@@ -787,13 +804,6 @@ func rewriteTSF2Timestamp(frame []byte, timestamp uint64) []byte {
 		binary.BigEndian.PutUint64(out[21:29], timestamp)
 	}
 	return out
-}
-
-func chooseLatestPendingVideoFrame(existing []byte, existingKeyFrame bool, next []byte, nextKeyFrame bool) ([]byte, bool) {
-	if len(existing) > 0 && existingKeyFrame && !nextKeyFrame {
-		return existing, true
-	}
-	return next, nextKeyFrame
 }
 
 func ageSinceMillis(now time.Time, at time.Time) int64 {

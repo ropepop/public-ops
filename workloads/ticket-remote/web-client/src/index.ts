@@ -21,6 +21,21 @@ type TicketClientHandlers = {
   onSnapshotApplied?: () => void;
 };
 
+export type TicketHDREngine = "client_webgpu_v2";
+export const TICKET_HDR_DISPLAY_BOOSTS = [2, 3, 4, 5, 6] as const;
+export type TicketHDRDisplayBoost = typeof TICKET_HDR_DISPLAY_BOOSTS[number];
+
+function ticketHDREngine(value: unknown): TicketHDREngine {
+  return "client_webgpu_v2";
+}
+
+function ticketHDRDisplayBoost(value: unknown): TicketHDRDisplayBoost {
+  const boost = Number(value);
+  return TICKET_HDR_DISPLAY_BOOSTS.includes(boost as TicketHDRDisplayBoost)
+    ? boost as TicketHDRDisplayBoost
+    : 4;
+}
+
 const STREAM_FOCUS_REFRESH_MS = 30000;
 
 function pickAccessor<T = any>(source: any, candidates: string[]): T {
@@ -311,6 +326,32 @@ class TicketSpacetimeClient {
     });
   }
 
+  setHDREngine(engine: TicketHDREngine): Promise<void> {
+    return this.callReducer("ownerSetHdrEngine", {
+      ticketId: this.cfg.ticketId,
+      engine: ticketHDREngine(engine),
+    });
+  }
+
+  refreshHDREngineState(): Promise<void> {
+    return this.callReducer("memberRefreshHdrEngineState", {
+      ticketId: this.cfg.ticketId,
+    });
+  }
+
+  setHDRDisplayBoost(selectedDisplayBoost: TicketHDRDisplayBoost): Promise<void> {
+    return this.callReducer("ownerSetHdrDisplayBoost", {
+      ticketId: this.cfg.ticketId,
+      selectedDisplayBoost: ticketHDRDisplayBoost(selectedDisplayBoost),
+    });
+  }
+
+  refreshHDRBoostState(): Promise<void> {
+    return this.callReducer("memberRefreshHdrBoostState", {
+      ticketId: this.cfg.ticketId,
+    });
+  }
+
   refreshLimitState(): Promise<void> {
     return this.callReducer("memberRefreshLimitState", {
       ticketId: this.cfg.ticketId,
@@ -443,6 +484,12 @@ class TicketSpacetimeClient {
         void this.refreshHDRState().catch((error) => {
           this.handlers.onStatus?.("hdr_refresh_failed", error && String(error));
         });
+        void this.refreshHDREngineState().catch((error) => {
+          this.handlers.onStatus?.("hdr_engine_refresh_failed", error && String(error));
+        });
+        void this.refreshHDRBoostState().catch((error) => {
+          this.handlers.onStatus?.("hdr_boost_refresh_failed", error && String(error));
+        });
       })
       .subscribe([
         `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
@@ -457,6 +504,8 @@ class TicketSpacetimeClient {
         `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
         `SELECT * FROM ticketremote_ticket_slider_region_v3 WHERE id = ${backendRow}`,
         `SELECT * FROM ticketremote_member_hdr_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
+        `SELECT * FROM ticketremote_member_hdr_engine_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
+        `SELECT * FROM ticketremote_member_hdr_boost_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
         `SELECT * FROM ticketremote_member_limit_state WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       ]);
   }
@@ -485,6 +534,15 @@ class TicketSpacetimeClient {
     const memberHDRState = tableRows(tableAccessor(db, "member_hdr_state"))
       .find((row) => rowTicketId(row) === this.cfg.ticketId &&
         String(row.accountScopeId || row.account_scope_id || "") === validAccountScopeId(this.cfg.accountScopeId)) || null;
+    const memberHDREngineState = tableRows(tableAccessor(db, "member_hdr_engine_state"))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId &&
+        String(row.accountScopeId || row.account_scope_id || "") === validAccountScopeId(this.cfg.accountScopeId)) || null;
+    const memberHDREngine = ticketHDREngine(memberHDREngineState && memberHDREngineState.engine);
+    const memberHDRBoostState = tableRows(tableAccessor(db, "member_hdr_boost_state"))
+      .find((row) => rowTicketId(row) === this.cfg.ticketId &&
+        String(row.accountScopeId || row.account_scope_id || "") === validAccountScopeId(this.cfg.accountScopeId)) || null;
+    const memberHDRDisplayBoost = ticketHDRDisplayBoost(memberHDRBoostState &&
+      (memberHDRBoostState.selectedDisplayBoost ?? memberHDRBoostState.selected_display_boost));
     const activationDecisions = tableRows(tableAccessor(db, "activation_decision"))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
       .map((row) => ({
@@ -672,6 +730,18 @@ class TicketSpacetimeClient {
         updatedAt: String(memberHDRState.updatedAt || memberHDRState.updated_at || ""),
         serverAt: String(memberHDRState.serverAt || memberHDRState.server_at || ""),
       } : null,
+      memberHDREngine: {
+        engine: memberHDREngine,
+        ownerProjectionAvailable: Boolean(memberHDREngineState),
+        updatedAt: String(memberHDREngineState && (memberHDREngineState.updatedAt || memberHDREngineState.updated_at) || ""),
+        serverAt: String(memberHDREngineState && (memberHDREngineState.serverAt || memberHDREngineState.server_at) || ""),
+      },
+      memberHDRBoost: {
+        selectedDisplayBoost: memberHDRDisplayBoost,
+        accountProjectionAvailable: Boolean(memberHDRBoostState),
+        updatedAt: String(memberHDRBoostState && (memberHDRBoostState.updatedAt || memberHDRBoostState.updated_at) || ""),
+        serverAt: String(memberHDRBoostState && (memberHDRBoostState.serverAt || memberHDRBoostState.server_at) || ""),
+      },
       activationDecisions,
       ticketActions,
       ticketAction: ticketActions[0] || null,
@@ -728,7 +798,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_limit_state"]
+    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state"]
       .map((name) => tableAccessor(source, name));
   }
 

@@ -352,10 +352,10 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 
 	for _, needle := range []string{
 		"const controlCodeCapturePollMs = 100;",
-		"const controlCodeResultInitialKeyframeDelayMs = 1200;",
+		"const controlCodeResultInitialKeyframeDelayMs = 1250;",
 		"const controlCodeCaptureKeyframeRetryMs = 5000;",
 		"const controlCodeCaptureKeyframeRetryLimit = 2;",
-		"const controlCodeLowLatencyVisualAgeMs = 750;",
+		"const controlCodeLowLatencyVisualAgeMs = 1250;",
 		"const controlCodeLowLatencyDecodeQueueLimit = 1;",
 		"const keyframeCommandMinIntervalMs = 2500;",
 		"let lastKeyframeCommandAt = 0;",
@@ -710,6 +710,11 @@ func TestTicketViewerDoesNotRaceInitialResumeBurstWithEarlySocketAdoption(t *tes
 		strings.Contains(idleResumeBody, "requestKeyframeDebounced(") {
 		t.Fatal("idle resume must start one bounded recovery burst, not a duplicate watchdog cascade")
 	}
+	for _, needle := range []string{"lastHiddenAt = 0;", "lastHiddenWallAt = 0;"} {
+		if !strings.Contains(idleResumeBody, needle) {
+			t.Fatalf("idle resume must consume pending hidden lifecycle state: missing %q", needle)
+		}
+	}
 	if strings.Count(visibilityResumeBody, "claimActivationResumeLifecycle(") != 1 ||
 		strings.Contains(visibilityResumeBody, "startActivationResumeFlow(") {
 		t.Fatal("visibility resume must reuse one paused recovery burst, not start a second watchdog cascade")
@@ -789,6 +794,7 @@ let idleDisconnected = false;
 let idleDisconnectTimer = null;
 let hiddenStreamFocusTimer = null;
 let hiddenDecoderTransientLogged = false;
+let experimentalMediaLifecycleArmed = false;
 let lastHiddenAt = 0;
 let lastHiddenWallAt = 0;
 let hasRenderedFrame = false;
@@ -826,6 +832,8 @@ function clearTimeout() {}
 function scheduleViewerIdleDisconnect() {}
 function resumeFromIdleDisconnect(reason) {
   if (!idleDisconnected) return false;
+  lastHiddenAt = 0;
+  lastHiddenWallAt = 0;
   idleDisconnected = false;
   idleResumes += 1;
   const flow = startActivationResumeFlow(reason || 'idle_resume', 'idle_resume');
@@ -833,6 +841,7 @@ function resumeFromIdleDisconnect(reason) {
   return true;
 }
 function scheduleStreamFeedback() {}
+function noteExperimentalMediaForegroundPulse() {}
 function cancelTicketSliderFromLifecycle() {}
 function releaseScreenWakeLock() {}
 function pauseHiddenStreamAfterGrace() {}
@@ -844,6 +853,8 @@ function streamHasFreshRenderedFrame() { return false; }
 function recoverAfterVisibilityResume(reason) {
   const flow = claimActivationResumeLifecycle(reason, 'visibility_resume');
   if (!flow) return false;
+  lastHiddenAt = 0;
+  lastHiddenWallAt = 0;
   recoveryRuns += 1;
   runActivationReconnectBurst(reason, flow);
   return true;
@@ -852,7 +863,9 @@ function recoverAfterVisibilityResume(reason) {
 	startActivationResumeFlow('initial_load', 'initial_load');
 	check(keyframeRequests === 0, 'initial load must wait for the server ordered keyframe');
 	handlers.pageshow({ persisted: false, isTrusted: true });
+	document.wasDiscarded = true;
 	handlers.focus();
+	document.wasDiscarded = false;
 	check(keyframeRequests === 0 && recoveryRuns === 0, 'ordinary pageshow and focus must follow the initial-load owner');
 
 document.visibilityState = 'hidden';
@@ -875,12 +888,30 @@ check(recoveryRuns === 2, 'persisted pageshow then focus must run one recovery')
 check(exhaustedRecoveries === 0, 'persisted restore must not inherit an exhausted hidden budget');
 check(limitRefreshes === 1, 'the visibility resume must refresh the database-backed limits once');
 
+document.visibilityState = 'hidden';
+handlers.visibilitychange();
+now += 20000;
+document.visibilityState = 'visible';
+ticketCurrentProofVisualState.resumePending = false;
+handlers.focus();
+check(recoveryRuns === 3, 'focus-only restore must run the full hidden lifecycle recovery');
+check(keyframeRequests === 3, 'focus-only restore must request one recovery keyframe');
+check(ticketCurrentProofVisualState.resumePending,
+  'focus-only restore must refresh the current ticket proof');
+check(lastHiddenAt === 0 && lastHiddenWallAt === 0,
+  'focus-only restore must consume the hidden lifecycle timestamps');
+
 activeResumeFlow = null;
 idleDisconnected = true;
+lastHiddenAt = now;
+lastHiddenWallAt = 100000 + now;
 const recoveriesBeforeIdleFocus = recoveryRuns;
 handlers.focus();
 check(idleResumes === 1, 'idle focus must resume exactly once');
 check(recoveryRuns === recoveriesBeforeIdleFocus, 'idle focus must return before a second lifecycle recovery');
+handlers.focus();
+check(idleResumes === 1 && recoveryRuns === recoveriesBeforeIdleFocus,
+  'clustered focus after idle resume must not start a second hidden lifecycle recovery');
 `)
 }
 
@@ -956,6 +987,9 @@ func TestTicketViewerPersistedPagehideKeepsHiddenGraceAndRapidRestoreCancelsIt(t
 	pageshow := substringBetween(t, source,
 		"window.addEventListener('pageshow', (event) => {",
 		"  window.addEventListener('focus', () => {")
+	focus := substringBetween(t, source,
+		"window.addEventListener('focus', () => {",
+		"  window.addEventListener('pagehide', (event) => {")
 	pagehide := substringBetween(t, source,
 		"window.addEventListener('pagehide', (event) => {",
 		"  window.addEventListener('load', () => keepFirstScreenPinned(true));")
@@ -983,6 +1017,7 @@ const window = { addEventListener: (name, fn) => { handlers[name] = fn; } };
 const document = { visibilityState: 'hidden', wasDiscarded: false };
 const WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
 const hiddenVideoCloseDelayMs = 3000;
+let experimentalMediaLifecycleArmed = false;
 const backgroundRecoveryHiddenMs = 30000;
 const oldTabFreshResumeHiddenMs = 5000;
 const streamStaleVideoReconnectMs = 5000;
@@ -1084,7 +1119,9 @@ function reconnectVideoForRecovery() {}
 function chaseLiveStream() {}
 function noteViewerActivity() { return false; }
 function followActivationResumeLifecycle() {}
-`+hiddenPause+freshRecovery+reconnectBurst+recovery+pageshow+pagehide+`
+function resumeExperimentalMediaForLifecycle() {}
+function noteExperimentalMediaForegroundPulse() {}
+`+hiddenPause+freshRecovery+reconnectBurst+recovery+pageshow+focus+pagehide+`
 
 handlers.pagehide({ persisted: true });
 pauseHiddenStreamAfterGrace('chase_live_stream_hidden');
@@ -1164,13 +1201,52 @@ handlers.pageshow({ persisted: true, isTrusted: true });
 check(closes === closesBeforeConnectingRestore + 1, 'overlong cached CONNECTING socket must close once on persisted pageshow');
 check(opens === opensBeforeConnectingRestore + 1, 'overlong cached CONNECTING socket must open one replacement');
 check(videoWs !== connectingSocket && videoWs.readyState === WebSocket.OPEN, 'overlong cached CONNECTING socket must recover to a new open socket');
+
+document.visibilityState = 'hidden';
+configured = false;
+lastFrameAt = 0;
+videoWs = { readyState: WebSocket.OPEN, generation: videoSocketOpenSeq };
+handlers.pagehide({ persisted: true });
+advance(oldTabFreshResumeHiddenMs + 1);
+document.visibilityState = 'visible';
+const closesBeforeFocusRestore = closes;
+const opensBeforeFocusRestore = opens;
+handlers.focus();
+const focusSocket = videoWs;
+check(opens === opensBeforeFocusRestore + 1, 'focus-only restore must open one replacement socket');
+check(lastHiddenAt === 0 && lastHiddenWallAt === 0, 'focus-only restore must clear hidden timestamps');
+advance(2000);
+check(videoWs === focusSocket, 'focus-only follow-up must retain the first replacement socket');
+check(opens === opensBeforeFocusRestore + 1, 'focus-only follow-up must not open a second socket');
+check(closes === closesBeforeFocusRestore + 1, 'focus-only follow-up must not close the replacement socket');
+
+document.visibilityState = 'hidden';
+configured = false;
+lastFrameAt = 0;
+videoWs = { readyState: WebSocket.CONNECTING, generation: videoSocketOpenSeq };
+videoSocketCreatedAt = clock - resumeSoftReconnectMs - 1;
+lastRecoveryVideoReconnectSeq = videoSocketOpenSeq;
+lastRecoveryVideoReconnectAt = clock - 100;
+const focusConnectingSocket = videoWs;
+handlers.pagehide({ persisted: true });
+advance(1000);
+document.visibilityState = 'visible';
+const closesBeforeFocusConnecting = closes;
+const opensBeforeFocusConnecting = opens;
+handlers.focus();
+check(closes === closesBeforeFocusConnecting + 1,
+  'focus-only restore must close an overlong CONNECTING socket despite the reuse debounce');
+check(opens === opensBeforeFocusConnecting + 1,
+  'focus-only restore must open one replacement for an overlong CONNECTING socket');
+check(videoWs !== focusConnectingSocket && videoWs.readyState === WebSocket.OPEN,
+  'focus-only restore must not retain the overlong CONNECTING socket');
 `)
 }
 
-func TestTicketEarlySocketRetainsFreshKeyframeAcrossDelayedAdoption(t *testing.T) {
+func TestTicketEarlySocketRetainsOnlyNewestIndependentFrame(t *testing.T) {
 	template := ticketIndexTemplate(t)
 	earlyQueue := substringBetween(t, template,
-		"var earlyMaxFrames = 8;",
+		"var earlyMaxBytes = 2 * 1024 * 1024;",
 		"      function streamURL() {")
 
 	runTicketJavaScript(t, `
@@ -1179,10 +1255,10 @@ const wallStart = 1000000;
 const performance = { now: () => monotonic };
 const originalDateNow = Date.now;
 Date.now = () => wallStart + monotonic + 10000;
-const early = { config: { data: '{"type":"config"}' }, queue: [], queueBytes: 0, firstCaptureAt: 0, lastCaptureAt: 0 };
+const early = { config: null, frameDependencyMode: '', queue: [], queueBytes: 0, firstCaptureAt: 0, lastCaptureAt: 0, error: false };
 function check(value, message) { if (!value) throw new Error(message); }
-function frame(key, sequence, capturedAt) {
-  const raw = new ArrayBuffer(30);
+function frame(key, sequence, capturedAt, byteLength) {
+  const raw = new ArrayBuffer(byteLength || 30);
   const view = new DataView(raw);
   view.setUint32(0, 0x54534632);
   view.setUint8(4, key ? 1 : 0);
@@ -1196,21 +1272,31 @@ function frame(key, sequence, capturedAt) {
   return { data: raw };
 }
 `+earlyQueue+`
+earlyEnqueue({ data: JSON.stringify({ type: 'config', frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 }) });
 earlyEnqueue(frame(true, 1, monotonic));
 monotonic = 110; earlyEnqueue(frame(false, 2, monotonic));
-monotonic = 210; earlyEnqueue(frame(false, 3, monotonic));
-monotonic = 310; earlyEnqueue(frame(false, 4, monotonic));
 check(early.queue.length === 1 && early.queue[0].meta.key && early.queue[0].meta.sequence === 1,
-  'delayed adoption must retain the fresh keyframe after trimming dependent deltas');
-check(early.config && early.config.data.includes('config'), 'decoder config must survive delayed queue trimming');
-monotonic = 410; earlyEnqueue(frame(false, 5, monotonic));
-check(early.queue.length === 1 && early.queue[0].meta.sequence === 1,
-  'later deltas with a trimmed dependency must not evict the retained keyframe');
-monotonic = 510; earlyEnqueue(frame(true, 10, monotonic));
+  'early all-intra socket admitted an unexpected delta');
+monotonic = 210; earlyEnqueue(frame(true, 10, monotonic));
 check(early.queue.length === 1 && early.queue[0].meta.sequence === 10,
-  'a newer keyframe must replace the retained GOP');
-monotonic = 2011; earlyEnqueue(frame(false, 11, monotonic));
-check(early.queue.length === 0, 'a retained keyframe must still expire at the bounded freshness limit');
+  'newest independent frame did not replace the previous frame');
+monotonic = 310; earlyEnqueue(frame(true, 9, monotonic));
+check(early.queue.length === 1 && early.queue[0].meta.sequence === 10,
+  'older independent frame replaced newer sequence authority');
+monotonic = 410; earlyEnqueue(frame(true, 11, monotonic, earlyMaxBytes + 1));
+check(early.queue.length === 1 && early.queue[0].meta.sequence === 10,
+  'oversized frame replaced the bounded retained frame');
+check(early.config && early.config.data.includes('all_intra'), 'decoder config did not survive frame replacement');
+
+earlyEnqueue({ data: JSON.stringify({ type: 'config', frameDependencyMode: 'gop', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 }) });
+check(early.error === true && early.config === null && early.queue.length === 0,
+  'early socket did not fail closed on an unknown dependency mode');
+earlyEnqueue({ data: JSON.stringify({ type: 'config', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 }) });
+check(early.error === true && early.config === null,
+  'early socket admitted a config without explicit all-intra mode');
+earlyEnqueue({ data: JSON.stringify({ type: 'config', frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 2 }) });
+check(early.error === true && early.config === null,
+  'early socket admitted a non-1/1/1 all-intra config');
 Date.now = originalDateNow;
 	`)
 }
@@ -1221,8 +1307,8 @@ func TestTicketEarlySocketRevalidatesRetainedKeyframeWhenClaimed(t *testing.T) {
 	claimEarly := substringBetween(t, source,
 		"function claimableEarlyVideoQueue(early) {",
 		"  function scheduleViewerIdleDisconnect(reason) {")
-	if !strings.Contains(template, "early.maxKeyframeAgeMs = earlyMaxKeyframeAgeMs;") {
-		t.Fatal("head socket must expose its retained-keyframe freshness bound to the app claim path")
+	if !strings.Contains(template, "early.maxFrameAgeMs = earlyMaxFrameAgeMs;") {
+		t.Fatal("head socket must expose its independent-frame freshness bound to the app claim path")
 	}
 
 	runTicketJavaScript(t, `
@@ -1238,13 +1324,17 @@ function makeEarly(receivedAt) {
   return {
     ws: { readyState: WebSocket.OPEN, close() {} },
     config: { data: '{"type":"config"}' },
-    queue: [{
-      data: new ArrayBuffer(30),
-      meta: { key: true, epoch: 1, sequence: 1, timestamp: (wallStart + receivedAt) * 1000 },
-      receivedAt
-    }],
-    queueBytes: 30,
-    maxKeyframeAgeMs: 1500,
+	    queue: [{
+	      data: new ArrayBuffer(30),
+	      meta: { key: true, epoch: 1, sequence: 1, timestamp: (wallStart + receivedAt) * 1000 },
+	      receivedAt
+	    }, {
+	      data: new ArrayBuffer(30),
+	      meta: { key: true, epoch: 1, sequence: 2, timestamp: (wallStart + receivedAt + 1) * 1000 },
+	      receivedAt: receivedAt + 1
+	    }],
+	    queueBytes: 60,
+	    maxFrameAgeMs: 1250,
     openedAt: receivedAt,
     claimed: false,
     error: false,
@@ -1256,9 +1346,11 @@ const freshEarly = makeEarly(10);
 window.TICKET_EARLY_VIDEO = freshEarly;
 const freshClaim = claimEarlyVideoSocket();
 check(freshClaim && freshClaim.queued.length === 2,
-  'fresh claim must retain decoder config and the retained keyframe');
+  'fresh claim must retain decoder config and only the newest independent frame');
+check(freshClaim.queued[1].meta.sequence === 2,
+  'claim path did not select the newest independent frame');
 
-monotonic = 1600;
+monotonic = 1300;
 const expiredEarly = makeEarly(10);
 window.TICKET_EARLY_VIDEO = expiredEarly;
 const expiredClaim = claimEarlyVideoSocket();
@@ -1298,7 +1390,7 @@ let serverClockHasLiveSample = true;
 let serverClockSkewMs = -10000;
 let freshnessQueries = 0;
 let currentStreamEpoch = 1;
-let lastDecoderConfig = { streamEpoch: 1 };
+let lastDecoderConfig = { streamEpoch: 1, frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 let lastPacketSequence = 0;
 let lastPacketSequenceAdvancedAt = 0;
 let lastPacketTimestamp = 0;
@@ -1315,7 +1407,8 @@ let decoderRejectedFrames = 0;
 let resyncDroppedFrames = 0;
 let avcAdapterTried = true;
 const streamDecoderQueueHardLimit = 4;
-const streamIngressFrameMaxAgeMs = 2000;
+const streamIngressFrameMaxAgeMs = 1250;
+const recoveryKeyframeDebounceMs = 2000;
 const frames = [];
 const decoded = [];
 const resetReasons = [];
@@ -1350,7 +1443,7 @@ function switchToAvcAdapter() {}
   check(decoded.length === 1 && decoded[0] === 1, 'old painted canvas rejected a valid incoming keyframe');
   check(freshnessQueries === 0, 'incoming frame path consulted rendered canvas age');
 
-  frames.push({ kind: 'delta', epoch: 1, sequence: 2, timestamp: (wallStart + now - 3000) * 1000, data: new Uint8Array([2]) });
+  frames.push({ kind: 'key', epoch: 1, sequence: 2, timestamp: (wallStart + now - 1500) * 1000, data: new Uint8Array([2]) });
   await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
   check(decoded.length === 1, 'genuinely stale incoming frame reached the decoder');
   check(needsKeyFrame, 'genuinely stale incoming frame did not enter keyframe-only recovery');
@@ -1395,7 +1488,7 @@ const document = { visibilityState: 'visible' };
 let serverClockHasLiveSample = true;
 let serverClockSkewMs = 0;
 let currentStreamEpoch = 0;
-let lastDecoderConfig = { streamEpoch: 0, provisional: true, codec: 'avc1.42C028' };
+let lastDecoderConfig = { streamEpoch: 0, provisional: true, codec: 'avc1.42C028', frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 let lastPacketSequence = 0;
 let lastPacketSequenceAdvancedAt = 0;
 let lastPacketTimestamp = 0;
@@ -1407,13 +1500,13 @@ let needsKeyFrame = true;
 let lastFeedbackSentAt = 0;
 let lastDecodedFrameSequence = 0;
 let lastRenderedFrameSequence = 0;
-let lastRenderedKeyframeSequence = 0;
 let feedbackSentCount = 0;
 let feedbackSendFailureCount = 0;
 let feedbackImmediateKey = '';
 const streamFeedbackVersion = 1;
 const streamFeedbackIntervalMs = 500;
 const streamFeedbackHiddenIntervalMs = 2000;
+const recoveryKeyframeDebounceMs = 2000;
 let sentFeedback = null;
 const videoWs = {
   readyState: WebSocket.OPEN,
@@ -1421,8 +1514,10 @@ const videoWs = {
 };
 const decoder = { decodeQueueSize: 0 };
 function check(value, message) { if (!value) throw new Error(message); }
-function requestKeyframeDebounced() { throw new Error('unexpected keyframe request'); }
+const keyframeReasons = [];
+function requestKeyframeDebounced(reason) { keyframeReasons.push(reason); return true; }
 function scheduleStreamFeedback() {}
+function sendVideoClientLog() {}
 function clampFeedbackNumber(value, max) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
@@ -1432,6 +1527,8 @@ function currentRenderedFreshness() { return { visualAgeMillis: 0 }; }
 `+acceptFrame+sendFeedback+`
 const delta = { kind: 'delta', epoch: 42, sequence: 1, timestamp: (wallStart + now) * 1000 };
 check(acceptFreshFrame(delta) === false, 'provisional decoder bound to a delta frame');
+check(keyframeReasons.length === 1 && keyframeReasons[0] === 'all_intra_delta_rejected',
+  'unexpected delta did not request one independent refresh');
 check(currentStreamEpoch === 0 && lastDecoderConfig.streamEpoch === 0,
   'rejected delta changed the provisional epoch');
 
@@ -1440,9 +1537,14 @@ check(acceptFreshFrame(keyframe) === true, 'fresh recovery keyframe was rejected
 check(currentStreamEpoch === 42, 'first recovery keyframe did not bind the live epoch');
 check(lastDecoderConfig.streamEpoch === 42 && lastDecoderConfig.provisional === false,
   'decoder recovery config retained the provisional epoch');
+check(keyframeReasons.length === 1, 'accepted independent frame requested another refresh');
+lastDecodedFrameSequence = 2;
+lastRenderedFrameSequence = 2;
 check(sendStreamFeedback('recovery_keyframe', true) === true, 'bound-epoch feedback was not sent');
 check(sentFeedback && sentFeedback.epoch === 42,
   'feedback advertised provisional epoch 0 after the live keyframe');
+check(sentFeedback.renderedKeyframeSequence === 2,
+  'rolling compatibility field did not mirror the latest rendered independent frame');
 
 const wrongEpochKeyframe = { kind: 'key', epoch: 43, sequence: 3, timestamp: (wallStart + now) * 1000 };
 check(acceptFreshFrame(wrongEpochKeyframe) === false,
@@ -1452,10 +1554,109 @@ Date.now = originalDateNow;
 `)
 }
 
+func TestTicketViewerRequiresStrictAllIntraAndAcceptsIndependentSequenceGaps(t *testing.T) {
+	source := ticketAppSource(t)
+	acceptFrame := substringBetween(t, source,
+		"function acceptFreshFrame(frame) {",
+		"  function queueFrameMetadata(frame) {")
+	configureDecoder := substringBetween(t, source,
+		"async function configureDecoder(config, options) {",
+		"  function configureAvcDecoderFromDescription(config, description) {")
+
+	for _, needle := range []string{
+		"frameDependencyMode !== 'all_intra'",
+		"Number(config.fps) !== 1",
+		"Number(config.sourceFps) !== 1",
+		"Number(config.keyframeIntervalFrames) !== 1",
+	} {
+		if !strings.Contains(configureDecoder, needle) {
+			t.Fatalf("decoder config must fail closed unless all-intra 1/1/1 is explicit, missing %q", needle)
+		}
+	}
+	if strings.Contains(acceptFrame, "frame_sequence_gap") || strings.Contains(acceptFrame, "lastAcceptedFrameSequence + 1") {
+		t.Fatal("independent all-intra pictures must not require contiguous source sequences")
+	}
+
+	runTicketJavaScript(t, `
+let now = 100;
+const wallStart = 1000000;
+const performance = { now: () => now };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + now;
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = 0;
+let currentStreamEpoch = 7;
+let lastDecoderConfig = { streamEpoch: 7, frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
+let lastPacketSequence = 0;
+let lastPacketSequenceAdvancedAt = 0;
+let lastPacketTimestamp = 0;
+let lastAcceptedFrameSequence = 0;
+let lastAcceptedFrameTimestamp = 0;
+let lastAcceptedFrameReceivedAt = 0;
+let lastAcceptedFrameVisualAgeMillis = 0;
+let needsKeyFrame = true;
+const recoveryKeyframeDebounceMs = 2000;
+const keyframeReasons = [];
+const feedbackReasons = [];
+const logEvents = [];
+function check(value, message) { if (!value) throw new Error(message); }
+function requestKeyframeDebounced(reason) { keyframeReasons.push(reason); return true; }
+function scheduleStreamFeedback(reason) { feedbackReasons.push(reason); }
+function sendVideoClientLog(event) { logEvents.push(event); }
+`+acceptFrame+`
+const key = { kind: 'key', epoch: 7, sequence: 1, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(key) === true, 'all-intra keyframe was rejected');
+const delta = { kind: 'delta', epoch: 7, sequence: 2, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(delta) === false, 'all-intra delta was accepted');
+check(lastAcceptedFrameSequence === 1 && needsKeyFrame === true,
+  'all-intra delta changed accepted sequence authority');
+check(keyframeReasons.length === 1 && keyframeReasons[0] === 'all_intra_delta_rejected',
+  'all-intra delta did not request bounded recovery');
+check(feedbackReasons.length === 1 && logEvents[0] === 'invalid_tsf2_frame',
+  'all-intra delta rejection was not observable');
+
+const gappedIndependent = { kind: 'key', epoch: 7, sequence: 10, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(gappedIndependent) === true,
+  'independently decodable frame was rejected because its source sequence had a gap');
+check(lastAcceptedFrameSequence === 10 && needsKeyFrame === false,
+  'gapped independent frame did not become decoder authority');
+const olderIndependent = { kind: 'key', epoch: 7, sequence: 9, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(olderIndependent) === false,
+  'older independent frame replaced the newest sequence authority');
+
+lastDecoderConfig = { streamEpoch: 7, fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
+needsKeyFrame = false;
+const missingModeKey = { kind: 'key', epoch: 7, sequence: 11, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(missingModeKey) === false,
+  'config without explicit all-intra mode was accepted');
+check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
+  'missing dependency mode changed accepted sequence authority');
+
+lastDecoderConfig = { streamEpoch: 7, frameDependencyMode: 'gop', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
+needsKeyFrame = false;
+const unknownModeKey = { kind: 'key', epoch: 7, sequence: 12, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(unknownModeKey) === false,
+  'main viewer admitted a frame under an unknown nonempty dependency mode');
+check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
+  'unknown dependency mode changed accepted sequence authority');
+check(keyframeReasons.length === 3 && keyframeReasons[1] === 'all_intra_config_rejected' && keyframeReasons[2] === 'all_intra_config_rejected',
+  'invalid all-intra configs did not request bounded recovery');
+
+lastDecoderConfig = { streamEpoch: 7, frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 2 };
+needsKeyFrame = false;
+const wrongCadenceKey = { kind: 'key', epoch: 7, sequence: 13, timestamp: (wallStart + now) * 1000 };
+check(acceptFreshFrame(wrongCadenceKey) === false,
+  'main viewer admitted a non-1/1/1 all-intra config');
+check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
+  'wrong all-intra cadence changed accepted sequence authority');
+Date.now = originalDateNow;
+`)
+}
+
 func TestTicketViewerRenderedAgeUsesCalibratedIngressAge(t *testing.T) {
 	source := ticketAppSource(t)
 	renderFrame := substringBetween(t, source,
-		"function renderDecodedFrame(frame, source) {",
+		"function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {",
 		"  async function configureDecoder(config, options) {")
 
 	runTicketJavaScript(t, `
@@ -1479,6 +1680,8 @@ let lastRenderedFrameRenderedAt = 0;
 let lastRenderedFrameVisualAgeMillis = 0;
 let lastRenderedFrameEpoch = 0;
 let lastRenderedFrameSequence = 0;
+let lastRenderedPresentationOrdinal = 0;
+let authoritativeSDRRenderSerial = 0;
 let lastRenderedKeyframeSequence = 0;
 let lastRenderedFrameTimestamp = 0;
 let firstFrameReceived = false;
@@ -1486,8 +1689,12 @@ let hasRenderedFrame = false;
 let firstRenderedTraceSent = false;
 let needsKeyFrame = false;
 let currentState = null;
+let decoderGeneration = 1;
+let experimentalClientHDRController = null;
 let firstFrameDetail = null;
 let closes = 0;
+const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
+const experimentalMediaState = { enabled: false, engine: 'client_webgpu_v2' };
 const canvas = { width: 720, height: 1482 };
 const ctx = { drawImage() {} };
 const frame = { close() { closes += 1; } };
@@ -1502,6 +1709,7 @@ const metadata = {
   queuedAt: 90
 };
 function check(value, message) { if (!value) throw new Error(message); }
+function controlCodePresentationPriorityActive() { return false; }
 function shiftFrameMetadata() { throw new Error('explicit metadata was ignored'); }
 function resetFirstFrameServerRecovery() {}
 function sendVideoSocketClientLog(event, detail) {
@@ -1510,6 +1718,7 @@ function sendVideoSocketClientLog(event, detail) {
 function maybeCaptureControlCodeResultImage() {}
 function hideEmpty() {}
 function updateStreamFreshnessStatus() {}
+function noteExperimentalMediaForegroundFrame() {}
 function renderTicketInteraction() {}
 function updateControlCodeSubmitAvailability() {}
 function publishStreamDebug() {}
@@ -1530,18 +1739,185 @@ Date.now = originalDateNow;
 `)
 }
 
-func TestTicketViewerRejectsTrimmedGOPGapUntilRecoveryKeyframe(t *testing.T) {
+func TestTicketViewerCoordinatedHDRCommitGuardsPriorityAndDecoderGeneration(t *testing.T) {
 	source := ticketAppSource(t)
-	template := ticketIndexTemplate(t)
-	earlyQueue := substringBetween(t, template,
-		"var earlyMaxFrames = 8;",
-		"      function streamURL() {")
+	renderFrame := substringBetween(t, source,
+		"function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {",
+		"  async function configureDecoder(config, options) {")
+
+	for _, needle := range []string{
+		"const controlCodePriority = controlCodePresentationPriorityActive();",
+		"experimentalClientHDRController.markSDRStale('control_code_priority');",
+		"if (!renderOptions.coordinatedCommit && !controlCodePriority && clientHDRCanCoordinateDecodedFrame()) {",
+		"const coordinatedDecoderGeneration = decoderGeneration;",
+		"if (coordinatedDecoderGeneration !== decoderGeneration) return false;",
+		"if (Number(lastRenderedFrameEpoch || 0) === epoch && Number(lastRenderedFrameSequence || 0) >= sequence) return false;",
+		"if (renderOptions.coordinatedCommit && controlCodePriority) hdrMetadata.skipHDRCommit = true;",
+		"Object.assign(candidate, committed);",
+		"if (!renderOptions.coordinatedCommit && !controlCodePriority) {",
+	} {
+		if !strings.Contains(renderFrame, needle) {
+			t.Fatalf("coordinated browser HDR handoff is missing %q", needle)
+		}
+	}
+	if strings.Contains(renderFrame,
+		"candidate.presentationOrdinal || 0) === Number(lastRenderedPresentationOrdinal || 0) + 1") {
+		t.Fatal("a provisional HDR ordinal must not reject a newer decoded frame at SDR commit time")
+	}
+	priority := strings.Index(renderFrame, "experimentalClientHDRController.markSDRStale('control_code_priority');")
+	draw := strings.Index(renderFrame, "ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);")
+	if priority < 0 || draw < 0 || priority > draw {
+		t.Fatal("control-code priority must latch the SDR fallback before drawing its authoritative frame")
+	}
+}
+
+func TestTicketViewerCoordinatedHDRCommitUsesLiveOrdinalAndHonorsLifecycle(t *testing.T) {
+	source := ticketAppSource(t)
+	renderFrame := substringBetween(t, source,
+		"function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {",
+		"  async function configureDecoder(config, options) {")
+
+	runTicketJavaScript(t, `
+let now = 100;
+const wallStart = 1000000;
+const performance = { now: () => ++now };
+const originalDateNow = Date.now;
+Date.now = () => wallStart + now;
+let serverClockHasLiveSample = true;
+let serverClockSkewMs = 0;
+let currentStreamEpoch = 7;
+let decoderGeneration = 3;
+let lastFrameAt = 0;
+let lastDecodedFrameAt = 0;
+let lastDecodedFrameSequence = 0;
+let lastAcceptedFrameSequence = 4;
+let lastAcceptedFrameReceivedAt = 90;
+let lastAcceptedFrameQueuedAt = 95;
+let lastRenderedFrameReceivedAt = 0;
+let lastRenderedFrameQueuedAt = 0;
+let lastRenderedFrameRenderedAt = 0;
+let lastRenderedFrameVisualAgeMillis = 0;
+let lastRenderedFrameEpoch = 7;
+let lastRenderedFrameSequence = 4;
+let lastRenderedPresentationOrdinal = 3;
+let authoritativeSDRRenderSerial = 3;
+let lastRenderedKeyframeSequence = 4;
+let lastRenderedFrameTimestamp = 0;
+let firstFrameReceived = true;
+let hasRenderedFrame = true;
+let firstRenderedTraceSent = true;
+let needsKeyFrame = false;
+let currentState = null;
+let priority = false;
+let experimentalMediaPresentationRegionBlocked = false;
+let experimentalMediaPresentationRecoveryPending = false;
+let offered = [];
+let events = [];
+const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
+const experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
+const experimentalClientHDRController = {
+  canCoordinateSDRFrame() { return true; },
+  offerFrame(frame, metadata, options) {
+    offered.push({ metadata: { ...metadata }, commitSDR: options && options.commitSDR });
+    return true;
+  },
+  noteSDRFrame() { throw new Error('coordinated or priority frame was re-offered'); },
+  markSDRStale(reason) {
+    events.push('stale:' + reason);
+    priority = false;
+  }
+};
+const canvas = { width: 720, height: 1482 };
+const ctx = { drawImage() { events.push('draw'); } };
+function controlCodePresentationPriorityActive() { return priority; }
+function experimentalHDRSurfacePresentationAllowed() { return true; }
+function check(value, message) { if (!value) throw new Error(message); }
+function shiftFrameMetadata() { throw new Error('explicit metadata was ignored'); }
+function resetFirstFrameServerRecovery() {}
+function sendVideoSocketClientLog() {}
+function maybeCaptureControlCodeResultImage() {}
+function hideEmpty() {}
+function updateStreamFreshnessStatus() {}
+function noteExperimentalMediaForegroundFrame() {}
+function renderTicketInteraction() {}
+function observeTicketCurrentProofFrame() {}
+function updateControlCodeSubmitAvailability() {}
+function publishStreamDebug() {}
+function scheduleStreamFeedback() {}
+function sendVideoClientLog() {}
+function preserveCurrentFrame() {}
+function showStreamRecovery() {}
+function requestKeyframe() {}
+`+renderFrame+`
+const metadata = (sequence) => ({
+  epoch: 7,
+  sequence,
+  timestamp: (wallStart + now) * 1000,
+  visualAgeMillis: 10,
+  visualAgeKnown: true,
+  receivedAt: 90,
+  queuedAt: 95
+});
+let sourceCloses = 0;
+const sourceFrame = { close() { sourceCloses += 1; } };
+const provisional = renderDecodedFrame(sourceFrame, 'annexb', metadata(5));
+check(provisional.presentationOrdinal === 4 && sourceCloses === 1 && events.length === 0,
+  'coordinated offer painted SDR early or did not release the decoder frame exactly once');
+check(offered.length === 1 && typeof offered[0].commitSDR === 'function',
+  'coordinated offer did not retain its SDR commit callback');
+
+lastRenderedPresentationOrdinal = 9;
+let ownedCloses = 0;
+const ownedFrame = { close() { ownedCloses += 1; } };
+const candidate = { ...offered[0].metadata };
+const committed = offered[0].commitSDR(ownedFrame, candidate);
+check(committed && committed.presentationOrdinal === 10 && candidate.presentationOrdinal === 10,
+  'coordinated commit kept the provisional ordinal instead of the live SDR ordinal');
+check(lastRenderedFrameSequence === 5 && events.join(',') === 'draw' && ownedCloses === 0,
+  'coordinated commit did not paint once or stole the controller-owned frame');
+check(offered.length === 1, 'coordinated SDR commit re-offered its frame to the GPU');
+
+const lifecycleFrame = { close() { sourceCloses += 1; } };
+renderDecodedFrame(lifecycleFrame, 'annexb', metadata(6));
+check(offered.length === 2 && sourceCloses === 2, 'second coordinated frame was not accepted cleanly');
+decoderGeneration += 1;
+const drawsBeforeLifecycleCommit = events.length;
+check(offered[1].commitSDR(ownedFrame, { ...offered[1].metadata }) === false,
+  'old decoder generation was allowed to commit');
+check(events.length === drawsBeforeLifecycleCommit,
+  'invalidated decoder generation painted stale SDR');
+
+priority = true;
+events = [];
+let priorityCloses = 0;
+const priorityFrame = { close() { priorityCloses += 1; } };
+renderDecodedFrame(priorityFrame, 'annexb', metadata(7));
+check(events.join(',') === 'stale:control_code_priority,draw',
+  'control-code priority did not hide HDR before its SDR draw');
+check(offered.length === 2 && priorityCloses === 1,
+  'control-code priority re-offered the frame or did not close it exactly once');
+
+priority = false;
+renderDecodedFrame({ close() { sourceCloses += 1; } }, 'annexb', metadata(8));
+check(offered.length === 3, 'post-priority coordinated frame was not offered');
+priority = true;
+events = [];
+const priorityCandidate = { ...offered[2].metadata };
+const bypassed = offered[2].commitSDR(ownedFrame, priorityCandidate);
+check(events.join(',') === 'stale:control_code_priority,draw',
+  'late control-code priority did not hide HDR before coordinated SDR commit');
+check(bypassed && bypassed.skipHDRCommit === true && priorityCandidate.skipHDRCommit === true,
+  'late control-code priority did not remain latched after its state changed during the draw');
+check(offered.length === 3, 'priority coordinated commit re-offered its frame to the GPU');
+Date.now = originalDateNow;
+`)
+}
+
+func TestTicketViewerAcceptsSourceSequenceGapsBetweenIndependentFrames(t *testing.T) {
+	source := ticketAppSource(t)
 	parseFrame := substringBetween(t, source,
 		"function readUint64(view, offset) {",
 		"  function isAppleWebKit() {")
-	keyframePolicy := substringBetween(t, source,
-		"function liveStreamSuppressesBackgroundRequest(reason) {",
-		"  function requestServerRecoveryDebounced(reason, force) {")
 	acceptFrame := substringBetween(t, source,
 		"function acceptFreshFrame(frame) {",
 		"  function queueFrameMetadata(frame) {")
@@ -1557,15 +1933,13 @@ const originalDateNow = Date.now;
 Date.now = () => wallStart + monotonic;
 let serverClockHasLiveSample = true;
 let serverClockSkewMs = 0;
-const early = { config: { data: '{"type":"config"}' }, queue: [], queueBytes: 0, firstCaptureAt: 0, lastCaptureAt: 0 };
 const FRAME_ENVELOPE_MAGIC = 0x54534632;
 const FRAME_ENVELOPE_HEADER_BYTES = 29;
 const streamDecoderQueueHardLimit = 4;
-const streamIngressFrameMaxAgeMs = 2000;
+const streamIngressFrameMaxAgeMs = 1250;
 const recoveryKeyframeDebounceMs = 2000;
-const keyframeCommandMinIntervalMs = 2500;
-const streamFirstFrameKeyframeMs = 2000;
 let currentStreamEpoch = 1;
+let lastDecoderConfig = { streamEpoch: 1, frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 let lastPacketSequence = 0;
 let lastPacketSequenceAdvancedAt = 0;
 let lastPacketTimestamp = 0;
@@ -1580,14 +1954,9 @@ let decoderMode = 'annexb';
 let decoderRejectedFrames = 0;
 let resyncDroppedFrames = 0;
 let avcAdapterTried = true;
-let lastKeyframeCommandAt = 0;
-let lastRecoveryKeyframeAt = 0;
-let hasRenderedFrame = false;
-let activeResumeFlow = { trigger: 'initial_load', done: false, startedAt: 10 };
 let videoWs = null;
-let lastFrameAt = 0;
-let keyframeMutations = 0;
 const decoded = [];
+const keyframeReasons = [];
 const decoder = {
   decodeQueueSize: 0,
   decode: () => { decoded.push(lastAcceptedFrameSequence); }
@@ -1610,49 +1979,37 @@ function frame(key, sequence, capturedAt) {
   view.setUint32(25, timestamp >>> 0);
   return { data: raw };
 }
-function streamHasFreshRenderedFrame() { return true; }
-function clientLog() {}
-function runSpacetimeMutation(callback) {
-  keyframeMutations += 1;
-  callback({ requestKeyframe() {} });
-  return Promise.resolve();
-}
+function requestKeyframeDebounced(reason) { keyframeReasons.push(reason); return true; }
+function requestKeyframe(reason) { keyframeReasons.push(reason); return true; }
 function scheduleStreamFeedback() {}
 function queueFrameMetadata() {}
 function clearFrameMetadata() {}
 function resetDecoderForRecovery() { return false; }
-function currentRenderedFreshness() { return { visualAgeMillis: 0 }; }
 function decodeAvcFrame() { throw new Error('unexpected AVC path'); }
 function sendVideoClientLog() {}
-function showUnsupported(message) { throw new Error(message); }
 function switchToAvcAdapter() {}
-`+earlyQueue+parseFrame+keyframePolicy+acceptFrame+handleMessage+`
+`+parseFrame+acceptFrame+handleMessage+`
 ;(async () => {
-  earlyEnqueue(frame(true, 1, monotonic));
-  monotonic = 110; earlyEnqueue(frame(false, 2, monotonic));
-  monotonic = 210; earlyEnqueue(frame(false, 3, monotonic));
-  monotonic = 310; earlyEnqueue(frame(false, 4, monotonic));
-  check(early.queue.length === 1 && early.queue[0].meta.sequence === 1,
-    'test setup did not trim the early GOP to its retained keyframe');
-
-  await handleVideoSocketMessage(early.queue[0]);
-  check(decoded.join(',') === '1', 'retained keyframe was not decoded');
-
-  monotonic = 410;
-  await handleVideoSocketMessage(frame(false, 5, monotonic));
-  check(decoded.join(',') === '1', 'noncontiguous live delta reached the decoder');
-  check(lastAcceptedFrameSequence === 1 && needsKeyFrame, 'sequence gap did not enter keyframe-only recovery');
-  check(keyframeMutations === 1, 'sequence gap did not request one bounded recovery keyframe');
-
-  await handleVideoSocketMessage(frame(false, 6, monotonic));
-  check(keyframeMutations === 1, 'repeated gapped deltas bypassed the recovery debounce');
-  check(resyncDroppedFrames === 2, 'gapped deltas were not counted as resync drops');
-
-  monotonic = 600;
+  await handleVideoSocketMessage(frame(true, 1, monotonic));
+  monotonic = 110;
   await handleVideoSocketMessage(frame(true, 10, monotonic));
+  check(decoded.join(',') === '1,10', 'source sequence gap rejected an independent frame');
+  check(lastAcceptedFrameSequence === 10 && !needsKeyFrame,
+    'newest gapped independent frame did not become decoder authority');
+
+  monotonic = 210;
   await handleVideoSocketMessage(frame(false, 11, monotonic));
-  check(decoded.join(',') === '1,10,11', 'recovery keyframe did not restore exact delta continuity');
-  check(!needsKeyFrame && lastAcceptedFrameSequence === 11, 'recovery did not return the viewer to flowing state');
+  check(decoded.join(',') === '1,10', 'delta frame reached the all-intra decoder');
+  check(lastAcceptedFrameSequence === 10 && needsKeyFrame,
+    'delta frame changed accepted sequence authority');
+  check(keyframeReasons.join(',') === 'all_intra_delta_rejected',
+    'delta rejection did not request one bounded independent refresh');
+
+  monotonic = 310;
+  await handleVideoSocketMessage(frame(true, 20, monotonic));
+  check(decoded.join(',') === '1,10,20', 'fresh independent frame did not recover after rejected delta');
+  check(lastAcceptedFrameSequence === 20 && !needsKeyFrame,
+    'fresh independent frame did not restore decoder authority');
   Date.now = originalDateNow;
 })().catch((error) => {
   Date.now = originalDateNow;
@@ -1738,7 +2095,8 @@ function reportDecoderError() {}
 function switchToAvcAdapter() {}
 `+closeDecoder+configureDecoder+`
 function config(width, epoch) {
-  return { codec: 'avc1.42C028', transport: 'h264-annexb', width, height: width + 1, streamEpoch: epoch };
+  return { codec: 'avc1.42C028', transport: 'h264-annexb', width, height: width + 1, streamEpoch: epoch,
+    frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 }
 ;(async () => {
   const oldFirst = configureDecoder(config(101, 1));
@@ -2478,9 +2836,6 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	submitRequest := substringBetween(t, source,
 		"async function submitControlCodeRequest() {",
 		"  async function closeCurrentControlCode(openNext) {")
-	hotspot := substringBetween(t, source,
-		"function requestControlCodeFromHotspot(event) {",
-		"  function relayReportToStreamStatus(report) {")
 	updateSubmit := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
@@ -2582,7 +2937,6 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	for name, body := range map[string]string{
 		"open dialog": openDialog,
 		"submit":      submitRequest,
-		"hotspot":     hotspot,
 	} {
 		if strings.Contains(body, "controlCodeReadinessMessage()") || strings.Contains(body, "fast_not_ready") {
 			t.Fatalf("%s must not block on setup readiness", name)
@@ -2607,23 +2961,51 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	if setInFlight < 0 || mutation < 0 || clearInFlight < 0 || !(setInFlight < mutation && mutation < clearInFlight) {
 		t.Fatalf("local submission guard must cover the complete asynchronous mutation")
 	}
-	for _, forbidden := range []string{
-		"controlCodeHotspot.addEventListener('touchend'",
+	hotspotRequest := substringBetween(t, source,
+		"function requestControlCodeFromHotspot(event) {",
+		"  async function submitControlCodeRequest() {")
+	for _, needle := range []string{
+		"const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');",
+		"document.documentElement.style.setProperty('--ticket-hotspot-width', `${stageViewport.width * 0.5}px`);",
+		"document.documentElement.style.setProperty('--ticket-hotspot-height', `${stageViewport.height * 0.25}px`);",
+		"if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden || ticketRegisterOverlayOccupiesHotspot()) return;",
+		"if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;",
+		"openControlCodeDialog();",
 	} {
-		if strings.Contains(source, forbidden) {
-			t.Fatalf("native hotspot buttons must not fire touchend after a swipe: %q", forbidden)
+		if !strings.Contains(source, needle) && !strings.Contains(hotspotRequest, needle) {
+			t.Fatalf("the top-left control-code surface must be a start-only alias for the existing dialog and yield to overlays, missing %q", needle)
 		}
 	}
+	overlap := substringBetween(t, source,
+		"function ticketRegisterOverlayOccupiesHotspot() {",
+		"  function requestControlCodeFromHotspot(event) {")
 	for _, needle := range []string{
-		"--ticket-hotspot-width",
-		"--ticket-hotspot-height",
-		"stageViewport.width * 0.5",
-		"stageViewport.height * 0.25",
-		"Spacetime connection is not ready",
+		"if (ticketRegisterOverlay.hidden) return false;",
+		"const sliderRect = ticketRegisterOverlay.getBoundingClientRect();",
+		"const hotspotRect = controlCodeHotspot.getBoundingClientRect();",
+		"sliderRect.left < hotspotRect.right && sliderRect.right > hotspotRect.left",
+		"sliderRect.top < hotspotRect.bottom && sliderRect.bottom > hotspotRect.top",
 	} {
-		if !strings.Contains(source, needle) {
-			t.Fatalf("mobile immediate-submit rough edge missing %q", needle)
+		if !strings.Contains(overlap, needle) {
+			t.Fatalf("the registration slider must suppress the corner only when their visible rectangles overlap, missing %q", needle)
 		}
+	}
+	if !strings.Contains(source, "controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);") {
+		t.Fatal("the top-left control-code button must use the bounded start-only handler")
+	}
+	for _, forbidden := range []string{
+		"refreshControlCodeReadiness(\"control_code_dialog_background_warmup\")",
+		"reconnectVideoForRecovery(\"control_code_dialog_stream_warmup\")",
+		"controlCodeHotspot.addEventListener('click', closeCurrentControlCode",
+		"controlCodeHotspot.addEventListener('pointerdown'",
+		"controlCodeHotspot.addEventListener('pointermove'",
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("the restored start surface must not revive result dismissal, gestures, or background preparation: %q", forbidden)
+		}
+	}
+	if !strings.Contains(source, "Spacetime connection is not ready") {
+		t.Fatal("mobile immediate-submit path must retain its explicit disconnected error")
 	}
 }
 
@@ -2972,7 +3354,7 @@ func TestControlCodeCloseHidesGeneratedResultBeforeNetworkRoundTrip(t *testing.T
 	source := ticketAppSource(t)
 	closeBody := substringBetween(t, source,
 		"async function closeCurrentControlCode(openNext) {",
-		"  function requestControlCodeFromHotspot(event) {")
+		"  function relayReportToStreamStatus(report) {")
 
 	postIndex := strings.Index(closeBody, "client.closeControlCode(requestID, 'browser_closed')")
 	closedIndex := strings.Index(closeBody, "locallyClosedControlCodeRequestIDs.add(String(requestID));")
@@ -2994,9 +3376,6 @@ func TestControlCodeCloseLocallyDismissesFailedResultWithoutOwnershipCache(t *te
 	source := ticketAppSource(t)
 	closeBody := substringBetween(t, source,
 		"async function closeCurrentControlCode(openNext) {",
-		"  function requestControlCodeFromHotspot(event) {")
-	hotspotBody := substringBetween(t, source,
-		"function requestControlCodeFromHotspot(event) {",
 		"  function relayReportToStreamStatus(report) {")
 
 	for _, required := range []string{
@@ -3022,17 +3401,13 @@ func TestControlCodeCloseLocallyDismissesFailedResultWithoutOwnershipCache(t *te
 	if cleanupIndex < 0 || postGuardIndex < 0 || cleanupIndex > postGuardIndex {
 		t.Fatal("result close must clear the local overlay before deciding whether the server close may run")
 	}
-	if !strings.Contains(hotspotBody, "if (!codeResultArea.hidden) {") ||
-		strings.Contains(hotspotBody, "if (!codeResultArea.hidden && codeRequest)") {
-		t.Fatal("the left result-dismiss action must work even when a failed result no longer has request state")
-	}
 }
 
 func TestControlCodeClosePreventsLateCaptureRedisplay(t *testing.T) {
 	source := ticketAppSource(t)
 	closeBody := substringBetween(t, source,
 		"async function closeCurrentControlCode(openNext) {",
-		"  function requestControlCodeFromHotspot(event) {")
+		"  function relayReportToStreamStatus(report) {")
 	captureBody := substringBetween(t, source,
 		"async function captureControlCodeResultScreenshot(request",
 		"  function failControlCodeResultScreenshotWait() {")
@@ -3207,7 +3582,7 @@ let latestStreamStatus = null;
 let hasRenderedFrame = true;
 let lastRecoveryVideoReconnectAt = 0;
 const recoveryVideoReconnectDebounceMs = 8000;
-const streamStaleKeyframeMs = 2500;
+const streamStaleKeyframeMs = 3000;
 const streamStaleDecoderResetMs = 5000;
 const streamStaleVideoReconnectMs = 8000;
 const streamStaleServerRecoverMs = 12000;
@@ -3387,10 +3762,16 @@ func TestTicketViewerBoundsPresentationLiveGraceWithoutRelaxingProof(t *testing.
 	resetBody := substringBetween(t, source,
 		"function resetStreamState(options) {",
 		"  function restartStream(reason, options) {")
+	unsupportedBody := substringBetween(t, source,
+		"function showUnsupported(message) {",
+		"  function resizeCanvasBox() {")
 
 	if !strings.Contains(showEmptyBody, "clearStreamLiveStaleGrace();") ||
 		!strings.Contains(resetBody, "clearStreamLiveStaleGrace();") {
 		t.Fatal("hard unavailable and stream-reset paths must cancel the presentation-live grace")
+	}
+	if !strings.Contains(unsupportedBody, "updateStreamFreshnessStatus('stream_unsupported');") {
+		t.Fatal("a terminal decoder/configuration rejection must immediately reveal authoritative SDR")
 	}
 	if !strings.Contains(source, "return currentRenderedFreshness(performance.now()).liveLabeled;") {
 		t.Fatal("proof freshness must remain strict and must not consume the presentation-only grace")
@@ -3444,6 +3825,12 @@ function updateControlCodeSubmitAvailability() {}
 let activeResumeFlow = null;
 function finishActivationResumeFlow() {}
 let hasRenderedFrame = true;
+const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
+let experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
+const hdrStaleReasons = [];
+let experimentalClientHDRController = {
+  markSDRStale(reason) { hdrStaleReasons.push(reason); }
+};
 function check(value, message) { if (!value) throw new Error(message); }
 `+freshnessBody+`
 
@@ -3459,6 +3846,8 @@ timers.clear();
 expiry.callback();
 check(document.body.dataset.streamLive === 'false', 'an unchanged stale frame must become unavailable at expiry');
 check(streamLiveStaleGraceTimer === null && timers.size === 0, 'expiry must not re-arm its own grace');
+check(hdrStaleReasons.length === 1 && hdrStaleReasons[0] === 'sdr_stream_not_live',
+  'an aged-out rendered frame left frozen HDR above the authoritative SDR recovery view');
 
 freshness = { hasFrame: true, liveLabeled: true, streamFreshnessState: 'LIVE_OK' };
 updateStreamFreshnessStatus('frame_rendered');
@@ -3470,6 +3859,8 @@ latestStreamStatus.phoneConnected = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a disconnected phone must bypass the grace immediately');
+check(hdrStaleReasons.length === 2 && hdrStaleReasons[1] === 'sdr_stream_unavailable',
+  'a disconnected phone must immediately reveal SDR');
 
 latestStreamStatus.phoneConnected = true;
 document.body.dataset.streamLive = 'true';
@@ -3477,6 +3868,10 @@ latestStreamStatus.phoneDesired = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'an intentionally stopped phone stream must bypass the grace immediately');
+check(hdrStaleReasons.length === 3, 'a stopped phone stream must immediately reveal SDR');
+updateStreamFreshnessStatus('frame_rendered');
+check(hdrStaleReasons.length === 4,
+  'buffered decoder output must not recover HDR after the stream authority stopped it');
 
 latestStreamStatus.phoneDesired = true;
 document.body.dataset.streamLive = 'true';
@@ -3484,6 +3879,7 @@ freshStatus = null;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a missing fresh relay status must bypass the grace immediately');
+check(hdrStaleReasons.length === 5, 'missing relay authority must immediately reveal SDR');
 
 freshStatus = latestStreamStatus;
 document.body.dataset.streamLive = 'true';
@@ -3491,6 +3887,7 @@ latestStreamStatus.phoneStreamState = 'preparing_phone';
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a non-streaming phone state must bypass the grace immediately');
+check(hdrStaleReasons.length === 6, 'a non-streaming phone must immediately reveal SDR');
 
 latestStreamStatus.phoneStreamState = 'streaming';
 document.body.dataset.streamLive = 'true';
@@ -3498,6 +3895,7 @@ latestStreamStatus.activeVideoClients = 0;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'an inactive relay must bypass the grace immediately');
+check(hdrStaleReasons.length === 7, 'an inactive relay must immediately reveal SDR');
 
 latestStreamStatus.activeVideoClients = 1;
 document.body.dataset.streamLive = 'true';
@@ -3505,6 +3903,7 @@ foreground = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a hidden or unfocused viewer must bypass the grace immediately');
+check(hdrStaleReasons.length === 8, 'a hidden viewer must immediately reveal SDR');
 
 foreground = true;
 document.body.dataset.streamLive = 'true';
@@ -3512,6 +3911,7 @@ videoWs.readyState = WebSocket.CLOSED;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a closed video socket must bypass the grace immediately');
+check(hdrStaleReasons.length === 9, 'a closed browser media socket must immediately reveal SDR');
 
 videoWs.readyState = WebSocket.OPEN;
 document.body.dataset.streamLive = 'true';
@@ -3519,6 +3919,13 @@ latestStreamStatus.lastFrameAgoMillis = 2600;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a server-confirmed stale stream must bypass the grace immediately');
+check(hdrStaleReasons.length === 10 && hdrStaleReasons[9] === 'sdr_stream_not_live',
+  'a server-confirmed stale stream left frozen HDR above the SDR recovery view');
+
+streamUnsupported = true;
+updateStreamFreshnessStatus('stream_unsupported');
+check(hdrStaleReasons.length === 11,
+  'terminal browser decoding rejection must immediately reveal SDR');
 `)
 }
 
@@ -3574,7 +3981,6 @@ func TestTicketViewerCanRecoverAfterIdleTimeoutWithoutReload(t *testing.T) {
 		"closeDirectVideo();",
 		"resetStreamState({ preserveFrame: true });",
 		"spacetimeClient.close();",
-		"releaseScreenWakeLock('idle_disconnect');",
 		"showEmpty('Straume ir apturēta pēc 15 minūtēm bez darbības. Pieskaries Sākt, lai turpinātu.', true);",
 		"document.body.dataset.streamFreshness = 'IDLE_DISCONNECTED';",
 		"setConnected('Apturēts');",

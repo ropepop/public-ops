@@ -16,14 +16,14 @@ LOCAL_RELEASE_GC_SCRIPT="${SCRIPT_DIR}/local_release_gc.py"
 MEMORY_REPORT_SCRIPT="${SCRIPT_DIR}/memory_report.py"
 DOCKER_GC_REMOTE_STATE_DIR="/etc/arbuzas/docker-gc"
 DOCKER_GC_REMOTE_STATE_FILE="${DOCKER_GC_REMOTE_STATE_DIR}/state.json"
-DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-24h}"
+DOCKER_GC_AUTOMATIC_STAMP_FILE="${DOCKER_GC_REMOTE_STATE_DIR}/last-automatic-success"
+DOCKER_GC_AUTOMATIC_MIN_INTERVAL_SECONDS="${DOCKER_GC_AUTOMATIC_MIN_INTERVAL_SECONDS:-86400}"
+DOCKER_GC_BUILD_CACHE_UNTIL="${DOCKER_GC_BUILD_CACHE_UNTIL:-168h}"
 DOCKER_GC_RELEASE_KEEP_PER_FAMILY="${DOCKER_GC_RELEASE_KEEP_PER_FAMILY:-10}"
 ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS="${ARBUZAS_LOCAL_RELEASE_MAX_AGE_HOURS:-72}"
 ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY="${ARBUZAS_LOCAL_RELEASE_KEEP_PER_FAMILY:-10}"
 ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN="${ARBUZAS_LOCAL_RELEASE_CLEANUP_DRY_RUN:-false}"
-ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS="${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS:-7}"
 ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE="${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE:-100M}"
-ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE="${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE:-true}"
 ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS="${ARBUZAS_FAST_SMOKE_TIMEOUT_SECONDS:-45}"
 NETDATA_CONFIG_ROOT="${REPO_ROOT}/infra/arbuzas/netdata"
 NETDATA_REMOTE_CONFIG_DIR="/etc/netdata"
@@ -114,6 +114,7 @@ ARBUZAS_TICKET_CLOUDFLARED_IMAGE="${ARBUZAS_TICKET_CLOUDFLARED_IMAGE:-cloudflare
 
 action=""
 requested_release_id=""
+CLEANUP_DOCKER_APPLY=0
 VALIDATION_PROFILE="${ARBUZAS_VALIDATION_PROFILE:-full}"
 VALIDATION_PROFILE_OPTION_SET=0
 TARGETED_MODE=0
@@ -149,7 +150,6 @@ ALL_SERVICES=(
   satiksme_bot
   ticket_phone_bridge
   ticket_remote_spacetime_sidecar
-  ticket_hdr_transformer
   ticket_remote
   train_tunnel
   satiksme_tunnel
@@ -178,6 +178,17 @@ deployment_timing_safe_token_or_none() {
   else
     printf 'none'
   fi
+}
+
+deployment_timing_resolve_target() {
+  local selector="all"
+  local sorted_selectors=""
+
+  if (( ${#REQUESTED_SERVICES[@]} > 0 )); then
+    sorted_selectors="$(printf '%s\n' "${REQUESTED_SERVICES[@]}" | LC_ALL=C sort -u | paste -sd: -)"
+    [[ -n "${sorted_selectors}" ]] && selector="${sorted_selectors}"
+  fi
+  deployment_timing_safe_token_or_none "${ARBUZAS_HOST}:${selector}" 160
 }
 
 deployment_timing_now_millis() {
@@ -337,7 +348,7 @@ start_deployment_timing_reporting() {
   else
     DEPLOYMENT_TIMING_RELEASE_ID="$(deployment_timing_safe_token_or_none "${ARBUZAS_RELEASE_ID}" 160)"
   fi
-  DEPLOYMENT_TIMING_TARGET="$(deployment_timing_safe_token_or_none "${ARBUZAS_HOST}" 160)"
+  DEPLOYMENT_TIMING_TARGET="$(deployment_timing_resolve_target)"
   if [[ "${action}" == "deploy-config" ]]; then
     DEPLOYMENT_TIMING_PROFILE="none"
   else
@@ -639,16 +650,29 @@ run_local_release_cleanup() {
 }
 
 remote_run_docker_gc() {
+  local mode="${1:-preview}"
   local gc_script=""
+  local dry_run_arg=""
 
   if [[ ! "${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}" =~ ^[0-9]+$ ]]; then
     echo "DOCKER_GC_RELEASE_KEEP_PER_FAMILY must be a non-negative integer" >&2
     return 2
   fi
+  case "${mode}" in
+    preview)
+      dry_run_arg=" --dry-run"
+      ;;
+    apply)
+      ;;
+    *)
+      echo "Docker GC mode must be preview or apply" >&2
+      return 2
+      ;;
+  esac
 
   if gc_script="$(resolve_local_docker_gc_script)"; then
     run_ssh "$(remote_target)" \
-      "sudo -n python3 - --current-link '${REMOTE_CURRENT_LINK}' --releases-root '${REMOTE_RELEASES_ROOT}' --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' --build-cache-until '${DOCKER_GC_BUILD_CACHE_UNTIL}' --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'" \
+      "sudo -n python3 - --current-link '${REMOTE_CURRENT_LINK}' --releases-root '${REMOTE_RELEASES_ROOT}' --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' --build-cache-until '${DOCKER_GC_BUILD_CACHE_UNTIL}' --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'${dry_run_arg}" \
       < "${gc_script}"
     return 0
   fi
@@ -664,7 +688,7 @@ remote_run_docker_gc() {
       --releases-root '${REMOTE_RELEASES_ROOT}' \
       --state-file '${DOCKER_GC_REMOTE_STATE_FILE}' \
       --build-cache-until '${DOCKER_GC_BUILD_CACHE_UNTIL}' \
-      --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'
+      --release-keep-per-family '${DOCKER_GC_RELEASE_KEEP_PER_FAMILY}'${dry_run_arg}
   "
 }
 
@@ -679,63 +703,26 @@ remote_run_memory_report() {
     < "${MEMORY_REPORT_SCRIPT}"
 }
 
-remote_run_host_cache_cleanup() {
-  if [[ ! "${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS}" =~ ^[0-9]+$ ]]; then
-    echo "ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS must be a non-negative integer" >&2
-    return 2
-  fi
+configure_remote_journald_limit() {
   if [[ ! "${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}" =~ ^[0-9]+[KMGTP]?$ ]]; then
     echo "ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE must be a systemd size such as 100M" >&2
     return 2
   fi
-  case "${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE}" in
-    true|false)
-      ;;
-    *)
-      echo "ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE must be true or false" >&2
-      return 2
-      ;;
-  esac
 
   remote_root_command "
-    tmp_min_age_days='${ARBUZAS_HOST_CLEANUP_TMP_MIN_AGE_DAYS}'
-    journal_max_size='${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}'
-    drop_reclaimable_cache='${ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE}'
-    report_memory() {
-      local label=\"\$1\"
-      if command -v free >/dev/null 2>&1; then
-        echo \"host memory \${label}:\"
-        free -m
-      fi
-    }
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get clean
-    fi
-    if [[ -d /tmp ]]; then
-      tmp_mtime_days=\$(( tmp_min_age_days > 0 ? tmp_min_age_days - 1 : 0 ))
-      find /tmp -xdev -mindepth 1 -maxdepth 1 \
-        \\( -name 'arbuzas-*' \
-          -o -name 'satiksme-*' \
-          -o -name 'chat-analyzer-*' \
-          -o -name 'ticket-*' \
-          -o -name 'speedtest-install.*' \\) \
-        -mtime +\"\${tmp_mtime_days}\" \
-        -exec rm -rf -- {} +
-    fi
-    if command -v journalctl >/dev/null 2>&1; then
-      journalctl --vacuum-size=\"\${journal_max_size}\"
-    fi
-    if [[ \"\${drop_reclaimable_cache}\" == 'true' ]]; then
-      report_memory 'before reclaimable cache flush'
-      sync
-      if [[ ! -w /proc/sys/vm/drop_caches ]]; then
-        echo 'cannot flush reclaimable cache: /proc/sys/vm/drop_caches is not writable' >&2
-        exit 1
-      fi
-      printf '3\n' > /proc/sys/vm/drop_caches
-      report_memory 'after reclaimable cache flush'
-    else
-      echo 'reclaimable cache flush skipped because ARBUZAS_HOST_DROP_RECLAIMABLE_CACHE=false'
+    policy_dir='/etc/systemd/journald.conf.d'
+    policy_path=\"\${policy_dir}/20-arbuzas-size.conf\"
+    mkdir -p \"\${policy_dir}\"
+    policy_tmp=\$(mktemp \"\${policy_dir}/.20-arbuzas-size.XXXXXX\")
+    trap 'rm -f \"\${policy_tmp}\"' EXIT
+    printf '%s\n' \
+      '[Journal]' \
+      'SystemMaxUse=${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}' \
+      'RuntimeMaxUse=${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}' > \"\${policy_tmp}\"
+    if [[ ! -f \"\${policy_path}\" ]] || ! cmp -s \"\${policy_tmp}\" \"\${policy_path}\"; then
+      install -o root -g root -m 0644 \"\${policy_tmp}\" \"\${policy_path}\"
+      systemctl restart systemd-journald.service
+      journalctl --vacuum-size='${ARBUZAS_HOST_CLEANUP_JOURNAL_MAX_SIZE}'
     fi
   "
 }
@@ -1486,15 +1473,49 @@ install_remote_thinkpad_fan() {
 }
 
 run_automatic_remote_docker_gc() {
-  log "Cleanup: pruning unused Docker images, old releases, old build cache, and safe host caches"
-  if remote_run_docker_gc; then
-    if remote_run_host_cache_cleanup; then
-      return 0
-    fi
-    log "Cleanup warning: host cache cleanup failed on ${ARBUZAS_HOST}, but the release remains successful"
+  local cooldown_status=""
+  if [[ ! "${DOCKER_GC_AUTOMATIC_MIN_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]]; then
+    log "Cleanup warning: invalid automatic cleanup interval; the release remains successful"
     return 0
   fi
-  log "Cleanup warning: Docker/release cleanup failed on ${ARBUZAS_HOST}, but the release remains successful"
+  if ! cooldown_status="$(remote_root_command "
+    now=\$(date +%s)
+    last=0
+    if [[ -f '${DOCKER_GC_AUTOMATIC_STAMP_FILE}' && ! -L '${DOCKER_GC_AUTOMATIC_STAMP_FILE}' ]]; then
+      read -r last < '${DOCKER_GC_AUTOMATIC_STAMP_FILE}' || last=0
+    fi
+    [[ \"\${last}\" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last >= ${DOCKER_GC_AUTOMATIC_MIN_INTERVAL_SECONDS} )); then
+      printf 'due\n'
+    else
+      printf 'recent\n'
+    fi
+  " 1 | tail -n 1 | tr -d '\r\n')"; then
+    log "Cleanup warning: automatic cleanup cooldown could not be checked; skipping cleanup without affecting the release"
+    return 0
+  fi
+  if [[ "${cooldown_status}" == "recent" ]]; then
+    log "Cleanup: automatic Docker/release cleanup already succeeded within 24 hours"
+    return 0
+  fi
+  if [[ "${cooldown_status}" != "due" ]]; then
+    log "Cleanup warning: automatic cleanup cooldown returned an invalid status; skipping cleanup without affecting the release"
+    return 0
+  fi
+
+  log "Cleanup: applying unused-image, old-release, and seven-day build-cache policy"
+  if ! remote_run_docker_gc apply; then
+    log "Cleanup warning: Docker/release cleanup failed on ${ARBUZAS_HOST}, but the release remains successful"
+    return 0
+  fi
+  if ! remote_root_command "
+    stamp_tmp=\$(mktemp '${DOCKER_GC_REMOTE_STATE_DIR}/.automatic-success.XXXXXX')
+    trap 'rm -f \"\${stamp_tmp}\"' EXIT
+    date +%s > \"\${stamp_tmp}\"
+    install -o root -g root -m 0600 \"\${stamp_tmp}\" '${DOCKER_GC_AUTOMATIC_STAMP_FILE}'
+  " 1; then
+    log "Cleanup warning: cleanup succeeded but its cooldown marker could not be written"
+  fi
 }
 
 upload_remote_file() {
@@ -1572,10 +1593,10 @@ usage() {
 Usage: deploy.sh ACTION [options]
 
 Actions:
-  deploy            Prepare a release bundle, copy it to the live host, render tunnel configs, and run docker compose up -d --build
+  deploy            Prepare, build, activate, and validate a release on the live host
   validate          Validate the active or requested release on the live host
   rollback          Point /etc/arbuzas/current at a previous release and redeploy it
-  cleanup-docker    Run the Arbuzas Docker image, release, build-cache, and host-cache cleanup policy on the live host
+  cleanup-docker    Preview the bounded Docker image, release, and build-cache cleanup policy; use --apply to delete
   memory-report     Report corrected host memory pressure and provider-like cached-inclusive memory from /proc/meminfo
   install-memory-report   Install the corrected host memory report service and timer on the live host
   validate-memory-report  Validate the corrected host memory report service, timer, and latest snapshot
@@ -1597,10 +1618,11 @@ Options:
   --ssh-port PORT
   --ssh-known-hosts-file PATH
   --env-file PATH
+  --apply            Apply cleanup-docker candidates (preview is the default)
 
 Services:
   train_bot, train_tunnel, satiksme_bot, satiksme_tunnel, ticket_phone_bridge,
-  ticket_remote_spacetime_sidecar, ticket_hdr_transformer, ticket_remote, ticket_remote_tunnel,
+  ticket_remote_spacetime_sidecar, ticket_remote, ticket_remote_tunnel,
   qbittorrent, qbittorrent_housekeeper,
   jellyfin,
   tiny_vless (separate Compose project; explicit selection required to recreate)
@@ -1727,7 +1749,6 @@ mark_validation_group() {
       VALIDATE_TICKET_REMOTE=1
       append_unique DIAGNOSTIC_SERVICES ticket_phone_bridge
       append_unique DIAGNOSTIC_SERVICES ticket_remote_spacetime_sidecar
-      append_unique DIAGNOSTIC_SERVICES ticket_hdr_transformer
       append_unique DIAGNOSTIC_SERVICES ticket_remote
       append_unique DIAGNOSTIC_SERVICES ticket_remote_tunnel
       ;;
@@ -1790,21 +1811,12 @@ resolve_requested_services() {
         ;;
       ticket_remote)
         if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
-          append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
           append_unique COMPOSE_TARGET_SERVICES ticket_remote
         else
           append_unique COMPOSE_TARGET_SERVICES ticket_phone_bridge
           append_unique COMPOSE_TARGET_SERVICES ticket_remote_spacetime_sidecar
-          append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
           append_unique COMPOSE_TARGET_SERVICES ticket_remote
           append_unique COMPOSE_TARGET_SERVICES ticket_remote_tunnel
-        fi
-        mark_validation_group ticket_remote
-        ;;
-      ticket_hdr_transformer)
-        append_unique COMPOSE_TARGET_SERVICES ticket_hdr_transformer
-        if [[ "${VALIDATION_PROFILE}" != "fast" ]]; then
-          append_unique COMPOSE_TARGET_SERVICES ticket_remote
         fi
         mark_validation_group ticket_remote
         ;;
@@ -1908,7 +1920,6 @@ compose_all_service_args() {
     satiksme_bot
     ticket_phone_bridge
     ticket_remote_spacetime_sidecar
-    ticket_hdr_transformer
     ticket_remote
     qbittorrent
     qbittorrent_housekeeper
@@ -1923,6 +1934,58 @@ compose_all_service_args() {
 
 compose_all_tunnel_service_args() {
   printf '%s' " train_tunnel satiksme_tunnel ticket_remote_tunnel"
+}
+
+compose_build_service_args() {
+  local service_args=""
+  local service_name
+  local -a candidates=()
+  local -a build_services=(
+    train_bot
+    satiksme_bot
+    ticket_phone_bridge
+    ticket_remote_spacetime_sidecar
+    ticket_remote
+    qbittorrent
+    qbittorrent_housekeeper
+  )
+
+  if (( TARGETED_MODE == 1 )); then
+    candidates=("${COMPOSE_TARGET_SERVICES[@]}")
+  else
+    candidates=("${build_services[@]}")
+  fi
+  for service_name in ${candidates[@]+"${candidates[@]}"}; do
+    if array_contains "${service_name}" "${build_services[@]}"; then
+      service_args+=" ${service_name}"
+    fi
+  done
+  printf '%s' "${service_args}"
+}
+
+compose_pull_service_args() {
+  local service_args=""
+  local service_name
+  local -a candidates=()
+  local -a pull_services=(
+    jellyfin
+    meshcentral
+    train_tunnel
+    satiksme_tunnel
+    ticket_remote_tunnel
+  )
+
+  if (( TARGETED_MODE == 1 )); then
+    candidates=("${COMPOSE_TARGET_SERVICES[@]}")
+  else
+    candidates=("${pull_services[@]}")
+  fi
+  for service_name in ${candidates[@]+"${candidates[@]}"}; do
+    if array_contains "${service_name}" "${pull_services[@]}"; then
+      service_args+=" ${service_name}"
+    fi
+  done
+  printf '%s' "${service_args}"
 }
 
 targeted_service_selected() {
@@ -2099,6 +2162,22 @@ validate_remote_host_probe() {
 
   log "Validate: ${label}"
   if ! remote_shell "${script}"; then
+    log "Validation failed: ${label}"
+    mark_remote_validation_failed
+    collect_remote_validation_diagnostics "${diagnostics_release_dir}" ${services[@]+"${services[@]}"}
+    return 1
+  fi
+}
+
+validate_remote_root_probe() {
+  local diagnostics_release_dir="$1"
+  local label="$2"
+  local script="$3"
+  shift 3
+  local services=("$@")
+
+  log "Validate: ${label}"
+  if ! remote_root_shell "${script}"; then
     log "Validation failed: ${label}"
     mark_remote_validation_failed
     collect_remote_validation_diagnostics "${diagnostics_release_dir}" ${services[@]+"${services[@]}"}
@@ -3370,7 +3449,6 @@ prepare_remote_ticket_runtime_permissions() {
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
       '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
-      '/etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret' \
       '/etc/arbuzas/secrets/satiksme-bot-spacetime.key' \
       '/etc/arbuzas/secrets/satiksme-bot-web-session-secret' \
       '/etc/arbuzas/secrets/satiksme-telegram-client.secret' \
@@ -3443,7 +3521,8 @@ prepare_remote_host_layout() {
       '/etc/arbuzas/env/train-bot.env' \
       '/etc/arbuzas/env/satiksme-bot.env' \
       '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
-  "
+  " || return $?
+  configure_remote_journald_limit || return $?
   prepare_remote_ticket_runtime_permissions
 }
 
@@ -4700,71 +4779,138 @@ resolve_remote_current_release_id() {
   fi
 }
 
-remote_compose_up() {
+prepare_remote_release_image_aliases() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+  local non_tunnel_service_args=""
+  non_tunnel_service_args="$(compose_target_service_args_without_tunnels)"
+  [[ "${VALIDATION_PROFILE}" == "fast" && "${TARGETED_MODE}" == "1" ]] || return 0
+
+  remote_shell "
+    cd '${remote_release_dir}'
+    for service_image in \
+      train_bot=arbuzas/train-bot \
+      satiksme_bot=arbuzas/satiksme-bot \
+      ticket_phone_bridge=arbuzas/ticket-phone-bridge \
+      ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
+      ticket_remote=arbuzas/ticket-remote \
+      qbittorrent=arbuzas/qbittorrent \
+      qbittorrent_housekeeper=arbuzas/qbittorrent-housekeeper; do
+      service_name=\${service_image%%=*}
+      image_repository=\${service_image#*=}
+      case ' ${non_tunnel_service_args} ' in
+        *\" \${service_name} \"*) continue ;;
+      esac
+      new_image=\"\${image_repository}:${ARBUZAS_RELEASE_ID}\"
+      docker image inspect \"\${new_image}\" >/dev/null 2>&1 && continue
+      container_id=\$(docker ps -aq \
+        --filter 'label=com.docker.compose.project=arbuzas' \
+        --filter \"label=com.docker.compose.service=\${service_name}\" \
+        | head -n 1)
+      [[ -n \"\${container_id}\" ]] || continue
+      image_id=\$(docker inspect --format '{{.Image}}' \"\${container_id}\")
+      docker image tag \"\${image_id}\" \"\${new_image}\"
+    done
+  "
+}
+
+validate_and_prepare_remote_release_compose() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+  local pull_image_args=""
+  local pull_service_args=""
+  pull_service_args="$(compose_pull_service_args)"
+  pull_image_args+=" $(shell_quote "jellyfin=jellyfin/jellyfin:10.11.11@sha256:aefb67e6a7ff1debdd154a78a7bbb780fd0c873d8639210a7f6a2016ad2b35db")"
+  pull_image_args+=" $(shell_quote "meshcentral=${ARBUZAS_MESHCENTRAL_IMAGE}")"
+  pull_image_args+=" $(shell_quote "train_tunnel=${ARBUZAS_CLOUDFLARED_IMAGE}")"
+  pull_image_args+=" $(shell_quote "satiksme_tunnel=${ARBUZAS_CLOUDFLARED_IMAGE}")"
+  pull_image_args+=" $(shell_quote "ticket_remote_tunnel=${ARBUZAS_TICKET_CLOUDFLARED_IMAGE}")"
+
+  remote_shell "
+    cd '${remote_release_dir}'
+    compose_args=(docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml')
+    \"\${compose_args[@]}\" config >/dev/null
+    if [[ -n '${pull_service_args}' ]]; then
+      for service_image in${pull_image_args}; do
+        service_name=\${service_image%%=*}
+        image_ref=\${service_image#*=}
+        case ' ${pull_service_args} ' in
+          *\" \${service_name} \"*) ;;
+          *) continue ;;
+        esac
+        docker image inspect \"\${image_ref}\" >/dev/null 2>&1 || \"\${compose_args[@]}\" pull \"\${service_name}\"
+      done
+    fi
+  "
+}
+
+build_remote_release_images() {
+  local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
+  local build_service_args=""
+  build_service_args="$(compose_build_service_args)"
+  [[ -n "${build_service_args}" ]] || return 0
+
+  remote_shell "
+    cd '${remote_release_dir}'
+    docker compose --project-name arbuzas \
+      --env-file '${remote_release_dir}/release.env' \
+      -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' \
+      build${build_service_args}
+  "
+}
+
+activate_remote_release_services() {
   local remote_release_dir="${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}"
   local non_tunnel_service_args=""
   local all_service_args=""
   local tunnel_service_args=""
+  local retire_ticket_hdr=0
   non_tunnel_service_args="$(compose_target_service_args_without_tunnels)"
   all_service_args="$(compose_all_service_args)"
   if (( TARGETED_MODE == 1 )); then
     tunnel_service_args="$(compose_target_tunnel_service_args)"
+    if targeted_service_selected ticket_remote; then
+      retire_ticket_hdr=1
+    fi
   else
     tunnel_service_args="$(compose_all_tunnel_service_args)"
   fi
 
   if (( TARGETED_MODE == 1 )); then
     remote_shell "
-      cd '${remote_release_dir}'
-      if [[ '${VALIDATION_PROFILE}' == 'fast' ]]; then
-        for service_image in \
-          train_bot=arbuzas/train-bot \
-          satiksme_bot=arbuzas/satiksme-bot \
-          ticket_phone_bridge=arbuzas/ticket-phone-bridge \
-          ticket_remote_spacetime_sidecar=arbuzas/ticket-remote-spacetime-sidecar \
-          ticket_hdr_transformer=arbuzas/ticket-hdr-transformer \
-          ticket_remote=arbuzas/ticket-remote \
-          qbittorrent=arbuzas/qbittorrent \
-          qbittorrent_housekeeper=arbuzas/qbittorrent-housekeeper; do
-          service_name=\${service_image%%=*}
-          image_repository=\${service_image#*=}
-          case ' ${non_tunnel_service_args} ' in
-            *\" \${service_name} \"*) continue ;;
-          esac
-          new_image=\"\${image_repository}:${ARBUZAS_RELEASE_ID}\"
-          docker image inspect \"\${new_image}\" >/dev/null 2>&1 && continue
-          container_id=\$(docker ps -aq \
-            --filter 'label=com.docker.compose.project=arbuzas' \
-            --filter \"label=com.docker.compose.service=\${service_name}\" \
-            | head -n 1)
-          [[ -n \"\${container_id}\" ]] || continue
-          image_id=\$(docker inspect --format '{{.Image}}' \"\${container_id}\")
-          docker image tag \"\${image_id}\" \"\${new_image}\"
-        done
-      fi
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
       if [[ -n '${non_tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --no-deps${non_tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --no-deps${non_tunnel_service_args}
       fi
       if [[ -n '${tunnel_service_args}' ]]; then
-        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+        docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --no-deps${tunnel_service_args}
       fi
-    " || return $?
-    stabilize_remote_declared_docker_no_swap_limits
+      if [[ '${retire_ticket_hdr}' == '1' ]] && ! docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' config --services | grep -Fxq ticket_hdr_transformer; then
+        docker ps -aq \
+          --filter 'label=com.docker.compose.project=arbuzas' \
+          --filter 'label=com.docker.compose.service=ticket_hdr_transformer' | xargs -r docker rm -f
+        if docker network inspect arbuzas_ticket_hdr >/dev/null 2>&1; then
+          docker network ls -q --filter 'name=^arbuzas_ticket_hdr$' --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.network=ticket_hdr' | grep -q . || { echo 'refusing to remove unexpected Ticket HDR network' >&2; exit 1; }
+          docker network inspect --format '{{len .Containers}}' arbuzas_ticket_hdr | grep -Fxq 0 || { echo 'refusing to remove active Ticket HDR network' >&2; exit 1; }
+          docker network rm arbuzas_ticket_hdr >/dev/null
+        fi
+      fi
+    "
     return
   fi
 
   remote_shell "
-    cd '${remote_release_dir}'
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
-    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --build --force-recreate --remove-orphans${all_service_args}
+    docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --remove-orphans${all_service_args}
     if [[ -n '${tunnel_service_args}' ]]; then
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${tunnel_service_args}
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --no-deps${tunnel_service_args}
     fi
-  " || return $?
-  stabilize_remote_declared_docker_no_swap_limits
+    if ! docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' config --services | grep -Fxq ticket_hdr_transformer && docker network inspect arbuzas_ticket_hdr >/dev/null 2>&1; then
+      docker network ls -q --filter 'name=^arbuzas_ticket_hdr$' --filter 'label=com.docker.compose.project=arbuzas' --filter 'label=com.docker.compose.network=ticket_hdr' | grep -q . || { echo 'refusing to remove unexpected Ticket HDR network' >&2; exit 1; }
+      docker network inspect --format '{{len .Containers}}' arbuzas_ticket_hdr | grep -Fxq 0 || { echo 'refusing to remove active Ticket HDR network' >&2; exit 1; }
+      docker network rm arbuzas_ticket_hdr >/dev/null
+    fi
+  "
 }
 
 cleanup_remote_public_bundle_versions() {
@@ -7626,12 +7772,12 @@ validate_remote_ticket_remote_workload_health() {
       grep -aF \"generate_control_code\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"requestControlCode\" \"\${binary}\" >/dev/null
       grep -aF \"sanitizeControlDigits\" \"\${binary}\" >/dev/null
-      grep -aF \"navigator.wakeLock.request\" \"\${binary}\" >/dev/null
-      grep -aF \"requestFullscreen\" \"\${binary}\" >/dev/null
+      grep -aF \"navigator.wakeLock.request\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"requestFullscreen\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"toolbarCollapseAnchorPx\" \"\${binary}\" >/dev/null && exit 1
       grep -aF -- \"--ticket-viewport-height\" \"\${binary}\" >/dev/null
-      grep -aF \"gesturechange\" \"\${binary}\" >/dev/null
-      grep -aF \"dblclick\" \"\${binary}\" >/dev/null
+      grep -aF \"gesturechange\" \"\${binary}\" >/dev/null && exit 1
+      grep -aF \"dblclick\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"touch-action: pan-y\" \"\${binary}\" >/dev/null
       grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null
       grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null
@@ -7923,10 +8069,20 @@ validate_remote_host_baseline() {
 
 validate_remote_private_configuration_permissions() {
   local remote_release_dir="$1"
+  local scope="${2:-all}"
   local diagnostics_services=()
 
+  case "${scope}" in
+    all|satiksme)
+      ;;
+    *)
+      echo "unsupported private configuration validation scope: ${scope}" >&2
+      return 1
+      ;;
+  esac
+
   populate_current_diagnostic_services diagnostics_services
-  validate_remote_host_probe "${remote_release_dir}" \
+  validate_remote_root_probe "${remote_release_dir}" \
     "private deployment configuration permissions" \
     "
       assert_private_file() {
@@ -7942,57 +8098,77 @@ validate_remote_private_configuration_permissions() {
         }
       }
 
-      for path in \
-        '/etc/arbuzas/env/train-bot.env' \
-        '/etc/arbuzas/env/satiksme-bot.env'; do
-        assert_private_file \"\${path}\" '0:0:600'
-      done
-      assert_private_file '/etc/arbuzas/env/ticket-remote.env' '1001:1001:600'
+      assert_private_file '/etc/arbuzas/env/satiksme-bot.env' '0:0:600'
+      if [[ '${scope}' == 'all' ]]; then
+        assert_private_file '/etc/arbuzas/env/train-bot.env' '0:0:600'
+        assert_private_file '/etc/arbuzas/env/ticket-remote.env' '1001:1001:600'
+      fi
 
       if grep -Eq '^SATIKSME_CHAT_ANALYZER_(API_ID|API_HASH|GOOGLE_API_KEY|MODEL_API_KEY)=.+' \
           '/etc/arbuzas/env/satiksme-bot.env'; then
         echo 'Satiksme analyzer credentials remain inline in the host env' >&2
         exit 1
       fi
-      for file_key in API_ID API_HASH GOOGLE_API_KEY MODEL_API_KEY; do
-        grep -Eq \"^SATIKSME_CHAT_ANALYZER_\${file_key}_FILE=.+\" \
-          '/etc/arbuzas/env/satiksme-bot.env' || {
-          echo \"Satiksme analyzer file-backed credential is missing: \${file_key}\" >&2
-          exit 1
-        }
-      done
+      if grep -Eq '^SATIKSME_CHAT_ANALYZER_MODEL_API_KEY(_FILE)?=' \
+          '/etc/arbuzas/env/satiksme-bot.env'; then
+        echo 'retired Satiksme analyzer model-key setting remains in the host env' >&2
+        exit 1
+      fi
 
-      for path in \
-        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
-        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
-        '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
-        '/etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret'; do
-        assert_private_file \"\${path}\" '0:0:600'
-        [[ -s \"\${path}\" ]] || {
-          echo \"required Satiksme analyzer credential is empty: \${path}\" >&2
+      if grep -Eq '^SATIKSME_CHAT_ANALYZER_ENABLED=true$' \
+          '/etc/arbuzas/env/satiksme-bot.env'; then
+        if grep -Eq '^SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER=' \
+            '/etc/arbuzas/env/satiksme-bot.env' && \
+            ! grep -Eq '^SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER=google$' \
+              '/etc/arbuzas/env/satiksme-bot.env'; then
+          echo 'Satiksme analyzer only supports the managed Google credential path' >&2
           exit 1
-        }
-      done
-
-      analyzer_enabled=\$(sed -n 's/^SATIKSME_CHAT_ANALYZER_ENABLED=//p' \
-        '/etc/arbuzas/env/satiksme-bot.env' | tail -1)
-      if [[ \"\${analyzer_enabled}\" == 'true' ]]; then
+        fi
+        for path in \
+          '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
+          '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
+          '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret'; do
+          assert_private_file \"\${path}\" '0:0:600'
+          [[ -s \"\${path}\" ]] || {
+            echo \"required Satiksme analyzer credential is empty: \${path}\" >&2
+            exit 1
+          }
+        done
         path='/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'
         assert_private_file \"\${path}\" '0:0:600'
         [[ -s \"\${path}\" ]] || {
           echo \"required Satiksme analyzer session is empty: \${path}\" >&2
           exit 1
         }
+      elif ! grep -Eq '^SATIKSME_CHAT_ANALYZER_ENABLED=false$' \
+          '/etc/arbuzas/env/satiksme-bot.env'; then
+        echo 'SATIKSME_CHAT_ANALYZER_ENABLED must be explicitly true or false' >&2
+        exit 1
       fi
 
-      if find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
+      if [[ '${scope}' == 'all' ]]; then
+        history_match=\$(find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
           \( -name '*.bak*' -o -name '*.before-*' -o -name '*.retired-*' -o -name '*~' \) \
-          -print -quit | grep -q .; then
+          -print -quit)
+      else
+        history_match=\$(find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
+          \( -name 'satiksme-bot.env.bak*' -o -name 'satiksme-bot.env.before-*' \
+             -o -name 'satiksme-bot.env.retired-*' -o -name 'satiksme-bot.env~' \) \
+          -print -quit)
+      fi
+      if [[ -n \"\${history_match}\" ]]; then
         echo 'unmanaged host environment history remains under /etc/arbuzas/env' >&2
         exit 1
       fi
     " \
     ${diagnostics_services[@]+"${diagnostics_services[@]}"}
+}
+
+preflight_remote_satiksme_private_configuration() {
+  local remote_release_dir="${1:-${REMOTE_RELEASES_ROOT}/${ARBUZAS_RELEASE_ID}}"
+  local REMOTE_VALIDATION_FAILED=0
+
+  validate_remote_private_configuration_permissions "${remote_release_dir}" satiksme
 }
 
 validate_remote_retired_portainer_absence() {
@@ -8147,11 +8323,17 @@ run_post_deploy_maintenance() {
   if ! run_local_release_cleanup "${protect_release_id}"; then
     log "Cleanup warning: local release cleanup failed, but the validated release remains successful"
   fi
-  if [[ "${VALIDATION_PROFILE}" != "full" ]]; then
-    log "Remote cleanup deferred by ${VALIDATION_PROFILE} profile; local expired release cleanup still completed"
+  if [[ "${action}" == "rollback" ]]; then
+    log "Remote cleanup skipped after rollback; local expired release cleanup still completed"
     return 0
   fi
-  cleanup_remote_public_bundle_versions
+  if [[ "${VALIDATION_PROFILE}" == "fast" ]]; then
+    log "Remote cleanup deferred by fast profile; local expired release cleanup still completed"
+    return 0
+  fi
+  if [[ "${VALIDATION_PROFILE}" == "full" ]]; then
+    cleanup_remote_public_bundle_versions
+  fi
   run_automatic_remote_docker_gc
 }
 
@@ -8188,6 +8370,15 @@ rollback_remote_release() {
         esac
       fi
     done
+    if [[ '${TARGETED_MODE}' == '1' ]]; then
+      case ' ${rollback_service_args} ' in
+        *' ticket_remote '*)
+          if printf '%s\n' "\${declared_services}" | grep -Fxq ticket_hdr_transformer; then
+            rollback_services+=(ticket_hdr_transformer)
+          fi
+          ;;
+      esac
+    fi
     for rollback_service in${rollback_tunnel_service_args}; do
       if printf '%s\\n' \"\${declared_services}\" | grep -Fxq \"\${rollback_service}\"; then
         rollback_tunnel_services+=(\"\${rollback_service}\")
@@ -8346,6 +8537,7 @@ deploy_config_from_mirror() {
   local -a compose_services=()
   local service_name=""
   local service_args=""
+  local satiksme_changed=0
   local tiny_vless_changed=0
   local tiny_vless_config_rollback=""
   changed_paths_file="$(mktemp "${TMPDIR:-/tmp}/arbuzas-host-mirror-changed.XXXXXX")"
@@ -8388,8 +8580,17 @@ deploy_config_from_mirror() {
     else
       compose_services+=("${service_name}")
       service_args+=" ${service_name}"
+      if [[ "${service_name}" == "satiksme_bot" ]]; then
+        satiksme_changed=1
+      fi
     fi
   done
+  if (( satiksme_changed == 1 )) && ! preflight_remote_satiksme_private_configuration "${REMOTE_CURRENT_LINK}"; then
+    if (( tiny_vless_changed == 1 )); then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+    fi
+    return 1
+  fi
   remote_shell "
     [[ -f '${REMOTE_CURRENT_LINK}/release.env' ]] || { echo 'missing active release: ${REMOTE_CURRENT_LINK}/release.env' >&2; exit 1; }
     [[ -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing active compose file under ${REMOTE_CURRENT_LINK}' >&2; exit 1; }
@@ -8402,7 +8603,7 @@ deploy_config_from_mirror() {
   if (( ${#compose_services[@]} > 0 )); then
     remote_shell "
       cd '${REMOTE_CURRENT_LINK}'
-      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --force-recreate --no-deps${service_args}
+      docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --no-deps${service_args}
     " || {
       if (( tiny_vless_changed == 1 )); then
         restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
@@ -8519,6 +8720,9 @@ while (( $# > 0 )); do
         set +a
       fi
       ;;
+    --apply)
+      CLEANUP_DOCKER_APPLY=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -8572,6 +8776,11 @@ if (( ${#REQUESTED_SERVICES[@]} > 0 )); then
       exit 2
       ;;
   esac
+fi
+
+if (( CLEANUP_DOCKER_APPLY == 1 )) && [[ "${action}" != "cleanup-docker" ]]; then
+  echo "--apply is only supported for cleanup-docker" >&2
+  exit 2
 fi
 
 resolve_requested_services
@@ -8661,9 +8870,30 @@ case "${action}" in
     if ! run_timed_phase prepare_jellyfin prepare_remote_jellyfin_runtime; then
       exit 1
     fi
+    if ! run_timed_phase prepare_compose validate_and_prepare_remote_release_compose; then
+      log "Compose validation or external image preparation failed before release activation; the current release and running services are unchanged"
+      exit 1
+    fi
+    if [[ "${VALIDATION_PROFILE}" == "fast" ]] && \
+        ! run_timed_phase prepare_image_aliases prepare_remote_release_image_aliases; then
+      exit 1
+    fi
+    if ! run_timed_phase build_images build_remote_release_images; then
+      log "Image build failed before release activation; the current release and running services are unchanged"
+      exit 1
+    fi
+    if targeted_service_selected satiksme_bot && \
+        ! run_timed_phase preflight_private_configuration preflight_remote_satiksme_private_configuration; then
+      log "Private configuration preflight failed before Satiksme recreation; the current release and running services are unchanged"
+      exit 1
+    fi
     deploy_ready_for_validation=1
     tiny_vless_deploy_completed=0
-    if ! run_timed_phase restart_services remote_compose_up; then
+    if ! run_timed_phase activate_services activate_remote_release_services; then
+      deploy_ready_for_validation=0
+    fi
+    if (( deploy_ready_for_validation == 1 )) && \
+        ! run_timed_phase stabilize_limits stabilize_remote_declared_docker_no_swap_limits; then
       deploy_ready_for_validation=0
     fi
     if (( deploy_ready_for_validation == 1 )); then
@@ -8793,8 +9023,11 @@ case "${action}" in
       echo "--release-id is not supported for cleanup-docker" >&2
       exit 2
     fi
-    remote_run_docker_gc
-    remote_run_host_cache_cleanup
+    if (( CLEANUP_DOCKER_APPLY == 1 )); then
+      remote_run_docker_gc apply
+    else
+      remote_run_docker_gc preview
+    fi
     ;;
   memory-report)
     if [[ -n "${requested_release_id}" ]]; then

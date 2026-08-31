@@ -29,24 +29,24 @@ import (
 	"ticketremote/internal/state"
 )
 
-//go:embed static/*
+//go:embed static/* diagnostic/*
 var staticFS embed.FS
 
 type Server struct {
-	cfg          config.Config
-	store        state.Store
-	relay        *phone.Relay
-	auth         *auth.Validator
-	direct       *directStreamHub
-	experimental *experimentalMediaHub
-	static       fs.FS
-	indexTmpl    *template.Template
-	adminTmpl    *template.Template
-	authTmpl     *template.Template
+	cfg               config.Config
+	store             state.Store
+	relay             *phone.Relay
+	auth              *auth.Validator
+	direct            *directStreamHub
+	static            fs.FS
+	diagnostic        fs.FS
+	indexTmpl         *template.Template
+	adminTmpl         *template.Template
+	authTmpl          *template.Template
+	hdrDiagnosticTmpl *template.Template
 
 	mu                  sync.Mutex
 	clients             map[*client]struct{}
-	experimentalClients map[*client]struct{}
 	relayViewerRefs     map[string]int
 	streamPrewarmTimers map[string]*time.Timer
 	streamPrewarmOwners map[string]string
@@ -71,7 +71,6 @@ type Server struct {
 	backgroundKeyframeNeeds    map[string]time.Time
 	backgroundKeyframeActive   map[string]struct{}
 	backgroundKeyframePending  []pendingBackgroundKeyframeRequest
-	nextVideoKeyframeOwnerID   uint64
 
 	streamRecoveryMu            sync.Mutex
 	lastStreamRecoveryAt        time.Time
@@ -95,9 +94,6 @@ type Server struct {
 	startupRunMu              sync.Mutex
 	startupLeaseMu            sync.Mutex
 	streamLifecycleMu         sync.RWMutex
-	streamCadenceMu           sync.Mutex
-	lastStreamCadenceDemand   string
-	lastStreamCadenceMaxFPS   int
 	browserClientLogMu        sync.Mutex
 	browserClientLogWindow    time.Time
 	browserClientLogCount     int
@@ -125,70 +121,45 @@ type client struct {
 	clientLogWindowStart time.Time
 	clientLogCount       int
 
-	videoMu              sync.Mutex
-	videoWriteActive     bool
-	videoPendingFrame    []byte
-	videoPendingKeyFrame bool
-	videoPendingAt       time.Time
-	videoReadyForDelta   bool
-	videoReadyEpoch      uint64
-	videoBroadcastReady  bool
+	videoMu             sync.Mutex
+	videoBroadcastReady bool
 
-	videoDeliveryMode            videoDeliveryMode
-	videoEpoch                   uint64
-	videoLastWrittenSeq          uint64
-	videoInFlight                bool
-	videoInFlightKey             bool
-	videoInFlightEpoch           uint64
-	videoInFlightSeq             uint64
-	videoInFlightConfigGen       uint64
-	videoInFlightProbeGen        uint64
-	videoConfigGeneration        uint64
-	videoWrittenEpoch            uint64
-	videoWrittenSequence         uint64
-	videoWrittenKeyframeSequence uint64
-	videoProbeAwaitingKeyframe   bool
-	videoProbeGeneration         uint64
-	videoProbeKeyframeEpoch      uint64
-	videoProbeKeyframeSequence   uint64
-	videoKeyframeRequestPending  bool
-	videoKeyframeRequestSequence uint64
-	videoKeyframeRequirementID   uint64
-	videoWrittenEvidence         []videoWrittenFrameEvidence
-	videoQueueBytes              int
-	videoQueue                   []queuedVideoFrame
-	controlQueue                 []queuedControlMessage
-	controlQueueBytes            int
-	writerWake                   chan struct{}
-	writerDone                   chan struct{}
-	writerCancel                 context.CancelFunc
-	writerStartOnce              sync.Once
-	writerStopOnce               sync.Once
-	writerClosed                 bool
-	writerCloseReason            string
-	onVideoFrameWritten          func(tsf2Metadata)
-	onVideoKeyframeNeeded        func(string, uint64)
-	startupTraceOrderMu          sync.Mutex
-	feedbackMu                   sync.Mutex
-	lastFeedbackAt               time.Time
-	lastFeedbackEpoch            uint64
-	lastFeedbackReceived         uint64
-	lastFeedbackDecoded          uint64
-	lastFeedbackRendered         uint64
-	lastFeedbackRenderedKeyframe uint64
-	lastFeedbackQueue            uint64
-	lastFeedbackAge              uint64
-	feedbackCount                uint64
-	feedbackDropped              uint64
-	feedbackPressureStreak       uint8
-	feedbackSourceStallStreak    uint8
-	feedbackSourceStallRequested bool
-	feedbackHealthyStreak        uint8
-	feedbackKeyframeStreak       uint8
-	feedbackProbeSince           time.Time
-	feedbackState                string
-	feedbackCause                string
-	feedbackVisibility           string
+	videoEpoch             uint64
+	videoLastWrittenSeq    uint64
+	videoInFlight          bool
+	videoInFlightEpoch     uint64
+	videoInFlightSeq       uint64
+	videoInFlightConfigGen uint64
+	videoConfigGeneration  uint64
+	videoWrittenEpoch      uint64
+	videoWrittenSequence   uint64
+	videoWrittenEvidence   []videoWrittenFrameEvidence
+	videoQueueBytes        int
+	videoQueue             []queuedVideoFrame
+	controlQueue           []queuedControlMessage
+	controlQueueBytes      int
+	writerWake             chan struct{}
+	writerDone             chan struct{}
+	writerCancel           context.CancelFunc
+	writerStartOnce        sync.Once
+	writerStopOnce         sync.Once
+	writerClosed           bool
+	writerCloseReason      string
+	onVideoFrameWritten    func(tsf2Metadata)
+	startupTraceOrderMu    sync.Mutex
+	feedbackMu             sync.Mutex
+	lastFeedbackAt         time.Time
+	lastFeedbackEpoch      uint64
+	lastFeedbackReceived   uint64
+	lastFeedbackDecoded    uint64
+	lastFeedbackRendered   uint64
+	lastFeedbackQueue      uint64
+	lastFeedbackAge        uint64
+	feedbackCount          uint64
+	feedbackDropped        uint64
+	feedbackState          string
+	feedbackCause          string
+	feedbackVisibility     string
 
 	firstVideoFrameRendered bool
 }
@@ -202,7 +173,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-08-27-painted-browser-captured-control-code-account-hdr-preference-slider-end-hdr-metrics-v123"
+	serverVersion                 = "ticket-remote-2026-08-31-browser-captured-control-code-full-color-hdr-all-intra-1fps-v148"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -215,8 +186,6 @@ const (
 	streamPrewarmHTTPStartDedupe  = 2 * time.Second
 	warmPrewarmReconnectProbe     = 200 * time.Millisecond
 	warmPrewarmReconnectPoll      = 5 * time.Millisecond
-	videoWriteTimeout             = 250 * time.Millisecond
-	videoPendingFrameMaxAge       = 250 * time.Millisecond
 	defaultFiniteCookieTTL        = auth.DefaultServerSessionTTL
 	relayReportHeartbeat          = 3 * time.Second
 	relayReportCoalesceWindow     = 75 * time.Millisecond
@@ -230,6 +199,10 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 	if err != nil {
 		return nil, err
 	}
+	diagnosticSub, err := fs.Sub(staticFS, "diagnostic")
+	if err != nil {
+		return nil, err
+	}
 	relayReportCtx, relayReportCancel := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:                      cfg,
@@ -238,11 +211,12 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		auth:                     auth.NewValidator(cfg.Access),
 		direct:                   newDirectStreamHub(),
 		static:                   staticSub,
+		diagnostic:               diagnosticSub,
 		indexTmpl:                template.Must(template.New("index").Parse(indexHTML)),
 		adminTmpl:                template.Must(template.New("admin").Parse(adminHTML)),
 		authTmpl:                 template.Must(template.New("auth").Parse(authRedirectHTML)),
+		hdrDiagnosticTmpl:        template.Must(template.New("hdr-diagnostic").Parse(hdrDiagnosticHTML)),
 		clients:                  map[*client]struct{}{},
-		experimentalClients:      map[*client]struct{}{},
 		relayViewerRefs:          map[string]int{},
 		streamPrewarmTimers:      map[string]*time.Timer{},
 		streamPrewarmOwners:      map[string]string{},
@@ -251,12 +225,6 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		relayReportCancel:        relayReportCancel,
 		relayReportDone:          make(chan struct{}),
 	}
-	s.experimental = newExperimentalMediaHub(
-		cfg.ExperimentalMedia.HDRTransformerURL,
-		cfg.ExperimentalMedia.TransformTimeout,
-		s.broadcastExperimentalFrame,
-		s.failExperimentalClients,
-	)
 	relay.SetHandlers(s.handlePhoneMessage, s.handlePhoneDisconnect)
 	// Pixel owns Spacetime command execution. The server writes durable commands
 	// and uses the direct bridge relay only for video transport.
@@ -266,9 +234,6 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 
 func (s *Server) Close() {
 	s.cancelIdleStreamDesiredRelease()
-	if s.experimental != nil {
-		s.experimental.Close()
-	}
 	if s.relayReportCancel != nil {
 		s.relayReportCancel()
 		select {
@@ -322,8 +287,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleBrowserSocket(w, r)
 	case path == "/api/v1/experimental-media/capability":
 		s.withMember(w, r, s.handleExperimentalMediaCapability)
-	case path == "/api/v1/experimental-media/stream":
-		s.handleExperimentalMediaSocket(w, r)
 	case path == "/api/v1/stream/prewarm":
 		s.withMember(w, r, s.handleStreamPrewarmHTTP)
 	case path == "/api/v1/internal/service-events":
@@ -338,6 +301,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.withAdmin(w, r, s.handleAdminPhoneBackend)
 	case path == "/api/v1/admin/ticket/reselect-latest/schedule":
 		s.withAdmin(w, r, s.handleAdminTicketReselectLatestSchedule)
+	case path == "/owner/hdr-diagnostic":
+		s.withOwner(w, r, s.handleHDRDiagnosticPage)
+	case path == "/owner/hdr-diagnostic/app.js":
+		s.withOwner(w, r, s.handleHDRDiagnosticScript)
 	case path == "/admin":
 		s.handleAdminShell(w, r)
 	case path == "/auth/callback":
@@ -347,6 +314,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) handleHDRDiagnosticPage(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	nonce := randomID()
+	s.writeHTMLHeaders(w, nonce)
+	const knownHDRReferenceOrigin = "https://ccameron-chromium.github.io"
+	csp := w.Header().Get("Content-Security-Policy")
+	w.Header().Set("Content-Security-Policy", strings.Replace(
+		csp,
+		"img-src 'self' data: blob:",
+		"img-src 'self' data: blob: "+knownHDRReferenceOrigin,
+		1,
+	))
+	_ = s.hdrDiagnosticTmpl.Execute(w, map[string]any{
+		"AssetVersion": assetVersion(),
+		"Nonce":        nonce,
+	})
+}
+
+func (s *Server) handleHDRDiagnosticScript(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := fs.ReadFile(s.diagnostic, "hdr-diagnostic.js")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	writeNoStoreHeaders(w)
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = w.Write(body)
 }
 
 func retiredTicketRoute(path string) bool {
@@ -463,7 +466,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot s
 		"phone":               phoneHealth,
 		"activePhoneBackend":  s.activePhoneBackend(),
 		"directStream":        s.direct.snapshot(streamNow, phoneHealth),
-		"experimentalMedia":   s.experimental.snapshot(),
+		"experimentalMedia": map[string]any{
+			"enabled":         true,
+			"browserOnly":     true,
+			"pipelineVersion": "webgpu-mainthread-edr-v2",
+		},
 	})
 }
 
@@ -1335,14 +1342,6 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 			s.direct.recordStartupPhaseOnceForTrace(startupTraceID, "first_forwarded_frame", fmt.Sprintf("epoch=%d sequence=%d keyframe=%t", meta.epoch, meta.sequence, meta.keyFrame))
 		},
 	}
-	c.onVideoKeyframeNeeded = func(reason string, requestSequence uint64) {
-		cleanReason := cleanStreamControlText(reason, "gap")
-		// This is viewer-local recovery rather than a startup-trace phase. Pass
-		// explicit empty trace context so an unbound or replaced socket cannot
-		// mark whichever startup trace happens to be current.
-		requirement := fmt.Sprintf("viewer_%d_%s:%d", c.videoKeyframeRequirementID, cleanReason, requestSequence)
-		s.requestPhoneKeyframeWithRequirement("viewer_"+cleanReason, requirement, "", "")
-	}
 	if !s.tryAddClient(c) {
 		close(startupTraceReady)
 		_ = conn.Close(websocket.StatusPolicyViolation, "connection limit reached")
@@ -1371,7 +1370,6 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	s.cancelIdleStreamDesiredRelease()
 	s.direct.addVideoClient()
 	s.direct.recordStartupPhaseForTrace(startupTraceID, "video_client_registered", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
-	s.publishAdaptiveStreamCadence("video_client_registered")
 	s.wakePhoneStreamFromVideoSocketOpen("video_socket_open", startupTraceCorrelation, startupTraceID)
 	s.sendBrowserVideoWarmStart(c)
 	close(startupTraceReady)
@@ -1382,7 +1380,6 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 		c.stopVideoWriter()
 		s.removeClient(c)
 		s.direct.removeVideoClient()
-		s.publishAdaptiveStreamCadence("video_socket_closed")
 		s.direct.recordStartupPhaseForTrace(startupTraceID, "video_socket_closed", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_closed", traceID, map[string]any{
 			"activeVideoClients": s.direct.activeVideoClientCount(),
@@ -1576,27 +1573,12 @@ func (s *Server) handleStreamFeedback(c *client, data []byte, now time.Time) {
 	if !outcome.accepted {
 		return
 	}
-	s.publishAdaptiveStreamCadence("stream_feedback")
 	if !outcome.transition {
 		return
 	}
-	action := "classified"
-	switch {
-	case outcome.keyframeRequested:
-		action = "keyframe_requested"
-	case outcome.state == "flowing" && outcome.toMode == videoDeliveryFull:
-		action = "recovered"
-	case outcome.state == "flowing":
-		action = "stabilizing"
-	case outcome.fromMode != outcome.toMode:
-		action = "delivery_mode_changed"
-	}
 	s.direct.recordClientTelemetry("stream_feedback_transition", fmt.Sprintf(
-		"cause=%s action=%s from=%s to=%s state=%s received_delta=%d decoded_delta=%d rendered_delta=%d lag=%d queue=%d visual_age_ms=%d",
+		"cause=%s state=%s received_delta=%d decoded_delta=%d rendered_delta=%d lag=%d queue=%d visual_age_ms=%d",
 		outcome.cause,
-		action,
-		outcome.fromMode,
-		outcome.toMode,
 		outcome.state,
 		outcome.receivedDelta,
 		outcome.decodedDelta,
@@ -1697,10 +1679,6 @@ func (s *Server) handlePhoneMessage(msg phone.Message) {
 				}
 			}
 			s.broadcastFrame(frame)
-			if s.experimental != nil && s.experimental.HasClients() {
-				s.experimental.Enqueue(frame)
-			}
-			s.publishAdaptiveStreamCadence("video_frame_delivery")
 		}
 	}
 }
@@ -1757,7 +1735,10 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 	}
 	if msgType == "config" {
 		raw = browserVideoConfigMessage(raw)
-		s.direct.setConfig(raw)
+		if !s.direct.setConfig(raw) {
+			s.direct.recordStartupPhase("phone_config_rejected", "reason=all_intra_contract_mismatch")
+			return true
+		}
 		s.direct.recordStartupPhaseOnce("phone_config_received", "config=true")
 		_, cachedKeyFrame := s.direct.warmStart()
 		needsFreshKeyFrame := false
@@ -1767,7 +1748,6 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 				needsFreshKeyFrame = true
 			}
 		}
-		s.broadcastExperimentalConfig(raw, cachedKeyFrame)
 		if needsFreshKeyFrame {
 			streamEpoch := controlCodeInt64FromMessage(msg["streamEpoch"])
 			if streamEpoch < 0 {
@@ -1820,15 +1800,9 @@ func browserVideoConfigMessage(raw []byte) []byte {
 	if _, ok := payload["feedbackVersion"]; !ok {
 		payload["feedbackVersion"] = 1
 	}
-	if _, ok := payload["sourceFps"]; !ok {
-		if fps, exists := payload["fps"]; exists {
-			payload["sourceFps"] = fps
-		} else {
-			payload["sourceFps"] = 10
-		}
-	}
-	if _, ok := payload["keyframeIntervalFrames"]; !ok {
-		payload["keyframeIntervalFrames"] = 10
+	frameDependencyMode, _ := payload["frameDependencyMode"].(string)
+	if strings.EqualFold(strings.TrimSpace(frameDependencyMode), frameDependencyModeAllIntra) {
+		payload["frameDependencyMode"] = frameDependencyModeAllIntra
 	}
 	next, err := json.Marshal(payload)
 	if err != nil {
@@ -2037,6 +2011,19 @@ func (s *Server) withAdmin(w http.ResponseWriter, r *http.Request, next func(htt
 	}
 	if !snapshot.IsAdmin(id.Email) {
 		writeErrorPage(w, http.StatusForbidden, "Admin access is required.")
+		return
+	}
+	next(w, r, id, sessionID, snapshot)
+}
+
+func (s *Server) withOwner(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request, auth.Identity, string, state.Snapshot)) {
+	id, sessionID, snapshot, ok := s.identifyMember(w, r)
+	if !ok {
+		return
+	}
+	member, memberOK := snapshot.Member(id.Email)
+	if !memberOK || member.Role != state.RoleOwner {
+		http.NotFound(w, r)
 		return
 	}
 	next(w, r, id, sessionID, snapshot)

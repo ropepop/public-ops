@@ -82,7 +82,7 @@ grep -Fxq 'changes=none' <<<"${parse_output}" || fail "documented flags are not 
 
 for contract in \
   'tools/arbuzas/deploy.sh" deploy' \
-  'train_bot,train_tunnel,ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_hdr_transformer,ticket_remote,ticket_remote_tunnel' \
+  'train_bot,train_tunnel,ticket_phone_bridge,ticket_remote_spacetime_sidecar,ticket_remote,ticket_remote_tunnel' \
   'deploy_orchestrator_apk.sh"' \
   '--action redeploy_component' \
   '--component ticket_screen' \
@@ -289,7 +289,7 @@ fake_docker_log="${fake_cleanup_root}/docker.log"
 ) >/dev/null || fail "fake-host cleanup rejected its exact expected failed release"
 [[ ! -e "${fake_cleanup_root}/current" ]] || fail "fake-host cleanup left the exact failed current link"
 [[ -d "${fake_cleanup_root}/releases/expected-release" ]] || fail "fake-host cleanup deleted failed release artifacts"
-for service in train_bot train_tunnel ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_hdr_transformer ticket_remote ticket_remote_tunnel; do
+for service in train_bot train_tunnel ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel; do
   grep -Fq "label=com.docker.compose.service=${service}" "${fake_docker_log}" ||
     fail "fake-host cleanup missed selected service ${service}"
 done

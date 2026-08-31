@@ -38,6 +38,8 @@ import TicketremoteAdminScheduleTicketActionV3Reducer from "./ticketremote_admin
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
+import TicketremoteMemberRefreshHdrBoostStateReducer from "./ticketremote_member_refresh_hdr_boost_state_reducer";
+import TicketremoteMemberRefreshHdrEngineStateReducer from "./ticketremote_member_refresh_hdr_engine_state_reducer";
 import TicketremoteMemberRefreshHdrStateReducer from "./ticketremote_member_refresh_hdr_state_reducer";
 import TicketremoteMemberRefreshLimitStateReducer from "./ticketremote_member_refresh_limit_state_reducer";
 import TicketremoteMemberRequestControlCodeReducer from "./ticketremote_member_request_control_code_reducer";
@@ -46,6 +48,8 @@ import TicketremoteMemberRequestTicketActionV3Reducer from "./ticketremote_membe
 import TicketremoteMemberSetHdrPreferenceReducer from "./ticketremote_member_set_hdr_preference_reducer";
 import TicketremoteMemberSetLimitPreferenceReducer from "./ticketremote_member_set_limit_preference_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "./ticketremote_member_set_stream_focus_reducer";
+import TicketremoteOwnerSetHdrDisplayBoostReducer from "./ticketremote_owner_set_hdr_display_boost_reducer";
+import TicketremoteOwnerSetHdrEngineReducer from "./ticketremote_owner_set_hdr_engine_reducer";
 
 // Import all procedure arg schemas
 
@@ -55,6 +59,8 @@ import TicketremoteActivationEligibilityRow from "./ticketremote_activation_elig
 import TicketremoteControlCodeFastStateRow from "./ticketremote_control_code_fast_state_table";
 import TicketremoteControlCodeRequestRow from "./ticketremote_control_code_request_table";
 import TicketremoteLatencyLinkV1Row from "./ticketremote_latency_link_v_1_table";
+import TicketremoteMemberHdrBoostStateRow from "./ticketremote_member_hdr_boost_state_table";
+import TicketremoteMemberHdrEngineStateRow from "./ticketremote_member_hdr_engine_state_table";
 import TicketremoteMemberHdrStateRow from "./ticketremote_member_hdr_state_table";
 import TicketremoteMemberLimitStateRow from "./ticketremote_member_limit_state_table";
 import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_report_table";
@@ -229,6 +235,48 @@ const tablesSchema = __schema({
       { name: 'ticketremote_latency_link_v1_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteLatencyLinkV1Row),
+  ticketremote_member_hdr_boost_state: __table({
+    name: 'ticketremote_member_hdr_boost_state',
+    indexes: [
+      { accessor: 'accountScopeId', name: 'ticketremote_member_hdr_boost_state_account_scope_id_idx_btree', algorithm: 'btree', columns: [
+        'accountScopeId',
+      ] },
+      { accessor: 'id', name: 'ticketremote_member_hdr_boost_state_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketAccount', name: 'ticketremote_member_hdr_boost_state_ticket_id_account_scope_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'accountScopeId',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_member_hdr_boost_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_member_hdr_boost_state_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteMemberHdrBoostStateRow),
+  ticketremote_member_hdr_engine_state: __table({
+    name: 'ticketremote_member_hdr_engine_state',
+    indexes: [
+      { accessor: 'accountScopeId', name: 'ticketremote_member_hdr_engine_state_account_scope_id_idx_btree', algorithm: 'btree', columns: [
+        'accountScopeId',
+      ] },
+      { accessor: 'id', name: 'ticketremote_member_hdr_engine_state_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketAccount', name: 'ticketremote_member_hdr_engine_state_ticket_id_account_scope_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'accountScopeId',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_member_hdr_engine_state_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_member_hdr_engine_state_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteMemberHdrEngineStateRow),
   ticketremote_member_hdr_state: __table({
     name: 'ticketremote_member_hdr_state',
     indexes: [
@@ -432,6 +480,8 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),
+  __reducerSchema("ticketremote_member_refresh_hdr_boost_state", TicketremoteMemberRefreshHdrBoostStateReducer),
+  __reducerSchema("ticketremote_member_refresh_hdr_engine_state", TicketremoteMemberRefreshHdrEngineStateReducer),
   __reducerSchema("ticketremote_member_refresh_hdr_state", TicketremoteMemberRefreshHdrStateReducer),
   __reducerSchema("ticketremote_member_refresh_limit_state", TicketremoteMemberRefreshLimitStateReducer),
   __reducerSchema("ticketremote_member_request_control_code", TicketremoteMemberRequestControlCodeReducer),
@@ -440,6 +490,8 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_set_hdr_preference", TicketremoteMemberSetHdrPreferenceReducer),
   __reducerSchema("ticketremote_member_set_limit_preference", TicketremoteMemberSetLimitPreferenceReducer),
   __reducerSchema("ticketremote_member_set_stream_focus", TicketremoteMemberSetStreamFocusReducer),
+  __reducerSchema("ticketremote_owner_set_hdr_display_boost", TicketremoteOwnerSetHdrDisplayBoostReducer),
+  __reducerSchema("ticketremote_owner_set_hdr_engine", TicketremoteOwnerSetHdrEngineReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */

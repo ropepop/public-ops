@@ -49,8 +49,7 @@ file_mode() {
 for secret_file in \
   telegram-api-id.secret \
   telegram-api-hash.secret \
-  google-api-key.secret \
-  model-api-key.secret; do
+  google-api-key.secret; do
   [[ -s "${secrets_dir}/${secret_file}" ]]
   [[ "$(file_mode "${secrets_dir}/${secret_file}")" == 600 ]]
 done
@@ -61,6 +60,26 @@ python3 "${SCRIPT}" --env-file "${env_file}" --secrets-dir "${secrets_dir}"
 after_hashes="$(shasum -a 256 "${env_file}" "${secrets_dir}"/*.secret)"
 [[ "${before_hashes}" == "${after_hashes}" ]]
 
+# An already-migrated env may still carry the retired model-key file setting.
+# Check mode must reject it, while migration removes it without needing direct
+# credential values again.
+printf '%s\n' \
+  'SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE=/etc/arbuzas/secrets/satiksme-chat-analyzer/model-api-key.secret' \
+  >> "${env_file}"
+if python3 "${SCRIPT}" --env-file "${env_file}" --secrets-dir "${secrets_dir}" \
+    --check >"${tmp_dir}/retired-check.out" 2>"${tmp_dir}/retired-check.err"; then
+  printf 'check accepted the retired model-key file setting\n' >&2
+  exit 1
+fi
+grep -F 'retired analyzer model-key settings remain' "${tmp_dir}/retired-check.err" >/dev/null
+python3 "${SCRIPT}" --env-file "${env_file}" --secrets-dir "${secrets_dir}"
+if grep -F 'SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE=' "${env_file}" >/dev/null; then
+  printf 'migration left the retired model-key file setting in place\n' >&2
+  exit 1
+fi
+[[ "$(grep -Fc '# Analyzer credentials are stored in root-only host secret files.' "${env_file}")" == 1 ]]
+python3 "${SCRIPT}" --env-file "${env_file}" --secrets-dir "${secrets_dir}" --check
+
 replacement_output="$(printf '%s' 'synthetic-replacement-key' | python3 "${SCRIPT}" \
   --secrets-dir "${secrets_dir}" --set-google-key-stdin)"
 if [[ "${replacement_output}" == *synthetic-replacement-key* ]]; then
@@ -68,8 +87,6 @@ if [[ "${replacement_output}" == *synthetic-replacement-key* ]]; then
   exit 1
 fi
 grep -Fx 'synthetic-replacement-key' "${secrets_dir}/google-api-key.secret" >/dev/null
-grep -Fx 'synthetic-replacement-key' "${secrets_dir}/model-api-key.secret" >/dev/null
 [[ "$(file_mode "${secrets_dir}/google-api-key.secret")" == 600 ]]
-[[ "$(file_mode "${secrets_dir}/model-api-key.secret")" == 600 ]]
 
 printf 'Satiksme analyzer secret migration tests passed\n'

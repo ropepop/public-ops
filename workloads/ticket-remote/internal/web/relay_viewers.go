@@ -25,11 +25,6 @@ func (s *Server) tryAddClient(c *client) bool {
 	if identityConnections >= maxBrowserSocketsPerIdentity || sessionConnections >= maxBrowserSocketsPerSession {
 		return false
 	}
-	s.nextVideoKeyframeOwnerID++
-	if s.nextVideoKeyframeOwnerID == 0 {
-		s.nextVideoKeyframeOwnerID++
-	}
-	c.videoKeyframeRequirementID = s.nextVideoKeyframeOwnerID
 	s.clients[c] = struct{}{}
 	return true
 }
