@@ -2,6 +2,7 @@ package reports
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +10,44 @@ import (
 	"telegramtrainapp/internal/domain"
 	"telegramtrainapp/internal/store"
 )
+
+func TestReportActionsShareOneGlobalLimit(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, 2, 25, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-15 * time.Minute)
+	arr := now.Add(45 * time.Minute)
+	seedTrain(t, st, "train-global-limit", dep, arr)
+	seedTrainStops(t, st, "train-global-limit", dep, arr)
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+	userID := int64(44)
+
+	if _, err := svc.SubmitReport(ctx, userID, "train-global-limit", domain.SignalInspectionStarted, now.Add(-25*time.Minute)); err != nil {
+		t.Fatalf("train report: %v", err)
+	}
+	destinationID := "jelgava"
+	matchedTrainID := "train-global-limit"
+	if _, err := svc.SubmitStationSighting(ctx, userID, "riga", &destinationID, &matchedTrainID, now.Add(-20*time.Minute)); err != nil {
+		t.Fatalf("station sighting: %v", err)
+	}
+	if _, err := svc.SubmitAreaReport(ctx, userID, 56.946, 24.106, 100, "near tunnel a", now.Add(-15*time.Minute)); err != nil {
+		t.Fatalf("first area report: %v", err)
+	}
+	if _, err := svc.SubmitAreaReport(ctx, userID, 56.947, 24.107, 100, "near tunnel b", now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("second area report: %v", err)
+	}
+	if _, err := svc.SubmitStationReport(ctx, userID, domain.Station{ID: "zemitani", Name: "Zemitāni"}, now.Add(-5*time.Minute)); err != nil {
+		t.Fatalf("station report: %v", err)
+	}
+
+	_, err := svc.SubmitAreaReport(ctx, userID, 56.948, 24.108, 100, "one report too many", now)
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.Reason != "map_report_limit" {
+		t.Fatalf("sixth report error = %v, want map_report_limit", err)
+	}
+}
 
 func setupStore(t *testing.T) *store.SQLiteStore {
 	t.Helper()

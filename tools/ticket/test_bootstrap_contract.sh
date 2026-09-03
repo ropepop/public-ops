@@ -28,7 +28,6 @@ for required in \
   '--server-recovery-mirror-root' \
   '--restore-empty-server' \
   '--pixel-token-file' \
-  '--pixel-vivi-login-file' \
   '--pixel-platform-bootstrap' \
   '--authorize-server-adb-key'
 do
@@ -64,7 +63,6 @@ parse_output="$(${SCRIPT} plan \
   --pixel-repo "${PIXEL_ROOT}" \
   --pixel-mirror-root /tmp/pixel-mirror \
   --pixel-token-file /tmp/pixel-token \
-  --pixel-vivi-login-file /tmp/pixel-vivi-login \
   --pixel-transport adb \
   --pixel-device clean-pixel \
   --pixel-ssh-host pixel.example \
@@ -72,7 +70,6 @@ parse_output="$(${SCRIPT} plan \
   --install-server-prerequisites \
   --restore-empty-server \
   --replace-pixel-token \
-  --replace-pixel-vivi-login \
   --pixel-platform-bootstrap \
   --pixel-rootfs-tarball /tmp/rootfs.tar \
   --pixel-dropbear-artifact-dir /tmp/dropbear \
@@ -322,7 +319,9 @@ grep -Fq 'runtimeInstaller.syncBundledRuntimeAssets(assetProvider, component = s
 grep -Fq '"ticket_screen" -> RedeploySpec(' "${PIXEL_FACADE}" || fail "Ticket redeploy spec is missing"
 grep -Fq -- '--scope platform' "${SCRIPT}" || fail "clean Pixel platform bootstrap is missing"
 grep -Fq -- '--mode force-bootstrap' "${SCRIPT}" || fail "clean Pixel force-bootstrap mode is missing"
-grep -Fq 'ticket-screen-vivi-login.env' "${SCRIPT}" || fail "ViVi recovery credentials are not staged"
+if grep -Fq 'ticket-screen-vivi-login.env' "${SCRIPT}"; then
+  fail "dead ViVi recovery credential staging returned"
+fi
 grep -Fq -- '--enable-ticket-service' "${SCRIPT}" || fail "Ticket reboot persistence is not enabled"
 grep -Fq 'ticket_service_enabled' "${SCRIPT}" || fail "Ticket reboot-persistence proxy is not verified"
 grep -Fq 'adb pubkey' "${SCRIPT}" || fail "server ADB key pair is not validated"

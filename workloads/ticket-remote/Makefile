@@ -7,6 +7,9 @@ test: spacetime-sidecar-bindings-check spacetime-test
 	cd ./web-client && npm run test:client-hdr-boost-preference
 	cd ./web-client && npm run test:client-hdr
 	cd ./web-client && npm run test:ticket-actions-v3
+	cd ./web-client && npm run test:admin-schedule
+	cd ./web-client && npm run test:admin-statistics
+	cd ./web-client && npm run test:admin-vivi-auth
 	go test ./...
 	cd ./spacetime-sidecar && cargo test
 

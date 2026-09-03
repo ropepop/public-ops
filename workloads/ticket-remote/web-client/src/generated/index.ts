@@ -37,6 +37,7 @@ import {
 import TicketremoteAdminScheduleTicketActionV3Reducer from "./ticketremote_admin_schedule_ticket_action_v_3_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
+import TicketremoteMemberRecordActivityTickReducer from "./ticketremote_member_record_activity_tick_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRefreshHdrBoostStateReducer from "./ticketremote_member_refresh_hdr_boost_state_reducer";
 import TicketremoteMemberRefreshHdrEngineStateReducer from "./ticketremote_member_refresh_hdr_engine_state_reducer";
@@ -48,6 +49,12 @@ import TicketremoteMemberRequestTicketActionV3Reducer from "./ticketremote_membe
 import TicketremoteMemberSetHdrPreferenceReducer from "./ticketremote_member_set_hdr_preference_reducer";
 import TicketremoteMemberSetLimitPreferenceReducer from "./ticketremote_member_set_limit_preference_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "./ticketremote_member_set_stream_focus_reducer";
+import TicketremoteOwnerClearViviCredentialsReducer from "./ticketremote_owner_clear_vivi_credentials_reducer";
+import TicketremoteOwnerPrepareViviCredentialsReducer from "./ticketremote_owner_prepare_vivi_credentials_reducer";
+import TicketremoteOwnerRequestViviReauthReducer from "./ticketremote_owner_request_vivi_reauth_reducer";
+import TicketremoteOwnerRequestViviReauthFullResetReducer from "./ticketremote_owner_request_vivi_reauth_full_reset_reducer";
+import TicketremoteOwnerRequestViviReauthLogoutLoginReducer from "./ticketremote_owner_request_vivi_reauth_logout_login_reducer";
+import TicketremoteOwnerSaveViviCredentialsReducer from "./ticketremote_owner_save_vivi_credentials_reducer";
 import TicketremoteOwnerSetHdrDisplayBoostReducer from "./ticketremote_owner_set_hdr_display_boost_reducer";
 import TicketremoteOwnerSetHdrEngineReducer from "./ticketremote_owner_set_hdr_engine_reducer";
 
@@ -63,6 +70,7 @@ import TicketremoteMemberHdrBoostStateRow from "./ticketremote_member_hdr_boost_
 import TicketremoteMemberHdrEngineStateRow from "./ticketremote_member_hdr_engine_state_table";
 import TicketremoteMemberHdrStateRow from "./ticketremote_member_hdr_state_table";
 import TicketremoteMemberLimitStateRow from "./ticketremote_member_limit_state_table";
+import TicketremoteOwnerViviCredentialsRow from "./ticketremote_owner_vivi_credentials_table";
 import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_report_table";
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
 import TicketremoteStreamDesiredStateRow from "./ticketremote_stream_desired_state_table";
@@ -70,6 +78,8 @@ import TicketremoteStreamViewerFocusRow from "./ticketremote_stream_viewer_focus
 import TicketremoteTicketActionV3Row from "./ticketremote_ticket_action_v_3_table";
 import TicketremoteTicketInteractionRow from "./ticketremote_ticket_interaction_table";
 import TicketremoteTicketSliderRegionV3Row from "./ticketremote_ticket_slider_region_v_3_table";
+import TicketremoteViviCredentialStateRow from "./ticketremote_vivi_credential_state_table";
+import TicketremoteViviReauthAttemptRow from "./ticketremote_vivi_reauth_attempt_table";
 
 /** Type-only namespace exports for generated type groups. */
 
@@ -472,6 +482,63 @@ const tablesSchema = __schema({
       { name: 'ticketremote_ticket_slider_region_v3_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteTicketSliderRegionV3Row),
+  ticketremote_vivi_credential_state: __table({
+    name: 'ticketremote_vivi_credential_state',
+    indexes: [
+      { accessor: 'id', name: 'ticketremote_vivi_credential_state_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketBackend', name: 'ticketremote_vivi_credential_state_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_vivi_credential_state_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteViviCredentialStateRow),
+  ticketremote_vivi_reauth_attempt: __table({
+    name: 'ticketremote_vivi_reauth_attempt',
+    indexes: [
+      { accessor: 'backendId', name: 'ticketremote_vivi_reauth_attempt_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'backendId',
+      ] },
+      { accessor: 'expiresAt', name: 'ticketremote_vivi_reauth_attempt_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'expiresAt',
+      ] },
+      { accessor: 'id', name: 'ticketremote_vivi_reauth_attempt_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'requestId', name: 'ticketremote_vivi_reauth_attempt_request_id_idx_btree', algorithm: 'btree', columns: [
+        'requestId',
+      ] },
+      { accessor: 'status', name: 'ticketremote_vivi_reauth_attempt_status_idx_btree', algorithm: 'btree', columns: [
+        'status',
+      ] },
+      { accessor: 'ticketBackendStatus', name: 'ticketremote_vivi_reauth_attempt_ticket_id_backend_id_status_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+        'status',
+      ] },
+      { accessor: 'ticketExpiresAt', name: 'ticketremote_vivi_reauth_attempt_ticket_id_expires_at_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'expiresAt',
+      ] },
+      { accessor: 'ticketId', name: 'ticketremote_vivi_reauth_attempt_ticket_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_vivi_reauth_attempt_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremoteViviReauthAttemptRow),
+  ticketremote_owner_vivi_credentials: __table({
+    name: 'ticketremote_owner_vivi_credentials',
+    indexes: [
+    ],
+    constraints: [
+    ],
+  }, TicketremoteOwnerViviCredentialsRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
@@ -479,6 +546,7 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_admin_schedule_ticket_action_v3", TicketremoteAdminScheduleTicketActionV3Reducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
+  __reducerSchema("ticketremote_member_record_activity_tick", TicketremoteMemberRecordActivityTickReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),
   __reducerSchema("ticketremote_member_refresh_hdr_boost_state", TicketremoteMemberRefreshHdrBoostStateReducer),
   __reducerSchema("ticketremote_member_refresh_hdr_engine_state", TicketremoteMemberRefreshHdrEngineStateReducer),
@@ -490,6 +558,12 @@ const reducersSchema = __reducers(
   __reducerSchema("ticketremote_member_set_hdr_preference", TicketremoteMemberSetHdrPreferenceReducer),
   __reducerSchema("ticketremote_member_set_limit_preference", TicketremoteMemberSetLimitPreferenceReducer),
   __reducerSchema("ticketremote_member_set_stream_focus", TicketremoteMemberSetStreamFocusReducer),
+  __reducerSchema("ticketremote_owner_clear_vivi_credentials", TicketremoteOwnerClearViviCredentialsReducer),
+  __reducerSchema("ticketremote_owner_prepare_vivi_credentials", TicketremoteOwnerPrepareViviCredentialsReducer),
+  __reducerSchema("ticketremote_owner_request_vivi_reauth", TicketremoteOwnerRequestViviReauthReducer),
+  __reducerSchema("ticketremote_owner_request_vivi_reauth_full_reset", TicketremoteOwnerRequestViviReauthFullResetReducer),
+  __reducerSchema("ticketremote_owner_request_vivi_reauth_logout_login", TicketremoteOwnerRequestViviReauthLogoutLoginReducer),
+  __reducerSchema("ticketremote_owner_save_vivi_credentials", TicketremoteOwnerSaveViviCredentialsReducer),
   __reducerSchema("ticketremote_owner_set_hdr_display_boost", TicketremoteOwnerSetHdrDisplayBoostReducer),
   __reducerSchema("ticketremote_owner_set_hdr_engine", TicketremoteOwnerSetHdrEngineReducer),
 );

@@ -9,7 +9,6 @@ EXECUTE=0
 INSTALL_SERVER_PREREQUISITES=0
 RESTORE_EMPTY_SERVER=0
 REPLACE_PIXEL_TOKEN=0
-REPLACE_PIXEL_VIVI_LOGIN=0
 AUTHORIZE_SERVER_ADB_KEY=0
 PIXEL_PLATFORM_BOOTSTRAP=0
 
@@ -31,7 +30,6 @@ TICKET_ADB_TARGET=""
 PIXEL_REPO=""
 PIXEL_MIRROR_ROOT=""
 PIXEL_TOKEN_FILE=""
-PIXEL_VIVI_LOGIN_FILE=""
 PIXEL_TRANSPORT=""
 PIXEL_DEVICE=""
 PIXEL_SSH_HOST=""
@@ -85,8 +83,6 @@ Safety:
                                   target /etc/arbuzas config trees contain no files.
   --replace-pixel-token           Permit replacing a different existing Pixel
                                   Ticket service token. Missing or identical is safe.
-  --replace-pixel-vivi-login      Permit replacing different existing ViVi login
-                                  credentials. Missing or identical is safe.
   --authorize-server-adb-key      Add the mirrored server ADB public key to the
                                   rooted Pixel. Does not expose ADB or alter networking.
 
@@ -109,7 +105,6 @@ Pixel target:
   --pixel-repo DIR                Default: sibling ../pixel-phone checkout
   --pixel-mirror-root DIR         Default: <pixel-repo>/host-mirror
   --pixel-token-file FILE         Default: ticket token in the Pixel mirror
-  --pixel-vivi-login-file FILE    Default: ViVi recovery login in the Pixel mirror
   --pixel-transport adb|ssh       Required for pixel/all; use adb for a clean device.
   --pixel-device SERIAL           Required with adb.
   --pixel-ssh-host HOST           Required with ssh.
@@ -559,7 +554,6 @@ preflight_pixel_local() {
   require_cmd python3
   require_cmd adb
   require_private_file "${PIXEL_TOKEN_FILE}"
-  require_private_file "${PIXEL_VIVI_LOGIN_FILE}"
   require_file "${PIXEL_REPO}/tools/pixel/transport.sh"
   require_file "${PIXEL_REPO}/tools/pixel/ticket_first_setup.sh"
   require_file "${PIXEL_REPO}/orchestrator/scripts/android/deploy_orchestrator_apk.sh"
@@ -643,8 +637,6 @@ preflight_pixel_platform_inputs() {
 preflight_pixel_device() {
   local local_hash=""
   local remote_hash=""
-  local local_vivi_hash=""
-  local remote_vivi_hash=""
   configure_pixel_transport
   pixel_transport_require_device >/dev/null
   pixel_transport_require_root >/dev/null
@@ -665,11 +657,6 @@ preflight_pixel_device() {
     die "the Pixel already has a different Ticket token; pass --replace-pixel-token only for an intentional recovery cutover"
   fi
 
-  local_vivi_hash="$(file_sha256 "${PIXEL_VIVI_LOGIN_FILE}")"
-  remote_vivi_hash="$(pixel_remote_secret_hash_or_absent /data/local/pixel-stack/conf/apps/ticket-screen-vivi-login.env "ViVi login")"
-  if [[ -n "${remote_vivi_hash}" && "${remote_vivi_hash}" != "${local_vivi_hash}" && "${REPLACE_PIXEL_VIVI_LOGIN}" != "1" ]]; then
-    die "the Pixel already has different ViVi recovery credentials; pass --replace-pixel-vivi-login only for an intentional cutover"
-  fi
 }
 
 stage_pixel_secret() {
@@ -697,10 +684,6 @@ stage_pixel_ticket_secrets() {
     "${PIXEL_TOKEN_FILE}" \
     /data/local/pixel-stack/conf/apps/ticket-screen-spacetime-token \
     "Ticket service token"
-  stage_pixel_secret \
-    "${PIXEL_VIVI_LOGIN_FILE}" \
-    /data/local/pixel-stack/conf/apps/ticket-screen-vivi-login.env \
-    "ViVi recovery credentials"
 }
 
 authorize_server_adb_key_on_pixel() {
@@ -904,7 +887,6 @@ ticket_adb_target=${TICKET_ADB_TARGET:-missing}
 pixel_transport=${PIXEL_TRANSPORT:-missing}
 pixel_target=$([[ "${PIXEL_TRANSPORT}" == "adb" ]] && printf '%s' "${PIXEL_DEVICE:-missing}" || printf '%s' "${PIXEL_SSH_HOST:-missing}")
 pixel_token=$([[ -s "${PIXEL_TOKEN_FILE}" ]] && printf configured || printf missing)
-pixel_vivi_login=$([[ -s "${PIXEL_VIVI_LOGIN_FILE}" ]] && printf configured || printf missing)
 pixel_platform_bootstrap=$([[ "${PIXEL_PLATFORM_BOOTSTRAP}" == "1" ]] && printf planned || printf existing-required)
 server_services=${TICKET_SERVICES}
 order=pixel_then_server
@@ -938,7 +920,6 @@ while (( $# > 0 )); do
     --install-server-prerequisites) INSTALL_SERVER_PREREQUISITES=1 ;;
     --restore-empty-server) RESTORE_EMPTY_SERVER=1 ;;
     --replace-pixel-token) REPLACE_PIXEL_TOKEN=1 ;;
-    --replace-pixel-vivi-login) REPLACE_PIXEL_VIVI_LOGIN=1 ;;
     --authorize-server-adb-key) AUTHORIZE_SERVER_ADB_KEY=1 ;;
     --server-host) shift; SERVER_HOST="${1:-}" ;;
     --server-user) shift; SERVER_USER="${1:-}" ;;
@@ -951,7 +932,6 @@ while (( $# > 0 )); do
     --pixel-repo) shift; PIXEL_REPO="${1:-}" ;;
     --pixel-mirror-root) shift; PIXEL_MIRROR_ROOT="${1:-}" ;;
     --pixel-token-file) shift; PIXEL_TOKEN_FILE="${1:-}" ;;
-    --pixel-vivi-login-file) shift; PIXEL_VIVI_LOGIN_FILE="${1:-}" ;;
     --pixel-transport) shift; PIXEL_TRANSPORT="${1:-}" ;;
     --pixel-device) shift; PIXEL_DEVICE="${1:-}" ;;
     --pixel-ssh-host) shift; PIXEL_SSH_HOST="${1:-}" ;;
@@ -971,7 +951,6 @@ ACTIVE_SERVER_MIRROR_ROOT="${SERVER_MIRROR_ROOT}"
 [[ -n "${PIXEL_REPO}" ]] || PIXEL_REPO="$(cd "${OPS_ROOT}/../pixel-phone" 2>/dev/null && pwd || true)"
 [[ -n "${PIXEL_MIRROR_ROOT}" ]] || PIXEL_MIRROR_ROOT="${PIXEL_REPO}/host-mirror"
 [[ -n "${PIXEL_TOKEN_FILE}" ]] || PIXEL_TOKEN_FILE="${PIXEL_MIRROR_ROOT}/data/local/pixel-stack/conf/apps/ticket-screen-spacetime-token"
-[[ -n "${PIXEL_VIVI_LOGIN_FILE}" ]] || PIXEL_VIVI_LOGIN_FILE="${PIXEL_MIRROR_ROOT}/data/local/pixel-stack/conf/apps/ticket-screen-vivi-login.env"
 
 if [[ "${TICKET_BOOTSTRAP_LIBRARY_ONLY:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0

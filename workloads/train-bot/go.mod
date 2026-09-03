@@ -1,11 +1,12 @@
 module telegramtrainapp
 
-go 1.22
+go 1.26.0
+
+toolchain go1.26.7
 
 require (
-	modernc.org/sqlite v1.30.1
 	github.com/ropepop/ops/workloads/shared-go v0.0.0
-	rsc.io/pdf v0.1.1
+	modernc.org/sqlite v1.30.1
 )
 
 require (

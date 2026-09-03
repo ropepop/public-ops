@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"telegramtrainapp/internal/domain"
@@ -21,7 +22,8 @@ import (
 var migrationFS embed.FS
 
 type SQLiteStore struct {
-	db *sql.DB
+	db         *sql.DB
+	mutationMu sync.Mutex
 }
 
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
@@ -1119,6 +1121,55 @@ func (s *SQLiteStore) InsertReportEvent(ctx context.Context, e domain.ReportEven
 	return err
 }
 
+func (s *SQLiteStore) SubmitReportEvent(ctx context.Context, e domain.ReportEvent, policy ReportMutationPolicy) error {
+	if err := validateReportMutationPolicy(policy); err != nil {
+		return err
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var lastSignal, lastCreatedRaw string
+	err = tx.QueryRowContext(ctx, `
+		SELECT signal, created_at
+		FROM report_events
+		WHERE user_id = ? AND train_instance_id = ?
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, e.UserID, strings.TrimSpace(e.TrainInstanceID)).Scan(&lastSignal, &lastCreatedRaw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		lastCreated, parseErr := time.Parse(time.RFC3339, lastCreatedRaw)
+		if parseErr != nil {
+			return parseErr
+		}
+		elapsed := nonNegativeDuration(e.CreatedAt.Sub(lastCreated))
+		if domain.SignalType(lastSignal) == e.Signal && elapsed < policy.Dedupe {
+			return &MutationRejectedError{Reason: MutationReportDuplicate, Remaining: policy.Dedupe - elapsed}
+		}
+		if elapsed < policy.Cooldown {
+			return &MutationRejectedError{Reason: MutationReportCooldown, Remaining: policy.Cooldown - elapsed}
+		}
+	}
+	if err := enforceReportMutationLimit(ctx, tx, e.UserID, e.CreatedAt.Add(-policy.ActionWindow), policy.ActionWindow, policy.ActionLimit); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO report_events(id, train_instance_id, user_id, signal, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, e.ID, e.TrainInstanceID, e.UserID, string(e.Signal), e.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) GetLastReportByUserTrain(ctx context.Context, userID int64, trainID string) (*domain.ReportEvent, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, train_instance_id, user_id, signal, created_at
@@ -1198,6 +1249,28 @@ func (s *SQLiteStore) ListRecentReportEvents(ctx context.Context, since time.Tim
 	return scanReportRows(rows)
 }
 
+func (s *SQLiteStore) CountReportActionsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM (
+			SELECT created_at FROM report_events WHERE user_id = ? AND created_at >= ?
+			UNION ALL
+			SELECT created_at FROM station_sighting_events WHERE user_id = ? AND created_at >= ?
+			UNION ALL
+			SELECT created_at FROM location_report_events WHERE user_id = ? AND created_at >= ?
+		)
+	`,
+		userID, since.UTC().Format(time.RFC3339),
+		userID, since.UTC().Format(time.RFC3339),
+		userID, since.UTC().Format(time.RFC3339),
+	).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *SQLiteStore) InsertStationSighting(ctx context.Context, e domain.StationSighting) error {
 	var destinationStationID any
 	var matchedTrainID any
@@ -1212,6 +1285,71 @@ func (s *SQLiteStore) InsertStationSighting(ctx context.Context, e domain.Statio
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, e.ID, e.StationID, destinationStationID, matchedTrainID, e.UserID, e.CreatedAt.UTC().Format(time.RFC3339))
 	return err
+}
+
+func (s *SQLiteStore) SubmitStationSighting(ctx context.Context, e domain.StationSighting, policy ReportMutationPolicy) error {
+	if err := validateReportMutationPolicy(policy); err != nil {
+		return err
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	destinationStationID := trimStringValue(e.DestinationStationID)
+	var lastCreatedRaw string
+	if destinationStationID == "" {
+		err = tx.QueryRowContext(ctx, `
+			SELECT created_at FROM station_sighting_events
+			WHERE user_id = ? AND station_id = ? AND destination_station_id IS NULL
+			ORDER BY created_at DESC LIMIT 1
+		`, e.UserID, strings.TrimSpace(e.StationID)).Scan(&lastCreatedRaw)
+	} else {
+		err = tx.QueryRowContext(ctx, `
+			SELECT created_at FROM station_sighting_events
+			WHERE user_id = ? AND station_id = ? AND destination_station_id = ?
+			ORDER BY created_at DESC LIMIT 1
+		`, e.UserID, strings.TrimSpace(e.StationID), destinationStationID).Scan(&lastCreatedRaw)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		lastCreated, parseErr := time.Parse(time.RFC3339, lastCreatedRaw)
+		if parseErr != nil {
+			return parseErr
+		}
+		elapsed := nonNegativeDuration(e.CreatedAt.Sub(lastCreated))
+		if elapsed < policy.Dedupe {
+			return &MutationRejectedError{Reason: MutationReportDuplicate, Remaining: policy.Dedupe - elapsed}
+		}
+		if elapsed < policy.Cooldown {
+			return &MutationRejectedError{Reason: MutationReportCooldown, Remaining: policy.Cooldown - elapsed}
+		}
+	}
+	if err := enforceReportMutationLimit(ctx, tx, e.UserID, e.CreatedAt.Add(-policy.ActionWindow), policy.ActionWindow, policy.ActionLimit); err != nil {
+		return err
+	}
+
+	var destination any
+	if destinationStationID != "" {
+		destination = destinationStationID
+	}
+	var matchedTrainID any
+	if value := trimStringValue(e.MatchedTrainInstanceID); value != "" {
+		matchedTrainID = value
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO station_sighting_events(id, station_id, destination_station_id, matched_train_instance_id, user_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, e.ID, e.StationID, destination, matchedTrainID, e.UserID, e.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) GetLastStationSightingByUserScope(ctx context.Context, userID int64, stationID string, destinationStationID *string) (*domain.StationSighting, error) {
@@ -1327,6 +1465,63 @@ func (s *SQLiteStore) InsertLocationReport(ctx context.Context, e domain.Locatio
 	return err
 }
 
+func (s *SQLiteStore) SubmitLocationReport(ctx context.Context, e domain.LocationReport, policy ReportMutationPolicy) error {
+	if err := validateReportMutationPolicy(policy); err != nil {
+		return err
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var lastCreatedRaw string
+	err = tx.QueryRowContext(ctx, `
+		SELECT created_at FROM location_report_events
+		WHERE user_id = ? AND scope = ? AND subject_id = ?
+		ORDER BY created_at DESC LIMIT 1
+	`, e.UserID, strings.TrimSpace(e.Scope), strings.TrimSpace(e.SubjectID)).Scan(&lastCreatedRaw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		lastCreated, parseErr := time.Parse(time.RFC3339, lastCreatedRaw)
+		if parseErr != nil {
+			return parseErr
+		}
+		elapsed := nonNegativeDuration(e.CreatedAt.Sub(lastCreated))
+		if elapsed < policy.Dedupe {
+			return &MutationRejectedError{Reason: MutationReportDuplicate, Remaining: policy.Dedupe - elapsed}
+		}
+		if elapsed < policy.Cooldown {
+			return &MutationRejectedError{Reason: MutationReportCooldown, Remaining: policy.Cooldown - elapsed}
+		}
+	}
+	if err := enforceReportMutationLimit(ctx, tx, e.UserID, e.CreatedAt.Add(-policy.ActionWindow), policy.ActionWindow, policy.ActionLimit); err != nil {
+		return err
+	}
+
+	var latitude any
+	var longitude any
+	if e.Latitude != nil {
+		latitude = *e.Latitude
+	}
+	if e.Longitude != nil {
+		longitude = *e.Longitude
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO location_report_events(
+			id, scope, subject_id, subject_name, latitude, longitude, radius_meters, description, user_id, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.ID, strings.TrimSpace(e.Scope), strings.TrimSpace(e.SubjectID), strings.TrimSpace(e.SubjectName), latitude, longitude, e.RadiusMeters, strings.TrimSpace(e.Description), e.UserID, e.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, scope, subject_id, subject_name, latitude, longitude, radius_meters, description, user_id, created_at
@@ -1392,6 +1587,85 @@ func (s *SQLiteStore) InsertIncidentVoteEvent(ctx context.Context, vote domain.I
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, vote.ID, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), vote.CreatedAt.UTC().Format(time.RFC3339))
 	return err
+}
+
+func (s *SQLiteStore) SubmitIncidentVote(ctx context.Context, vote domain.IncidentVote, event domain.IncidentVoteEvent, policy VoteMutationPolicy) error {
+	if policy.ChangeWindow <= 0 || policy.ActionWindow <= 0 || policy.ActionLimit <= 0 {
+		return fmt.Errorf("invalid incident vote mutation policy")
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	updatedAt := vote.UpdatedAt.UTC()
+	if updatedAt.IsZero() {
+		updatedAt = event.CreatedAt.UTC()
+	}
+	if updatedAt.IsZero() {
+		return fmt.Errorf("incident vote timestamp is required")
+	}
+	event.IncidentID = vote.IncidentID
+	event.UserID = vote.UserID
+	event.Nickname = vote.Nickname
+	event.Value = vote.Value
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = updatedAt
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var currentUpdatedRaw string
+	err = tx.QueryRowContext(ctx, `
+		SELECT updated_at FROM incident_votes WHERE incident_id = ? AND user_id = ?
+	`, strings.TrimSpace(vote.IncidentID), vote.UserID).Scan(&currentUpdatedRaw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		currentUpdated, parseErr := time.Parse(time.RFC3339, currentUpdatedRaw)
+		if parseErr != nil {
+			return parseErr
+		}
+		elapsed := nonNegativeDuration(updatedAt.Sub(currentUpdated))
+		if elapsed < policy.ChangeWindow {
+			return &MutationRejectedError{Reason: MutationVoteCooldown, Remaining: policy.ChangeWindow - elapsed}
+		}
+	}
+
+	var voteCount int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM incident_vote_events WHERE user_id = ? AND created_at >= ?
+	`, vote.UserID, updatedAt.Add(-policy.ActionWindow).Format(time.RFC3339)).Scan(&voteCount); err != nil {
+		return err
+	}
+	if voteCount >= policy.ActionLimit {
+		return &MutationRejectedError{Reason: MutationVoteActionLimit, Remaining: policy.ActionWindow}
+	}
+
+	createdAt := vote.CreatedAt.UTC()
+	if createdAt.IsZero() {
+		createdAt = updatedAt
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_votes(incident_id, user_id, nickname, vote_value, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(incident_id, user_id) DO UPDATE SET
+			nickname = excluded.nickname,
+			vote_value = excluded.vote_value,
+			updated_at = excluded.updated_at
+	`, vote.IncidentID, vote.UserID, strings.TrimSpace(vote.Nickname), string(vote.Value), createdAt.Format(time.RFC3339), updatedAt.Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_vote_events(id, incident_id, user_id, nickname, vote_value, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, event.ID, event.IncidentID, event.UserID, strings.TrimSpace(event.Nickname), string(event.Value), event.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error) {
@@ -1468,12 +1742,110 @@ func (s *SQLiteStore) ListIncidentVoteEvents(ctx context.Context, incidentID str
 	return out, rows.Err()
 }
 
+func (s *SQLiteStore) CountIncidentVoteEventsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_vote_events
+		WHERE user_id = ? AND created_at >= ?
+	`, userID, since.UTC().Format(time.RFC3339)).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *SQLiteStore) InsertIncidentComment(ctx context.Context, comment domain.IncidentComment) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO incident_comments(id, incident_id, user_id, nickname, body, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, comment.ID, comment.IncidentID, comment.UserID, strings.TrimSpace(comment.Nickname), strings.TrimSpace(comment.Body), comment.CreatedAt.UTC().Format(time.RFC3339))
 	return err
+}
+
+func (s *SQLiteStore) SubmitIncidentComment(ctx context.Context, comment domain.IncidentComment, policy CommentMutationPolicy) error {
+	if policy.ActionWindow <= 0 || policy.ActionLimit <= 0 || policy.IncidentLimit <= 0 {
+		return fmt.Errorf("invalid incident comment mutation policy")
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	since := comment.CreatedAt.Add(-policy.ActionWindow).UTC().Format(time.RFC3339)
+	var userCount int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM incident_comments WHERE user_id = ? AND created_at >= ?
+	`, comment.UserID, since).Scan(&userCount); err != nil {
+		return err
+	}
+	if userCount >= policy.ActionLimit {
+		return &MutationRejectedError{Reason: MutationCommentActionLimit, Remaining: policy.ActionWindow}
+	}
+	var incidentCount int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM incident_comments WHERE incident_id = ? AND created_at >= ?
+	`, strings.TrimSpace(comment.IncidentID), since).Scan(&incidentCount); err != nil {
+		return err
+	}
+	if incidentCount >= policy.IncidentLimit {
+		return &MutationRejectedError{Reason: MutationIncidentCommentLimit, Remaining: policy.ActionWindow}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_comments(id, incident_id, user_id, nickname, body, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, comment.ID, comment.IncidentID, comment.UserID, strings.TrimSpace(comment.Nickname), strings.TrimSpace(comment.Body), comment.CreatedAt.UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateReportMutationPolicy(policy ReportMutationPolicy) error {
+	if policy.Cooldown <= 0 || policy.Dedupe <= 0 || policy.ActionWindow <= 0 || policy.ActionLimit <= 0 {
+		return fmt.Errorf("invalid report mutation policy")
+	}
+	return nil
+}
+
+func enforceReportMutationLimit(ctx context.Context, tx *sql.Tx, userID int64, since time.Time, window time.Duration, limit int) error {
+	var count int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM (
+			SELECT created_at FROM report_events WHERE user_id = ? AND created_at >= ?
+			UNION ALL
+			SELECT created_at FROM station_sighting_events WHERE user_id = ? AND created_at >= ?
+			UNION ALL
+			SELECT created_at FROM location_report_events WHERE user_id = ? AND created_at >= ?
+		)
+	`,
+		userID, since.UTC().Format(time.RFC3339),
+		userID, since.UTC().Format(time.RFC3339),
+		userID, since.UTC().Format(time.RFC3339),
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count >= limit {
+		return &MutationRejectedError{Reason: MutationReportActionLimit, Remaining: window}
+	}
+	return nil
+}
+
+func nonNegativeDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func trimStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func (s *SQLiteStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]domain.IncidentComment, error) {

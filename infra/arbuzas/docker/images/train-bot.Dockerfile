@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514 AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
 RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl poppler-utils \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/train-bot

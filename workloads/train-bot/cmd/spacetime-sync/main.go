@@ -24,6 +24,7 @@ import (
 type syncConfig struct {
 	serviceDate      string
 	scheduleDir      string
+	cachePath        string
 	timezone         string
 	scraperDailyHour int
 	dryRun           bool
@@ -82,7 +83,10 @@ func run(ctx context.Context, stdout io.Writer, cfg syncConfig, loc *time.Locati
 		return fmt.Errorf("configure spacetime syncer: %w", err)
 	}
 
-	scheduleCachePath := deriveScheduleCachePath(cfg.scheduleDir)
+	scheduleCachePath, err := prepareScheduleCachePath(cfg.cachePath, cfg.scheduleDir)
+	if err != nil {
+		return err
+	}
 	scheduleStore, err := store.NewSQLiteStore(scheduleCachePath)
 	if err != nil {
 		return fmt.Errorf("open schedule cache sqlite: %w", err)
@@ -131,6 +135,7 @@ func parseFlags() syncConfig {
 	httpTimeoutFlag := flag.Int("http-timeout-sec", envOrInt("HTTP_TIMEOUT_SEC", 45), "HTTP timeout in seconds")
 	serviceDateFlag := flag.String("service-date", "", "service date to sync in YYYY-MM-DD (defaults to local today)")
 	scheduleDirFlag := flag.String("schedule-dir", strings.TrimSpace(os.Getenv("SCHEDULE_DIR")), "schedule snapshot directory")
+	cachePathFlag := flag.String("cache-path", strings.TrimSpace(os.Getenv("TRAIN_RUNTIME_CACHE_PATH")), "writable SQLite schedule cache path")
 	timezoneFlag := flag.String("timezone", envOr("TZ", "Europe/Riga"), "timezone used to resolve service dates")
 	scraperDailyHourFlag := flag.Int("scraper-daily-hour", envOrInt("SCRAPER_DAILY_HOUR", 3), "cutoff hour used by the local schedule manager")
 	dryRunFlag := flag.Bool("dry-run", false, "print the sync plan without writing to Spacetime")
@@ -139,6 +144,7 @@ func parseFlags() syncConfig {
 	return syncConfig{
 		serviceDate:       strings.TrimSpace(*serviceDateFlag),
 		scheduleDir:       strings.TrimSpace(*scheduleDirFlag),
+		cachePath:         strings.TrimSpace(*cachePathFlag),
 		timezone:          strings.TrimSpace(*timezoneFlag),
 		scraperDailyHour:  *scraperDailyHourFlag,
 		dryRun:            *dryRunFlag,
@@ -188,6 +194,24 @@ func deriveScheduleCachePath(scheduleDir string) string {
 		return filepath.Clean("train-runtime-cache.db")
 	}
 	return filepath.Join(filepath.Dir(dir), "train-runtime-cache.db")
+}
+
+func prepareScheduleCachePath(cachePath string, scheduleDir string) (string, error) {
+	clean := strings.TrimSpace(cachePath)
+	if clean == "" {
+		clean = deriveScheduleCachePath(scheduleDir)
+	}
+	clean = filepath.Clean(clean)
+	if clean == "." || clean == "" {
+		return "", fmt.Errorf("runtime cache path is required")
+	}
+	dir := filepath.Dir(clean)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", fmt.Errorf("create runtime cache directory: %w", err)
+		}
+	}
+	return clean, nil
 }
 
 func firstEnv(keys ...string) string {

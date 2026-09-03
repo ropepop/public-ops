@@ -1,20 +1,41 @@
 {
-  "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
+  "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/1.2.5/meshcentral-config-schema.json",
   "settings": {
     "cert": "mesh.jolkins.id.lv",
     "WANonly": true,
     "port": 28443,
-    "redirport": 0,
-    "mpsport": 0,
-    "exactports": true,
-    "TLSOffload": false,
-    "SelfUpdate": false,
-    "WebRTC": false
+    "redirPort": 0,
+    "mpsPort": 0,
+    "exactPorts": true,
+    "tlsOffload": false,
+    "selfUpdate": false,
+    "webRTC": false,
+    "allowFraming": false,
+    "allowLoginToken": false,
+    "sessionTime": 60,
+    "maxInvalidLogin": {
+      "time": 10,
+      "count": 5,
+      "coolofftime": 30
+    },
+    "maxInvalid2fa": {
+      "time": 10,
+      "count": 5,
+      "coolofftime": 30
+    }
   },
   "domains": {
     "": {
-      "NewAccounts": false,
-      "localSessionRecording": true
+      "newAccounts": false,
+      "localSessionRecording": true,
+      "userSessionIdleTimeout": 30,
+      "logoutOnIdleSessionTimeout": true,
+      "passwordRequirements": {
+        "min": 14,
+        "force2factor": false,
+        "otp2factor": true,
+        "loginTokens": false
+      }
     }
   }
 }

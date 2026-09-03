@@ -173,7 +173,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-08-31-browser-captured-control-code-full-color-hdr-all-intra-1fps-v148"
+	serverVersion                 = "ticket-remote-2026-09-01-browser-captured-control-code-exact-hdr-result-all-intra-1fps-v149"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -727,6 +727,13 @@ func publicHealthError(err error) string {
 }
 
 func redactSnapshotForHealth(snapshot state.Snapshot) state.Snapshot {
+	snapshot.PageActivityDaily = nil
+	snapshot.MemberHDREngines = nil
+	snapshot.MemberHDRBoosts = nil
+	snapshot.Members = append([]state.Member(nil), snapshot.Members...)
+	for index := range snapshot.Members {
+		snapshot.Members[index].AccountScopeID = ""
+	}
 	if snapshot.Phone == nil {
 		return snapshot
 	}
@@ -871,12 +878,23 @@ func ticketAccountScopeID(email string) string {
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
 	nonce := randomID()
 	s.writeHTMLHeaders(w, nonce)
+	adminTab := "overview"
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("tab")), "statistics") {
+		adminTab = "statistics"
+	}
+	isStatistics := adminTab == "statistics"
 	member, _ := snapshot.Member(id.Email)
-	members := make([]state.Member, 0, len(snapshot.Members))
+	members := make([]adminMemberPageRow, 0, len(snapshot.Members))
 	viewers := 0
+	ownerCount := activeOwnerCount(snapshot)
+	isOwner := member.Role == state.RoleOwner
 	for _, item := range snapshot.Members {
 		if item.Active {
-			members = append(members, item)
+			canRemove := isOwner || item.Role == state.RoleMember
+			if item.Role == state.RoleOwner && ownerCount <= 1 {
+				canRemove = false
+			}
+			members = append(members, adminMemberPageRow{Member: item, CanRemove: canRemove})
 		}
 	}
 	for _, viewer := range snapshot.Viewers {
@@ -886,26 +904,58 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 	}
 	phoneHealth := s.relay.Snapshot()
 	activeBackend := s.activePhoneBackend()
+	rawStateSnapshot := snapshot
+	rawStateSnapshot.PageActivityDaily = nil
+	rawStateSnapshot.Members = append([]state.Member(nil), snapshot.Members...)
+	for index := range rawStateSnapshot.Members {
+		rawStateSnapshot.Members[index].AccountScopeID = ""
+	}
 	pageData := map[string]any{
-		"AssetVersion":  assetVersion(),
-		"Email":         id.Email,
-		"IsOwner":       member.Role == state.RoleOwner,
-		"Members":       members,
-		"ViewerCount":   viewers,
-		"Phone":         phoneHealth,
-		"Backends":      s.configuredPhoneBackends(),
-		"ActiveBackend": activeBackend.ID,
-		"RawState":      mustJSON(map[string]any{"state": snapshot, "phone": phoneHealth}),
-		"Nonce":         nonce,
+		"AssetVersion":   assetVersion(),
+		"AdminTab":       adminTab,
+		"IsStatistics":   isStatistics,
+		"Email":          id.Email,
+		"IsOwner":        isOwner,
+		"Members":        members,
+		"ViewerCount":    viewers,
+		"Phone":          phoneHealth,
+		"Backends":       s.configuredPhoneBackends(),
+		"ActiveBackend":  activeBackend.ID,
+		"RawState":       mustJSON(map[string]any{"state": rawStateSnapshot, "phone": phoneHealth}),
+		"StatisticsJSON": template.JS(mustJSON(adminStatisticsPayload(snapshot))),
+		"Nonce":          nonce,
 		"AdminConfigJSON": template.JS(mustJSON(map[string]any{
 			"ticketId":  s.cfg.TicketID,
 			"backendId": activeBackend.ID,
+			"isOwner":   isOwner,
 		})),
 	}
 	for key, value := range s.phoneSchedulePageData(snapshot, time.Now()) {
 		pageData[key] = value
 	}
 	_ = s.adminTmpl.Execute(w, pageData)
+}
+
+func adminStatisticsPayload(snapshot state.Snapshot) map[string]any {
+	members := append([]state.Member(nil), snapshot.Members...)
+	for index := range members {
+		if strings.TrimSpace(members[index].AccountScopeID) == "" && strings.TrimSpace(members[index].Email) != "" {
+			members[index].AccountScopeID = ticketAccountScopeID(members[index].Email)
+		}
+	}
+	return map[string]any{
+		"members":           members,
+		"pageActivityDaily": snapshot.PageActivityDaily,
+		"serverTime":        snapshot.ServerTime,
+		"timeZone":          "Europe/Riga",
+		"days":              30,
+		"secondsPerTick":    5,
+	}
+}
+
+type adminMemberPageRow struct {
+	state.Member
+	CanRemove bool
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
@@ -1059,12 +1109,13 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		}
 		s.setPrivateAuthCookie(w, "ticket_remote_direct_spacetime", "", -1)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":            true,
-			"authenticated": true,
-			"email":         id.Email,
-			"sessionId":     sessionID,
-			"state":         snapshot.PublicForMember(id.Email),
-			"spacetime":     s.directSpacetimeSessionFromRequest(r, id.Email),
+			"ok":             true,
+			"authenticated":  true,
+			"email":          id.Email,
+			"accountScopeId": ticketAccountScopeID(id.Email),
+			"sessionId":      sessionID,
+			"state":          snapshot.PublicForMember(id.Email),
+			"spacetime":      s.directSpacetimeSessionFromRequest(r, id.Email),
 		})
 	case http.MethodPost:
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 32*1024))
@@ -1165,8 +1216,14 @@ func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id a
 			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "bad_role", Message: "Role must be owner, admin, or member.", State: current})
 			return
 		}
-		if memberHasRole(current, req.Email, state.RoleOwner) && role != state.RoleOwner {
-			writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Owner access cannot be changed from the member editor.", State: current})
+		actor, _ := current.Member(id.Email)
+		target, targetExists := current.Member(req.Email)
+		if actor.Role != state.RoleOwner && (role != state.RoleMember || (targetExists && target.Role != state.RoleMember)) {
+			writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "forbidden", Message: "Only an owner can create or change administrator and owner accounts.", State: current})
+			return
+		}
+		if targetExists && target.Role == state.RoleOwner && role != state.RoleOwner && activeOwnerCount(current) <= 1 {
+			writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Create another owner before changing the final owner.", State: current})
 			return
 		}
 		snapshot, err := s.store.UpsertMember(r.Context(), s.cfg.TicketID, id.Email, req.Email, role)
@@ -1179,8 +1236,14 @@ func (s *Server) handleAdminMembers(w http.ResponseWriter, r *http.Request, id a
 }
 
 func (s *Server) removeAdminMember(w http.ResponseWriter, r *http.Request, actor string, current state.Snapshot, email string) {
-	if memberHasRole(current, email, state.RoleOwner) {
-		writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Owner access cannot be removed from the member editor.", State: current})
+	actorMember, _ := current.Member(actor)
+	target, targetExists := current.Member(email)
+	if actorMember.Role != state.RoleOwner && targetExists && target.Role != state.RoleMember {
+		writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "forbidden", Message: "Only an owner can remove administrator and owner accounts.", State: current})
+		return
+	}
+	if targetExists && target.Role == state.RoleOwner && activeOwnerCount(current) <= 1 {
+		writeJSON(w, http.StatusConflict, apiResponse{OK: false, Error: "owner_protected", Message: "Create another owner before removing the final owner.", State: current})
 		return
 	}
 	snapshot, err := s.store.RemoveMember(r.Context(), s.cfg.TicketID, actor, strings.TrimSpace(email))
@@ -1200,14 +1263,14 @@ func requestedAdminRole(value string) (string, bool) {
 	}
 }
 
-func memberHasRole(snapshot state.Snapshot, email string, role string) bool {
-	cleanEmail := strings.TrimSpace(email)
+func activeOwnerCount(snapshot state.Snapshot) int {
+	count := 0
 	for _, member := range snapshot.Members {
-		if strings.EqualFold(strings.TrimSpace(member.Email), cleanEmail) && member.Role == role {
-			return true
+		if member.Active && member.Role == state.RoleOwner {
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 func (s *Server) handleAdminPhoneBackends(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, _ state.Snapshot) {
@@ -1950,6 +2013,8 @@ func (s *Server) writeStateMutation(w http.ResponseWriter, r *http.Request, acto
 		status := http.StatusConflict
 		if errors.Is(err, state.ErrForbidden) || errors.Is(err, state.ErrNotMember) {
 			status = http.StatusForbidden
+		} else if errors.Is(err, state.ErrInvalidRole) {
+			status = http.StatusBadRequest
 		}
 		if publicState {
 			writeJSON(w, status, map[string]any{
@@ -2321,6 +2386,10 @@ func errorCode(err error) string {
 		return "forbidden"
 	case errors.Is(err, state.ErrNotMember):
 		return "not_member"
+	case errors.Is(err, state.ErrInvalidRole):
+		return "bad_role"
+	case errors.Is(err, state.ErrOwnerProtected):
+		return "owner_protected"
 	default:
 		return "error"
 	}

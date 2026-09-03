@@ -183,3 +183,24 @@ func buildNotifierSnapshotTrain(id string, serviceDate string, fromStation strin
 		},
 	}
 }
+
+func TestPrepareRuntimeCachePathCreatesWritableParent(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "state", "train-runtime-cache.db")
+	got, err := prepareRuntimeCachePath(want)
+	if err != nil {
+		t.Fatalf("prepare runtime cache path: %v", err)
+	}
+	if got != want {
+		t.Fatalf("runtime cache path = %q, want %q", got, want)
+	}
+	probe := filepath.Join(filepath.Dir(got), "write-probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+		t.Fatalf("runtime cache parent is not writable: %v", err)
+	}
+}
+
+func TestPrepareRuntimeCachePathRejectsBlankPath(t *testing.T) {
+	if _, err := prepareRuntimeCachePath("  "); err == nil {
+		t.Fatalf("expected blank runtime cache path to fail")
+	}
+}

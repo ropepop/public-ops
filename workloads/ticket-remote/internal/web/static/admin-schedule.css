@@ -81,6 +81,88 @@
   opacity: .72;
 }
 
+.admin-vivi-auth-card {
+  display: grid;
+  gap: 14px;
+}
+
+.admin-vivi-auth-summary,
+.admin-vivi-auth-attempt {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.admin-vivi-auth-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.admin-vivi-auth-form label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: #9cabbc;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.admin-vivi-auth-form input {
+  min-height: 44px;
+  padding: 0 10px;
+}
+
+.admin-vivi-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.admin-vivi-auth-form .admin-vivi-auth-actions {
+  grid-column: 1 / -1;
+}
+
+.admin-vivi-auth-reauth,
+.admin-vivi-auth-full-reset,
+.admin-vivi-auth-confirm {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  border: 1px solid #57333a;
+  border-radius: 8px;
+  padding: 12px;
+  background: #1c1116;
+}
+
+.admin-vivi-auth-reauth p,
+.admin-vivi-auth-full-reset p,
+.admin-vivi-auth-confirm p {
+  margin: 5px 0 0;
+}
+
+.admin-vivi-auth-reauth {
+  border-color: #31527c;
+  background: #101a28;
+}
+
+.admin-vivi-auth-full-reset {
+  border-color: #9e3547;
+  background: #2a1017;
+  box-shadow: inset 3px 0 #d65a6c;
+}
+
+.admin-vivi-auth-confirm[hidden] {
+  display: none;
+}
+
+.admin-vivi-auth-card button.danger {
+  border-color: #87434e;
+  background: #421b23;
+  color: #ffe8ec;
+}
+
 @media (max-width: 780px) {
   .admin-schedule-form,
   .admin-schedule-card {
@@ -88,7 +170,20 @@
   }
 
   .admin-schedule-card button,
-  .admin-schedule-form button {
+  .admin-schedule-form button,
+  .admin-vivi-auth-reauth button,
+  .admin-vivi-auth-full-reset button {
     width: 100%;
+  }
+
+  .admin-vivi-auth-form {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-vivi-auth-reauth,
+  .admin-vivi-auth-full-reset,
+  .admin-vivi-auth-confirm {
+    align-items: stretch;
+    flex-direction: column;
   }
 }

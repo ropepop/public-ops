@@ -3,7 +3,8 @@
 // them solely to satisfy Clippy would break generated clients.
 #![allow(clippy::too_many_arguments)]
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Days, LocalResult, TimeZone, Timelike, Utc};
+use chrono_tz::Europe::Riga;
 use sha2::{Digest, Sha256};
 use spacetimedb::{
     CaseConversionPolicy, Identity, ReducerContext, ScheduleAt, SpacetimeType, Table, Timestamp,
@@ -45,6 +46,9 @@ const REGISTRATION_RATE_INTERVAL_MS: i64 = 30_000;
 const REGISTRATION_RATE_LIMIT: usize = 10;
 const REGISTRATION_RATE_WINDOW_MS: i64 = 60 * 60 * 1000;
 const MEMBER_LIMIT_EVENT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const MEMBER_ACTIVITY_TICK_SLOT_MICROS: i64 = 5 * 1_000_000;
+const MEMBER_ACTIVITY_RETENTION_DAYS: u64 = 37;
+const MEMBER_ACTIVITY_HOURS_PER_DAY: usize = 24;
 const CONTROL_CODE_REQUEST_TTL_MS: i64 = 5 * 60_000;
 const CONTROL_CODE_RESULT_TTL_MS: i64 = 60_000;
 const CONTROL_CODE_COMMAND_TTL_MS: i64 = 2 * 60_000;
@@ -71,12 +75,23 @@ const TICKET_ACTIVATION_CLEANUP_BATCH_SIZE: u32 = 10_000;
 const TICKET_ACTIVATION_CLEANUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const TICKET_ACTIVATION_CATCHUP_DELAY_SECS: u64 = 60;
 const CONTROL_CODE_PHONE_TTL_MS: i64 = 105_000;
+const VIVI_REAUTH_COMMAND_TTL_MS: i64 = 3 * 60_000;
+const VIVI_REAUTH_LEGACY_REQUEST_PREFIX: &str = "vivi-reauth-";
+const VIVI_REAUTH_FULL_RESET_REQUEST_PREFIX: &str = "vivi-full-reset-";
+const VIVI_REAUTH_LOGOUT_LOGIN_REQUEST_PREFIX: &str = "vivi-logout-login-";
 const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
 const STREAM_VIEWER_FOCUS_TTL_MS: i64 = 90_000;
 const SAFE_JSON_MAX_BYTES: usize = 4096;
 const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 2_500;
 const STREAM_BACKGROUND_REPORT_MAX_AGE_MS: i64 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViviReauthMode {
+    LegacyV1,
+    FullResetV2,
+    LogoutLoginV3,
+}
 
 macro_rules! same_fields {
     ($left:expr, $right:expr; $($field:ident),+ $(,)?) => {
@@ -203,14 +218,6 @@ macro_rules! purge_ticket_history {
         );
         purge_expired_rows!(
             $ctx,
-            ticketremote_latest_ticket_reselect_schedule,
-            $ticket,
-            $bound,
-            $limit,
-            $deleted
-        );
-        purge_expired_rows!(
-            $ctx,
             ticketremote_ticket_interaction,
             $ticket,
             $bound,
@@ -233,6 +240,33 @@ macro_rules! purge_ticket_history {
             $limit,
             $deleted
         );
+        // A scheduled terminal action needs its schedule to validate the
+        // original command revision on replay. Purge the action first so
+        // bounded cleanup never leaves an action without that correlation.
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_latest_ticket_reselect_schedule,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_vivi_reauth_attempt,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_vivi_reauth_owner,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
         purge_expired_rows!(
             $ctx,
             ticketremote_ticket_slider_region_v3,
@@ -244,6 +278,14 @@ macro_rules! purge_ticket_history {
         purge_expired_rows!(
             $ctx,
             ticketremote_member_limit_event,
+            $ticket,
+            $bound,
+            $limit,
+            $deleted
+        );
+        purge_expired_rows!(
+            $ctx,
+            ticketremote_member_daily_activity,
             $ticket,
             $bound,
             $limit,
@@ -375,6 +417,29 @@ pub struct TicketremoteTicketMember {
     pub active: bool,
     pub createdAt: String,
     pub updatedAt: String,
+}
+
+/// Private, server-time activity aggregate for one authenticated account and
+/// one Europe/Riga calendar day. Raw usage is exposed only through the
+/// service-identity-gated projection below.
+#[spacetimedb::table(
+    accessor = ticketremote_member_daily_activity,
+    index(accessor = ticketDay, btree(columns = [ticketId, day])),
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberDailyActivity {
+    #[primary_key]
+    pub id: String,
+    pub ticketId: String,
+    pub accountScopeId: String,
+    pub day: String,
+    pub hourlyTicks: Vec<u32>,
+    pub lastTickSlot: i64,
+    pub firstTickAt: String,
+    pub lastTickAt: String,
+    pub updatedAt: String,
+    pub expiresAt: String,
 }
 
 #[spacetimedb::table(accessor = ticketremote_phone_backend)]
@@ -674,6 +739,118 @@ pub struct TicketremoteTicketActionV3QueuedIntent {
     pub requestedEmail: String,
     pub privatePayloadJson: String,
     pub createdAt: String,
+    #[index(btree)]
+    pub expiresAt: String,
+}
+
+/// Private owner-to-service credential authority for the single ViVi account
+/// used by one Ticket phone backend. These values must never be copied into a
+/// public table, command payload, status report, or operational event.
+#[spacetimedb::table(
+    accessor = ticketremote_vivi_credentials,
+    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteViviCredentials {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub backendId: String,
+    pub email: String,
+    pub password: String,
+    pub revision: String,
+    pub createdAt: String,
+    pub updatedAt: String,
+}
+
+/// Private binding used only to make owner-filtered views depend on the
+/// authenticated Spacetime identity rather than on caller-supplied email.
+#[spacetimedb::table(
+    accessor = ticketremote_member_identity,
+    index(accessor = byIdentity, btree(columns = [identity])),
+    index(accessor = ticketEmail, btree(columns = [ticketId, email]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteMemberIdentity {
+    #[primary_key]
+    pub id: String,
+    pub identity: Identity,
+    pub ticketId: String,
+    pub email: String,
+    pub updatedAt: String,
+}
+
+/// Private exact requester binding for revoking queued or not-yet-started
+/// owner re-authentication work without exposing an email in public status.
+#[spacetimedb::table(
+    accessor = ticketremote_vivi_reauth_owner,
+    index(accessor = ticketOwner, btree(columns = [ticketId, ownerEmail])),
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteViviReauthOwner {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub ticketId: String,
+    pub backendId: String,
+    pub requestId: String,
+    pub ownerEmail: String,
+    #[index(btree)]
+    pub expiresAt: String,
+}
+
+/// Public credential projection. It deliberately exposes only whether an
+/// owner has configured credentials and the opaque revision needed to fence a
+/// re-auth request from a concurrent credential replacement.
+#[spacetimedb::table(
+    accessor = ticketremote_vivi_credential_state,
+    public,
+    index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteViviCredentialState {
+    #[primary_key]
+    pub id: String,
+    pub ticketId: String,
+    pub backendId: String,
+    pub configured: bool,
+    pub revision: String,
+    pub updatedAt: String,
+}
+
+/// Public, privacy-safe status for one explicit owner re-auth request. The
+/// matching credentials remain exclusively in the private credential table.
+#[spacetimedb::table(
+    accessor = ticketremote_vivi_reauth_attempt,
+    public,
+    index(accessor = ticketBackendStatus, btree(columns = [ticketId, backendId, status])),
+    index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
+)]
+#[derive(Clone)]
+pub struct TicketremoteViviReauthAttempt {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub requestId: String,
+    #[index(btree)]
+    pub ticketId: String,
+    #[index(btree)]
+    pub backendId: String,
+    pub credentialRevision: String,
+    pub ownerPublicId: String,
+    #[index(btree)]
+    pub status: String,
+    pub phase: String,
+    pub reason: String,
+    pub proofSource: String,
+    pub streamEpoch: String,
+    pub frameSequence: String,
+    pub createdAt: String,
+    pub updatedAt: String,
+    pub completedAt: String,
     #[index(btree)]
     pub expiresAt: String,
 }
@@ -1281,6 +1458,30 @@ pub struct TicketremoteServiceMember {
     pub updatedAt: String,
 }
 
+/// Additive account-identity mapping for activity joins. This intentionally
+/// leaves the pre-existing service member projection byte-for-byte compatible
+/// with sidecars that are still running during a module-first rollout.
+#[derive(Clone, SpacetimeType)]
+pub struct TicketremoteServiceMemberAccount {
+    pub id: String,
+    pub ticketId: String,
+    pub email: String,
+    pub publicId: String,
+    pub accountScopeId: String,
+    pub role: String,
+    pub active: bool,
+    pub updatedAt: String,
+}
+
+cloned_projection! {
+    TicketremoteServiceMemberDailyActivity from TicketremoteMemberDailyActivity
+        with service_member_daily_activity_from_row {
+        id: String, ticketId: String, accountScopeId: String, day: String,
+        hourlyTicks: Vec<u32>, lastTickSlot: i64, firstTickAt: String,
+        lastTickAt: String, updatedAt: String, expiresAt: String
+    }
+}
+
 cloned_projection! {
     TicketremoteServicePhone from TicketremotePhoneBackend with service_phone_from_row {
         id: String, ticketId: String, backendId: String, attachName: String, baseUrl: String,
@@ -1309,6 +1510,49 @@ cloned_projection! {
     }
 }
 
+cloned_projection! {
+    TicketremoteViviCredentialView from TicketremoteViviCredentials
+        with vivi_credential_view_from_row {
+        id: String, ticketId: String, backendId: String, email: String,
+        password: String, revision: String, updatedAt: String
+    }
+}
+
+#[spacetimedb::view(
+    accessor = ticketremote_owner_vivi_credentials,
+    public,
+    primary_key = id
+)]
+pub fn ticketremote_owner_vivi_credentials_view(
+    ctx: &ViewContext,
+) -> Vec<TicketremoteViviCredentialView> {
+    let Some(binding) = ctx
+        .db
+        .ticketremote_member_identity()
+        .byIdentity()
+        .filter(&ctx.sender())
+        .next()
+    else {
+        return Vec::new();
+    };
+    let member_id = member_id(&binding.ticketId, &binding.email);
+    let owner = ctx
+        .db
+        .ticketremote_ticket_member()
+        .id()
+        .find(&member_id)
+        .is_some_and(|row| row.active && row.role == "owner");
+    if !owner {
+        return Vec::new();
+    }
+    ctx.db
+        .ticketremote_vivi_credentials()
+        .ticketBackend()
+        .filter((&binding.ticketId,))
+        .map(|row| vivi_credential_view_from_row(&row))
+        .collect()
+}
+
 service_views! {
     ticketremote_service_ticket => ticketremote_service_ticket_view -> TicketremoteServiceTicket
     |ctx, ticket| {
@@ -1319,6 +1563,18 @@ service_views! {
     |ctx, ticket| {
         ctx.db.ticketremote_ticket_member().ticketId().filter(&ticket)
             .map(|row| service_member_from_row(&row)).collect()
+    }
+    ticketremote_service_member_account =>
+        ticketremote_service_member_account_view -> TicketremoteServiceMemberAccount
+    |ctx, ticket| {
+        ctx.db.ticketremote_ticket_member().ticketId().filter(&ticket)
+            .map(|row| service_member_account_from_row(&row)).collect()
+    }
+    ticketremote_service_member_daily_activity =>
+        ticketremote_service_member_daily_activity_view -> TicketremoteServiceMemberDailyActivity
+    |ctx, ticket| {
+        ctx.db.ticketremote_member_daily_activity().ticketDay().filter((&ticket,))
+            .map(|row| service_member_daily_activity_from_row(&row)).collect()
     }
     ticketremote_service_phone_backend => ticketremote_service_phone_backend_view -> TicketremoteServicePhone
     |ctx, ticket| {
@@ -1337,6 +1593,29 @@ service_views! {
     |ctx, ticket| {
         ctx.db.ticketremote_latest_ticket_reselect_schedule().ticketId().filter(&ticket)
             .map(|row| service_latest_ticket_reselect_schedule_from_row(&row)).collect()
+    }
+    ticketremote_service_vivi_credentials =>
+        ticketremote_service_vivi_credentials_view -> TicketremoteViviCredentialView
+    |ctx, ticket| {
+        ctx.db.ticketremote_vivi_credentials().ticketBackend().filter((&ticket,))
+            .filter(|credential| ["pending", "running"].into_iter().any(|status| {
+                ctx.db.ticketremote_vivi_reauth_attempt().ticketBackendStatus()
+                    .filter((&credential.ticketId, &credential.backendId, status))
+                    .any(|attempt| {
+                        attempt.credentialRevision == credential.revision &&
+                            ctx.db.ticketremote_stream_command().id()
+                                .find(vivi_reauth_command_id(
+                                    &attempt.ticketId,
+                                    &attempt.backendId,
+                                    &attempt.requestId,
+                                ))
+                                .is_some_and(|command| {
+                                    command.commandType == "vivi_reauth" &&
+                                        matches!(command.status.as_str(), "pending" | "running")
+                                })
+                    })
+            }))
+            .map(|row| vivi_credential_view_from_row(&row)).collect()
     }
 }
 
@@ -1424,6 +1703,24 @@ fn ticket_action_v3_public_reason(value: &str, fallback: &str) -> String {
             "ticket_action_v3_superseded",
             "ticket_action_v3_failed",
             "ticket_action_v3_internal_failure",
+            "ticket_action_v3_service_stopping",
+            "ticket_action_v3_startup_reconcile_unproved",
+            "control_code_cleanup_pending_requires_visual_reopen",
+            "ticket_action_current_physical_touch_active",
+            "ticket_action_current_stream_unavailable",
+            "ticket_action_current_proof_fence_changed",
+            "ticket_action_current_activated",
+            "ticket_action_current_list",
+            "ticket_action_current_tickets_single_use_empty",
+            "ticket_action_current_tickets_time_empty",
+            "ticket_action_current_vivi_home",
+            "ticket_action_current_vivi_profile",
+            "ticket_action_current_vivi_other_tab",
+            "ticket_action_current_login_required",
+            "ticket_action_current_blocked",
+            "ticket_action_current_unknown",
+            "ticket_action_current_unactivated_proved",
+            "ticket_action_visual_stream_unavailable",
             "ticket_action_latest_not_detected",
             "ticket_action_latest_redetected",
             "ticket_action_navigation_dispatch_uncertain",
@@ -1440,21 +1737,42 @@ fn ticket_action_v3_public_reason(value: &str, fallback: &str) -> String {
             "ticket_action_selected_anchor_conflict",
             "ticket_action_target_not_reached",
             "ticket_action_target_visible",
+            "ticket_action_navigation_journal_unproved",
+            "ticket_action_navigation_journal_unproved_after_dispatch",
             "ticket_action_slider_unproved",
             "ticket_action_slider_geometry_invalid",
             "ticket_action_interaction_proof_invalid",
             "ticket_action_interaction_revision_unproved",
             "ticket_action_detail_identity_conflict",
+            "ticket_action_detail_identity_unproved",
+            "ticket_action_current_detail_identity_unproved",
+            "ticket_action_register_current_requires_unactivated_detail",
             "ticket_action_accessibility_unavailable",
+            "ticket_action_input_window_unproved",
+            "ticket_action_exact_input_fence_changed",
+            "ticket_action_frame_watermark_unproved",
+            "ticket_action_panel_dark_preempted",
+            "ticket_action_panel_dark_preempted_after_dispatch",
+            "ticket_action_physical_touch_preempted_before_dispatch",
+            "ticket_action_physical_touch_preempted_after_dispatch",
+            "ticket_action_physical_touch_preempted_after_dispatch_reconciled",
+            "ticket_action_physical_touch_preempted_after_dispatch_visual_unproved",
             "ticket_action_activation_dispatch_uncertain",
+            "ticket_action_activation_outcome_unknown",
+            "ticket_action_activation_checkpoint_unproved",
+            "ticket_action_activation_dispatch_checkpoint_unproved",
+            "ticket_action_activation_proven_checkpoint_unproved",
             "ticket_action_gesture_start_uncertain",
             "ticket_action_gesture_start_rejected",
             "ticket_action_gesture_rejected",
             "ticket_action_gesture_completion_uncertain",
             "ticket_action_gesture_completed_no_transition",
-            "ticket_action_no_transition_retry_queued",
+            "ticket_action_retry_not_dispatched",
+            "ticket_action_no_transition_checkpoint_unproved",
             "ticket_action_post_gesture_visual_unproved",
             "ticket_action_activation_visual_unproved",
+            "ticket_action_terminal_journal_unproved",
+            "ticket_action_terminal_view_unproved",
             "ticket_action_registered",
             "ticket_view_switch_unavailable",
             "slider_proof_stale",
@@ -1646,24 +1964,116 @@ fn ticket_action_v3_command_id(ticket_id: &str, backend_id: &str, action_id: &st
     )
 }
 
-fn ticket_action_v3_retry_child_id(parent_action_id: &str) -> String {
-    format!("{}-retry-1", parent_action_id.trim())
+fn vivi_reauth_attempt_id(ticket_id: &str, backend_id: &str, request_id: &str) -> String {
+    format!(
+        "vivi-reauth:{}:{}:{}",
+        clean_ticket_id(ticket_id),
+        clean_backend_id(backend_id),
+        request_id.trim()
+    )
 }
 
-fn ticket_action_v3_no_transition_retry_allowed(action: &TicketremoteTicketActionV3) -> bool {
-    ticket_action_v3_is_activation(&action.target)
-        && matches!(action.status.as_str(), "pending" | "running")
-        && action.retryOrdinal == 0
-        && action
-            .parentActionId
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
+fn vivi_reauth_command_id(ticket_id: &str, backend_id: &str, request_id: &str) -> String {
+    format!(
+        "{}:{}:vivi_reauth:{}",
+        clean_ticket_id(ticket_id),
+        clean_backend_id(backend_id),
+        request_id.trim()
+    )
+}
+
+/// The durable command key is the authoritative correlation for cleanup. It
+/// remains usable even when a corrupt or legacy payload cannot be decoded (or
+/// has already been scrubbed after a failed acknowledgement).
+fn vivi_reauth_request_id_from_command(command: &TicketremoteStreamCommand) -> Option<String> {
+    if command.commandType != "vivi_reauth" {
+        return None;
+    }
+    let prefix = format!(
+        "{}:{}:vivi_reauth:",
+        clean_ticket_id(&command.ticketId),
+        clean_backend_id(&command.backendId)
+    );
+    command
+        .id
+        .strip_prefix(&prefix)
+        .and_then(|request_id| clean_vivi_request_id(request_id).ok())
+}
+
+fn vivi_reauth_attempt_for_command(
+    ctx: &ReducerContext,
+    command: &TicketremoteStreamCommand,
+) -> Option<TicketremoteViviReauthAttempt> {
+    let request_id = vivi_reauth_request_id_from_command(command)?;
+    let attempt_id = vivi_reauth_attempt_id(&command.ticketId, &command.backendId, &request_id);
+    ctx.db
+        .ticketremote_vivi_reauth_attempt()
+        .id()
+        .find(&attempt_id)
+}
+
+fn vivi_reauth_terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "needs_attention")
+}
+
+fn vivi_reauth_interrupted_terminal_status(current_status: &str) -> &'static str {
+    if current_status == "running" {
+        "needs_attention"
+    } else {
+        "failed"
+    }
+}
+
+fn ticket_has_vivi_reauth_in_progress(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+) -> bool {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    ["pending", "running"].into_iter().any(|status| {
+        ctx.db
+            .ticketremote_vivi_reauth_attempt()
+            .ticketBackendStatus()
+            .filter((&ticket_id, &backend_id, status))
+            .next()
+            .is_some()
+    })
+}
+
+fn ticket_has_live_vivi_reauth(ctx: &ReducerContext, ticket_id: &str, backend_id: &str) -> bool {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = clean_backend_id(backend_id);
+    ["queued", "pending", "running"].into_iter().any(|status| {
+        ctx.db
+            .ticketremote_vivi_reauth_attempt()
+            .ticketBackendStatus()
+            .filter((&ticket_id, &backend_id, status))
+            .next()
+            .is_some()
+    })
 }
 
 fn ticket_action_v3_terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "needs_attention")
+}
+
+fn ticket_action_v3_obsolete_read_only_finalization(
+    target: &str,
+    action: Option<(&str, &str)>,
+    command_exists: bool,
+    attempt_id: &str,
+    activation_revision: &str,
+) -> bool {
+    target == "prove_current"
+        && !command_exists
+        && attempt_id.is_empty()
+        && activation_revision.is_empty()
+        && action.is_none_or(|(action_target, action_status)| {
+            action_target == "prove_current"
+                && ticket_action_v3_terminal(action_status)
+                && action_status != "succeeded"
+        })
 }
 
 fn ticket_action_v3_phone_lane_statuses() -> [&'static str; 2] {
@@ -1689,75 +2099,10 @@ fn ticket_has_ticket_action_v3_in_progress(
         })
 }
 
-/// Background current-view proofs are read-only. A newly admitted explicit V3 action may retire
-/// them transactionally before checking the physical phone lane, allowing the user command to be
-/// inserted immediately while leaving every mutating action mutually exclusive.
-fn supersede_read_only_ticket_actions_for_mutation(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-) {
-    let ticket_id = clean_ticket_id(ticket_id);
-    let backend_id = clean_backend_id(backend_id);
-    let proofs = ticket_action_v3_phone_lane_statuses()
-        .into_iter()
-        .flat_map(|status| {
-            ctx.db
-                .ticketremote_ticket_action_v3()
-                .ticketBackendStatus()
-                .filter((&ticket_id, &backend_id, status))
-        })
-        .filter(|row| row.target == "prove_current")
-        .collect::<Vec<_>>();
-    for proof in proofs {
-        let command_id = ticket_action_v3_command_id(&ticket_id, &backend_id, &proof.actionId);
-        if ctx
-            .db
-            .ticketremote_stream_command()
-            .id()
-            .find(&command_id)
-            .is_some()
-        {
-            update_stream_command_status(
-                ctx,
-                &command_id,
-                "failed",
-                "ticket_action_v3_superseded",
-                now,
-            );
-            if let Some(retired) = ctx.db.ticketremote_ticket_action_v3().id().find(&proof.id) {
-                ctx.db
-                    .ticketremote_ticket_action_v3()
-                    .id()
-                    .update(TicketremoteTicketActionV3 {
-                        phase: "superseded".into(),
-                        expiresAt: add_ms(now, TICKET_SLIDER_REGION_V3_TTL_MS),
-                        ..retired
-                    });
-            }
-        } else {
-            ctx.db
-                .ticketremote_ticket_action_v3()
-                .id()
-                .update(TicketremoteTicketActionV3 {
-                    status: "failed".into(),
-                    phase: "superseded".into(),
-                    reason: "ticket_action_v3_superseded".into(),
-                    switchAvailable: false,
-                    switchExpiresAt: String::new(),
-                    updatedAt: now.into(),
-                    completedAt: now.into(),
-                    expiresAt: add_ms(now, TICKET_SLIDER_REGION_V3_TTL_MS),
-                    ..proof
-                });
-        }
-    }
-}
-
 fn ticket_phone_mutation_lane_conflict_reason(
     control_code_busy: bool,
     ticket_action_v3_busy: bool,
+    vivi_reauth_busy: bool,
     legacy_reset_busy: bool,
     interaction_busy: bool,
 ) -> Option<&'static str> {
@@ -1765,6 +2110,8 @@ fn ticket_phone_mutation_lane_conflict_reason(
         Some("control_code_in_progress")
     } else if ticket_action_v3_busy {
         Some("ticket_action_in_progress")
+    } else if vivi_reauth_busy {
+        Some("vivi_reauth_in_progress")
     } else if legacy_reset_busy {
         Some("ticket_reset_in_progress")
     } else if interaction_busy {
@@ -1800,6 +2147,7 @@ fn ticket_phone_mutation_lane_conflict_ignoring_control_request(
             now,
         ),
         ticket_has_ticket_action_v3_in_progress(ctx, ticket_id, backend_id),
+        ticket_has_vivi_reauth_in_progress(ctx, ticket_id, backend_id),
         ticket_has_ticket_registration_reset_in_progress(ctx, ticket_id, backend_id, now),
         false,
     );
@@ -1827,6 +2175,7 @@ fn ticket_phone_mutation_lane_conflict_ignoring_control_request(
         interaction
     };
     ticket_phone_mutation_lane_conflict_reason(
+        false,
         false,
         false,
         false,
@@ -1908,6 +2257,339 @@ fn ticket_action_v3_finish_without_command(
 
 fn ticket_action_v3_queue_id(ticket_id: &str, backend_id: &str) -> String {
     phone_row_id(ticket_id, backend_id)
+}
+
+fn current_vivi_credential_revision(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+) -> String {
+    let id = phone_row_id(ticket_id, backend_id);
+    ctx.db
+        .ticketremote_vivi_credential_state()
+        .id()
+        .find(&id)
+        .map(|row| row.revision)
+        .or_else(|| {
+            ctx.db
+                .ticketremote_vivi_credentials()
+                .id()
+                .find(&id)
+                .map(|row| row.revision)
+        })
+        .unwrap_or_default()
+}
+
+fn upsert_vivi_credential_state(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    configured: bool,
+    revision: &str,
+    now: &str,
+) -> TicketremoteViviCredentialState {
+    let row = TicketremoteViviCredentialState {
+        id: phone_row_id(ticket_id, backend_id),
+        ticketId: clean_ticket_id(ticket_id),
+        backendId: clean_backend_id(backend_id),
+        configured,
+        revision: bounded_text(revision.trim(), 160),
+        updatedAt: now.into(),
+    };
+    upsert_row!(ctx, ticketremote_vivi_credential_state, row)
+}
+
+fn upsert_vivi_reauth_owner(
+    ctx: &ReducerContext,
+    attempt_id: &str,
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    owner_email: &str,
+    now: &str,
+) {
+    let row = TicketremoteViviReauthOwner {
+        id: attempt_id.into(),
+        ticketId: clean_ticket_id(ticket_id),
+        backendId: clean_backend_id(backend_id),
+        requestId: request_id.trim().into(),
+        ownerEmail: clean_email(owner_email),
+        expiresAt: add_ms(now, HISTORY_TTL_MS),
+    };
+    upsert_row!(ctx, ticketremote_vivi_reauth_owner, row);
+}
+
+fn insert_vivi_reauth_attempt(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    credential_revision: &str,
+    owner_email: &str,
+    status: &str,
+    phase: &str,
+    reason: &str,
+    now: &str,
+) -> Result<TicketremoteViviReauthAttempt, String> {
+    let id = vivi_reauth_attempt_id(ticket_id, backend_id, request_id);
+    let table = ctx.db.ticketremote_vivi_reauth_attempt();
+    if let Some(existing) = table.id().find(&id) {
+        if existing.requestId == request_id.trim()
+            && existing.credentialRevision == credential_revision.trim()
+        {
+            return Ok(existing);
+        }
+        return Err("vivi_reauth_request_id_reused".into());
+    }
+    let row = TicketremoteViviReauthAttempt {
+        id,
+        requestId: request_id.trim().into(),
+        ticketId: clean_ticket_id(ticket_id),
+        backendId: clean_backend_id(backend_id),
+        credentialRevision: bounded_text(credential_revision.trim(), 160),
+        ownerPublicId: account_public_id(owner_email),
+        status: vivi_reauth_status(status)?,
+        phase: vivi_reauth_phase(phase)?,
+        reason: vivi_reauth_reason(reason)?,
+        proofSource: String::new(),
+        streamEpoch: "0".into(),
+        frameSequence: "0".into(),
+        createdAt: now.into(),
+        updatedAt: now.into(),
+        completedAt: String::new(),
+        expiresAt: add_ms(now, HISTORY_TTL_MS),
+    };
+    table.insert(row.clone());
+    upsert_vivi_reauth_owner(
+        ctx,
+        &row.id,
+        &row.ticketId,
+        &row.backendId,
+        &row.requestId,
+        owner_email,
+        now,
+    );
+    Ok(row)
+}
+
+fn finish_vivi_reauth_attempt(
+    ctx: &ReducerContext,
+    mut row: TicketremoteViviReauthAttempt,
+    status: &str,
+    phase: &str,
+    reason: &str,
+    proof_source: &str,
+    stream_epoch: &str,
+    frame_sequence: &str,
+    now: &str,
+) -> Result<(), String> {
+    row.status = vivi_reauth_status(status)?;
+    row.phase = vivi_reauth_phase(phase)?;
+    row.reason = vivi_reauth_reason(reason)?;
+    row.proofSource = vivi_reauth_proof_source(proof_source)?;
+    row.streamEpoch = bounded_frame_ordinal(stream_epoch);
+    row.frameSequence = bounded_frame_ordinal(frame_sequence);
+    row.updatedAt = now.into();
+    if vivi_reauth_terminal(&row.status) {
+        row.completedAt = now.into();
+    }
+    row.expiresAt = add_ms(now, HISTORY_TTL_MS);
+    let terminal = vivi_reauth_terminal(&row.status);
+    let id = row.id.clone();
+    ctx.db.ticketremote_vivi_reauth_attempt().id().update(row);
+    if terminal {
+        ctx.db.ticketremote_vivi_reauth_owner().id().delete(id);
+    }
+    Ok(())
+}
+
+fn vivi_reauth_command_payload(
+    request_id: &str,
+    credential_revision: &str,
+    mode: ViviReauthMode,
+) -> String {
+    match mode {
+        ViviReauthMode::LegacyV1 => serde_json::json!({
+            "version": 1,
+            "requestId": request_id,
+            "credentialRevision": credential_revision,
+        })
+        .to_string(),
+        ViviReauthMode::FullResetV2 => serde_json::json!({
+            "version": 2,
+            "requestId": request_id,
+            "credentialRevision": credential_revision,
+            "resetAppData": true,
+        })
+        .to_string(),
+        ViviReauthMode::LogoutLoginV3 => serde_json::json!({
+            "version": 3,
+            "requestId": request_id,
+            "credentialRevision": credential_revision,
+            "logoutInApp": true,
+        })
+        .to_string(),
+    }
+}
+
+fn vivi_reauth_queued_intent_payload(credential_revision: &str, mode: ViviReauthMode) -> String {
+    match mode {
+        ViviReauthMode::LegacyV1 => json_object(&[("credentialRevision", credential_revision)]),
+        ViviReauthMode::FullResetV2 => serde_json::json!({
+            "credentialRevision": credential_revision,
+            "resetAppData": true,
+        })
+        .to_string(),
+        ViviReauthMode::LogoutLoginV3 => serde_json::json!({
+            "credentialRevision": credential_revision,
+            "logoutInApp": true,
+        })
+        .to_string(),
+    }
+}
+
+fn vivi_reauth_queued_intent_fields(payload_json: &str) -> Option<(String, ViviReauthMode)> {
+    let value = serde_json::from_str::<serde_json::Value>(payload_json).ok()?;
+    let object = value.as_object()?;
+    let credential_revision = clean_vivi_revision(
+        object
+            .get("credentialRevision")
+            .and_then(serde_json::Value::as_str)?,
+    )
+    .ok()?;
+    match (
+        object.len(),
+        object.get("resetAppData"),
+        object.get("logoutInApp"),
+    ) {
+        (1, None, None) => Some((credential_revision, ViviReauthMode::LegacyV1)),
+        (2, Some(serde_json::Value::Bool(true)), None) => {
+            Some((credential_revision, ViviReauthMode::FullResetV2))
+        }
+        (2, None, Some(serde_json::Value::Bool(true))) => {
+            Some((credential_revision, ViviReauthMode::LogoutLoginV3))
+        }
+        _ => None,
+    }
+}
+
+fn admit_vivi_reauth(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    credential_revision: &str,
+    mode: ViviReauthMode,
+    owner_email: &str,
+    now: &str,
+) -> Result<(), String> {
+    let attempt = insert_vivi_reauth_attempt(
+        ctx,
+        ticket_id,
+        backend_id,
+        request_id,
+        credential_revision,
+        owner_email,
+        "pending",
+        "queued",
+        "requested",
+        now,
+    )?;
+    if attempt.status != "pending" {
+        return Ok(());
+    }
+    let payload = vivi_reauth_command_payload(request_id, credential_revision, mode);
+    insert_stream_command(
+        ctx,
+        ticket_id,
+        backend_id,
+        &vivi_reauth_command_id(ticket_id, backend_id, request_id),
+        "vivi_reauth",
+        credential_revision,
+        "vivi_reauth_requested",
+        &payload,
+        VIVI_REAUTH_COMMAND_TTL_MS,
+        now,
+    );
+    Ok(())
+}
+
+fn queue_vivi_reauth_intent(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    request_id: &str,
+    credential_revision: &str,
+    mode: ViviReauthMode,
+    owner_email: &str,
+    now: &str,
+) -> Result<(), String> {
+    let queue_id = ticket_action_v3_queue_id(ticket_id, backend_id);
+    if ctx
+        .db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .find(&queue_id)
+        .is_some_and(|row| parse_time_ms(&row.expiresAt) > parse_time_ms(now))
+    {
+        return Err("ticket_action_queue_full".into());
+    }
+    ctx.db
+        .ticketremote_ticket_action_v3_queued_intent()
+        .id()
+        .delete(&queue_id);
+    insert_vivi_reauth_attempt(
+        ctx,
+        ticket_id,
+        backend_id,
+        request_id,
+        credential_revision,
+        owner_email,
+        "queued",
+        "waiting_for_phone_lane",
+        "queued",
+        now,
+    )?;
+    let expires_at = command_expires_at(now, VIVI_REAUTH_COMMAND_TTL_MS);
+    ctx.db.ticketremote_ticket_action_v3_queued_intent().insert(
+        TicketremoteTicketActionV3QueuedIntent {
+            id: queue_id,
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            actionId: request_id.into(),
+            kind: "vivi_reauth".into(),
+            target: String::new(),
+            source: "ticket_remote_admin".into(),
+            reason: "vivi_reauth_queued".into(),
+            attemptId: String::new(),
+            expectedInteractionRevision: String::new(),
+            scheduleId: String::new(),
+            requestedEmail: owner_email.into(),
+            privatePayloadJson: vivi_reauth_queued_intent_payload(credential_revision, mode),
+            createdAt: now.into(),
+            expiresAt: expires_at.clone(),
+        },
+    );
+    ctx.db
+        .ticketremote_stream_command()
+        .insert(TicketremoteStreamCommand {
+            id: vivi_reauth_command_id(ticket_id, backend_id, request_id),
+            ticketId: clean_ticket_id(ticket_id),
+            backendId: clean_backend_id(backend_id),
+            commandType: "vivi_reauth".into(),
+            status: "queued".into(),
+            revision: credential_revision.into(),
+            reason: "vivi_reauth_queued".into(),
+            payloadJson: json_object(&[
+                ("requestId", request_id),
+                ("credentialRevision", credential_revision),
+                ("queueSlot", "1"),
+            ]),
+            createdAt: now.into(),
+            updatedAt: now.into(),
+            expiresAt: expires_at,
+        });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2131,6 +2813,85 @@ fn promote_ticket_action_v3_queue(
     )
     .is_some()
     {
+        return;
+    }
+    if intent.kind == "vivi_reauth" {
+        let command_id = vivi_reauth_command_id(ticket_id, backend_id, &intent.actionId);
+        ctx.db
+            .ticketremote_ticket_action_v3_queued_intent()
+            .id()
+            .delete(&queue_id);
+        ctx.db
+            .ticketremote_stream_command()
+            .id()
+            .delete(&command_id);
+        let attempt_id = vivi_reauth_attempt_id(ticket_id, backend_id, &intent.actionId);
+        let Some(attempt) = ctx
+            .db
+            .ticketremote_vivi_reauth_attempt()
+            .id()
+            .find(&attempt_id)
+        else {
+            return;
+        };
+        let queued_fields = vivi_reauth_queued_intent_fields(&intent.privatePayloadJson);
+        let credential_revision = queued_fields
+            .as_ref()
+            .map(|(revision, _)| revision.as_str())
+            .unwrap_or("");
+        let mode = queued_fields.as_ref().map(|(_, mode)| *mode);
+        let rejection = if parse_time_ms(&intent.expiresAt) <= parse_time_ms(now) {
+            Some("command_expired")
+        } else if queued_fields.is_none() {
+            Some("credential_revision_stale")
+        } else if mode.is_none_or(|mode| !vivi_reauth_request_mode_matches(&intent.actionId, mode))
+        {
+            Some("internal_failure")
+        } else if !is_owner(ctx, ticket_id, &intent.requestedEmail) {
+            Some("owner_role_required")
+        } else {
+            let credentials = ctx
+                .db
+                .ticketremote_vivi_credentials()
+                .id()
+                .find(phone_row_id(ticket_id, backend_id));
+            if credentials
+                .as_ref()
+                .is_none_or(|row| row.revision != credential_revision)
+            {
+                Some("credential_revision_stale")
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = rejection {
+            let _ = finish_vivi_reauth_attempt(
+                ctx,
+                attempt,
+                "failed",
+                "complete",
+                reason,
+                "spacetimedb",
+                "0",
+                "0",
+                now,
+            );
+            return;
+        }
+        ctx.db
+            .ticketremote_vivi_reauth_attempt()
+            .id()
+            .delete(&attempt_id);
+        let _ = admit_vivi_reauth(
+            ctx,
+            ticket_id,
+            backend_id,
+            &intent.actionId,
+            credential_revision,
+            mode.expect("validated queued ViVi re-auth mode"),
+            &intent.requestedEmail,
+            now,
+        );
         return;
     }
     if intent.kind == "control_code" {
@@ -3962,15 +4723,18 @@ fn expire_ticket_switch_anchor(
     refresh_ticket_switch_action_projections(ctx, ticket_id, backend_id, now);
 }
 
-fn commit_ticket_activation_impl(
+fn commit_ticket_activation_at_impl(
     ctx: &ReducerContext,
     ticket_id: &str,
     backend_id: &str,
     attempt_id: &str,
     interaction_revision: &str,
     activation_revision: &str,
+    completed_at: &str,
+    now_arg: &str,
 ) -> Result<(), String> {
-    let now = now(ctx);
+    let now = canonical_time(now_arg);
+    let completed_at = canonical_time(completed_at);
     let ticket = ensure_ticket(ctx, ticket_id, "", &now);
     let backend_id = canonical_activation_backend(ctx, &ticket.id, backend_id)?;
     let attempt_id = attempt_id.trim();
@@ -3984,7 +4748,10 @@ fn commit_ticket_activation_impl(
     }
     let history = activation_history_for_attempt(ctx, &ticket.id, attempt_id)
         .ok_or_else(|| "activation_admission_not_found".to_string())?;
-    if history.backendId != backend_id || history.admission != "admitted" {
+    if history.backendId != backend_id
+        || history.admission != "admitted"
+        || history.interactionRevision != interaction_revision
+    {
         return Err("activation_admission_mismatch".into());
     }
     if let Some(existing_revision) =
@@ -4032,7 +4799,7 @@ fn commit_ticket_activation_impl(
         return Err("activation_admission_not_pending".into());
     }
     let refresh_due_at = iso(Timestamp::from_micros_since_unix_epoch(
-        activation_refresh_due_at_ms(parse_time_ms(&now)).saturating_mul(1_000),
+        activation_refresh_due_at_ms(parse_time_ms(&completed_at)).saturating_mul(1_000),
     ));
     schedule_activation_refresh(
         ctx,
@@ -4048,7 +4815,7 @@ fn commit_ticket_activation_impl(
         outcome: "succeeded".into(),
         reason: "activation_succeeded".into(),
         activationRevision: activation_revision.clone(),
-        completedAt: now.clone(),
+        completedAt: completed_at.clone(),
         refreshDueAt: refresh_due_at.clone(),
         refreshCompletedAt: String::new(),
         refreshOutcome: "pending".into(),
@@ -4063,13 +4830,13 @@ fn commit_ticket_activation_impl(
         &backend_id,
         attempt_id,
         &activation_revision,
-        &now,
+        &completed_at,
         &now,
     );
     let mut next = current;
     next.status = "activated".into();
     next.activationRevision = activation_revision;
-    next.activationAt = now.clone();
+    next.activationAt = completed_at;
     next.scheduledResetAt = refresh_due_at;
     next.ownerPublicId.clear();
     next.controlId.clear();
@@ -4089,6 +4856,94 @@ fn commit_ticket_activation_impl(
     Ok(())
 }
 
+fn commit_ticket_activation_impl(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    attempt_id: &str,
+    interaction_revision: &str,
+    activation_revision: &str,
+) -> Result<(), String> {
+    let now = now(ctx);
+    commit_ticket_activation_at_impl(
+        ctx,
+        ticket_id,
+        backend_id,
+        attempt_id,
+        interaction_revision,
+        activation_revision,
+        &now,
+        &now,
+    )
+}
+
+fn finalize_ticket_activation_failure_checked_impl(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    attempt_id: &str,
+    outcome: &str,
+    reason: &str,
+    interaction_revision: &str,
+    completed_at: &str,
+    now: &str,
+) -> Result<(), String> {
+    let attempt_id = attempt_id.trim();
+    if !valid_schedule_identifier(attempt_id) {
+        return Err("invalid_activation_attempt_id".into());
+    }
+    let ticket_id = clean_ticket_id(ticket_id);
+    let backend_id = canonical_activation_backend(ctx, &ticket_id, backend_id)?;
+    let history = activation_history_for_attempt(ctx, &ticket_id, attempt_id)
+        .ok_or_else(|| "activation_admission_not_found".to_string())?;
+    let interaction_revision = bounded_text(interaction_revision, 160);
+    let completed_at = canonical_time(completed_at);
+    if history.backendId != backend_id
+        || history.admission != "admitted"
+        || history.interactionRevision != interaction_revision
+    {
+        return Err("activation_admission_mismatch".into());
+    }
+    let outcome = if outcome.trim() == "expired" {
+        "expired"
+    } else {
+        "failed"
+    };
+    let reason = safe_token(
+        &bounded_text(reason, 80),
+        if outcome == "expired" {
+            "activation_expired"
+        } else {
+            "activation_failed"
+        },
+    );
+    if history.outcome != "pending" {
+        return if history.outcome == outcome
+            && history.reason == reason
+            && canonical_time(&history.completedAt) == completed_at
+        {
+            Ok(())
+        } else {
+            Err("activation_terminal_conflict".into())
+        };
+    }
+    ctx.db
+        .ticketremote_activation_history()
+        .id()
+        .update(TicketremoteActivationHistory {
+            outcome: outcome.into(),
+            reason,
+            completedAt: completed_at,
+            refreshOutcome: "not_scheduled".into(),
+            refreshCompletedAt: String::new(),
+            refreshRetryAt: String::new(),
+            updatedAt: now.into(),
+            ..history
+        });
+    refresh_activation_eligibility(ctx, &ticket_id, &backend_id, now);
+    Ok(())
+}
+
 fn finalize_ticket_activation_failure_impl(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -4098,57 +4953,35 @@ fn finalize_ticket_activation_failure_impl(
     reason: &str,
     now: &str,
 ) {
-    let attempt_id = attempt_id.trim();
-    if !valid_schedule_identifier(attempt_id) {
-        return;
-    }
-    let ticket_id = clean_ticket_id(ticket_id);
-    let Ok(backend_id) = canonical_activation_backend(ctx, &ticket_id, backend_id) else {
-        return;
-    };
-    let Some(history) = activation_history_for_attempt(ctx, &ticket_id, attempt_id) else {
-        return;
-    };
-    if history.admission != "admitted" || history.outcome != "pending" {
-        return;
-    }
-    let outcome = if outcome.trim() == "expired" {
-        "expired"
-    } else {
-        "failed"
-    };
-    ctx.db
-        .ticketremote_activation_history()
-        .id()
-        .update(TicketremoteActivationHistory {
-            outcome: outcome.into(),
-            reason: safe_token(
-                &bounded_text(reason, 80),
-                if outcome == "expired" {
-                    "activation_expired"
-                } else {
-                    "activation_failed"
-                },
-            ),
-            completedAt: now.into(),
-            refreshOutcome: "not_scheduled".into(),
-            refreshCompletedAt: String::new(),
-            refreshRetryAt: String::new(),
-            updatedAt: now.into(),
-            ..history
-        });
-    refresh_activation_eligibility(ctx, &ticket_id, &backend_id, now);
+    let interaction_revision = activation_history_for_attempt(ctx, ticket_id, attempt_id)
+        .map(|history| history.interactionRevision)
+        .unwrap_or_default();
+    let _ = finalize_ticket_activation_failure_checked_impl(
+        ctx,
+        ticket_id,
+        backend_id,
+        attempt_id,
+        outcome,
+        reason,
+        &interaction_revision,
+        now,
+        now,
+    );
 }
 
-fn finalize_ticket_activation_refresh_impl(
+fn finalize_ticket_activation_refresh_at_impl(
     ctx: &ReducerContext,
     ticket_id: &str,
     backend_id: &str,
     activation_revision: &str,
     interaction_revision: &str,
     reason: &str,
+    phase: &str,
+    completed_at: &str,
+    now_arg: &str,
 ) -> Result<(), String> {
-    let now = now(ctx);
+    let now = canonical_time(now_arg);
+    let completed_at = canonical_time(completed_at);
     let ticket = ensure_ticket(ctx, ticket_id, "", &now);
     let backend_id = clean_backend_id(backend_id);
     let activation_revision = bounded_text(activation_revision, 160);
@@ -4187,7 +5020,7 @@ fn finalize_ticket_activation_refresh_impl(
     let current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
     let history_table = ctx.db.ticketremote_activation_history();
     history_table.id().update(TicketremoteActivationHistory {
-        refreshCompletedAt: now.clone(),
+        refreshCompletedAt: completed_at.clone(),
         refreshOutcome: "succeeded".into(),
         refreshRetryAt: String::new(),
         updatedAt: now.clone(),
@@ -4200,10 +5033,10 @@ fn finalize_ticket_activation_refresh_impl(
         .update(TicketremoteLatestTicketReselectSchedule {
             status: "succeeded".into(),
             resultReason: bounded_text(&non_empty(reason, "activation_refresh_completed"), 240),
-            resultPhase: "ready".into(),
+            resultPhase: bounded_text(&safe_token(phase, "ready"), 80),
             proofSource: "phone_worker".into(),
             updatedAt: now.clone(),
-            completedAt: now.clone(),
+            completedAt: completed_at,
             expiresAt: add_ms(&now, HISTORY_TTL_MS),
             ..schedule
         });
@@ -4231,6 +5064,28 @@ fn finalize_ticket_activation_refresh_impl(
     upsert_ticket_interaction(ctx, next);
     refresh_activation_eligibility(ctx, &ticket.id, &backend_id, &now);
     Ok(())
+}
+
+fn finalize_ticket_activation_refresh_impl(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    backend_id: &str,
+    activation_revision: &str,
+    interaction_revision: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let now = now(ctx);
+    finalize_ticket_activation_refresh_at_impl(
+        ctx,
+        ticket_id,
+        backend_id,
+        activation_revision,
+        interaction_revision,
+        reason,
+        "ready",
+        &now,
+        &now,
+    )
 }
 
 fn request_ticket_action_v3_impl(
@@ -4292,9 +5147,6 @@ fn request_ticket_action_v3_impl(
     let row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, action_id);
     if let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&row_id) {
         return ticket_action_v3_duplicate_result(&existing.target, &target);
-    }
-    if target != "prove_current" {
-        supersede_read_only_ticket_actions_for_mutation(ctx, &ticket.id, &backend_id, now);
     }
     if let Some(conflict_reason) =
         ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, now)
@@ -4929,6 +5781,7 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
     }
     let email = client_email_from_auth(ctx, DEFAULT_TICKET_ID)?;
     let now = now(ctx);
+    upsert_member_identity(ctx, DEFAULT_TICKET_ID, &email, &now);
     refresh_member_limit_state(ctx, DEFAULT_TICKET_ID, &email, &now);
     refresh_member_hdr_state(ctx, DEFAULT_TICKET_ID, &email, &now);
     refresh_member_hdr_engine_state(ctx, DEFAULT_TICKET_ID, &email, &now);
@@ -4938,6 +5791,19 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
 
 #[spacetimedb::reducer(client_disconnected)]
 pub fn identity_disconnected(_ctx: &ReducerContext) {}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_member_record_activity_tick(
+    ctx: &ReducerContext,
+    ticketId: String,
+) -> Result<(), String> {
+    let observed_at = now(ctx);
+    let ticket = ensure_ticket(ctx, &ticketId, "", &observed_at);
+    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let bucket = member_activity_bucket(ctx.timestamp)?;
+    upsert_member_activity_tick(ctx, &ticket.id, &email, &observed_at, &bucket);
+    Ok(())
+}
 
 #[spacetimedb::reducer]
 pub fn ticketremote_member_set_limit_preference(
@@ -5703,14 +6569,358 @@ member_reducers! {
     ticketremote_member_upsert_member(ctx; ticketId: String, email: String, role: String;
         ticket = ticketId)
         |ticket, actor, now| {
-        require_admin(ctx, &ticket.id, &actor)?;
-        upsert_member_row(ctx, &ticket.id, &email, &role, &now)
+        authorize_and_upsert_member(ctx, &ticket.id, &actor, &email, &role, &now)?
     }
     ticketremote_member_remove_member(ctx; ticketId: String, email: String; ticket = ticketId)
         |ticket, actor, now| {
-        require_admin(ctx, &ticket.id, &actor)?;
-        deactivate_member_row(ctx, &ticket.id, &email, &now)
+        authorize_and_deactivate_member(ctx, &ticket.id, &actor, &email, &now)?
     }
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_prepare_vivi_credentials(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let (ticket_id, _backend_id) = vivi_scope(&ticketId, &backendId)?;
+    let ticket = ensure_ticket(ctx, &ticket_id, "", &now);
+    let owner_email = client_email_from_auth(ctx, &ticket.id)?;
+    require_owner(ctx, &ticket.id, &owner_email)?;
+    upsert_member_identity(ctx, &ticket.id, &owner_email, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_save_vivi_credentials(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    email: String,
+    password: String,
+    expectedRevision: String,
+    revision: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let (ticket_id, backend_id) = vivi_scope(&ticketId, &backendId)?;
+    let ticket = ensure_ticket(ctx, &ticket_id, "", &now);
+    let owner_email = client_email_from_auth(ctx, &ticket.id)?;
+    require_owner(ctx, &ticket.id, &owner_email)?;
+    upsert_member_identity(ctx, &ticket.id, &owner_email, &now);
+    if ticket_has_live_vivi_reauth(ctx, &ticket.id, &backend_id) {
+        return Err("vivi_reauth_in_progress".into());
+    }
+    let email = email.trim();
+    if email.is_empty()
+        || email.len() > 254
+        || !email.contains('@')
+        || email.chars().any(char::is_control)
+    {
+        return Err("invalid_vivi_email".into());
+    }
+    if password.is_empty() || password.len() > 1024 || password.chars().any(char::is_control) {
+        return Err("invalid_vivi_password".into());
+    }
+    let expected_revision = clean_expected_vivi_revision(&expectedRevision)?;
+    let revision = clean_vivi_revision(&revision)?;
+    let id = phone_row_id(&ticket.id, &backend_id);
+    let table = ctx.db.ticketremote_vivi_credentials();
+    if let Some(existing) = table.id().find(&id) {
+        if existing.revision == revision {
+            if existing.email == email && existing.password == password {
+                upsert_vivi_credential_state(ctx, &ticket.id, &backend_id, true, &revision, &now);
+                return Ok(());
+            }
+            return Err("vivi_credential_revision_reused".into());
+        }
+        if current_vivi_credential_revision(ctx, &ticket.id, &backend_id) != expected_revision {
+            return Err("vivi_credential_revision_stale".into());
+        }
+        table.id().update(TicketremoteViviCredentials {
+            email: email.into(),
+            password,
+            revision: revision.clone(),
+            updatedAt: now.clone(),
+            ..existing
+        });
+    } else {
+        if current_vivi_credential_revision(ctx, &ticket.id, &backend_id) != expected_revision {
+            return Err("vivi_credential_revision_stale".into());
+        }
+        table.insert(TicketremoteViviCredentials {
+            id,
+            ticketId: ticket.id.clone(),
+            backendId: backend_id.clone(),
+            email: email.into(),
+            password,
+            revision: revision.clone(),
+            createdAt: now.clone(),
+            updatedAt: now.clone(),
+        });
+    }
+    upsert_vivi_credential_state(ctx, &ticket.id, &backend_id, true, &revision, &now);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_clear_vivi_credentials(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    expectedRevision: String,
+    revision: String,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let (ticket_id, backend_id) = vivi_scope(&ticketId, &backendId)?;
+    let ticket = ensure_ticket(ctx, &ticket_id, "", &now);
+    let owner_email = client_email_from_auth(ctx, &ticket.id)?;
+    require_owner(ctx, &ticket.id, &owner_email)?;
+    upsert_member_identity(ctx, &ticket.id, &owner_email, &now);
+    if ticket_has_live_vivi_reauth(ctx, &ticket.id, &backend_id) {
+        return Err("vivi_reauth_in_progress".into());
+    }
+    let expected_revision = clean_expected_vivi_revision(&expectedRevision)?;
+    let revision = clean_vivi_revision(&revision)?;
+    let id = phone_row_id(&ticket.id, &backend_id);
+    let state = ctx.db.ticketremote_vivi_credential_state().id().find(&id);
+    let credentials = ctx.db.ticketremote_vivi_credentials().id().find(&id);
+    if state
+        .as_ref()
+        .is_some_and(|row| !row.configured && row.revision == revision)
+        && credentials.is_none()
+    {
+        return Ok(());
+    }
+    if current_vivi_credential_revision(ctx, &ticket.id, &backend_id) != expected_revision {
+        return Err("vivi_credential_revision_stale".into());
+    }
+    ctx.db.ticketremote_vivi_credentials().id().delete(id);
+    upsert_vivi_credential_state(ctx, &ticket.id, &backend_id, false, &revision, &now);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn owner_request_vivi_reauth(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    credentialRevision: String,
+    mode: ViviReauthMode,
+) -> Result<(), String> {
+    let now = now(ctx);
+    let (ticket_id, backend_id) = vivi_scope(&ticketId, &backendId)?;
+    let ticket = ensure_ticket(ctx, &ticket_id, "", &now);
+    let owner_email = client_email_from_auth(ctx, &ticket.id)?;
+    require_owner(ctx, &ticket.id, &owner_email)?;
+    upsert_member_identity(ctx, &ticket.id, &owner_email, &now);
+    let request_id = clean_vivi_request_id(&requestId)?;
+    let credential_revision = clean_vivi_revision(&credentialRevision)?;
+    let credentials = ctx
+        .db
+        .ticketremote_vivi_credentials()
+        .id()
+        .find(phone_row_id(&ticket.id, &backend_id))
+        .ok_or_else(|| "credential_missing".to_string())?;
+    if credentials.revision != credential_revision {
+        return Err("credential_revision_stale".into());
+    }
+    let attempt_id = vivi_reauth_attempt_id(&ticket.id, &backend_id, &request_id);
+    if let Some(existing) = ctx
+        .db
+        .ticketremote_vivi_reauth_attempt()
+        .id()
+        .find(&attempt_id)
+    {
+        return if existing.credentialRevision == credential_revision {
+            Ok(())
+        } else {
+            Err("vivi_reauth_request_id_reused".into())
+        };
+    }
+    if ticket_phone_mutation_lane_conflict(ctx, &ticket.id, &backend_id, &now).is_some() {
+        return queue_vivi_reauth_intent(
+            ctx,
+            &ticket.id,
+            &backend_id,
+            &request_id,
+            &credential_revision,
+            mode,
+            &owner_email,
+            &now,
+        );
+    }
+    admit_vivi_reauth(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        &request_id,
+        &credential_revision,
+        mode,
+        &owner_email,
+        &now,
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_request_vivi_reauth(
+    ctx: &ReducerContext,
+    version: u32,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    credentialRevision: String,
+) -> Result<(), String> {
+    if version != 1 {
+        return Err("unsupported_vivi_reauth_version".into());
+    }
+    if !vivi_reauth_request_mode_matches(&requestId, ViviReauthMode::LegacyV1) {
+        return Err("vivi_reauth_request_mode_mismatch".into());
+    }
+    owner_request_vivi_reauth(
+        ctx,
+        ticketId,
+        backendId,
+        requestId,
+        credentialRevision,
+        ViviReauthMode::LegacyV1,
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_request_vivi_reauth_full_reset(
+    ctx: &ReducerContext,
+    version: u32,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    credentialRevision: String,
+) -> Result<(), String> {
+    if version != 2 {
+        return Err("unsupported_vivi_reauth_version".into());
+    }
+    if !vivi_reauth_request_mode_matches(&requestId, ViviReauthMode::FullResetV2) {
+        return Err("vivi_reauth_request_mode_mismatch".into());
+    }
+    owner_request_vivi_reauth(
+        ctx,
+        ticketId,
+        backendId,
+        requestId,
+        credentialRevision,
+        ViviReauthMode::FullResetV2,
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_owner_request_vivi_reauth_logout_login(
+    ctx: &ReducerContext,
+    version: u32,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    credentialRevision: String,
+) -> Result<(), String> {
+    if version != 3 {
+        return Err("unsupported_vivi_reauth_version".into());
+    }
+    if !vivi_reauth_request_mode_matches(&requestId, ViviReauthMode::LogoutLoginV3) {
+        return Err("vivi_reauth_request_mode_mismatch".into());
+    }
+    owner_request_vivi_reauth(
+        ctx,
+        ticketId,
+        backendId,
+        requestId,
+        credentialRevision,
+        ViviReauthMode::LogoutLoginV3,
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_update_vivi_reauth_attempt(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    requestId: String,
+    credentialRevision: String,
+    status: String,
+    phase: String,
+    reason: String,
+    proofSource: String,
+    streamEpoch: String,
+    frameSequence: String,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = now_or(ctx, &nowArg);
+    let (ticket_id, backend_id) = vivi_scope(&ticketId, &backendId)?;
+    let request_id = clean_vivi_request_id(&requestId)?;
+    let credential_revision = clean_vivi_revision(&credentialRevision)?;
+    let status = vivi_reauth_status(&status)?;
+    let phase = vivi_reauth_phase(&phase)?;
+    let reason = vivi_reauth_reason(&reason)?;
+    let proof_source = vivi_reauth_proof_source(&proofSource)?;
+    let stream_epoch = bounded_frame_ordinal(&streamEpoch);
+    let frame_sequence = bounded_frame_ordinal(&frameSequence);
+    if !matches!(
+        status.as_str(),
+        "running" | "succeeded" | "failed" | "needs_attention"
+    ) {
+        return Err("invalid_vivi_reauth_service_status".into());
+    }
+    let attempt_id = vivi_reauth_attempt_id(&ticket_id, &backend_id, &request_id);
+    let attempt = ctx
+        .db
+        .ticketremote_vivi_reauth_attempt()
+        .id()
+        .find(&attempt_id)
+        .ok_or_else(|| "vivi_reauth_attempt_not_found".to_string())?;
+    if attempt.credentialRevision != credential_revision {
+        return Err("credential_revision_stale".into());
+    }
+    if vivi_reauth_terminal(&attempt.status) {
+        return if attempt.status == status
+            && attempt.phase == phase
+            && attempt.reason == reason
+            && attempt.proofSource == proof_source
+            && attempt.streamEpoch == stream_epoch
+            && attempt.frameSequence == frame_sequence
+        {
+            Ok(())
+        } else {
+            Err("vivi_reauth_terminal_conflict".into())
+        };
+    }
+    if attempt.status == "queued" {
+        return Err("vivi_reauth_attempt_not_dispatched".into());
+    }
+    // This transition is the durable at-most-once claim for the physical
+    // login. A response lost after commit may leave work unperformed, but a
+    // second worker must never be allowed to cross the mutation boundary.
+    if status == "running" && attempt.status != "pending" {
+        return Err("vivi_reauth_attempt_already_claimed".into());
+    }
+    if status != "running" && attempt.status != "running" {
+        return Err("vivi_reauth_attempt_not_claimed".into());
+    }
+    finish_vivi_reauth_attempt(
+        ctx,
+        attempt,
+        &status,
+        &phase,
+        &reason,
+        &proof_source,
+        &stream_epoch,
+        &frame_sequence,
+        &now,
+    )?;
+    let command_id = vivi_reauth_command_id(&ticket_id, &backend_id, &request_id);
+    if status != "running" {
+        update_stream_command_status(ctx, &command_id, "acknowledged", &reason, &now);
+    }
+    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -5866,15 +7076,13 @@ service_reducers! {
         role: String, nowArg: String) {
         let now = now_or(ctx, &nowArg);
         let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-        require_admin(ctx, &ticket.id, &actorEmail)?;
-        upsert_member_row(ctx, &ticket.id, &email, &role, &now)
+        authorize_and_upsert_member(ctx, &ticket.id, &actorEmail, &email, &role, &now)?
     }
     ticketremote_remove_member(ctx; ticketId: String, actorEmail: String, email: String,
         nowArg: String) {
         let now = now_or(ctx, &nowArg);
         let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-        require_admin(ctx, &ticket.id, &actorEmail)?;
-        deactivate_member_row(ctx, &ticket.id, &email, &now)
+        authorize_and_deactivate_member(ctx, &ticket.id, &actorEmail, &email, &now)?
     }
     ticketremote_update_phone(ctx; ticketId: String, backendId: String, attachName: String,
         baseUrl: String, desiredState: String, healthJson: String, lastError: String, nowArg: String) {
@@ -6602,6 +7810,286 @@ struct TicketSliderRegionV3Input {
     bottom_basis_points: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TicketActionV3TerminalFacts {
+    target: String,
+    status: String,
+    phase: String,
+    current_view: String,
+    stream_epoch: String,
+    frame_sequence: String,
+    reason: String,
+    completed_at: String,
+    attempt_id: String,
+    interaction_revision: String,
+    activation_revision: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ticket_action_v3_terminal_facts(
+    target: &str,
+    status: &str,
+    phase: &str,
+    current_view: &str,
+    stream_epoch: &str,
+    frame_sequence: &str,
+    reason: &str,
+    completed_at: &str,
+    attempt_id: &str,
+    interaction_revision: &str,
+    activation_revision: &str,
+    now: &str,
+) -> Result<TicketActionV3TerminalFacts, String> {
+    let target = ticket_action_v3_target(target);
+    let status = ticket_action_v3_status(status);
+    if target.is_empty() || !ticket_action_v3_terminal(&status) {
+        return Err("ticket_action_terminal_result_invalid".into());
+    }
+    let current_view = current_view.trim();
+    if !matches!(
+        current_view,
+        "latest_unactivated" | "recent_activated" | "activated_current" | "unknown"
+    ) {
+        return Err("ticket_action_terminal_view_invalid".into());
+    }
+    let phase = allowlisted(
+        phase,
+        &[
+            "activation_proven",
+            "complete",
+            "failed",
+            "needs_attention",
+            "no_transition",
+            "not_dispatched",
+            "outcome_unknown",
+            "retry_not_dispatched",
+            "startup_reconcile",
+        ],
+        "",
+    );
+    if phase.is_empty() {
+        return Err("ticket_action_terminal_phase_invalid".into());
+    }
+    let reason = ticket_action_v3_public_reason(reason, "ticket_action_v3_failed");
+    let activation_target = ticket_action_v3_is_activation(&target);
+    let phase_matches_result = match phase.as_str() {
+        "activation_proven" => activation_target && status == "succeeded",
+        "complete" => !activation_target && status == "succeeded",
+        "failed" => status == "failed",
+        "needs_attention" => status == "needs_attention",
+        "no_transition" | "retry_not_dispatched" => {
+            activation_target && status == "needs_attention" && current_view == "latest_unactivated"
+        }
+        "not_dispatched" => activation_target && status != "succeeded",
+        "outcome_unknown" => activation_target && status == "needs_attention",
+        "startup_reconcile" => status == "failed",
+        _ => false,
+    };
+    if !phase_matches_result {
+        return Err("ticket_action_terminal_phase_result_mismatch".into());
+    }
+    let completed_at = canonical_time(completed_at);
+    if parse_time_micros(&completed_at) <= 0
+        || parse_time_micros(&completed_at) > parse_time_micros(now).saturating_add(60 * 1_000_000)
+    {
+        return Err("ticket_action_terminal_time_invalid".into());
+    }
+    let stream_epoch = bounded_frame_ordinal(stream_epoch);
+    let frame_sequence = bounded_frame_ordinal(frame_sequence);
+    let visual_proof_required = status == "succeeded"
+        || matches!(phase.as_str(), "no_transition" | "retry_not_dispatched")
+        || reason == "ticket_action_latest_not_detected";
+    if visual_proof_required && (stream_epoch == "0" || frame_sequence == "0") {
+        return Err("ticket_action_terminal_visual_proof_required".into());
+    }
+    let attempt_id = attempt_id.trim();
+    if !attempt_id.is_empty() && !valid_schedule_identifier(attempt_id) {
+        return Err("invalid_activation_attempt_id".into());
+    }
+    let interaction_revision = bounded_text(interaction_revision.trim(), 160);
+    if interaction_revision.is_empty() {
+        return Err("ticket_action_interaction_revision_required".into());
+    }
+    let activation_revision = bounded_text(activation_revision.trim(), 160);
+    if activation_target {
+        if attempt_id.is_empty() {
+            return Err("ticket_action_attempt_id_mismatch".into());
+        }
+        if status == "succeeded" {
+            if activation_revision.is_empty() || current_view != "activated_current" {
+                return Err("ticket_action_activation_proof_invalid".into());
+            }
+        } else if !activation_revision.is_empty() {
+            return Err("ticket_action_unproved_activation_revision".into());
+        }
+    }
+    Ok(TicketActionV3TerminalFacts {
+        target,
+        status,
+        phase,
+        current_view: current_view.into(),
+        stream_epoch,
+        frame_sequence,
+        reason,
+        completed_at,
+        attempt_id: attempt_id.into(),
+        interaction_revision,
+        activation_revision,
+    })
+}
+
+fn ticket_action_v3_terminal_replay_matches(
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    ticket_action_v3_terminal(&action.status)
+        && action.parentActionId.as_deref().unwrap_or("").is_empty()
+        && action.rootActionId.as_deref().unwrap_or(&action.actionId) == action.actionId
+        && action.retryOrdinal == 0
+        && action.target == facts.target
+        && action.status == facts.status
+        && action.phase == facts.phase
+        && action.currentView == facts.current_view
+        && action.streamEpoch == facts.stream_epoch
+        && action.frameSequence == facts.frame_sequence
+        && action.reason == facts.reason
+        && canonical_time(&action.completedAt) == facts.completed_at
+}
+
+fn ticket_action_v3_slider_region_replay_matches(
+    region: Option<&TicketremoteTicketSliderRegionV3>,
+    action: &TicketremoteTicketActionV3,
+    input: Option<TicketSliderRegionV3Input>,
+) -> bool {
+    match region {
+        // Geometry is intentionally short-lived. Its absence cannot turn an
+        // already matching terminal action into a conflict, and replay must
+        // not recreate or extend an expired proof.
+        None => true,
+        // The one region row is a current-view projection. A later proof may
+        // legitimately supersede this action while its immutable terminal
+        // facts remain available for idempotent acknowledgement.
+        Some(region) if region.proofActionId != action.actionId => true,
+        Some(region) => input.is_some_and(|input| {
+            region.ticketId == action.ticketId
+                && region.backendId == action.backendId
+                && region.streamEpoch == action.streamEpoch
+                && region.frameSequence == action.frameSequence
+                && region.leftBasisPoints == input.left_basis_points
+                && region.topBasisPoints == input.top_basis_points
+                && region.rightBasisPoints == input.right_basis_points
+                && region.bottomBasisPoints == input.bottom_basis_points
+        }),
+    }
+}
+
+fn ticket_action_v3_command_matches_finalization(
+    command: &TicketremoteStreamCommand,
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+) -> Result<bool, String> {
+    if command.commandType != "ticket_action_v3"
+        || command.ticketId != action.ticketId
+        || command.backendId != action.backendId
+        || !matches!(
+            command.status.as_str(),
+            "pending" | "dispatched" | "running"
+        )
+        || command.revision != facts.interaction_revision
+        || !action.parentActionId.as_deref().unwrap_or("").is_empty()
+        || action.rootActionId.as_deref().unwrap_or(&action.actionId) != action.actionId
+        || action.retryOrdinal != 0
+    {
+        return Ok(false);
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(&command.payloadJson)
+        .map_err(|_| "ticket_action_command_payload_invalid".to_string())?;
+    if payload.get("version").and_then(|value| value.as_u64()) != Some(3)
+        || payload
+            .get("actionId")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            != Some(action.actionId.as_str())
+        || payload
+            .get("target")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            != Some(facts.target.as_str())
+    {
+        return Ok(false);
+    }
+    let payload_attempt = payload
+        .get("attemptId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let payload_schedule = payload
+        .get("scheduleId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let refresh_flow = payload
+        .get("flow")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        == "activation_expiry_reset";
+    if ticket_action_v3_is_activation(&facts.target) {
+        return Ok(facts.attempt_id == action.actionId
+            && payload_attempt == facts.attempt_id
+            && payload_schedule.is_empty()
+            && payload
+                .get("expectedInteractionRevision")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                == if facts.target == "register_current" {
+                    facts.interaction_revision.as_str()
+                } else {
+                    ""
+                });
+    }
+    if refresh_flow {
+        return Ok(payload_schedule == action.actionId
+            && payload
+                .get("activationAttemptId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                == facts.attempt_id
+            && payload
+                .get("activationRevision")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                == facts.activation_revision
+            && !facts.attempt_id.is_empty()
+            && !facts.activation_revision.is_empty());
+    }
+    Ok(payload_attempt.is_empty()
+        && facts.attempt_id.is_empty()
+        && facts.activation_revision.is_empty()
+        && (payload_schedule.is_empty() || payload_schedule == action.actionId))
+}
+
+fn ticket_action_v3_command_is_activation_refresh(command: &TicketremoteStreamCommand) -> bool {
+    serde_json::from_str::<serde_json::Value>(&command.payloadJson)
+        .ok()
+        .is_some_and(|payload| {
+            payload.get("flow").and_then(|value| value.as_str()) == Some("activation_expiry_reset")
+        })
+}
+
+fn ticket_action_v3_activation_admission_matches(
+    history: &TicketremoteActivationHistory,
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    history.ticketId == action.ticketId
+        && history.backendId == action.backendId
+        && history.admission == "admitted"
+        && history.attemptId == action.actionId
+        && history.attemptId == facts.attempt_id
+        && history.interactionRevision == facts.interaction_revision
+        && history.interactionCorrelation == action.actionId
+}
+
 fn ticket_slider_region_v3_row_for_action(
     ticket_id: &str,
     backend_id: &str,
@@ -6785,6 +8273,472 @@ fn update_ticket_action_v3_projection(
     Ok(())
 }
 
+fn ticket_action_v3_activation_replay_matches(
+    ctx: &ReducerContext,
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    let Some(history) = activation_history_for_attempt(ctx, &action.ticketId, &facts.attempt_id)
+    else {
+        return false;
+    };
+    if !ticket_action_v3_activation_admission_matches(&history, action, facts)
+        || canonical_time(&history.completedAt) != facts.completed_at
+    {
+        return false;
+    }
+    if facts.status == "succeeded" {
+        history.outcome == "succeeded" && history.activationRevision == facts.activation_revision
+    } else {
+        history.outcome == "failed"
+            && history.reason == safe_token(&bounded_text(&facts.reason, 80), "activation_failed")
+            && history.activationRevision.is_empty()
+    }
+}
+
+fn ticket_action_v3_refresh_replay_matches(
+    ctx: &ReducerContext,
+    action: &TicketremoteTicketActionV3,
+    command_id: &str,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    let Some(history) = activation_history_for_revision(
+        ctx,
+        &action.ticketId,
+        &action.backendId,
+        &facts.activation_revision,
+    ) else {
+        return false;
+    };
+    let schedule = ctx
+        .db
+        .ticketremote_latest_ticket_reselect_schedule()
+        .id()
+        .find(&action.actionId);
+    ticket_action_v3_refresh_terminal_replay_matches(
+        &history,
+        schedule.as_ref(),
+        action,
+        command_id,
+        facts,
+    )
+}
+
+fn ticket_action_v3_refresh_terminal_replay_matches(
+    history: &TicketremoteActivationHistory,
+    schedule: Option<&TicketremoteLatestTicketReselectSchedule>,
+    action: &TicketremoteTicketActionV3,
+    command_id: &str,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    let terminal_status = if facts.status == "succeeded" {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    history.ticketId == action.ticketId
+        && history.backendId == action.backendId
+        && history.admission == "admitted"
+        && history.outcome == "succeeded"
+        && history.attemptId == facts.attempt_id
+        && history.activationRevision == facts.activation_revision
+        && facts.interaction_revision == format!("schedule:{}", action.actionId)
+        && history.refreshOutcome == terminal_status
+        && canonical_time(&history.refreshCompletedAt) == facts.completed_at
+        // A terminal schedule has the same six-hour retention as its action,
+        // but bounded cleanup may remove it first. Immutable action + history
+        // facts remain sufficient; never recreate an expired schedule.
+        && schedule.is_none_or(|schedule| {
+            schedule.purpose.as_deref() == Some("activation_expiry_reset")
+                && schedule.activationAttemptId.as_deref() == Some(facts.attempt_id.as_str())
+                && schedule.activationRevision.as_deref()
+                    == Some(facts.activation_revision.as_str())
+                && schedule.ticketId == action.ticketId
+                && schedule.backendId == action.backendId
+                && schedule.commandId == command_id
+                && schedule.status == terminal_status
+                && schedule.resultReason == facts.reason
+                && schedule.resultPhase == facts.phase
+                && schedule.proofSource == "phone_worker"
+                && schedule.completedAt == facts.completed_at
+        })
+}
+
+fn ticket_action_v3_scheduled_replay_matches(
+    ctx: &ReducerContext,
+    action: &TicketremoteTicketActionV3,
+    command_id: &str,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    let schedule = ctx
+        .db
+        .ticketremote_latest_ticket_reselect_schedule()
+        .id()
+        .find(&action.actionId);
+    ticket_action_v3_scheduled_terminal_replay_matches(schedule.as_ref(), action, command_id, facts)
+}
+
+fn ticket_action_v3_scheduled_terminal_replay_matches(
+    schedule: Option<&TicketremoteLatestTicketReselectSchedule>,
+    action: &TicketremoteTicketActionV3,
+    command_id: &str,
+    facts: &TicketActionV3TerminalFacts,
+) -> bool {
+    if !facts.attempt_id.is_empty() || !facts.activation_revision.is_empty() {
+        return false;
+    }
+    let terminal_status = if facts.status == "succeeded" {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    match schedule {
+        // Ordinary browser actions use their action id as the immutable
+        // command revision. A scheduled action must retain its schedule row
+        // for replay, because no existing action field can distinguish it
+        // safely after that row is gone.
+        None => facts.interaction_revision == action.actionId,
+        Some(schedule) => {
+            facts.interaction_revision == format!("schedule:{}", action.actionId)
+                && schedule.purpose.as_deref() == Some("ticket_action_v3_redetect_latest")
+                && schedule.ticketId == action.ticketId
+                && schedule.backendId == action.backendId
+                && schedule.commandId == command_id
+                && schedule.status == terminal_status
+                && schedule.resultReason == facts.reason
+                && schedule.resultPhase == facts.phase
+                && schedule.proofSource == "phone_worker"
+                && schedule.completedAt == facts.completed_at
+        }
+    }
+}
+
+fn finalize_ticket_action_v3_refresh_failure(
+    ctx: &ReducerContext,
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+    now: &str,
+) -> Result<(), String> {
+    let schedule = active_activation_refresh_schedule_for_revision(
+        ctx,
+        &action.ticketId,
+        &action.backendId,
+        &facts.activation_revision,
+    )
+    .ok_or_else(|| "activation_refresh_schedule_not_active".to_string())?;
+    if schedule.id != action.actionId
+        || schedule.activationAttemptId.as_deref() != Some(facts.attempt_id.as_str())
+        || facts.interaction_revision != format!("schedule:{}", schedule.id)
+    {
+        return Err("activation_refresh_correlation_mismatch".into());
+    }
+    let history = activation_refresh_history_for_schedule(ctx, &schedule)
+        .ok_or_else(|| "activation_refresh_history_mismatch".to_string())?;
+    let _ = fail_current_activation_refresh(
+        ctx,
+        &action.ticketId,
+        &action.backendId,
+        &facts.activation_revision,
+        &facts.reason,
+        now,
+    );
+    ctx.db
+        .ticketremote_activation_history()
+        .id()
+        .update(TicketremoteActivationHistory {
+            refreshOutcome: "failed".into(),
+            refreshCompletedAt: facts.completed_at.clone(),
+            refreshRetryAt: String::new(),
+            updatedAt: now.into(),
+            ..history
+        });
+    delete_latest_ticket_reselect_timers(ctx, &schedule.id);
+    ctx.db
+        .ticketremote_latest_ticket_reselect_schedule()
+        .id()
+        .update(TicketremoteLatestTicketReselectSchedule {
+            status: "failed".into(),
+            resultReason: facts.reason.clone(),
+            resultPhase: facts.phase.clone(),
+            proofSource: "phone_worker".into(),
+            updatedAt: now.into(),
+            completedAt: facts.completed_at.clone(),
+            expiresAt: add_ms(now, HISTORY_TTL_MS),
+            ..schedule
+        });
+    refresh_activation_eligibility(ctx, &action.ticketId, &action.backendId, now);
+    Ok(())
+}
+
+fn finalize_ticket_action_v3_scheduled_result(
+    ctx: &ReducerContext,
+    command: &TicketremoteStreamCommand,
+    action: &TicketremoteTicketActionV3,
+    facts: &TicketActionV3TerminalFacts,
+    now: &str,
+) -> Result<(), String> {
+    let schedule_id = ticket_reset_command_payload_value(&command.payloadJson, "scheduleId");
+    if schedule_id.is_empty() {
+        return Ok(());
+    }
+    if schedule_id != action.actionId {
+        return Err("ticket_action_schedule_id_mismatch".into());
+    }
+    let schedule = latest_ticket_reselect_schedule_for_command(ctx, &command.id)
+        .ok_or_else(|| "ticket_action_schedule_not_active".to_string())?;
+    if schedule.id != schedule_id
+        || schedule.ticketId != action.ticketId
+        || schedule.backendId != action.backendId
+        || schedule.purpose.as_deref() != Some("ticket_action_v3_redetect_latest")
+    {
+        return Err("ticket_action_schedule_mismatch".into());
+    }
+    delete_latest_ticket_reselect_timers(ctx, &schedule.id);
+    ctx.db
+        .ticketremote_latest_ticket_reselect_schedule()
+        .id()
+        .update(TicketremoteLatestTicketReselectSchedule {
+            status: if facts.status == "succeeded" {
+                "succeeded".into()
+            } else {
+                "failed".into()
+            },
+            resultReason: facts.reason.clone(),
+            resultPhase: facts.phase.clone(),
+            proofSource: "phone_worker".into(),
+            updatedAt: now.into(),
+            completedAt: facts.completed_at.clone(),
+            expiresAt: add_ms(now, HISTORY_TTL_MS),
+            ..schedule
+        });
+    Ok(())
+}
+
+/// Pixel's single terminal handoff. Reducers are transactional, so action,
+/// activation/refresh state, optional geometry, command retirement, signal,
+/// and one queue promotion either all commit or all roll back.
+#[spacetimedb::reducer]
+pub fn ticketremote_finalize_ticket_action_v3(
+    ctx: &ReducerContext,
+    ticketId: String,
+    backendId: String,
+    commandId: String,
+    actionId: String,
+    target: String,
+    status: String,
+    phase: String,
+    currentView: String,
+    streamEpoch: String,
+    frameSequence: String,
+    reason: String,
+    completedAt: String,
+    attemptId: String,
+    interactionRevision: String,
+    activationRevision: String,
+    hasSliderRegion: bool,
+    leftBasisPoints: u32,
+    topBasisPoints: u32,
+    rightBasisPoints: u32,
+    bottomBasisPoints: u32,
+    nowArg: String,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let now = canonical_time(&now_or(ctx, &nowArg));
+    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
+    let backend_id = canonical_activation_backend(ctx, &ticket.id, &backendId)?;
+    let action_id = actionId.trim();
+    if !valid_schedule_identifier(action_id) {
+        return Err("invalid_ticket_action_id".into());
+    }
+    let expected_command_id = ticket_action_v3_command_id(&ticket.id, &backend_id, action_id);
+    if commandId.trim() != expected_command_id {
+        return Err("ticket_action_command_id_mismatch".into());
+    }
+    let facts = ticket_action_v3_terminal_facts(
+        &target,
+        &status,
+        &phase,
+        &currentView,
+        &streamEpoch,
+        &frameSequence,
+        &reason,
+        &completedAt,
+        &attemptId,
+        &interactionRevision,
+        &activationRevision,
+        &now,
+    )?;
+    let action_row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, action_id);
+    let action = ctx
+        .db
+        .ticketremote_ticket_action_v3()
+        .id()
+        .find(&action_row_id);
+    let command = ctx
+        .db
+        .ticketremote_stream_command()
+        .id()
+        .find(&expected_command_id);
+    if ticket_action_v3_obsolete_read_only_finalization(
+        &facts.target,
+        action
+            .as_ref()
+            .map(|row| (row.target.as_str(), row.status.as_str())),
+        command.is_some(),
+        &facts.attempt_id,
+        &facts.activation_revision,
+    ) {
+        return Ok(());
+    }
+    let action = action.ok_or_else(|| "ticket_action_not_found".to_string())?;
+    if action.target != facts.target {
+        return Err("ticket_action_target_mismatch".into());
+    }
+    let slider_input = hasSliderRegion.then_some(TicketSliderRegionV3Input {
+        left_basis_points: leftBasisPoints,
+        top_basis_points: topBasisPoints,
+        right_basis_points: rightBasisPoints,
+        bottom_basis_points: bottomBasisPoints,
+    });
+    if slider_input.is_some()
+        && (facts.status != "succeeded"
+            || facts.current_view != "latest_unactivated"
+            || ticket_action_v3_is_activation(&facts.target))
+    {
+        return Err("ticket_action_slider_region_result_invalid".into());
+    }
+    if ticket_action_v3_terminal(&action.status) {
+        if command.is_some() || !ticket_action_v3_terminal_replay_matches(&action, &facts) {
+            return Err("ticket_action_terminal_conflict".into());
+        }
+        let region_id = ticket_slider_region_v3_id(&ticket.id, &backend_id);
+        let region = ctx
+            .db
+            .ticketremote_ticket_slider_region_v3()
+            .id()
+            .find(region_id);
+        if !ticket_action_v3_slider_region_replay_matches(region.as_ref(), &action, slider_input) {
+            return Err("ticket_action_terminal_region_conflict".into());
+        }
+        if ticket_action_v3_is_activation(&facts.target)
+            && !ticket_action_v3_activation_replay_matches(ctx, &action, &facts)
+        {
+            return Err("ticket_action_activation_terminal_conflict".into());
+        }
+        if !ticket_action_v3_is_activation(&facts.target) {
+            if !facts.activation_revision.is_empty() {
+                if !ticket_action_v3_refresh_replay_matches(
+                    ctx,
+                    &action,
+                    &expected_command_id,
+                    &facts,
+                ) {
+                    return Err("ticket_action_refresh_terminal_conflict".into());
+                }
+            } else if !ticket_action_v3_scheduled_replay_matches(
+                ctx,
+                &action,
+                &expected_command_id,
+                &facts,
+            ) {
+                return Err("ticket_action_schedule_terminal_conflict".into());
+            }
+        }
+        return Ok(());
+    }
+    if !matches!(action.status.as_str(), "pending" | "running") {
+        return Err("ticket_action_not_dispatched".into());
+    }
+    let command = command.ok_or_else(|| "ticket_action_command_not_found".to_string())?;
+    if !ticket_action_v3_command_matches_finalization(&command, &action, &facts)? {
+        return Err("ticket_action_command_mismatch".into());
+    }
+    let activation_refresh = ticket_action_v3_command_is_activation_refresh(&command);
+    if ticket_action_v3_is_activation(&facts.target) {
+        let history = activation_history_for_attempt(ctx, &ticket.id, &facts.attempt_id)
+            .ok_or_else(|| "activation_admission_not_found".to_string())?;
+        if !ticket_action_v3_activation_admission_matches(&history, &action, &facts) {
+            return Err("activation_admission_mismatch".into());
+        }
+    }
+
+    update_ticket_action_v3_projection(
+        ctx,
+        &ticket.id,
+        &backend_id,
+        action_id,
+        &facts.target,
+        &facts.status,
+        &facts.phase,
+        &facts.current_view,
+        &facts.stream_epoch,
+        &facts.frame_sequence,
+        &facts.reason,
+        &facts.completed_at,
+        slider_input,
+        &now,
+    )?;
+    if slider_input.is_none() {
+        ctx.db
+            .ticketremote_ticket_slider_region_v3()
+            .id()
+            .delete(ticket_slider_region_v3_id(&ticket.id, &backend_id));
+    }
+
+    if ticket_action_v3_is_activation(&facts.target) {
+        if facts.status == "succeeded" {
+            commit_ticket_activation_at_impl(
+                ctx,
+                &ticket.id,
+                &backend_id,
+                &facts.attempt_id,
+                &facts.interaction_revision,
+                &facts.activation_revision,
+                &facts.completed_at,
+                &now,
+            )?;
+        } else {
+            finalize_ticket_activation_failure_checked_impl(
+                ctx,
+                &ticket.id,
+                &backend_id,
+                &facts.attempt_id,
+                "failed",
+                &facts.reason,
+                &facts.interaction_revision,
+                &facts.completed_at,
+                &now,
+            )?;
+        }
+    } else if activation_refresh {
+        if facts.status == "succeeded" {
+            finalize_ticket_activation_refresh_at_impl(
+                ctx,
+                &ticket.id,
+                &backend_id,
+                &facts.activation_revision,
+                &facts.interaction_revision,
+                &facts.reason,
+                &facts.phase,
+                &facts.completed_at,
+                &now,
+            )?;
+        } else {
+            finalize_ticket_action_v3_refresh_failure(ctx, &action, &facts, &now)?;
+        }
+    } else {
+        finalize_ticket_action_v3_scheduled_result(ctx, &command, &action, &facts, &now)?;
+    }
+
+    ctx.db
+        .ticketremote_stream_command()
+        .id()
+        .delete(&expected_command_id);
+    upsert_stream_command_signal(ctx, &ticket.id, &backend_id, &command.revision, &now);
+    promote_ticket_action_v3_queue(ctx, &ticket.id, &backend_id, &now);
+    Ok(())
+}
+
 #[spacetimedb::reducer]
 pub fn ticketremote_update_ticket_action_v3(
     ctx: &ReducerContext,
@@ -6881,188 +8835,6 @@ pub fn ticketremote_update_ticket_action_v3_with_slider_region(
         slider_region,
         &now,
     )
-}
-
-/// Pixel-only, bounded continuation for the one safe registration failure:
-/// Accessibility reported a completed stroke and two fresh agreeing frames
-/// still prove the exact same unactivated detail. The existing admission and
-/// attempt remain authoritative; this reducer creates no quota or history row.
-#[spacetimedb::reducer]
-pub fn ticketremote_retry_ticket_action_v3_after_no_transition(
-    ctx: &ReducerContext,
-    ticketId: String,
-    backendId: String,
-    parentActionId: String,
-    interactionRevision: String,
-    streamEpoch: String,
-    frameSequence: String,
-    nowArg: String,
-) -> Result<(), String> {
-    require_service(ctx)?;
-    let now = now_or(ctx, &nowArg);
-    let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let backend_id = clean_backend_id(&backendId);
-    let parent_action_id = parentActionId.trim();
-    if !valid_schedule_identifier(parent_action_id) {
-        return Err("invalid_ticket_action_id".into());
-    }
-    let child_action_id = ticket_action_v3_retry_child_id(parent_action_id);
-    if !valid_schedule_identifier(&child_action_id) {
-        return Err("invalid_ticket_action_retry_id".into());
-    }
-    let child_row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, &child_action_id);
-    if let Some(existing) = ctx
-        .db
-        .ticketremote_ticket_action_v3()
-        .id()
-        .find(&child_row_id)
-    {
-        return if existing.parentActionId.as_deref() == Some(parent_action_id)
-            && existing.retryOrdinal == 1
-        {
-            Ok(())
-        } else {
-            Err("ticket_action_retry_id_reused".into())
-        };
-    }
-    let parent_row_id = ticket_action_v3_row_id(&ticket.id, &backend_id, parent_action_id);
-    let Some(parent) = ctx
-        .db
-        .ticketremote_ticket_action_v3()
-        .id()
-        .find(&parent_row_id)
-    else {
-        return Err("ticket_action_not_found".into());
-    };
-    if !ticket_action_v3_no_transition_retry_allowed(&parent) {
-        return Err("ticket_action_retry_not_allowed".into());
-    }
-    let stream_epoch = bounded_frame_ordinal(&streamEpoch);
-    let frame_sequence = bounded_frame_ordinal(&frameSequence);
-    if stream_epoch == "0" || frame_sequence == "0" {
-        return Err("ticket_action_retry_visual_proof_required".into());
-    }
-    let parent_command_id = ticket_action_v3_command_id(&ticket.id, &backend_id, parent_action_id);
-    let Some(parent_command) = ctx
-        .db
-        .ticketremote_stream_command()
-        .id()
-        .find(&parent_command_id)
-    else {
-        return Err("ticket_action_command_not_found".into());
-    };
-    if parent_command.commandType != "ticket_action_v3"
-        || !matches!(
-            parent_command.status.as_str(),
-            "pending" | "dispatched" | "running"
-        )
-        || parse_time_ms(&parent_command.expiresAt) <= parse_time_ms(&now)
-    {
-        return Err("ticket_action_retry_command_stale".into());
-    }
-    let interaction_revision = bounded_text(&interactionRevision, 160);
-    if interaction_revision.is_empty() || interaction_revision != parent_command.revision {
-        return Err("ticket_action_retry_interaction_revision_unproved".into());
-    }
-    let parent_payload = serde_json::from_str::<serde_json::Value>(&parent_command.payloadJson)
-        .map_err(|_| "ticket_action_retry_payload_invalid".to_string())?;
-    let root_action_id = non_empty(
-        parent.rootActionId.as_deref().unwrap_or(""),
-        parent_action_id,
-    );
-    let attempt_id = parent_payload
-        .get("attemptId")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    if attempt_id != root_action_id {
-        return Err("ticket_action_retry_attempt_mismatch".into());
-    }
-    let history = activation_history_for_attempt(ctx, &ticket.id, &root_action_id)
-        .ok_or_else(|| "activation_admission_not_found".to_string())?;
-    if history.backendId != backend_id
-        || history.admission != "admitted"
-        || history.outcome != "pending"
-    {
-        return Err("activation_admission_mismatch".into());
-    }
-    let schedule_id = parent_payload
-        .get("scheduleId")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let source = parent_payload
-        .get("source")
-        .and_then(|value| value.as_str())
-        .unwrap_or("browser_button");
-
-    ctx.db
-        .ticketremote_ticket_action_v3()
-        .id()
-        .update(TicketremoteTicketActionV3 {
-            status: "needs_attention".into(),
-            phase: "retry_queued".into(),
-            currentView: "latest_unactivated".into(),
-            streamEpoch: stream_epoch.clone(),
-            frameSequence: frame_sequence.clone(),
-            reason: "ticket_action_no_transition_retry_queued".into(),
-            switchAvailable: false,
-            switchExpiresAt: String::new(),
-            updatedAt: now.clone(),
-            completedAt: now.clone(),
-            expiresAt: add_ms(&now, HISTORY_TTL_MS),
-            ..parent.clone()
-        });
-    let child = TicketremoteTicketActionV3 {
-        id: child_row_id,
-        actionId: child_action_id.clone(),
-        ticketId: ticket.id.clone(),
-        backendId: backend_id.clone(),
-        target: "register_current".into(),
-        parentActionId: Some(parent_action_id.into()),
-        rootActionId: Some(root_action_id.clone()),
-        retryOrdinal: 1,
-        status: "pending".into(),
-        phase: "queued".into(),
-        currentView: "latest_unactivated".into(),
-        switchAvailable: false,
-        switchExpiresAt: String::new(),
-        streamEpoch: stream_epoch.clone(),
-        frameSequence: frame_sequence.clone(),
-        reason: "ticket_action_no_transition_retry_queued".into(),
-        createdAt: now.clone(),
-        updatedAt: now.clone(),
-        completedAt: String::new(),
-        expiresAt: add_ms(&now, HISTORY_TTL_MS),
-    };
-    ctx.db.ticketremote_ticket_action_v3().insert(child);
-    let payload = serde_json::json!({
-        "version": 3,
-        "actionId": child_action_id.clone(),
-        "target": "register_current",
-        "source": source,
-        "reason": "ticket_action_no_transition_retry_queued",
-        "attemptId": root_action_id.clone(),
-        "expectedInteractionRevision": interaction_revision,
-        "scheduleId": schedule_id,
-        "parentActionId": parent_action_id,
-        "rootActionId": attempt_id,
-        "retryOrdinal": 1,
-        "retryProofStreamEpoch": stream_epoch,
-        "retryProofFrameSequence": frame_sequence,
-    })
-    .to_string();
-    insert_stream_command(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        &ticket_action_v3_command_id(&ticket.id, &backend_id, &child_action_id),
-        "ticket_action_v3",
-        &parent_command.revision,
-        "ticket_action_no_transition_retry_queued",
-        &payload,
-        TICKET_ACTIVATION_COMMAND_TTL_MS,
-        &now,
-    );
-    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -7368,6 +9140,150 @@ service_reducers! {
     }
 }
 
+fn vivi_scope(ticket_id: &str, backend_id: &str) -> Result<(String, String), String> {
+    let ticket_id = clean_ticket_id(ticket_id);
+    if ticket_id != DEFAULT_TICKET_ID {
+        return Err("unsupported_vivi_ticket".into());
+    }
+    let backend_id = clean_backend_id(backend_id);
+    if backend_id != "pixel" {
+        return Err("unsupported_vivi_backend".into());
+    }
+    Ok((ticket_id, backend_id))
+}
+
+fn clean_vivi_revision(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+    {
+        return Err("invalid_vivi_credential_revision".into());
+    }
+    Ok(value.into())
+}
+
+fn clean_expected_vivi_revision(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(String::new())
+    } else {
+        clean_vivi_revision(value)
+    }
+}
+
+fn clean_vivi_request_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+    {
+        return Err("invalid_vivi_reauth_request_id".into());
+    }
+    Ok(value.into())
+}
+
+fn vivi_reauth_request_mode(request_id: &str) -> Option<ViviReauthMode> {
+    let request_id = request_id.trim();
+    for (prefix, mode) in [
+        (VIVI_REAUTH_LEGACY_REQUEST_PREFIX, ViviReauthMode::LegacyV1),
+        (
+            VIVI_REAUTH_FULL_RESET_REQUEST_PREFIX,
+            ViviReauthMode::FullResetV2,
+        ),
+        (
+            VIVI_REAUTH_LOGOUT_LOGIN_REQUEST_PREFIX,
+            ViviReauthMode::LogoutLoginV3,
+        ),
+    ] {
+        if request_id
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty())
+        {
+            return Some(mode);
+        }
+    }
+    None
+}
+
+fn vivi_reauth_request_mode_matches(request_id: &str, expected: ViviReauthMode) -> bool {
+    vivi_reauth_request_mode(request_id) == Some(expected)
+}
+
+fn vivi_reauth_status(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    matches!(
+        value,
+        "queued" | "pending" | "running" | "succeeded" | "failed" | "needs_attention"
+    )
+    .then(|| value.to_string())
+    .ok_or_else(|| "invalid_vivi_reauth_status".into())
+}
+
+fn vivi_reauth_phase(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    matches!(
+        value,
+        "queued"
+            | "waiting_for_phone_lane"
+            | "opening_vivi"
+            | "resetting_vivi"
+            | "detecting_login"
+            | "opening_account_controls"
+            | "requesting_logout"
+            | "verifying_signed_out"
+            | "entering_credentials"
+            | "submitting"
+            | "verifying_signed_in"
+            | "complete"
+    )
+    .then(|| value.to_string())
+    .ok_or_else(|| "invalid_vivi_reauth_phase".into())
+}
+
+fn vivi_reauth_reason(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    matches!(
+        value,
+        "requested"
+            | "queued"
+            | "running"
+            | "signed_in_proven"
+            | "saved_credentials_sign_in_proven"
+            | "credentials_rejected"
+            | "login_required"
+            | "login_screen_not_detected"
+            | "login_fields_not_detected"
+            | "additional_verification_required"
+            | "device_link_required"
+            | "profile_selection_required"
+            | "captcha_required"
+            | "onboarding_required"
+            | "logout_control_not_detected"
+            | "logout_transition_not_proven"
+            | "logout_action_uncertain"
+            | "visual_proof_failed"
+            | "credential_missing"
+            | "credential_revision_stale"
+            | "command_expired"
+            | "owner_role_required"
+            | "internal_failure"
+    )
+    .then(|| value.to_string())
+    .ok_or_else(|| "invalid_vivi_reauth_reason".into())
+}
+
+fn vivi_reauth_proof_source(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    matches!(value, "" | "phone_visual" | "phone_worker" | "spacetimedb")
+        .then(|| value.to_string())
+        .ok_or_else(|| "invalid_vivi_reauth_proof_source".into())
+}
+
 expression_functions! {
     fn now(ctx: &ReducerContext) -> String = iso(ctx.timestamp);
     fn parse_time_ms(value: &str) -> i64 = parse_time_micros(value) / 1000;
@@ -7518,6 +9434,13 @@ expression_functions! {
             email: email.clone(), publicId: account_public_id(&email), role: clean_role(&row.role),
             active: row.active, updatedAt: row.updatedAt.clone() }
     };
+    fn service_member_account_from_row(row: &TicketremoteTicketMember) -> TicketremoteServiceMemberAccount = {
+        let email = clean_email(&row.email);
+        TicketremoteServiceMemberAccount { id: row.id.clone(), ticketId: row.ticketId.clone(),
+            email: email.clone(), publicId: account_public_id(&email),
+            accountScopeId: account_scope_id(&email), role: clean_role(&row.role), active: row.active,
+            updatedAt: row.updatedAt.clone() }
+    };
     fn public_hash(value: &str, len: usize) -> String = {
         let mut out = to_base36(fnv32(value.trim()));
         if out.len() < len { out = format!("{:0>width$}", out, width = len); }
@@ -7581,6 +9504,126 @@ fn parse_time_micros(value: &str) -> i64 {
                 .map(|dt| dt.timestamp_micros())
         })
         .unwrap_or(0)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MemberActivityBucket {
+    day: String,
+    hour: usize,
+    tick_slot: i64,
+    expires_at: String,
+}
+
+fn member_activity_bucket(timestamp: Timestamp) -> Result<MemberActivityBucket, String> {
+    let micros = timestamp.to_micros_since_unix_epoch();
+    let utc = DateTime::<Utc>::from_timestamp_micros(micros)
+        .ok_or_else(|| "activity timestamp outside supported range".to_string())?;
+    member_activity_bucket_from_utc(utc)
+}
+
+fn member_activity_bucket_from_utc(utc: DateTime<Utc>) -> Result<MemberActivityBucket, String> {
+    let local = utc.with_timezone(&Riga);
+    let day = local.date_naive();
+    let expiry_day = day
+        .checked_add_days(Days::new(MEMBER_ACTIVITY_RETENTION_DAYS))
+        .ok_or_else(|| "activity expiry outside supported range".to_string())?;
+    let expiry_midnight = expiry_day
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| "activity expiry boundary unavailable".to_string())?;
+    let expiry_local = match Riga.from_local_datetime(&expiry_midnight) {
+        LocalResult::Single(value) => value,
+        // Europe/Riga has no modern midnight transition, but choosing the
+        // earliest occurrence keeps the boundary deterministic if that ever
+        // changes in the timezone database.
+        LocalResult::Ambiguous(earliest, _) => earliest,
+        LocalResult::None => return Err("activity expiry boundary unavailable".into()),
+    };
+    let expires_at = iso(Timestamp::from_micros_since_unix_epoch(
+        expiry_local.with_timezone(&Utc).timestamp_micros(),
+    ));
+    Ok(MemberActivityBucket {
+        day: format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day()),
+        hour: local.hour() as usize,
+        tick_slot: utc
+            .timestamp_micros()
+            .div_euclid(MEMBER_ACTIVITY_TICK_SLOT_MICROS),
+        expires_at,
+    })
+}
+
+fn member_activity_row_id(ticket_id: &str, account_scope_id: &str, day: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        clean_ticket_id(ticket_id),
+        account_scope_id.trim(),
+        day.trim()
+    )
+}
+
+fn apply_member_activity_tick(
+    hourly_ticks: &mut Vec<u32>,
+    last_tick_slot: &mut i64,
+    hour: usize,
+    tick_slot: i64,
+) -> bool {
+    if hour >= MEMBER_ACTIVITY_HOURS_PER_DAY || tick_slot <= *last_tick_slot {
+        return false;
+    }
+    hourly_ticks.resize(MEMBER_ACTIVITY_HOURS_PER_DAY, 0);
+    hourly_ticks.truncate(MEMBER_ACTIVITY_HOURS_PER_DAY);
+    hourly_ticks[hour] = hourly_ticks[hour].saturating_add(1);
+    *last_tick_slot = tick_slot;
+    true
+}
+
+fn upsert_member_activity_tick(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    email: &str,
+    observed_at: &str,
+    bucket: &MemberActivityBucket,
+) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let account_scope_id = account_scope_id(email);
+    let id = member_activity_row_id(&ticket_id, &account_scope_id, &bucket.day);
+    let table = ctx.db.ticketremote_member_daily_activity();
+    if let Some(mut existing) = table.id().find(&id) {
+        if !apply_member_activity_tick(
+            &mut existing.hourlyTicks,
+            &mut existing.lastTickSlot,
+            bucket.hour,
+            bucket.tick_slot,
+        ) {
+            return;
+        }
+        existing.lastTickAt = observed_at.into();
+        existing.updatedAt = observed_at.into();
+        existing.expiresAt = bucket.expires_at.clone();
+        table.id().update(existing);
+        return;
+    }
+
+    let mut hourly_ticks = vec![0; MEMBER_ACTIVITY_HOURS_PER_DAY];
+    let mut last_tick_slot = i64::MIN;
+    let accepted = apply_member_activity_tick(
+        &mut hourly_ticks,
+        &mut last_tick_slot,
+        bucket.hour,
+        bucket.tick_slot,
+    );
+    debug_assert!(accepted);
+    table.insert(TicketremoteMemberDailyActivity {
+        id,
+        ticketId: ticket_id,
+        accountScopeId: account_scope_id,
+        day: bucket.day.clone(),
+        hourlyTicks: hourly_ticks,
+        lastTickSlot: last_tick_slot,
+        firstTickAt: observed_at.into(),
+        lastTickAt: observed_at.into(),
+        updatedAt: observed_at.into(),
+        expiresAt: bucket.expires_at.clone(),
+    });
 }
 
 fn live_relay_suppresses_background_stream_command(
@@ -7810,6 +9853,24 @@ fn register_service_identity(ctx: &ReducerContext, ticket_id: String, now: &str)
     }
 }
 
+fn upsert_member_identity(ctx: &ReducerContext, ticket_id: &str, email: &str, now: &str) {
+    let identity = ctx.sender();
+    let id = identity.to_string();
+    let row = TicketremoteMemberIdentity {
+        id: id.clone(),
+        identity,
+        ticketId: clean_ticket_id(ticket_id),
+        email: clean_email(email),
+        updatedAt: now.into(),
+    };
+    let table = ctx.db.ticketremote_member_identity();
+    if table.id().find(&id).is_some() {
+        table.id().update(row);
+    } else {
+        table.insert(row);
+    }
+}
+
 fn client_email_from_auth(ctx: &ReducerContext, ticket_id: &str) -> Result<String, String> {
     if !ctx.sender_auth().has_jwt() {
         return Err("auth required".into());
@@ -7893,6 +9954,199 @@ fn stream_viewer_focus_id(
     )
 }
 
+fn requested_member_role(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "owner" => Ok("owner".into()),
+        "admin" => Ok("admin".into()),
+        "member" => Ok("member".into()),
+        _ => Err("invalid_role".into()),
+    }
+}
+
+fn member_upsert_policy(
+    actor_role: Option<&str>,
+    target_role: Option<&str>,
+    requested_role: &str,
+    active_owner_count: usize,
+) -> Result<String, String> {
+    let requested_role = requested_member_role(requested_role)?;
+    match actor_role {
+        Some("owner") => {}
+        Some("admin")
+            if requested_role == "member" && target_role.is_none_or(|role| role == "member") => {}
+        _ => return Err("forbidden".into()),
+    }
+    if target_role == Some("owner") && requested_role != "owner" && active_owner_count <= 1 {
+        return Err("owner_protected".into());
+    }
+    Ok(requested_role)
+}
+
+fn member_remove_policy(
+    actor_role: Option<&str>,
+    target_role: Option<&str>,
+    active_owner_count: usize,
+) -> Result<(), String> {
+    match actor_role {
+        Some("owner") => {}
+        Some("admin") if target_role.is_none_or(|role| role == "member") => {}
+        _ => return Err("forbidden".into()),
+    }
+    if target_role == Some("owner") && active_owner_count <= 1 {
+        return Err("owner_protected".into());
+    }
+    Ok(())
+}
+
+fn active_member_role(ctx: &ReducerContext, ticket_id: &str, email: &str) -> Option<String> {
+    ctx.db
+        .ticketremote_ticket_member()
+        .id()
+        .find(member_id(ticket_id, email))
+        .filter(|row| row.active)
+        .map(|row| row.role)
+}
+
+fn active_owner_count(ctx: &ReducerContext, ticket_id: &str) -> usize {
+    let ticket_id = clean_ticket_id(ticket_id);
+    ctx.db
+        .ticketremote_ticket_member()
+        .ticketId()
+        .filter(&ticket_id)
+        .filter(|row| row.active && row.role == "owner")
+        .count()
+}
+
+/// Revocation fence for an owner-triggered phone login that has not started on
+/// the Pixel. The phone publishes `running` before its first physical boundary;
+/// after that point the already-started at-most-once action is allowed to report
+/// its terminal result rather than being orphaned mid-mutation.
+fn cancel_unstarted_vivi_reauth_for_owner(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    owner_email: &str,
+    now: &str,
+) {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let owner_email = clean_email(owner_email);
+    let mut affected_backends = Vec::new();
+    let attempts = ctx
+        .db
+        .ticketremote_vivi_reauth_owner()
+        .ticketOwner()
+        .filter((&ticket_id, &owner_email))
+        .filter_map(|authority| {
+            ctx.db
+                .ticketremote_vivi_reauth_attempt()
+                .id()
+                .find(&authority.id)
+        })
+        .filter(|attempt| matches!(attempt.status.as_str(), "queued" | "pending"))
+        .collect::<Vec<_>>();
+    for attempt in attempts {
+        if attempt.status == "queued" {
+            let queue_id = ticket_action_v3_queue_id(&attempt.ticketId, &attempt.backendId);
+            let queued = ctx
+                .db
+                .ticketremote_ticket_action_v3_queued_intent()
+                .id()
+                .find(&queue_id)
+                .is_some_and(|intent| {
+                    intent.kind == "vivi_reauth"
+                        && intent.actionId == attempt.requestId
+                        && clean_email(&intent.requestedEmail) == owner_email
+                });
+            if queued {
+                ctx.db
+                    .ticketremote_ticket_action_v3_queued_intent()
+                    .id()
+                    .delete(&queue_id);
+            }
+        }
+        // Queued and pending attempts both already have an exact durable
+        // command. Remove it at the same revocation boundary so expiry cannot
+        // overwrite the owner-role terminal result later.
+        let command_id =
+            vivi_reauth_command_id(&attempt.ticketId, &attempt.backendId, &attempt.requestId);
+        if let Some(command) = ctx.db.ticketremote_stream_command().id().find(&command_id) {
+            ctx.db
+                .ticketremote_stream_command()
+                .id()
+                .delete(&command_id);
+            upsert_stream_command_signal(
+                ctx,
+                &command.ticketId,
+                &command.backendId,
+                &command.revision,
+                now,
+            );
+        }
+        let backend_id = attempt.backendId.clone();
+        let _ = finish_vivi_reauth_attempt(
+            ctx,
+            attempt,
+            "failed",
+            "complete",
+            "owner_role_required",
+            "spacetimedb",
+            "0",
+            "0",
+            now,
+        );
+        affected_backends.push(backend_id);
+    }
+    affected_backends.sort();
+    affected_backends.dedup();
+    for backend_id in affected_backends {
+        promote_ticket_action_v3_queue(ctx, &ticket_id, &backend_id, now);
+    }
+}
+
+fn authorize_and_upsert_member(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    actor_email: &str,
+    target_email: &str,
+    requested_role: &str,
+    now: &str,
+) -> Result<(), String> {
+    let actor_role = active_member_role(ctx, ticket_id, actor_email);
+    let target_role = active_member_role(ctx, ticket_id, target_email);
+    let role = member_upsert_policy(
+        actor_role.as_deref(),
+        target_role.as_deref(),
+        requested_role,
+        active_owner_count(ctx, ticket_id),
+    )?;
+    let owner_revoked = target_role.as_deref() == Some("owner") && role != "owner";
+    upsert_member_row(ctx, ticket_id, target_email, &role, now);
+    if owner_revoked {
+        cancel_unstarted_vivi_reauth_for_owner(ctx, ticket_id, target_email, now);
+    }
+    Ok(())
+}
+
+fn authorize_and_deactivate_member(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    actor_email: &str,
+    target_email: &str,
+    now: &str,
+) -> Result<(), String> {
+    let actor_role = active_member_role(ctx, ticket_id, actor_email);
+    let target_role = active_member_role(ctx, ticket_id, target_email);
+    member_remove_policy(
+        actor_role.as_deref(),
+        target_role.as_deref(),
+        active_owner_count(ctx, ticket_id),
+    )?;
+    deactivate_member_row(ctx, ticket_id, target_email, now);
+    if target_role.as_deref() == Some("owner") {
+        cancel_unstarted_vivi_reauth_for_owner(ctx, ticket_id, target_email, now);
+    }
+    Ok(())
+}
+
 fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &str, now: &str) {
     let email = clean_email(email);
     if email.is_empty() {
@@ -7912,7 +10166,7 @@ fn upsert_member_row(ctx: &ReducerContext, ticket_id: &str, email: &str, role: &
         id,
         ticketId: clean_ticket_id(ticket_id),
         email: email.clone(),
-        role: clean_role(role),
+        role: role.into(),
         active: true,
         createdAt: created_at,
         updatedAt: now.into(),
@@ -9357,11 +11611,6 @@ fn fail_ticket_action_v3_for_command(
     if command.commandType != "ticket_action_v3" {
         return;
     }
-    // The parent is only a transport shell once its deterministic child exists. A lost parent
-    // acknowledgement or TTL cleanup must not revoke the child's shared admission/correlation.
-    if ticket_action_v3_retry_handoff_in_progress(ctx, command) {
-        return;
-    }
     let payload = serde_json::from_str::<serde_json::Value>(&command.payloadJson)
         .unwrap_or_else(|_| serde_json::json!({}));
     let action_id = payload
@@ -9415,51 +11664,6 @@ fn fail_ticket_action_v3_for_command(
         );
         reconcile_ticket_action_activation_terminal_interaction(ctx, command, reason, now);
     }
-}
-
-fn ticket_action_v3_retry_handoff_in_progress(
-    ctx: &ReducerContext,
-    command: &TicketremoteStreamCommand,
-) -> bool {
-    if command.commandType != "ticket_action_v3" {
-        return false;
-    }
-    let payload = serde_json::from_str::<serde_json::Value>(&command.payloadJson)
-        .unwrap_or_else(|_| serde_json::json!({}));
-    let parent_action_id = payload
-        .get("actionId")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .trim();
-    if !valid_schedule_identifier(parent_action_id) {
-        return false;
-    }
-    let child_action_id = ticket_action_v3_retry_child_id(parent_action_id);
-    let child_row_id =
-        ticket_action_v3_row_id(&command.ticketId, &command.backendId, &child_action_id);
-    let child_command_id =
-        ticket_action_v3_command_id(&command.ticketId, &command.backendId, &child_action_id);
-    ctx.db
-        .ticketremote_ticket_action_v3()
-        .id()
-        .find(&child_row_id)
-        .is_some_and(|row| {
-            row.parentActionId.as_deref() == Some(parent_action_id)
-                && row.retryOrdinal == 1
-                && matches!(row.status.as_str(), "queued" | "pending" | "running")
-        })
-        && ctx
-            .db
-            .ticketremote_stream_command()
-            .id()
-            .find(&child_command_id)
-            .is_some_and(|row| {
-                row.commandType == "ticket_action_v3"
-                    && matches!(
-                        row.status.as_str(),
-                        "queued" | "pending" | "dispatched" | "running"
-                    )
-            })
 }
 
 fn ticket_action_v3_command_failure_projection(target: &str) -> (&'static str, &'static str) {
@@ -9534,7 +11738,6 @@ fn update_stream_command_status(
     let status = safe_token(status, "acknowledged");
     let scheduled_reselect = latest_ticket_reselect_schedule_for_command(ctx, &existing.id);
     if status == "acknowledged" {
-        let retry_handoff = ticket_action_v3_retry_handoff_in_progress(ctx, &existing);
         if existing.commandType == "ticket_action_v3" {
             let payload = serde_json::from_str::<serde_json::Value>(&existing.payloadJson)
                 .unwrap_or_else(|_| serde_json::json!({}));
@@ -9554,16 +11757,32 @@ fn update_stream_command_status(
                 // A late compatibility publication may have landed after the
                 // action's terminal projection. Re-apply exact-revision cleanup
                 // before the command row that correlates them is deleted.
-                if !retry_handoff {
-                    reconcile_ticket_action_activation_terminal_interaction(
-                        ctx, &existing, reason, now,
-                    );
-                }
+                reconcile_ticket_action_activation_terminal_interaction(
+                    ctx, &existing, reason, now,
+                );
             } else {
                 fail_ticket_action_v3_for_command(
                     ctx,
                     &existing,
                     "ticket_action_result_missing",
+                    now,
+                );
+            }
+        }
+        if existing.commandType == "vivi_reauth" {
+            if let Some(attempt) = vivi_reauth_attempt_for_command(ctx, &existing)
+                && !vivi_reauth_terminal(&attempt.status)
+            {
+                let terminal_status = vivi_reauth_interrupted_terminal_status(&attempt.status);
+                let _ = finish_vivi_reauth_attempt(
+                    ctx,
+                    attempt,
+                    terminal_status,
+                    "complete",
+                    "visual_proof_failed",
+                    "spacetimedb",
+                    "0",
+                    "0",
                     now,
                 );
             }
@@ -9588,9 +11807,7 @@ fn update_stream_command_status(
             &existing.revision,
             now,
         );
-        if !retry_handoff {
-            promote_ticket_action_v3_queue(ctx, &existing.ticketId, &existing.backendId, now);
-        }
+        promote_ticket_action_v3_queue(ctx, &existing.ticketId, &existing.backendId, now);
         return;
     }
     if status == "dispatched" {
@@ -9612,7 +11829,10 @@ fn update_stream_command_status(
                 ..existing.clone()
             });
         } else if ticket_reset_command_is_relevant(&existing.commandType, &existing.payloadJson)
-            || existing.commandType == "ticket_action_v3"
+            || matches!(
+                existing.commandType.as_str(),
+                "ticket_action_v3" | "vivi_reauth"
+            )
         {
             // A reset/reselect may still be running on the phone after dispatch. Keep its
             // command addressable until the phone reports a terminal result or the TTL
@@ -9654,6 +11874,27 @@ fn update_stream_command_status(
     }
     if matches!(status.as_str(), "failed" | "expired") {
         fail_ticket_action_v3_for_command(ctx, &existing, reason, now);
+    }
+    if matches!(status.as_str(), "failed" | "expired") && existing.commandType == "vivi_reauth" {
+        if let Some(attempt) = vivi_reauth_attempt_for_command(ctx, &existing) {
+            let terminal_reason = if status == "expired" {
+                "command_expired"
+            } else {
+                "internal_failure"
+            };
+            let terminal_status = vivi_reauth_interrupted_terminal_status(&attempt.status);
+            let _ = finish_vivi_reauth_attempt(
+                ctx,
+                attempt,
+                terminal_status,
+                "complete",
+                terminal_reason,
+                "spacetimedb",
+                "0",
+                "0",
+                now,
+            );
+        }
     }
     if matches!(status.as_str(), "failed" | "expired")
         && matches!(
@@ -10969,6 +13210,22 @@ fn purge_expired_stream_commands_for_ticket(
         if row.commandType == "ticket_action_v3" {
             fail_ticket_action_v3_for_command(ctx, row, "command_expired", now);
         }
+        if row.commandType == "vivi_reauth" {
+            if let Some(attempt) = vivi_reauth_attempt_for_command(ctx, row) {
+                let terminal_status = vivi_reauth_interrupted_terminal_status(&attempt.status);
+                let _ = finish_vivi_reauth_attempt(
+                    ctx,
+                    attempt,
+                    terminal_status,
+                    "complete",
+                    "command_expired",
+                    "spacetimedb",
+                    "0",
+                    "0",
+                    now,
+                );
+            }
+        }
         if matches!(
             row.commandType.as_str(),
             "reset_ticket_registration" | "slider_control_start"
@@ -11063,6 +13320,1202 @@ fn refresh_stream_desired_from_viewer_focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_atomic_ticket_action(target: &str) -> TicketremoteTicketActionV3 {
+        TicketremoteTicketActionV3 {
+            id: ticket_action_v3_row_id("vivi-default", "pixel", "action-1"),
+            actionId: "action-1".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            target: target.into(),
+            status: "running".into(),
+            phase: "dispatching".into(),
+            currentView: "latest_unactivated".into(),
+            switchAvailable: false,
+            switchExpiresAt: String::new(),
+            streamEpoch: "41".into(),
+            frameSequence: "51".into(),
+            reason: "ticket_action_v3_running".into(),
+            createdAt: "2026-09-03T10:00:00Z".into(),
+            updatedAt: "2026-09-03T10:00:01Z".into(),
+            completedAt: String::new(),
+            expiresAt: "2026-09-03T16:00:00Z".into(),
+            parentActionId: None,
+            rootActionId: Some("action-1".into()),
+            retryOrdinal: 0,
+        }
+    }
+
+    fn atomic_ticket_action_command(target: &str, revision: &str) -> TicketremoteStreamCommand {
+        let activation = ticket_action_v3_is_activation(target);
+        TicketremoteStreamCommand {
+            id: ticket_action_v3_command_id("vivi-default", "pixel", "action-1"),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            commandType: "ticket_action_v3".into(),
+            status: "dispatched".into(),
+            revision: revision.into(),
+            reason: "ticket_action_requested".into(),
+            payloadJson: serde_json::json!({
+                "version": 3,
+                "actionId": "action-1",
+                "target": target,
+                "source": "browser_slider",
+                "reason": "ticket_action_requested",
+                "attemptId": if activation { "action-1" } else { "" },
+                "expectedInteractionRevision": if target == "register_current" { revision } else { "" },
+                "scheduleId": "",
+            })
+            .to_string(),
+            createdAt: "2026-09-03T10:00:00Z".into(),
+            updatedAt: "2026-09-03T10:00:01Z".into(),
+            expiresAt: "2026-09-03T10:10:00Z".into(),
+        }
+    }
+
+    fn atomic_terminal_facts(
+        target: &str,
+        status: &str,
+    ) -> Result<TicketActionV3TerminalFacts, String> {
+        ticket_action_v3_terminal_facts(
+            target,
+            status,
+            if status == "succeeded" {
+                "activation_proven"
+            } else {
+                "no_transition"
+            },
+            if status == "succeeded" {
+                "activated_current"
+            } else {
+                "latest_unactivated"
+            },
+            "42",
+            "52",
+            if status == "succeeded" {
+                "ticket_action_registered"
+            } else {
+                "ticket_action_gesture_completed_no_transition"
+            },
+            "2026-09-03T10:00:05Z",
+            "action-1",
+            "proof-1",
+            if status == "succeeded" {
+                "activation-1"
+            } else {
+                ""
+            },
+            "2026-09-03T10:00:06Z",
+        )
+    }
+
+    #[test]
+    fn atomic_ticket_action_terminal_contract_fails_closed() {
+        let succeeded = atomic_terminal_facts("register_current", "succeeded").unwrap();
+        assert_eq!(succeeded.current_view, "activated_current");
+        assert_eq!(succeeded.activation_revision, "activation-1");
+
+        let retry_not_dispatched = ticket_action_v3_terminal_facts(
+            "register_current",
+            "needs_attention",
+            "retry_not_dispatched",
+            "latest_unactivated",
+            "42",
+            "52",
+            "ticket_action_gesture_completed_no_transition",
+            "2026-09-03T10:00:05Z",
+            "action-1",
+            "proof-1",
+            "",
+            "2026-09-03T10:00:06Z",
+        )
+        .unwrap();
+        assert_eq!(retry_not_dispatched.phase, "retry_not_dispatched");
+
+        assert_eq!(
+            ticket_action_v3_terminal_facts(
+                "register_current",
+                "needs_attention",
+                "retry_not_dispatched",
+                "latest_unactivated",
+                "0",
+                "52",
+                "ticket_action_retry_not_dispatched",
+                "2026-09-03T10:00:05Z",
+                "action-1",
+                "proof-1",
+                "",
+                "2026-09-03T10:00:06Z",
+            ),
+            Err("ticket_action_terminal_visual_proof_required".into())
+        );
+        assert_eq!(
+            ticket_action_v3_terminal_facts(
+                "register_current",
+                "failed",
+                "activation_proven",
+                "activated_current",
+                "42",
+                "52",
+                "ticket_action_registered",
+                "2026-09-03T10:00:05Z",
+                "action-1",
+                "proof-1",
+                "activation-1",
+                "2026-09-03T10:00:06Z",
+            ),
+            Err("ticket_action_terminal_phase_result_mismatch".into())
+        );
+
+        assert_eq!(
+            ticket_action_v3_terminal_facts(
+                "register_current",
+                "succeeded",
+                "activation_proven",
+                "activated_current",
+                "0",
+                "52",
+                "ticket_action_registered",
+                "2026-09-03T10:00:05Z",
+                "action-1",
+                "proof-1",
+                "activation-1",
+                "2026-09-03T10:00:06Z",
+            ),
+            Err("ticket_action_terminal_visual_proof_required".into())
+        );
+        assert_eq!(
+            ticket_action_v3_terminal_facts(
+                "register_current",
+                "needs_attention",
+                "no_transition",
+                "latest_unactivated",
+                "42",
+                "52",
+                "ticket_action_gesture_completed_no_transition",
+                "2026-09-03T10:00:05Z",
+                "action-1",
+                "proof-1",
+                "unproved-revision",
+                "2026-09-03T10:00:06Z",
+            ),
+            Err("ticket_action_unproved_activation_revision".into())
+        );
+        assert_eq!(
+            ticket_action_v3_terminal_facts(
+                "register_current",
+                "needs_attention",
+                "no_transition",
+                "latest_unactivated",
+                "42",
+                "52",
+                "untrusted_reason",
+                "2026-09-03T10:00:05Z",
+                "action-1",
+                "proof-1",
+                "",
+                "2026-09-03T10:00:06Z",
+            )
+            .unwrap()
+            .reason,
+            "ticket_action_v3_failed"
+        );
+    }
+
+    #[test]
+    fn atomic_ticket_action_command_requires_exact_root_correlation() {
+        let action = pending_atomic_ticket_action("register_current");
+        let facts = atomic_terminal_facts("register_current", "succeeded").unwrap();
+        let command = atomic_ticket_action_command("register_current", "proof-1");
+        assert_eq!(
+            ticket_action_v3_command_matches_finalization(&command, &action, &facts),
+            Ok(true)
+        );
+
+        let mut conflicting = command.clone();
+        conflicting.revision = "other-proof".into();
+        assert_eq!(
+            ticket_action_v3_command_matches_finalization(&conflicting, &action, &facts),
+            Ok(false)
+        );
+        conflicting = command.clone();
+        conflicting.payloadJson = conflicting.payloadJson.replace(
+            "\"attemptId\":\"action-1\"",
+            "\"attemptId\":\"other-action\"",
+        );
+        assert_eq!(
+            ticket_action_v3_command_matches_finalization(&conflicting, &action, &facts),
+            Ok(false)
+        );
+        conflicting = command.clone();
+        conflicting.payloadJson = conflicting
+            .payloadJson
+            .replace("\"scheduleId\":\"\"", "\"scheduleId\":\"other-action\"");
+        assert_eq!(
+            ticket_action_v3_command_matches_finalization(&conflicting, &action, &facts),
+            Ok(false)
+        );
+        let mut child = action;
+        child.parentActionId = Some("parent-1".into());
+        child.retryOrdinal = 1;
+        assert_eq!(
+            ticket_action_v3_command_matches_finalization(&command, &child, &facts),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn atomic_activation_admission_requires_exact_action_and_revision() {
+        let action = pending_atomic_ticket_action("register_current");
+        let facts = atomic_terminal_facts("register_current", "succeeded").unwrap();
+        let mut history = successful_activation_history();
+        history.attemptId = action.actionId.clone();
+        history.interactionCorrelation = action.actionId.clone();
+        history.interactionRevision = facts.interaction_revision.clone();
+        assert!(ticket_action_v3_activation_admission_matches(
+            &history, &action, &facts
+        ));
+
+        history.interactionCorrelation = "other-action".into();
+        assert!(!ticket_action_v3_activation_admission_matches(
+            &history, &action, &facts
+        ));
+        history.interactionCorrelation = action.actionId.clone();
+        history.interactionRevision = "other-proof".into();
+        assert!(!ticket_action_v3_activation_admission_matches(
+            &history, &action, &facts
+        ));
+    }
+
+    #[test]
+    fn atomic_ticket_action_replay_requires_every_terminal_fact_and_region() {
+        let facts = atomic_terminal_facts("register_current", "succeeded").unwrap();
+        let mut action = pending_atomic_ticket_action("register_current");
+        action.status = facts.status.clone();
+        action.phase = facts.phase.clone();
+        action.currentView = facts.current_view.clone();
+        action.streamEpoch = facts.stream_epoch.clone();
+        action.frameSequence = facts.frame_sequence.clone();
+        action.reason = facts.reason.clone();
+        action.completedAt = facts.completed_at.clone();
+        assert!(ticket_action_v3_terminal_replay_matches(&action, &facts));
+        action.reason = "ticket_action_activation_visual_unproved".into();
+        assert!(!ticket_action_v3_terminal_replay_matches(&action, &facts));
+
+        let proof_action = TicketremoteTicketActionV3 {
+            target: "prove_current".into(),
+            status: "succeeded".into(),
+            phase: "complete".into(),
+            currentView: "latest_unactivated".into(),
+            actionId: "proof-1".into(),
+            streamEpoch: "70".into(),
+            frameSequence: "80".into(),
+            ..pending_atomic_ticket_action("prove_current")
+        };
+        let input = TicketSliderRegionV3Input {
+            left_basis_points: 1_000,
+            top_basis_points: 7_000,
+            right_basis_points: 9_000,
+            bottom_basis_points: 7_700,
+        };
+        let mut region = TicketremoteTicketSliderRegionV3 {
+            id: ticket_slider_region_v3_id("vivi-default", "pixel"),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            proofActionId: "proof-1".into(),
+            streamEpoch: "70".into(),
+            frameSequence: "80".into(),
+            leftBasisPoints: 1_000,
+            topBasisPoints: 7_000,
+            rightBasisPoints: 9_000,
+            bottomBasisPoints: 7_700,
+            updatedAt: "2026-09-03T10:00:05Z".into(),
+            expiresAt: "2026-09-03T10:05:05Z".into(),
+        };
+        assert!(ticket_action_v3_slider_region_replay_matches(
+            Some(&region),
+            &proof_action,
+            Some(input)
+        ));
+        region.rightBasisPoints = 8_999;
+        assert!(!ticket_action_v3_slider_region_replay_matches(
+            Some(&region),
+            &proof_action,
+            Some(input)
+        ));
+        assert!(!ticket_action_v3_slider_region_replay_matches(
+            Some(&region),
+            &proof_action,
+            None
+        ));
+        assert!(ticket_action_v3_slider_region_replay_matches(
+            None,
+            &proof_action,
+            Some(input)
+        ));
+
+        region.proofActionId = "newer-proof".into();
+        assert!(ticket_action_v3_slider_region_replay_matches(
+            Some(&region),
+            &proof_action,
+            Some(input)
+        ));
+        assert!(ticket_action_v3_slider_region_replay_matches(
+            Some(&region),
+            &proof_action,
+            None
+        ));
+    }
+
+    #[test]
+    fn atomic_refresh_replay_survives_terminal_schedule_cleanup() {
+        let mut action = pending_atomic_ticket_action("open_latest_unactivated");
+        action.id = ticket_action_v3_row_id("vivi-default", "pixel", "schedule-1");
+        action.actionId = "schedule-1".into();
+        action.rootActionId = Some("schedule-1".into());
+        let facts = ticket_action_v3_terminal_facts(
+            "open_latest_unactivated",
+            "succeeded",
+            "complete",
+            "latest_unactivated",
+            "42",
+            "52",
+            "ticket_action_latest_redetected",
+            "2026-09-03T10:00:05Z",
+            "activation-attempt-1",
+            "schedule:schedule-1",
+            "activation-1",
+            "2026-09-03T10:00:06Z",
+        )
+        .unwrap();
+        let command_id = ticket_action_v3_command_id("vivi-default", "pixel", "schedule-1");
+        let mut history = successful_activation_history();
+        history.refreshOutcome = "succeeded".into();
+        history.refreshCompletedAt = facts.completed_at.clone();
+        let mut schedule = activation_refresh_schedule();
+        schedule.commandId = command_id.clone();
+        schedule.status = "succeeded".into();
+        schedule.resultReason = facts.reason.clone();
+        schedule.resultPhase = facts.phase.clone();
+        schedule.proofSource = "phone_worker".into();
+        schedule.completedAt = facts.completed_at.clone();
+
+        assert!(ticket_action_v3_refresh_terminal_replay_matches(
+            &history,
+            Some(&schedule),
+            &action,
+            &command_id,
+            &facts,
+        ));
+        assert!(ticket_action_v3_refresh_terminal_replay_matches(
+            &history,
+            None,
+            &action,
+            &command_id,
+            &facts,
+        ));
+        let mut wrong_revision = facts.clone();
+        wrong_revision.interaction_revision = "schedule:different-action".into();
+        assert!(!ticket_action_v3_refresh_terminal_replay_matches(
+            &history,
+            None,
+            &action,
+            &command_id,
+            &wrong_revision,
+        ));
+
+        schedule.resultReason = "ticket_action_v3_failed".into();
+        assert!(!ticket_action_v3_refresh_terminal_replay_matches(
+            &history,
+            Some(&schedule),
+            &action,
+            &command_id,
+            &facts,
+        ));
+        history.refreshCompletedAt = "2026-09-03T10:00:04Z".into();
+        assert!(!ticket_action_v3_refresh_terminal_replay_matches(
+            &history,
+            None,
+            &action,
+            &command_id,
+            &facts,
+        ));
+    }
+
+    #[test]
+    fn atomic_nonactivation_replay_requires_the_original_command_revision() {
+        let mut action = pending_atomic_ticket_action("redetect_latest");
+        let direct = ticket_action_v3_terminal_facts(
+            "redetect_latest",
+            "succeeded",
+            "complete",
+            "latest_unactivated",
+            "42",
+            "52",
+            "ticket_action_latest_redetected",
+            "2026-09-03T10:00:05Z",
+            "",
+            "action-1",
+            "",
+            "2026-09-03T10:00:06Z",
+        )
+        .unwrap();
+        let command_id = ticket_action_v3_command_id("vivi-default", "pixel", "action-1");
+        assert!(ticket_action_v3_scheduled_terminal_replay_matches(
+            None,
+            &action,
+            &command_id,
+            &direct,
+        ));
+        let mut wrong_revision = direct.clone();
+        wrong_revision.interaction_revision = "different-revision".into();
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            None,
+            &action,
+            &command_id,
+            &wrong_revision,
+        ));
+        let mut unexpected_attempt = direct.clone();
+        unexpected_attempt.attempt_id = "unexpected-attempt".into();
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            None,
+            &action,
+            &command_id,
+            &unexpected_attempt,
+        ));
+        let mut unexpected_activation = direct.clone();
+        unexpected_activation.activation_revision = "unexpected-activation".into();
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            None,
+            &action,
+            &command_id,
+            &unexpected_activation,
+        ));
+
+        let mut schedule = latest_ticket_reselect_schedule();
+        schedule.id = "action-1".into();
+        schedule.purpose = Some("ticket_action_v3_redetect_latest".into());
+        schedule.commandId = command_id.clone();
+        schedule.status = "succeeded".into();
+        schedule.resultReason = direct.reason.clone();
+        schedule.resultPhase = direct.phase.clone();
+        schedule.proofSource = "phone_worker".into();
+        schedule.completedAt = direct.completed_at.clone();
+        let mut scheduled = direct.clone();
+        scheduled.interaction_revision = "schedule:action-1".into();
+        assert!(ticket_action_v3_scheduled_terminal_replay_matches(
+            Some(&schedule),
+            &action,
+            &command_id,
+            &scheduled,
+        ));
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            Some(&schedule),
+            &action,
+            &command_id,
+            &direct,
+        ));
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            None,
+            &action,
+            &command_id,
+            &scheduled,
+        ));
+
+        action.actionId = "other-action".into();
+        assert!(!ticket_action_v3_scheduled_terminal_replay_matches(
+            Some(&schedule),
+            &action,
+            &command_id,
+            &scheduled,
+        ));
+
+        let source = include_str!("lib.rs");
+        let cleanup = source
+            .split("macro_rules! purge_ticket_history")
+            .nth(1)
+            .and_then(|body| body.split("macro_rules! bootstrap_stream_state").next())
+            .expect("bounded ticket history cleanup");
+        assert!(
+            cleanup.find("ticketremote_ticket_action_v3,").unwrap()
+                < cleanup
+                    .find("ticketremote_latest_ticket_reselect_schedule,")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_finalizer_rolls_back_before_retirement_and_creates_no_child() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("pub fn ticketremote_finalize_ticket_action_v3(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_update_ticket_action_v3(")
+                    .next()
+            })
+            .expect("atomic finalizer body");
+        assert!(body.contains("require_service(ctx)?"));
+        assert!(body.contains("ticket_action_v3_obsolete_read_only_finalization("));
+        assert!(body.contains("ticket_action_v3_command_matches_finalization"));
+        assert!(body.contains("commit_ticket_activation_at_impl("));
+        assert!(body.contains("finalize_ticket_activation_failure_checked_impl("));
+        assert!(body.contains("finalize_ticket_activation_refresh_at_impl("));
+        assert!(body.contains(".delete(&expected_command_id)"));
+        assert!(body.contains("upsert_stream_command_signal("));
+        assert!(body.contains("promote_ticket_action_v3_queue("));
+        let delete = body.find(".delete(&expected_command_id)").unwrap();
+        assert!(body.find("update_ticket_action_v3_projection(").unwrap() < delete);
+        assert!(body.find("commit_ticket_activation_at_impl(").unwrap() < delete);
+        assert!(
+            body.find("finalize_ticket_activation_failure_checked_impl(")
+                .unwrap()
+                < delete
+        );
+        assert!(body.find("upsert_stream_command_signal(").unwrap() > delete);
+        assert!(body.find("promote_ticket_action_v3_queue(").unwrap() > delete);
+        assert_eq!(body.matches(".delete(&expected_command_id)").count(), 1);
+        assert_eq!(body.matches("promote_ticket_action_v3_queue(").count(), 1);
+        assert!(!body.contains("admit_member_limit_event("));
+        assert!(!body.contains("activation_admission_for_action("));
+        assert!(!body.contains("retryOrdinal: 1"));
+        assert!(!body.contains("ticketremote_ticket_action_v3().insert"));
+    }
+
+    #[test]
+    fn vivi_credential_and_reauth_contract_is_private_fenced_and_sanitized() {
+        assert_eq!(
+            vivi_scope("vivi-default", "pixel").unwrap(),
+            ("vivi-default".into(), "pixel".into())
+        );
+        assert_eq!(
+            vivi_scope("", "").unwrap(),
+            ("vivi-default".into(), "pixel".into())
+        );
+        assert_eq!(
+            vivi_scope("another-ticket", "pixel"),
+            Err("unsupported_vivi_ticket".into())
+        );
+        assert_eq!(
+            vivi_scope("vivi-default", "another-backend"),
+            Err("unsupported_vivi_backend".into())
+        );
+        assert_eq!(clean_vivi_revision(" cred-01 ").unwrap(), "cred-01");
+        assert!(clean_vivi_revision("").is_err());
+        assert!(clean_vivi_revision("revision with spaces").is_err());
+        assert_eq!(clean_expected_vivi_revision("  ").unwrap(), "");
+        assert_eq!(
+            clean_expected_vivi_revision(" cred-01 ").unwrap(),
+            "cred-01"
+        );
+        assert_eq!(clean_vivi_request_id("request_01").unwrap(), "request_01");
+        assert!(clean_vivi_request_id("request/01").is_err());
+        assert_eq!(
+            vivi_reauth_request_mode("vivi-reauth-01"),
+            Some(ViviReauthMode::LegacyV1)
+        );
+        assert_eq!(
+            vivi_reauth_request_mode("vivi-full-reset-01"),
+            Some(ViviReauthMode::FullResetV2)
+        );
+        assert_eq!(
+            vivi_reauth_request_mode("vivi-logout-login-01"),
+            Some(ViviReauthMode::LogoutLoginV3)
+        );
+        assert_eq!(vivi_reauth_request_mode("vivi-reauth-"), None);
+        assert_eq!(vivi_reauth_request_mode("vivi-full-reset-"), None);
+        assert_eq!(vivi_reauth_request_mode("vivi-logout-login-"), None);
+        assert_eq!(vivi_reauth_request_mode("request_01"), None);
+        assert!(vivi_reauth_request_mode_matches(
+            "vivi-reauth-01",
+            ViviReauthMode::LegacyV1
+        ));
+        assert!(!vivi_reauth_request_mode_matches(
+            "vivi-full-reset-01",
+            ViviReauthMode::LegacyV1
+        ));
+        assert!(vivi_reauth_request_mode_matches(
+            "vivi-full-reset-01",
+            ViviReauthMode::FullResetV2
+        ));
+        assert!(vivi_reauth_request_mode_matches(
+            "vivi-logout-login-01",
+            ViviReauthMode::LogoutLoginV3
+        ));
+
+        for status in [
+            "queued",
+            "pending",
+            "running",
+            "succeeded",
+            "failed",
+            "needs_attention",
+        ] {
+            assert_eq!(vivi_reauth_status(status).unwrap(), status);
+        }
+        assert!(vivi_reauth_status("retrying").is_err());
+        for phase in [
+            "resetting_vivi",
+            "opening_account_controls",
+            "requesting_logout",
+            "verifying_signed_out",
+        ] {
+            assert_eq!(vivi_reauth_phase(phase).unwrap(), phase);
+        }
+        for reason in [
+            "saved_credentials_sign_in_proven",
+            "logout_control_not_detected",
+            "logout_transition_not_proven",
+            "logout_action_uncertain",
+        ] {
+            assert_eq!(vivi_reauth_reason(reason).unwrap(), reason);
+        }
+        assert!(vivi_reauth_reason("password=secret").is_err());
+        assert!(vivi_reauth_phase("raw_password_entry").is_err());
+        assert!(vivi_reauth_proof_source("screenshot_ocr").is_err());
+
+        let safe_payload = serde_json::from_str::<serde_json::Value>(&vivi_reauth_command_payload(
+            "vivi-reauth-01",
+            "cred-01",
+            ViviReauthMode::LegacyV1,
+        ))
+        .unwrap();
+        assert_eq!(
+            safe_payload,
+            serde_json::json!({
+                "version": 1,
+                "requestId": "vivi-reauth-01",
+                "credentialRevision": "cred-01",
+            })
+        );
+        let full_reset_payload =
+            serde_json::from_str::<serde_json::Value>(&vivi_reauth_command_payload(
+                "vivi-full-reset-01",
+                "cred-01",
+                ViviReauthMode::FullResetV2,
+            ))
+            .unwrap();
+        assert_eq!(
+            full_reset_payload,
+            serde_json::json!({
+                "version": 2,
+                "requestId": "vivi-full-reset-01",
+                "credentialRevision": "cred-01",
+                "resetAppData": true,
+            })
+        );
+        let logout_login_payload =
+            serde_json::from_str::<serde_json::Value>(&vivi_reauth_command_payload(
+                "vivi-logout-login-01",
+                "cred-01",
+                ViviReauthMode::LogoutLoginV3,
+            ))
+            .unwrap();
+        assert_eq!(
+            logout_login_payload,
+            serde_json::json!({
+                "version": 3,
+                "requestId": "vivi-logout-login-01",
+                "credentialRevision": "cred-01",
+                "logoutInApp": true,
+            })
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(&vivi_reauth_queued_intent_payload(
+                "cred-01",
+                ViviReauthMode::LegacyV1,
+            )),
+            Some(("cred-01".into(), ViviReauthMode::LegacyV1))
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(&vivi_reauth_queued_intent_payload(
+                "cred-01",
+                ViviReauthMode::FullResetV2,
+            )),
+            Some(("cred-01".into(), ViviReauthMode::FullResetV2))
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(&vivi_reauth_queued_intent_payload(
+                "cred-01",
+                ViviReauthMode::LogoutLoginV3,
+            )),
+            Some(("cred-01".into(), ViviReauthMode::LogoutLoginV3))
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","resetAppData":false}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","logoutInApp":false}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","logoutInApp":true,"extra":1}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","resetAppData":true,"extra":1}"#
+            ),
+            None
+        );
+
+        let source = include_str!("lib.rs");
+        let command = source
+            .split("fn vivi_reauth_command_payload(")
+            .nth(1)
+            .and_then(|body| body.split("fn queue_vivi_reauth_intent(").next())
+            .expect("ViVi reauth command contract must remain inspectable");
+        for required in [
+            "vivi_reauth_command_payload(request_id, credential_revision, mode)",
+            "\"vivi_reauth\"",
+        ] {
+            assert!(
+                command.contains(required),
+                "missing command marker {required}"
+            );
+        }
+        for forbidden in ["\"password\"", "\"email\"", "TicketremoteViviCredentials"] {
+            assert!(
+                !command.contains(forbidden),
+                "credential material escaped into command payload: {forbidden}"
+            );
+        }
+        let promotion = source
+            .split("if intent.kind == \"vivi_reauth\"")
+            .nth(1)
+            .and_then(|body| body.split("if intent.kind == \"control_code\"").next())
+            .expect("queued ViVi reauth promotion must remain inspectable");
+        for required in [
+            "vivi_reauth_queued_intent_fields(&intent.privatePayloadJson)",
+            "vivi_reauth_request_mode_matches(&intent.actionId, mode)",
+            "admit_vivi_reauth(",
+        ] {
+            assert!(
+                promotion.contains(required),
+                "queued ViVi re-auth mode was not preserved through promotion: {required}"
+            );
+        }
+
+        let credential_table = source
+            .split("accessor = ticketremote_vivi_credentials,")
+            .nth(1)
+            .and_then(|body| body.split("pub struct TicketremoteViviCredentials").next())
+            .expect("private credential table must remain inspectable");
+        assert!(!credential_table.contains("public"));
+        let owner_authority_table = source
+            .split("accessor = ticketremote_vivi_reauth_owner,")
+            .nth(1)
+            .and_then(|body| body.split("pub struct TicketremoteViviReauthOwner").next())
+            .expect("private owner authority table must remain inspectable");
+        assert!(!owner_authority_table.contains("public"));
+        assert!(source.contains("accessor = ticketremote_owner_vivi_credentials"));
+        assert!(source.contains("accessor = ticketremote_service_vivi_credentials"));
+        let owner_prepare = source
+            .split("pub fn ticketremote_owner_prepare_vivi_credentials(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_owner_save_vivi_credentials(")
+                    .next()
+            })
+            .expect("owner credential access preparation must remain inspectable");
+        for required in [
+            "vivi_scope(&ticketId, &backendId)?",
+            "client_email_from_auth(ctx, &ticket.id)?",
+            "require_owner(ctx, &ticket.id, &owner_email)?",
+            "upsert_member_identity(ctx, &ticket.id, &owner_email, &now)",
+        ] {
+            assert!(
+                owner_prepare.contains(required),
+                "missing owner access preparation marker {required}"
+            );
+        }
+        assert!(source.contains("ticket_has_vivi_reauth_in_progress(ctx, ticket_id, backend_id)"));
+        assert!(source.contains("cancel_unstarted_vivi_reauth_for_owner"));
+        assert!(source.contains("vivi_reauth_terminal_conflict"));
+        assert!(source.contains("vivi_reauth_attempt_already_claimed"));
+        assert!(source.contains("vivi_reauth_attempt_not_claimed"));
+        assert!(source.contains("expectedRevision: String"));
+        assert_eq!(vivi_reauth_interrupted_terminal_status("pending"), "failed");
+        assert_eq!(
+            vivi_reauth_interrupted_terminal_status("running"),
+            "needs_attention"
+        );
+
+        let mut malformed_command = stream_command("vivi_reauth", "requested");
+        malformed_command.id = vivi_reauth_command_id("vivi-default", "pixel", "request_01");
+        malformed_command.payloadJson = "{not-json".into();
+        assert_eq!(
+            vivi_reauth_request_id_from_command(&malformed_command).as_deref(),
+            Some("request_01")
+        );
+        malformed_command.payloadJson =
+            r#"{"version":"1","requestId":7,"credentialRevision":false}"#.into();
+        assert_eq!(
+            vivi_reauth_request_id_from_command(&malformed_command).as_deref(),
+            Some("request_01")
+        );
+        malformed_command.payloadJson = "{}".into();
+        assert_eq!(
+            vivi_reauth_request_id_from_command(&malformed_command).as_deref(),
+            Some("request_01")
+        );
+    }
+
+    #[test]
+    fn member_role_parser_rejects_unknown_and_empty_roles() {
+        assert_eq!(requested_member_role(" MEMBER ").unwrap(), "member");
+        assert_eq!(requested_member_role("Admin").unwrap(), "admin");
+        assert_eq!(requested_member_role("owner").unwrap(), "owner");
+        assert_eq!(requested_member_role(""), Err("invalid_role".into()));
+        assert_eq!(
+            requested_member_role("superuser"),
+            Err("invalid_role".into())
+        );
+    }
+
+    fn activity_utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid UTC activity fixture")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn member_activity_bucket_uses_riga_day_hour_and_global_five_second_slot() {
+        let utc = activity_utc("2026-09-02T21:34:56.789Z");
+        let bucket = member_activity_bucket_from_utc(utc).expect("valid activity bucket");
+
+        assert_eq!(bucket.day, "2026-09-03");
+        assert_eq!(bucket.hour, 0);
+        assert_eq!(
+            bucket.tick_slot,
+            utc.timestamp_micros()
+                .div_euclid(MEMBER_ACTIVITY_TICK_SLOT_MICROS)
+        );
+        assert_eq!(bucket.expires_at, "2026-10-09T21:00:00+00:00");
+    }
+
+    #[test]
+    fn member_activity_combines_repeated_riga_hour_and_skips_spring_gap() {
+        let autumn_first = member_activity_bucket_from_utc(activity_utc("2026-10-25T00:30:00Z"))
+            .expect("first repeated-hour bucket");
+        let autumn_second = member_activity_bucket_from_utc(activity_utc("2026-10-25T01:30:00Z"))
+            .expect("second repeated-hour bucket");
+        assert_eq!(autumn_first.day, "2026-10-25");
+        assert_eq!(autumn_second.day, autumn_first.day);
+        assert_eq!(autumn_first.hour, 3);
+        assert_eq!(autumn_second.hour, autumn_first.hour);
+        assert_ne!(autumn_first.tick_slot, autumn_second.tick_slot);
+
+        let spring_before = member_activity_bucket_from_utc(activity_utc("2026-03-29T00:59:59Z"))
+            .expect("pre-gap bucket");
+        let spring_after = member_activity_bucket_from_utc(activity_utc("2026-03-29T01:00:00Z"))
+            .expect("post-gap bucket");
+        assert_eq!(spring_before.day, "2026-03-29");
+        assert_eq!(spring_after.day, spring_before.day);
+        assert_eq!(spring_before.hour, 2);
+        assert_eq!(spring_after.hour, 4);
+    }
+
+    #[test]
+    fn member_activity_expiry_is_thirty_seven_local_calendar_days() {
+        let day_start = activity_utc("2026-09-30T21:00:00Z");
+        let bucket = member_activity_bucket_from_utc(day_start).expect("valid autumn bucket");
+        let expiry = activity_utc(&bucket.expires_at);
+
+        assert_eq!(bucket.day, "2026-10-01");
+        assert_eq!(bucket.expires_at, "2026-11-06T22:00:00+00:00");
+        assert_eq!(
+            expiry.timestamp_micros() - day_start.timestamp_micros(),
+            (37 * 24 * 60 * 60 + 60 * 60) * 1_000_000
+        );
+    }
+
+    #[test]
+    fn member_activity_tick_is_slot_deduplicated_normalized_and_saturating() {
+        let mut ticks = Vec::new();
+        let mut last_slot = i64::MIN;
+        assert!(apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            3,
+            100
+        ));
+        assert_eq!(ticks.len(), 24);
+        assert_eq!(ticks[3], 1);
+        assert_eq!(last_slot, 100);
+
+        assert!(!apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            3,
+            100
+        ));
+        assert!(!apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            4,
+            99
+        ));
+        assert_eq!(ticks[3], 1);
+        assert_eq!(ticks[4], 0);
+
+        assert!(apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            3,
+            101
+        ));
+        assert_eq!(ticks[3], 2);
+        ticks[3] = u32::MAX;
+        assert!(apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            3,
+            102
+        ));
+        assert_eq!(ticks[3], u32::MAX);
+        assert_eq!(last_slot, 102);
+        assert!(!apply_member_activity_tick(
+            &mut ticks,
+            &mut last_slot,
+            24,
+            103
+        ));
+        assert_eq!(last_slot, 102);
+    }
+
+    #[test]
+    fn member_activity_row_identity_is_account_and_day_scoped() {
+        let first = account_scope_id(" First@Example.Invalid ");
+        let same = account_scope_id("first@example.invalid");
+        let second = account_scope_id("second@example.invalid");
+        assert_eq!(first, same);
+        assert_eq!(
+            member_activity_row_id("vivi-default", &first, "2026-09-02"),
+            member_activity_row_id("vivi-default", &same, "2026-09-02")
+        );
+        assert_ne!(
+            member_activity_row_id("vivi-default", &first, "2026-09-02"),
+            member_activity_row_id("vivi-default", &second, "2026-09-02")
+        );
+        assert_ne!(
+            member_activity_row_id("vivi-default", &first, "2026-09-02"),
+            member_activity_row_id("vivi-default", &first, "2026-09-03")
+        );
+    }
+
+    #[test]
+    fn member_activity_contract_is_private_authenticated_and_service_only() {
+        let source = include_str!("lib.rs");
+        let table = source
+            .split("accessor = ticketremote_member_daily_activity")
+            .nth(1)
+            .and_then(|body| body.split("accessor = ticketremote_phone_backend").next())
+            .expect("private activity table schema");
+        assert!(!table.lines().next().unwrap_or_default().contains("public"));
+        for field in [
+            "pub id: String",
+            "pub ticketId: String",
+            "pub accountScopeId: String",
+            "pub day: String",
+            "pub hourlyTicks: Vec<u32>",
+            "pub lastTickSlot: i64",
+            "pub firstTickAt: String",
+            "pub lastTickAt: String",
+            "pub updatedAt: String",
+            "pub expiresAt: String",
+        ] {
+            assert!(table.contains(field), "missing activity field: {field}");
+        }
+        assert!(table.contains("index(accessor = ticketDay"));
+        assert!(table.contains("index(accessor = ticketExpiresAt"));
+
+        let reducer = source
+            .split("pub fn ticketremote_member_record_activity_tick(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub fn ticketremote_member_set_limit_preference(")
+                    .next()
+            })
+            .expect("member activity reducer");
+        assert!(reducer.contains("ticketId: String"));
+        assert!(!reducer.contains("nowArg"));
+        assert!(!reducer.contains("email: String"));
+        assert!(reducer.contains("client_email_from_auth(ctx, &ticket.id)?"));
+        assert!(reducer.contains("member_activity_bucket(ctx.timestamp)?"));
+        assert!(reducer.contains("upsert_member_activity_tick("));
+
+        let service_view = source
+            .split("ticketremote_service_member_daily_activity =>")
+            .nth(1)
+            .and_then(|body| body.split("ticketremote_service_phone_backend =>").next())
+            .expect("service-only activity projection");
+        assert!(service_view.contains("ticketremote_service_member_daily_activity_view"));
+        assert!(service_view.contains("ticketDay().filter((&ticket,))"));
+        let view_gate = source
+            .split("macro_rules! service_views")
+            .nth(1)
+            .and_then(|body| body.split("macro_rules! expression_functions").next())
+            .expect("service view authorization gate");
+        assert!(view_gate.contains("service_ticket_id_for_viewer($ctx)"));
+
+        let legacy_member_projection = source
+            .split("pub struct TicketremoteServiceMember {")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub struct TicketremoteServiceMemberAccount")
+                    .next()
+            })
+            .expect("compatible service member projection");
+        assert!(!legacy_member_projection.contains("pub accountScopeId: String"));
+        let member_account_projection = source
+            .split("pub struct TicketremoteServiceMemberAccount {")
+            .nth(1)
+            .and_then(|body| body.split("cloned_projection!").next())
+            .expect("additive service member account projection");
+        assert!(member_account_projection.contains("pub accountScopeId: String"));
+        assert!(source.contains("ticketremote_service_member_account_view"));
+        assert!(source.contains("accountScopeId: account_scope_id(&email)"));
+    }
+
+    #[test]
+    fn member_activity_cleanup_uses_the_shared_bounded_expiry_path() {
+        let source = include_str!("lib.rs");
+        let cleanup = source
+            .split("macro_rules! purge_ticket_history")
+            .nth(1)
+            .and_then(|body| body.split("macro_rules! bootstrap_stream_state").next())
+            .expect("bounded ticket cleanup path");
+        assert!(cleanup.contains("ticketremote_member_daily_activity"));
+        let generic_purger = source
+            .split("macro_rules! purge_expired_rows")
+            .nth(1)
+            .and_then(|body| body.split("macro_rules! ticket_expiry_purgers").next())
+            .expect("generic indexed expiry purger");
+        assert!(generic_purger.contains("ticketExpiresAt()"));
+        assert!(generic_purger.contains("cleanup_remaining($limit, $deleted)"));
+        assert!(generic_purger.contains(".take("));
+    }
+
+    #[test]
+    fn member_upsert_policy_separates_admin_and_owner_authority() {
+        for target in [None, Some("member")] {
+            assert_eq!(
+                member_upsert_policy(Some("admin"), target, "member", 1),
+                Ok("member".into())
+            );
+        }
+        for requested in ["admin", "owner"] {
+            assert_eq!(
+                member_upsert_policy(Some("admin"), None, requested, 1),
+                Err("forbidden".into())
+            );
+        }
+        for target in [Some("admin"), Some("owner")] {
+            assert_eq!(
+                member_upsert_policy(Some("admin"), target, "member", 2),
+                Err("forbidden".into())
+            );
+        }
+        for actor in [None, Some("member")] {
+            assert_eq!(
+                member_upsert_policy(actor, None, "member", 1),
+                Err("forbidden".into())
+            );
+        }
+        for requested in ["member", "admin", "owner"] {
+            assert_eq!(
+                member_upsert_policy(Some("owner"), Some("admin"), requested, 1),
+                Ok(requested.into())
+            );
+        }
+        assert_eq!(
+            member_upsert_policy(Some("owner"), Some("owner"), "owner", 1),
+            Ok("owner".into())
+        );
+        assert_eq!(
+            member_upsert_policy(Some("owner"), Some("owner"), "member", 1),
+            Err("owner_protected".into())
+        );
+        assert_eq!(
+            member_upsert_policy(Some("owner"), Some("owner"), "admin", 2),
+            Ok("admin".into())
+        );
+    }
+
+    #[test]
+    fn member_remove_policy_protects_privileged_roles_and_the_final_owner() {
+        assert_eq!(member_remove_policy(Some("admin"), None, 1), Ok(()));
+        assert_eq!(
+            member_remove_policy(Some("admin"), Some("member"), 1),
+            Ok(())
+        );
+        for target in [Some("admin"), Some("owner")] {
+            assert_eq!(
+                member_remove_policy(Some("admin"), target, 2),
+                Err("forbidden".into())
+            );
+        }
+        assert_eq!(
+            member_remove_policy(Some("owner"), Some("owner"), 1),
+            Err("owner_protected".into())
+        );
+        assert_eq!(
+            member_remove_policy(Some("owner"), Some("owner"), 2),
+            Ok(())
+        );
+        assert_eq!(
+            member_remove_policy(Some("owner"), Some("admin"), 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn direct_and_service_member_reducers_share_the_authorization_helpers() {
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        for (reducer, next_reducer, helper) in [
+            (
+                "ticketremote_member_upsert_member",
+                "ticketremote_member_remove_member",
+                "authorize_and_upsert_member",
+            ),
+            (
+                "ticketremote_member_remove_member",
+                "ticketremote_service_bootstrap",
+                "authorize_and_deactivate_member",
+            ),
+            (
+                "ticketremote_upsert_member",
+                "ticketremote_remove_member",
+                "authorize_and_upsert_member",
+            ),
+            (
+                "ticketremote_remove_member",
+                "ticketremote_update_phone",
+                "authorize_and_deactivate_member",
+            ),
+        ] {
+            let body = production
+                .split(reducer)
+                .nth(1)
+                .and_then(|remainder| remainder.split_once(next_reducer).map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("{reducer} reducer body must remain inspectable"));
+            assert!(
+                body.contains(helper),
+                "{reducer} must call {helper} inside its own reducer body"
+            );
+        }
+    }
 
     fn control_request() -> TicketremoteControlCodeRequest {
         TicketremoteControlCodeRequest {
@@ -11586,24 +15039,28 @@ mod tests {
             ["pending", "running"]
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(true, false, false, false),
+            ticket_phone_mutation_lane_conflict_reason(true, false, false, false, false),
             Some("control_code_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, true, false, false),
+            ticket_phone_mutation_lane_conflict_reason(false, true, false, false, false),
             Some("ticket_action_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, false, true, false),
+            ticket_phone_mutation_lane_conflict_reason(false, false, false, true, false),
             Some("ticket_reset_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, false, false, true),
+            ticket_phone_mutation_lane_conflict_reason(false, false, false, false, true),
             Some("ticket_mutation_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, false, false, false),
+            ticket_phone_mutation_lane_conflict_reason(false, false, false, false, false),
             None
+        );
+        assert_eq!(
+            ticket_phone_mutation_lane_conflict_reason(false, false, true, false, false),
+            Some("vivi_reauth_in_progress")
         );
 
         let source = include_str!("lib.rs");
@@ -11680,19 +15137,19 @@ mod tests {
     #[test]
     fn scheduled_redetect_conflicts_preserve_the_pending_schedule_for_bounded_retry() {
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(true, false, false, false),
+            ticket_phone_mutation_lane_conflict_reason(true, false, false, false, false),
             Some("control_code_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, true, false, false),
+            ticket_phone_mutation_lane_conflict_reason(false, true, false, false, false),
             Some("ticket_action_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(true, true, true, true),
+            ticket_phone_mutation_lane_conflict_reason(true, true, true, true, true),
             Some("control_code_in_progress")
         );
         assert_eq!(
-            ticket_phone_mutation_lane_conflict_reason(false, false, false, false),
+            ticket_phone_mutation_lane_conflict_reason(false, false, false, false, false),
             None
         );
 
@@ -13329,37 +16786,109 @@ mod tests {
     }
 
     #[test]
-    fn explicit_v3_action_supersedes_read_only_proof_before_phone_lane_admission() {
+    fn explicit_v3_action_and_reauth_queue_behind_an_active_read_only_proof() {
         let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production module source");
+        assert!(!production.contains("supersede_read_only_ticket_actions_for_mutation"));
+
         let request = source
             .split("fn request_ticket_action_v3_impl(")
             .nth(1)
             .and_then(|body| body.split("fn request_ticket_reset_impl(").next())
             .expect("immediate V3 request path must remain inspectable");
-        let supersede = request
-            .find("supersede_read_only_ticket_actions_for_mutation(")
-            .expect("explicit action must retire background proof");
         let lane = request
             .find("ticket_phone_mutation_lane_conflict(")
-            .expect("mutating action must still use the shared phone lane");
+            .expect("mutating action must use the shared phone lane");
+        let queue = request
+            .find("return queue_ticket_action_v3_intent(")
+            .expect("explicit action must use the durable queue when the lane is occupied");
         assert!(request.contains("if target != \"prove_current\""));
-        assert!(supersede < lane);
-        let helper = source
-            .split("fn supersede_read_only_ticket_actions_for_mutation(")
+        assert!(lane < queue);
+
+        let reauth = source
+            .split("fn owner_request_vivi_reauth(")
             .nth(1)
-            .and_then(|body| {
-                body.split("fn ticket_phone_mutation_lane_conflict_reason(")
-                    .next()
-            })
-            .expect("proof supersession helper must remain inspectable");
-        assert!(helper.contains("row.target == \"prove_current\""));
-        assert!(helper.contains("ticket_action_v3_superseded"));
-        assert_eq!(
-            helper.matches("phase: \"superseded\".into()").count(),
-            2,
-            "proof supersession must publish the same phase whether or not its command row still exists"
-        );
-        assert!(!helper.contains("ticket_action_v3_is_activation"));
+            .and_then(|body| body.split("#[spacetimedb::reducer]").next())
+            .expect("ViVi reauthentication request path must remain inspectable");
+        let reauth_lane = reauth
+            .find("ticket_phone_mutation_lane_conflict(")
+            .expect("ViVi reauthentication must use the shared phone lane");
+        let reauth_queue = reauth
+            .find("return queue_vivi_reauth_intent(")
+            .expect("ViVi reauthentication must queue when the lane is occupied");
+        assert!(reauth_lane < reauth_queue);
+    }
+
+    #[test]
+    fn only_an_uncorrelated_command_free_obsolete_proof_is_an_idempotent_finalization() {
+        assert!(ticket_action_v3_obsolete_read_only_finalization(
+            "prove_current",
+            None,
+            false,
+            "",
+            "",
+        ));
+        for terminal_status in ["failed", "needs_attention"] {
+            assert!(ticket_action_v3_obsolete_read_only_finalization(
+                "prove_current",
+                Some(("prove_current", terminal_status)),
+                false,
+                "",
+                "",
+            ));
+        }
+        for live_or_successful_status in ["pending", "running", "succeeded"] {
+            assert!(!ticket_action_v3_obsolete_read_only_finalization(
+                "prove_current",
+                Some(("prove_current", live_or_successful_status)),
+                false,
+                "",
+                "",
+            ));
+        }
+        assert!(!ticket_action_v3_obsolete_read_only_finalization(
+            "prove_current",
+            None,
+            true,
+            "",
+            "",
+        ));
+        assert!(!ticket_action_v3_obsolete_read_only_finalization(
+            "prove_current",
+            Some(("register_current", "failed")),
+            false,
+            "",
+            "",
+        ));
+        assert!(!ticket_action_v3_obsolete_read_only_finalization(
+            "prove_current",
+            None,
+            false,
+            "attempt-1",
+            "",
+        ));
+        assert!(!ticket_action_v3_obsolete_read_only_finalization(
+            "prove_current",
+            None,
+            false,
+            "",
+            "activation-1",
+        ));
+        for target in [
+            "open_latest_unactivated",
+            "open_latest_and_register",
+            "register_current",
+            "redetect_latest",
+            "show_recent_activated",
+            "return_to_latest_unactivated",
+        ] {
+            assert!(!ticket_action_v3_obsolete_read_only_finalization(
+                target, None, false, "", "",
+            ));
+        }
     }
 
     #[test]
@@ -13777,87 +17306,6 @@ mod tests {
             ticket_action_v3_duplicate_result("register_current", "open_latest_unactivated"),
             Err("ticket_action_id_reused".into())
         );
-    }
-
-    #[test]
-    fn no_transition_retry_is_one_deterministic_register_current_child_without_readmission() {
-        let action = TicketremoteTicketActionV3 {
-            id: "row-register-1".into(),
-            actionId: "register-1".into(),
-            ticketId: "vivi-default".into(),
-            backendId: "pixel".into(),
-            target: "open_latest_and_register".into(),
-            parentActionId: None,
-            rootActionId: Some("register-1".into()),
-            retryOrdinal: 0,
-            status: "running".into(),
-            phase: "registering".into(),
-            currentView: "latest_unactivated".into(),
-            switchAvailable: false,
-            switchExpiresAt: String::new(),
-            streamEpoch: "41".into(),
-            frameSequence: "52".into(),
-            reason: "ticket_action_v3_running".into(),
-            createdAt: "2026-08-26T12:00:00Z".into(),
-            updatedAt: "2026-08-26T12:00:01Z".into(),
-            completedAt: String::new(),
-            expiresAt: "2026-08-26T12:05:00Z".into(),
-        };
-        assert!(ticket_action_v3_no_transition_retry_allowed(&action));
-        assert_eq!(
-            ticket_action_v3_retry_child_id(&action.actionId),
-            "register-1-retry-1"
-        );
-
-        let mut child = action.clone();
-        child.actionId = ticket_action_v3_retry_child_id(&action.actionId);
-        child.parentActionId = Some(action.actionId.clone());
-        child.retryOrdinal = 1;
-        child.target = "register_current".into();
-        assert!(!ticket_action_v3_no_transition_retry_allowed(&child));
-
-        let body = include_str!("lib.rs")
-            .split("pub fn ticketremote_retry_ticket_action_v3_after_no_transition(")
-            .nth(1)
-            .and_then(|body| {
-                body.split("pub fn ticketremote_update_ticket_slider_region_v3(")
-                    .next()
-            })
-            .expect("retry reducer body");
-        assert!(body.contains("\"target\": \"register_current\""));
-        assert!(body.contains("history.outcome != \"pending\""));
-        assert!(!body.contains("activation_admission_for_action("));
-        assert!(!body.contains("ticketremote_activation_history().insert"));
-
-        let acknowledgement = include_str!("lib.rs")
-            .split("fn update_stream_command_status(")
-            .nth(1)
-            .and_then(|body| body.split("fn ticket_reset_command_is_relevant(").next())
-            .expect("stream-command acknowledgement body");
-        assert!(acknowledgement.contains(
-            "let retry_handoff = ticket_action_v3_retry_handoff_in_progress(ctx, &existing)"
-        ));
-        assert!(acknowledgement.contains("if !retry_handoff {\n                    reconcile_ticket_action_activation_terminal_interaction"));
-        assert!(
-            acknowledgement
-                .contains("if !retry_handoff {\n            promote_ticket_action_v3_queue")
-        );
-
-        let failure_cleanup = include_str!("lib.rs")
-            .split("fn fail_ticket_action_v3_for_command(")
-            .nth(1)
-            .and_then(|body| {
-                body.split("fn ticket_action_v3_retry_handoff_in_progress(")
-                    .next()
-            })
-            .expect("ticket-action failure cleanup body");
-        let handoff_guard = failure_cleanup
-            .find("ticket_action_v3_retry_handoff_in_progress(ctx, command)")
-            .expect("retry handoff failure guard");
-        let admission_failure = failure_cleanup
-            .find("finalize_ticket_activation_failure_impl(")
-            .expect("activation failure finalization");
-        assert!(handoff_guard < admission_failure);
     }
 
     #[test]

@@ -1,6 +1,10 @@
 import { DbConnection } from "./generated/index";
 import { installCspSafeSpacetimeCodecs } from "./csp-safe-codecs";
 import { ticketActionV3ActionsByAuthority } from "../ticket-action-v3-core.mjs";
+import {
+  ownerViviConnectionEventAllowed,
+  prepareOwnerViviAccessBeforeSubscribe,
+} from "../owner-vivi-access-core.js";
 
 installCspSafeSpacetimeCodecs();
 
@@ -13,6 +17,7 @@ type TicketClientConfig = {
   email: string;
   accountScopeId: string;
   backendId?: string;
+  ownerViviAuth?: boolean;
 };
 
 type TicketClientHandlers = {
@@ -171,9 +176,25 @@ class TicketSpacetimeClient {
           this.conn = connection;
           this.connected = true;
           this.reconnectDelayMs = 1000;
-          this.handlers.onStatus?.("live");
-          this.resolveLive();
-          this.subscribeState(connection);
+          void prepareOwnerViviAccessBeforeSubscribe({
+            ownerViviAuth: this.cfg.ownerViviAuth === true,
+            prepare: () => this.callReducerOnConnection(connection, "ownerPrepareViviCredentials", {
+              ticketId: this.cfg.ticketId,
+              backendId: this.backendId(),
+            }),
+            subscribe: () => {
+              if (generation !== this.connectionGeneration || this.conn !== connection) return;
+              this.subscribeState(connection, generation);
+            },
+            ready: () => {
+              if (generation !== this.connectionGeneration || this.conn !== connection) return;
+              this.handlers.onStatus?.("live");
+              this.resolveLive();
+            },
+          }).catch((error) => {
+            if (generation !== this.connectionGeneration || this.conn !== connection) return;
+            this.handlers.onStatus?.("owner_vivi_access_failed", error && String(error));
+          });
         })
         .onDisconnect(() => {
           if (generation !== this.connectionGeneration) return;
@@ -306,10 +327,66 @@ class TicketSpacetimeClient {
     });
   }
 
+  recordActivityTick(): Promise<void> {
+    return this.callReducer("memberRecordActivityTick", {
+      ticketId: this.cfg.ticketId,
+    });
+  }
+
   setLimitPreference(obeyLimits: boolean): Promise<void> {
     return this.callReducer("memberSetLimitPreference", {
       ticketId: this.cfg.ticketId,
       obeyLimits: Boolean(obeyLimits),
+    });
+  }
+
+  saveViviCredentials(email: string, password: string, expectedRevision: string, revision: string): Promise<void> {
+    return this.callReducer("ownerSaveViviCredentials", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      email,
+      password,
+      expectedRevision,
+      revision,
+    });
+  }
+
+  clearViviCredentials(expectedRevision: string, revision: string): Promise<void> {
+    return this.callReducer("ownerClearViviCredentials", {
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      expectedRevision,
+      revision,
+    });
+  }
+
+  requestViviReauth(requestId: string, credentialRevision: string): Promise<void> {
+    return this.callReducer("ownerRequestViviReauth", {
+      version: 1,
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      requestId,
+      credentialRevision,
+    });
+  }
+
+  requestViviReauthLogoutLogin(requestId: string, credentialRevision: string): Promise<void> {
+    return this.callReducer("ownerRequestViviReauthLogoutLogin", {
+      version: 3,
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      requestId,
+      credentialRevision,
+    });
+  }
+
+  requestViviReauthFullReset(requestId: string, credentialRevision: string): Promise<void> {
+    return this.callReducer("ownerRequestViviReauthFullReset", {
+      version: 2,
+      ticketId: this.cfg.ticketId,
+      backendId: this.backendId(),
+      requestId,
+      credentialRevision,
     });
   }
 
@@ -454,8 +531,16 @@ class TicketSpacetimeClient {
     }, delayMs);
   }
 
-  private attachStateListeners(connection: DbConnection): void {
-    const publish = () => this.publishFocusedState();
+  private attachStateListeners(connection: DbConnection, generation: number): void {
+    const publish = () => {
+      if (!ownerViviConnectionEventAllowed({
+        eventGeneration: generation,
+        currentGeneration: this.connectionGeneration,
+        eventConnection: connection,
+        currentConnection: this.conn,
+      })) return;
+      this.publishFocusedState();
+    };
     for (const table of this.focusedStateTables(connection.db)) {
       if (table.onInsert) table.onInsert(publish);
       if (table.onUpdate) table.onUpdate(publish);
@@ -463,51 +548,70 @@ class TicketSpacetimeClient {
     }
   }
 
-  private subscribeState(connection: DbConnection): void {
+  private subscribeState(connection: DbConnection, generation: number): void {
     const ticket = sqlString(this.cfg.ticketId);
     const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);
     const backendId = sqlString(this.backendId());
     const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
     const accountScopeId = sqlString(validAccountScopeId(this.cfg.accountScopeId));
     let applied = false;
+    const queries = [
+      `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_control_code_fast_state WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+      `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
+      `SELECT * FROM ticketremote_ticket_interaction WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_activation_eligibility WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_activation_decision WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+      `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+      `SELECT * FROM ticketremote_ticket_slider_region_v3 WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_member_hdr_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
+      `SELECT * FROM ticketremote_member_hdr_engine_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
+      `SELECT * FROM ticketremote_member_hdr_boost_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
+      `SELECT * FROM ticketremote_member_limit_state WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
+    ];
+    if (this.cfg.ownerViviAuth) {
+      queries.push(
+        `SELECT * FROM ticketremote_vivi_credential_state WHERE id = ${backendRow}`,
+        `SELECT * FROM ticketremote_vivi_reauth_attempt WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+        `SELECT * FROM ticketremote_owner_vivi_credentials WHERE id = ${backendRow}`,
+      );
+    }
+    const connectionIsCurrent = () => ownerViviConnectionEventAllowed({
+      eventGeneration: generation,
+      currentGeneration: this.connectionGeneration,
+      eventConnection: connection,
+      currentConnection: this.conn,
+    });
     this.subscription = connection.subscriptionBuilder()
       .onApplied(() => {
+        if (!connectionIsCurrent()) return;
         if (!applied) {
           applied = true;
-          this.attachStateListeners(connection);
+          this.attachStateListeners(connection, generation);
         }
         this.handlers.onSnapshotApplied?.();
         this.publishFocusedState();
         void this.refreshLimitState().catch((error) => {
+          if (!connectionIsCurrent()) return;
           this.handlers.onStatus?.("limit_refresh_failed", error && String(error));
         });
         void this.refreshHDRState().catch((error) => {
+          if (!connectionIsCurrent()) return;
           this.handlers.onStatus?.("hdr_refresh_failed", error && String(error));
         });
         void this.refreshHDREngineState().catch((error) => {
+          if (!connectionIsCurrent()) return;
           this.handlers.onStatus?.("hdr_engine_refresh_failed", error && String(error));
         });
         void this.refreshHDRBoostState().catch((error) => {
+          if (!connectionIsCurrent()) return;
           this.handlers.onStatus?.("hdr_boost_refresh_failed", error && String(error));
         });
       })
-      .subscribe([
-        `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_control_code_fast_state WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
-        `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
-        `SELECT * FROM ticketremote_ticket_interaction WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_activation_eligibility WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_activation_decision WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
-        `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
-        `SELECT * FROM ticketremote_ticket_slider_region_v3 WHERE id = ${backendRow}`,
-        `SELECT * FROM ticketremote_member_hdr_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
-        `SELECT * FROM ticketremote_member_hdr_engine_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
-        `SELECT * FROM ticketremote_member_hdr_boost_state WHERE ticketId = ${ticket} AND accountScopeId = ${accountScopeId}`,
-        `SELECT * FROM ticketremote_member_limit_state WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
-      ]);
+      .subscribe(queries);
   }
 
   private publishFocusedState(): void {
@@ -543,6 +647,35 @@ class TicketSpacetimeClient {
         String(row.accountScopeId || row.account_scope_id || "") === validAccountScopeId(this.cfg.accountScopeId)) || null;
     const memberHDRDisplayBoost = ticketHDRDisplayBoost(memberHDRBoostState &&
       (memberHDRBoostState.selectedDisplayBoost ?? memberHDRBoostState.selected_display_boost));
+    const viviCredentialState = this.cfg.ownerViviAuth
+      ? tableRows(tableAccessor(db, "vivi_credential_state")).find((row) => rowId(row) === backendRow) || null
+      : null;
+    const ownerViviCredentials = this.cfg.ownerViviAuth
+      ? tableRows(tableAccessor(db, "owner_vivi_credentials")).find((row) => rowId(row) === backendRow) || null
+      : null;
+    const viviReauthAttempts = this.cfg.ownerViviAuth
+      ? tableRows(tableAccessor(db, "vivi_reauth_attempt"))
+        .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
+        .sort((left, right) => {
+          const updated = String(right.updatedAt || right.updated_at || "")
+            .localeCompare(String(left.updatedAt || left.updated_at || ""));
+          if (updated) return updated;
+          return String(right.requestId || right.request_id || "")
+            .localeCompare(String(left.requestId || left.request_id || ""));
+        })
+        .map((row) => ({
+          requestId: String(row.requestId || row.request_id || ""),
+          credentialRevision: String(row.credentialRevision || row.credential_revision || ""),
+          ownerPublicId: String(row.ownerPublicId || row.owner_public_id || ""),
+          status: String(row.status || ""),
+          phase: String(row.phase || ""),
+          reason: String(row.reason || ""),
+          proofSource: String(row.proofSource || row.proof_source || ""),
+          createdAt: String(row.createdAt || row.created_at || ""),
+          updatedAt: String(row.updatedAt || row.updated_at || ""),
+          completedAt: String(row.completedAt || row.completed_at || ""),
+        }))
+      : [];
     const activationDecisions = tableRows(tableAccessor(db, "activation_decision"))
       .filter((row) => rowTicketId(row) === this.cfg.ticketId && rowBackendId(row) === this.backendId())
       .map((row) => ({
@@ -742,6 +875,21 @@ class TicketSpacetimeClient {
         updatedAt: String(memberHDRBoostState && (memberHDRBoostState.updatedAt || memberHDRBoostState.updated_at) || ""),
         serverAt: String(memberHDRBoostState && (memberHDRBoostState.serverAt || memberHDRBoostState.server_at) || ""),
       },
+      viviCredentialState: viviCredentialState ? {
+        configured: viviCredentialState.configured === true,
+        revision: String(viviCredentialState.revision || ""),
+        updatedAt: String(viviCredentialState.updatedAt || viviCredentialState.updated_at || ""),
+      } : null,
+      ownerViviCredentials: ownerViviCredentials ? {
+        email: String(ownerViviCredentials.email || ""),
+        password: String(ownerViviCredentials.password || ""),
+        revision: String(ownerViviCredentials.revision || ""),
+        updatedAt: String(ownerViviCredentials.updatedAt || ownerViviCredentials.updated_at || ""),
+      } : null,
+      viviReauthAttempts,
+      // Keep the singular projection for older admin bundles while new code
+      // follows its exact request and computes phone-lane busy from every row.
+      viviReauthAttempt: viviReauthAttempts[0] || null,
       activationDecisions,
       ticketActions,
       ticketAction: ticketActions[0] || null,
@@ -798,7 +946,11 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    return ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state"]
+    const names = ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state"];
+    if (this.cfg.ownerViviAuth) {
+      names.push("vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials");
+    }
+    return names
       .map((name) => tableAccessor(source, name));
   }
 
@@ -807,9 +959,17 @@ class TicketSpacetimeClient {
   }
 
   private reducer(name: string): any {
-    const connection = this.requireConnection();
+    return this.reducerOnConnection(this.requireConnection(), name);
+  }
+
+  private reducerOnConnection(connection: DbConnection, name: string): any {
     const suffix = `${name.charAt(0).toUpperCase()}${name.slice(1)}`;
     return pickAccessor(connection.reducers, [`ticketremote${suffix}`, `ticketRemote${suffix}`, name]);
+  }
+
+  private async callReducerOnConnection(connection: DbConnection, name: string, args: Record<string, unknown>): Promise<void> {
+    const reducer = this.reducerOnConnection(connection, name);
+    await reducer(args);
   }
 
   private async callReducer(name: string, args: Record<string, unknown>): Promise<void> {

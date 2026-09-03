@@ -31,12 +31,18 @@ execFileSync(
 );
 
 const keptBindings = new Set([
-  ...["activation_decision", "activation_eligibility", "control_code_fast_state", "control_code_request", "latency_link_v_1", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_interaction", "ticket_action_v_3", "ticket_slider_region_v_3"]
+  ...["activation_decision", "activation_eligibility", "control_code_fast_state", "control_code_request", "latency_link_v_1", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state", "phone_current_report", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_interaction", "ticket_action_v_3", "ticket_slider_region_v_3", "vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials"]
     .map((name) => `ticketremote_${name}_table`),
-  ...["close_control_code", "confirm_control_code_browser_capture", "recover_stream", "refresh_hdr_state", "refresh_hdr_engine_state", "refresh_hdr_boost_state", "refresh_limit_state", "request_control_code", "request_keyframe", "set_hdr_preference", "set_limit_preference", "set_stream_focus", "request_ticket_action_v_3"]
+  ...["close_control_code", "confirm_control_code_browser_capture", "record_activity_tick", "recover_stream", "refresh_hdr_state", "refresh_hdr_engine_state", "refresh_hdr_boost_state", "refresh_limit_state", "request_control_code", "request_keyframe", "set_hdr_preference", "set_limit_preference", "set_stream_focus", "request_ticket_action_v_3"]
     .map((name) => `ticketremote_member_${name}_reducer`),
   "ticketremote_owner_set_hdr_engine_reducer",
   "ticketremote_owner_set_hdr_display_boost_reducer",
+  "ticketremote_owner_prepare_vivi_credentials_reducer",
+  "ticketremote_owner_save_vivi_credentials_reducer",
+  "ticketremote_owner_clear_vivi_credentials_reducer",
+  "ticketremote_owner_request_vivi_reauth_reducer",
+  "ticketremote_owner_request_vivi_reauth_logout_login_reducer",
+  "ticketremote_owner_request_vivi_reauth_full_reset_reducer",
   "ticketremote_admin_schedule_ticket_action_v_3_reducer",
 ]);
 const allowedGeneratedFiles = new Set([

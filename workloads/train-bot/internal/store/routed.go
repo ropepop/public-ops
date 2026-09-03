@@ -248,6 +248,10 @@ func (s *RoutedStore) InsertReportEvent(ctx context.Context, e domain.ReportEven
 	return s.state.InsertReportEvent(ctx, e)
 }
 
+func (s *RoutedStore) SubmitReportEvent(ctx context.Context, e domain.ReportEvent, policy ReportMutationPolicy) error {
+	return s.state.SubmitReportEvent(ctx, e, policy)
+}
+
 func (s *RoutedStore) GetLastReportByUserTrain(ctx context.Context, userID int64, trainID string) (*domain.ReportEvent, error) {
 	return s.state.GetLastReportByUserTrain(ctx, userID, trainID)
 }
@@ -264,8 +268,16 @@ func (s *RoutedStore) ListRecentReportEvents(ctx context.Context, since time.Tim
 	return s.state.ListRecentReportEvents(ctx, since, limit)
 }
 
+func (s *RoutedStore) CountReportActionsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	return s.state.CountReportActionsByUserSince(ctx, userID, since)
+}
+
 func (s *RoutedStore) InsertStationSighting(ctx context.Context, e domain.StationSighting) error {
 	return s.state.InsertStationSighting(ctx, e)
+}
+
+func (s *RoutedStore) SubmitStationSighting(ctx context.Context, e domain.StationSighting, policy ReportMutationPolicy) error {
+	return s.state.SubmitStationSighting(ctx, e, policy)
 }
 
 func (s *RoutedStore) GetLastStationSightingByUserScope(ctx context.Context, userID int64, stationID string, destinationStationID *string) (*domain.StationSighting, error) {
@@ -288,6 +300,10 @@ func (s *RoutedStore) InsertLocationReport(ctx context.Context, e domain.Locatio
 	return s.state.InsertLocationReport(ctx, e)
 }
 
+func (s *RoutedStore) SubmitLocationReport(ctx context.Context, e domain.LocationReport, policy ReportMutationPolicy) error {
+	return s.state.SubmitLocationReport(ctx, e, policy)
+}
+
 func (s *RoutedStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
 	return s.state.GetLastLocationReportByUserScope(ctx, userID, scope, subjectID)
 }
@@ -304,6 +320,10 @@ func (s *RoutedStore) InsertIncidentVoteEvent(ctx context.Context, vote domain.I
 	return s.state.InsertIncidentVoteEvent(ctx, vote)
 }
 
+func (s *RoutedStore) SubmitIncidentVote(ctx context.Context, vote domain.IncidentVote, event domain.IncidentVoteEvent, policy VoteMutationPolicy) error {
+	return s.state.SubmitIncidentVote(ctx, vote, event, policy)
+}
+
 func (s *RoutedStore) ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error) {
 	return s.state.ListIncidentVotes(ctx, incidentID)
 }
@@ -312,8 +332,16 @@ func (s *RoutedStore) ListIncidentVoteEvents(ctx context.Context, incidentID str
 	return s.state.ListIncidentVoteEvents(ctx, incidentID, since, limit)
 }
 
+func (s *RoutedStore) CountIncidentVoteEventsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	return s.state.CountIncidentVoteEventsByUserSince(ctx, userID, since)
+}
+
 func (s *RoutedStore) InsertIncidentComment(ctx context.Context, comment domain.IncidentComment) error {
 	return s.state.InsertIncidentComment(ctx, comment)
+}
+
+func (s *RoutedStore) SubmitIncidentComment(ctx context.Context, comment domain.IncidentComment, policy CommentMutationPolicy) error {
+	return s.state.SubmitIncidentComment(ctx, comment, policy)
 }
 
 func (s *RoutedStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]domain.IncidentComment, error) {

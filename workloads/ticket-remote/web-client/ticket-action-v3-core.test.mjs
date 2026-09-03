@@ -3,6 +3,7 @@ import test from 'node:test';
 import { performance } from 'node:perf_hooks';
 import {
   TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT,
+  adminRedetectTicketActionV3TerminalMessage,
   adminRedetectTicketActionV3Args,
   adminScheduleTicketActionV3Args,
   beginTicketActionV3LocalRequest,
@@ -23,8 +24,10 @@ import {
   ticketCurrentProofFingerprintChanged,
   ticketCurrentProofRequestNeeded,
   ticketControlCodeVisualRecoveryRequired,
+  ticketActionV3ActivationTerminalMessage,
   ticketActionV3ClientId,
   ticketActionV3ExplicitResultForDisplay,
+  ticketActionV3IsExpectedEmptyRedetect,
   ticketActionV3LocalRequestBusy,
   ticketActionV3OccupiesPhone,
   ticketActionV3RequestArgs,
@@ -742,22 +745,17 @@ test('accepted slider stays at 100 until its exact durable action is terminal', 
     }
   }), false, 'input/change after pointer completion cannot submit a second action');
   assert.deepEqual(submissions, [{ source: 'browser_slider', actionId: 'register-exact' }]);
-  assert.equal(releaseTicketLocalRegisterSliderOnTerminal(state, [
+  assert.deepEqual(releaseTicketLocalRegisterSliderOnTerminal(state, [
     { actionId: 'other', status: 'succeeded' },
     { actionId: 'register-exact', status: 'running' }
   ]), null);
   assert.equal(state.inFlight, true);
-  assert.equal(releaseTicketLocalRegisterSliderOnTerminal(state, [
-    { actionId: 'register-exact', rootActionId: 'register-exact', status: 'needs_attention', createdAt: '2026-08-26T12:00:00Z' },
-    { actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'queued', createdAt: '2026-08-26T12:00:01Z' }
-  ]), null, 'the parent terminal result cannot release the slider while its one child waits');
-  assert.equal(state.inFlight, true);
   assert.deepEqual(releaseTicketLocalRegisterSliderOnTerminal(state, [
     { actionId: 'register-exact', rootActionId: 'register-exact', status: 'needs_attention', createdAt: '2026-08-26T12:00:00Z' },
-    { actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'succeeded', createdAt: '2026-08-26T12:00:01Z' }
+    { actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'queued', createdAt: '2026-08-26T12:00:01Z' }
   ]), {
-    actionId: 'register-exact-retry-1', rootActionId: 'register-exact', status: 'succeeded', createdAt: '2026-08-26T12:00:01Z'
-  });
+    actionId: 'register-exact', rootActionId: 'register-exact', status: 'needs_attention', createdAt: '2026-08-26T12:00:00Z'
+  }, 'only the exact user action controls release; a child row is unrelated');
   assert.equal(state.inFlight, false);
   assert.equal(state.actionId, '');
   assert.equal(resetTicketLocalRegisterSliderState(state), false);
@@ -925,14 +923,79 @@ test('automatic current proof cannot replace the last explicit user action resul
     status: 'running',
     createdAt: '2026-08-26T12:00:01Z'
   };
-  assert.equal(
+  assert.deepEqual(
     ticketActionV3ExplicitResultForDisplay(
       [{ ...explicitFailure, createdAt: '2026-08-26T12:00:00Z' }, retryChild],
       explicitFailure.actionId
     ),
-    retryChild,
-    'the browser follows the deterministic child as the same explicit user action'
+    { ...explicitFailure, createdAt: '2026-08-26T12:00:00Z' },
+    'the browser never follows a child row in place of the exact user action'
   );
+});
+
+test('activation attention explains whether a swipe was avoided, unchanged, or ambiguous', () => {
+  const base = { target: 'register_current', status: 'needs_attention' };
+  assert.match(ticketActionV3ActivationTerminalMessage({ ...base, phase: 'not_dispatched' }), /nekas netika pavilkts/);
+  assert.match(ticketActionV3ActivationTerminalMessage({ ...base, phase: 'retry_not_dispatched' }), /otrā vilkšana netika nosūtīta/);
+  assert.match(ticketActionV3ActivationTerminalMessage({ ...base, phase: 'no_transition' }), /Abi atļautie vilkšanas mēģinājumi/);
+  assert.match(ticketActionV3ActivationTerminalMessage({ ...base, phase: 'outcome_unknown' }), /Pirms jauna mēģinājuma/);
+  assert.equal(ticketActionV3ActivationTerminalMessage({ ...base, phase: 'running' }), '');
+  assert.equal(ticketActionV3ActivationTerminalMessage({ ...base, target: 'redetect_latest', phase: 'not_dispatched' }), '');
+});
+
+test('only the exact terminal empty redetect result is treated as an expected no-ticket outcome', () => {
+  const emptyRedetect = {
+    actionId: 'ticket_action_v3_empty',
+    target: 'redetect_latest',
+    status: 'failed',
+    phase: 'failed',
+    currentView: 'unknown',
+    reason: 'ticket_action_latest_not_detected',
+    streamEpoch: '41',
+    frameSequence: '73'
+  };
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect(emptyRedetect), true);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, status: 'needs_attention' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, status: 'running' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, phase: 'running' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, phase: undefined }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, target: 'open_latest_unactivated' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, currentView: 'latest_unactivated' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, streamEpoch: '0' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, streamEpoch: '' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, frameSequence: '0' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, frameSequence: undefined }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, reason: 'ticket_action_visual_unproved' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect({ ...emptyRedetect, reason: 'ticket_action_latest_not_detected_extra' }), false);
+  assert.equal(ticketActionV3IsExpectedEmptyRedetect(null), false);
+});
+
+test('admin redetection terminal copy distinguishes empty, success, attention, and safe failure', () => {
+  const base = {
+    actionId: 'ticket_action_v3_admin_exact',
+    target: 'redetect_latest',
+    status: 'failed',
+    phase: 'failed',
+    currentView: 'unknown',
+    reason: 'ticket_action_latest_not_detected',
+    streamEpoch: '41',
+    frameSequence: '73'
+  };
+  assert.equal(adminRedetectTicketActionV3TerminalMessage(base), 'No tickets found.');
+  assert.equal(
+    adminRedetectTicketActionV3TerminalMessage({ ...base, status: 'succeeded', reason: 'ticket_action_latest_redetected' }),
+    'Latest ticket redetection completed.'
+  );
+  assert.equal(
+    adminRedetectTicketActionV3TerminalMessage({ ...base, status: 'needs_attention' }),
+    'The phone view needs manual attention; the action was not repeated.'
+  );
+  assert.equal(
+    adminRedetectTicketActionV3TerminalMessage({ ...base, streamEpoch: '0' }),
+    'Ticket redetection stopped safely without an unproven action.'
+  );
+  assert.equal(adminRedetectTicketActionV3TerminalMessage({ ...base, status: 'running' }), '');
+  assert.equal(adminRedetectTicketActionV3TerminalMessage({ ...base, target: 'prove_current' }), '');
 });
 
 test('local v3 request remains latched after reducer acknowledgement until its exact row arrives', () => {

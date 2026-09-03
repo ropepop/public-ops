@@ -1282,6 +1282,75 @@ func (s *Syncer) ServicePutActivity(ctx context.Context, activity TrainbotActivi
 	return err
 }
 
+func (s *Syncer) ServiceSubmitReportEvent(ctx context.Context, id string, trainID string, stableID string, nickname string, signal string) error {
+	_, err := s.CallReducer(ctx, "service_submit_report", []any{
+		strings.TrimSpace(id),
+		strings.TrimSpace(trainID),
+		strings.TrimSpace(stableID),
+		strings.TrimSpace(nickname),
+		strings.TrimSpace(signal),
+	})
+	return err
+}
+
+func (s *Syncer) ServiceSubmitStationSighting(ctx context.Context, id string, stationID string, stationName string, destinationStationID string, destinationStationName string, matchedTrainID string, stableID string, nickname string) error {
+	_, err := s.CallReducer(ctx, "service_submit_station_sighting", []any{
+		strings.TrimSpace(id),
+		strings.TrimSpace(stationID),
+		strings.TrimSpace(stationName),
+		strings.TrimSpace(destinationStationID),
+		strings.TrimSpace(destinationStationName),
+		strings.TrimSpace(matchedTrainID),
+		strings.TrimSpace(stableID),
+		strings.TrimSpace(nickname),
+	})
+	return err
+}
+
+func (s *Syncer) ServiceSubmitLocationReport(ctx context.Context, payload any) error {
+	_, err := s.CallReducer(ctx, "service_submit_location_report", []any{mustJSON(payload)})
+	return err
+}
+
+func (s *Syncer) ServiceSubmitIncidentVote(ctx context.Context, eventID string, incidentID string, stableID string, nickname string, value string) error {
+	_, err := s.CallReducer(ctx, "service_submit_incident_vote", []any{
+		strings.TrimSpace(eventID),
+		strings.TrimSpace(incidentID),
+		strings.TrimSpace(stableID),
+		strings.TrimSpace(nickname),
+		strings.TrimSpace(value),
+	})
+	return err
+}
+
+func (s *Syncer) ServiceSubmitIncidentComment(ctx context.Context, id string, incidentID string, stableID string, nickname string, body string) error {
+	_, err := s.CallReducer(ctx, "service_submit_incident_comment", []any{
+		strings.TrimSpace(id),
+		strings.TrimSpace(incidentID),
+		strings.TrimSpace(stableID),
+		strings.TrimSpace(nickname),
+		strings.TrimSpace(body),
+	})
+	return err
+}
+
+func (s *Syncer) ServiceCountIncidentVoteEvents(ctx context.Context, stableID string, since time.Time) (int, error) {
+	payload, err := s.CallProcedure(ctx, "service_count_incident_vote_events", []any{
+		strings.TrimSpace(stableID),
+		since.UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var raw struct {
+		Count int `json:"count"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
+		return 0, err
+	}
+	return raw.Count, nil
+}
+
 func (s *Syncer) ServiceResetTestRider(ctx context.Context, stableID string) error {
 	_, err := s.CallReducer(ctx, "service_reset_test_rider", []any{strings.TrimSpace(stableID)})
 	return err

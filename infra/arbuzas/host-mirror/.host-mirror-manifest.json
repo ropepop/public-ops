@@ -27,16 +27,16 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "bff5f1e55000d79f3bb1d8a14aad216515a80a6d413674e08454151f4ce6b8ec",
-      "size": 1985
+      "sha256": "bc4591bebfacb12d2a811c063c44251c60428d2949b43e6647f4a170d66ae0ea",
+      "size": 2077
     },
     "etc/arbuzas/env/meshcentral-config.json": {
-      "mode": 420,
-      "sha256": "4d9a70eebc08c70c5ccccdf8f18e2e6a39c14103b71125af2f5f783a6bd1ef7e",
-      "size": 438
+      "mode": 384,
+      "sha256": "0ee4b3c5fd012df8d8c89c05f47282084333f5f365a320966555e78644d513de",
+      "size": 925
     },
     "etc/arbuzas/env/meshcentral.env": {
-      "mode": 420,
+      "mode": 384,
       "sha256": "0e5c9bc693f61716fc1698b54cdcb0afd345fb5ef3a289d7231d707c4f9f4a38",
       "size": 191
     },
@@ -152,5 +152,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1788103405
+  "updatedEpochSeconds": 1788239201
 }

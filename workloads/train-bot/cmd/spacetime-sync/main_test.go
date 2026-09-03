@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,20 @@ func TestDefaultServiceDateUsesTargetTimezone(t *testing.T) {
 	now := time.Date(2026, time.April, 8, 22, 30, 0, 0, time.UTC)
 	if got := defaultServiceDate(now, loc); got != "2026-04-09" {
 		t.Fatalf("unexpected service date: %s", got)
+	}
+}
+
+func TestPrepareScheduleCachePathPrefersExplicitWritableState(t *testing.T) {
+	explicit := filepath.Join(t.TempDir(), "state", "train-runtime-cache.db")
+	got, err := prepareScheduleCachePath(explicit, "/read-only/data/schedules")
+	if err != nil {
+		t.Fatalf("prepare schedule cache path: %v", err)
+	}
+	if got != explicit {
+		t.Fatalf("cache path = %q, want %q", got, explicit)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(got), "probe"), []byte("ok"), 0o600); err != nil {
+		t.Fatalf("cache directory is not writable: %v", err)
 	}
 }
 

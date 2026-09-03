@@ -32,6 +32,12 @@ for rel in (
     if host_mirror.required_private_mode(rel) != 0o600:
         raise SystemExit(f"tiny-VLESS mirror path is not private: {rel}")
 
+retired_vivi_login = "data/local/pixel-stack/conf/apps/ticket-screen-vivi-login.env"
+if not host_mirror.is_excluded("pixel", retired_vivi_login):
+    raise SystemExit("retired ViVi login file is still managed by the Pixel mirror")
+if host_mirror.is_allowed("pixel", retired_vivi_login):
+    raise SystemExit("retired ViVi login file is still pushable by the Pixel mirror")
+
 
 def is_history(path: Path) -> bool:
     name = path.name

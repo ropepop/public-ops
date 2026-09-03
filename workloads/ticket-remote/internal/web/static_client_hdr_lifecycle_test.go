@@ -90,7 +90,7 @@ function clientHDRMeasurement(event, _a, _b, detail) { metrics.push({ event, det
 function streamHasFreshRenderedFrame() { return true; }
 function experimentalHDRSurfacePresentationAllowed() { return true; }
 function experimentalMediaDocumentHasFocus() { return documentFocused; }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function refreshExperimentalClientCapability() {
   return { supported: localCapabilitySupported, videoFrame: true, mainThreadCanvas: true, webgpu: true,
     dynamicRangeLimit: true, highDynamicRange: localCapabilitySupported };
@@ -382,6 +382,175 @@ function check(value, message) { if (!value) throw new Error(message); }
 `)
 }
 
+func TestTicketViewerHDROnlineRecoveryPreservesHeldSurfaceAndReconnects(t *testing.T) {
+	source := ticketAppSource(t)
+	adopt := substringBetween(t, source,
+		"function adoptVideoSocket(socket, queuedMessages, openedAt, reason) {",
+		"  function sendVideoClientLog(event, detail) {")
+	networkRecovery := substringBetween(t, source,
+		"function preserveExperimentalClientHDRForNetworkResume() {",
+		"  window.addEventListener('resize', resizeCanvasBox);")
+	networkHandlers := substringBetween(t, source,
+		"window.addEventListener('online', () => {",
+		"  window.addEventListener('blur', () => {")
+
+	runTicketJavaScript(t, `
+const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
+const WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+const handlers = {};
+const timers = [];
+const rendererIdentity = { id: 'renderer-1' };
+const canvasIdentity = { id: 'canvas-1' };
+const window = {
+  addEventListener(name, callback) { handlers[name] = callback; }
+};
+const document = { visibilityState: 'visible' };
+const performance = { now() { return 1000; } };
+let experimentalMediaPresentationRegionBlocked = false;
+let experimentalMediaPresentationRecoveryPending = false;
+let experimentalMediaPresentationRecoveryReason = '';
+const experimentalMediaPreferenceController = { enabled: true };
+const experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
+let controllerSnapshot = {
+  active: true,
+  ready: true,
+  rendererActive: true,
+  firstPresented: true,
+  surfaceVisible: true,
+  visualHoldover: false,
+  proofFresh: true,
+  rendererIdentity,
+  canvasIdentity
+};
+let holdCalls = 0;
+let documentVisibleCalls = 0;
+let surfaceFalseTransitions = 0;
+const experimentalClientHDRController = {
+  snapshot() { return { ...controllerSnapshot }; },
+  setDocumentVisible(visible) { if (visible) documentVisibleCalls += 1; },
+  holdLastPresentation() {
+    holdCalls += 1;
+    controllerSnapshot.visualHoldover = true;
+    controllerSnapshot.proofFresh = false;
+    return true;
+  }
+};
+let videoWs = null;
+const activeVideoSockets = new Set();
+const intentionallyClosedVideoSockets = new Set();
+let idleDisconnected = false;
+let configured = true;
+let lastFrameAt = 900;
+let lastFeedbackSentAt = 1;
+let begins = 0;
+let closes = 0;
+let resets = 0;
+let connects = 0;
+let chases = 0;
+let keyframes = 0;
+let refreshes = 0;
+let stateUnconfirmed = 0;
+let directSpacetimeAuth = true;
+function experimentalHDRSurfacePresentationAllowed() { return true; }
+function controlCodeHDRFreezeTargetActive() { return false; }
+function beginExperimentalMediaForegroundRecovery() { begins += 1; return true; }
+function closeExperimentalMedia() { closes += 1; }
+function refreshSpacetimeStateAfterResume() { refreshes += 1; return Promise.resolve(false); }
+function usesDirectSpacetimeAuth() { return directSpacetimeAuth; }
+function markSpacetimeStateUnconfirmed(reason) {
+  if (reason !== 'network_offline') throw new Error('unexpected state-unconfirmed reason');
+  stateUnconfirmed += 1;
+}
+function clientLog() {}
+function connectDirectVideo() {
+  connects += 1;
+  videoWs = { readyState: WebSocket.CONNECTING };
+}
+function chaseLiveStream() { chases += 1; }
+function requestKeyframeDebounced() { keyframes += 1; return true; }
+function refreshUserActivityTickSchedule() {}
+function publishCurrentStreamFocus() {}
+function handleVideoSocketMessage() {}
+function noteVideoSocketOpen() {}
+function resetStreamState() {
+  resets += 1;
+  experimentalMediaPresentationRecoveryPending = true;
+  experimentalMediaPresentationRecoveryReason = 'socket_close_waiting_keyframe';
+}
+function showStreamRecovery() {}
+function viewerIsForeground() { return true; }
+function setTimeout(callback, millis) {
+  const timer = { callback, millis };
+  timers.push(timer);
+  return timer;
+}
+function reconcileClientHDRStreamContinuity() {
+  return experimentalClientHDRController.holdLastPresentation('transient_network_wait');
+}
+function check(value, message) { if (!value) throw new Error(message); }
+`+adopt+networkRecovery+networkHandlers+`
+
+handlers.offline();
+check(stateUnconfirmed === 1,
+  'browser offline did not require a fresh SpaceTime snapshot before holdover release');
+const socket = { readyState: WebSocket.OPEN };
+check(adoptVideoSocket(socket, [], 0, 'test_socket') === true,
+  'test video socket was not adopted');
+socket.readyState = WebSocket.CLOSED;
+socket.onclose({ code: 1006, wasClean: false });
+check(experimentalMediaPresentationRecoveryPending === true && resets === 1,
+  'socket close did not establish the simulated waiting-keyframe state');
+handlers.online();
+check(holdCalls === 3,
+  'offline, socket-close, and online events did not preserve one continuous HDR surface');
+check(begins === 0 && closes === 0 && surfaceFalseTransitions === 0,
+  'online recovery reset or hid a reusable held HDR surface');
+check(controllerSnapshot.rendererIdentity === rendererIdentity &&
+  controllerSnapshot.canvasIdentity === canvasIdentity && documentVisibleCalls === 1,
+  'online recovery replaced the renderer/canvas instead of reusing it');
+check(experimentalMediaPresentationRecoveryPending === false &&
+  experimentalMediaPresentationRecoveryReason === '',
+  'online recovery left a stale pending flag blocking the held surface');
+check(connects === 1 && chases === 1 && keyframes === 1 && refreshes === 1,
+  'online recovery did not reconnect state/video and chase a fresh keyframe');
+
+directSpacetimeAuth = false;
+handlers.offline();
+check(stateUnconfirmed === 1,
+  'development mode incorrectly invalidated a direct SpaceTime snapshot it does not use');
+directSpacetimeAuth = true;
+
+controllerSnapshot.active = false;
+controllerSnapshot.surfaceVisible = false;
+videoWs = { readyState: WebSocket.OPEN };
+recoverExperimentalMediaAfterNetworkOnline();
+check(begins === 1,
+  'online recovery without a reusable first-presented surface did not start bounded HDR recovery');
+`)
+
+	if strings.Contains(networkHandlers, "beginExperimentalMediaForegroundRecovery('network_online'") {
+		t.Fatal("online event handler still bypasses the held-surface preservation helper")
+	}
+	for _, needle := range []string{
+		"recoverExperimentalMediaAfterNetworkOnline();",
+		"if (usesDirectSpacetimeAuth()) markSpacetimeStateUnconfirmed('network_offline');",
+		"reconcileClientHDRStreamContinuity('network_offline', 'sdr_stream_unavailable');",
+	} {
+		if !strings.Contains(networkHandlers, needle) {
+			t.Fatalf("network lifecycle handler is missing %q", needle)
+		}
+	}
+	socketClose := substringBetween(t, adopt,
+		"socket.onclose = (event) => {",
+		"    socket.onerror = () => {")
+	holdIndex := strings.Index(socketClose,
+		"reconcileClientHDRStreamContinuity('video_socket_closed', 'sdr_stream_unavailable');")
+	resetIndex := strings.Index(socketClose, "resetStreamState({ preserveFrame: true });")
+	if holdIndex < 0 || resetIndex < 0 || holdIndex > resetIndex {
+		t.Fatal("video socket close does not make the existing HDR picture passive before resetting stream proof")
+	}
+}
+
 func TestTicketViewerHDRLifecycleHandlersClassifyPersistedAndClusteredReturns(t *testing.T) {
 	source := ticketAppSource(t)
 	handlers := substringBetween(t, source,
@@ -441,8 +610,10 @@ function armExperimentalMediaLifecycleResume() {
   experimentalMediaForegroundRecovery = null;
 }
 function closeExperimentalMedia() { order.push('close'); }
+function reconcileClientHDRStreamContinuity(reason) { order.push('hold:' + reason); return true; }
 function pauseActivationResumeLifecycle() { return {}; }
 function logResumeCheckpoint() {}
+function resumeBooleanLabel(value) { return value ? 'yes' : 'no'; }
 function clearActivationReconnectBurst() {}
 function pauseHiddenStreamAfterGrace() {}
 function streamHasFreshRenderedFrame() { return true; }
@@ -571,13 +742,203 @@ experimentalMediaLifecycleResumeAttemptID = 0;
 experimentalMediaForegroundRecovery = { id: ++foregroundAttemptSequence, cancelled: false };
 const shortReturnAttemptBaseline = foregroundAttemptSequence;
 handlers.blur();
-check(order.join(',') === 'arm,close' && experimentalMediaForegroundRecovery === null,
-  'a short Home-screen blur did not immediately fence and retire the old HDR surface');
+check(order.join(',') === 'arm,hold:window_blur_visible' && experimentalMediaForegroundRecovery === null,
+  'a visible blur did not fence proof while preserving the bright HDR surface');
 handlers.focus();
 check(order.includes('resume:focus') && order.includes('confirm:focus') &&
   foregroundAttemptSequence === shortReturnAttemptBaseline + 1,
   'the matching focus did not create one fresh attempt and arm trailing confirmation');
+
+order.length = 0;
+experimentalMediaLifecycleArmed = false;
+experimentalMediaForegroundRecovery = null;
+document.visibilityState = 'hidden';
+handlers.blur();
+check(order.join(',') === 'arm,close',
+  'a hidden blur did not immediately retire the HDR surface');
+
+order.length = 0;
+experimentalMediaLifecycleArmed = false;
+document.visibilityState = 'visible';
+handlers.pagehide({ persisted: true });
+check(order.length >= 2 && order[0] === 'arm' && order[1] === 'close',
+  'pagehide did not immediately fence and retire the HDR surface');
 `)
+}
+
+func TestTicketViewerHDRVisibleBlurHoldsPixelsButFocusStartsFreshGeneration(t *testing.T) {
+	source := ticketAppSource(t)
+	handlers := substringBetween(t, source,
+		"window.addEventListener('blur', () => {",
+		"  window.addEventListener('pagehide', (event) => {")
+
+	runTicketJavaScript(t, `
+const handlers = {};
+const document = { visibilityState: 'visible' };
+const window = { addEventListener(name, callback) { handlers[name] = callback; } };
+let experimentalMediaLifecycleArmed = false;
+let lifecycleGeneration = 4;
+let rendererGeneration = 9;
+let closeCalls = 0;
+let recoveryStarts = 0;
+let surfaceTransitions = 1;
+let focusInferenceCalls = 0;
+let lastHiddenAt = 0;
+let lastHiddenWallAt = 0;
+const ticketCurrentProofVisualState = { resumePending: false };
+const experimentalMediaState = { enabled: true };
+function makeCanvas(id, visible) {
+  const attributes = new Map();
+  if (!visible) attributes.set('hidden', '');
+  attributes.set('aria-hidden', visible ? 'false' : 'true');
+  return {
+    id,
+    dataset: visible ? { clientHdrSurface: 'visible' } : {},
+    get hidden() { return attributes.has('hidden'); },
+    set hidden(value) { if (value) attributes.set('hidden', ''); else attributes.delete('hidden'); },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    getAttribute(name) { return attributes.has(name) ? attributes.get(name) : null; },
+    hasAttribute(name) { return attributes.has(name); }
+  };
+}
+let canvas = makeCanvas('canvas-1', true);
+let renderer = { id: 'renderer-9', disposed: false };
+let controllerSnapshot = {
+  active: true,
+  ready: true,
+  rendererActive: true,
+  firstPresented: true,
+  surfaceVisible: true,
+  presentationState: 'visible',
+  visualHoldover: false,
+  proofFresh: true,
+  epoch: 7,
+  sequence: 42,
+  presentationOrdinal: 19
+};
+function armExperimentalMediaLifecycleResume() {
+  if (!experimentalMediaLifecycleArmed) lifecycleGeneration += 1;
+  experimentalMediaLifecycleArmed = true;
+}
+function reconcileClientHDRStreamContinuity(reason) {
+  if (reason !== 'window_blur_visible') throw new Error('visible blur used the wrong holdover reason');
+  if (!controllerSnapshot.surfaceVisible) return false;
+  controllerSnapshot.presentationState = 'holdover';
+  controllerSnapshot.visualHoldover = true;
+  controllerSnapshot.proofFresh = false;
+  return true;
+}
+function closeExperimentalMedia() {
+  closeCalls += 1;
+  renderer.disposed = true;
+  canvas.hidden = true;
+  delete canvas.dataset.clientHdrSurface;
+  canvas.setAttribute('aria-hidden', 'true');
+  controllerSnapshot.active = false;
+  controllerSnapshot.ready = false;
+  controllerSnapshot.rendererActive = false;
+  controllerSnapshot.surfaceVisible = false;
+  controllerSnapshot.proofFresh = false;
+}
+function noteExperimentalMediaForegroundPulse() { return false; }
+function recoverExperimentalMediaForFocusOnlyLifecycle() {
+  focusInferenceCalls += 1;
+  return false;
+}
+function resumeExperimentalMediaForLifecycle(reason) {
+  if (reason !== 'focus' || document.visibilityState !== 'visible') return false;
+  if (!experimentalMediaLifecycleArmed) return true;
+  closeExperimentalMedia();
+  experimentalMediaLifecycleArmed = false;
+  recoveryStarts += 1;
+  rendererGeneration += 1;
+  renderer = { id: 'renderer-' + rendererGeneration, disposed: false };
+  canvas = makeCanvas('canvas-' + rendererGeneration, false);
+  controllerSnapshot = {
+    active: true,
+    ready: false,
+    rendererActive: true,
+    firstPresented: false,
+    surfaceVisible: false,
+    presentationState: 'standby',
+    visualHoldover: false,
+    proofFresh: false,
+    epoch: 0,
+    sequence: 0,
+    presentationOrdinal: 0
+  };
+  return true;
+}
+function presentAuthorizedFreshFrame() {
+  controllerSnapshot.ready = true;
+  controllerSnapshot.firstPresented = true;
+  controllerSnapshot.surfaceVisible = true;
+  controllerSnapshot.presentationState = 'visible';
+  controllerSnapshot.proofFresh = true;
+  controllerSnapshot.epoch = 8;
+  controllerSnapshot.sequence = 1;
+  controllerSnapshot.presentationOrdinal = 20;
+  canvas.hidden = false;
+  canvas.dataset.clientHdrSurface = 'visible';
+  canvas.setAttribute('aria-hidden', 'false');
+}
+function scheduleExperimentalMediaForegroundReturnConfirmation() { return true; }
+function noteViewerActivity() { return false; }
+function chaseLiveStream() {}
+function publishCurrentStreamFocus() {}
+function followActivationResumeLifecycle() {}
+function recoverAfterVisibilityResume() {}
+function check(value, message) { if (!value) throw new Error(message); }
+`+handlers+`
+
+const originalCanvas = canvas;
+const originalRenderer = renderer;
+const originalLifecycleGeneration = lifecycleGeneration;
+const originalRendererGeneration = rendererGeneration;
+const originalTransitions = surfaceTransitions;
+handlers.blur();
+check(experimentalMediaLifecycleArmed === true &&
+  lifecycleGeneration === originalLifecycleGeneration + 1,
+  'visible blur did not arm a fresh lifecycle boundary');
+check(canvas === originalCanvas && renderer === originalRenderer &&
+  renderer.disposed === false && canvas.hidden === false &&
+  !canvas.hasAttribute('hidden') && canvas.dataset.clientHdrSurface === 'visible' &&
+  canvas.getAttribute('aria-hidden') === 'false' &&
+  rendererGeneration === originalRendererGeneration &&
+  surfaceTransitions === originalTransitions && closeCalls === 0,
+  'visible blur hid, replaced, disposed, or transitioned the bright HDR surface');
+check(controllerSnapshot.visualHoldover === true &&
+  controllerSnapshot.proofFresh === false && controllerSnapshot.surfaceVisible === true,
+  'visible blur left the held picture authoritative for phone controls');
+
+handlers.focus();
+check(recoveryStarts === 1 && closeCalls === 1 && focusInferenceCalls === 1 &&
+  experimentalMediaLifecycleArmed === false,
+  'focus did not consume the armed blur through one fresh recovery');
+check(canvas !== originalCanvas && renderer !== originalRenderer &&
+  originalRenderer.disposed === true && rendererGeneration === originalRendererGeneration + 1,
+  'focus reused the pre-blur WebGPU canvas or renderer');
+check(controllerSnapshot.proofFresh === false && controllerSnapshot.surfaceVisible === false &&
+  canvas.hidden === true && canvas.hasAttribute('hidden'),
+  'fresh focus recovery claimed proof before its new presentation');
+
+presentAuthorizedFreshFrame();
+check(controllerSnapshot.proofFresh === true && controllerSnapshot.surfaceVisible === true &&
+  canvas.hidden === false && !canvas.hasAttribute('hidden') &&
+  canvas.dataset.clientHdrSurface === 'visible',
+  'the new generation did not regain proof after an authorized fresh presentation');
+`)
+
+	blur := substringBetween(t, handlers,
+		"window.addEventListener('blur', () => {",
+		"  window.addEventListener('focus', () => {")
+	armIndex := strings.Index(blur, "armExperimentalMediaLifecycleResume()")
+	holdIndex := strings.Index(blur,
+		"reconcileClientHDRStreamContinuity('window_blur_visible', 'window_blur_visible')")
+	closeIndex := strings.Index(blur, "closeExperimentalMedia(")
+	if armIndex < 0 || holdIndex < armIndex || closeIndex < holdIndex {
+		t.Fatal("visible blur must arm lifecycle, hold pixels, and reserve close for the hidden branch")
+	}
 }
 
 func TestTicketViewerHDRFocusOnlyReturnIsFreshAndClustered(t *testing.T) {
@@ -678,7 +1039,7 @@ const window = {
   }
 };
 function experimentalHDRSurfacePresentationAllowed() { return true; }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function foregroundRecoveryCurrent(attempt) {
   return Boolean(attempt && attempt === experimentalMediaForegroundRecovery && !attempt.cancelled);
 }
@@ -875,7 +1236,7 @@ function setTimeout(callback, millis) {
 }
 function scheduleExperimentalMediaStart(reason, options) { starts.push({ reason, options }); }
 function experimentalHDRSurfacePresentationAllowed() { return true; }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function foregroundRecoveryCurrent(attempt) {
   return Boolean(attempt && experimentalMediaForegroundRecovery &&
     attempt.id === experimentalMediaForegroundRecovery.id);
@@ -945,7 +1306,7 @@ function beginExperimentalMediaForegroundRecovery(reason, options) {
   return true;
 }
 function experimentalHDRSurfacePresentationAllowed() { return true; }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function check(value, message) { if (!value) throw new Error(message); }
 `+recovery+`
 
@@ -1019,7 +1380,7 @@ function setExperimentalMediaStatus() {}
 function clearExperimentalMediaDynamicRangeRecovery() {}
 function scheduleExperimentalMediaCapabilityRetry() { throw new Error('unexpected capability retry'); }
 function experimentalHDRSurfacePresentationAllowed() { return true; }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function connectExperimentalClientHDR(options) { starts.push(options); return true; }
 function check(value, message) { if (!value) throw new Error(message); }
 `+cancel+start+`

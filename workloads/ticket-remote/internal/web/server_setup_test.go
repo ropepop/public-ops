@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1440,11 +1441,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"if(codeDialogOpen||!codeDialog.hidden||!codeResultArea.hidden||ticketRegisterOverlayOccupiesHotspot())return",
 		"if(controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
 		"const sliderOwnsHotspot=ticketRegisterOverlayOccupiesHotspot()",
-		"const hotspotUnavailable=busy||limitBlocked||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
+		"const hotspotUnavailable=busy||limitBlocked||!hdrControlReady||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
 		"controlCodeHotspot.disabled=hotspotUnavailable",
 	} {
 		if !staticContains(js, snippet) {
-			t.Fatalf("control-code hotspot must be start-only and unavailable during busy/quota/slider/result states, missing %q", snippet)
+			t.Fatalf("control-code hotspot must be start-only and unavailable during busy/quota/HDR-proof/slider/result states, missing %q", snippet)
 		}
 	}
 	resultClickStart := strings.Index(js, `codeResultArea.addEventListener("click"`)
@@ -1859,6 +1860,112 @@ func TestAdminMemberMutationsProtectOwnerAndRejectInvalidRoles(t *testing.T) {
 	}
 }
 
+func TestAdminCanManageOnlyOrdinaryMembers(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	request := func(method, target, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Ticket-Remote-Email", "admin@example.com")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := request(http.MethodPost, "/api/v1/admin/members", `{"email":"ordinary@example.com","role":"member"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin add member status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	for _, body := range []string{
+		`{"email":"promoted@example.com","role":"admin"}`,
+		`{"email":"promoted@example.com","role":"owner"}`,
+		`{"email":"admin@example.com","role":"member"}`,
+		`{"email":"ticket@jolkins.id.lv","role":"member"}`,
+	} {
+		rec := request(http.MethodPost, "/api/v1/admin/members", body)
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"error":"forbidden"`) {
+			t.Fatalf("admin privileged mutation status = %d body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	for _, email := range []string{"admin@example.com", "ticket@jolkins.id.lv"} {
+		rec := request(http.MethodDelete, "/api/v1/admin/members?email="+url.QueryEscape(email), "")
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"error":"forbidden"`) {
+			t.Fatalf("admin privileged removal status = %d body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	if rec := request(http.MethodDelete, "/api/v1/admin/members?email=ordinary%40example.com", ""); rec.Code != http.StatusOK {
+		t.Fatalf("admin remove member status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOwnerCanTransferOwnershipWithoutRemovingFinalOwner(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	request := func(actor, method, target, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Ticket-Remote-Email", actor)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := request("ticket@jolkins.id.lv", http.MethodPost, "/api/v1/admin/members", `{"email":"second.owner@example.com","role":"owner"}`); rec.Code != http.StatusOK {
+		t.Fatalf("create second owner status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := request("second.owner@example.com", http.MethodDelete, "/api/v1/admin/members?email=ticket%40jolkins.id.lv", ""); rec.Code != http.StatusOK {
+		t.Fatalf("remove first of two owners status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := request("second.owner@example.com", http.MethodPost, "/api/v1/admin/members", `{"email":"second.owner@example.com","role":"member"}`); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"error":"owner_protected"`) {
+		t.Fatalf("demote final owner status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := request("second.owner@example.com", http.MethodDelete, "/api/v1/admin/members?email=second.owner%40example.com", ""); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"error":"owner_protected"`) {
+		t.Fatalf("remove final owner status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminMemberEditorRendersRoleAppropriateControls(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	ownerReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	ownerReq.Header.Set("X-Ticket-Remote-Email", "ticket@jolkins.id.lv")
+	ownerRec := httptest.NewRecorder()
+	server.ServeHTTP(ownerRec, ownerReq)
+	if ownerRec.Code != http.StatusOK {
+		t.Fatalf("owner page status = %d body = %s", ownerRec.Code, ownerRec.Body.String())
+	}
+	ownerBody := ownerRec.Body.String()
+	for _, option := range []string{`<option value="member">`, `<option value="admin">`, `<option value="owner">`} {
+		if !strings.Contains(ownerBody, option) {
+			t.Fatalf("owner page missing role option %s", option)
+		}
+	}
+	if !strings.Contains(ownerBody, `data-member-role="owner" disabled`) {
+		t.Fatal("owner page must disable removal of the final owner")
+	}
+	if strings.Contains(ownerBody, `data-member-role="admin" disabled`) || strings.Contains(ownerBody, `data-member-role="member" disabled`) {
+		t.Fatal("owner page must permit removal of administrator and member accounts")
+	}
+
+	adminReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	adminReq.Header.Set("X-Ticket-Remote-Email", "admin@example.com")
+	adminRec := httptest.NewRecorder()
+	server.ServeHTTP(adminRec, adminReq)
+	if adminRec.Code != http.StatusOK {
+		t.Fatalf("admin page status = %d body = %s", adminRec.Code, adminRec.Body.String())
+	}
+	adminBody := adminRec.Body.String()
+	if !strings.Contains(adminBody, `<option value="member">`) || strings.Contains(adminBody, `<option value="admin">`) || strings.Contains(adminBody, `<option value="owner">`) {
+		t.Fatal("administrator role selector must offer only ordinary member access")
+	}
+	for _, role := range []string{"owner", "admin"} {
+		if !strings.Contains(adminBody, `data-member-role="`+role+`" disabled`) {
+			t.Fatalf("administrator page must disable %s removal", role)
+		}
+	}
+	if strings.Contains(adminBody, `data-member-role="member" disabled`) {
+		t.Fatal("administrator page must permit ordinary member removal")
+	}
+}
+
 func TestAdminMembersRouteRequiresAdmin(t *testing.T) {
 	server := newTicketSetupTestServer(t, "pixel")
 
@@ -2029,6 +2136,9 @@ func TestSpacetimeAuthServerSessionKeepsAuthenticatedHTTPWorking(t *testing.T) {
 	var payload map[string]any
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
+	}
+	if payload["accountScopeId"] != ticketAccountScopeID("ticket@jolkins.id.lv") {
+		t.Fatalf("authenticated session account scope = %#v, want signed-in account scope", payload["accountScopeId"])
 	}
 	spacetimePayload, _ := payload["spacetime"].(map[string]any)
 	if spacetimePayload["token"] != "sidecar-member-token" {

@@ -225,3 +225,33 @@ export const TicketremoteTicketInteraction = __t.object("TicketremoteTicketInter
 });
 export type TicketremoteTicketInteraction = __Infer<typeof TicketremoteTicketInteraction>;
 
+export const TicketremoteViviCredentialState = __t.object("TicketremoteViviCredentialState", {
+  id: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  configured: __t.bool(),
+  revision: __t.string(),
+  updatedAt: __t.string(),
+});
+export type TicketremoteViviCredentialState = __Infer<typeof TicketremoteViviCredentialState>;
+
+export const TicketremoteViviReauthAttempt = __t.object("TicketremoteViviReauthAttempt", {
+  id: __t.string(),
+  requestId: __t.string(),
+  ticketId: __t.string(),
+  backendId: __t.string(),
+  credentialRevision: __t.string(),
+  ownerPublicId: __t.string(),
+  status: __t.string(),
+  phase: __t.string(),
+  reason: __t.string(),
+  proofSource: __t.string(),
+  streamEpoch: __t.string(),
+  frameSequence: __t.string(),
+  createdAt: __t.string(),
+  updatedAt: __t.string(),
+  completedAt: __t.string(),
+  expiresAt: __t.string(),
+});
+export type TicketremoteViviReauthAttempt = __Infer<typeof TicketremoteViviReauthAttempt>;
+

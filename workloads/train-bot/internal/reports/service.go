@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -61,20 +62,6 @@ func NewService(st store.Store, cooldown, dedupe time.Duration) *Service {
 }
 
 func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string, signal domain.SignalType, now time.Time) (SubmitResult, error) {
-	last, err := s.store.GetLastReportByUserTrain(ctx, userID, trainID)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	if last != nil {
-		delta := now.Sub(last.CreatedAt)
-		if last.Signal == signal && delta < s.dedupe {
-			return SubmitResult{Accepted: false, Deduped: true}, nil
-		}
-		if delta < s.cooldown {
-			return SubmitResult{Accepted: false, CooldownRemaining: s.cooldown - delta}, nil
-		}
-	}
-
 	event := domain.ReportEvent{
 		ID:              generateID(),
 		TrainInstanceID: trainID,
@@ -82,8 +69,12 @@ func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string
 		Signal:          signal,
 		CreatedAt:       now.UTC(),
 	}
-	if err := s.store.InsertReportEvent(ctx, event); err != nil {
-		return SubmitResult{}, err
+	if err := s.store.SubmitReportEvent(ctx, event, s.reportMutationPolicy()); err != nil {
+		deduped, cooldownRemaining, mappedErr := mapReportMutationError(err)
+		if mappedErr != nil {
+			return SubmitResult{}, mappedErr
+		}
+		return SubmitResult{Deduped: deduped, CooldownRemaining: cooldownRemaining}, nil
 	}
 	train, err := s.store.GetTrainInstanceByID(ctx, trainID)
 	if err != nil {
@@ -98,20 +89,6 @@ func (s *Service) SubmitReport(ctx context.Context, userID int64, trainID string
 }
 
 func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stationID string, destinationStationID *string, matchedTrainID *string, now time.Time) (StationSightingSubmitResult, error) {
-	last, err := s.store.GetLastStationSightingByUserScope(ctx, userID, stationID, destinationStationID)
-	if err != nil {
-		return StationSightingSubmitResult{}, err
-	}
-	if last != nil {
-		delta := now.Sub(last.CreatedAt)
-		if delta < s.dedupe {
-			return StationSightingSubmitResult{Accepted: false, Deduped: true}, nil
-		}
-		if delta < s.cooldown {
-			return StationSightingSubmitResult{Accepted: false, CooldownRemaining: s.cooldown - delta}, nil
-		}
-	}
-
 	event := domain.StationSighting{
 		ID:                     generateID(),
 		StationID:              stationID,
@@ -120,8 +97,12 @@ func (s *Service) SubmitStationSighting(ctx context.Context, userID int64, stati
 		UserID:                 userID,
 		CreatedAt:              now.UTC(),
 	}
-	if err := s.store.InsertStationSighting(ctx, event); err != nil {
-		return StationSightingSubmitResult{}, err
+	if err := s.store.SubmitStationSighting(ctx, event, s.reportMutationPolicy()); err != nil {
+		deduped, cooldownRemaining, mappedErr := mapReportMutationError(err)
+		if mappedErr != nil {
+			return StationSightingSubmitResult{}, mappedErr
+		}
+		return StationSightingSubmitResult{Deduped: deduped, CooldownRemaining: cooldownRemaining}, nil
 	}
 	contextKey, _ := stationIncidentContext(event)
 	return StationSightingSubmitResult{Accepted: true, IncidentID: StationIncidentID(stationID, incidentDayKey(now), contextKey), Event: &event}, nil
@@ -190,23 +171,40 @@ func (s *Service) SubmitAreaReport(ctx context.Context, userID int64, latitude f
 }
 
 func (s *Service) submitLocationReport(ctx context.Context, event domain.LocationReport, now time.Time) (LocationReportSubmitResult, error) {
-	last, err := s.store.GetLastLocationReportByUserScope(ctx, event.UserID, event.Scope, event.SubjectID)
-	if err != nil {
-		return LocationReportSubmitResult{}, err
-	}
-	if last != nil {
-		delta := now.Sub(last.CreatedAt)
-		if delta < s.dedupe {
-			return LocationReportSubmitResult{Accepted: false, Deduped: true}, nil
+	if err := s.store.SubmitLocationReport(ctx, event, s.reportMutationPolicy()); err != nil {
+		deduped, cooldownRemaining, mappedErr := mapReportMutationError(err)
+		if mappedErr != nil {
+			return LocationReportSubmitResult{}, mappedErr
 		}
-		if delta < s.cooldown {
-			return LocationReportSubmitResult{Accepted: false, CooldownRemaining: s.cooldown - delta}, nil
-		}
-	}
-	if err := s.store.InsertLocationReport(ctx, event); err != nil {
-		return LocationReportSubmitResult{}, err
+		return LocationReportSubmitResult{Deduped: deduped, CooldownRemaining: cooldownRemaining}, nil
 	}
 	return LocationReportSubmitResult{Accepted: true, IncidentID: LocationIncidentID(event, incidentDayKey(now)), Event: &event}, nil
+}
+
+func (s *Service) reportMutationPolicy() store.ReportMutationPolicy {
+	return store.ReportMutationPolicy{
+		Cooldown:     s.cooldown,
+		Dedupe:       s.dedupe,
+		ActionWindow: reportActionWindow,
+		ActionLimit:  reportActionLimit,
+	}
+}
+
+func mapReportMutationError(err error) (bool, time.Duration, error) {
+	var rejected *store.MutationRejectedError
+	if !errors.As(err, &rejected) {
+		return false, 0, err
+	}
+	switch rejected.Reason {
+	case store.MutationReportDuplicate:
+		return true, 0, nil
+	case store.MutationReportCooldown:
+		return false, rejected.Remaining, nil
+	case store.MutationReportActionLimit:
+		return false, 0, &RateLimitError{Reason: "map_report_limit", Remaining: reportActionWindow}
+	default:
+		return false, 0, err
+	}
 }
 
 func (s *Service) BuildStatus(ctx context.Context, trainID string, now time.Time) (domain.TrainStatus, error) {

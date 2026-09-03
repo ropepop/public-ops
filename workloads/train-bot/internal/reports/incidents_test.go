@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -216,9 +217,20 @@ func TestIncidentDetailIncludesNewestActivityFirst(t *testing.T) {
 	if len(detail.Comments) != 1 || detail.Comments[0].Body != "Still checking" {
 		t.Fatalf("expected comments to remain available in their own section, got %+v", detail.Comments)
 	}
+	if detail.Summary.LastReporter != publicIncidentActorLabel || detail.Summary.LastActivityActor != publicIncidentActorLabel {
+		t.Fatalf("public summary exposed a named actor: %+v", detail.Summary)
+	}
+	for _, event := range detail.Events {
+		if event.Nickname != publicIncidentActorLabel {
+			t.Fatalf("public event actor = %q, want %q", event.Nickname, publicIncidentActorLabel)
+		}
+	}
+	if detail.Comments[0].Nickname != publicIncidentActorLabel {
+		t.Fatalf("public comment actor = %q, want %q", detail.Comments[0].Nickname, publicIncidentActorLabel)
+	}
 }
 
-func TestVoteIncidentRejectsRepeatedSameVoteInsideWindow(t *testing.T) {
+func TestVoteIncidentRejectsAnyVoteChangeInsideWindow(t *testing.T) {
 	ctx := context.Background()
 	st := setupStore(t)
 	defer st.Close()
@@ -237,10 +249,47 @@ func TestVoteIncidentRejectsRepeatedSameVoteInsideWindow(t *testing.T) {
 		t.Fatalf("first vote: %v", err)
 	}
 
-	_, err = svc.VoteIncident(ctx, report.IncidentID, 51, domain.IncidentVoteOngoing, now.Add(-1*time.Minute))
+	_, err = svc.VoteIncident(ctx, report.IncidentID, 51, domain.IncidentVoteCleared, now.Add(-1*time.Minute))
 	var rateErr *RateLimitError
 	if !errors.As(err, &rateErr) || rateErr.Reason != "same_vote" {
-		t.Fatalf("expected same-vote rate limit, got %v", err)
+		t.Fatalf("expected vote-change cooldown, got %v", err)
+	}
+	if _, err := svc.VoteIncident(ctx, report.IncidentID, 51, domain.IncidentVoteCleared, now.Add(29*time.Minute)); err != nil {
+		t.Fatalf("vote after 31-minute cooldown: %v", err)
+	}
+}
+
+func TestVoteIncidentCapsGlobalVoteActions(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-15 * time.Minute)
+	seedTrain(t, st, "train-global-vote-limit", dep, dep.Add(45*time.Minute))
+	seedTrainStops(t, st, "train-global-vote-limit", dep, dep.Add(45*time.Minute))
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+	report, err := svc.SubmitReport(ctx, 70, "train-global-vote-limit", domain.SignalInspectionStarted, now.Add(-10*time.Minute))
+	if err != nil {
+		t.Fatalf("submit report: %v", err)
+	}
+	for i := 0; i < voteActionLimit; i++ {
+		if err := st.InsertIncidentVoteEvent(ctx, domain.IncidentVoteEvent{
+			ID:         fmt.Sprintf("existing-vote-%d", i),
+			IncidentID: fmt.Sprintf("other-incident-%d", i),
+			UserID:     71,
+			Nickname:   "private nickname",
+			Value:      domain.IncidentVoteOngoing,
+			CreatedAt:  now.Add(-time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("seed vote event %d: %v", i, err)
+		}
+	}
+
+	_, err = svc.VoteIncident(ctx, report.IncidentID, 71, domain.IncidentVoteOngoing, now)
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.Reason != "vote_action_limit" {
+		t.Fatalf("vote after global limit error = %v, want vote_action_limit", err)
 	}
 }
 
@@ -269,6 +318,40 @@ func TestAddIncidentCommentCapsUserCommentActions(t *testing.T) {
 	var rateErr *RateLimitError
 	if !errors.As(err, &rateErr) || rateErr.Reason != "comment_action_limit" {
 		t.Fatalf("expected comment action rate limit, got %v", err)
+	}
+}
+
+func TestAddIncidentCommentCapsIncidentCommentActions(t *testing.T) {
+	ctx := context.Background()
+	st := setupStore(t)
+	defer st.Close()
+
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	dep := now.Add(-15 * time.Minute)
+	seedTrain(t, st, "train-incident-comment-limit", dep, dep.Add(45*time.Minute))
+	seedTrainStops(t, st, "train-incident-comment-limit", dep, dep.Add(45*time.Minute))
+	svc := NewService(st, 3*time.Minute, 90*time.Second)
+	report, err := svc.SubmitReport(ctx, 80, "train-incident-comment-limit", domain.SignalInspectionStarted, now.Add(-10*time.Minute))
+	if err != nil {
+		t.Fatalf("submit report: %v", err)
+	}
+	for i := 0; i < incidentCommentActionLimit; i++ {
+		if err := st.InsertIncidentComment(ctx, domain.IncidentComment{
+			ID:         fmt.Sprintf("existing-comment-%d", i),
+			IncidentID: report.IncidentID,
+			UserID:     int64(1000 + i),
+			Nickname:   "private nickname",
+			Body:       "existing comment",
+			CreatedAt:  now.Add(-time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatalf("seed comment %d: %v", i, err)
+		}
+	}
+
+	_, err = svc.AddIncidentComment(ctx, report.IncidentID, 99, "one too many", now)
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) || rateErr.Reason != "incident_comment_limit" {
+		t.Fatalf("comment after incident limit error = %v, want incident_comment_limit", err)
 	}
 }
 

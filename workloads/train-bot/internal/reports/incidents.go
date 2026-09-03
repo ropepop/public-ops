@@ -2,6 +2,7 @@ package reports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"telegramtrainapp/internal/domain"
+	"telegramtrainapp/internal/store"
 )
 
 const (
@@ -18,10 +20,15 @@ const (
 	stationIncidentActiveWindow = 30 * time.Minute
 	maxIncidentComments         = 100
 	maxIncidentVoteEvents       = 100
-	sameVoteWindow              = 30 * time.Minute
+	reportActionWindow          = 30 * time.Minute
+	reportActionLimit           = 5
+	voteChangeWindow            = 30 * time.Minute
+	voteActionWindow            = time.Hour
+	voteActionLimit             = 20
 	commentActionWindow         = time.Hour
 	commentActionLimit          = 10
 	incidentCommentActionLimit  = 50
+	publicIncidentActorLabel    = "Anonymous"
 )
 
 type RateLimitError struct {
@@ -32,7 +39,11 @@ type RateLimitError struct {
 func (e *RateLimitError) Error() string {
 	switch e.Reason {
 	case "same_vote":
-		return "same vote submitted too recently"
+		return "wait before changing this vote again"
+	case "map_report_limit":
+		return "too many reports"
+	case "vote_action_limit":
+		return "too many votes"
 	case "comment_action_limit":
 		return "too many comments"
 	case "incident_comment_limit":
@@ -40,11 +51,6 @@ func (e *RateLimitError) Error() string {
 	default:
 		return "wait before trying again"
 	}
-}
-
-type incidentCommentRateLimitStore interface {
-	CountIncidentCommentsByUserSince(context.Context, int64, time.Time) (int, error)
-	CountIncidentCommentsByIncidentSince(context.Context, string, time.Time) (int, error)
 }
 
 type incidentBundle struct {
@@ -172,6 +178,9 @@ func (s *Service) IncidentDetail(ctx context.Context, incidentID string, now tim
 		return nil, err
 	}
 	events := append([]domain.IncidentEvent{}, bundle.events...)
+	for idx := range comments {
+		comments[idx].Nickname = publicIncidentActorLabel
+	}
 	for _, comment := range comments {
 		if comment.CreatedAt.Before(dayStart) {
 			continue
@@ -193,7 +202,7 @@ func (s *Service) IncidentDetail(ctx context.Context, incidentID string, now tim
 			ID:        voteEvent.ID,
 			Kind:      "vote",
 			Name:      incidentVoteEventLabel(voteEvent.Value),
-			Nickname:  voteEvent.Nickname,
+			Nickname:  publicIncidentActorLabel,
 			CreatedAt: voteEvent.CreatedAt,
 		})
 	}
@@ -214,9 +223,6 @@ func (s *Service) VoteIncident(ctx context.Context, incidentID string, userID in
 	if _, err := s.IncidentDetail(ctx, incidentID, now, userID); err != nil {
 		return domain.IncidentVoteSummary{}, err
 	}
-	if err := s.enforceSameVoteWindow(ctx, incidentID, userID, value, now); err != nil {
-		return domain.IncidentVoteSummary{}, err
-	}
 	vote := domain.IncidentVote{
 		IncidentID: incidentID,
 		UserID:     userID,
@@ -225,18 +231,20 @@ func (s *Service) VoteIncident(ctx context.Context, incidentID string, userID in
 		CreatedAt:  now.UTC(),
 		UpdatedAt:  now.UTC(),
 	}
-	if err := s.store.UpsertIncidentVote(ctx, vote); err != nil {
-		return domain.IncidentVoteSummary{}, err
-	}
-	if err := s.store.InsertIncidentVoteEvent(ctx, domain.IncidentVoteEvent{
+	event := domain.IncidentVoteEvent{
 		ID:         generateID(),
 		IncidentID: incidentID,
 		UserID:     userID,
 		Nickname:   vote.Nickname,
 		Value:      value,
 		CreatedAt:  now.UTC(),
+	}
+	if err := s.store.SubmitIncidentVote(ctx, vote, event, store.VoteMutationPolicy{
+		ChangeWindow: voteChangeWindow,
+		ActionWindow: voteActionWindow,
+		ActionLimit:  voteActionLimit,
 	}); err != nil {
-		return domain.IncidentVoteSummary{}, err
+		return domain.IncidentVoteSummary{}, mapIncidentMutationError(err)
 	}
 	return s.incidentVoteSummary(ctx, incidentID, userID)
 }
@@ -252,9 +260,6 @@ func (s *Service) AddIncidentComment(ctx context.Context, incidentID string, use
 	if len([]rune(body)) > 280 {
 		return nil, fmt.Errorf("comment is too long")
 	}
-	if err := s.enforceCommentActionLimit(ctx, incidentID, userID, now); err != nil {
-		return nil, err
-	}
 	comment := domain.IncidentComment{
 		ID:         generateID(),
 		IncidentID: incidentID,
@@ -263,61 +268,34 @@ func (s *Service) AddIncidentComment(ctx context.Context, incidentID string, use
 		Body:       body,
 		CreatedAt:  now.UTC(),
 	}
-	if err := s.store.InsertIncidentComment(ctx, comment); err != nil {
-		return nil, err
+	if err := s.store.SubmitIncidentComment(ctx, comment, store.CommentMutationPolicy{
+		ActionWindow:  commentActionWindow,
+		ActionLimit:   commentActionLimit,
+		IncidentLimit: incidentCommentActionLimit,
+	}); err != nil {
+		return nil, mapIncidentMutationError(err)
 	}
+	comment.Nickname = publicIncidentActorLabel
 	return &comment, nil
 }
 
-func (s *Service) enforceSameVoteWindow(ctx context.Context, incidentID string, userID int64, value domain.IncidentVoteValue, now time.Time) error {
-	current, err := s.currentIncidentVote(ctx, incidentID, userID)
-	if err != nil {
+func mapIncidentMutationError(err error) error {
+	var rejected *store.MutationRejectedError
+	if !errors.As(err, &rejected) {
 		return err
 	}
-	if current == nil || current.Value != value {
-		return nil
-	}
-	delta := now.Sub(current.UpdatedAt)
-	if delta < sameVoteWindow {
-		return &RateLimitError{Reason: "same_vote", Remaining: sameVoteWindow - delta}
-	}
-	return nil
-}
-
-func (s *Service) enforceCommentActionLimit(ctx context.Context, incidentID string, userID int64, now time.Time) error {
-	rateStore, ok := s.store.(incidentCommentRateLimitStore)
-	if !ok {
-		return nil
-	}
-	since := now.Add(-commentActionWindow)
-	userCount, err := rateStore.CountIncidentCommentsByUserSince(ctx, userID, since)
-	if err != nil {
-		return err
-	}
-	if userCount >= commentActionLimit {
+	switch rejected.Reason {
+	case store.MutationVoteCooldown:
+		return &RateLimitError{Reason: "same_vote", Remaining: rejected.Remaining}
+	case store.MutationVoteActionLimit:
+		return &RateLimitError{Reason: "vote_action_limit", Remaining: voteActionWindow}
+	case store.MutationCommentActionLimit:
 		return &RateLimitError{Reason: "comment_action_limit", Remaining: commentActionWindow}
-	}
-	incidentCount, err := rateStore.CountIncidentCommentsByIncidentSince(ctx, incidentID, since)
-	if err != nil {
+	case store.MutationIncidentCommentLimit:
+		return &RateLimitError{Reason: "incident_comment_limit", Remaining: commentActionWindow}
+	default:
 		return err
 	}
-	if incidentCount >= incidentCommentActionLimit {
-		return &RateLimitError{Reason: "incident_comment_limit", Remaining: commentActionWindow}
-	}
-	return nil
-}
-
-func (s *Service) currentIncidentVote(ctx context.Context, incidentID string, userID int64) (*domain.IncidentVote, error) {
-	items, err := s.store.ListIncidentVotes(ctx, incidentID)
-	if err != nil {
-		return nil, err
-	}
-	for _, item := range items {
-		if item.UserID == userID {
-			return &item, nil
-		}
-	}
-	return nil, nil
 }
 
 func TrainIncidentID(trainID string, dayKey string, contextKey string) string {
@@ -366,7 +344,7 @@ func (s *Service) collectTrainIncidentBundles(ctx context.Context, now time.Time
 			ID:        reportEvent.ID,
 			Kind:      "report",
 			Name:      trainSignalIncidentLabel(reportEvent.Signal),
-			Nickname:  domain.GenericNickname(reportEvent.UserID),
+			Nickname:  publicIncidentActorLabel,
 			CreatedAt: reportEvent.CreatedAt,
 		}
 		existing, ok := bundlesByID[incidentID]
@@ -422,7 +400,7 @@ func (s *Service) collectStationIncidentBundles(ctx context.Context, now time.Ti
 			ID:        stationSighting.ID,
 			Kind:      "report",
 			Name:      reportName,
-			Nickname:  domain.GenericNickname(stationSighting.UserID),
+			Nickname:  publicIncidentActorLabel,
 			CreatedAt: stationSighting.CreatedAt,
 		}
 		existing, ok := bundlesByID[incidentID]
@@ -478,7 +456,7 @@ func (s *Service) collectLocationIncidentBundles(ctx context.Context, now time.T
 			Kind:      "report",
 			Name:      locationReportIncidentLabel(report),
 			Detail:    locationReportIncidentDetail(report),
-			Nickname:  domain.GenericNickname(report.UserID),
+			Nickname:  publicIncidentActorLabel,
 			CreatedAt: report.CreatedAt,
 		}
 		existing, ok := bundlesByID[incidentID]
@@ -632,6 +610,12 @@ func (s *Service) enrichIncidentSummary(ctx context.Context, summary domain.Inci
 			summary.LastActivityName = incidentVoteEventLabel(voteEvent.Value)
 			summary.LastActivityActor = voteEvent.Nickname
 		}
+	}
+	if strings.TrimSpace(summary.LastReporter) != "" {
+		summary.LastReporter = publicIncidentActorLabel
+	}
+	if strings.TrimSpace(summary.LastActivityActor) != "" {
+		summary.LastActivityActor = publicIncidentActorLabel
 	}
 	return summary, nil
 }

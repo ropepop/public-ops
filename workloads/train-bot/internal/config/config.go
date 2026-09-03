@@ -14,6 +14,7 @@ type Config struct {
 	SingleInstanceLockPath                 string
 	Timezone                               string
 	ScheduleDir                            string
+	TrainRuntimeCachePath                  string
 	LongPollTimeout                        int
 	HTTPTimeoutSec                         int
 	DataRetentionHrs                       int
@@ -158,6 +159,7 @@ func Load() (Config, error) {
 		SingleInstanceLockPath:                 strings.TrimSpace(envOr("SINGLE_INSTANCE_LOCK_PATH", "")),
 		Timezone:                               envOr("TZ", "Europe/Riga"),
 		ScheduleDir:                            envOr("SCHEDULE_DIR", "./data/schedules"),
+		TrainRuntimeCachePath:                  strings.TrimSpace(envOr("TRAIN_RUNTIME_CACHE_PATH", "")),
 		LongPollTimeout:                        longPollTimeout,
 		HTTPTimeoutSec:                         httpTimeoutSec,
 		DataRetentionHrs:                       dataRetentionHrs,
@@ -280,6 +282,9 @@ func Load() (Config, error) {
 	if cfg.TrainWebPublicEdgeCacheStateFile == "" {
 		cfg.TrainWebPublicEdgeCacheStateFile = defaultTrainWebPublicEdgeCacheStateFile(cfg.ScheduleDir)
 	}
+	if cfg.TrainRuntimeCachePath == "" {
+		cfg.TrainRuntimeCachePath = defaultTrainRuntimeCachePath(cfg.ScheduleDir)
+	}
 	if cfg.TrainWebBundleDir == "" {
 		cfg.TrainWebBundleDir = defaultTrainWebBundleDir(cfg.ScheduleDir)
 	}
@@ -340,6 +345,10 @@ func defaultTrainWebBundleDir(scheduleDir string) string {
 
 func defaultTrainWebPublicEdgeCacheStateFile(scheduleDir string) string {
 	return filepath.Join(defaultRuntimeStateDir(scheduleDir), "train-bot.public-edge-cache.json")
+}
+
+func defaultTrainRuntimeCachePath(scheduleDir string) string {
+	return filepath.Join(defaultRuntimeStateDir(scheduleDir), "train-runtime-cache.db")
 }
 
 func envOr(key, fallback string) string {

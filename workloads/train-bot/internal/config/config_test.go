@@ -112,6 +112,9 @@ func TestLoadAcceptsRuntimeSpacetimeConfig(t *testing.T) {
 		if cfg.TrainWebPublicEdgeCacheStateFile != filepath.Join(".", "data", "train-bot.public-edge-cache.json") {
 			t.Fatalf("unexpected edge cache state file: %q", cfg.TrainWebPublicEdgeCacheStateFile)
 		}
+		if cfg.TrainRuntimeCachePath != filepath.Join(".", "data", "train-runtime-cache.db") {
+			t.Fatalf("unexpected runtime cache path: %q", cfg.TrainRuntimeCachePath)
+		}
 		if cfg.TrainWebBundleDir != filepath.Join(".", "data", "public-bundles") {
 			t.Fatalf("unexpected bundle dir: %q", cfg.TrainWebBundleDir)
 		}
@@ -131,8 +134,25 @@ func TestLoadUsesScheduleDirForDerivedPaths(t *testing.T) {
 			if cfg.TrainWebPublicEdgeCacheStateFile != "/tmp/train/runtime/data/train-bot.public-edge-cache.json" {
 				t.Fatalf("unexpected derived edge cache file: %q", cfg.TrainWebPublicEdgeCacheStateFile)
 			}
+			if cfg.TrainRuntimeCachePath != "/tmp/train/runtime/data/train-runtime-cache.db" {
+				t.Fatalf("unexpected derived runtime cache path: %q", cfg.TrainRuntimeCachePath)
+			}
 			if cfg.TrainWebBundleDir != "/tmp/train/runtime/data/public-bundles" {
 				t.Fatalf("unexpected derived bundle dir: %q", cfg.TrainWebBundleDir)
+			}
+		})
+	})
+}
+
+func TestLoadUsesExplicitWritableRuntimeCachePath(t *testing.T) {
+	withRuntimeEnv(t, func() {
+		withEnv("TRAIN_RUNTIME_CACHE_PATH", "/srv/train-bot/state/train-runtime-cache.db", func() {
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("expected valid config, got %v", err)
+			}
+			if cfg.TrainRuntimeCachePath != "/srv/train-bot/state/train-runtime-cache.db" {
+				t.Fatalf("unexpected explicit runtime cache path: %q", cfg.TrainRuntimeCachePath)
 			}
 		})
 	})

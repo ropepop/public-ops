@@ -87,7 +87,7 @@ ARBUZAS_TICKET_TUNNEL_UID="${ARBUZAS_TICKET_TUNNEL_UID:-501}"
 ARBUZAS_TICKET_TUNNEL_GID="${ARBUZAS_TICKET_TUNNEL_GID:-50}"
 ARBUZAS_MESHCENTRAL_HOST_PORT="${ARBUZAS_MESHCENTRAL_HOST_PORT:-28443}"
 ARBUZAS_MESHCENTRAL_HOSTNAME="${ARBUZAS_MESHCENTRAL_HOSTNAME:-mesh.jolkins.id.lv}"
-ARBUZAS_MESHCENTRAL_IMAGE="${ARBUZAS_MESHCENTRAL_IMAGE:-ghcr.io/ylianst/meshcentral:1.2.4-slim}"
+ARBUZAS_MESHCENTRAL_IMAGE="${ARBUZAS_MESHCENTRAL_IMAGE:-ghcr.io/ylianst/meshcentral:1.2.5-slim@sha256:f2250e9911480e02f861b7456dcbfaa45baeccfac9fd083d7907129dbc4f56be}"
 ARBUZAS_NETDATA_PORT="${ARBUZAS_NETDATA_PORT:-19999}"
 ARBUZAS_QBITTORRENT_WEBUI_PORT="${ARBUZAS_QBITTORRENT_WEBUI_PORT:-18080}"
 ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT="${ARBUZAS_QBITTORRENT_INTERNAL_WEBUI_PORT:-24680}"
@@ -109,7 +109,7 @@ ARBUZAS_FAN_EXIT_AUTO_C="${ARBUZAS_FAN_EXIT_AUTO_C:-89}"
 ARBUZAS_TRAIN_BOT_HOSTNAME="${ARBUZAS_TRAIN_BOT_HOSTNAME:-vilciens.kontrole.info}"
 ARBUZAS_SATIKSME_BOT_HOSTNAME="${ARBUZAS_SATIKSME_BOT_HOSTNAME:-kontrole.info}"
 ARBUZAS_TICKET_REMOTE_HOSTNAME="${ARBUZAS_TICKET_REMOTE_HOSTNAME:-ticket.jolkins.id.lv}"
-ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}"
+ARBUZAS_CLOUDFLARED_IMAGE="${ARBUZAS_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0}"
 ARBUZAS_TICKET_CLOUDFLARED_IMAGE="${ARBUZAS_TICKET_CLOUDFLARED_IMAGE:-cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0}"
 
 action=""
@@ -568,7 +568,10 @@ remote_root_command() {
 remote_compose_shell() {
   local remote_release_dir="$1"
   local script="$2"
-  remote_shell "
+  # Compose expands every service-level env_file while loading the project,
+  # including root-only files for services that were not selected. Keep those
+  # files private and run project parsing through the existing root boundary.
+  remote_root_shell "
     compose() {
       docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' \"\$@\"
     }
@@ -1792,6 +1795,7 @@ resolve_requested_services() {
         mark_validation_group train
         ;;
       train_tunnel)
+        append_unique COMPOSE_TARGET_SERVICES train_bot
         append_unique COMPOSE_TARGET_SERVICES train_tunnel
         mark_validation_group train
         ;;
@@ -3299,6 +3303,7 @@ prepare_local_release_bundle() {
   mkdir -p "${ARBUZAS_RELEASE_DIR}/generated/cloudflared"
 
   copy_tree_into_release "infra/arbuzas/docker"
+  copy_tree_into_release "infra/arbuzas/host-security"
   copy_tree_into_release "infra/arbuzas/qbittorrent"
   copy_tree_into_release "infra/arbuzas/jellyfin"
   copy_tree_into_release "infra/arbuzas/meshcentral"
@@ -3351,10 +3356,12 @@ prepare_local_fast_release_overlay() {
         copy_tree_into_fast_release_overlay "workloads/ticket-remote"
         ;;
       qbittorrent|qbittorrent_housekeeper)
+        copy_tree_into_fast_release_overlay "infra/arbuzas/host-security"
         copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
         copy_tree_into_fast_release_overlay "workloads/qbittorrent-housekeeper"
         ;;
       jellyfin)
+        copy_tree_into_fast_release_overlay "infra/arbuzas/host-security"
         copy_tree_into_fast_release_overlay "infra/arbuzas/qbittorrent"
         copy_tree_into_fast_release_overlay "infra/arbuzas/jellyfin"
         ;;
@@ -3419,9 +3426,39 @@ append_csv_unique() {
 }
 
 prepare_remote_ticket_runtime_permissions() {
+  local explicit_service_selection=0
+  if [[ "${1:-}" == "--selected-services" ]]; then
+    explicit_service_selection=1
+    shift
+  fi
+  local train_selected=0
+  local satiksme_selected=0
   local meshcentral_selected=0
-  if (( TARGETED_MODE == 0 )) || targeted_service_selected meshcentral; then
-    meshcentral_selected=1
+  local service_name=""
+  if (( explicit_service_selection == 1 )); then
+    for service_name in "$@"; do
+      case "${service_name}" in
+        train_bot|train_tunnel)
+          train_selected=1
+          ;;
+        satiksme_bot|satiksme_tunnel)
+          satiksme_selected=1
+          ;;
+        meshcentral)
+          meshcentral_selected=1
+          ;;
+      esac
+    done
+  else
+    if (( TARGETED_MODE == 0 || VALIDATE_TRAIN == 1 )); then
+      train_selected=1
+    fi
+    if (( TARGETED_MODE == 0 || VALIDATE_SATIKSME == 1 )); then
+      satiksme_selected=1
+    fi
+    if (( TARGETED_MODE == 0 )) || targeted_service_selected meshcentral; then
+      meshcentral_selected=1
+    fi
   fi
   remote_root_command "
     secure_private_file() {
@@ -3442,24 +3479,109 @@ prepare_remote_ticket_runtime_permissions() {
       \( -name '*.bak*' -o -name '*.before-*' -o -name '*.retired-*' -o -name '*~' \) \
       -delete
 
-    install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/satiksme-chat-analyzer'
-    for path in \
-      '/etc/arbuzas/env/train-bot.env' \
-      '/etc/arbuzas/env/satiksme-bot.env' \
-      '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
-      '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
-      '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret' \
-      '/etc/arbuzas/secrets/satiksme-bot-spacetime.key' \
-      '/etc/arbuzas/secrets/satiksme-bot-web-session-secret' \
-      '/etc/arbuzas/secrets/satiksme-telegram-client.secret' \
-      '/etc/arbuzas/secrets/train-bot-spacetime.key' \
-      '/etc/arbuzas/secrets/train-bot-web-session-secret' \
-      '/etc/arbuzas/secrets/train-bot-test-ticket.secret' \
-      '/etc/arbuzas/cloudflared/train-bot.json' \
-      '/etc/arbuzas/cloudflared/satiksme-bot.json' \
-      '/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'; do
-      secure_private_file \"\${path}\" 'root:root'
-    done
+    if (( ${train_selected} == 1 )); then
+      secure_private_file '/etc/arbuzas/secrets/train-bot-test-ticket.secret' 'root:root'
+      for path in \
+        '/etc/arbuzas/env/train-bot.env' \
+        '/etc/arbuzas/secrets/train-bot-spacetime.key' \
+        '/etc/arbuzas/secrets/train-bot-web-session-secret'; do
+        secure_private_file \"\${path}\" '1001:1001'
+      done
+      secure_private_file '/etc/arbuzas/cloudflared/train-bot.json' '501:50'
+      for path in \
+        '/srv/arbuzas/train-bot/state' \
+        '/srv/arbuzas/train-bot/data/schedules' \
+        '/srv/arbuzas/train-bot/data/public-bundles'; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          [[ -d \"\${path}\" && ! -L \"\${path}\" ]] || {
+            echo \"refusing unsafe Train application state directory: \${path}\" >&2
+            exit 1
+          }
+          if find \"\${path}\" -xdev -type l -print -quit | grep -q .; then
+            echo \"refusing symbolic link inside Train application state directory: \${path}\" >&2
+            exit 1
+          fi
+          find \"\${path}\" -xdev -exec chown 1001:1001 {} +
+          chmod 0750 \"\${path}\"
+        fi
+      done
+    fi
+
+    if (( ${satiksme_selected} == 1 )); then
+      for path in \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer' \
+        '/srv/arbuzas/satiksme-chat-analyzer' \
+        '/srv/arbuzas/satiksme-chat-analyzer/state' \
+        '/srv/arbuzas/satiksme-bot/state'; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          [[ -d \"\${path}\" && ! -L \"\${path}\" ]] || {
+            echo \"refusing unsafe Satiksme analyzer directory: \${path}\" >&2
+            exit 1
+          }
+        fi
+      done
+      install -d -o root -g root -m 0700 \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer' \
+        '/srv/arbuzas/satiksme-chat-analyzer' \
+        '/srv/arbuzas/satiksme-chat-analyzer/state'
+
+      old_analyzer_session='/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'
+      analyzer_session='/srv/arbuzas/satiksme-chat-analyzer/state/chat-analyzer.session'
+      for path in \"\${old_analyzer_session}\" \"\${analyzer_session}\"; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          [[ -f \"\${path}\" && ! -L \"\${path}\" ]] || {
+            echo \"refusing unsafe Satiksme analyzer session: \${path}\" >&2
+            exit 1
+          }
+        fi
+      done
+      if [[ -e \"\${old_analyzer_session}\" ]]; then
+        [[ \"\$(stat -c '%d' \"\$(dirname \"\${old_analyzer_session}\")\")\" == \
+           \"\$(stat -c '%d' \"\$(dirname \"\${analyzer_session}\")\")\" ]] || {
+          echo 'Satiksme analyzer session migration must stay on one filesystem' >&2
+          exit 1
+        }
+        if [[ -e \"\${analyzer_session}\" ]] && ! cmp -s \"\${old_analyzer_session}\" \"\${analyzer_session}\"; then
+          echo 'refusing to overwrite a different restricted Satiksme analyzer session' >&2
+          exit 1
+        fi
+        mv -f \"\${old_analyzer_session}\" \"\${analyzer_session}\"
+      fi
+      secure_private_file \"\${analyzer_session}\" 'root:root'
+
+      for path in \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret'; do
+        secure_private_file \"\${path}\" 'root:root'
+      done
+      for path in \
+        '/etc/arbuzas/env/satiksme-bot.env' \
+        '/etc/arbuzas/secrets/satiksme-bot-spacetime.key' \
+        '/etc/arbuzas/secrets/satiksme-bot-web-session-secret' \
+        '/etc/arbuzas/secrets/satiksme-telegram-client.secret'; do
+        secure_private_file \"\${path}\" '1001:1001'
+      done
+      secure_private_file '/etc/arbuzas/cloudflared/satiksme-bot.json' '501:50'
+      for path in \
+        '/srv/arbuzas/satiksme-bot/state' \
+        '/srv/arbuzas/satiksme-bot/data/catalog/source' \
+        '/srv/arbuzas/satiksme-bot/data/catalog/generated' \
+        '/srv/arbuzas/satiksme-bot/data/public-bundles'; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          [[ -d \"\${path}\" && ! -L \"\${path}\" ]] || {
+            echo \"refusing unsafe Satiksme application state directory: \${path}\" >&2
+            exit 1
+          }
+          if find \"\${path}\" -xdev -type l -print -quit | grep -q .; then
+            echo \"refusing symbolic link inside Satiksme application state directory: \${path}\" >&2
+            exit 1
+          fi
+          find \"\${path}\" -xdev -exec chown 1001:1001 {} +
+          chmod 0750 \"\${path}\"
+        fi
+      done
+    fi
 
     install -d -o 1001 -g 1001 -m 0750 '/srv/arbuzas/ticket-remote/state'
     for path in \
@@ -3474,34 +3596,66 @@ prepare_remote_ticket_runtime_permissions() {
     secure_private_file \
       '/etc/arbuzas/cloudflared/ticket-remote.json' \
       '${ARBUZAS_TICKET_TUNNEL_UID}:${ARBUZAS_TICKET_TUNNEL_GID}'
-    if [[ -f '/etc/arbuzas/env/meshcentral.env' ]]; then
-      chown root:root '/etc/arbuzas/env/meshcentral.env'
-      chmod 0644 '/etc/arbuzas/env/meshcentral.env'
+    if (( ${meshcentral_selected} == 1 )); then
+      secure_private_file '/etc/arbuzas/env/meshcentral.env' 'root:root'
+      secure_private_file '/etc/arbuzas/env/meshcentral-config.json' 'root:root'
+      install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/meshcentral'
+      find '/etc/arbuzas/secrets/meshcentral' -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +
+      for path in \
+        '/srv/arbuzas/meshcentral/data' \
+        '/srv/arbuzas/meshcentral/files' \
+        '/srv/arbuzas/meshcentral/web' \
+        '/srv/arbuzas/meshcentral/backups'; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          [[ -d \"\${path}\" && ! -L \"\${path}\" ]] || {
+            echo \"refusing unsafe MeshCentral state directory: \${path}\" >&2
+            exit 1
+          }
+          if find \"\${path}\" -xdev -type l -print -quit | grep -q .; then
+            echo \"refusing symbolic link inside MeshCentral state directory: \${path}\" >&2
+            exit 1
+          fi
+          if find \"\${path}\" -xdev ! -type d ! -type f ! -type l -print -quit | grep -q .; then
+            echo \"refusing unsupported object inside MeshCentral state directory: \${path}\" >&2
+            exit 1
+          fi
+          find \"\${path}\" -xdev -type d -exec chown root:root {} + -exec chmod 0700 {} +
+          find \"\${path}\" -xdev -type f -exec chown root:root {} + -exec chmod 0600 {} +
+        fi
+      done
     fi
-    if [[ -f '/etc/arbuzas/env/meshcentral-config.json' ]]; then
-      chown root:root '/etc/arbuzas/env/meshcentral-config.json'
-      chmod 0644 '/etc/arbuzas/env/meshcentral-config.json'
-    fi
-    install -d -o root -g root -m 0700 '/etc/arbuzas/secrets/meshcentral'
-    find '/etc/arbuzas/secrets/meshcentral' -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 0600 {} +
   "
 }
 
 prepare_remote_host_layout() {
+  local train_selected=0
+  local satiksme_selected=0
+  if (( TARGETED_MODE == 0 || VALIDATE_TRAIN == 1 )); then
+    train_selected=1
+  fi
+  if (( TARGETED_MODE == 0 || VALIDATE_SATIKSME == 1 )); then
+    satiksme_selected=1
+  fi
   remote_root_command "
     command -v docker >/dev/null 2>&1 || { echo 'docker is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     docker compose version >/dev/null 2>&1 || { echo 'docker compose is required on ${ARBUZAS_HOST}' >&2; exit 1; }
     command -v python3 >/dev/null 2>&1 || { echo 'python3 is required on ${ARBUZAS_HOST}' >&2; exit 1; }
+    if (( ${train_selected} == 1 )); then
+      install -d -o 1001 -g 1001 -m 0750 \
+        '/srv/arbuzas/train-bot/state' \
+        '/srv/arbuzas/train-bot/data/schedules' \
+        '/srv/arbuzas/train-bot/data/public-bundles'
+      touch '/etc/arbuzas/env/train-bot.env' 2>/dev/null || true
+    fi
+    if (( ${satiksme_selected} == 1 )); then
+      install -d -o 1001 -g 1001 -m 0750 \
+        '/srv/arbuzas/satiksme-bot/state' \
+        '/srv/arbuzas/satiksme-bot/data/catalog/source' \
+        '/srv/arbuzas/satiksme-bot/data/catalog/generated' \
+        '/srv/arbuzas/satiksme-bot/data/public-bundles'
+      touch '/etc/arbuzas/env/satiksme-bot.env' 2>/dev/null || true
+    fi
     mkdir -p \
-      '/srv/arbuzas/train-bot/run' \
-      '/srv/arbuzas/train-bot/state' \
-      '/srv/arbuzas/train-bot/data/schedules' \
-      '/srv/arbuzas/train-bot/data/public-bundles' \
-      '/srv/arbuzas/satiksme-bot/run' \
-      '/srv/arbuzas/satiksme-bot/state' \
-      '/srv/arbuzas/satiksme-bot/data/catalog/source' \
-      '/srv/arbuzas/satiksme-bot/data/catalog/generated' \
-      '/srv/arbuzas/satiksme-bot/data/public-bundles' \
       '/srv/arbuzas/ticket-remote/run' \
       '/srv/arbuzas/ticket-remote/state' \
       '/srv/arbuzas/meshcentral/data' \
@@ -3517,10 +3671,7 @@ prepare_remote_host_layout() {
     if [[ ! -f '${DOCKER_GC_REMOTE_STATE_FILE}' && -r '/srv/arbuzas/docker-gc/state.json' ]]; then
       cp '/srv/arbuzas/docker-gc/state.json' '${DOCKER_GC_REMOTE_STATE_FILE}'
     fi
-    touch \
-      '/etc/arbuzas/env/train-bot.env' \
-      '/etc/arbuzas/env/satiksme-bot.env' \
-      '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
+    touch '/etc/arbuzas/env/ticket-remote.env' 2>/dev/null || true
   " || return $?
   configure_remote_journald_limit || return $?
   prepare_remote_ticket_runtime_permissions
@@ -4223,7 +4374,7 @@ rollback_release_before_qbittorrent() {
   # Recover the prior application release before changing ingress. A route
   # cleanup failure must never prevent the known-good Compose stack from
   # coming back.
-  remote_shell "
+  remote_root_shell "
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing rollback release: ${remote_release_dir}' >&2; exit 1; }
     [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
@@ -4332,7 +4483,7 @@ validate_release_before_qbittorrent_recovery() {
     require_route_absent=1
   fi
 
-  validate_remote_host_probe "${remote_release_dir}" "pre-qBittorrent release recovered" \
+  validate_remote_root_probe "${remote_release_dir}" "pre-qBittorrent release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
       expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot|subscription_bot|subscription_tunnel)$')
@@ -4496,7 +4647,7 @@ rollback_release_before_jellyfin() {
     " || return 1
   else
     # Full or multi-service rollback restores the complete known-good project.
-    remote_shell "
+    remote_root_shell "
       [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing rollback release: ${remote_release_dir}' >&2; exit 1; }
       [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback compose file: ${remote_release_dir}' >&2; exit 1; }
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
@@ -4528,7 +4679,7 @@ validate_release_before_jellyfin_recovery() {
     require_route_absent=1
   fi
 
-  validate_remote_host_probe "${remote_release_dir}" "pre-Jellyfin release recovered" \
+  validate_remote_root_probe "${remote_release_dir}" "pre-Jellyfin release recovered" \
     "test \"\$(readlink -f '${REMOTE_CURRENT_LINK}')\" = \"\$(readlink -f '${remote_release_dir}')\"
       cd '${remote_release_dir}'
       expected=\$(docker compose --project-name arbuzas --env-file release.env -f infra/arbuzas/docker/compose.yml config --services | grep -Ev '^(portainer|chatgpt_broker|chatgpt_bot|subscription_bot|subscription_tunnel)$')
@@ -4824,7 +4975,7 @@ validate_and_prepare_remote_release_compose() {
   pull_image_args+=" $(shell_quote "satiksme_tunnel=${ARBUZAS_CLOUDFLARED_IMAGE}")"
   pull_image_args+=" $(shell_quote "ticket_remote_tunnel=${ARBUZAS_TICKET_CLOUDFLARED_IMAGE}")"
 
-  remote_shell "
+  remote_root_shell "
     cd '${remote_release_dir}'
     compose_args=(docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml')
     \"\${compose_args[@]}\" config >/dev/null
@@ -4848,7 +4999,7 @@ build_remote_release_images() {
   build_service_args="$(compose_build_service_args)"
   [[ -n "${build_service_args}" ]] || return 0
 
-  remote_shell "
+  remote_root_shell "
     cd '${remote_release_dir}'
     docker compose --project-name arbuzas \
       --env-file '${remote_release_dir}/release.env' \
@@ -4875,7 +5026,7 @@ activate_remote_release_services() {
   fi
 
   if (( TARGETED_MODE == 1 )); then
-    remote_shell "
+    remote_root_shell "
       sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
       cd '${REMOTE_CURRENT_LINK}'
       if [[ -n '${non_tunnel_service_args}' ]]; then
@@ -4898,7 +5049,7 @@ activate_remote_release_services() {
     return
   fi
 
-  remote_shell "
+  remote_root_shell "
     sudo -n ln -sfn '${remote_release_dir}' '${REMOTE_CURRENT_LINK}'
     cd '${REMOTE_CURRENT_LINK}'
     docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --remove-orphans${all_service_args}
@@ -6111,7 +6262,10 @@ def assert_satiksme_public_json(path, payload):
 def assert_satiksme_map_area_ids(path, payload):
     if not isinstance(payload, dict):
         raise SystemExit(f'{path} payload is malformed')
-    area_incidents = payload.get('areaIncidents')
+    # Area collections use omitempty in the public compatibility shape. An
+    # absent collection therefore means an empty collection, not a failed
+    # projection. Validate every row whenever the collection is present.
+    area_incidents = payload.get('areaIncidents', [])
     sightings = payload.get('sightings')
     if not isinstance(area_incidents, list) or not isinstance(sightings, dict):
         raise SystemExit(f'{path} is missing its area collections')
@@ -6983,10 +7137,255 @@ validate_remote_public_tls_dns_hardening() {
     train_bot train_tunnel satiksme_bot satiksme_tunnel
 }
 
+validate_remote_public_app_container_boundary() {
+  local remote_release_dir="$1"
+  local service_name="$2"
+  local tunnel_name="$3"
+  local network_name="$4"
+
+  validate_remote_probe "${remote_release_dir}" "${service_name} container boundary" \
+    "python3 - '${service_name}' <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+roots = {
+    'train_bot': [
+        '/srv/arbuzas/train-bot/state',
+        '/srv/arbuzas/train-bot/data/schedules',
+        '/srv/arbuzas/train-bot/data/public-bundles',
+    ],
+    'satiksme_bot': [
+        '/srv/arbuzas/satiksme-bot/state',
+        '/srv/arbuzas/satiksme-bot/data/catalog/source',
+        '/srv/arbuzas/satiksme-bot/data/catalog/generated',
+        '/srv/arbuzas/satiksme-bot/data/public-bundles',
+    ],
+}[sys.argv[1]]
+for root_name in roots:
+    root = Path(root_name)
+    root_info = root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_IMODE(root_info.st_mode) != 0o750:
+        raise SystemExit(f'unsafe application state root: {root}')
+    for path in [root, *root.rglob('*')]:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 1001 or info.st_gid != 1001:
+            raise SystemExit(f'unsafe application state metadata: {path}')
+PY
+      inspect_json=\$(mktemp)
+      trap 'rm -f \"\${inspect_json}\"' EXIT
+      docker inspect \"\$(compose ps -q '${service_name}')\" \"\$(compose ps -q '${tunnel_name}')\" > \"\${inspect_json}\"
+      python3 - \"\${inspect_json}\" '${service_name}' '${tunnel_name}' 'arbuzas_${network_name}' <<'PY'
+import json
+import re
+import sys
+
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+service_name, tunnel_name, expected_network = sys.argv[2:]
+containers = {
+    item.get('Config', {}).get('Labels', {}).get('com.docker.compose.service'): item
+    for item in payload
+}
+app = containers.get(service_name)
+tunnel = containers.get(tunnel_name)
+if app is None or tunnel is None:
+    raise SystemExit(f'missing inspected containers: {sorted(containers)!r}')
+
+
+def parse_tmpfs_size(raw):
+    suffix = raw[-1:].lower()
+    multipliers = {'k': 1024, 'm': 1024 ** 2, 'g': 1024 ** 3}
+    if suffix in multipliers:
+        return int(raw[:-1]) * multipliers[suffix]
+    return int(raw)
+
+
+def assert_hardening(
+    container,
+    expected_user,
+    expected_pids,
+    expected_tmpfs,
+    expected_memory=None,
+    expected_nano_cpus=None,
+):
+    host = container.get('HostConfig', {})
+    config = container.get('Config', {})
+    if config.get('User') != expected_user:
+        raise SystemExit(f'{config.get("Labels", {}).get("com.docker.compose.service")} runs as {config.get("User")!r}')
+    if host.get('ReadonlyRootfs') is not True or host.get('Privileged') is not False:
+        raise SystemExit('container root filesystem or privilege policy is unsafe')
+    if host.get('CapDrop') != ['ALL']:
+        raise SystemExit(f'container capability policy is unsafe: {host.get("CapDrop")!r}')
+    if 'no-new-privileges:true' not in (host.get('SecurityOpt') or []):
+        raise SystemExit(f'container no-new-privileges policy is missing: {host.get("SecurityOpt")!r}')
+    if host.get('PidsLimit') != expected_pids:
+        raise SystemExit(f'container process limit is {host.get("PidsLimit")!r}, expected {expected_pids}')
+    log = host.get('LogConfig') or {}
+    if log.get('Type') != 'local' or log.get('Config') != {'max-file': '3', 'max-size': '10m'}:
+        raise SystemExit(f'container logging is not bounded: {log!r}')
+    tmpfs = host.get('Tmpfs') or {}
+    if set(tmpfs) != set(expected_tmpfs):
+        raise SystemExit(f'container tmpfs targets are {sorted(tmpfs)!r}, expected {sorted(expected_tmpfs)!r}')
+    for target, options in tmpfs.items():
+        option_set = set(options.split(','))
+        if not {'rw', 'noexec', 'nosuid', 'nodev'}.issubset(option_set):
+            raise SystemExit(f'unsafe tmpfs options for {target}: {options!r}')
+        sizes = [item.removeprefix('size=') for item in option_set if item.startswith('size=')]
+        if len(sizes) != 1 or parse_tmpfs_size(sizes[0]) != expected_tmpfs[target]:
+            raise SystemExit(f'unsafe tmpfs size for {target}: {options!r}')
+    if expected_memory is not None:
+        if host.get('Memory') != expected_memory:
+            raise SystemExit(f'container memory limit is {host.get("Memory")!r}, expected {expected_memory}')
+        if host.get('MemorySwap') != expected_memory:
+            raise SystemExit(f'container memory plus swap limit is {host.get("MemorySwap")!r}, expected {expected_memory}')
+    if expected_nano_cpus is not None and host.get('NanoCpus') != expected_nano_cpus:
+        raise SystemExit(f'container CPU limit is {host.get("NanoCpus")!r}, expected {expected_nano_cpus}')
+
+
+app_root = {
+    'train_bot': '/srv/train-bot',
+    'satiksme_bot': '/srv/satiksme-bot',
+}[service_name]
+app_tmpfs = {
+    'train_bot': {'/tmp': 32 * 1024 ** 2, '/srv/train-bot/run': 8 * 1024 ** 2},
+    'satiksme_bot': {'/tmp': 16 * 1024 ** 2, '/srv/satiksme-bot/run': 8 * 1024 ** 2},
+}[service_name]
+app_limits = {
+    'train_bot': (512 * 1024 ** 2, 1_000_000_000),
+    'satiksme_bot': (None, None),
+}[service_name]
+assert_hardening(app, '1001:1001', 128, app_tmpfs, *app_limits)
+assert_hardening(tunnel, '501:50', 64, {'/tmp': 8 * 1024 ** 2})
+if service_name == 'satiksme_bot':
+    configured_analyzer_env = sorted(
+        item for item in (app.get('Config', {}).get('Env') or [])
+        if item.startswith('SATIKSME_CHAT_ANALYZER_')
+    )
+    if configured_analyzer_env != ['SATIKSME_CHAT_ANALYZER_ENABLED=false']:
+        raise SystemExit('public Satiksme container receives analyzer configuration or credentials')
+    command = '\n'.join(app.get('Config', {}).get('Cmd') or [])
+    for required in [
+        'Satiksme chat analyzer must stay disabled in the public container',
+        'export SATIKSME_CHAT_ANALYZER_ENABLED=\"false\"',
+    ]:
+        if required not in command:
+            raise SystemExit(f'public Satiksme analyzer fail-closed command is missing: {required}')
+    unset_match = re.search(r'(?s)\bunset\s+(?P<variables>.*?)\bmkdir\s+-p\b', command)
+    if unset_match is None:
+        raise SystemExit('public Satiksme analyzer fail-closed command has no bounded unset block')
+    expected_unset_variables = {
+        'SATIKSME_CHAT_ANALYZER_CHAT_ID',
+        'SATIKSME_CHAT_ANALYZER_PHONE',
+        'SATIKSME_CHAT_ANALYZER_PASSWORD',
+        'SATIKSME_CHAT_ANALYZER_SESSION_FILE',
+        'SATIKSME_CHAT_ANALYZER_API_ID',
+        'SATIKSME_CHAT_ANALYZER_API_ID_FILE',
+        'SATIKSME_CHAT_ANALYZER_API_HASH',
+        'SATIKSME_CHAT_ANALYZER_API_HASH_FILE',
+        'SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY',
+        'SATIKSME_CHAT_ANALYZER_GOOGLE_API_KEY_FILE',
+        'SATIKSME_CHAT_ANALYZER_MODEL_API_KEY',
+        'SATIKSME_CHAT_ANALYZER_MODEL_API_KEY_FILE',
+        'SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER',
+        'SATIKSME_CHAT_ANALYZER_MODEL_BASE_URL',
+        'SATIKSME_CHAT_ANALYZER_MODEL_NAME',
+        'SATIKSME_CHAT_ANALYZER_MODEL_TIMEOUT',
+        'SATIKSME_CHAT_ANALYZER_GOOGLE_MODEL_AUTO',
+        'SATIKSME_CHAT_ANALYZER_GOOGLE_MODELS_URL',
+        'SATIKSME_CHAT_ANALYZER_GOOGLE_MODEL_POLICY',
+        'SATIKSME_CHAT_ANALYZER_MODEL_NATIVE_OLLAMA',
+        'SATIKSME_CHAT_ANALYZER_MODEL_CALL_DELAY',
+        'SATIKSME_CHAT_ANALYZER_RETRY_BASE_DELAY',
+        'SATIKSME_CHAT_ANALYZER_RETRY_MAX_DELAY',
+        'SATIKSME_CHAT_ANALYZER_DRY_RUN',
+        'SATIKSME_CHAT_ANALYZER_PROCESS_START',
+        'SATIKSME_CHAT_ANALYZER_PROCESS_END',
+        'SATIKSME_CHAT_ANALYZER_POLL_INTERVAL',
+        'SATIKSME_CHAT_ANALYZER_PROCESS_INTERVAL',
+        'SATIKSME_CHAT_ANALYZER_COLLECTION_PAGE_SIZE',
+        'SATIKSME_CHAT_ANALYZER_BATCH_LIMIT',
+        'SATIKSME_CHAT_ANALYZER_MAX_MESSAGE_AGE',
+        'SATIKSME_CHAT_ANALYZER_MIN_CONFIDENCE',
+    }
+    actual_unset_variables = set(re.findall(
+        r'SATIKSME_CHAT_ANALYZER_[A-Z0-9_]+',
+        unset_match.group('variables'),
+    ))
+    if actual_unset_variables != expected_unset_variables:
+        missing = sorted(expected_unset_variables - actual_unset_variables)
+        unexpected = sorted(actual_unset_variables - expected_unset_variables)
+        raise SystemExit(
+            f'public Satiksme analyzer unset block mismatch: missing={missing!r} unexpected={unexpected!r}'
+        )
+
+expected_app_mounts = {
+    'train_bot': {
+        '/srv/train-bot/state': ('/srv/arbuzas/train-bot/state', True),
+        '/srv/train-bot/data/schedules': ('/srv/arbuzas/train-bot/data/schedules', True),
+        '/srv/train-bot/data/public-bundles': ('/srv/arbuzas/train-bot/data/public-bundles', True),
+        '/srv/train-bot/.env': ('/etc/arbuzas/env/train-bot.env', False),
+        '/etc/arbuzas/secrets/train-bot-spacetime.key': ('/etc/arbuzas/secrets/train-bot-spacetime.key', False),
+        '/etc/arbuzas/secrets/train-bot-web-session-secret': ('/etc/arbuzas/secrets/train-bot-web-session-secret', False),
+    },
+    'satiksme_bot': {
+        '/srv/satiksme-bot/state': ('/srv/arbuzas/satiksme-bot/state', True),
+        '/srv/satiksme-bot/data/catalog/source': ('/srv/arbuzas/satiksme-bot/data/catalog/source', True),
+        '/srv/satiksme-bot/data/catalog/generated': ('/srv/arbuzas/satiksme-bot/data/catalog/generated', True),
+        '/srv/satiksme-bot/data/public-bundles': ('/srv/arbuzas/satiksme-bot/data/public-bundles', True),
+        '/srv/satiksme-bot/.env': ('/etc/arbuzas/env/satiksme-bot.env', False),
+        '/etc/arbuzas/secrets/satiksme-bot-spacetime.key': ('/etc/arbuzas/secrets/satiksme-bot-spacetime.key', False),
+        '/etc/arbuzas/secrets/satiksme-bot-web-session-secret': ('/etc/arbuzas/secrets/satiksme-bot-web-session-secret', False),
+        '/etc/arbuzas/secrets/satiksme-telegram-client.secret': ('/etc/arbuzas/secrets/satiksme-telegram-client.secret', False),
+    },
+}[service_name]
+actual_app_mounts = {
+    item.get('Destination'): (item.get('Source'), item.get('RW'))
+    for item in app.get('Mounts', [])
+}
+if actual_app_mounts != expected_app_mounts:
+    raise SystemExit(f'unexpected {service_name} mounts: {actual_app_mounts!r}')
+
+tunnel_mounts = {
+    item.get('Destination'): (item.get('Source'), item.get('RW'))
+    for item in tunnel.get('Mounts', [])
+}
+if set(tunnel_mounts) != {
+    '/etc/cloudflared/config.yml',
+    '/run/arbuzas/cloudflared/credentials.json',
+} or any(writable for _source, writable in tunnel_mounts.values()):
+    raise SystemExit(f'unexpected {tunnel_name} mounts: {tunnel_mounts!r}')
+prefix = service_name.removesuffix('_bot').replace('_', '-')
+credentials_source = tunnel_mounts['/run/arbuzas/cloudflared/credentials.json'][0]
+if credentials_source != f'/etc/arbuzas/cloudflared/{prefix}-bot.json':
+    raise SystemExit(f'unexpected {tunnel_name} credential source: {credentials_source!r}')
+config_source = tunnel_mounts['/etc/cloudflared/config.yml'][0]
+if not str(config_source).endswith(f'/generated/cloudflared/{prefix}-bot.yml'):
+    raise SystemExit(f'unexpected {tunnel_name} configuration source: {config_source!r}')
+
+for container in (app, tunnel):
+    networks = container.get('NetworkSettings', {}).get('Networks', {})
+    if set(networks) != {expected_network}:
+        raise SystemExit(f'unexpected Docker networks: {sorted(networks)!r}')
+    published = {
+        port: bindings
+        for port, bindings in (container.get('NetworkSettings', {}).get('Ports', {}) or {}).items()
+        if bindings
+    }
+    if published:
+        raise SystemExit(f'container unexpectedly publishes host ports: {published!r}')
+
+expected_tunnel_image = 'cloudflare/cloudflared@sha256:12ff5c6992a9863db4da270746af7c244bcaee49353039af8104268a18d6c4f0'
+if tunnel.get('Config', {}).get('Image') != expected_tunnel_image:
+    raise SystemExit(f'tunnel image is not pinned as expected: {tunnel.get("Config", {}).get("Image")!r}')
+PY" \
+    "${service_name}" "${tunnel_name}"
+}
+
 validate_remote_train_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" train_bot train_tunnel
+  validate_remote_public_app_container_boundary "${remote_release_dir}" train_bot train_tunnel train_ingress
   validate_remote_probe "${remote_release_dir}" "train local health" \
     "wait_until_ok compose exec -T train_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_TRAIN_BOT_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
@@ -7123,6 +7522,7 @@ validate_remote_satiksme_workload_health() {
   local remote_release_dir="$1"
 
   validate_remote_running_services "${remote_release_dir}" "expected services running" satiksme_bot satiksme_tunnel
+  validate_remote_public_app_container_boundary "${remote_release_dir}" satiksme_bot satiksme_tunnel satiksme_ingress
   validate_remote_probe "${remote_release_dir}" "satiksme local health" \
     "wait_until_ok compose exec -T satiksme_bot sh -lc 'curl -fsS http://127.0.0.1:${ARBUZAS_SATIKSME_BOT_PORT}/api/v1/health >/dev/null 2>/dev/null'" \
     satiksme_bot satiksme_tunnel
@@ -7642,6 +8042,139 @@ validate_remote_meshcentral_workload_health() {
       done
       (( reachable == 1 ))" \
     meshcentral
+  validate_remote_root_probe "${remote_release_dir}" "MeshCentral private state and policy" \
+    "python3 - <<'PY'
+import json
+import os
+import stat
+from pathlib import Path
+
+private_files = [
+    Path('/etc/arbuzas/env/meshcentral.env'),
+    Path('/etc/arbuzas/env/meshcentral-config.json'),
+    Path('/etc/arbuzas/secrets/meshcentral/cloudflare-api-token'),
+    Path('/etc/arbuzas/secrets/meshcentral/webserver-cert-private.key'),
+]
+for path in private_files:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit(f'unsafe MeshCentral private file: {path}')
+    if info.st_uid != 0 or info.st_gid != 0:
+        raise SystemExit(f'unsafe MeshCentral private ownership: {path}')
+
+for root_name in [
+    '/srv/arbuzas/meshcentral/data',
+    '/srv/arbuzas/meshcentral/files',
+    '/srv/arbuzas/meshcentral/web',
+    '/srv/arbuzas/meshcentral/backups',
+]:
+    root = Path(root_name)
+    for path in [root, *root.rglob('*')]:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f'unsafe MeshCentral state link: {path}')
+        if stat.S_ISDIR(info.st_mode):
+            expected = 0o700
+        elif stat.S_ISREG(info.st_mode):
+            expected = 0o600
+        else:
+            raise SystemExit(f'unsafe MeshCentral state object: {path}')
+        if stat.S_IMODE(info.st_mode) != expected or info.st_uid != 0 or info.st_gid != 0:
+            raise SystemExit(f'unsafe MeshCentral state metadata: {path}')
+
+config = json.loads(Path('/etc/arbuzas/env/meshcentral-config.json').read_text(encoding='utf-8'))
+settings = config.get('settings', {})
+domain = config.get('domains', {}).get('', {})
+passwords = domain.get('passwordRequirements', {})
+expected_settings = {
+    'tlsOffload': False,
+    'allowFraming': False,
+    'allowLoginToken': False,
+    'sessionTime': 60,
+    'maxInvalidLogin': {'time': 10, 'count': 5, 'coolofftime': 30},
+    'maxInvalid2fa': {'time': 10, 'count': 5, 'coolofftime': 30},
+}
+for key, expected in expected_settings.items():
+    if settings.get(key) != expected:
+        raise SystemExit(f'MeshCentral setting {key} is {settings.get(key)!r}, expected {expected!r}')
+if domain.get('newAccounts') is not False or domain.get('userSessionIdleTimeout') != 30:
+    raise SystemExit('MeshCentral account or idle-session policy is unsafe')
+if passwords.get('min') != 14 or passwords.get('banCommonPasswords') is True:
+    raise SystemExit('MeshCentral password policy is unsafe')
+if passwords.get('loginTokens') is not False or passwords.get('force2factor') is not False:
+    raise SystemExit('MeshCentral login-token or optional-MFA policy is unsafe')
+if passwords.get('otp2factor') is not True:
+    raise SystemExit('MeshCentral TOTP enrollment is disabled')
+PY" \
+    meshcentral
+  validate_remote_probe "${remote_release_dir}" "MeshCentral container boundary" \
+    "inspect_json=\$(mktemp)
+      trap 'rm -f \"\${inspect_json}\"' EXIT
+      container_id=\$(compose ps -q meshcentral)
+      process_umask=\$(docker exec \"\${container_id}\" /bin/sh -lc \"awk '/^Umask:/{print \\\$2}' /proc/1/status\")
+      if [[ \"\${process_umask}\" != '0077' ]]; then
+        echo \"MeshCentral process umask is \${process_umask:-missing}, expected 0077\" >&2
+        exit 1
+      fi
+      docker inspect \"\${container_id}\" > \"\${inspect_json}\"
+      python3 - \"\${inspect_json}\" <<'PY'
+import json
+import sys
+
+container = json.load(open(sys.argv[1], encoding='utf-8'))[0]
+host = container.get('HostConfig', {})
+config = container.get('Config', {})
+if config.get('User') != '0:0':
+    raise SystemExit(f'MeshCentral runs as {config.get("User")!r}, expected explicit root')
+if config.get('Image') != 'ghcr.io/ylianst/meshcentral:1.2.5-slim@sha256:f2250e9911480e02f861b7456dcbfaa45baeccfac9fd083d7907129dbc4f56be':
+    raise SystemExit(f'MeshCentral image is not pinned as expected: {config.get("Image")!r}')
+if config.get('Entrypoint') != ['/bin/bash', '-lc', 'umask 077; exec /bin/bash /opt/meshcentral/entrypoint.sh']:
+    raise SystemExit(f'MeshCentral private-file umask entrypoint is missing: {config.get("Entrypoint")!r}')
+if host.get('ReadonlyRootfs') is not True or host.get('Privileged') is not False:
+    raise SystemExit('MeshCentral root filesystem or privilege policy is unsafe')
+if host.get('CapDrop') != ['ALL']:
+    raise SystemExit(f'MeshCentral capability policy is unsafe: {host.get("CapDrop")!r}')
+if 'no-new-privileges:true' not in (host.get('SecurityOpt') or []):
+    raise SystemExit(f'MeshCentral no-new-privileges is missing: {host.get("SecurityOpt")!r}')
+if host.get('PidsLimit') != 256:
+    raise SystemExit(f'MeshCentral process limit is unsafe: {host.get("PidsLimit")!r}')
+log = host.get('LogConfig') or {}
+if log.get('Type') != 'local' or log.get('Config') != {'max-file': '3', 'max-size': '10m'}:
+    raise SystemExit(f'MeshCentral logging is not bounded: {log!r}')
+tmpfs = host.get('Tmpfs') or {}
+if set(tmpfs) != {'/tmp'} or not {'rw', 'noexec', 'nosuid', 'nodev'}.issubset(set(tmpfs['/tmp'].split(','))):
+    raise SystemExit(f'MeshCentral tmpfs policy is unsafe: {tmpfs!r}')
+
+expected_mounts = {
+    '/opt/meshcentral/meshcentral-data': ('/srv/arbuzas/meshcentral/data', True),
+    '/opt/meshcentral/meshcentral-files': ('/srv/arbuzas/meshcentral/files', True),
+    '/opt/meshcentral/meshcentral-web': ('/srv/arbuzas/meshcentral/web', True),
+    '/opt/meshcentral/meshcentral-backups': ('/srv/arbuzas/meshcentral/backups', True),
+    '/opt/meshcentral/meshcentral-data/config.json': ('/etc/arbuzas/env/meshcentral-config.json', False),
+    '/opt/meshcentral/meshcentral-data/webserver-cert-public.crt': ('/etc/arbuzas/secrets/meshcentral/webserver-cert-public.crt', False),
+    '/opt/meshcentral/meshcentral-data/webserver-cert-private.key': ('/etc/arbuzas/secrets/meshcentral/webserver-cert-private.key', False),
+}
+actual_mounts = {
+    item.get('Destination'): (item.get('Source'), item.get('RW'))
+    for item in container.get('Mounts', [])
+}
+if actual_mounts != expected_mounts:
+    raise SystemExit(f'unexpected MeshCentral mounts: {actual_mounts!r}')
+networks = container.get('NetworkSettings', {}).get('Networks', {})
+if set(networks) != {'arbuzas_meshcentral_private'}:
+    raise SystemExit(f'unexpected MeshCentral networks: {sorted(networks)!r}')
+published = {
+    port: bindings
+    for port, bindings in (container.get('NetworkSettings', {}).get('Ports', {}) or {}).items()
+    if bindings
+}
+web = published.pop('28443/tcp', [])
+if not web or any(item.get('HostPort') != '${ARBUZAS_MESHCENTRAL_HOST_PORT}' for item in web):
+    raise SystemExit(f'unexpected MeshCentral HTTPS publishing: {web!r}')
+if published:
+    raise SystemExit(f'MeshCentral publishes unexpected host ports: {published!r}')
+PY" \
+    meshcentral
 }
 
 validate_remote_ticket_remote_workload_health() {
@@ -7650,7 +8183,7 @@ validate_remote_ticket_remote_workload_health() {
   local ticket_declared_services=''
   local ticket_required_services=(ticket_phone_bridge ticket_remote_spacetime_sidecar ticket_remote ticket_remote_tunnel)
 
-  if ! ticket_declared_services="$(remote_shell "
+  if ! ticket_declared_services="$(remote_root_shell "
     docker compose --project-name arbuzas \
       --env-file '${remote_release_dir}/release.env' \
       -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' \
@@ -8098,13 +8631,22 @@ validate_remote_private_configuration_permissions() {
         }
       }
 
-      assert_private_file '/etc/arbuzas/env/satiksme-bot.env' '0:0:600'
+      assert_private_file '/etc/arbuzas/env/satiksme-bot.env' '1001:1001:600'
+      assert_private_file '/etc/arbuzas/secrets/satiksme-bot-spacetime.key' '1001:1001:600'
+      assert_private_file '/etc/arbuzas/secrets/satiksme-bot-web-session-secret' '1001:1001:600'
+      assert_private_file '/etc/arbuzas/secrets/satiksme-telegram-client.secret' '1001:1001:600'
+      assert_private_file '/etc/arbuzas/cloudflared/satiksme-bot.json' '501:50:600'
       if [[ '${scope}' == 'all' ]]; then
-        assert_private_file '/etc/arbuzas/env/train-bot.env' '0:0:600'
+        assert_private_file '/etc/arbuzas/env/train-bot.env' '1001:1001:600'
+        assert_private_file '/etc/arbuzas/secrets/train-bot-spacetime.key' '1001:1001:600'
+        assert_private_file '/etc/arbuzas/secrets/train-bot-web-session-secret' '1001:1001:600'
+        assert_private_file '/etc/arbuzas/cloudflared/train-bot.json' '501:50:600'
         assert_private_file '/etc/arbuzas/env/ticket-remote.env' '1001:1001:600'
+        assert_private_file '/etc/arbuzas/env/meshcentral.env' '0:0:600'
+        assert_private_file '/etc/arbuzas/env/meshcentral-config.json' '0:0:600'
       fi
 
-      if grep -Eq '^SATIKSME_CHAT_ANALYZER_(API_ID|API_HASH|GOOGLE_API_KEY|MODEL_API_KEY)=.+' \
+      if grep -Eq '^SATIKSME_CHAT_ANALYZER_(PHONE|PASSWORD|API_ID|API_HASH|GOOGLE_API_KEY|MODEL_API_KEY)=.+' \
           '/etc/arbuzas/env/satiksme-bot.env'; then
         echo 'Satiksme analyzer credentials remain inline in the host env' >&2
         exit 1
@@ -8115,36 +8657,43 @@ validate_remote_private_configuration_permissions() {
         exit 1
       fi
 
-      if grep -Eq '^SATIKSME_CHAT_ANALYZER_ENABLED=true$' \
+      if ! grep -Eq '^SATIKSME_CHAT_ANALYZER_ENABLED=false$' \
           '/etc/arbuzas/env/satiksme-bot.env'; then
-        if grep -Eq '^SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER=' \
-            '/etc/arbuzas/env/satiksme-bot.env' && \
-            ! grep -Eq '^SATIKSME_CHAT_ANALYZER_MODEL_PROVIDER=google$' \
-              '/etc/arbuzas/env/satiksme-bot.env'; then
-          echo 'Satiksme analyzer only supports the managed Google credential path' >&2
-          exit 1
-        fi
-        for path in \
-          '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
-          '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
-          '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret'; do
-          assert_private_file \"\${path}\" '0:0:600'
-          [[ -s \"\${path}\" ]] || {
-            echo \"required Satiksme analyzer credential is empty: \${path}\" >&2
-            exit 1
-          }
-        done
-        path='/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'
-        assert_private_file \"\${path}\" '0:0:600'
-        [[ -s \"\${path}\" ]] || {
-          echo \"required Satiksme analyzer session is empty: \${path}\" >&2
-          exit 1
-        }
-      elif ! grep -Eq '^SATIKSME_CHAT_ANALYZER_ENABLED=false$' \
-          '/etc/arbuzas/env/satiksme-bot.env'; then
-        echo 'SATIKSME_CHAT_ANALYZER_ENABLED must be explicitly true or false' >&2
+        echo 'SATIKSME_CHAT_ANALYZER_ENABLED must remain false until a separate restricted worker exists' >&2
         exit 1
       fi
+
+      old_analyzer_session='/srv/arbuzas/satiksme-bot/state/chat-analyzer.session'
+      analyzer_session='/srv/arbuzas/satiksme-chat-analyzer/state/chat-analyzer.session'
+      if [[ -e \"\${old_analyzer_session}\" || -L \"\${old_analyzer_session}\" ]]; then
+        echo 'Satiksme analyzer session remains exposed inside public application state' >&2
+        exit 1
+      fi
+      assert_private_file \"\${analyzer_session}\" '0:0:600'
+      [[ -s \"\${analyzer_session}\" ]] || {
+        echo 'restricted Satiksme analyzer session is empty' >&2
+        exit 1
+      }
+      [[ \"\$(stat -c '%u:%g:%a' '/srv/arbuzas/satiksme-chat-analyzer')\" == '0:0:700' ]] || {
+        echo 'Satiksme analyzer private root has unsafe ownership or mode' >&2
+        exit 1
+      }
+      [[ \"\$(stat -c '%u:%g:%a' '/srv/arbuzas/satiksme-chat-analyzer/state')\" == '0:0:700' ]] || {
+        echo 'Satiksme analyzer state directory has unsafe ownership or mode' >&2
+        exit 1
+      }
+      for path in \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-id.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/telegram-api-hash.secret' \
+        '/etc/arbuzas/secrets/satiksme-chat-analyzer/google-api-key.secret'; do
+        if [[ -e \"\${path}\" || -L \"\${path}\" ]]; then
+          assert_private_file \"\${path}\" '0:0:600'
+          [[ -s \"\${path}\" ]] || {
+            echo \"restricted Satiksme analyzer credential is empty: \${path}\" >&2
+            exit 1
+          }
+        fi
+      done
 
       if [[ '${scope}' == 'all' ]]; then
         history_match=\$(find '/etc/arbuzas/env' -mindepth 1 -maxdepth 1 \
@@ -8352,7 +8901,7 @@ rollback_remote_release() {
   else
     rollback_service_args="$(compose_all_service_args)"
   fi
-  remote_shell "
+  remote_root_shell "
     [[ -f '${remote_release_dir}/release.env' ]] || { echo 'missing release bundle: ${remote_release_dir}' >&2; exit 1; }
     [[ -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml' ]] || { echo 'missing rollback Compose file: ${remote_release_dir}' >&2; exit 1; }
     target_compose_args=(docker compose --project-name arbuzas --env-file '${remote_release_dir}/release.env' -f '${remote_release_dir}/infra/arbuzas/docker/compose.yml')
@@ -8549,12 +9098,6 @@ deploy_config_from_mirror() {
   if grep -Eq '^etc/arbuzas/(env/tiny-vless\.env|secrets/tiny-vless(/|$))' "${changed_paths_file}"; then
     tiny_vless_changed=1
   fi
-  if ! prepare_remote_ticket_runtime_permissions; then
-    if (( tiny_vless_changed == 1 )); then
-      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
-    fi
-    return 1
-  fi
   if affected_output="$(host_mirror_affected_services "${changed_paths_file}")"; then
     :
   else
@@ -8585,6 +9128,12 @@ deploy_config_from_mirror() {
       fi
     fi
   done
+  if ! prepare_remote_ticket_runtime_permissions --selected-services "${compose_services[@]}"; then
+    if (( tiny_vless_changed == 1 )); then
+      restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
+    fi
+    return 1
+  fi
   if (( satiksme_changed == 1 )) && ! preflight_remote_satiksme_private_configuration "${REMOTE_CURRENT_LINK}"; then
     if (( tiny_vless_changed == 1 )); then
       restore_remote_tiny_vless_config_rollback "${tiny_vless_config_rollback}" || true
@@ -8601,7 +9150,7 @@ deploy_config_from_mirror() {
     return 1
   }
   if (( ${#compose_services[@]} > 0 )); then
-    remote_shell "
+    remote_root_shell "
       cd '${REMOTE_CURRENT_LINK}'
       docker compose --project-name arbuzas --env-file '${REMOTE_CURRENT_LINK}/release.env' -f '${REMOTE_CURRENT_LINK}/infra/arbuzas/docker/compose.yml' up -d --pull never --force-recreate --no-deps${service_args}
     " || {

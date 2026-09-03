@@ -9,6 +9,7 @@ import { type Infer as __Infer } from "spacetimedb";
 import TicketremoteAdminScheduleTicketActionV3Reducer from "../ticketremote_admin_schedule_ticket_action_v_3_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
+import TicketremoteMemberRecordActivityTickReducer from "../ticketremote_member_record_activity_tick_reducer";
 import TicketremoteMemberRecoverStreamReducer from "../ticketremote_member_recover_stream_reducer";
 import TicketremoteMemberRefreshHdrBoostStateReducer from "../ticketremote_member_refresh_hdr_boost_state_reducer";
 import TicketremoteMemberRefreshHdrEngineStateReducer from "../ticketremote_member_refresh_hdr_engine_state_reducer";
@@ -20,12 +21,19 @@ import TicketremoteMemberRequestTicketActionV3Reducer from "../ticketremote_memb
 import TicketremoteMemberSetHdrPreferenceReducer from "../ticketremote_member_set_hdr_preference_reducer";
 import TicketremoteMemberSetLimitPreferenceReducer from "../ticketremote_member_set_limit_preference_reducer";
 import TicketremoteMemberSetStreamFocusReducer from "../ticketremote_member_set_stream_focus_reducer";
+import TicketremoteOwnerClearViviCredentialsReducer from "../ticketremote_owner_clear_vivi_credentials_reducer";
+import TicketremoteOwnerPrepareViviCredentialsReducer from "../ticketremote_owner_prepare_vivi_credentials_reducer";
+import TicketremoteOwnerRequestViviReauthReducer from "../ticketremote_owner_request_vivi_reauth_reducer";
+import TicketremoteOwnerRequestViviReauthFullResetReducer from "../ticketremote_owner_request_vivi_reauth_full_reset_reducer";
+import TicketremoteOwnerRequestViviReauthLogoutLoginReducer from "../ticketremote_owner_request_vivi_reauth_logout_login_reducer";
+import TicketremoteOwnerSaveViviCredentialsReducer from "../ticketremote_owner_save_vivi_credentials_reducer";
 import TicketremoteOwnerSetHdrDisplayBoostReducer from "../ticketremote_owner_set_hdr_display_boost_reducer";
 import TicketremoteOwnerSetHdrEngineReducer from "../ticketremote_owner_set_hdr_engine_reducer";
 
 export type TicketremoteAdminScheduleTicketActionV3Params = __Infer<typeof TicketremoteAdminScheduleTicketActionV3Reducer>;
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
+export type TicketremoteMemberRecordActivityTickParams = __Infer<typeof TicketremoteMemberRecordActivityTickReducer>;
 export type TicketremoteMemberRecoverStreamParams = __Infer<typeof TicketremoteMemberRecoverStreamReducer>;
 export type TicketremoteMemberRefreshHdrBoostStateParams = __Infer<typeof TicketremoteMemberRefreshHdrBoostStateReducer>;
 export type TicketremoteMemberRefreshHdrEngineStateParams = __Infer<typeof TicketremoteMemberRefreshHdrEngineStateReducer>;
@@ -37,6 +45,12 @@ export type TicketremoteMemberRequestTicketActionV3Params = __Infer<typeof Ticke
 export type TicketremoteMemberSetHdrPreferenceParams = __Infer<typeof TicketremoteMemberSetHdrPreferenceReducer>;
 export type TicketremoteMemberSetLimitPreferenceParams = __Infer<typeof TicketremoteMemberSetLimitPreferenceReducer>;
 export type TicketremoteMemberSetStreamFocusParams = __Infer<typeof TicketremoteMemberSetStreamFocusReducer>;
+export type TicketremoteOwnerClearViviCredentialsParams = __Infer<typeof TicketremoteOwnerClearViviCredentialsReducer>;
+export type TicketremoteOwnerPrepareViviCredentialsParams = __Infer<typeof TicketremoteOwnerPrepareViviCredentialsReducer>;
+export type TicketremoteOwnerRequestViviReauthParams = __Infer<typeof TicketremoteOwnerRequestViviReauthReducer>;
+export type TicketremoteOwnerRequestViviReauthFullResetParams = __Infer<typeof TicketremoteOwnerRequestViviReauthFullResetReducer>;
+export type TicketremoteOwnerRequestViviReauthLogoutLoginParams = __Infer<typeof TicketremoteOwnerRequestViviReauthLogoutLoginReducer>;
+export type TicketremoteOwnerSaveViviCredentialsParams = __Infer<typeof TicketremoteOwnerSaveViviCredentialsReducer>;
 export type TicketremoteOwnerSetHdrDisplayBoostParams = __Infer<typeof TicketremoteOwnerSetHdrDisplayBoostReducer>;
 export type TicketremoteOwnerSetHdrEngineParams = __Infer<typeof TicketremoteOwnerSetHdrEngineReducer>;
 

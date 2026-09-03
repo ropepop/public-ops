@@ -20,6 +20,11 @@ FILESYSTEM_LABEL="ARBUZAS_QBT"
 UNIT_NAME="srv-arbuzas-qbittorrent-storage.mount"
 UNIT_SOURCE="${SCRIPT_DIR}/etc/systemd/system/${UNIT_NAME}"
 UNIT_TARGET="/etc/systemd/system/${UNIT_NAME}"
+LOOP_MODULE_SOURCE="${SCRIPT_DIR}/../host-security/modules-load/arbuzas-qbittorrent-loop.conf"
+LOOP_MODULE_TARGET="/etc/modules-load.d/arbuzas-qbittorrent-loop.conf"
+LOOP_ORDERING_SOURCE="${SCRIPT_DIR}/../host-security/systemd/${UNIT_NAME}.d/10-loop-module-ordering.conf"
+LOOP_ORDERING_TARGET="/etc/systemd/system/${UNIT_NAME}.d/10-loop-module-ordering.conf"
+LOOP_ORDERING_CHANGED=0
 QBITTORRENT_UID=""
 QBITTORRENT_GID=""
 TEMP_IMAGE=""
@@ -64,9 +69,51 @@ directory_has_entries() {
 
 require_commands() {
   local command_name
-  for command_name in blkid cmp fallocate find findmnt flock losetup mkfs.ext4 stat systemctl tune2fs; do
+  for command_name in blkid cmp fallocate find findmnt flock losetup mkfs.ext4 modprobe stat systemctl tune2fs; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "missing required command: ${command_name}"
   done
+}
+
+verify_loop_module_policy() {
+  [[ -f "${LOOP_MODULE_SOURCE}" && ! -L "${LOOP_MODULE_SOURCE}" ]] \
+    || fail "missing loop module policy source: ${LOOP_MODULE_SOURCE}"
+  [[ -f "${LOOP_MODULE_TARGET}" && ! -L "${LOOP_MODULE_TARGET}" ]] \
+    || fail "missing installed loop module policy: ${LOOP_MODULE_TARGET}"
+  cmp -s "${LOOP_MODULE_SOURCE}" "${LOOP_MODULE_TARGET}" \
+    || fail "installed loop module policy differs from the release copy"
+  [[ -f "${LOOP_ORDERING_SOURCE}" && ! -L "${LOOP_ORDERING_SOURCE}" ]] \
+    || fail "missing loop ordering policy source: ${LOOP_ORDERING_SOURCE}"
+  [[ -f "${LOOP_ORDERING_TARGET}" && ! -L "${LOOP_ORDERING_TARGET}" ]] \
+    || fail "missing installed loop ordering policy: ${LOOP_ORDERING_TARGET}"
+  cmp -s "${LOOP_ORDERING_SOURCE}" "${LOOP_ORDERING_TARGET}" \
+    || fail "installed loop ordering policy differs from the release copy"
+  [[ -c /dev/loop-control ]] || fail "loop driver is not active: /dev/loop-control is absent"
+}
+
+install_loop_module_policy() {
+  [[ -f "${LOOP_MODULE_SOURCE}" && ! -L "${LOOP_MODULE_SOURCE}" ]] \
+    || fail "missing loop module policy source: ${LOOP_MODULE_SOURCE}"
+  if [[ -e "${LOOP_MODULE_TARGET}" || -L "${LOOP_MODULE_TARGET}" ]]; then
+    [[ -f "${LOOP_MODULE_TARGET}" && ! -L "${LOOP_MODULE_TARGET}" ]] \
+      || fail "refusing unsafe loop module policy path: ${LOOP_MODULE_TARGET}"
+  fi
+  install -d -m 0755 /etc/modules-load.d
+  if [[ ! -f "${LOOP_MODULE_TARGET}" ]] || ! cmp -s "${LOOP_MODULE_SOURCE}" "${LOOP_MODULE_TARGET}"; then
+    install -m 0644 "${LOOP_MODULE_SOURCE}" "${LOOP_MODULE_TARGET}"
+  fi
+  [[ -f "${LOOP_ORDERING_SOURCE}" && ! -L "${LOOP_ORDERING_SOURCE}" ]] \
+    || fail "missing loop ordering policy source: ${LOOP_ORDERING_SOURCE}"
+  if [[ -e "${LOOP_ORDERING_TARGET}" || -L "${LOOP_ORDERING_TARGET}" ]]; then
+    [[ -f "${LOOP_ORDERING_TARGET}" && ! -L "${LOOP_ORDERING_TARGET}" ]] \
+      || fail "refusing unsafe loop ordering policy path: ${LOOP_ORDERING_TARGET}"
+  fi
+  install -d -m 0755 "$(dirname "${LOOP_ORDERING_TARGET}")"
+  if [[ ! -f "${LOOP_ORDERING_TARGET}" ]] || ! cmp -s "${LOOP_ORDERING_SOURCE}" "${LOOP_ORDERING_TARGET}"; then
+    install -m 0644 "${LOOP_ORDERING_SOURCE}" "${LOOP_ORDERING_TARGET}"
+    LOOP_ORDERING_CHANGED=1
+  fi
+  modprobe loop
+  verify_loop_module_policy
 }
 
 acquire_lock() {
@@ -275,14 +322,14 @@ install_mount() {
     install -m 0644 "${UNIT_SOURCE}" "${UNIT_TARGET}"
     unit_changed=1
   fi
-  if (( unit_changed == 1 )); then
+  if (( unit_changed == 1 || LOOP_ORDERING_CHANGED == 1 )); then
     systemctl daemon-reload
   fi
   if ! systemctl is-enabled --quiet "${UNIT_NAME}"; then
     systemctl enable "${UNIT_NAME}" >/dev/null
     enablement_changed=1
   fi
-  if (( unit_changed == 1 || enablement_changed == 1 )); then
+  if (( unit_changed == 1 || enablement_changed == 1 || LOOP_ORDERING_CHANGED == 1 )); then
     # systemd on this host reapplies infinity when runc has not persisted a
     # zero-valued transient scope property. Stabilize every running container
     # that already declares memory-swap equal to memory without restarting it.
@@ -344,6 +391,7 @@ apply_runtime_permissions() {
 }
 
 prepare_media_consumer() {
+  verify_loop_module_policy
   verify_image
   verify_active_mount
   verify_mount_unit
@@ -359,6 +407,7 @@ main() {
   acquire_lock
 
   if [[ "${ACTION}" == "check" ]]; then
+    verify_loop_module_policy
     verify_image
     verify_active_mount
     verify_mount_unit
@@ -373,6 +422,7 @@ main() {
     return
   fi
 
+  install_loop_module_policy
   prepare_owned_directories
   if [[ ! -e "${IMAGE_FILE}" ]]; then
     create_image

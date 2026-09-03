@@ -145,7 +145,7 @@ func TestExplicitTicketActionsCanSupersedeBackgroundVisualProof(t *testing.T) {
 	for _, required := range []string{
 		"const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy()",
 		"const blockingBusy = busy && !backgroundProofBusy;",
-		"spacetimeStateFresh && !blockingBusy && !controlBusy",
+		"spacetimeStateFresh && hdrControlReady && !blockingBusy && !controlBusy",
 		"ticketActionV3Busy(currentAction) && !backgroundProofBusy",
 		"Pašreizējais skats tiek pārbaudīts fonā; atvēršanas darbības ir pieejamas.",
 	} {
@@ -168,7 +168,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"statusView === 'activated_current'",
 		"statusView === 'recent_activated'",
 		"Atvērtā biļete ir veiksmīgi reģistrēta un vizuāli apstiprināta.",
-		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy, registerReady && Boolean(region))",
+		"hdrControlReady && registerReady && Boolean(region)",
 		"ticketSliderRegionV3ForAction(",
 		"ticketSliderRegionV3Layout(",
 	} {
@@ -276,7 +276,6 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"ticketLocalRegisterSlider.addEventListener('lostpointercapture'",
 		"ticketLocalRegisterSlider.setPointerCapture(",
 		"ticketLocalRegisterSlider.releasePointerCapture(",
-		"event.preventDefault()",
 	} {
 		if strings.Contains(panelSlider, forbidden) {
 			t.Fatalf("slider gesture handling must remain element-local without manual pointer capture, found %q", forbidden)
@@ -287,6 +286,10 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 		"  ticketLocalRegisterSlider.addEventListener('input'")
 	if !strings.Contains(pointerMove, "}, { passive: true });") {
 		t.Fatal("the slider-local direction observer must remain passive")
+	}
+	if !strings.Contains(panelSlider, "if (!revealAuthoritativeSDRForConsequentialControl()) {") ||
+		!strings.Contains(panelSlider, "event.preventDefault();") {
+		t.Fatal("a passive HDR holdover must cancel slider entry without starting a phone action")
 	}
 	secondaryPointer := substringBetween(t, panelSlider,
 		"if (event.isPrimary === false) {",
@@ -364,7 +367,7 @@ func TestControlCodeBrowserGateIncludesEveryActiveV3Action(t *testing.T) {
 	}
 	for _, required := range []string{
 		"const sliderOwnsHotspot = ticketRegisterOverlayOccupiesHotspot()",
-		"const hotspotUnavailable = busy || limitBlocked || sliderOwnsHotspot || codeDialogOpen || !codeResultArea.hidden",
+		"const hotspotUnavailable = busy || limitBlocked || !hdrControlReady || sliderOwnsHotspot ||",
 		"controlCodeHotspot.disabled = hotspotUnavailable",
 	} {
 		if !strings.Contains(availability, required) {
@@ -395,6 +398,29 @@ func TestSuccessfulRedetectReplacesTheStaleBusyMessage(t *testing.T) {
 	if strings.Index(resultRendering, "Jaunākā biļete ir veiksmīgi atkārtoti noteikta.") >
 		strings.Index(resultRendering, "} else if (statusBusy) {") {
 		t.Fatal("redetect success must be rendered before the generic busy fallback")
+	}
+}
+
+func TestEmptyRedetectRendersAnExpectedNoTicketOutcome(t *testing.T) {
+	source := ticketAppSource(t)
+	render := substringBetween(t, source,
+		"function renderTicketActionV3Controls(state = currentState) {",
+		"  async function requestTicketActionV3(")
+	for _, required := range []string{
+		"ticketActionV3IsExpectedEmptyRedetect(statusAction)",
+		"Biļetes nav atrastas.",
+		"Biļetes darbība droši apstājās bez nepierādītas darbības.",
+	} {
+		if !strings.Contains(render, required) {
+			t.Fatalf("empty-ticket result rendering missing %q", required)
+		}
+	}
+	resultRendering := substringBetween(t, render,
+		"if (ticketActionV3LastUserMessage)",
+		"    updateControlCodeSubmitAvailability()")
+	if strings.Index(resultRendering, "Biļetes nav atrastas.") >
+		strings.Index(resultRendering, "Biļetes darbība droši apstājās bez nepierādītas darbības.") {
+		t.Fatal("the expected empty-ticket result must be rendered before the generic failure fallback")
 	}
 }
 
@@ -438,17 +464,42 @@ func TestAdminRedetectionUsesAuthenticatedDirectV3Reducers(t *testing.T) {
 		"fetch('/api/v1/auth/session'",
 		"window.TicketSpacetime.create({",
 		"sessionState.phone && sessionState.phone.id",
+		"const accountScopeId = String(session.accountScopeId || '')",
+		"accountScopeId",
 		"client.requestTicketActionV3(",
 		"adminRedetectTicketActionV3Args(",
 		"client.scheduleTicketActionV3(",
 		"adminScheduleTicketActionV3Args({",
+		"async function submitImmediateRedetect(form)",
+		"exactTicketAction(state, actionId)",
+		"adminRedetectTicketActionV3TerminalMessage(action)",
+		"ADMIN_REDETECT_RESULT_TIMEOUT_MILLIS",
+		"window.addEventListener('pagehide', pagehide, { once: true })",
+		"void submitImmediateRedetect(immediateForm)",
 		"preferenceClient.setLimitPreference(requested)",
 		"state && state.memberLimits",
-		"client.disconnect(false)",
+		"current.disconnect(false)",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("direct admin v3 flow missing %q", required)
 		}
+	}
+	immediate := substringBetween(t, source,
+		"async function submitImmediateRedetect(form) {",
+		"  if (immediateForm) {")
+	for _, required := range []string{
+		"const actionId = requestId(form, 'admin_redetect')",
+		"finish(terminalMessage, true)",
+		"if (button) button.disabled = false",
+		"current.disconnect(false)",
+		"The phone result was not received in time.",
+	} {
+		if !strings.Contains(immediate, required) {
+			t.Fatalf("immediate admin result flow missing %q", required)
+		}
+	}
+	if strings.Contains(immediate, "window.location.reload()") {
+		t.Fatal("immediate admin redetection must wait inline for its authoritative result instead of reloading")
 	}
 	for _, forbidden := range []string{
 		"fetch('/api/v1/admin/ticket/reselect-latest'",
@@ -460,7 +511,7 @@ func TestAdminRedetectionUsesAuthenticatedDirectV3Reducers(t *testing.T) {
 		}
 	}
 	built := ticketRemoteSourceFile(t, "internal", "web", "static", "admin-schedule.js")
-	for _, required := range []string{"requestTicketActionV3", "scheduleTicketActionV3", "setLimitPreference", "redetect_latest", "ticket_remote_admin", "ticket_action_v3_"} {
+	for _, required := range []string{"requestTicketActionV3", "scheduleTicketActionV3", "setLimitPreference", "accountScopeId", "redetect_latest", "ticket_remote_admin", "ticket_action_v3_"} {
 		if !strings.Contains(built, required) {
 			t.Fatalf("built admin v3 client missing %q; run make web-client-build", required)
 		}
@@ -794,8 +845,8 @@ func TestTicketStateFailsClosedUntilFreshSnapshotAndNeverShowsOldActivation(t *t
 		"renderTicketInteraction(spacetimeStateFresh ? state.ticketInteraction : null);",
 		"const proofReady = spacetimeStateFresh && ticketActionV3RegistrationProofIsFresh(action);",
 		"const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);",
-		"setTicketButtonGate(activateTicketButton, !blockingBusy && !controlBusy && registerReady, registerReason);",
-		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy, registerReady && Boolean(region));",
+		"hdrControlReady && !blockingBusy && !controlBusy && registerReady",
+		"hdrControlReady && registerReady && Boolean(region)",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("Ticket state freshness guard missing %q", required)

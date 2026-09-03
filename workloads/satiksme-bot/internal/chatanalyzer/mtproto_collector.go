@@ -401,7 +401,9 @@ func resolveUsernamePeer(ctx context.Context, api *tg.Client, raw string) (tg.In
 	if username == "" {
 		return nil, "", fmt.Errorf("telegram username is empty")
 	}
-	resolved, err := api.ContactsResolveUsername(ctx, username)
+	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+		Username: username,
+	})
 	if err != nil {
 		return nil, "", err
 	}

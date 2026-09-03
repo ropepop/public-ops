@@ -1044,25 +1044,19 @@ func (s *SpacetimeStore) ListAllFavoriteRoutes(ctx context.Context) ([]domain.Fa
 }
 
 func (s *SpacetimeStore) InsertReportEvent(ctx context.Context, e domain.ReportEvent) error {
-	activity, err := s.ensureTrainActivity(ctx, e.TrainInstanceID, e.CreatedAt)
-	if err != nil {
-		return err
-	}
-	rider, err := s.ensureRider(ctx, e.UserID)
-	if err != nil {
-		return err
-	}
-	activity.Timeline = append(activity.Timeline, spacetime.TrainbotActivityEvent{
-		ID:              strings.TrimSpace(e.ID),
-		Kind:            "report",
-		StableID:        spacetime.StableIDForTelegramUser(e.UserID),
-		Nickname:        rider.Nickname,
-		Name:            reportSignalLabel(e.Signal),
-		CreatedAt:       e.CreatedAt.UTC().Format(time.RFC3339),
-		Signal:          string(e.Signal),
-		TrainInstanceID: strings.TrimSpace(e.TrainInstanceID),
-	})
-	return s.client.ServicePutActivity(ctx, *activity)
+	return fmt.Errorf("unguarded report insertion is unavailable for SpacetimeDB; use SubmitReportEvent")
+}
+
+func (s *SpacetimeStore) SubmitReportEvent(ctx context.Context, e domain.ReportEvent, policy ReportMutationPolicy) error {
+	err := s.client.ServiceSubmitReportEvent(
+		ctx,
+		e.ID,
+		e.TrainInstanceID,
+		spacetime.StableIDForTelegramUser(e.UserID),
+		domain.GenericNickname(e.UserID),
+		string(e.Signal),
+	)
+	return mapSpacetimeMutationError(err, policy.Cooldown, policy.ActionWindow)
 }
 
 func (s *SpacetimeStore) GetLastReportByUserTrain(ctx context.Context, userID int64, trainID string) (*domain.ReportEvent, error) {
@@ -1117,39 +1111,50 @@ func (s *SpacetimeStore) ListRecentReportEvents(ctx context.Context, since time.
 	return trimReports(out, limit), nil
 }
 
+func (s *SpacetimeStore) CountReportActionsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	stableID := spacetime.StableIDForTelegramUser(userID)
+	activities, err := s.client.ServiceListActivities(ctx, spacetime.ListActivitiesFilter{Since: &since})
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, activity := range activities {
+		for _, event := range activity.Timeline {
+			if event.StableID != stableID || (event.Kind != "report" && event.Kind != "station_sighting" && event.Kind != "location_report") {
+				continue
+			}
+			createdAt, err := time.Parse(time.RFC3339, event.CreatedAt)
+			if err != nil {
+				return 0, err
+			}
+			if !createdAt.Before(since.UTC()) {
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
 func (s *SpacetimeStore) InsertStationSighting(ctx context.Context, e domain.StationSighting) error {
-	activity, err := s.ensureStationActivity(ctx, e.StationID, e.StationName, e.CreatedAt)
-	if err != nil {
-		return err
-	}
-	rider, err := s.ensureRider(ctx, e.UserID)
-	if err != nil {
-		return err
-	}
-	destinationStationID := ""
-	if e.DestinationStationID != nil {
-		destinationStationID = strings.TrimSpace(*e.DestinationStationID)
-	}
-	matchedTrainID := ""
-	if e.MatchedTrainInstanceID != nil {
-		matchedTrainID = strings.TrimSpace(*e.MatchedTrainInstanceID)
-	}
-	stationName := firstNonEmpty(strings.TrimSpace(e.StationName), s.stationName(ctx, e.StationID))
+	return fmt.Errorf("unguarded station sighting insertion is unavailable for SpacetimeDB; use SubmitStationSighting")
+}
+
+func (s *SpacetimeStore) SubmitStationSighting(ctx context.Context, e domain.StationSighting, policy ReportMutationPolicy) error {
+	destinationStationID := trimStringValue(e.DestinationStationID)
+	stationName := firstNonEmpty(strings.TrimSpace(e.StationName), s.stationName(ctx, e.StationID), strings.TrimSpace(e.StationID))
 	destinationName := firstNonEmpty(strings.TrimSpace(e.DestinationStationName), s.stationName(ctx, destinationStationID))
-	activity.Timeline = append(activity.Timeline, spacetime.TrainbotActivityEvent{
-		ID:                     strings.TrimSpace(e.ID),
-		Kind:                   "station_sighting",
-		StableID:               spacetime.StableIDForTelegramUser(e.UserID),
-		Nickname:               rider.Nickname,
-		Name:                   stationSightingLabel(destinationName),
-		CreatedAt:              e.CreatedAt.UTC().Format(time.RFC3339),
-		StationID:              strings.TrimSpace(e.StationID),
-		StationName:            stationName,
-		DestinationStationID:   destinationStationID,
-		DestinationStationName: destinationName,
-		MatchedTrainInstanceID: matchedTrainID,
-	})
-	return s.client.ServicePutActivity(ctx, *activity)
+	err := s.client.ServiceSubmitStationSighting(
+		ctx,
+		e.ID,
+		e.StationID,
+		stationName,
+		destinationStationID,
+		destinationName,
+		trimStringValue(e.MatchedTrainInstanceID),
+		spacetime.StableIDForTelegramUser(e.UserID),
+		domain.GenericNickname(e.UserID),
+	)
+	return mapSpacetimeMutationError(err, policy.Cooldown, policy.ActionWindow)
 }
 
 func (s *SpacetimeStore) GetLastStationSightingByUserScope(ctx context.Context, userID int64, stationID string, destinationStationID *string) (*domain.StationSighting, error) {
@@ -1203,46 +1208,24 @@ func (s *SpacetimeStore) ListRecentStationSightingsByTrain(ctx context.Context, 
 }
 
 func (s *SpacetimeStore) InsertLocationReport(ctx context.Context, e domain.LocationReport) error {
-	var (
-		activity *spacetime.TrainbotActivityRow
-		err      error
-	)
-	scope := strings.TrimSpace(e.Scope)
-	if scope == "area" {
-		activity, err = s.ensureAreaActivity(ctx, e.SubjectID, e.SubjectName, e.CreatedAt)
-	} else {
-		activity, err = s.ensureStationActivity(ctx, e.SubjectID, e.SubjectName, e.CreatedAt)
+	return fmt.Errorf("unguarded location report insertion is unavailable for SpacetimeDB; use SubmitLocationReport")
+}
+
+func (s *SpacetimeStore) SubmitLocationReport(ctx context.Context, e domain.LocationReport, policy ReportMutationPolicy) error {
+	payload := map[string]any{
+		"id":           strings.TrimSpace(e.ID),
+		"scope":        strings.TrimSpace(e.Scope),
+		"subjectId":    strings.TrimSpace(e.SubjectID),
+		"subjectName":  strings.TrimSpace(e.SubjectName),
+		"latitude":     e.Latitude,
+		"longitude":    e.Longitude,
+		"radiusMeters": e.RadiusMeters,
+		"description":  strings.TrimSpace(e.Description),
+		"stableId":     spacetime.StableIDForTelegramUser(e.UserID),
+		"nickname":     domain.GenericNickname(e.UserID),
 	}
-	if err != nil {
-		return err
-	}
-	rider, err := s.ensureRider(ctx, e.UserID)
-	if err != nil {
-		return err
-	}
-	stationID := ""
-	stationName := ""
-	if scope != "area" {
-		stationID = strings.TrimSpace(e.SubjectID)
-		stationName = firstNonEmpty(strings.TrimSpace(e.SubjectName), s.stationName(ctx, stationID))
-	}
-	activity.Timeline = append(activity.Timeline, spacetime.TrainbotActivityEvent{
-		ID:                  strings.TrimSpace(e.ID),
-		Kind:                "location_report",
-		StableID:            spacetime.StableIDForTelegramUser(e.UserID),
-		Nickname:            rider.Nickname,
-		Name:                locationReportName(scope),
-		Detail:              strings.TrimSpace(e.Description),
-		CreatedAt:           e.CreatedAt.UTC().Format(time.RFC3339),
-		Signal:              encodeLocationReportSignal(e.Latitude, e.Longitude, e.RadiusMeters),
-		StationID:           stationID,
-		StationName:         stationName,
-		Latitude:            copyFloatPtr(e.Latitude),
-		Longitude:           copyFloatPtr(e.Longitude),
-		RadiusMeters:        e.RadiusMeters,
-		LocationDescription: strings.TrimSpace(e.Description),
-	})
-	return s.client.ServicePutActivity(ctx, *activity)
+	err := s.client.ServiceSubmitLocationReport(ctx, payload)
+	return mapSpacetimeMutationError(err, policy.Cooldown, policy.ActionWindow)
 }
 
 func (s *SpacetimeStore) GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error) {
@@ -1291,38 +1274,23 @@ func (s *SpacetimeStore) ListRecentLocationReports(ctx context.Context, since ti
 }
 
 func (s *SpacetimeStore) UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error {
-	activity, err := s.ensureIncidentActivity(ctx, vote.IncidentID, vote.UpdatedAt)
-	if err != nil {
-		return err
-	}
-	rider, err := s.ensureRider(ctx, vote.UserID)
-	if err != nil {
-		return err
-	}
-	createdAt := vote.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = vote.UpdatedAt
-	}
-	if createdAt.IsZero() {
-		createdAt = time.Now().UTC()
-	}
-	updatedAt := vote.UpdatedAt
-	if updatedAt.IsZero() {
-		updatedAt = createdAt
-	}
-	activity.Votes = filterVotes(activity.Votes, spacetime.StableIDForTelegramUser(vote.UserID))
-	activity.Votes = append(activity.Votes, spacetime.TrainbotActivityVote{
-		StableID:  spacetime.StableIDForTelegramUser(vote.UserID),
-		Nickname:  firstNonEmpty(strings.TrimSpace(vote.Nickname), rider.Nickname),
-		Value:     string(vote.Value),
-		CreatedAt: createdAt.UTC().Format(time.RFC3339),
-		UpdatedAt: updatedAt.UTC().Format(time.RFC3339),
-	})
-	return s.client.ServicePutActivity(ctx, *activity)
+	return fmt.Errorf("split incident vote updates are unavailable for SpacetimeDB; use SubmitIncidentVote")
 }
 
-func (s *SpacetimeStore) InsertIncidentVoteEvent(context.Context, domain.IncidentVoteEvent) error {
-	return nil
+func (s *SpacetimeStore) InsertIncidentVoteEvent(ctx context.Context, event domain.IncidentVoteEvent) error {
+	return fmt.Errorf("split incident vote accounting is unavailable for SpacetimeDB; use SubmitIncidentVote")
+}
+
+func (s *SpacetimeStore) SubmitIncidentVote(ctx context.Context, vote domain.IncidentVote, event domain.IncidentVoteEvent, policy VoteMutationPolicy) error {
+	err := s.client.ServiceSubmitIncidentVote(
+		ctx,
+		event.ID,
+		vote.IncidentID,
+		spacetime.StableIDForTelegramUser(vote.UserID),
+		firstNonEmpty(strings.TrimSpace(vote.Nickname), domain.GenericNickname(vote.UserID)),
+		string(vote.Value),
+	)
+	return mapSpacetimeMutationError(err, policy.ChangeWindow, policy.ActionWindow)
 }
 
 func (s *SpacetimeStore) ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error) {
@@ -1367,23 +1335,49 @@ func (s *SpacetimeStore) ListIncidentVoteEvents(ctx context.Context, incidentID 
 	return trimVoteEvents(out, limit), nil
 }
 
+func (s *SpacetimeStore) CountIncidentVoteEventsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	return s.client.ServiceCountIncidentVoteEvents(ctx, spacetime.StableIDForTelegramUser(userID), since)
+}
+
 func (s *SpacetimeStore) InsertIncidentComment(ctx context.Context, comment domain.IncidentComment) error {
-	activity, err := s.ensureIncidentActivity(ctx, comment.IncidentID, comment.CreatedAt)
-	if err != nil {
+	return fmt.Errorf("unguarded incident comment insertion is unavailable for SpacetimeDB; use SubmitIncidentComment")
+}
+
+func (s *SpacetimeStore) SubmitIncidentComment(ctx context.Context, comment domain.IncidentComment, policy CommentMutationPolicy) error {
+	err := s.client.ServiceSubmitIncidentComment(
+		ctx,
+		comment.ID,
+		comment.IncidentID,
+		spacetime.StableIDForTelegramUser(comment.UserID),
+		firstNonEmpty(strings.TrimSpace(comment.Nickname), domain.GenericNickname(comment.UserID)),
+		comment.Body,
+	)
+	return mapSpacetimeMutationError(err, policy.ActionWindow, policy.ActionWindow)
+}
+
+func mapSpacetimeMutationError(err error, cooldown time.Duration, actionWindow time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "duplicate report ignored") || strings.Contains(message, "duplicate station sighting ignored"):
+		return &MutationRejectedError{Reason: MutationReportDuplicate, Remaining: cooldown}
+	case strings.Contains(message, "report cooldown active") || strings.Contains(message, "station sighting cooldown active"):
+		return &MutationRejectedError{Reason: MutationReportCooldown, Remaining: cooldown}
+	case strings.Contains(message, "too many reports"):
+		return &MutationRejectedError{Reason: MutationReportActionLimit, Remaining: actionWindow}
+	case strings.Contains(message, "vote cooldown active"):
+		return &MutationRejectedError{Reason: MutationVoteCooldown, Remaining: cooldown}
+	case strings.Contains(message, "too many votes"):
+		return &MutationRejectedError{Reason: MutationVoteActionLimit, Remaining: actionWindow}
+	case strings.Contains(message, "too many comments on this incident"):
+		return &MutationRejectedError{Reason: MutationIncidentCommentLimit, Remaining: actionWindow}
+	case strings.Contains(message, "too many comments"):
+		return &MutationRejectedError{Reason: MutationCommentActionLimit, Remaining: actionWindow}
+	default:
 		return err
 	}
-	rider, err := s.ensureRider(ctx, comment.UserID)
-	if err != nil {
-		return err
-	}
-	activity.Comments = append(activity.Comments, spacetime.TrainbotActivityComment{
-		ID:        strings.TrimSpace(comment.ID),
-		StableID:  spacetime.StableIDForTelegramUser(comment.UserID),
-		Nickname:  firstNonEmpty(strings.TrimSpace(comment.Nickname), rider.Nickname),
-		Body:      strings.TrimSpace(comment.Body),
-		CreatedAt: comment.CreatedAt.UTC().Format(time.RFC3339),
-	})
-	return s.client.ServicePutActivity(ctx, *activity)
 }
 
 func (s *SpacetimeStore) ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]domain.IncidentComment, error) {

@@ -10,8 +10,17 @@ import { ScheduleAt } from 'spacetimedb';
 
 const REPORT_COOLDOWN_MS = 3 * 60 * 1000;
 const REPORT_DEDUPE_MS = 90 * 1000;
+const REPORT_ACTION_WINDOW_MS = 30 * 60 * 1000;
+const REPORT_ACTION_LIMIT = 5;
 const STATION_SIGHTING_COOLDOWN_MS = 3 * 60 * 1000;
 const STATION_SIGHTING_DEDUPE_MS = 90 * 1000;
+const VOTE_ACTION_WINDOW_MS = 60 * 60 * 1000;
+const VOTE_ACTION_LIMIT = 20;
+const VOTE_CHANGE_COOLDOWN_MS = 30 * 60 * 1000;
+const COMMENT_ACTION_WINDOW_MS = 60 * 60 * 1000;
+const COMMENT_ACTION_LIMIT = 10;
+const INCIDENT_COMMENT_ACTION_LIMIT = 50;
+const PUBLIC_INCIDENT_ACTOR_LABEL = 'Anonymous';
 const UNDO_CHECKOUT_WINDOW_MS = 10 * 1000;
 const CHECKIN_GRACE_MS = 10 * 60 * 1000;
 const CHECKIN_FALLBACK_WINDOW_MS = 6 * 60 * 60 * 1000;
@@ -158,7 +167,9 @@ const activityVoteDoc = t.object('TrainbotActivityVoteDoc', {
 
 const timelineBucketDoc = t.object('TrainbotTimelineBucketDoc', {
   at: t.string(),
-  eventLabel: t.string(),
+  // Compatibility: production's persisted public schema calls this field
+  // `signal`. It contains only the human-readable public label.
+  signal: t.string(),
   count: t.u32(),
 });
 
@@ -373,7 +384,8 @@ const trainbot_trip_timeline_bucket = table(
     trainId: t.string().index(),
     serviceDate: t.string().index(),
     at: t.string(),
-    eventLabel: t.string(),
+    // Keep the established column name and position for additive publishes.
+    signal: t.string(),
     count: t.u32(),
   }
 );
@@ -435,6 +447,8 @@ const trainbot_incident_event = table(
     detail: t.string(),
     nickname: t.string(),
     createdAt: t.string(),
+    // Retained for production schema compatibility; public rows keep it blank.
+    signal: t.string(),
   }
 );
 
@@ -526,6 +540,8 @@ const trainbot_trip_public = table(
     toStationName: t.string(),
     departureAt: t.string(),
     arrivalAt: t.string(),
+    // Retained for production schema compatibility; public rows keep it blank.
+    sourceVersion: t.string(),
     state: t.string(),
     confidence: t.string(),
     uniqueReporters: t.u32(),
@@ -653,6 +669,17 @@ const trainbot_incident_vote = table(
   }
 );
 
+const trainbot_incident_vote_event = table(
+  { name: named('incident_vote_event') },
+  {
+    id: t.string().primaryKey(),
+    incidentId: t.string().index(),
+    stableId: t.string().index(),
+    value: t.string(),
+    createdAt: t.string().index(),
+  }
+);
+
 const spacetimedb: any = schema(
   {
     trainbot_service_day,
@@ -689,6 +716,7 @@ const spacetimedb: any = schema(
     trainbot_train_subscription,
     trainbot_recent_action_state,
     trainbot_incident_vote,
+    trainbot_incident_vote_event,
   },
   { CASE_CONVERSION_POLICY: CaseConversionPolicy.None }
 );
@@ -1331,6 +1359,7 @@ function deleteProjectedRiderState(tx: any, stableId: string): void {
   clearRowsByStableId(tx.db.trainbot_train_mute, cleanStableId);
   clearRowsByStableId(tx.db.trainbot_train_subscription, cleanStableId);
   clearRowsByStableId(tx.db.trainbot_incident_vote, cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_incident_vote_event, cleanStableId);
   deleteJobsWithPrefix(tx, `rider:${cleanStableId}|`);
   deleteJobsWithPrefix(tx, routeCheckInJobPrefix(cleanStableId));
   tx.db.trainbot_rider.stableId.delete(cleanStableId);
@@ -1520,6 +1549,7 @@ function resetTestRider(tx: any, stableId: string): any {
     recentActionState: { updatedAt: currentAt },
   });
   tx.db.trainbot_route_checkin.stableId.delete(cleanStableId);
+  clearRowsByStableId(tx.db.trainbot_incident_vote_event, cleanStableId);
   deleteJobsWithPrefix(tx, `route-checkin:${cleanStableId}|`);
   scheduleRiderExpiryJobs(tx, rider);
 
@@ -2273,17 +2303,16 @@ function publicTimelineEventLabel(bucket: any): string {
 function publicTimelineBucket(bucket: any): any {
   return {
     at: asString(bucket?.at).trim(),
-    eventLabel: publicTimelineEventLabel(bucket),
+    signal: publicTimelineEventLabel(bucket),
     count: Number(bucket?.count) || 0,
   };
 }
 
 function publicTimelinePayload(bucket: any): any {
-  const projected = publicTimelineBucket(bucket);
   return {
-    at: projected.at,
-    eventLabel: projected.eventLabel,
-    count: Number(projected.count) || 0,
+    at: asString(bucket?.at).trim(),
+    eventLabel: publicTimelineEventLabel(bucket),
+    count: Number(bucket?.count) || 0,
   };
 }
 
@@ -2298,6 +2327,7 @@ function publicTripRow(row: any): any {
     toStationName: asString(item.toStationName).trim(),
     departureAt: asString(item.departureAt).trim(),
     arrivalAt: asString(item.arrivalAt).trim(),
+    sourceVersion: '',
     state: asString(item.state).trim(),
     confidence: asString(item.confidence).trim(),
     uniqueReporters: publicReporterCount(Number(item.uniqueReporters) || 0),
@@ -2749,8 +2779,8 @@ function incidentSummaryPayload(tx: any, activity: any, viewerStableId: string) 
     lastReportAt: activity.summary.lastReportAt,
     lastActivityName: activity.summary.lastActivityName,
     lastActivityAt: activity.summary.lastActivityAt,
-    lastActivityActor: activity.summary.lastActivityActor,
-    lastReporter: activity.summary.lastReporter,
+    lastActivityActor: asString(activity.summary.lastActivityActor).trim() ? PUBLIC_INCIDENT_ACTOR_LABEL : '',
+    lastReporter: asString(activity.summary.lastReporter).trim() ? PUBLIC_INCIDENT_ACTOR_LABEL : '',
     commentCount: Array.isArray(activity.comments) ? activity.comments.length : 0,
     votes: activityVoteSummary(activity, viewerStableId),
     location: publicIncidentLocationPayload(activity),
@@ -2791,12 +2821,12 @@ function incidentDetailPayload(tx: any, incidentId: string) {
     kind: item.kind === 'station_sighting' || item.kind === 'location_report' ? 'report' : item.kind,
     name: item.name,
     detail: publicIncidentEventDetail(activity, item),
-    nickname: item.nickname,
+    nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
     createdAt: item.createdAt,
   }));
   const sanitizedComments = (activity.comments || []).map((item: any, index: number) => ({
     id: publicOpaqueId('comment', activity.id, item.createdAt, index),
-    nickname: item.nickname,
+    nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
     body: item.body,
     createdAt: item.createdAt,
   }));
@@ -2814,7 +2844,7 @@ function incidentDetailPayload(tx: any, incidentId: string) {
       id: publicOpaqueId('vote-event', activity.id, item.updatedAt, index),
       kind: 'vote',
       name: incidentVoteEventLabel(item.value),
-      nickname: item.nickname,
+      nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
       createdAt: item.updatedAt,
     }));
   const events = [...timelineEvents, ...commentEvents, ...voteEvents];
@@ -2833,41 +2863,60 @@ function appendTimelineEvent(activity: any, event: any): any {
   );
 }
 
-function trainActivityFor(tx: any, trainId: string): any {
-  const train = trainById(tx, trainId);
-  if (!train) {
-    return null;
-  }
-  const id = trainActivityId(trainId, train.serviceDate);
-  return tx.db.trainbot_activity.id.find(id) || null;
-}
-
-function latestReportFor(tx: any, stableId: string, trainId: string): any | null {
-  const activity = trainActivityFor(tx, trainId);
-  if (!activity) {
-    return null;
-  }
-  for (const event of activity.timeline || []) {
-    if (event.kind === 'report' && event.stableId === stableId) {
-      return event;
+function countReportActionsForStableIdSince(tx: any, stableId: string, sinceMs: number): number {
+  let count = 0;
+  for (const activity of rowsFrom(tx.db.trainbot_activity.iter())) {
+    for (const event of activity.timeline || []) {
+      const kind = asString(event.kind).trim();
+      if (asString(event.stableId).trim() !== stableId.trim()
+        || (kind !== 'report' && kind !== 'station_sighting' && kind !== 'location_report')) {
+        continue;
+      }
+      const createdMs = parseISO(asString(event.createdAt).trim())?.getTime() || 0;
+      if (createdMs >= sinceMs) {
+        count += 1;
+      }
     }
   }
-  return null;
+  return count;
 }
 
-function latestStationSightingFor(tx: any, stableId: string, stationId: string, destinationStationId: string | undefined): any | null {
-  const activity = tx.db.trainbot_activity.id.find(stationActivityId(stationId, activeServiceDate(tx))) || null;
-  if (!activity) {
-    return null;
-  }
-  for (const event of activity.timeline || []) {
-    const currentDestination = asString(event.destinationStationId).trim();
-    if (event.kind !== 'station_sighting' || event.stableId !== stableId || currentDestination !== (destinationStationId || '')) {
-      continue;
+function countVoteActionsForStableIdSince(tx: any, stableId: string, sinceMs: number): number {
+  return rowsFrom(tx.db.trainbot_incident_vote_event.stableId.filter(stableId.trim()))
+    .filter((event) => (parseISO(asString(event.createdAt).trim())?.getTime() || 0) >= sinceMs)
+    .length;
+}
+
+function countCommentsForStableIdSince(tx: any, stableId: string, sinceMs: number): number {
+  let count = 0;
+  for (const activity of rowsFrom(tx.db.trainbot_activity.iter())) {
+    for (const comment of activity.comments || []) {
+      if (asString(comment.stableId).trim() !== stableId.trim()) {
+        continue;
+      }
+      const createdMs = parseISO(asString(comment.createdAt).trim())?.getTime() || 0;
+      if (createdMs >= sinceMs) {
+        count += 1;
+      }
     }
-    return event;
   }
-  return null;
+  return count;
+}
+
+function countCommentsForIncidentSince(activity: any, sinceMs: number): number {
+  return (activity.comments || [])
+    .filter((comment: any) => (parseISO(asString(comment.createdAt).trim())?.getTime() || 0) >= sinceMs)
+    .length;
+}
+
+function voteChangeCooldownSeconds(tx: any, incidentId: string, stableId: string): number {
+  const current = tx.db.trainbot_incident_vote.id.find(`${incidentId.trim()}|${stableId.trim()}`);
+  if (!current) {
+    return 0;
+  }
+  const updatedMs = parseISO(asString(current.updatedAt).trim())?.getTime() || 0;
+  const remainingMs = VOTE_CHANGE_COOLDOWN_MS - (nowDate(tx).getTime() - updatedMs);
+  return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0;
 }
 
 function ensureTrainActivity(tx: any, trainId: string): any {
@@ -2908,6 +2957,156 @@ function ensureStationActivity(tx: any, stationId: string, stationName: string, 
     comments: [],
     votes: [],
   });
+}
+
+function ensureAreaActivity(tx: any, subjectId: string, subjectName: string, serviceDate: string): any {
+  const id = `area:${subjectId}:${serviceDate}`;
+  const existing = tx.db.trainbot_activity.id.find(id);
+  if (existing) {
+    return existing;
+  }
+  return putActivityRow(tx, {
+    id,
+    scopeType: 'area',
+    subjectId,
+    subjectName,
+    serviceDate,
+    timeline: [],
+    comments: [],
+    votes: [],
+  });
+}
+
+function submitReportActionAtomic(tx: any, activity: any, rawEvent: any): any {
+  const stableId = asString(rawEvent?.stableId).trim();
+  const kind = asString(rawEvent?.kind).trim();
+  if (!stableId || !['report', 'station_sighting', 'location_report'].includes(kind)) {
+    throw new SenderError('invalid report action');
+  }
+
+  const currentAt = nowDate(tx);
+  const currentAtMs = currentAt.getTime();
+  const latest = (activity.timeline || []).find((item: any) => {
+    if (asString(item?.kind).trim() !== kind || asString(item?.stableId).trim() !== stableId) {
+      return false;
+    }
+    if (kind === 'report') {
+      return asString(item?.trainInstanceId).trim() === asString(rawEvent?.trainInstanceId).trim();
+    }
+    if (kind === 'station_sighting') {
+      return asString(item?.destinationStationId).trim() === asString(rawEvent?.destinationStationId).trim();
+    }
+    return true;
+  });
+  if (latest) {
+    const latestAtMs = parseISO(asString(latest.createdAt).trim())?.getTime() || 0;
+    const deltaMs = Math.max(0, currentAtMs - latestAtMs);
+    const sameReport = kind !== 'report'
+      || asString(latest.signal).trim().toUpperCase() === asString(rawEvent.signal).trim().toUpperCase();
+    const dedupeMs = kind === 'station_sighting' ? STATION_SIGHTING_DEDUPE_MS : REPORT_DEDUPE_MS;
+    const cooldownMs = kind === 'station_sighting' ? STATION_SIGHTING_COOLDOWN_MS : REPORT_COOLDOWN_MS;
+    if (sameReport && deltaMs < dedupeMs) {
+      throw new SenderError(kind === 'station_sighting' ? 'duplicate station sighting ignored' : 'duplicate report ignored');
+    }
+    if (deltaMs < cooldownMs) {
+      const label = kind === 'station_sighting' ? 'station sighting cooldown' : 'report cooldown';
+      throw new SenderError(`${label} active for ${Math.ceil((cooldownMs - deltaMs) / 1000)}s`);
+    }
+  }
+
+  if (countReportActionsForStableIdSince(tx, stableId, currentAtMs - REPORT_ACTION_WINDOW_MS) >= REPORT_ACTION_LIMIT) {
+    throw new SenderError('too many reports; wait before reporting again');
+  }
+
+  const event = {
+    ...rawEvent,
+    id: asString(rawEvent.id).trim() || `${stableId}|${tx.newUuidV7().toString()}`,
+    stableId,
+    createdAt: currentAt.toISOString(),
+  };
+  const nextActivity = putActivityRow(tx, { ...activity, timeline: [event, ...(activity.timeline || [])] });
+  refreshActivityProjection(tx, nextActivity.id);
+  scheduleActivityRefreshJobs(tx, nextActivity);
+  return nextActivity;
+}
+
+function submitIncidentVoteAtomic(tx: any, raw: any): any {
+  const incidentId = asString(raw?.incidentId).trim();
+  const stableId = asString(raw?.stableId).trim();
+  const value = asString(raw?.value).trim().toUpperCase();
+  if (!incidentId || !stableId || (value !== 'ONGOING' && value !== 'CLEARED')) {
+    throw new SenderError('invalid incident vote');
+  }
+  const activity = tx.db.trainbot_activity.id.find(incidentId);
+  if (!activity) {
+    throw new SenderError('not found');
+  }
+  const voteCooldown = voteChangeCooldownSeconds(tx, incidentId, stableId);
+  if (voteCooldown > 0) {
+    throw new SenderError(`vote cooldown active for ${voteCooldown}s`);
+  }
+  if (countVoteActionsForStableIdSince(tx, stableId, nowDate(tx).getTime() - VOTE_ACTION_WINDOW_MS) >= VOTE_ACTION_LIMIT) {
+    throw new SenderError('too many votes; wait before voting again');
+  }
+
+  const currentAt = nowISO(tx);
+  const existing = (activity.votes || []).find((item: any) => item.stableId === stableId);
+  const nextVotes = (activity.votes || []).filter((item: any) => item.stableId !== stableId);
+  nextVotes.unshift({
+    stableId,
+    nickname: asString(raw?.nickname).trim(),
+    value,
+    createdAt: existing ? existing.createdAt : currentAt,
+    updatedAt: currentAt,
+  });
+  const nextActivity = putActivityRow(tx, { ...activity, votes: nextVotes });
+  tx.db.trainbot_incident_vote_event.insert({
+    id: asString(raw?.eventId).trim() || `${stableId}|${tx.newUuidV7().toString()}`,
+    incidentId,
+    stableId,
+    value,
+    createdAt: currentAt,
+  });
+  refreshActivityProjection(tx, nextActivity.id);
+  scheduleActivityRefreshJobs(tx, nextActivity);
+  return nextActivity;
+}
+
+function submitIncidentCommentAtomic(tx: any, raw: any): any {
+  const incidentId = asString(raw?.incidentId).trim();
+  const stableId = asString(raw?.stableId).trim();
+  const body = asString(raw?.body).trim();
+  if (!incidentId || !stableId) {
+    throw new SenderError('invalid incident comment');
+  }
+  if (!body) {
+    throw new SenderError('comment body is required');
+  }
+  if (Array.from(body).length > 280) {
+    throw new SenderError('comment body is too long');
+  }
+  const activity = tx.db.trainbot_activity.id.find(incidentId);
+  if (!activity) {
+    throw new SenderError('not found');
+  }
+  const commentWindowStart = nowDate(tx).getTime() - COMMENT_ACTION_WINDOW_MS;
+  if (countCommentsForStableIdSince(tx, stableId, commentWindowStart) >= COMMENT_ACTION_LIMIT) {
+    throw new SenderError('too many comments; wait before commenting again');
+  }
+  if (countCommentsForIncidentSince(activity, commentWindowStart) >= INCIDENT_COMMENT_ACTION_LIMIT) {
+    throw new SenderError('too many comments on this incident; wait before commenting again');
+  }
+  const comment = {
+    id: asString(raw?.id).trim() || `${stableId}|${tx.newUuidV7().toString()}`,
+    stableId,
+    nickname: asString(raw?.nickname).trim(),
+    body,
+    createdAt: nowISO(tx),
+  };
+  const nextActivity = putActivityRow(tx, { ...activity, comments: [comment, ...(activity.comments || [])] });
+  refreshActivityProjection(tx, nextActivity.id);
+  scheduleActivityRefreshJobs(tx, nextActivity);
+  return nextActivity;
 }
 
 function parseBatchItems(itemsJson: string): Record<string, unknown>[] {
@@ -3513,6 +3712,7 @@ function deleteActivity(tx: any, incidentId: string): boolean {
   clearRowsByIncident(tx.db.trainbot_incident_comment, incidentId);
   clearRowsByIncident(tx.db.trainbot_public_sighting, incidentId);
   clearRowsByIncident(tx.db.trainbot_incident_vote, incidentId);
+  clearRowsByIncident(tx.db.trainbot_incident_vote_event, incidentId);
   tx.db.trainbot_incident_summary.id.delete(incidentId);
   tx.db.trainbot_activity.id.delete(incidentId);
   if (existing && asString(existing.scopeType).trim() === 'train') {
@@ -3704,11 +3904,11 @@ function refreshTripProjection(tx: any, trainId: string): void {
   for (const bucket of buckets) {
     const publicBucket = publicTimelineBucket(bucket);
     tx.db.trainbot_trip_timeline_bucket.insert({
-      id: publicOpaqueId('timeline', trainId, publicBucket.at, publicBucket.eventLabel),
+      id: publicOpaqueId('timeline', trainId, publicBucket.at, publicBucket.signal),
       trainId,
       serviceDate: trip.serviceDate,
       at: publicBucket.at,
-      eventLabel: publicBucket.eventLabel,
+      signal: publicBucket.signal,
       count: Number(bucket.count) || 0,
     });
   }
@@ -3721,6 +3921,7 @@ function refreshTripProjection(tx: any, trainId: string): void {
     toStationName: trip.toStationName,
     departureAt: trip.departureAt,
     arrivalAt: trip.arrivalAt,
+    sourceVersion: '',
     state: asString(status.state).trim(),
     confidence: asString(status.confidence).trim(),
     uniqueReporters: Number(publicStatus.uniqueReporters) || 0,
@@ -3781,8 +3982,9 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       kind: event.kind === 'station_sighting' || event.kind === 'location_report' ? 'report' : event.kind,
       name: event.name,
       detail: publicIncidentEventDetail(activity, event),
-      nickname: event.nickname,
+      nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
       createdAt: event.createdAt,
+      signal: '',
     });
     if (event.kind === 'station_sighting') {
       const createdMs = parseISO(event.createdAt)?.getTime() || 0;
@@ -3806,7 +4008,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       id: publicOpaqueId('comment', incidentId, comment.createdAt, index),
       incidentId,
       serviceDate: activity.serviceDate,
-      nickname: comment.nickname,
+      nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
       body: comment.body,
       createdAt: comment.createdAt,
     });
@@ -3823,8 +4025,9 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       kind: 'vote',
       name: incidentVoteEventLabel(vote.value),
       detail: '',
-      nickname: vote.nickname,
+      nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
       createdAt: vote.updatedAt,
+      signal: '',
     });
   }
 
@@ -4119,6 +4322,7 @@ export const publicDashboardLive = spacetimedb.anonymousView(
         toStationName: trip.toStationName,
         departureAt: trip.departureAt,
         arrivalAt: trip.arrivalAt,
+        sourceVersion: '',
         state: asString(status.state).trim(),
         confidence: asString(status.confidence).trim(),
         uniqueReporters: publicReporterCount(Number(status.uniqueReporters) || 0),
@@ -4659,16 +4863,6 @@ export const submitReport = spacetimedb.reducer(
     if (!ride || !ride.checkIn || ride.checkIn.trainInstanceId !== trainId) {
       throw new SenderError('active ride required for this departure');
     }
-    const latest = latestReportFor(ctx, session.stableId, trainId);
-    if (latest) {
-      const deltaMs = nowDate(ctx).getTime() - (parseISO(latest.createdAt)?.getTime() || 0);
-      if (latest.signal === signal && deltaMs < REPORT_DEDUPE_MS) {
-        throw new SenderError('duplicate report ignored');
-      }
-      if (deltaMs < REPORT_COOLDOWN_MS) {
-        throw new SenderError(`report cooldown active for ${Math.ceil((REPORT_COOLDOWN_MS - deltaMs) / 1000)}s`);
-      }
-    }
     const event = {
       id: `${session.stableId}|${ctx.newUuidV7().toString()}`,
       kind: 'report',
@@ -4686,9 +4880,7 @@ export const submitReport = spacetimedb.reducer(
       matchedTrainInstanceId: '',
     };
     const activity = ensureTrainActivity(ctx, trainId);
-    const nextActivity = putActivityRow(ctx, { ...activity, timeline: [event, ...(activity.timeline || [])] });
-    refreshActivityProjection(ctx, nextActivity.id);
-    scheduleActivityRefreshJobs(ctx, nextActivity);
+    submitReportActionAtomic(ctx, activity, event);
     const nextRider = putRiderRow(ctx, { ...rider, recentActionState: { updatedAt: nowISO(ctx) }, updatedAt: nowISO(ctx), lastSeenAt: nowISO(ctx) });
     scheduleRiderExpiryJobs(ctx, nextRider);
   }
@@ -4712,16 +4904,6 @@ export const submitStationSighting = spacetimedb.reducer(
       throw new SenderError('stationId is required');
     }
     requireActiveBundle(ctx, asString(args.bundleVersion), asString(args.bundleServiceDate));
-    const latest = latestStationSightingFor(ctx, session.stableId, stationId, trimOptional(destinationStationId));
-    if (latest) {
-      const deltaMs = nowDate(ctx).getTime() - (parseISO(latest.createdAt)?.getTime() || 0);
-      if (deltaMs < STATION_SIGHTING_DEDUPE_MS) {
-        throw new SenderError('duplicate station sighting ignored');
-      }
-      if (deltaMs < STATION_SIGHTING_COOLDOWN_MS) {
-        throw new SenderError(`station sighting cooldown active for ${Math.ceil((STATION_SIGHTING_COOLDOWN_MS - deltaMs) / 1000)}s`);
-      }
-    }
     const matchedTrainInstanceId = selectedTrainId || maybeResolveMatchedTrain(ctx, stationId, trimOptional(destinationStationId));
     const stationName = stationNameFor(ctx, stationId);
     const destinationStationName = stationNameFor(ctx, destinationStationId);
@@ -4743,9 +4925,7 @@ export const submitStationSighting = spacetimedb.reducer(
     };
     const serviceDate = activeServiceDate(ctx) || formatServiceDateFor(nowDate(ctx));
     const activity = ensureStationActivity(ctx, stationId, stationName, serviceDate);
-    const nextActivity = putActivityRow(ctx, { ...activity, timeline: [event, ...(activity.timeline || [])] });
-    refreshActivityProjection(ctx, nextActivity.id);
-    scheduleActivityRefreshJobs(ctx, nextActivity);
+    submitReportActionAtomic(ctx, activity, event);
     const nextRider = putRiderRow(ctx, { ...rider, recentActionState: { updatedAt: nowISO(ctx) }, updatedAt: nowISO(ctx), lastSeenAt: nowISO(ctx) });
     scheduleRiderExpiryJobs(ctx, nextRider);
   }
@@ -4767,22 +4947,13 @@ export const voteIncident = spacetimedb.reducer(
     if (value !== 'ONGOING' && value !== 'CLEARED') {
       throw new SenderError('invalid vote value');
     }
-    const activity = ctx.db.trainbot_activity.id.find(incidentId);
-    if (!activity) {
-      throw new SenderError('not found');
-    }
-    const existing = (activity.votes || []).find((item: any) => item.stableId === session.stableId);
-    const nextVotes = (activity.votes || []).filter((item: any) => item.stableId !== session.stableId);
-    nextVotes.unshift({
+    submitIncidentVoteAtomic(ctx, {
+      eventId: `${session.stableId}|${ctx.newUuidV7().toString()}`,
+      incidentId,
       stableId: session.stableId,
       nickname: rider.nickname,
       value,
-      createdAt: existing ? existing.createdAt : nowISO(ctx),
-      updatedAt: nowISO(ctx),
     });
-    const nextActivity = putActivityRow(ctx, { ...activity, votes: nextVotes });
-    refreshActivityProjection(ctx, nextActivity.id);
-    scheduleActivityRefreshJobs(ctx, nextActivity);
   }
 );
 
@@ -4799,23 +4970,13 @@ export const commentIncident = spacetimedb.reducer(
     if (!incidentId) {
       throw new SenderError('incidentId is required');
     }
-    if (!body) {
-      throw new SenderError('comment body is required');
-    }
-    const activity = ctx.db.trainbot_activity.id.find(incidentId);
-    if (!activity) {
-      throw new SenderError('not found');
-    }
-    const comment = {
+    submitIncidentCommentAtomic(ctx, {
       id: `${session.stableId}|${ctx.newUuidV7().toString()}`,
+      incidentId,
       stableId: session.stableId,
       nickname: rider.nickname,
       body,
-      createdAt: nowISO(ctx),
-    };
-    const nextActivity = putActivityRow(ctx, { ...activity, comments: [comment, ...(activity.comments || [])] });
-    refreshActivityProjection(ctx, nextActivity.id);
-    scheduleActivityRefreshJobs(ctx, nextActivity);
+    });
   }
 );
 
@@ -4930,6 +5091,24 @@ export const serviceListActivities = spacetimedb.procedure(
         asString(serviceDate).trim(),
       ),
     });
+  })
+);
+
+export const serviceCountIncidentVoteEvents = spacetimedb.procedure(
+  { name: named('service_count_incident_vote_events') },
+  {
+    stableId: t.string(),
+    sinceIso: t.string(),
+  },
+  t.string(),
+  (ctx, { stableId, sinceIso }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    const cleanStableId = asString(stableId).trim();
+    const sinceMs = parseISO(asString(sinceIso).trim())?.getTime();
+    if (!cleanStableId || sinceMs == null) {
+      throw new SenderError('invalid vote event count arguments');
+    }
+    return serialize({ count: countVoteActionsForStableIdSince(tx, cleanStableId, sinceMs) });
   })
 );
 
@@ -5594,6 +5773,16 @@ function cleanupOrphanIncidentVotes(tx: any): void {
   }
 }
 
+function cleanupExpiredIncidentVoteEvents(tx: any, retentionCutoffMs: number): void {
+  for (const voteEvent of rowsFrom(tx.db.trainbot_incident_vote_event.iter())) {
+    const createdMs = parseISO(asString(voteEvent.createdAt).trim())?.getTime() || 0;
+    if (!tx.db.trainbot_activity.id.find(asString(voteEvent.incidentId).trim())
+      || (createdMs > 0 && createdMs < retentionCutoffMs)) {
+      tx.db.trainbot_incident_vote_event.id.delete(asString(voteEvent.id).trim());
+    }
+  }
+}
+
 function cleanupExpiredTestLoginTickets(tx: any, nowAt: Date): void {
   const cutoffMs = nowAt.getTime();
   for (const ticket of rowsFrom(tx.db.trainbot_test_login_ticket.iter())) {
@@ -5694,6 +5883,7 @@ export const cleanupExpiredState = spacetimedb.reducer(
 
     if (rawCleanup.retentionRan === true) {
       cleanupOrphanIncidentVotes(ctx);
+      cleanupExpiredIncidentVoteEvents(ctx, retentionCutoffAt.getTime());
     }
 
     if (rawCleanup.retentionRan === true) {
@@ -5814,6 +6004,154 @@ export const servicePutActivity = spacetimedb.reducer(
   }
 );
 
+export const serviceSubmitReport = spacetimedb.reducer(
+  { name: named('service_submit_report') },
+  {
+    id: t.string(),
+    trainId: t.string(),
+    stableId: t.string(),
+    nickname: t.string(),
+    signal: t.string(),
+  },
+  (ctx, { id, trainId, stableId, nickname, signal }) => {
+    requireServiceRole(ctx);
+    const cleanTrainId = asString(trainId).trim();
+    const cleanSignal = asString(signal).trim().toUpperCase();
+    if (!cleanTrainId || (cleanSignal !== 'INSPECTION_STARTED' && cleanSignal !== 'INSPECTION_IN_MY_CAR' && cleanSignal !== 'INSPECTION_ENDED')) {
+      throw new SenderError('invalid report action');
+    }
+    const activity = ensureTrainActivity(ctx, cleanTrainId);
+    submitReportActionAtomic(ctx, activity, {
+      id,
+      kind: 'report',
+      stableId,
+      nickname,
+      name: trainSignalIncidentLabel(cleanSignal),
+      detail: '',
+      signal: cleanSignal,
+      trainInstanceId: cleanTrainId,
+      stationId: '',
+      stationName: '',
+      destinationStationId: '',
+      destinationStationName: '',
+      matchedTrainInstanceId: '',
+    });
+  }
+);
+
+export const serviceSubmitStationSighting = spacetimedb.reducer(
+  { name: named('service_submit_station_sighting') },
+  {
+    id: t.string(),
+    stationId: t.string(),
+    stationName: t.string(),
+    destinationStationId: t.string(),
+    destinationStationName: t.string(),
+    matchedTrainId: t.string(),
+    stableId: t.string(),
+    nickname: t.string(),
+  },
+  (ctx, args) => {
+    requireServiceRole(ctx);
+    const stationId = asString(args.stationId).trim();
+    if (!stationId) {
+      throw new SenderError('invalid station sighting');
+    }
+    const serviceDate = activeServiceDate(ctx) || formatServiceDateFor(nowDate(ctx));
+    const stationName = asString(args.stationName).trim() || stationNameFor(ctx, stationId) || stationId;
+    const destinationStationId = asString(args.destinationStationId).trim();
+    const destinationStationName = asString(args.destinationStationName).trim() || stationNameFor(ctx, destinationStationId);
+    const activity = ensureStationActivity(ctx, stationId, stationName, serviceDate);
+    submitReportActionAtomic(ctx, activity, {
+      id: args.id,
+      kind: 'station_sighting',
+      stableId: args.stableId,
+      nickname: args.nickname,
+      name: destinationStationName ? `Platform sighting to ${destinationStationName}` : 'Platform sighting',
+      detail: '',
+      signal: '',
+      trainInstanceId: '',
+      stationId,
+      stationName,
+      destinationStationId,
+      destinationStationName,
+      matchedTrainInstanceId: asString(args.matchedTrainId).trim(),
+    });
+  }
+);
+
+export const serviceSubmitLocationReport = spacetimedb.reducer(
+  { name: named('service_submit_location_report') },
+  { reportJson: t.string() },
+  (ctx, { reportJson }) => {
+    requireServiceRole(ctx);
+    const report = parseJSON(reportJson, 'invalid location report JSON');
+    const scope = asString(report?.scope).trim();
+    const subjectId = asString(report?.subjectId).trim();
+    const subjectName = asString(report?.subjectName).trim() || subjectId;
+    if (!subjectId || (scope !== 'station' && scope !== 'area')) {
+      throw new SenderError('invalid location report');
+    }
+    const serviceDate = activeServiceDate(ctx) || formatServiceDateFor(nowDate(ctx));
+    const activity = scope === 'area'
+      ? ensureAreaActivity(ctx, subjectId, subjectName, serviceDate)
+      : ensureStationActivity(ctx, subjectId, subjectName, serviceDate);
+    const latitude = typeof report?.latitude === 'number' ? report.latitude : undefined;
+    const longitude = typeof report?.longitude === 'number' ? report.longitude : undefined;
+    const radiusMeters = Math.max(0, Math.floor(Number(report?.radiusMeters) || 0));
+    const description = asString(report?.description).trim();
+    submitReportActionAtomic(ctx, activity, {
+      id: report?.id,
+      kind: 'location_report',
+      stableId: report?.stableId,
+      nickname: report?.nickname,
+      name: locationReportName(scope),
+      detail: description,
+      signal: '',
+      trainInstanceId: '',
+      stationId: scope === 'station' ? subjectId : '',
+      stationName: scope === 'station' ? subjectName : '',
+      destinationStationId: '',
+      destinationStationName: '',
+      matchedTrainInstanceId: '',
+      latitude,
+      longitude,
+      radiusMeters,
+      locationDescription: description,
+    });
+  }
+);
+
+export const serviceSubmitIncidentVote = spacetimedb.reducer(
+  { name: named('service_submit_incident_vote') },
+  {
+    eventId: t.string(),
+    incidentId: t.string(),
+    stableId: t.string(),
+    nickname: t.string(),
+    value: t.string(),
+  },
+  (ctx, args) => {
+    requireServiceRole(ctx);
+    submitIncidentVoteAtomic(ctx, args);
+  }
+);
+
+export const serviceSubmitIncidentComment = spacetimedb.reducer(
+  { name: named('service_submit_incident_comment') },
+  {
+    id: t.string(),
+    incidentId: t.string(),
+    stableId: t.string(),
+    nickname: t.string(),
+    body: t.string(),
+  },
+  (ctx, args) => {
+    requireServiceRole(ctx);
+    submitIncidentCommentAtomic(ctx, args);
+  }
+);
+
 export const serviceResetTestRider = spacetimedb.reducer(
   { name: named('service_reset_test_rider') },
   { stableId: t.string() },
@@ -5888,10 +6226,11 @@ export const serviceSetActiveBundle = spacetimedb.reducer(
       serviceDate: asString(serviceDate).trim(),
       generatedAt: asString(generatedAt).trim(),
       sourceVersion: asString(sourceVersion).trim(),
-      updatedAt: new Date().toISOString(),
+      updatedAt: nowISO(ctx),
     };
     ctx.db.trainbot_active_bundle.id.delete(next.id);
     ctx.db.trainbot_active_bundle.insert(next);
+    refreshAllPublicProjections(ctx, next.serviceDate);
   }
 );
 

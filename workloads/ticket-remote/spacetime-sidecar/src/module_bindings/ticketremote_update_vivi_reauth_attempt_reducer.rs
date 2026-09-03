@@ -6,23 +6,31 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct TicketremoteRetryTicketActionV3AfterNoTransitionArgs {
+pub(super) struct TicketremoteUpdateViviReauthAttemptArgs {
     pub ticket_id: String,
     pub backend_id: String,
-    pub parent_action_id: String,
-    pub interaction_revision: String,
+    pub request_id: String,
+    pub credential_revision: String,
+    pub status: String,
+    pub phase: String,
+    pub reason: String,
+    pub proof_source: String,
     pub stream_epoch: String,
     pub frame_sequence: String,
     pub now_arg: String,
 }
 
-impl From<TicketremoteRetryTicketActionV3AfterNoTransitionArgs> for super::Reducer {
-    fn from(args: TicketremoteRetryTicketActionV3AfterNoTransitionArgs) -> Self {
-        Self::TicketremoteRetryTicketActionV3AfterNoTransition {
+impl From<TicketremoteUpdateViviReauthAttemptArgs> for super::Reducer {
+    fn from(args: TicketremoteUpdateViviReauthAttemptArgs) -> Self {
+        Self::TicketremoteUpdateViviReauthAttempt {
             ticket_id: args.ticket_id,
             backend_id: args.backend_id,
-            parent_action_id: args.parent_action_id,
-            interaction_revision: args.interaction_revision,
+            request_id: args.request_id,
+            credential_revision: args.credential_revision,
+            status: args.status,
+            phase: args.phase,
+            reason: args.reason,
+            proof_source: args.proof_source,
             stream_epoch: args.stream_epoch,
             frame_sequence: args.frame_sequence,
             now_arg: args.now_arg,
@@ -30,36 +38,44 @@ impl From<TicketremoteRetryTicketActionV3AfterNoTransitionArgs> for super::Reduc
     }
 }
 
-impl __sdk::InModule for TicketremoteRetryTicketActionV3AfterNoTransitionArgs {
+impl __sdk::InModule for TicketremoteUpdateViviReauthAttemptArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `ticketremote_retry_ticket_action_v3_after_no_transition`.
+/// Extension trait for access to the reducer `ticketremote_update_vivi_reauth_attempt`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait ticketremote_retry_ticket_action_v_3_after_no_transition {
-    /// Request that the remote module invoke the reducer `ticketremote_retry_ticket_action_v3_after_no_transition` to run as soon as possible.
+pub trait ticketremote_update_vivi_reauth_attempt {
+    /// Request that the remote module invoke the reducer `ticketremote_update_vivi_reauth_attempt` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`ticketremote_retry_ticket_action_v_3_after_no_transition:ticketremote_retry_ticket_action_v_3_after_no_transition_then`] to run a callback after the reducer completes.
-    fn ticketremote_retry_ticket_action_v_3_after_no_transition(
+    /// /// Use [`ticketremote_update_vivi_reauth_attempt:ticketremote_update_vivi_reauth_attempt_then`] to run a callback after the reducer completes.
+    fn ticketremote_update_vivi_reauth_attempt(
         &self,
         ticket_id: String,
         backend_id: String,
-        parent_action_id: String,
-        interaction_revision: String,
+        request_id: String,
+        credential_revision: String,
+        status: String,
+        phase: String,
+        reason: String,
+        proof_source: String,
         stream_epoch: String,
         frame_sequence: String,
         now_arg: String,
     ) -> __sdk::Result<()> {
-        self.ticketremote_retry_ticket_action_v_3_after_no_transition_then(
+        self.ticketremote_update_vivi_reauth_attempt_then(
             ticket_id,
             backend_id,
-            parent_action_id,
-            interaction_revision,
+            request_id,
+            credential_revision,
+            status,
+            phase,
+            reason,
+            proof_source,
             stream_epoch,
             frame_sequence,
             now_arg,
@@ -67,18 +83,22 @@ pub trait ticketremote_retry_ticket_action_v_3_after_no_transition {
         )
     }
 
-    /// Request that the remote module invoke the reducer `ticketremote_retry_ticket_action_v3_after_no_transition` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `ticketremote_update_vivi_reauth_attempt` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn ticketremote_retry_ticket_action_v_3_after_no_transition_then(
+    fn ticketremote_update_vivi_reauth_attempt_then(
         &self,
         ticket_id: String,
         backend_id: String,
-        parent_action_id: String,
-        interaction_revision: String,
+        request_id: String,
+        credential_revision: String,
+        status: String,
+        phase: String,
+        reason: String,
+        proof_source: String,
         stream_epoch: String,
         frame_sequence: String,
         now_arg: String,
@@ -89,13 +109,17 @@ pub trait ticketremote_retry_ticket_action_v_3_after_no_transition {
     ) -> __sdk::Result<()>;
 }
 
-impl ticketremote_retry_ticket_action_v_3_after_no_transition for super::RemoteReducers {
-    fn ticketremote_retry_ticket_action_v_3_after_no_transition_then(
+impl ticketremote_update_vivi_reauth_attempt for super::RemoteReducers {
+    fn ticketremote_update_vivi_reauth_attempt_then(
         &self,
         ticket_id: String,
         backend_id: String,
-        parent_action_id: String,
-        interaction_revision: String,
+        request_id: String,
+        credential_revision: String,
+        status: String,
+        phase: String,
+        reason: String,
+        proof_source: String,
         stream_epoch: String,
         frame_sequence: String,
         now_arg: String,
@@ -105,11 +129,15 @@ impl ticketremote_retry_ticket_action_v_3_after_no_transition for super::RemoteR
             + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            TicketremoteRetryTicketActionV3AfterNoTransitionArgs {
+            TicketremoteUpdateViviReauthAttemptArgs {
                 ticket_id,
                 backend_id,
-                parent_action_id,
-                interaction_revision,
+                request_id,
+                credential_revision,
+                status,
+                phase,
+                reason,
+                proof_source,
                 stream_epoch,
                 frame_sequence,
                 now_arg,

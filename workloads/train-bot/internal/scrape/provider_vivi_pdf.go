@@ -1,27 +1,50 @@
 package scrape
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-
-	"rsc.io/pdf"
 )
+
+const (
+	viviLandingMaxBytes       = 2 << 20
+	viviPDFMaxInputBytes      = 8 << 20
+	viviPDFMaxTextBytes       = 8 << 20
+	viviPDFMaxDiagnosticBytes = 64 << 10
+	viviPDFExtractTimeout     = 15 * time.Second
+	viviPDFTextCommand        = "pdftotext"
+	viviPDFMaxLinks           = 32
+	viviMaxRedirects          = 5
+	viviMaxResolvedAddresses  = 16
+)
+
+type viviIPResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
 
 type ViviPDFProvider struct {
 	name      string
 	pageURL   string
 	userAgent string
+	timeout   time.Duration
 	client    *http.Client
+	resolver  viviIPResolver
 }
 
 func NewViviPDFProvider(name string, pageURL string, userAgent string, timeout time.Duration) *ViviPDFProvider {
@@ -32,7 +55,8 @@ func NewViviPDFProvider(name string, pageURL string, userAgent string, timeout t
 		name:      name,
 		pageURL:   pageURL,
 		userAgent: userAgent,
-		client:    &http.Client{Timeout: timeout},
+		timeout:   timeout,
+		resolver:  net.DefaultResolver,
 	}
 }
 
@@ -44,14 +68,25 @@ func (p *ViviPDFProvider) Fetch(ctx context.Context, serviceDate time.Time) (Raw
 	if strings.TrimSpace(p.pageURL) == "" {
 		return RawSchedule{}, fmt.Errorf("provider %s page URL is empty", p.name)
 	}
-	req, err := http.NewRequest(http.MethodGet, p.pageURL, nil)
+	pageURL, err := url.Parse(p.pageURL)
+	if err != nil {
+		return RawSchedule{}, err
+	}
+	if err := viviValidateOrigin(pageURL); err != nil {
+		return RawSchedule{}, err
+	}
+	client := p.client
+	if client == nil {
+		client = viviSafeHTTPClient(p.timeout, pageURL, p.resolver)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL.String(), nil)
 	if err != nil {
 		return RawSchedule{}, err
 	}
 	if p.userAgent != "" {
 		req.Header.Set("User-Agent", p.userAgent)
 	}
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return RawSchedule{}, err
 	}
@@ -59,12 +94,15 @@ func (p *ViviPDFProvider) Fetch(ctx context.Context, serviceDate time.Time) (Raw
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return RawSchedule{}, fmt.Errorf("provider %s status %d", p.name, resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	if err := viviValidateResponseURL(pageURL, resp.Request); err != nil {
+		return RawSchedule{}, err
+	}
+	body, err := viviReadBounded(resp.Body, resp.ContentLength, viviLandingMaxBytes, "landing page")
 	if err != nil {
 		return RawSchedule{}, err
 	}
 
-	basePDFs, changePDFs, err := viviCollectPDFLinks(p.pageURL, string(body), serviceDate)
+	basePDFs, changePDFs, err := viviCollectPDFLinks(pageURL.String(), string(body), serviceDate)
 	if err != nil {
 		return RawSchedule{}, err
 	}
@@ -75,11 +113,11 @@ func (p *ViviPDFProvider) Fetch(ctx context.Context, serviceDate time.Time) (Raw
 	merged := map[string]RawTrain{}
 	parseAndMerge := func(ctx context.Context, urls []string, override bool) error {
 		for _, pdfURL := range urls {
-			pdfBytes, err := p.fetchBytes(ctx, pdfURL)
+			pdfBytes, err := p.fetchBytes(ctx, client, pageURL, pdfURL)
 			if err != nil {
 				return fmt.Errorf("fetch %s: %w", pdfURL, err)
 			}
-			trains, err := viviParseSchedulePDF(pdfBytes, serviceDate)
+			trains, err := viviParseSchedulePDF(ctx, pdfBytes, serviceDate)
 			if err != nil {
 				return fmt.Errorf("parse %s: %w", pdfURL, err)
 			}
@@ -123,7 +161,14 @@ func (p *ViviPDFProvider) Fetch(ctx context.Context, serviceDate time.Time) (Raw
 	return out, nil
 }
 
-func (p *ViviPDFProvider) fetchBytes(ctx context.Context, target string) ([]byte, error) {
+func (p *ViviPDFProvider) fetchBytes(ctx context.Context, client *http.Client, origin *url.URL, target string) ([]byte, error) {
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	if err := viviValidateTargetURL(origin, targetURL); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
@@ -131,7 +176,7 @@ func (p *ViviPDFProvider) fetchBytes(ctx context.Context, target string) ([]byte
 	if p.userAgent != "" {
 		req.Header.Set("User-Agent", p.userAgent)
 	}
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +184,10 @@ func (p *ViviPDFProvider) fetchBytes(ctx context.Context, target string) ([]byte
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	if err := viviValidateResponseURL(origin, resp.Request); err != nil {
+		return nil, err
+	}
+	return viviReadBounded(resp.Body, resp.ContentLength, viviPDFMaxInputBytes, "pdf")
 }
 
 var viviAnchorPDFRe = regexp.MustCompile(`(?is)<a[^>]*href=["']([^"']+\.pdf)["'][^>]*>(.*?)</a>`)
@@ -150,10 +198,16 @@ func viviCollectPDFLinks(pageURL string, htmlBody string, serviceDate time.Time)
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := viviValidateOrigin(baseURL); err != nil {
+		return nil, nil, err
+	}
 
 	baseSet := map[string]struct{}{}
 	changeSet := map[string]struct{}{}
-	matches := viviAnchorPDFRe.FindAllStringSubmatch(htmlBody, -1)
+	matches := viviAnchorPDFRe.FindAllStringSubmatch(htmlBody, viviPDFMaxLinks+1)
+	if len(matches) > viviPDFMaxLinks {
+		return nil, nil, fmt.Errorf("schedule page exposes more than %d pdf links", viviPDFMaxLinks)
+	}
 	for _, m := range matches {
 		if len(m) != 3 {
 			continue
@@ -166,7 +220,12 @@ func viviCollectPDFLinks(pageURL string, htmlBody string, serviceDate time.Time)
 		if err != nil {
 			continue
 		}
-		abs := baseURL.ResolveReference(u).String()
+		resolved := baseURL.ResolveReference(u)
+		if err := viviValidateTargetURL(baseURL, resolved); err != nil {
+			return nil, nil, err
+		}
+		resolved.Fragment = ""
+		abs := resolved.String()
 		lower := strings.ToLower(abs)
 		linkText := strings.TrimSpace(stripTagRe.ReplaceAllString(html.UnescapeString(m[2]), " "))
 		linkText = strings.Join(strings.Fields(linkText), " ")
@@ -180,6 +239,9 @@ func viviCollectPDFLinks(pageURL string, htmlBody string, serviceDate time.Time)
 			}
 		}
 	}
+	if len(baseSet)+len(changeSet) > viviPDFMaxLinks {
+		return nil, nil, fmt.Errorf("schedule page exposes more than %d pdf links", viviPDFMaxLinks)
+	}
 
 	base := make([]string, 0, len(baseSet))
 	for u := range baseSet {
@@ -192,6 +254,156 @@ func viviCollectPDFLinks(pageURL string, htmlBody string, serviceDate time.Time)
 	}
 	sort.Strings(changes)
 	return base, changes, nil
+}
+
+func viviReadBounded(body io.Reader, contentLength int64, maxBytes int64, label string) ([]byte, error) {
+	if contentLength > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d byte limit", label, maxBytes)
+	}
+	payload, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d byte limit", label, maxBytes)
+	}
+	return payload, nil
+}
+
+func viviValidateOrigin(origin *url.URL) error {
+	if origin == nil || !strings.EqualFold(origin.Scheme, "https") || strings.TrimSpace(origin.Hostname()) == "" {
+		return fmt.Errorf("ViVi origin must be an HTTPS URL")
+	}
+	if origin.User != nil {
+		return fmt.Errorf("ViVi origin must not contain user information")
+	}
+	return nil
+}
+
+func viviValidateTargetURL(origin *url.URL, target *url.URL) error {
+	if err := viviValidateOrigin(origin); err != nil {
+		return err
+	}
+	if target == nil || !strings.EqualFold(target.Scheme, "https") || strings.TrimSpace(target.Hostname()) == "" {
+		return fmt.Errorf("ViVi target must be an HTTPS URL")
+	}
+	if target.User != nil {
+		return fmt.Errorf("ViVi target must not contain user information")
+	}
+	if !strings.EqualFold(origin.Hostname(), target.Hostname()) || viviEffectivePort(origin) != viviEffectivePort(target) {
+		return fmt.Errorf("ViVi target must remain on origin %s", origin.Host)
+	}
+	return nil
+}
+
+func viviValidateResponseURL(origin *url.URL, request *http.Request) error {
+	if request == nil || request.URL == nil {
+		return fmt.Errorf("ViVi response URL is unavailable")
+	}
+	return viviValidateTargetURL(origin, request.URL)
+}
+
+func viviEffectivePort(target *url.URL) string {
+	if port := target.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(target.Scheme, "https") {
+		return "443"
+	}
+	return ""
+}
+
+func viviSafeHTTPClient(timeout time.Duration, origin *url.URL, resolver viviIPResolver) *http.Client {
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = viviSafeDialContext(resolver, dialer)
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= viviMaxRedirects {
+				return fmt.Errorf("ViVi redirect limit exceeded")
+			}
+			return viviValidateTargetURL(origin, req.URL)
+		},
+	}
+}
+
+func viviSafeDialContext(resolver viviIPResolver, dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("parse ViVi network address: %w", err)
+		}
+		addresses, err := viviResolvePublicAddresses(ctx, resolver, host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, item := range addresses {
+			conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(item.String(), port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		return nil, fmt.Errorf("dial ViVi public address: %w", lastErr)
+	}
+}
+
+func viviResolvePublicAddresses(ctx context.Context, resolver viviIPResolver, host string) ([]netip.Addr, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("ViVi resolver is unavailable")
+	}
+	if literal, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		if !viviIsPublicAddress(literal) {
+			return nil, fmt.Errorf("ViVi address is not publicly routable")
+		}
+		return []netip.Addr{literal.Unmap()}, nil
+	}
+	resolved, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ViVi host: %w", err)
+	}
+	if len(resolved) == 0 || len(resolved) > viviMaxResolvedAddresses {
+		return nil, fmt.Errorf("ViVi host resolved to an invalid number of addresses")
+	}
+	out := make([]netip.Addr, 0, len(resolved))
+	for _, item := range resolved {
+		addr, ok := netip.AddrFromSlice(item.IP)
+		if !ok || !viviIsPublicAddress(addr) {
+			return nil, fmt.Errorf("ViVi host resolved to a non-public address")
+		}
+		out = append(out, addr.Unmap())
+	}
+	return out, nil
+}
+
+func viviIsPublicAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return false
+	}
+	blocked := []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	for _, prefix := range blocked {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }
 
 var lvMonthByPrefix = map[string]time.Month{
@@ -243,11 +455,15 @@ type viviRow struct {
 var trainNumberRe = regexp.MustCompile(`\b\d{3,5}\b`)
 var dotTimeRe = regexp.MustCompile(`\b([0-2]?\d)\.([0-5]\d)\b`)
 
-func viviParseSchedulePDF(pdfBytes []byte, serviceDate time.Time) ([]RawTrain, error) {
-	lines, err := viviExtractPDFLines(pdfBytes)
+func viviParseSchedulePDF(ctx context.Context, pdfBytes []byte, serviceDate time.Time) ([]RawTrain, error) {
+	lines, err := viviExtractPDFLines(ctx, pdfBytes)
 	if err != nil {
 		return nil, err
 	}
+	return viviParseScheduleLines(lines, serviceDate)
+}
+
+func viviParseScheduleLines(lines []string, serviceDate time.Time) ([]RawTrain, error) {
 	trainNumbers := make([]string, 0)
 	rows := make([]viviRow, 0)
 	for _, line := range lines {
@@ -364,87 +580,147 @@ func viviTrainKey(t RawTrain) string {
 	return fmt.Sprintf("%s|%s|%s|%s", t.ServiceDate, strings.ToLower(strings.TrimSpace(t.FromStation)), strings.ToLower(strings.TrimSpace(t.ToStation)), t.DepartureAt.UTC().Format("1504"))
 }
 
-func viviExtractPDFLines(pdfBytes []byte) ([]string, error) {
+func viviExtractPDFLines(ctx context.Context, pdfBytes []byte) ([]string, error) {
+	return viviExtractPDFLinesWithCommand(ctx, pdfBytes, viviPDFTextCommand, viviPDFExtractTimeout, viviPDFMaxInputBytes, viviPDFMaxTextBytes, viviPDFMaxDiagnosticBytes)
+}
+
+func viviExtractPDFLinesWithCommand(
+	ctx context.Context,
+	pdfBytes []byte,
+	command string,
+	timeout time.Duration,
+	maxInputBytes int,
+	maxTextBytes int,
+	maxDiagnosticBytes int,
+) ([]string, error) {
+	if maxInputBytes <= 0 || len(pdfBytes) > maxInputBytes {
+		return nil, fmt.Errorf("pdf exceeds %d byte limit", maxInputBytes)
+	}
+	if timeout <= 0 {
+		timeout = viviPDFExtractTimeout
+	}
+	if maxTextBytes <= 0 {
+		maxTextBytes = viviPDFMaxTextBytes
+	}
+	if maxDiagnosticBytes <= 0 {
+		maxDiagnosticBytes = viviPDFMaxDiagnosticBytes
+	}
+
 	tmp, err := os.CreateTemp("", "vivi-schedule-*.pdf")
 	if err != nil {
 		return nil, err
 	}
 	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	defer os.Remove(tmpPath)
-	if err := os.WriteFile(tmpPath, pdfBytes, 0o600); err != nil {
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if _, err := tmp.Write(pdfBytes); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
 		return nil, err
 	}
 
-	doc, err := pdf.Open(tmpPath)
-	if err != nil {
-		return nil, err
+	extractCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(extractCtx, command, "-layout", "-enc", "UTF-8", tmpPath, "-")
+	cmd.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"LANG=C.UTF-8",
+		"LC_ALL=C.UTF-8",
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Cancel = func() error {
+		return killPDFProcessGroup(cmd)
+	}
+	stdout := newKillingBoundedBuffer(maxTextBytes, cmd)
+	stderr := newKillingBoundedBuffer(maxDiagnosticBytes, cmd)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	runErr := cmd.Run()
+	if stdout.Exceeded() {
+		return nil, fmt.Errorf("pdftotext output exceeds %d byte limit", maxTextBytes)
+	}
+	if stderr.Exceeded() {
+		return nil, fmt.Errorf("pdftotext diagnostics exceed %d byte limit", maxDiagnosticBytes)
+	}
+	if errors.Is(extractCtx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("pdftotext timed out after %s", timeout)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if runErr != nil {
+		diagnostic := strings.Join(strings.Fields(stderr.String()), " ")
+		if diagnostic == "" {
+			return nil, fmt.Errorf("pdftotext failed: %w", runErr)
+		}
+		return nil, fmt.Errorf("pdftotext failed: %w: %s", runErr, diagnostic)
 	}
 
-	type textFragment struct {
-		X float64
-		Y float64
-		S string
-	}
-	lines := make([]string, 0, 1024)
-	for i := 1; i <= doc.NumPage(); i++ {
-		page := doc.Page(i)
-		if page.V.IsNull() {
-			continue
-		}
-		content := page.Content()
-		fragments := make([]textFragment, 0, len(content.Text))
-		for _, item := range content.Text {
-			fragment := strings.TrimSpace(item.S)
-			if fragment == "" {
-				continue
-			}
-			fragments = append(fragments, textFragment{X: item.X, Y: item.Y, S: fragment})
-		}
-		sort.Slice(fragments, func(i, j int) bool {
-			if abs(fragments[i].Y-fragments[j].Y) < 1.2 {
-				return fragments[i].X < fragments[j].X
-			}
-			return fragments[i].Y > fragments[j].Y
-		})
-		curY := 0.0
-		lineParts := make([]textFragment, 0, 32)
-		flush := func() {
-			if len(lineParts) == 0 {
-				return
-			}
-			sort.Slice(lineParts, func(i, j int) bool { return lineParts[i].X < lineParts[j].X })
-			parts := make([]string, 0, len(lineParts))
-			for _, p := range lineParts {
-				parts = append(parts, p.S)
-			}
-			line := strings.Join(parts, " ")
-			line = strings.Join(strings.Fields(line), " ")
-			if line != "" {
-				lines = append(lines, line)
-			}
-			lineParts = lineParts[:0]
-		}
-		for _, fragment := range fragments {
-			if len(lineParts) == 0 {
-				curY = fragment.Y
-				lineParts = append(lineParts, fragment)
-				continue
-			}
-			if abs(curY-fragment.Y) > 1.2 {
-				flush()
-				curY = fragment.Y
-			}
-			lineParts = append(lineParts, fragment)
-		}
-		flush()
+	text := strings.ReplaceAll(stdout.String(), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) == 1 && strings.TrimSpace(lines[0]) == "" {
+		return nil, fmt.Errorf("pdftotext produced no text")
 	}
 	return lines, nil
 }
 
-func abs(v float64) float64 {
-	if v < 0 {
-		return -v
+type killingBoundedBuffer struct {
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	limit    int
+	exceeded bool
+	cmd      *exec.Cmd
+}
+
+func newKillingBoundedBuffer(limit int, cmd *exec.Cmd) *killingBoundedBuffer {
+	return &killingBoundedBuffer{limit: limit, cmd: cmd}
+}
+
+func (b *killingBoundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.exceeded {
+		return len(p), nil
 	}
-	return v
+	remaining := b.limit - b.buf.Len()
+	if remaining >= len(p) {
+		_, _ = b.buf.Write(p)
+		return len(p), nil
+	}
+	if remaining > 0 {
+		_, _ = b.buf.Write(p[:remaining])
+	}
+	b.exceeded = true
+	_ = killPDFProcessGroup(b.cmd)
+	return len(p), nil
+}
+
+func (b *killingBoundedBuffer) Exceeded() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.exceeded
+}
+
+func (b *killingBoundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func killPDFProcessGroup(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
 }

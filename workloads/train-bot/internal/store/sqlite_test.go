@@ -2,7 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +24,262 @@ func newTestStore(t *testing.T) *SQLiteStore {
 		t.Fatalf("migrate: %v", err)
 	}
 	return st
+}
+
+func TestConcurrentMixedReportSubmissionsCannotExceedGlobalLimit(t *testing.T) {
+	st := newTestStore(t)
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	insertTrain(t, st, "atomic-report-train", now.Add(-time.Hour), now.Add(time.Hour))
+	policy := ReportMutationPolicy{
+		Cooldown:     3 * time.Minute,
+		Dedupe:       90 * time.Second,
+		ActionWindow: 30 * time.Minute,
+		ActionLimit:  5,
+	}
+
+	const attempts = 24
+	start := make(chan struct{})
+	var accepted atomic.Int32
+	var limited atomic.Int32
+	var unexpected atomic.Value
+	var wg sync.WaitGroup
+	for idx := 0; idx < attempts; idx++ {
+		idx := idx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			var err error
+			if idx == 0 {
+				err = st.SubmitReportEvent(ctx, domain.ReportEvent{
+					ID:              "atomic-train-report",
+					TrainInstanceID: "atomic-report-train",
+					UserID:          500,
+					Signal:          domain.SignalInspectionStarted,
+					CreatedAt:       now,
+				}, policy)
+			} else {
+				lat := 56.9 + float64(idx)/10000
+				lng := 24.1 + float64(idx)/10000
+				err = st.SubmitLocationReport(ctx, domain.LocationReport{
+					ID:           fmt.Sprintf("atomic-location-%02d", idx),
+					Scope:        "area",
+					SubjectID:    fmt.Sprintf("area-%02d", idx),
+					SubjectName:  fmt.Sprintf("Area %02d", idx),
+					Latitude:     &lat,
+					Longitude:    &lng,
+					RadiusMeters: 100,
+					Description:  "Inspection here",
+					UserID:       500,
+					CreatedAt:    now,
+				}, policy)
+			}
+			if err == nil {
+				accepted.Add(1)
+				return
+			}
+			var rejected *MutationRejectedError
+			if errors.As(err, &rejected) && rejected.Reason == MutationReportActionLimit {
+				limited.Add(1)
+				return
+			}
+			unexpected.Store(err)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if err, _ := unexpected.Load().(error); err != nil {
+		t.Fatalf("unexpected concurrent submission error: %v", err)
+	}
+	if got := accepted.Load(); got != int32(policy.ActionLimit) {
+		t.Fatalf("accepted actions = %d, want %d", got, policy.ActionLimit)
+	}
+	if got := limited.Load(); got != attempts-int32(policy.ActionLimit) {
+		t.Fatalf("limited actions = %d, want %d", got, attempts-int32(policy.ActionLimit))
+	}
+	count, err := st.CountReportActionsByUserSince(ctx, 500, now.Add(-policy.ActionWindow))
+	if err != nil {
+		t.Fatalf("count report actions: %v", err)
+	}
+	if count != policy.ActionLimit {
+		t.Fatalf("persisted actions = %d, want %d", count, policy.ActionLimit)
+	}
+}
+
+func TestConcurrentIncidentVotesCommitStateAndAccountingTogether(t *testing.T) {
+	st := newTestStore(t)
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	policy := VoteMutationPolicy{ChangeWindow: 30 * time.Minute, ActionWindow: time.Hour, ActionLimit: 20}
+
+	const attempts = 40
+	start := make(chan struct{})
+	var accepted atomic.Int32
+	var limited atomic.Int32
+	var unexpected atomic.Value
+	var wg sync.WaitGroup
+	for idx := 0; idx < attempts; idx++ {
+		idx := idx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			incidentID := fmt.Sprintf("atomic-incident-%02d", idx)
+			vote := domain.IncidentVote{
+				IncidentID: incidentID,
+				UserID:     700,
+				Nickname:   "private",
+				Value:      domain.IncidentVoteOngoing,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			err := st.SubmitIncidentVote(ctx, vote, domain.IncidentVoteEvent{
+				ID:         fmt.Sprintf("atomic-vote-event-%02d", idx),
+				IncidentID: incidentID,
+				UserID:     700,
+				Nickname:   "private",
+				Value:      domain.IncidentVoteOngoing,
+				CreatedAt:  now,
+			}, policy)
+			if err == nil {
+				accepted.Add(1)
+				return
+			}
+			var rejected *MutationRejectedError
+			if errors.As(err, &rejected) && rejected.Reason == MutationVoteActionLimit {
+				limited.Add(1)
+				return
+			}
+			unexpected.Store(err)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if err, _ := unexpected.Load().(error); err != nil {
+		t.Fatalf("unexpected concurrent vote error: %v", err)
+	}
+	if accepted.Load() != int32(policy.ActionLimit) || limited.Load() != attempts-int32(policy.ActionLimit) {
+		t.Fatalf("accepted=%d limited=%d, want accepted=%d limited=%d", accepted.Load(), limited.Load(), policy.ActionLimit, attempts-int32(policy.ActionLimit))
+	}
+	eventCount, err := st.CountIncidentVoteEventsByUserSince(ctx, 700, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("count vote events: %v", err)
+	}
+	if eventCount != policy.ActionLimit {
+		t.Fatalf("vote events = %d, want %d", eventCount, policy.ActionLimit)
+	}
+	var stateCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_votes WHERE user_id = ?`, 700).Scan(&stateCount); err != nil {
+		t.Fatalf("count vote state: %v", err)
+	}
+	if stateCount != eventCount {
+		t.Fatalf("vote state rows = %d, event rows = %d", stateCount, eventCount)
+	}
+}
+
+func TestConcurrentIncidentCommentsCannotExceedPersistedLimits(t *testing.T) {
+	t.Run("per user", func(t *testing.T) {
+		st := newTestStore(t)
+		defer st.Close()
+		ctx := context.Background()
+		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+		policy := CommentMutationPolicy{ActionWindow: time.Hour, ActionLimit: 10, IncidentLimit: 50}
+
+		const attempts = 30
+		start := make(chan struct{})
+		var accepted atomic.Int32
+		var limited atomic.Int32
+		var wg sync.WaitGroup
+		errs := make(chan error, attempts)
+		for idx := 0; idx < attempts; idx++ {
+			idx := idx
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				err := st.SubmitIncidentComment(ctx, domain.IncidentComment{
+					ID:         fmt.Sprintf("atomic-user-comment-%02d", idx),
+					IncidentID: fmt.Sprintf("incident-%02d", idx),
+					UserID:     800,
+					Nickname:   "private",
+					Body:       "Still here",
+					CreatedAt:  now,
+				}, policy)
+				if err == nil {
+					accepted.Add(1)
+					return
+				}
+				var rejected *MutationRejectedError
+				if errors.As(err, &rejected) && rejected.Reason == MutationCommentActionLimit {
+					limited.Add(1)
+					return
+				}
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("unexpected concurrent comment error: %v", err)
+		}
+		if accepted.Load() != int32(policy.ActionLimit) || limited.Load() != attempts-int32(policy.ActionLimit) {
+			t.Fatalf("accepted=%d limited=%d, want accepted=%d limited=%d", accepted.Load(), limited.Load(), policy.ActionLimit, attempts-int32(policy.ActionLimit))
+		}
+	})
+
+	t.Run("per incident", func(t *testing.T) {
+		st := newTestStore(t)
+		defer st.Close()
+		ctx := context.Background()
+		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+		policy := CommentMutationPolicy{ActionWindow: time.Hour, ActionLimit: 10, IncidentLimit: 50}
+
+		const attempts = 80
+		start := make(chan struct{})
+		var accepted atomic.Int32
+		var limited atomic.Int32
+		var wg sync.WaitGroup
+		errs := make(chan error, attempts)
+		for idx := 0; idx < attempts; idx++ {
+			idx := idx
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				err := st.SubmitIncidentComment(ctx, domain.IncidentComment{
+					ID:         fmt.Sprintf("atomic-incident-comment-%02d", idx),
+					IncidentID: "shared-incident",
+					UserID:     int64(1000 + idx),
+					Nickname:   "private",
+					Body:       "Still here",
+					CreatedAt:  now,
+				}, policy)
+				if err == nil {
+					accepted.Add(1)
+					return
+				}
+				var rejected *MutationRejectedError
+				if errors.As(err, &rejected) && rejected.Reason == MutationIncidentCommentLimit {
+					limited.Add(1)
+					return
+				}
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("unexpected concurrent comment error: %v", err)
+		}
+		if accepted.Load() != int32(policy.IncidentLimit) || limited.Load() != attempts-int32(policy.IncidentLimit) {
+			t.Fatalf("accepted=%d limited=%d, want accepted=%d limited=%d", accepted.Load(), limited.Load(), policy.IncidentLimit, attempts-int32(policy.IncidentLimit))
+		}
+	})
 }
 
 func insertTrain(t *testing.T, st *SQLiteStore, trainID string, dep time.Time, arr time.Time) {

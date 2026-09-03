@@ -10,6 +10,49 @@ import (
 
 var ErrCleanupUnsupported = errors.New("cleanup unsupported")
 
+type MutationRejectionReason string
+
+const (
+	MutationReportDuplicate      MutationRejectionReason = "report_duplicate"
+	MutationReportCooldown       MutationRejectionReason = "report_cooldown"
+	MutationReportActionLimit    MutationRejectionReason = "report_action_limit"
+	MutationVoteCooldown         MutationRejectionReason = "vote_cooldown"
+	MutationVoteActionLimit      MutationRejectionReason = "vote_action_limit"
+	MutationCommentActionLimit   MutationRejectionReason = "comment_action_limit"
+	MutationIncidentCommentLimit MutationRejectionReason = "incident_comment_limit"
+)
+
+type MutationRejectedError struct {
+	Reason    MutationRejectionReason
+	Remaining time.Duration
+}
+
+func (e *MutationRejectedError) Error() string {
+	if e == nil {
+		return "mutation rejected"
+	}
+	return "mutation rejected: " + string(e.Reason)
+}
+
+type ReportMutationPolicy struct {
+	Cooldown     time.Duration
+	Dedupe       time.Duration
+	ActionWindow time.Duration
+	ActionLimit  int
+}
+
+type VoteMutationPolicy struct {
+	ChangeWindow time.Duration
+	ActionWindow time.Duration
+	ActionLimit  int
+}
+
+type CommentMutationPolicy struct {
+	ActionWindow  time.Duration
+	ActionLimit   int
+	IncidentLimit int
+}
+
 type CleanupResult struct {
 	CheckinsDeleted         int64
 	RouteCheckinsDeleted    int64
@@ -76,23 +119,30 @@ type Store interface {
 	ListAllFavoriteRoutes(ctx context.Context) ([]domain.FavoriteRoute, error)
 
 	InsertReportEvent(ctx context.Context, e domain.ReportEvent) error
+	SubmitReportEvent(ctx context.Context, e domain.ReportEvent, policy ReportMutationPolicy) error
 	GetLastReportByUserTrain(ctx context.Context, userID int64, trainID string) (*domain.ReportEvent, error)
 	ListReportsSince(ctx context.Context, trainID string, since time.Time, limit int) ([]domain.ReportEvent, error)
 	ListRecentReports(ctx context.Context, trainID string, limit int) ([]domain.ReportEvent, error)
 	ListRecentReportEvents(ctx context.Context, since time.Time, limit int) ([]domain.ReportEvent, error)
+	CountReportActionsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error)
 	InsertStationSighting(ctx context.Context, e domain.StationSighting) error
+	SubmitStationSighting(ctx context.Context, e domain.StationSighting, policy ReportMutationPolicy) error
 	GetLastStationSightingByUserScope(ctx context.Context, userID int64, stationID string, destinationStationID *string) (*domain.StationSighting, error)
 	ListRecentStationSightings(ctx context.Context, since time.Time, limit int) ([]domain.StationSighting, error)
 	ListRecentStationSightingsByStation(ctx context.Context, stationID string, since time.Time, limit int) ([]domain.StationSighting, error)
 	ListRecentStationSightingsByTrain(ctx context.Context, trainID string, since time.Time, limit int) ([]domain.StationSighting, error)
 	InsertLocationReport(ctx context.Context, e domain.LocationReport) error
+	SubmitLocationReport(ctx context.Context, e domain.LocationReport, policy ReportMutationPolicy) error
 	GetLastLocationReportByUserScope(ctx context.Context, userID int64, scope string, subjectID string) (*domain.LocationReport, error)
 	ListRecentLocationReports(ctx context.Context, since time.Time, limit int) ([]domain.LocationReport, error)
 	UpsertIncidentVote(ctx context.Context, vote domain.IncidentVote) error
 	InsertIncidentVoteEvent(ctx context.Context, vote domain.IncidentVoteEvent) error
+	SubmitIncidentVote(ctx context.Context, vote domain.IncidentVote, event domain.IncidentVoteEvent, policy VoteMutationPolicy) error
 	ListIncidentVotes(ctx context.Context, incidentID string) ([]domain.IncidentVote, error)
 	ListIncidentVoteEvents(ctx context.Context, incidentID string, since time.Time, limit int) ([]domain.IncidentVoteEvent, error)
+	CountIncidentVoteEventsByUserSince(ctx context.Context, userID int64, since time.Time) (int, error)
 	InsertIncidentComment(ctx context.Context, comment domain.IncidentComment) error
+	SubmitIncidentComment(ctx context.Context, comment domain.IncidentComment, policy CommentMutationPolicy) error
 	ListIncidentComments(ctx context.Context, incidentID string, limit int) ([]domain.IncidentComment, error)
 
 	CleanupExpired(ctx context.Context, now time.Time, retention time.Duration, loc *time.Location) (CleanupResult, error)

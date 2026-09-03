@@ -508,6 +508,209 @@ func TestCleanupExpiredStateRemovesEmptyAnonymousViewerRows(t *testing.T) {
 	}
 }
 
+func TestPublicIncidentActionsHaveGlobalLimitsAndAnonymousActors(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	for _, want := range []string{
+		"const REPORT_ACTION_WINDOW_MS = 30 * 60 * 1000;",
+		"const REPORT_ACTION_LIMIT = 5;",
+		"const VOTE_ACTION_LIMIT = 20;",
+		"const VOTE_CHANGE_COOLDOWN_MS = 30 * 60 * 1000;",
+		"const COMMENT_ACTION_LIMIT = 10;",
+		"const INCIDENT_COMMENT_ACTION_LIMIT = 50;",
+		"const PUBLIC_INCIDENT_ACTOR_LABEL = 'Anonymous';",
+		"const trainbot_incident_vote_event = table(",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("Spacetime source missing %q", want)
+		}
+	}
+
+	for _, tc := range []struct {
+		anchor string
+		want   []string
+	}{
+		{
+			anchor: "function submitReportActionAtomic",
+			want:   []string{"countReportActionsForStableIdSince", "REPORT_ACTION_LIMIT"},
+		},
+		{
+			anchor: "function submitIncidentVoteAtomic",
+			want: []string{
+				"voteChangeCooldownSeconds",
+				"countVoteActionsForStableIdSince",
+				"trainbot_incident_vote_event.insert",
+			},
+		},
+		{
+			anchor: "function submitIncidentCommentAtomic",
+			want: []string{
+				"countCommentsForStableIdSince",
+				"COMMENT_ACTION_LIMIT",
+				"countCommentsForIncidentSince",
+				"INCIDENT_COMMENT_ACTION_LIMIT",
+			},
+		},
+		{
+			anchor: "function incidentDetailPayload",
+			want:   []string{"nickname: PUBLIC_INCIDENT_ACTOR_LABEL"},
+		},
+	} {
+		snippet := sourceSnippet(t, source, tc.anchor, 3200)
+		for _, want := range tc.want {
+			if !strings.Contains(snippet, want) {
+				t.Fatalf("%s snippet missing %q in:\n%s", tc.anchor, want, snippet)
+			}
+		}
+	}
+}
+
+func TestDirectAndServiceIncidentMutationsShareAtomicReducers(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	for _, tc := range []struct {
+		anchor string
+		want   string
+	}{
+		{anchor: "export const submitReport = spacetimedb.reducer", want: "submitReportActionAtomic(ctx, activity, event);"},
+		{anchor: "export const submitStationSighting = spacetimedb.reducer", want: "submitReportActionAtomic(ctx, activity, event);"},
+		{anchor: "export const voteIncident = spacetimedb.reducer", want: "submitIncidentVoteAtomic(ctx,"},
+		{anchor: "export const commentIncident = spacetimedb.reducer", want: "submitIncidentCommentAtomic(ctx,"},
+		{anchor: "export const serviceSubmitReport = spacetimedb.reducer", want: "submitReportActionAtomic(ctx, activity,"},
+		{anchor: "export const serviceSubmitStationSighting = spacetimedb.reducer", want: "submitReportActionAtomic(ctx, activity,"},
+		{anchor: "export const serviceSubmitLocationReport = spacetimedb.reducer", want: "submitReportActionAtomic(ctx, activity,"},
+		{anchor: "export const serviceSubmitIncidentVote = spacetimedb.reducer", want: "submitIncidentVoteAtomic(ctx, args);"},
+		{anchor: "export const serviceSubmitIncidentComment = spacetimedb.reducer", want: "submitIncidentCommentAtomic(ctx, args);"},
+	} {
+		snippet := sourceSnippet(t, source, tc.anchor, 2600)
+		if !strings.Contains(snippet, tc.want) {
+			t.Fatalf("%s snippet missing shared atomic mutation %q in:\n%s", tc.anchor, tc.want, snippet)
+		}
+	}
+	if strings.Contains(source, "service_record_incident_vote_event") {
+		t.Fatalf("split service vote accounting reducer must not remain available")
+	}
+}
+
+func TestActiveBundlePublishReprojectsCurrentPublicIncidentRows(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	snippet := sourceSnippet(t, source, "export const serviceSetActiveBundle = spacetimedb.reducer", 1800)
+	if !strings.Contains(snippet, "refreshAllPublicProjections(ctx, next.serviceDate);") {
+		t.Fatalf("active bundle publish must deterministically rebuild current-day public projections:\n%s", snippet)
+	}
+	if !strings.Contains(snippet, "updatedAt: nowISO(ctx)") {
+		t.Fatalf("active bundle publish must use the reducer timestamp deterministically:\n%s", snippet)
+	}
+	projection := sourceSnippet(t, source, "function refreshActivityProjection", 5200)
+	for _, want := range []string{
+		"lastActivityActor: summary.lastActivityActor",
+		"lastReporter: summary.lastReporter",
+		"nickname: PUBLIC_INCIDENT_ACTOR_LABEL",
+	} {
+		if !strings.Contains(projection, want) {
+			t.Fatalf("public reprojection is missing anonymous actor write %q in:\n%s", want, projection)
+		}
+	}
+}
+
+func TestPersistedPublicProjectionSchemaRemainsBackwardCompatible(t *testing.T) {
+	t.Parallel()
+
+	source := readSpacetimeSource(t)
+	assertOrdered := func(name string, snippet string, fields ...string) {
+		t.Helper()
+		previous := -1
+		for _, field := range fields {
+			position := strings.Index(snippet, field)
+			if position < 0 {
+				t.Fatalf("%s missing persisted field %q in:\n%s", name, field, snippet)
+			}
+			if position <= previous {
+				t.Fatalf("%s persisted field %q is out of order in:\n%s", name, field, snippet)
+			}
+			previous = position
+		}
+	}
+
+	timelineDoc := sourceSnippet(t, source, "const timelineBucketDoc = t.object", 360)
+	assertOrdered("timelineBucketDoc", timelineDoc, "at: t.string()", "signal: t.string()", "count: t.u32()")
+	if strings.Contains(timelineDoc, "eventLabel: t.string()") {
+		t.Fatalf("persisted timeline object must retain its production signal field:\n%s", timelineDoc)
+	}
+
+	timelineTable := sourceSnippet(t, source, "const trainbot_trip_timeline_bucket = table", 720)
+	assertOrdered(
+		"trainbot_trip_timeline_bucket",
+		timelineTable,
+		"id: t.string().primaryKey()",
+		"trainId: t.string().index()",
+		"serviceDate: t.string().index()",
+		"at: t.string()",
+		"signal: t.string()",
+		"count: t.u32()",
+	)
+
+	incidentEvent := sourceSnippet(t, source, "const trainbot_incident_event = table", 780)
+	assertOrdered(
+		"trainbot_incident_event",
+		incidentEvent,
+		"id: t.string().primaryKey()",
+		"incidentId: t.string().index()",
+		"serviceDate: t.string().index()",
+		"kind: t.string()",
+		"name: t.string()",
+		"detail: t.string()",
+		"nickname: t.string()",
+		"createdAt: t.string()",
+		"signal: t.string()",
+	)
+
+	tripPublic := sourceSnippet(t, source, "const trainbot_trip_public = table", 1400)
+	assertOrdered(
+		"trainbot_trip_public",
+		tripPublic,
+		"id: t.string().primaryKey()",
+		"serviceDate: t.string().index()",
+		"fromStationId: t.string()",
+		"fromStationName: t.string()",
+		"toStationId: t.string()",
+		"toStationName: t.string()",
+		"departureAt: t.string()",
+		"arrivalAt: t.string()",
+		"sourceVersion: t.string()",
+		"state: t.string()",
+		"confidence: t.string()",
+		"uniqueReporters: t.u32()",
+		"riders: t.u32()",
+		"lastReportAt: t.string()",
+		"updatedAt: t.string()",
+		"recentTimeline: t.array(timelineBucketDoc)",
+	)
+
+	tripProjection := sourceSnippet(t, source, "function refreshTripProjection", 3300)
+	for _, want := range []string{"signal: publicBucket.signal", "sourceVersion: ''"} {
+		if !strings.Contains(tripProjection, want) {
+			t.Fatalf("public trip projection must retain a safe legacy field write %q in:\n%s", want, tripProjection)
+		}
+	}
+	if strings.Contains(tripProjection, "sourceVersion: trip.sourceVersion") {
+		t.Fatalf("public trip projection must not expose the private source version:\n%s", tripProjection)
+	}
+
+	incidentProjection := sourceSnippet(t, source, "function refreshActivityProjection", 5200)
+	if strings.Count(incidentProjection, "signal: ''") < 2 {
+		t.Fatalf("all public incident event variants must blank the legacy signal field:\n%s", incidentProjection)
+	}
+	apiTimeline := sourceSnippet(t, source, "function publicTimelinePayload", 420)
+	if !strings.Contains(apiTimeline, "eventLabel: publicTimelineEventLabel(bucket)") {
+		t.Fatalf("public API timeline must keep the eventLabel presentation field:\n%s", apiTimeline)
+	}
+}
+
 func readSpacetimeSource(t *testing.T) string {
 	t.Helper()
 

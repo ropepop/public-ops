@@ -17,6 +17,7 @@ export const CLIENT_HDR_PAINT_WAIT_TIMEOUT_MILLIS = 2000;
 export const CLIENT_HDR_RENDERER_INIT_TIMEOUT_MILLIS = 8000;
 export const CLIENT_HDR_SETTLEMENT_TIMEOUT_MILLIS = 2000;
 export const CLIENT_HDR_DISPLAY_BOOSTS = CLIENT_HDR_ALLOWED_BOOSTS;
+const CLIENT_HDR_HOLDOVER_SETTLEMENT_CANCEL_REASON = 'hdr_holdover_settlement_superseded';
 
 export function normalizeClientHDRDisplayBoost(value) {
   const boost = Number(value);
@@ -81,19 +82,23 @@ function releaseCandidate(candidate) {
   closeFrame(candidate.frame);
 }
 
-export function offerClientHDRCanvasFrame(controller, canvas, metadata = {}, environment = globalThis) {
+export function offerClientHDRCanvasFrame(controller, canvas, metadata = {}, environment = globalThis, options = {}) {
   const VideoFrameConstructor = environment && environment.VideoFrame;
   if (!controller || !canvas || typeof VideoFrameConstructor !== 'function') return false;
   const timestamp = Math.max(0, Math.round(finiteNumber(metadata.timestamp)));
   let frame = null;
+  let offered = false;
   try {
     frame = new VideoFrameConstructor(canvas, { timestamp });
-    return controller.offerFrame(frame, metadata);
+    offered = controller.offerFrame(frame, metadata, options);
+    return offered;
   } catch (_) {
     return false;
   } finally {
     closeFrame(frame);
-    try { controller.noteSDRFrame(metadata); } catch (_) {}
+    if (!offered || typeof options.commitSDR !== 'function') {
+      try { controller.noteSDRFrame(metadata); } catch (_) {}
+    }
   }
 }
 
@@ -165,6 +170,7 @@ export class ClientHDRController {
     this.onStatus = options.onStatus || (() => {});
     this.onMetric = options.onMetric || (() => {});
     this.onRecoveryRequest = options.onRecoveryRequest || (() => {});
+    this.canReleaseHoldover = options.canReleaseHoldover || (() => true);
     this.maxSequenceLag = finiteNumber(options.maxSequenceLag, 1);
     this.maxAgeDeltaMillis = finiteNumber(options.maxAgeDeltaMillis, 250);
     this.gpuCompletionTimeoutMillis = Math.max(1, Math.round(finiteNumber(
@@ -211,6 +217,9 @@ export class ClientHDRController {
     this.surfaceTransitions = 0;
     this.fallbackStartedAt = 0;
     this.fallbackKind = '';
+    this.visualHoldover = false;
+    this.visualHoldoverReason = '';
+    this.streamRegionVisible = true;
     this.recoveryPaintCheck = null;
     this.settlementWatchdog = null;
     this.settlementStartedWallAt = 0;
@@ -271,6 +280,8 @@ export class ClientHDRController {
     this.surfaceTransitions = 0;
     this.fallbackStartedAt = 0;
     this.fallbackKind = '';
+    this.visualHoldover = false;
+    this.visualHoldoverReason = '';
     this.cancelSettlementWatchdog();
     this.counters = this.newCounters();
     this.onSurface(false, null, 'starting');
@@ -419,6 +430,16 @@ export class ClientHDRController {
     }
   }
 
+  setStreamRegionVisible(visible) {
+    const next = Boolean(visible);
+    if (this.streamRegionVisible === next) return false;
+    this.streamRegionVisible = next;
+    this.onMetric('stream_region_visibility', Object.assign(this.snapshot(), {
+      streamRegionVisible: next
+    }));
+    return true;
+  }
+
   noteSDRFrame(metadata = {}) {
     if (this.checkSettlementDeadline('sdr_frame')) return false;
     this.currentSDR = this.sdrMetadata(metadata);
@@ -508,9 +529,48 @@ export class ClientHDRController {
   }
 
   markSDRStale(reason = 'sdr_stale') {
+    this.visualHoldover = false;
+    this.visualHoldoverReason = '';
     this.currentSDR = null;
     this.freshness = { fresh: false, reason: String(reason || 'sdr_stale') };
     this.latchFallback(this.freshness.reason);
+  }
+
+  holdLastPresentation(reason = 'stream_recovering') {
+    const holdoverReason = String(reason || 'stream_recovering').slice(0, 80);
+    if (!this.active || !this.renderer || !this.documentVisible || !this.firstPresented ||
+      !this.surfaceVisible || !this.presented || !this.surfaceRevealAllowed()) return false;
+    const changed = !this.visualHoldover || this.visualHoldoverReason !== holdoverReason;
+    this.cancelRecoveryPaintCheck();
+    // A transport interruption can arrive after the next frame has already
+    // copied but before its compositor confirmation resolves.  That copied
+    // frame is now the visual holdover; an older settlement deadline must not
+    // tear down the reusable bright surface while recovery waits for a new
+    // globally-authorized keyframe.
+    this.cancelSettlementWatchdog();
+    this.currentSDR = null;
+    this.freshness = { fresh: false, reason: holdoverReason };
+    this.presentationState = 'holdover';
+    this.recoveryFreshStreak = 0;
+    this.fallbackStartedAt = 0;
+    this.fallbackKind = '';
+    this.visualHoldover = true;
+    this.visualHoldoverReason = holdoverReason;
+    // The renderer also owns the requestAnimationFrame/timeout wait that is
+    // nested underneath the controller watchdog. Cancel that wait without
+    // disposing the renderer so its rejection cannot later tear down the
+    // retained canvas.
+    try {
+      if (typeof this.renderer.cancelCompositorSettlementWaits === 'function') {
+        this.renderer.cancelCompositorSettlementWaits(CLIENT_HDR_HOLDOVER_SETTLEMENT_CANCEL_REASON);
+      }
+    } catch (_) {}
+    if (changed) {
+      this.onMetric('presentation_holdover', Object.assign(this.snapshot(), {
+        reason: holdoverReason
+      }));
+    }
+    return true;
   }
 
   canCoordinateSDRFrame() {
@@ -801,6 +861,25 @@ export class ClientHDRController {
       presentation.selectedDisplayBoost === this.selectedDisplayBoost &&
       (!requireVisible || this.surfaceVisible) && this.surfaceRevealAllowed()
     );
+    const deferHoldoverRelease = (presentation, stage, discardPrepared, copyCompleted = false) => {
+      if (!this.visualHoldover || this.holdoverReleaseAllowed(presentation)) return false;
+      // If authority changed only after present(), these pixels are already on
+      // the continuous canvas.  Track their identity while keeping them
+      // passive/unproven; otherwise preserve the older held identity.
+      if (copyCompleted) this.presented = presentation;
+      this.cancelSettlementWatchdog();
+      this.presentationState = 'holdover';
+      this.freshness = { fresh: false, reason: 'holdover_release_not_authorized' };
+      if (this.pendingPresentation === presentation) this.pendingPresentation = null;
+      if (discardPrepared) {
+        this.discardPreparedCandidate(renderer, candidate, 'holdover_release_not_authorized');
+      }
+      this.onMetric('holdover_release_deferred', Object.assign(this.snapshot(), {
+        reason: 'global_stream_not_fresh',
+        stage: String(stage || 'unknown')
+      }));
+      return true;
+    };
 
     const run = async () => {
       const activationRequired = !this.firstPresented ||
@@ -833,7 +912,11 @@ export class ClientHDRController {
           !this.pending && this.paintRecoveryRequested;
         if (this.pendingPresentation === completedPresentation) this.pendingPresentation = null;
         this.discardPreparedCandidate(renderer, candidate, reason);
-        if (this.surfaceVisible) this.latchFallback(reason);
+        // A replacement candidate that misses its pre-copy paint opportunity
+        // has not changed the held canvas. Keep an established transient
+        // holdover bright and passive; ordinary live presentation retains the
+        // existing fail-closed behavior.
+        if (this.surfaceVisible && !this.visualHoldover) this.latchFallback(reason);
         if (reason === 'paint_wait_failed') {
           this.fail(reason);
         } else if (requestRecovery) {
@@ -870,10 +953,19 @@ export class ClientHDRController {
         return;
       }
       if (!authorityCurrent(completedPresentation)) throw new Error('presentation_authority_revoked');
+      // Rendering above only prepares a staging texture.  Once a valid HDR
+      // image is being held, global stream authority must be current before a
+      // prepared candidate is allowed to replace those visible pixels.
+      if (deferHoldoverRelease(completedPresentation, 'prepared', true)) return;
 
       if (activationRequired) {
         const activationCopy = await presentPrepared(revision);
         if (activationCopy === presentationAborted) return;
+        // present() has already changed the continuous canvas. During a
+        // holdover, its metadata must follow those physical pixels even while
+        // proof remains false.
+        if (this.visualHoldover) this.presented = completedPresentation;
+        if (deferHoldoverRelease(completedPresentation, 'after_activation_copy', false, true)) return;
         if (!authorityCurrent(completedPresentation)) throw new Error('presentation_authority_revoked');
         const activationFreshness = freshnessFor(completedPresentation);
         if (!activationFreshness.fresh) {
@@ -881,7 +973,7 @@ export class ClientHDRController {
           this.latchFallback(activationFreshness.reason);
           return;
         }
-        this.presented = completedPresentation;
+        if (!this.visualHoldover) this.presented = completedPresentation;
         if (this.presentationState === 'fallback_latched' && this.fallbackKind === 'hard') {
           this.recoveryFreshStreak += 1;
           if (this.recoveryFreshStreak < 2) {
@@ -905,6 +997,7 @@ export class ClientHDRController {
         if (!authorityCurrent(completedPresentation, true)) throw new Error('presentation_authority_revoked');
         const settledActivationFreshness = freshnessFor(completedPresentation);
         if (!settledActivationFreshness.fresh) throw new Error(settledActivationFreshness.reason);
+        if (deferHoldoverRelease(completedPresentation, 'after_activation_compositor', false, true)) return;
         this.rendererMetrics.activationCompositorOpportunitiesCompleted = true;
         this.rendererMetrics.activationPostPresentSource = String(activationPaint.postPresentSource || '');
         this.rendererMetrics.activationPostPresentOpportunityCount = Math.max(0, Math.round(finiteNumber(
@@ -936,8 +1029,14 @@ export class ClientHDRController {
         this.pendingPresentation = completedPresentation;
       }
 
+      // Re-check after every asynchronous preparation boundary.  present()
+      // performs the actual swap synchronously, so this is the final authority
+      // gate before the held canvas can change.
+      if (deferHoldoverRelease(completedPresentation, 'before_target_copy', true)) return;
       const targetCopy = await presentPrepared(revision);
       if (targetCopy === presentationAborted) return;
+      if (this.visualHoldover) this.presented = completedPresentation;
+      if (deferHoldoverRelease(completedPresentation, 'after_target_copy', false, true)) return;
       if (activationRequired && this.checkSettlementDeadline('target_copy_completion')) return;
       if (!authorityCurrent(completedPresentation, activationRequired)) {
         if (activationRequired) throw new Error('presentation_authority_revoked');
@@ -952,7 +1051,7 @@ export class ClientHDRController {
         this.latchFallback(copiedFreshness.reason);
         return;
       }
-      this.presented = completedPresentation;
+      if (!this.visualHoldover) this.presented = completedPresentation;
       if (!activationRequired) {
         if (this.presentationState === 'fallback_latched' && this.fallbackKind === 'hard') {
           this.recoveryFreshStreak += 1;
@@ -1001,10 +1100,16 @@ export class ClientHDRController {
       this.rendererMetrics.targetCompositorOpportunitiesCompleted = true;
       this.rendererMetrics.targetPostPresentSource = completedPresentation.postPresentSource;
       this.rendererMetrics.targetPostPresentOpportunityCount = completedPresentation.postPresentOpportunityCount;
+      // Global transport/status authority can change while the compositor
+      // confirmation is pending.  Keep proof false and identify the copied
+      // pixels accurately if that happens; do not claim this copy live.
+      if (deferHoldoverRelease(completedPresentation, 'after_compositor', false, true)) return;
       this.presented = completedPresentation;
       this.presentationState = 'visible';
       this.fallbackStartedAt = 0;
       this.fallbackKind = '';
+      this.visualHoldover = false;
+      this.visualHoldoverReason = '';
       if (this.pendingPresentation === completedPresentation) this.pendingPresentation = null;
       this.recordPresentedMetric(completedPresentation);
     };
@@ -1012,7 +1117,30 @@ export class ClientHDRController {
     run().catch((error) => {
       this.cancelInFlightTimeout(candidate);
       if (isCurrent()) {
-        this.fail(String(error && error.message || 'render_failed').slice(0, 80));
+        const failureReason = String(error && error.message || 'render_failed').slice(0, 80);
+        const supersededHoldoverSettlement = this.visualHoldover && this.firstPresented &&
+          this.surfaceVisible && this.presented && (
+            failureReason === CLIENT_HDR_HOLDOVER_SETTLEMENT_CANCEL_REASON ||
+            failureReason === 'hdr_presented_display_refresh_timeout'
+          );
+        if (supersededHoldoverSettlement) {
+          // The canvas was already copied before this compositor wait began.
+          // Keep those pixels and their identity, but never promote them to
+          // fresh proof or emit a presented-success metric.
+          this.cancelSettlementWatchdog();
+          this.pendingPresentation = null;
+          this.currentSDR = null;
+          this.presentationState = 'holdover';
+          this.freshness = {
+            fresh: false,
+            reason: this.visualHoldoverReason || 'stream_recovering'
+          };
+          this.onMetric('holdover_settlement_superseded', Object.assign(this.snapshot(), {
+            reason: failureReason
+          }));
+        } else {
+          this.fail(failureReason);
+        }
       }
     }).finally(() => {
       this.cancelInFlightTimeout(candidate);
@@ -1116,11 +1244,12 @@ export class ClientHDRController {
 
   ensureExactProof(epoch, sequence) {
     const exact = Boolean(
-      this.surfaceVisible && this.presented &&
+      this.surfaceVisible && !this.visualHoldover && this.presentationState === 'visible' &&
+      this.freshness && this.freshness.fresh && this.presented &&
       finiteNumber(this.presented.epoch) === finiteNumber(epoch) &&
       finiteNumber(this.presented.sequence) === finiteNumber(sequence)
     );
-    if (!exact) this.latchFallback('proof_mismatch');
+    if (!exact && !this.visualHoldover) this.latchFallback('proof_mismatch');
     return exact;
   }
 
@@ -1146,7 +1275,22 @@ export class ClientHDRController {
     }
   }
 
+  holdoverReleaseAllowed(presentation) {
+    try {
+      return this.canReleaseHoldover(presentation, this.snapshot()) !== false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   latchFallback(reason) {
+    const fallbackReason = String(reason || 'fallback');
+    const transientFreshnessMismatch = fallbackReason === 'missing_watermark' ||
+      fallbackReason === 'epoch_mismatch' || fallbackReason === 'sequence_lag' ||
+      fallbackReason === 'visual_age' || fallbackReason.startsWith('prepared_epoch_mismatch') ||
+      fallbackReason.startsWith('prepared_sequence_lag') ||
+      fallbackReason.startsWith('prepared_visual_age');
+    if (this.visualHoldover && transientFreshnessMismatch) return false;
     this.cancelRecoveryPaintCheck();
     const nextKind = reason === 'sequence_lag' || reason === 'visual_age'
       ? 'soft'
@@ -1159,7 +1303,10 @@ export class ClientHDRController {
       this.fallbackKind = 'hard';
     }
     this.recoveryFreshStreak = 0;
+    this.visualHoldover = false;
+    this.visualHoldoverReason = '';
     this.setSurface(false, this.presented, reason);
+    return true;
   }
 
   fail(reason) {
@@ -1209,6 +1356,8 @@ export class ClientHDRController {
     this.presentationState = 'standby';
     this.recoveryFreshStreak = 0;
     this.fallbackKind = '';
+    this.visualHoldover = false;
+    this.visualHoldoverReason = '';
     this.setSurface(false, this.presented, reason);
     const renderer = this.renderer;
     this.renderer = null;
@@ -1231,6 +1380,12 @@ export class ClientHDRController {
       surfaceVisible: this.surfaceVisible,
       presentationState: this.presentationState,
       fallbackKind: this.fallbackKind,
+      firstPresented: this.firstPresented,
+      visualHoldover: this.visualHoldover,
+      visualHoldoverReason: this.visualHoldoverReason,
+      proofFresh: Boolean(this.freshness && this.freshness.fresh &&
+        this.presentationState === 'visible' && !this.visualHoldover),
+      streamRegionVisible: this.streamRegionVisible,
       recoveryFreshStreak: this.recoveryFreshStreak,
       recoveryPaintCheckPending: Boolean(this.recoveryPaintCheck),
       paintPending: Boolean(this.pendingPresentation),

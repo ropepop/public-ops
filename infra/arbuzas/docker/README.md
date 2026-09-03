@@ -51,7 +51,18 @@ and host-integration details.
 Portainer was retired on 2026-07-20. There is no active Portainer container or listener on `9443`. Its former state is retained temporarily only as a restricted rollback archive matching `/srv/arbuzas/portainer-backups/portainer-retired-<timestamp>.tar.gz`; normal operations do not use it. Netdata runs separately as a host-native service with private Tailscale access. The live kitty-gration host must stay out of Docker Swarm, and the old Swarm and Pixel/orchestrator deployment paths are rollback-only legacy material.
 The subscription bot and Mini App were retired on 2026-07-26. They are absent from the active Compose project and public tunnel set. Their source is recoverable through `archive/subscription-bot/README.md`, and the final private state is retained only in a restricted host retirement archive.
 The ticket service talks privately and directly to `ticket_phone_bridge`, which owns the ADB connection to the physical Pixel. Stream desired state and commands are durable in SpacetimeDB; there is no ticket device lab or separate phone broker inside the production Compose project.
+The public Satiksme map process cannot run the personal-account chat analyzer. Its preserved session is stored in a separate root-only host directory and is not mounted into the public container. A future analyzer must run as its own restricted worker.
 
 qBittorrent uses VueTorrent at `https://arbuzas-vps.tail9345a.ts.net:24680/` over Tailscale with no application login. Its Web listener is loopback-only, its peer traffic uses TCP and UDP `45123`, and its configuration plus payload live inside a capped 25 GiB filesystem. See `docs/runbooks/QBITTORRENT_TAILSCALE.md` for retention and deployment details.
 
 Jellyfin uses `https://arbuzas-vps.tail9345a.ts.net:29096/` over Tailscale. Docker publishes its Web listener only at `127.0.0.1:18096`; Tailscale Serve supplies private HTTPS without using port `443` or Funnel. Jellyfin reads the qBittorrent payload through a read-only `/media` mount, while its configuration, artwork, temporary files, and disabled-by-policy transcode area remain disk-backed under `/srv/arbuzas/jellyfin`. The visible `Media` profile is passwordless; the hidden administrator password remains in the root-only host mirror secret and is not mounted into the container.
+
+MeshCentral keeps two-step authentication optional for each existing user. To
+enroll, sign in, open **My Account**, choose **Add 2-step login**, and follow
+the authenticator-app instructions. Store the recovery information somewhere
+separate from the VPS. New public account registration and login-link tokens
+remain disabled; password recovery can disable two-step authentication, so
+protect the recovery email account and re-enroll after any recovery.
+Passwords must be at least 14 characters. MeshCentral's optional common-password
+checker is deliberately not enabled because version 1.2.5 installs that module
+at startup, which is incompatible with the service's read-only container image.

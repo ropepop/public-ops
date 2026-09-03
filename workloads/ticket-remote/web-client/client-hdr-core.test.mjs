@@ -73,6 +73,7 @@ function harness(options = {}) {
       presentCompletionWaits: 0,
       postPresentPaints: 0,
       postPresentOpportunityTargets: [],
+      compositorSettlementCancellations: [],
       discardedPreparedFrames: 0,
       disposed: false,
       currentBoost: 4,
@@ -179,6 +180,12 @@ function harness(options = {}) {
             : source === 'animation_frame'
         };
       },
+      cancelCompositorSettlementWaits(reason = 'renderer_disposed') {
+        this.compositorSettlementCancellations.push(reason);
+        if (typeof options.onCancelCompositorSettlementWaits === 'function') {
+          options.onCancelCompositorSettlementWaits(reason, this);
+        }
+      },
       discardPreparedFrame() { this.discardedPreparedFrames += 1; this.preparedRender = null; },
       dispose() { this.disposed = true; }
     };
@@ -219,7 +226,10 @@ function harness(options = {}) {
     onRecoveryRequest: (reason, detail) => {
       recoveryRequests.push({ reason, detail });
       if (typeof options.onRecoveryRequest === 'function') options.onRecoveryRequest(reason, detail);
-    }
+    },
+    canReleaseHoldover: (presentation, snapshot) => typeof options.canReleaseHoldover === 'function'
+      ? options.canReleaseHoldover(presentation, snapshot)
+      : options.canReleaseHoldover !== false
   });
   const canvas = { width: 720, height: 1482, getContext() { return {}; } };
   return {
@@ -629,6 +639,166 @@ test('an independent settlement watchdog fails a copied target closed when compo
   assert.deepEqual(closed, ['stalled-settlement-clone']);
 });
 
+test('entering holdover while a copied frame settles cancels its teardown deadline', async () => {
+  const stalledCompositor = deferred();
+  let globalStreamFresh = true;
+  const state = harness({
+    autoRender: true,
+    postPresentPaintGates: [Promise.resolve(), Promise.resolve(), stalledCompositor.promise],
+    settlementTimeoutMillis: 2000,
+    canReleaseHoldover: () => globalStreamFresh
+  });
+  const closed = [];
+  state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+  await tick();
+  state.controller.noteSDRFrame({
+    epoch: 10, sequence: 70, presentationOrdinal: 70, visualAgeMillis: 10, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('settling-holdover-initial', closed), {
+    epoch: 10, sequence: 70, presentationOrdinal: 70, visualAgeMillis: 10, offeredAt: 100
+  });
+  await tick();
+  assert.equal(state.controller.snapshot().proofFresh, true);
+
+  const renderer = state.renderers[0];
+  const rendererGeneration = state.controller.snapshot().rendererGeneration;
+  state.controller.noteSDRFrame({
+    epoch: 10, sequence: 71, presentationOrdinal: 71, visualAgeMillis: 5, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('settling-holdover-copied', closed), {
+    epoch: 10, sequence: 71, presentationOrdinal: 71, visualAgeMillis: 5, offeredAt: 100
+  });
+  await tick();
+
+  const settling = state.controller.snapshot();
+  assert.equal(settling.presentationState, 'settling');
+  assert.equal(settling.settlementPending, true);
+  assert.deepEqual({
+    epoch: settling.epoch,
+    sequence: settling.sequence,
+    presentationOrdinal: settling.presentationOrdinal
+  }, { epoch: 10, sequence: 71, presentationOrdinal: 71 },
+  'metadata must already identify the pixels synchronously copied to the canvas');
+  const staleWatchdog = state.timers.findLast((timer) =>
+    !timer.cancelled && timer.millis === 2000);
+  assert.ok(staleWatchdog);
+
+  globalStreamFresh = false;
+  assert.equal(state.controller.holdLastPresentation('video_socket_reconnecting'), true);
+  const held = state.controller.snapshot();
+  assert.equal(staleWatchdog.cancelled, true);
+  assert.equal(held.settlementPending, false);
+  assert.equal(held.presentationState, 'holdover');
+  assert.equal(held.visualHoldover, true);
+  assert.equal(held.proofFresh, false);
+  assert.equal(held.surfaceVisible, true);
+  assert.deepEqual({
+    epoch: held.epoch,
+    sequence: held.sequence,
+    presentationOrdinal: held.presentationOrdinal
+  }, { epoch: 10, sequence: 71, presentationOrdinal: 71 });
+
+  state.setWallClock(4000);
+  staleWatchdog.callback();
+  await tick();
+  const afterOldDeadline = state.controller.snapshot();
+  assert.equal(afterOldDeadline.active, true);
+  assert.equal(afterOldDeadline.surfaceVisible, true);
+  assert.equal(afterOldDeadline.visualHoldover, true);
+  assert.equal(afterOldDeadline.proofFresh, false);
+  assert.equal(afterOldDeadline.rendererGeneration, rendererGeneration);
+  assert.equal(renderer.disposed, false);
+  assert.equal(state.metrics.some(({ event }) => event === 'settlement_deadline_exceeded'), false);
+
+  stalledCompositor.resolve();
+  await tick();
+  const afterLateCompositor = state.controller.snapshot();
+  assert.equal(afterLateCompositor.surfaceVisible, true);
+  assert.equal(afterLateCompositor.presentationState, 'holdover');
+  assert.equal(afterLateCompositor.visualHoldover, true);
+  assert.equal(afterLateCompositor.proofFresh, false);
+  assert.deepEqual({
+    epoch: afterLateCompositor.epoch,
+    sequence: afterLateCompositor.sequence,
+    presentationOrdinal: afterLateCompositor.presentationOrdinal
+  }, { epoch: 10, sequence: 71, presentationOrdinal: 71 });
+  assert.equal(renderer.disposed, false);
+  assert.deepEqual(closed, ['settling-holdover-initial-clone', 'settling-holdover-copied-clone']);
+});
+
+test('renderer compositor cancellation and a queued timeout cannot tear down holdover', async () => {
+  for (const ending of ['cancelled', 'timeout_race']) {
+    const stalledCompositor = deferred();
+    let state;
+    state = harness({
+      autoRender: true,
+      postPresentPaintGates: [Promise.resolve(), Promise.resolve(), stalledCompositor.promise],
+      settlementTimeoutMillis: 2000,
+      canReleaseHoldover: () => false,
+      onCancelCompositorSettlementWaits: (reason) => {
+        if (ending === 'cancelled') stalledCompositor.reject(new Error(reason));
+      }
+    });
+    const closed = [];
+    state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+    await tick();
+    state.controller.noteSDRFrame({
+      epoch: 11, sequence: 80, presentationOrdinal: 80, visualAgeMillis: 10, renderedAt: 100
+    });
+    state.controller.offerFrame(fakeFrame(`${ending}-initial`, closed), {
+      epoch: 11, sequence: 80, presentationOrdinal: 80, visualAgeMillis: 10, offeredAt: 100
+    });
+    await tick();
+
+    const renderer = state.renderers[0];
+    const generation = state.controller.snapshot().rendererGeneration;
+    const transitions = state.controller.snapshot().surfaceTransitions;
+    state.controller.noteSDRFrame({
+      epoch: 11, sequence: 81, presentationOrdinal: 81, visualAgeMillis: 5, renderedAt: 100
+    });
+    state.controller.offerFrame(fakeFrame(`${ending}-copied`, closed), {
+      epoch: 11, sequence: 81, presentationOrdinal: 81, visualAgeMillis: 5, offeredAt: 100
+    });
+    await tick();
+    assert.equal(state.controller.snapshot().presentationState, 'settling');
+    assert.equal(state.controller.snapshot().settlementPending, true);
+
+    assert.equal(state.controller.holdLastPresentation('control_socket_reconnecting'), true);
+    assert.deepEqual(renderer.compositorSettlementCancellations,
+      ['hdr_holdover_settlement_superseded']);
+    if (ending === 'timeout_race') {
+      // Model the renderer deadline already having settled its promise just
+      // before cancellation reached it. Its queued timeout rejection still
+      // belongs to the now-superseded compositor wait.
+      stalledCompositor.reject(new Error('hdr_presented_display_refresh_timeout'));
+    }
+    await tick();
+
+    const held = state.controller.snapshot();
+    assert.equal(held.active, true, `${ending} must keep the controller active`);
+    assert.equal(held.surfaceVisible, true, `${ending} must keep the HDR canvas visible`);
+    assert.equal(held.presentationState, 'holdover');
+    assert.equal(held.visualHoldover, true);
+    assert.equal(held.proofFresh, false);
+    assert.equal(held.paintPending, false);
+    assert.equal(held.settlementPending, false);
+    assert.equal(held.rendererGeneration, generation);
+    assert.equal(held.surfaceTransitions, transitions);
+    assert.deepEqual({
+      epoch: held.epoch,
+      sequence: held.sequence,
+      presentationOrdinal: held.presentationOrdinal
+    }, { epoch: 11, sequence: 81, presentationOrdinal: 81 },
+    `${ending} must retain the metadata for the pixels already copied`);
+    assert.equal(renderer.disposed, false);
+    assert.equal(state.metrics.some(({ event }) => event === 'fallback'), false);
+    assert.equal(state.metrics.some(({ event, detail }) => event === 'presented' &&
+      detail && detail.sequence === 81), false);
+    assert.equal(state.metrics.filter(({ event }) => event === 'holdover_settlement_superseded').length, 1);
+    assert.deepEqual(closed, [`${ending}-initial-clone`, `${ending}-copied-clone`]);
+  }
+});
+
 test('a fresh SDR frame enforces the settlement wall deadline even when the timer never fires', async () => {
   const compositorGate = deferred();
   const state = harness({
@@ -990,6 +1160,59 @@ test('sequence staleness hides an established HDR surface synchronously', async 
   assert.equal(state.metrics.some(({ event }) => event.startsWith('source_advance_mismatch_')), false);
 });
 
+test('an already-drawn control-code frame hands off to HDR without hiding the visible surface', async () => {
+  let controlPaint = null;
+  let authoritativeRenderSerial = 20;
+  const state = harness({
+    autoRender: true,
+    waitForPaint: () => controlPaint ? controlPaint.promise : Promise.resolve()
+  });
+  const closed = [];
+  state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+  await tick();
+  state.controller.noteSDRFrame({
+    epoch: 4, sequence: 20, presentationOrdinal: 20, visualAgeMillis: 20, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('initial', closed), {
+    epoch: 4, sequence: 20, presentationOrdinal: 20, visualAgeMillis: 20, offeredAt: 100
+  });
+  await tick();
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+  const transitions = state.controller.snapshot().surfaceTransitions;
+  const surfaceEvents = state.surfaces.length;
+
+  controlPaint = deferred();
+  authoritativeRenderSerial = 21;
+  state.controller.offerFrame(fakeFrame('priority-21', closed), {
+    epoch: 4, sequence: 21, presentationOrdinal: 21, visualAgeMillis: 20, offeredAt: 100
+  }, {
+    commitSDR: (_frame, candidate) => authoritativeRenderSerial === 21 ? candidate : false
+  });
+  await tick();
+  assert.equal(state.controller.snapshot().paintPending, true);
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+
+  authoritativeRenderSerial = 22;
+  state.controller.offerFrame(fakeFrame('priority-22', closed), {
+    epoch: 4, sequence: 22, presentationOrdinal: 22, visualAgeMillis: 20, offeredAt: 100
+  }, {
+    commitSDR: (_frame, candidate) => authoritativeRenderSerial === 22 ? candidate : false
+  });
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+  assert.equal(state.controller.snapshot().surfaceTransitions, transitions);
+
+  controlPaint.resolve();
+  await tick();
+  await tick();
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+  assert.equal(state.controller.snapshot().presentationState, 'visible');
+  assert.equal(state.controller.snapshot().sequence, 22);
+  assert.equal(state.controller.snapshot().surfaceTransitions, transitions);
+  assert.equal(state.surfaces.length, surfaceEvents, 'control-code continuity must not emit an HDR-to-SDR transition');
+  assert.equal(state.controller.ensureExactProof(4, 22), true);
+  assert.deepEqual(closed, ['initial-clone', 'priority-21-clone', 'priority-22-clone']);
+});
+
 test('a prepared catch-up frame cannot delay synchronous sequence fallback', async () => {
   let catchUpPaint = null;
   const state = harness({
@@ -1139,6 +1362,327 @@ test('epoch, hard-stale, and exact-proof failures still reveal SDR synchronously
     }
     assert.equal(state.controller.snapshot().surfaceVisible, false, `${failure} must hide synchronously`);
     assert.equal(state.paintChecks.length, 0);
+  }
+});
+
+test('a presented HDR surface stays live through scroll while transient recovery proof remains passive', async () => {
+  let globalStreamFresh = false;
+  const state = harness({
+    autoRender: true,
+    canReleaseHoldover: () => globalStreamFresh
+  });
+  const closed = [];
+  state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+  await tick();
+  state.controller.noteSDRFrame({
+    epoch: 4, sequence: 20, presentationOrdinal: 20, visualAgeMillis: 20, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('initial', closed), {
+    epoch: 4, sequence: 20, presentationOrdinal: 20, visualAgeMillis: 20, offeredAt: 100
+  });
+  await tick();
+
+  const renderer = state.renderers[0];
+  const generation = state.controller.snapshot().rendererGeneration;
+  const transitions = state.controller.snapshot().surfaceTransitions;
+  const surfaceEventsBeforeScroll = state.surfaces.length;
+  let heldPresentation = {
+    epoch: state.controller.snapshot().epoch,
+    sequence: state.controller.snapshot().sequence,
+    presentationOrdinal: state.controller.snapshot().presentationOrdinal
+  };
+  let presentsBeforeHoldoverCandidate = renderer.presents;
+  assert.equal(state.controller.snapshot().firstPresented, true);
+  assert.equal(state.metrics.filter(({ event }) => event === 'first_presented').length, 1);
+
+  assert.equal(state.controller.setStreamRegionVisible(false), true);
+  const offscreen = state.controller.snapshot();
+  assert.deepEqual({
+    active: offscreen.active,
+    ready: offscreen.ready,
+    visible: offscreen.surfaceVisible,
+    state: offscreen.presentationState,
+    firstPresented: offscreen.firstPresented,
+    streamRegionVisible: offscreen.streamRegionVisible,
+    proofFresh: offscreen.proofFresh
+  }, {
+    active: true,
+    ready: true,
+    visible: true,
+    state: 'visible',
+    firstPresented: true,
+    streamRegionVisible: false,
+    proofFresh: true
+  }, 'scrolling away must retain the fresh HDR picture without hiding it');
+  assert.equal(state.controller.ensureExactProof(4, 20), true,
+    'scrolling to the below-stream controls must preserve exact action proof');
+  assert.equal(state.controller.snapshot().surfaceVisible, true,
+    'off-screen bookkeeping must not latch SDR fallback');
+  assert.equal(state.controller.snapshot().rendererGeneration, generation);
+  assert.equal(state.controller.snapshot().surfaceTransitions, transitions);
+  assert.equal(state.surfaces.length, surfaceEventsBeforeScroll,
+    'scrolling away must not emit another surface transition');
+  assert.equal(renderer.presents, presentsBeforeHoldoverCandidate,
+    'scrolling away must not recopy or replace the presented pixels');
+  assert.equal(renderer.disposed, false);
+  assert.deepEqual({
+    epoch: state.controller.snapshot().epoch,
+    sequence: state.controller.snapshot().sequence,
+    presentationOrdinal: state.controller.snapshot().presentationOrdinal
+  }, heldPresentation, 'scrolling away must retain the exact presented watermark');
+
+  state.controller.noteSDRFrame({
+    epoch: 4, sequence: 21, presentationOrdinal: 21, visualAgeMillis: 15, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('offscreen-fresh', closed), {
+    epoch: 4, sequence: 21, presentationOrdinal: 21, visualAgeMillis: 15, offeredAt: 100
+  });
+  await tick();
+  assert.equal(state.controller.snapshot().streamRegionVisible, false);
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+  assert.equal(state.controller.snapshot().rendererGeneration, generation);
+  assert.equal(state.controller.snapshot().surfaceTransitions, transitions);
+  assert.equal(renderer.presents, presentsBeforeHoldoverCandidate + 1,
+    'the live HDR renderer must continue presenting newer frames while naturally off-screen');
+  assert.equal(renderer.disposed, false);
+  assert.equal(state.controller.ensureExactProof(4, 21), true,
+    'the latest off-screen presentation must remain exact proof for below-stream controls');
+  heldPresentation = {
+    epoch: state.controller.snapshot().epoch,
+    sequence: state.controller.snapshot().sequence,
+    presentationOrdinal: state.controller.snapshot().presentationOrdinal
+  };
+  presentsBeforeHoldoverCandidate = renderer.presents;
+  const presentedMetricsBeforeHoldoverCandidate = state.metrics.filter(
+    ({ event }) => event === 'presented'
+  ).length;
+
+  assert.equal(state.controller.setStreamRegionVisible(true), true);
+  assert.equal(state.controller.snapshot().surfaceVisible, true,
+    'scrolling away and back must not expose SDR');
+  assert.equal(state.controller.snapshot().proofFresh, true,
+    'returning in view must retain proof for the exact fresh presentation');
+  assert.equal(state.controller.ensureExactProof(4, 21), true);
+  assert.equal(state.controller.snapshot().rendererGeneration, generation,
+    'scrolling must not recreate the renderer');
+  assert.equal(state.controller.snapshot().surfaceTransitions, transitions);
+  assert.equal(renderer.disposed, false);
+
+  assert.equal(state.controller.holdLastPresentation('video_socket_reconnecting'), true);
+  assert.deepEqual({
+    visible: state.controller.snapshot().surfaceVisible,
+    state: state.controller.snapshot().presentationState,
+    holdover: state.controller.snapshot().visualHoldover,
+    proofFresh: state.controller.snapshot().proofFresh
+  }, { visible: true, state: 'holdover', holdover: true, proofFresh: false });
+  assert.equal(state.controller.ensureExactProof(4, 21), false,
+    'a held bright picture must not count as fresh exact-frame proof');
+  assert.equal(state.controller.snapshot().surfaceVisible, true,
+    'refusing proof during a transient wait must not flash through SDR');
+  assert.equal(state.controller.holdLastPresentation('video_socket_reconnecting'), true);
+  assert.equal(state.metrics.filter(({ event }) => event === 'presentation_holdover').length, 1,
+    'repeated stale watchdog observations must coalesce into one visual holdover');
+  assert.equal(renderer.disposed, false);
+
+  state.controller.noteSDRFrame({
+    epoch: 5, sequence: 1, presentationOrdinal: 22, visualAgeMillis: 10, renderedAt: 100
+  });
+  assert.equal(state.controller.snapshot().surfaceVisible, true,
+    'the new epoch watermark must stay hidden beneath the held HDR canvas');
+  state.controller.offerFrame(fakeFrame('fresh-keyframe', closed), {
+    epoch: 5, sequence: 1, presentationOrdinal: 22, visualAgeMillis: 10, offeredAt: 100
+  });
+  await tick();
+
+  assert.equal(state.controller.snapshot().surfaceVisible, true);
+  assert.equal(state.controller.snapshot().visualHoldover, true,
+    'a relative-fresh HDR copy must remain unproven while the global stream is stale');
+  assert.equal(state.controller.snapshot().proofFresh, false);
+  assert.equal(renderer.presents, presentsBeforeHoldoverCandidate,
+    'a globally stale candidate must be discarded before it copies over the held pixels');
+  assert.deepEqual({
+    epoch: state.controller.snapshot().epoch,
+    sequence: state.controller.snapshot().sequence,
+    presentationOrdinal: state.controller.snapshot().presentationOrdinal
+  }, heldPresentation, 'a rejected candidate must not replace the held presentation metadata');
+  assert.equal(renderer.discardedPreparedFrames, 1,
+    'a globally stale prepared texture must be explicitly discarded');
+  assert.equal(state.metrics.filter(({ event }) => event === 'presented').length,
+    presentedMetricsBeforeHoldoverCandidate,
+    'a globally stale candidate must not emit presented telemetry');
+  assert.equal(state.metrics.filter(({ event }) => event === 'holdover_release_deferred').length, 1);
+
+  globalStreamFresh = true;
+  state.controller.noteSDRFrame({
+    epoch: 5, sequence: 2, presentationOrdinal: 23, visualAgeMillis: 5, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('globally-fresh-keyframe', closed), {
+    epoch: 5, sequence: 2, presentationOrdinal: 23, visualAgeMillis: 5, offeredAt: 100
+  });
+  await tick();
+
+  const resumed = state.controller.snapshot();
+  assert.equal(resumed.surfaceVisible, true);
+  assert.equal(resumed.presentationState, 'visible');
+  assert.equal(resumed.visualHoldover, false);
+  assert.equal(resumed.proofFresh, true);
+  assert.equal(resumed.rendererGeneration, generation);
+  assert.equal(resumed.surfaceTransitions, transitions,
+    'fresh HDR must replace the holdover without an SDR/HDR visibility transition');
+  assert.equal(renderer.disposed, false);
+  assert.equal(state.metrics.filter(({ event }) => event === 'first_presented').length, 1,
+    'reconnect recovery must not make a second first-presented claim');
+  assert.equal(state.metrics.filter(({ event }) => event === 'presented').length,
+    presentedMetricsBeforeHoldoverCandidate + 1,
+    'only the newly copied keyframe may restore fresh presentation telemetry');
+  assert.equal(state.surfaces.some(({ visible }, index) => index > 0 && !visible), false,
+    'scroll, stale watchdog, reconnect, and keyframe wait must never expose SDR');
+  assert.deepEqual(closed, [
+    'initial-clone',
+    'offscreen-fresh-clone',
+    'fresh-keyframe-clone',
+    'globally-fresh-keyframe-clone'
+  ]);
+});
+
+test('holdover stays passive when global authority is lost during compositor confirmation', async () => {
+  let globalStreamFresh = true;
+  let revokeAtPaint = 0;
+  const state = harness({
+    autoRender: true,
+    canReleaseHoldover: () => globalStreamFresh,
+    onPostPresentPaintStart: (_requiredFrames, count) => {
+      if (count === revokeAtPaint) globalStreamFresh = false;
+    }
+  });
+  const closed = [];
+  state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+  await tick();
+  state.controller.noteSDRFrame({
+    epoch: 8, sequence: 40, presentationOrdinal: 40, visualAgeMillis: 10, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('race-initial', closed), {
+    epoch: 8, sequence: 40, presentationOrdinal: 40, visualAgeMillis: 10, offeredAt: 100
+  });
+  await tick();
+
+  const renderer = state.renderers[0];
+  const generation = state.controller.snapshot().rendererGeneration;
+  const transitions = state.controller.snapshot().surfaceTransitions;
+  const presentsBeforeRace = renderer.presents;
+  state.controller.holdLastPresentation('control_socket_reconnecting');
+  revokeAtPaint = renderer.postPresentPaints + 1;
+  state.controller.noteSDRFrame({
+    epoch: 8, sequence: 41, presentationOrdinal: 41, visualAgeMillis: 5, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('race-candidate', closed), {
+    epoch: 8, sequence: 41, presentationOrdinal: 41, visualAgeMillis: 5, offeredAt: 100
+  });
+  await tick();
+
+  const heldRace = state.controller.snapshot();
+  assert.equal(renderer.presents, presentsBeforeRace + 1,
+    'the candidate authorized at copy time should reach the continuous canvas once');
+  assert.deepEqual({
+    epoch: heldRace.epoch,
+    sequence: heldRace.sequence,
+    presentationOrdinal: heldRace.presentationOrdinal
+  }, { epoch: 8, sequence: 41, presentationOrdinal: 41 },
+  'metadata must describe pixels already copied before authority changed');
+  assert.equal(heldRace.visualHoldover, true);
+  assert.equal(heldRace.proofFresh, false);
+  assert.equal(heldRace.presentationState, 'holdover');
+  assert.equal(state.metrics.filter(({ event }) => event === 'presented').length, 0);
+  assert.equal(state.metrics.findLast(({ event }) => event === 'holdover_release_deferred').detail.stage,
+    'after_compositor');
+
+  globalStreamFresh = true;
+  revokeAtPaint = 0;
+  state.controller.noteSDRFrame({
+    epoch: 8, sequence: 42, presentationOrdinal: 42, visualAgeMillis: 5, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('race-recovered', closed), {
+    epoch: 8, sequence: 42, presentationOrdinal: 42, visualAgeMillis: 5, offeredAt: 100
+  });
+  await tick();
+
+  const resumed = state.controller.snapshot();
+  assert.equal(resumed.visualHoldover, false);
+  assert.equal(resumed.proofFresh, true);
+  assert.equal(resumed.rendererGeneration, generation);
+  assert.equal(resumed.surfaceTransitions, transitions);
+  assert.equal(renderer.disposed, false);
+  assert.deepEqual(closed, ['race-initial-clone', 'race-candidate-clone', 'race-recovered-clone']);
+});
+
+test('activation-copy races retain the pixels actually copied while holdover stays passive', async () => {
+  for (const lossStage of ['activation_present', 'activation_compositor']) {
+    let globalStreamFresh = true;
+    let revokeAtPresent = 0;
+    let revokeAtPaint = 0;
+    let state;
+    state = harness({
+      autoRender: true,
+      canReleaseHoldover: () => globalStreamFresh,
+      onPresent: () => {
+        const renderer = state.renderers[0];
+        if (renderer.presents + 1 === revokeAtPresent) globalStreamFresh = false;
+      },
+      onPostPresentPaintStart: (_requiredFrames, count) => {
+        if (count === revokeAtPaint) globalStreamFresh = false;
+      }
+    });
+    const closed = [];
+    state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+    await tick();
+    state.controller.noteSDRFrame({
+      epoch: 9, sequence: 60, presentationOrdinal: 60, visualAgeMillis: 10, renderedAt: 100
+    });
+    state.controller.offerFrame(fakeFrame(`${lossStage}-initial`, closed), {
+      epoch: 9, sequence: 60, presentationOrdinal: 60, visualAgeMillis: 10, offeredAt: 100
+    });
+    await tick();
+
+    const renderer = state.renderers[0];
+    assert.equal(state.controller.holdLastPresentation('waiting_for_next_keyframe'), true);
+    // Force the otherwise rare recovery branch where an established surface
+    // still needs the bounded activation/request-patch copy.
+    state.controller.requestPatchPresented = false;
+    const presentsBefore = renderer.presents;
+    const rendersBefore = renderer.renders.length;
+    if (lossStage === 'activation_present') revokeAtPresent = presentsBefore + 1;
+    else revokeAtPaint = renderer.postPresentPaints + 1;
+
+    state.controller.noteSDRFrame({
+      epoch: 9, sequence: 61, presentationOrdinal: 61, visualAgeMillis: 5, renderedAt: 100
+    });
+    state.controller.offerFrame(fakeFrame(`${lossStage}-candidate`, closed), {
+      epoch: 9, sequence: 61, presentationOrdinal: 61, visualAgeMillis: 5, offeredAt: 100
+    });
+    await tick();
+
+    const held = state.controller.snapshot();
+    assert.equal(renderer.presents, presentsBefore + 1,
+      `${lossStage} must copy exactly the activation pixels already submitted`);
+    assert.equal(renderer.renders.length, rendersBefore + 1,
+      `${lossStage} must not prepare or copy the full target after authority loss`);
+    assert.deepEqual({
+      epoch: held.epoch,
+      sequence: held.sequence,
+      presentationOrdinal: held.presentationOrdinal
+    }, { epoch: 9, sequence: 61, presentationOrdinal: 61 },
+    `${lossStage} metadata must identify the activation pixels now on the canvas`);
+    assert.equal(held.surfaceVisible, true);
+    assert.equal(held.visualHoldover, true);
+    assert.equal(held.proofFresh, false);
+    assert.equal(held.presentationState, 'holdover');
+    assert.equal(held.settlementPending, false,
+      `${lossStage} must not leave a timer that later disposes the held surface`);
+    assert.equal(state.metrics.filter(({ event }) => event === 'presented').length, 0);
+    assert.equal(state.metrics.findLast(({ event }) => event === 'holdover_release_deferred').detail.stage,
+      lossStage === 'activation_present' ? 'after_activation_copy' : 'after_activation_compositor');
+    assert.equal(renderer.disposed, false);
+    assert.deepEqual(closed, [`${lossStage}-initial-clone`, `${lossStage}-candidate-clone`]);
   }
 });
 
@@ -1525,6 +2069,64 @@ test('a missing paint callback on an established HDR surface reveals authoritati
   stalledPaint.resolve();
   await tick();
   assert.equal(state.renderers[0].presents, 2, 'late paint cannot restore a timed-out HDR frame');
+});
+
+test('a missing pre-copy paint callback preserves an established keyframe-wait holdover', async () => {
+  const state = harness({ autoRender: true, paintWaitTimeoutMillis: 400 });
+  const closed = [];
+  state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
+  await tick();
+  state.controller.noteSDRFrame({
+    epoch: 6, sequence: 50, presentationOrdinal: 50, visualAgeMillis: 20, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('holdover-paint-visible', closed), {
+    epoch: 6, sequence: 50, presentationOrdinal: 50, visualAgeMillis: 20, offeredAt: 100
+  });
+  await tick();
+
+  const renderer = state.renderers[0];
+  const presentsBeforeCandidate = renderer.presents;
+  const held = state.controller.snapshot();
+  assert.equal(state.controller.holdLastPresentation('waiting_for_next_keyframe'), true);
+  const stalledPaint = deferred();
+  state.controller.waitForPaint = () => stalledPaint.promise;
+  state.controller.noteSDRFrame({
+    epoch: 6, sequence: 51, presentationOrdinal: 51, visualAgeMillis: 20, renderedAt: 100
+  });
+  state.controller.offerFrame(fakeFrame('holdover-paint-stalled', closed), {
+    epoch: 6, sequence: 51, presentationOrdinal: 51, visualAgeMillis: 20, offeredAt: 100
+  });
+  await tick();
+  const paintTimeout = state.timers.findLast((timer) => !timer.cancelled && timer.millis === 400);
+  assert.ok(paintTimeout);
+  paintTimeout.callback();
+  await tick();
+
+  const snapshot = state.controller.snapshot();
+  assert.equal(snapshot.active, true);
+  assert.equal(snapshot.surfaceVisible, true,
+    'a candidate that never reached copy must not expose SDR beneath the holdover');
+  assert.equal(snapshot.presentationState, 'holdover');
+  assert.equal(snapshot.visualHoldover, true);
+  assert.equal(snapshot.proofFresh, false);
+  assert.equal(renderer.presents, presentsBeforeCandidate,
+    'the timed-out candidate must not replace held pixels');
+  assert.deepEqual({
+    epoch: snapshot.epoch,
+    sequence: snapshot.sequence,
+    presentationOrdinal: snapshot.presentationOrdinal
+  }, {
+    epoch: held.epoch,
+    sequence: held.sequence,
+    presentationOrdinal: held.presentationOrdinal
+  }, 'the timed-out candidate must not replace held proof metadata');
+  assert.equal(renderer.discardedPreparedFrames, 1);
+
+  stalledPaint.resolve();
+  await tick();
+  assert.equal(renderer.presents, presentsBeforeCandidate,
+    'a late callback cannot revive a candidate discarded during holdover');
+  assert.deepEqual(closed, ['holdover-paint-visible-clone', 'holdover-paint-stalled-clone']);
 });
 
 test('coordinated commit paints matching SDR before atomically presenting prepared HDR', async () => {
@@ -1995,6 +2597,29 @@ test('a rejected canvas retry records the authoritative SDR watermark exactly on
     epoch: 8, sequence: 2, presentationOrdinal: 2, timestamp: 200
   }, { VideoFrame: ThrowingCanvasVideoFrame }), false);
   assert.equal(notes, 2, 'constructor failure must not lose or duplicate the SDR watermark');
+  assert.equal(sourceCloses, 1);
+});
+
+test('an accepted coordinated canvas retry defers its SDR watermark until the atomic commit', () => {
+  let notes = 0;
+  let sourceCloses = 0;
+  let receivedOptions = null;
+  class CanvasVideoFrame {
+    close() { sourceCloses += 1; }
+  }
+  const controller = {
+    offerFrame(_frame, _metadata, options) {
+      receivedOptions = options;
+      return true;
+    },
+    noteSDRFrame() { notes += 1; }
+  };
+  const options = { commitSDR() { return true; } };
+  assert.equal(offerClientHDRCanvasFrame(controller, {}, {
+    epoch: 8, sequence: 3, presentationOrdinal: 3, timestamp: 300
+  }, { VideoFrame: CanvasVideoFrame }, options), true);
+  assert.equal(receivedOptions, options);
+  assert.equal(notes, 0);
   assert.equal(sourceCloses, 1);
 });
 

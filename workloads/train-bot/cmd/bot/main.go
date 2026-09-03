@@ -274,7 +274,10 @@ func openRuntime(cfg config.Config, loc *time.Location) (runtimeComponents, erro
 		return runtimeComponents{}, err
 	}
 	stateStore := store.NewSpacetimeStore(client)
-	scheduleCachePath := deriveScheduleCachePath(cfg.ScheduleDir)
+	scheduleCachePath, err := prepareRuntimeCachePath(cfg.TrainRuntimeCachePath)
+	if err != nil {
+		return runtimeComponents{}, err
+	}
 	scheduleStore, err := store.NewSQLiteStore(scheduleCachePath)
 	if err != nil {
 		return runtimeComponents{}, fmt.Errorf("schedule cache sqlite: %w", err)
@@ -288,12 +291,18 @@ func openRuntime(cfg config.Config, loc *time.Location) (runtimeComponents, erro
 	}, nil
 }
 
-func deriveScheduleCachePath(scheduleDir string) string {
-	dir := strings.TrimSpace(scheduleDir)
-	if dir == "" {
-		return filepath.Clean("train-runtime-cache.db")
+func prepareRuntimeCachePath(cachePath string) (string, error) {
+	clean := filepath.Clean(strings.TrimSpace(cachePath))
+	if clean == "." || clean == "" {
+		return "", fmt.Errorf("TRAIN_RUNTIME_CACHE_PATH is required")
 	}
-	return filepath.Join(filepath.Dir(dir), "train-runtime-cache.db")
+	dir := filepath.Dir(clean)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", fmt.Errorf("create runtime cache directory: %w", err)
+		}
+	}
+	return clean, nil
 }
 
 func acquireSingleInstanceLock(lockPath string) (*os.File, error) {

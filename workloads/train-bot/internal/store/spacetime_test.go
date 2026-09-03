@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestIsSpacetimePrivateRiderTableError(t *testing.T) {
@@ -76,5 +77,22 @@ func TestLocationReportSignalIgnoresOtherSignals(t *testing.T) {
 
 	if _, ok := decodeLocationReportSignal("INSPECTION_STARTED"); ok {
 		t.Fatalf("decodeLocationReportSignal() ok = true for report signal")
+	}
+}
+
+func TestMapSpacetimeMutationErrorTreatsStationDuplicateAsDedupe(t *testing.T) {
+	t.Parallel()
+
+	wantRemaining := 90 * time.Second
+	err := mapSpacetimeMutationError(errors.New("reducer failed: duplicate station sighting ignored"), wantRemaining, time.Hour)
+	var rejected *MutationRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("mapSpacetimeMutationError() = %v, want MutationRejectedError", err)
+	}
+	if rejected.Reason != MutationReportDuplicate {
+		t.Fatalf("reason = %q, want %q", rejected.Reason, MutationReportDuplicate)
+	}
+	if rejected.Remaining != wantRemaining {
+		t.Fatalf("remaining = %v, want %v", rejected.Remaining, wantRemaining)
 	}
 }

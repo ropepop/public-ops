@@ -26,6 +26,7 @@ make docker-image-build
 
 ```bash
 SCHEDULE_DIR=/srv/arbuzas/train-bot/data/schedules
+TRAIN_RUNTIME_CACHE_PATH=/srv/arbuzas/train-bot/state/train-runtime-cache.db
 SCRAPER_OUTPUT_DIR=/srv/arbuzas/train-bot/data/schedules
 TRAIN_WEB_ENABLED=true
 TRAIN_WEB_PUBLIC_BASE_URL=https://vilciens.kontrole.info

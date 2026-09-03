@@ -244,18 +244,13 @@ export function resetTicketLocalRegisterSliderState(state) {
   return changed;
 }
 
-function ticketActionV3Family(actions, rootActionId) {
-  return ticketActionV3ActionsByAuthority((Array.isArray(actions) ? actions : []).filter((action) =>
-    [action && action.actionId, action && action.rootActionId].some((id) => String(id || '').trim() === rootActionId)
-  ));
-}
-
 export function releaseTicketLocalRegisterSliderOnTerminal(state, actions) {
   if (!state || !state.inFlight || !String(state.actionId || '').trim()) return null;
-  const rootActionId = String(state.actionId || '').trim();
-  const family = ticketActionV3Family(actions, rootActionId);
-  if (family.some((action) => ticketActionV3OccupiesPhone(action))) return null;
-  const exact = family[0];
+  const actionId = String(state.actionId || '').trim();
+  const exact = (Array.isArray(actions) ? actions : []).find((action) =>
+    String(action && action.actionId || '').trim() === actionId
+  );
+  if (ticketActionV3OccupiesPhone(exact)) return null;
   if (!exact || !['succeeded', 'failed', 'needs_attention'].includes(String(exact.status || ''))) return null;
   resetTicketLocalRegisterSliderState(state);
   return exact;
@@ -295,11 +290,55 @@ export function ticketActionV3ActionsByAuthority(actions) {
 export function ticketActionV3ExplicitResultForDisplay(actions, actionId, rememberedAction = null) {
   const stableActionId = String(actionId || '').trim();
   if (!stableActionId) return null;
-  const exactAction = ticketActionV3Family(actions, stableActionId)[0];
+  const exactAction = (Array.isArray(actions) ? actions : []).find((action) =>
+    String(action && action.actionId || '').trim() === stableActionId
+  );
   if (exactAction) return exactAction;
   return String(rememberedAction && rememberedAction.actionId || '').trim() === stableActionId
     ? rememberedAction
     : null;
+}
+
+export function ticketActionV3ActivationTerminalMessage(action) {
+  if (!action || !ACTIVATION_TARGETS.has(String(action.target || ''))) return '';
+  if (!['failed', 'needs_attention'].includes(String(action.status || ''))) return '';
+  switch (String(action.phase || '')) {
+    case 'not_dispatched':
+      return 'To pašu atvērto biļeti neizdevās apstiprināt; nekas netika pavilkts.';
+    case 'retry_not_dispatched':
+      return 'Pirmā vilkšana biļeti nemainīja. Atkārtotās vilkšanas gatavību nevarēja droši apstiprināt, tāpēc otrā vilkšana netika nosūtīta.';
+    case 'no_transition':
+      return 'Abi atļautie vilkšanas mēģinājumi tika pabeigti, bet ViVi joprojām rāda nereģistrētu biļeti. Citas vilkšanas netika nosūtītas.';
+    case 'outcome_unknown':
+      return 'Vilkšanas rezultātu nevarēja droši apstiprināt. Pirms jauna mēģinājuma pārbaudi biļeti vēlreiz.';
+    default:
+      return '';
+  }
+}
+
+export function ticketActionV3IsExpectedEmptyRedetect(action) {
+  const streamEpoch = Number(action && action.streamEpoch);
+  const frameSequence = Number(action && action.frameSequence);
+  return Boolean(action &&
+    String(action.target || '') === 'redetect_latest' &&
+    String(action.status || '') === 'failed' &&
+    String(action.phase || '') === 'failed' &&
+    String(action.currentView || '') === 'unknown' &&
+    String(action.reason || '') === 'ticket_action_latest_not_detected' &&
+    Number.isFinite(streamEpoch) && streamEpoch > 0 &&
+    Number.isFinite(frameSequence) && frameSequence > 0);
+}
+
+export function adminRedetectTicketActionV3TerminalMessage(action) {
+  if (!action || String(action.target || '') !== 'redetect_latest') return '';
+  const status = String(action.status || '');
+  if (!['succeeded', 'failed', 'needs_attention'].includes(status)) return '';
+  if (ticketActionV3IsExpectedEmptyRedetect(action)) return 'No tickets found.';
+  if (status === 'succeeded') return 'Latest ticket redetection completed.';
+  if (status === 'needs_attention') {
+    return 'The phone view needs manual attention; the action was not repeated.';
+  }
+  return 'Ticket redetection stopped safely without an unproven action.';
 }
 
 export function ticketControlCodeVisualRecoveryRequired(requests) {

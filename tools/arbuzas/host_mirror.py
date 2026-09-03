@@ -72,6 +72,11 @@ EXCLUDES: dict[str, tuple[str, ...]] = {
     "ticket-recovery": (),
     "pixel": (
         "data/local/pixel-stack/conf/runtime/artifacts",
+        # Retained in place for this rollout, but no longer copied or pushed. In a
+        # later explicitly authorized credential-maintenance window, delete both
+        # copies after one admin-managed in-app re-auth succeeds and the release
+        # has remained healthy for 24 hours; then refresh the mirror manifest.
+        "data/local/pixel-stack/conf/apps/ticket-screen-vivi-login.env",
     ),
 }
 
@@ -118,11 +123,6 @@ def is_host_history_file(rel: str) -> bool:
 def required_private_mode(rel: str) -> int | None:
     """Return the local/remote mode required for credential-bearing mirrors."""
     rel = rel.strip("/")
-    if rel in {
-        "etc/arbuzas/env/meshcentral.env",
-        "etc/arbuzas/env/meshcentral-config.json",
-    }:
-        return 0o644
     if rel == "etc/arbuzas/current/release.env":
         return 0o600
     if rel.startswith(

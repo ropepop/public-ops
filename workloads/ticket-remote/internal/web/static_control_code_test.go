@@ -80,15 +80,15 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 		"  function clearControlCodeResultCapture() {")
 	imageReadyBody := substringBetween(t, source,
 		"function waitForControlCodeResultImageReady(image) {",
-		"  function controlCodeResultPaintReady(requestID) {")
+		"  function controlCodeResultPaintReady(requestID, presentation) {")
 	paintReadyBody := substringBetween(t, source,
-		"function controlCodeResultPaintReady(requestID) {",
+		"function controlCodeResultPaintReady(requestID, presentation) {",
 		"  function waitForControlCodePaintFrame() {")
 	displayBody := substringBetween(t, source,
 		"async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {",
 		"  function controlCodeResultDisplayedForRequest(requestID) {")
 	revealBody := substringBetween(t, source,
-		"function revealControlCodeResultImageAtomically(requestID) {",
+		"function revealControlCodeResultImageAtomically(requestID, presentation) {",
 		"  async function displayControlCodeResultImage(requestID, proof, capturedImage, outcome) {")
 	captureBody := substringBetween(t, source,
 		"async function captureControlCodeResultScreenshot(request, proof) {",
@@ -129,15 +129,41 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	}
 	for _, needle := range []string{
 		"document.visibilityState !== 'visible'",
-		"codeResultArea.hidden || codeResultImage.hidden",
-		"codeResultImage.naturalWidth <= 0 || codeResultImage.naturalHeight <= 0",
-		"areaRect.width <= 0 || areaRect.height <= 0 || imageRect.width <= 0 || imageRect.height <= 0",
+		"codeResultArea.hidden",
+		"areaRect.width <= 0 || areaRect.height <= 0",
 		"visibleWidth <= 0 || visibleHeight <= 0",
-		"areaStyle.display !== 'none'",
-		"imageStyle.visibility !== 'hidden'",
+		"areaStyle.display === 'none' || areaStyle.visibility === 'hidden'",
 	} {
 		if !strings.Contains(paintReadyBody, needle) {
 			t.Fatalf("paint visibility proof missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"presentation === 'exact-hdr'",
+		"target.requestId !== requestID",
+		"!target.exactPresented",
+		"codeResultArea.dataset.presentation !== 'exact-hdr'",
+		"!codeResultImage.hidden",
+		"snapshot.surfaceVisible !== true",
+		"snapshot.presentationState !== 'visible'",
+		"Number(snapshot.epoch || 0) !== target.epoch",
+		"Number(snapshot.sequence || 0) !== target.sequence",
+		"!controller.ensureExactProof(target.epoch, target.sequence)",
+		"experimentalMediaCanvas.hidden",
+		"hdrStyle.visibility !== 'hidden'",
+	} {
+		if !strings.Contains(paintReadyBody, needle) {
+			t.Fatalf("exact-HDR paint proof missing %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		"codeResultImage.hidden || !codeResultImage.complete",
+		"codeResultImage.naturalWidth <= 0 || codeResultImage.naturalHeight <= 0",
+		"imageRect.width <= 0 || imageRect.height <= 0",
+		"imageStyle.visibility !== 'hidden'",
+	} {
+		if !strings.Contains(paintReadyBody, needle) {
+			t.Fatalf("SDR fallback paint proof missing %q", needle)
 		}
 	}
 
@@ -146,7 +172,8 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	clearSourceIndex := strings.Index(displayBody, "codeResultImage.removeAttribute('src');")
 	srcIndex := strings.Index(displayBody, "codeResultImage.src = capturedImage;")
 	decodeIndex := strings.Index(displayBody, "await waitForControlCodeResultImageReady(codeResultImage)")
-	revealIndex := strings.Index(displayBody, "await revealControlCodeResultImageAtomically(requestID)")
+	waitExactIndex := strings.Index(displayBody, "await waitForControlCodeExactHDRPresentation(requestID, proof)")
+	revealIndex := strings.Index(displayBody, "await revealControlCodeResultImageAtomically(requestID, presentation)")
 	firstPaintIndex := strings.Index(displayBody, "await waitForControlCodePaintFrame()")
 	secondPaintRelative := -1
 	if firstPaintIndex >= 0 {
@@ -156,14 +183,15 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 	if secondPaintRelative >= 0 {
 		secondPaintIndex = firstPaintIndex + 1 + secondPaintRelative
 	}
-	reverifyIndex := strings.LastIndex(displayBody, "if (!controlCodeResultPaintReady(requestID)) return false;")
+	reverifyIndex := strings.LastIndex(displayBody, "controlCodeResultPaintReady(requestID, presentation)")
+	fallbackIndex := strings.Index(displayBody, "forceControlCodeResultSDRFallback('exact_hdr_paint_incomplete')")
 	paintedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_painted'")
 	displayedEventIndex := strings.Index(displayBody, "controlCodeCaptureTrace('control_code_frame_displayed'")
-	if hideAreaIndex < 0 || hideImageIndex < 0 || clearSourceIndex < 0 || srcIndex < 0 || decodeIndex < 0 || revealIndex < 0 || firstPaintIndex < 0 || secondPaintIndex < 0 || reverifyIndex < 0 || paintedEventIndex < 0 || displayedEventIndex < 0 {
+	if hideAreaIndex < 0 || hideImageIndex < 0 || clearSourceIndex < 0 || srcIndex < 0 || decodeIndex < 0 || waitExactIndex < 0 || revealIndex < 0 || firstPaintIndex < 0 || secondPaintIndex < 0 || reverifyIndex < 0 || fallbackIndex < 0 || paintedEventIndex < 0 || displayedEventIndex < 0 {
 		t.Fatal("control-code display path is missing a complete paint handshake")
 	}
-	if !(hideAreaIndex < srcIndex && hideImageIndex < srcIndex && clearSourceIndex < srcIndex && srcIndex < decodeIndex && decodeIndex < revealIndex && revealIndex < firstPaintIndex && firstPaintIndex < secondPaintIndex && secondPaintIndex < reverifyIndex && reverifyIndex < paintedEventIndex && paintedEventIndex < displayedEventIndex) {
-		t.Fatal("image must stay hidden through decode, reveal atomically, survive two paints, and be reverified before painted/displayed events")
+	if !(hideAreaIndex < srcIndex && hideImageIndex < srcIndex && clearSourceIndex < srcIndex && srcIndex < decodeIndex && decodeIndex < waitExactIndex && waitExactIndex < revealIndex && revealIndex < firstPaintIndex && firstPaintIndex < secondPaintIndex && secondPaintIndex < reverifyIndex && reverifyIndex < paintedEventIndex && paintedEventIndex < displayedEventIndex) {
+		t.Fatal("fallback image must preload before exact selection; the chosen result must survive two paints before displayed events")
 	}
 	for _, needle := range []string{
 		"requestAnimationFrame(() => {",
@@ -175,6 +203,9 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 		"!codeResultImage.complete",
 		"codeResultImage.naturalWidth <= 0",
 		"codeResultImage.naturalHeight <= 0",
+		"codeResultArea.dataset.presentation = 'exact-hdr';",
+		"codeResultImage.hidden = true;",
+		"delete codeResultArea.dataset.presentation;",
 		"codeResultImage.hidden = false;",
 		"setControlCodeResultVisible(true);",
 	} {
@@ -182,11 +213,14 @@ func TestControlCodeResultAcknowledgesOnlyAfterVisibleTwoFramePaintHandshake(t *
 			t.Fatalf("atomic control-code reveal missing %q", needle)
 		}
 	}
+	exactModeIndex := strings.Index(revealBody, "codeResultArea.dataset.presentation = 'exact-hdr';")
+	exactHideIndex := strings.Index(revealBody, "codeResultImage.hidden = true;")
 	imageRevealIndex := strings.Index(revealBody, "codeResultImage.hidden = false;")
 	areaRevealIndex := strings.Index(revealBody, "setControlCodeResultVisible(true);")
 	frameRevealIndex := strings.Index(revealBody, "frameID = requestAnimationFrame(() => {")
-	if frameRevealIndex < 0 || imageRevealIndex < frameRevealIndex || areaRevealIndex < imageRevealIndex {
-		t.Fatal("result image and containing layer must reveal together inside one animation frame")
+	if frameRevealIndex < 0 || exactModeIndex < frameRevealIndex || exactHideIndex < exactModeIndex ||
+		imageRevealIndex < frameRevealIndex || areaRevealIndex < exactHideIndex || areaRevealIndex < imageRevealIndex {
+		t.Fatal("exact-HDR or SDR fallback selection and its overlay must reveal together inside one animation frame")
 	}
 	if strings.Contains(displayBody[:paintedEventIndex], "confirmControlCodeBrowserCapture(") {
 		t.Fatal("display helper must never acknowledge before its painted event")
@@ -1709,7 +1743,8 @@ const metadata = {
   queuedAt: 90
 };
 function check(value, message) { if (!value) throw new Error(message); }
-function controlCodePresentationPriorityActive() { return false; }
+function controlCodeCapturePriorityActive() { return false; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function shiftFrameMetadata() { throw new Error('explicit metadata was ignored'); }
 function resetFirstFrameServerRecovery() {}
 function sendVideoSocketClientLog(event, detail) {
@@ -1739,22 +1774,33 @@ Date.now = originalDateNow;
 `)
 }
 
-func TestTicketViewerCoordinatedHDRCommitGuardsPriorityAndDecoderGeneration(t *testing.T) {
+func TestTicketViewerControlCodePriorityCommitsSDRBeforeContinuingHDR(t *testing.T) {
 	source := ticketAppSource(t)
 	renderFrame := substringBetween(t, source,
 		"function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {",
 		"  async function configureDecoder(config, options) {")
 
 	for _, needle := range []string{
-		"const controlCodePriority = controlCodePresentationPriorityActive();",
-		"experimentalClientHDRController.markSDRStale('control_code_priority');",
-		"if (!renderOptions.coordinatedCommit && !controlCodePriority && clientHDRCanCoordinateDecodedFrame()) {",
+		"const controlCodeCapturePriority = controlCodeCapturePriorityActive();",
+		"const controlCodeHDRFrozen = controlCodeHDRFreezeTargetActive();",
+		"if (!renderOptions.coordinatedCommit && !controlCodeCapturePriority &&",
+		"!controlCodeHDRFrozen && clientHDRCanCoordinateDecodedFrame()) {",
 		"const coordinatedDecoderGeneration = decoderGeneration;",
 		"if (coordinatedDecoderGeneration !== decoderGeneration) return false;",
 		"if (Number(lastRenderedFrameEpoch || 0) === epoch && Number(lastRenderedFrameSequence || 0) >= sequence) return false;",
-		"if (renderOptions.coordinatedCommit && controlCodePriority) hdrMetadata.skipHDRCommit = true;",
 		"Object.assign(candidate, committed);",
-		"if (!renderOptions.coordinatedCommit && !controlCodePriority) {",
+		"function renderedDecodedFrameCanCommit(candidate, expectedDecoderGeneration, expectedSDRRenderSerial) {",
+		"expectedDecoderGeneration === decoderGeneration",
+		"expectedSDRRenderSerial === authoritativeSDRRenderSerial",
+		"Number(lastRenderedFrameEpoch || 0) === epoch",
+		"Number(lastRenderedFrameSequence || 0) === sequence",
+		"Number(lastRenderedPresentationOrdinal || 0) === presentationOrdinal",
+		"Number(lastRenderedFrameTimestamp || 0) === timestamp",
+		"if (!renderOptions.coordinatedCommit && !controlCodeHDRFreezeTargetActive()) {",
+		"const priorityCommitOptions = controlCodeCapturePriority ? {",
+		"commitSDR: (_ownedFrame, candidate) => {",
+		"if (!renderedDecodedFrameCanCommit(",
+		"if (!controlCodeCapturePriority) experimentalClientHDRController.noteSDRFrame(hdrMetadata);",
 	} {
 		if !strings.Contains(renderFrame, needle) {
 			t.Fatalf("coordinated browser HDR handoff is missing %q", needle)
@@ -1764,10 +1810,20 @@ func TestTicketViewerCoordinatedHDRCommitGuardsPriorityAndDecoderGeneration(t *t
 		"candidate.presentationOrdinal || 0) === Number(lastRenderedPresentationOrdinal || 0) + 1") {
 		t.Fatal("a provisional HDR ordinal must not reject a newer decoded frame at SDR commit time")
 	}
-	priority := strings.Index(renderFrame, "experimentalClientHDRController.markSDRStale('control_code_priority');")
+	for _, forbidden := range []string{
+		"markSDRStale('control_code_priority')",
+		"hdrMetadata.skipHDRCommit = true",
+		"committed.skipHDRCommit = true",
+		"!renderOptions.coordinatedCommit && !controlCodeCapturePriority) {",
+	} {
+		if strings.Contains(renderFrame, forbidden) {
+			t.Fatalf("control-code capture cadence still revokes HDR: %q", forbidden)
+		}
+	}
 	draw := strings.Index(renderFrame, "ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);")
-	if priority < 0 || draw < 0 || priority > draw {
-		t.Fatal("control-code priority must latch the SDR fallback before drawing its authoritative frame")
+	directOffer := strings.LastIndex(renderFrame, "experimentalClientHDRController.offerFrame(frame, hdrMetadata, priorityCommitOptions)")
+	if draw < 0 || directOffer < 0 || draw > directOffer {
+		t.Fatal("control-code frames must become authoritative SDR before they are offered to HDR")
 	}
 }
 
@@ -1819,17 +1875,16 @@ const experimentalClientHDRController = {
   canCoordinateSDRFrame() { return true; },
   offerFrame(frame, metadata, options) {
     offered.push({ metadata: { ...metadata }, commitSDR: options && options.commitSDR });
+    events.push('offer:' + metadata.sequence);
     return true;
   },
-  noteSDRFrame() { throw new Error('coordinated or priority frame was re-offered'); },
-  markSDRStale(reason) {
-    events.push('stale:' + reason);
-    priority = false;
-  }
+  noteSDRFrame(metadata) { events.push('note:' + metadata.sequence); },
+  markSDRStale(reason) { throw new Error('control-code frame retired HDR: ' + reason); }
 };
 const canvas = { width: 720, height: 1482 };
 const ctx = { drawImage() { events.push('draw'); } };
-function controlCodePresentationPriorityActive() { return priority; }
+function controlCodeCapturePriorityActive() { return priority; }
+function controlCodeHDRFreezeTargetActive() { return false; }
 function experimentalHDRSurfacePresentationAllowed() { return true; }
 function check(value, message) { if (!value) throw new Error(message); }
 function shiftFrameMetadata() { throw new Error('explicit metadata was ignored'); }
@@ -1861,7 +1916,7 @@ const metadata = (sequence) => ({
 let sourceCloses = 0;
 const sourceFrame = { close() { sourceCloses += 1; } };
 const provisional = renderDecodedFrame(sourceFrame, 'annexb', metadata(5));
-check(provisional.presentationOrdinal === 4 && sourceCloses === 1 && events.length === 0,
+check(provisional.presentationOrdinal === 4 && sourceCloses === 1 && events.join(',') === 'offer:5',
   'coordinated offer painted SDR early or did not release the decoder frame exactly once');
 check(offered.length === 1 && typeof offered[0].commitSDR === 'function',
   'coordinated offer did not retain its SDR commit callback');
@@ -1873,7 +1928,7 @@ const candidate = { ...offered[0].metadata };
 const committed = offered[0].commitSDR(ownedFrame, candidate);
 check(committed && committed.presentationOrdinal === 10 && candidate.presentationOrdinal === 10,
   'coordinated commit kept the provisional ordinal instead of the live SDR ordinal');
-check(lastRenderedFrameSequence === 5 && events.join(',') === 'draw' && ownedCloses === 0,
+check(lastRenderedFrameSequence === 5 && events.join(',') === 'offer:5,draw' && ownedCloses === 0,
   'coordinated commit did not paint once or stole the controller-owned frame');
 check(offered.length === 1, 'coordinated SDR commit re-offered its frame to the GPU');
 
@@ -1892,25 +1947,90 @@ events = [];
 let priorityCloses = 0;
 const priorityFrame = { close() { priorityCloses += 1; } };
 renderDecodedFrame(priorityFrame, 'annexb', metadata(7));
-check(events.join(',') === 'stale:control_code_priority,draw',
-  'control-code priority did not hide HDR before its SDR draw');
-check(offered.length === 2 && priorityCloses === 1,
-  'control-code priority re-offered the frame or did not close it exactly once');
+check(events.join(',') === 'draw,offer:7',
+  'control-code priority did not paint authoritative SDR before continuing HDR');
+check(offered.length === 3 && typeof offered[2].commitSDR === 'function' && priorityCloses === 1,
+  'control-code priority did not retain its already-drawn SDR acknowledgement');
+const exactPriorityCandidate = { ...offered[2].metadata };
+check(offered[2].commitSDR(ownedFrame, {
+  ...exactPriorityCandidate,
+  timestamp: exactPriorityCandidate.timestamp + 1
+}) === false,
+  'a priority callback acknowledged a candidate that did not exactly match the drawn SDR frame');
+const exactPriorityCommit = offered[2].commitSDR(ownedFrame, exactPriorityCandidate);
+check(exactPriorityCommit && exactPriorityCommit.epoch === 7 &&
+  exactPriorityCommit.sequence === 7 &&
+  exactPriorityCommit.presentationOrdinal === lastRenderedPresentationOrdinal &&
+  exactPriorityCommit.timestamp === lastRenderedFrameTimestamp,
+  'the exact still-current priority frame was not acknowledged');
+check(events.join(',') === 'draw,offer:7',
+  'acknowledging an already-drawn priority frame repainted or advanced SDR');
+
+events = [];
+renderDecodedFrame({ close() { priorityCloses += 1; } }, 'annexb', metadata(8));
+const supersededPriority = offered[3];
+check(typeof supersededPriority.commitSDR === 'function' && events.join(',') === 'draw,offer:8',
+  'the next priority frame lost its coordinated acknowledgement');
+renderDecodedFrame({ close() { priorityCloses += 1; } }, 'annexb', metadata(9));
+check(events.join(',') === 'draw,offer:8,draw,offer:9' &&
+  supersededPriority.commitSDR(ownedFrame, { ...supersededPriority.metadata }) === false,
+  'a superseded priority frame was allowed to acknowledge stale SDR');
+check(!events.some((event) => event.startsWith('note:')),
+  'control-code priority advanced SDR freshness before matching HDR presentation');
 
 priority = false;
-renderDecodedFrame({ close() { sourceCloses += 1; } }, 'annexb', metadata(8));
-check(offered.length === 3, 'post-priority coordinated frame was not offered');
+renderDecodedFrame({ close() { sourceCloses += 1; } }, 'annexb', metadata(10));
+check(offered.length === 6 && typeof offered[5].commitSDR === 'function',
+  'post-priority coordinated frame was not offered');
 priority = true;
 events = [];
-const priorityCandidate = { ...offered[2].metadata };
-const bypassed = offered[2].commitSDR(ownedFrame, priorityCandidate);
-check(events.join(',') === 'stale:control_code_priority,draw',
-  'late control-code priority did not hide HDR before coordinated SDR commit');
-check(bypassed && bypassed.skipHDRCommit === true && priorityCandidate.skipHDRCommit === true,
-  'late control-code priority did not remain latched after its state changed during the draw');
-check(offered.length === 3, 'priority coordinated commit re-offered its frame to the GPU');
+const priorityCandidate = { ...offered[5].metadata };
+const continued = offered[5].commitSDR(ownedFrame, priorityCandidate);
+check(events.join(',') === 'draw',
+  'late control-code priority did not commit its authoritative SDR frame exactly once');
+check(continued && continued.skipHDRCommit !== true && priorityCandidate.skipHDRCommit !== true,
+  'late control-code priority revoked the matching HDR presentation');
+check(offered.length === 6, 'priority coordinated commit duplicated its HDR offer');
 Date.now = originalDateNow;
 `)
+}
+
+func TestTicketViewerControlCodeDialogUsesHDRConsistentOverlayWithoutCompositorEffects(t *testing.T) {
+	template := ticketIndexTemplate(t)
+	overlay := substringBetween(t, template,
+		"    .code-dialog {\n      background: rgba(2, 10, 22, 0.14);",
+		"    .experimental-media-control {")
+
+	for _, required := range []string{
+		".code-dialog-panel {",
+		"border-color: #3c6aa5;",
+		"background: #08111f;",
+		".code-dialog-field input:focus-visible {",
+		"@supports (color: color(display-p3 0 0 0)) {",
+		"background: color(display-p3 0 0.025 0.06 / 0.14);",
+		"border-color: color(display-p3 0.20 0.48 0.92);",
+		"background: color(display-p3 0.025 0.055 0.105);",
+		".code-dialog-panel .primary:not(:disabled) {",
+		"background: color(display-p3 0.04 0.34 0.88);",
+	} {
+		if !strings.Contains(overlay, required) {
+			t.Fatalf("HDR-consistent control-code overlay is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"backdrop-filter",
+		"-webkit-backdrop-filter",
+		"filter:",
+		"mix-blend-mode",
+		"opacity:",
+		"#experimentalMediaCanvas",
+		".stage-page",
+		".stage {",
+	} {
+		if strings.Contains(overlay, forbidden) {
+			t.Fatalf("control-code overlay must not add a full-screen compositor effect or alter an ancestor: found %q", forbidden)
+		}
+	}
 }
 
 func TestTicketViewerAcceptsSourceSequenceGapsBetweenIndependentFrames(t *testing.T) {
@@ -2730,10 +2850,10 @@ func TestControlCodeDialogLocksBodyScrollInsteadOfRestoringAfterSubmit(t *testin
 		t.Fatalf("control-code dialog close must blur focused input and release dialog-owned state")
 	}
 	if !strings.Contains(closeDialog, "updateControlCodeSubmitAvailability();") ||
-		!strings.Contains(updateSubmit, "codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !digitsValid;") {
+		!strings.Contains(updateSubmit, "codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !hdrControlReady || !digitsValid;") {
 		t.Fatalf("control-code submit must be unavailable while the dialog is closed")
 	}
-	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = busy || limitBlocked;") {
+	if !strings.Contains(updateSubmit, "requestCodeButton.disabled = busy || limitBlocked || !hdrControlReady;") {
 		t.Fatalf("closed-page request button should be unavailable while the phone lane or SpaceTime quota blocks it")
 	}
 	if !strings.Contains(updateReveal, "if (controlCodeDialogScrollLock && controlCodeDialogScrollLock.active) return;") {
@@ -2946,10 +3066,11 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"const digitCount = sanitizeControlDigits(codeDigits.value).length;",
 		"const digitsValid = digitCount >= 2 && digitCount <= 8;",
 		"const limitBlocked = memberLimitBlocked('control_code');",
-		"codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !digitsValid;",
+		"const hdrControlReady = clientHDRConsequentialControlProofReady();",
+		"codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !hdrControlReady || !digitsValid;",
 		"codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';",
 		"codeSubmit.setAttribute('aria-busy', 'true');",
-		"requestCodeButton.disabled = busy || limitBlocked;",
+		"requestCodeButton.disabled = busy || limitBlocked || !hdrControlReady;",
 	} {
 		if !strings.Contains(updateSubmit, needle) {
 			t.Fatalf("submit availability must depend on valid digits, occupied work, and SpaceTime quota, missing %q", needle)
@@ -3781,7 +3902,10 @@ func TestTicketViewerBoundsPresentationLiveGraceWithoutRelaxingProof(t *testing.
 let monotonic = 1000;
 const performance = { now: () => monotonic };
 const WebSocket = { OPEN: 1, CLOSED: 3 };
-const document = { body: { dataset: { streamLive: 'true', streamReady: 'true' } } };
+const document = {
+  visibilityState: 'visible',
+  body: { dataset: { streamLive: 'true', streamReady: 'true' } }
+};
 let idleDisconnected = false;
 let streamUnsupported = false;
 let foreground = true;
@@ -3821,6 +3945,7 @@ let spinnerShows = 0;
 let spinnerHides = 0;
 function showStreamResumeSpinner() { spinnerShows += 1; }
 function hideStreamResumeSpinner() { spinnerHides += 1; }
+function showExperimentalClientHDRHoldoverNotice() {}
 function updateControlCodeSubmitAvailability() {}
 let activeResumeFlow = null;
 function finishActivationResumeFlow() {}
@@ -3828,9 +3953,12 @@ let hasRenderedFrame = true;
 const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
 let experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
 const hdrStaleReasons = [];
+const hdrHoldReasons = [];
 let experimentalClientHDRController = {
+  holdLastPresentation(reason) { hdrHoldReasons.push(reason); return true; },
   markSDRStale(reason) { hdrStaleReasons.push(reason); }
 };
+function setExperimentalMediaStatus() {}
 function check(value, message) { if (!value) throw new Error(message); }
 `+freshnessBody+`
 
@@ -3846,8 +3974,9 @@ timers.clear();
 expiry.callback();
 check(document.body.dataset.streamLive === 'false', 'an unchanged stale frame must become unavailable at expiry');
 check(streamLiveStaleGraceTimer === null && timers.size === 0, 'expiry must not re-arm its own grace');
-check(hdrStaleReasons.length === 1 && hdrStaleReasons[0] === 'sdr_stream_not_live',
-  'an aged-out rendered frame left frozen HDR above the authoritative SDR recovery view');
+check(hdrHoldReasons.length === 1 && hdrHoldReasons[0] === 'sdr_stream_not_live' &&
+  hdrStaleReasons.length === 0,
+  'an aged-out rendered frame did not preserve the proven bright HDR presentation');
 
 freshness = { hasFrame: true, liveLabeled: true, streamFreshnessState: 'LIVE_OK' };
 updateStreamFreshnessStatus('frame_rendered');
@@ -3859,8 +3988,9 @@ latestStreamStatus.phoneConnected = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a disconnected phone must bypass the grace immediately');
-check(hdrStaleReasons.length === 2 && hdrStaleReasons[1] === 'sdr_stream_unavailable',
-  'a disconnected phone must immediately reveal SDR');
+check(hdrHoldReasons.length === 2 && hdrHoldReasons[1] === 'sdr_stream_unavailable' &&
+  hdrStaleReasons.length === 0,
+  'a transient phone disconnect did not retain the proven HDR presentation');
 
 latestStreamStatus.phoneConnected = true;
 document.body.dataset.streamLive = 'true';
@@ -3868,9 +3998,9 @@ latestStreamStatus.phoneDesired = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'an intentionally stopped phone stream must bypass the grace immediately');
-check(hdrStaleReasons.length === 3, 'a stopped phone stream must immediately reveal SDR');
+check(hdrStaleReasons.length === 1, 'an explicitly stopped phone stream must reveal SDR');
 updateStreamFreshnessStatus('frame_rendered');
-check(hdrStaleReasons.length === 4,
+check(hdrStaleReasons.length === 2,
   'buffered decoder output must not recover HDR after the stream authority stopped it');
 
 latestStreamStatus.phoneDesired = true;
@@ -3879,7 +4009,8 @@ freshStatus = null;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a missing fresh relay status must bypass the grace immediately');
-check(hdrStaleReasons.length === 5, 'missing relay authority must immediately reveal SDR');
+check(hdrHoldReasons.length === 3 && hdrStaleReasons.length === 2,
+  'missing relay state during reconnect did not retain the proven HDR presentation');
 
 freshStatus = latestStreamStatus;
 document.body.dataset.streamLive = 'true';
@@ -3887,7 +4018,8 @@ latestStreamStatus.phoneStreamState = 'preparing_phone';
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a non-streaming phone state must bypass the grace immediately');
-check(hdrStaleReasons.length === 6, 'a non-streaming phone must immediately reveal SDR');
+check(hdrHoldReasons.length === 4 && hdrStaleReasons.length === 2,
+  'a preparing phone state did not retain the proven HDR presentation');
 
 latestStreamStatus.phoneStreamState = 'streaming';
 document.body.dataset.streamLive = 'true';
@@ -3895,7 +4027,8 @@ latestStreamStatus.activeVideoClients = 0;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'an inactive relay must bypass the grace immediately');
-check(hdrStaleReasons.length === 7, 'an inactive relay must immediately reveal SDR');
+check(hdrHoldReasons.length === 5 && hdrStaleReasons.length === 2,
+  'a transient zero-viewer relay state did not retain the proven HDR presentation');
 
 latestStreamStatus.activeVideoClients = 1;
 document.body.dataset.streamLive = 'true';
@@ -3903,7 +4036,7 @@ foreground = false;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a hidden or unfocused viewer must bypass the grace immediately');
-check(hdrStaleReasons.length === 8, 'a hidden viewer must immediately reveal SDR');
+check(hdrStaleReasons.length === 3, 'a hidden viewer must immediately reveal SDR');
 
 foreground = true;
 document.body.dataset.streamLive = 'true';
@@ -3911,7 +4044,8 @@ videoWs.readyState = WebSocket.CLOSED;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a closed video socket must bypass the grace immediately');
-check(hdrStaleReasons.length === 9, 'a closed browser media socket must immediately reveal SDR');
+check(hdrHoldReasons.length === 6 && hdrStaleReasons.length === 3,
+  'a reconnecting media socket did not retain the proven HDR presentation');
 
 videoWs.readyState = WebSocket.OPEN;
 document.body.dataset.streamLive = 'true';
@@ -3919,12 +4053,13 @@ latestStreamStatus.lastFrameAgoMillis = 2600;
 updateStreamFreshnessStatus('stream_status');
 check(document.body.dataset.streamLive === 'false' && timers.size === 0,
   'a server-confirmed stale stream must bypass the grace immediately');
-check(hdrStaleReasons.length === 10 && hdrStaleReasons[9] === 'sdr_stream_not_live',
-  'a server-confirmed stale stream left frozen HDR above the SDR recovery view');
+check(hdrHoldReasons.length === 7 && hdrHoldReasons[6] === 'sdr_stream_not_live' &&
+  hdrStaleReasons.length === 3,
+  'a server-confirmed stale stream did not retain the proven bright HDR presentation');
 
 streamUnsupported = true;
 updateStreamFreshnessStatus('stream_unsupported');
-check(hdrStaleReasons.length === 11,
+check(hdrStaleReasons.length === 4,
   'terminal browser decoding rejection must immediately reveal SDR');
 `)
 }
