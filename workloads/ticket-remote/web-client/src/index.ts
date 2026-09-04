@@ -370,9 +370,13 @@ class TicketSpacetimeClient {
     });
   }
 
-  requestViviReauthLogoutLogin(requestId: string, credentialRevision: string): Promise<void> {
+  requestViviReauthLogoutLogin(
+    requestId: string,
+    credentialRevision: string,
+    redetectAfterLogin = false,
+  ): Promise<void> {
     return this.callReducer("ownerRequestViviReauthLogoutLogin", {
-      version: 3,
+      version: redetectAfterLogin ? 4 : 3,
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       requestId,

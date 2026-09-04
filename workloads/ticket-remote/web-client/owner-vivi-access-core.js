@@ -5,11 +5,42 @@ export async function prepareOwnerViviAccessBeforeSubscribe({ ownerViviAuth, pre
   return result;
 }
 
+const OWNER_VIVI_USER_EDIT_INPUT_TYPES = new Set([
+  'insertText',
+  'insertCompositionText',
+  'insertFromComposition',
+  'insertFromPaste',
+  'insertFromPasteAsQuotation',
+  'insertFromDrop',
+  'deleteContentBackward',
+  'deleteContentForward',
+  'deleteWordBackward',
+  'deleteWordForward',
+  'deleteSoftLineBackward',
+  'deleteSoftLineForward',
+  'deleteHardLineBackward',
+  'deleteHardLineForward',
+  'deleteByCut',
+  'deleteByDrag',
+  'deleteCompositionText',
+  'historyUndo',
+  'historyRedo'
+]);
+
+export function ownerViviInputIsUserEdit(event, activeElement) {
+  return Boolean(event && event.isTrusted === true &&
+    event.currentTarget && event.currentTarget === activeElement &&
+    OWNER_VIVI_USER_EDIT_INPUT_TYPES.has(String(event.inputType || '')));
+}
+
 export function ownerViviCredentialSnapshot(credentialState, credentials) {
   const configured = credentialState && credentialState.configured === true;
   const revision = String(credentialState && credentialState.revision || credentials && credentials.revision || '');
   const credentialRevision = String(credentials && credentials.revision || '');
-  const credentialsMatchCurrentRevision = Boolean(credentials) && Boolean(revision) && credentialRevision === revision;
+  const credentialEmail = String(credentials && credentials.email || '').trim();
+  const credentialPassword = String(credentials && credentials.password || '');
+  const credentialsMatchCurrentRevision = Boolean(credentials) && Boolean(revision) &&
+    credentialRevision === revision && Boolean(credentialEmail) && Boolean(credentialPassword);
   const ready = configured ? credentialsMatchCurrentRevision : !credentials;
   return { configured, revision, ready, credentialsMatchCurrentRevision };
 }
@@ -39,6 +70,7 @@ export function resetOwnerViviCredentialCopies(model) {
     authoritativeEmail: '',
     authoritativePassword: '',
     dirty: false,
+    confirmationRedetectAfterLogin: false,
     confirm: ''
   });
 }
@@ -101,6 +133,8 @@ export function resetOwnerViviSensitiveModel(model, { connection, message }) {
     operationRequestId: '',
     focusedRequestId: '',
     message,
+    redetectAfterLogin: false,
+    confirmationRedetectAfterLogin: false,
     confirm: '',
     attempts: [],
     attempt: null

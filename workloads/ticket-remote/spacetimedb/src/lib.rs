@@ -79,6 +79,7 @@ const VIVI_REAUTH_COMMAND_TTL_MS: i64 = 3 * 60_000;
 const VIVI_REAUTH_LEGACY_REQUEST_PREFIX: &str = "vivi-reauth-";
 const VIVI_REAUTH_FULL_RESET_REQUEST_PREFIX: &str = "vivi-full-reset-";
 const VIVI_REAUTH_LOGOUT_LOGIN_REQUEST_PREFIX: &str = "vivi-logout-login-";
+const VIVI_REAUTH_LOGOUT_REDETECT_LOGIN_REQUEST_PREFIX: &str = "vivi-logout-redetect-login-";
 const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
 const STREAM_VIEWER_FOCUS_TTL_MS: i64 = 90_000;
@@ -91,6 +92,7 @@ enum ViviReauthMode {
     LegacyV1,
     FullResetV2,
     LogoutLoginV3,
+    LogoutLoginRedetectV4,
 }
 
 macro_rules! same_fields {
@@ -2429,6 +2431,14 @@ fn vivi_reauth_command_payload(
             "logoutInApp": true,
         })
         .to_string(),
+        ViviReauthMode::LogoutLoginRedetectV4 => serde_json::json!({
+            "version": 4,
+            "requestId": request_id,
+            "credentialRevision": credential_revision,
+            "logoutInApp": true,
+            "redetectAfterLogin": true,
+        })
+        .to_string(),
     }
 }
 
@@ -2443,6 +2453,12 @@ fn vivi_reauth_queued_intent_payload(credential_revision: &str, mode: ViviReauth
         ViviReauthMode::LogoutLoginV3 => serde_json::json!({
             "credentialRevision": credential_revision,
             "logoutInApp": true,
+        })
+        .to_string(),
+        ViviReauthMode::LogoutLoginRedetectV4 => serde_json::json!({
+            "credentialRevision": credential_revision,
+            "logoutInApp": true,
+            "redetectAfterLogin": true,
         })
         .to_string(),
     }
@@ -2461,13 +2477,17 @@ fn vivi_reauth_queued_intent_fields(payload_json: &str) -> Option<(String, ViviR
         object.len(),
         object.get("resetAppData"),
         object.get("logoutInApp"),
+        object.get("redetectAfterLogin"),
     ) {
-        (1, None, None) => Some((credential_revision, ViviReauthMode::LegacyV1)),
-        (2, Some(serde_json::Value::Bool(true)), None) => {
+        (1, None, None, None) => Some((credential_revision, ViviReauthMode::LegacyV1)),
+        (2, Some(serde_json::Value::Bool(true)), None, None) => {
             Some((credential_revision, ViviReauthMode::FullResetV2))
         }
-        (2, None, Some(serde_json::Value::Bool(true))) => {
+        (2, None, Some(serde_json::Value::Bool(true)), None) => {
             Some((credential_revision, ViviReauthMode::LogoutLoginV3))
+        }
+        (3, None, Some(serde_json::Value::Bool(true)), Some(serde_json::Value::Bool(true))) => {
+            Some((credential_revision, ViviReauthMode::LogoutLoginRedetectV4))
         }
         _ => None,
     }
@@ -6822,19 +6842,14 @@ pub fn ticketremote_owner_request_vivi_reauth_logout_login(
     requestId: String,
     credentialRevision: String,
 ) -> Result<(), String> {
-    if version != 3 {
-        return Err("unsupported_vivi_reauth_version".into());
-    }
-    if !vivi_reauth_request_mode_matches(&requestId, ViviReauthMode::LogoutLoginV3) {
-        return Err("vivi_reauth_request_mode_mismatch".into());
-    }
+    let mode = vivi_reauth_logout_login_mode(version, &requestId)?;
     owner_request_vivi_reauth(
         ctx,
         ticketId,
         backendId,
         requestId,
         credentialRevision,
-        ViviReauthMode::LogoutLoginV3,
+        mode,
     )
 }
 
@@ -6870,6 +6885,15 @@ pub fn ticketremote_update_vivi_reauth_attempt(
     ) {
         return Err("invalid_vivi_reauth_service_status".into());
     }
+    validate_vivi_reauth_service_report_mode(
+        &request_id,
+        &status,
+        &phase,
+        &reason,
+        &proof_source,
+        &stream_epoch,
+        &frame_sequence,
+    )?;
     let attempt_id = vivi_reauth_attempt_id(&ticket_id, &backend_id, &request_id);
     let attempt = ctx
         .db
@@ -9199,6 +9223,10 @@ fn vivi_reauth_request_mode(request_id: &str) -> Option<ViviReauthMode> {
             VIVI_REAUTH_LOGOUT_LOGIN_REQUEST_PREFIX,
             ViviReauthMode::LogoutLoginV3,
         ),
+        (
+            VIVI_REAUTH_LOGOUT_REDETECT_LOGIN_REQUEST_PREFIX,
+            ViviReauthMode::LogoutLoginRedetectV4,
+        ),
     ] {
         if request_id
             .strip_prefix(prefix)
@@ -9212,6 +9240,65 @@ fn vivi_reauth_request_mode(request_id: &str) -> Option<ViviReauthMode> {
 
 fn vivi_reauth_request_mode_matches(request_id: &str, expected: ViviReauthMode) -> bool {
     vivi_reauth_request_mode(request_id) == Some(expected)
+}
+
+fn vivi_reauth_logout_login_mode(version: u32, request_id: &str) -> Result<ViviReauthMode, String> {
+    let mode = match version {
+        3 => ViviReauthMode::LogoutLoginV3,
+        4 => ViviReauthMode::LogoutLoginRedetectV4,
+        _ => return Err("unsupported_vivi_reauth_version".into()),
+    };
+    vivi_reauth_request_mode_matches(request_id, mode)
+        .then_some(mode)
+        .ok_or_else(|| "vivi_reauth_request_mode_mismatch".into())
+}
+
+fn validate_vivi_reauth_service_report_mode(
+    request_id: &str,
+    status: &str,
+    phase: &str,
+    reason: &str,
+    proof_source: &str,
+    stream_epoch: &str,
+    frame_sequence: &str,
+) -> Result<(), String> {
+    let mode = vivi_reauth_request_mode(request_id)
+        .ok_or_else(|| "vivi_reauth_request_mode_mismatch".to_string())?;
+    let v4_phase = phase == "redetecting_latest_ticket";
+    let v4_reason = matches!(
+        reason,
+        "saved_credentials_original_ticket_restored"
+            | "saved_credentials_latest_ticket_redetected"
+            | "saved_credentials_no_ticket_proven"
+    );
+    if mode != ViviReauthMode::LogoutLoginRedetectV4 && (v4_phase || v4_reason) {
+        return Err("vivi_reauth_report_mode_mismatch".into());
+    }
+    if mode != ViviReauthMode::LogoutLoginRedetectV4 {
+        return Ok(());
+    }
+    if v4_phase
+        && (status != "running"
+            || reason != "running"
+            || !proof_source.is_empty()
+            || stream_epoch != "0"
+            || frame_sequence != "0")
+    {
+        return Err("vivi_reauth_report_mode_mismatch".into());
+    }
+    if v4_reason && status != "succeeded" {
+        return Err("vivi_reauth_report_mode_mismatch".into());
+    }
+    if status == "succeeded"
+        && (phase != "complete"
+            || !v4_reason
+            || proof_source != "phone_visual"
+            || stream_epoch == "0"
+            || frame_sequence == "0")
+    {
+        return Err("vivi_reauth_v4_success_proof_invalid".into());
+    }
+    Ok(())
 }
 
 fn vivi_reauth_status(value: &str) -> Result<String, String> {
@@ -9239,6 +9326,7 @@ fn vivi_reauth_phase(value: &str) -> Result<String, String> {
             | "entering_credentials"
             | "submitting"
             | "verifying_signed_in"
+            | "redetecting_latest_ticket"
             | "complete"
     )
     .then(|| value.to_string())
@@ -9254,6 +9342,9 @@ fn vivi_reauth_reason(value: &str) -> Result<String, String> {
             | "running"
             | "signed_in_proven"
             | "saved_credentials_sign_in_proven"
+            | "saved_credentials_original_ticket_restored"
+            | "saved_credentials_latest_ticket_redetected"
+            | "saved_credentials_no_ticket_proven"
             | "credentials_rejected"
             | "login_required"
             | "login_screen_not_detected"
@@ -13910,6 +14001,10 @@ mod tests {
         );
         assert_eq!(clean_vivi_request_id("request_01").unwrap(), "request_01");
         assert!(clean_vivi_request_id("request/01").is_err());
+        assert!(
+            !VIVI_REAUTH_LOGOUT_REDETECT_LOGIN_REQUEST_PREFIX
+                .starts_with(VIVI_REAUTH_LOGOUT_LOGIN_REQUEST_PREFIX)
+        );
         assert_eq!(
             vivi_reauth_request_mode("vivi-reauth-01"),
             Some(ViviReauthMode::LegacyV1)
@@ -13922,9 +14017,17 @@ mod tests {
             vivi_reauth_request_mode("vivi-logout-login-01"),
             Some(ViviReauthMode::LogoutLoginV3)
         );
+        assert_eq!(
+            vivi_reauth_request_mode("vivi-logout-redetect-login-01"),
+            Some(ViviReauthMode::LogoutLoginRedetectV4)
+        );
         assert_eq!(vivi_reauth_request_mode("vivi-reauth-"), None);
         assert_eq!(vivi_reauth_request_mode("vivi-full-reset-"), None);
         assert_eq!(vivi_reauth_request_mode("vivi-logout-login-"), None);
+        assert_eq!(
+            vivi_reauth_request_mode("vivi-logout-redetect-login-"),
+            None
+        );
         assert_eq!(vivi_reauth_request_mode("request_01"), None);
         assert!(vivi_reauth_request_mode_matches(
             "vivi-reauth-01",
@@ -13942,6 +14045,108 @@ mod tests {
             "vivi-logout-login-01",
             ViviReauthMode::LogoutLoginV3
         ));
+        assert!(vivi_reauth_request_mode_matches(
+            "vivi-logout-redetect-login-01",
+            ViviReauthMode::LogoutLoginRedetectV4
+        ));
+        assert_eq!(
+            vivi_reauth_logout_login_mode(3, "vivi-logout-login-01"),
+            Ok(ViviReauthMode::LogoutLoginV3)
+        );
+        assert_eq!(
+            vivi_reauth_logout_login_mode(4, "vivi-logout-redetect-login-01"),
+            Ok(ViviReauthMode::LogoutLoginRedetectV4)
+        );
+        assert_eq!(
+            vivi_reauth_logout_login_mode(3, "vivi-logout-redetect-login-01"),
+            Err("vivi_reauth_request_mode_mismatch".into())
+        );
+        assert_eq!(
+            vivi_reauth_logout_login_mode(4, "vivi-logout-login-01"),
+            Err("vivi_reauth_request_mode_mismatch".into())
+        );
+        assert_eq!(
+            vivi_reauth_logout_login_mode(5, "vivi-logout-redetect-login-01"),
+            Err("unsupported_vivi_reauth_version".into())
+        );
+        assert_eq!(
+            validate_vivi_reauth_service_report_mode(
+                "vivi-logout-redetect-login-01",
+                "running",
+                "redetecting_latest_ticket",
+                "running",
+                "",
+                "0",
+                "0",
+            ),
+            Ok(())
+        );
+        for reason in [
+            "saved_credentials_original_ticket_restored",
+            "saved_credentials_latest_ticket_redetected",
+            "saved_credentials_no_ticket_proven",
+        ] {
+            assert_eq!(
+                validate_vivi_reauth_service_report_mode(
+                    "vivi-logout-redetect-login-01",
+                    "succeeded",
+                    "complete",
+                    reason,
+                    "phone_visual",
+                    "10",
+                    "20",
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                validate_vivi_reauth_service_report_mode(
+                    "vivi-logout-login-01",
+                    "succeeded",
+                    "complete",
+                    reason,
+                    "phone_visual",
+                    "10",
+                    "20",
+                ),
+                Err("vivi_reauth_report_mode_mismatch".into())
+            );
+        }
+        assert_eq!(
+            validate_vivi_reauth_service_report_mode(
+                "vivi-logout-redetect-login-01",
+                "succeeded",
+                "complete",
+                "saved_credentials_sign_in_proven",
+                "phone_visual",
+                "10",
+                "20",
+            ),
+            Err("vivi_reauth_v4_success_proof_invalid".into())
+        );
+        assert_eq!(
+            validate_vivi_reauth_service_report_mode(
+                "vivi-logout-redetect-login-01",
+                "succeeded",
+                "complete",
+                "saved_credentials_latest_ticket_redetected",
+                "",
+                "0",
+                "0",
+            ),
+            Err("vivi_reauth_v4_success_proof_invalid".into())
+        );
+        assert_eq!(
+            validate_vivi_reauth_service_report_mode(
+                "vivi-full-reset-01",
+                "running",
+                "redetecting_latest_ticket",
+                "running",
+                "",
+                "0",
+                "0",
+            ),
+            Err("vivi_reauth_report_mode_mismatch".into())
+        );
 
         for status in [
             "queued",
@@ -13959,6 +14164,7 @@ mod tests {
             "opening_account_controls",
             "requesting_logout",
             "verifying_signed_out",
+            "redetecting_latest_ticket",
         ] {
             assert_eq!(vivi_reauth_phase(phase).unwrap(), phase);
         }
@@ -13967,6 +14173,9 @@ mod tests {
             "logout_control_not_detected",
             "logout_transition_not_proven",
             "logout_action_uncertain",
+            "saved_credentials_original_ticket_restored",
+            "saved_credentials_latest_ticket_redetected",
+            "saved_credentials_no_ticket_proven",
         ] {
             assert_eq!(vivi_reauth_reason(reason).unwrap(), reason);
         }
@@ -14020,6 +14229,23 @@ mod tests {
                 "logoutInApp": true,
             })
         );
+        let logout_redetect_login_payload =
+            serde_json::from_str::<serde_json::Value>(&vivi_reauth_command_payload(
+                "vivi-logout-redetect-login-01",
+                "cred-01",
+                ViviReauthMode::LogoutLoginRedetectV4,
+            ))
+            .unwrap();
+        assert_eq!(
+            logout_redetect_login_payload,
+            serde_json::json!({
+                "version": 4,
+                "requestId": "vivi-logout-redetect-login-01",
+                "credentialRevision": "cred-01",
+                "logoutInApp": true,
+                "redetectAfterLogin": true,
+            })
+        );
         assert_eq!(
             vivi_reauth_queued_intent_fields(&vivi_reauth_queued_intent_payload(
                 "cred-01",
@@ -14034,12 +14260,33 @@ mod tests {
             )),
             Some(("cred-01".into(), ViviReauthMode::FullResetV2))
         );
+        let logout_login_queued_payload =
+            vivi_reauth_queued_intent_payload("cred-01", ViviReauthMode::LogoutLoginV3);
         assert_eq!(
-            vivi_reauth_queued_intent_fields(&vivi_reauth_queued_intent_payload(
-                "cred-01",
-                ViviReauthMode::LogoutLoginV3,
-            )),
+            serde_json::from_str::<serde_json::Value>(&logout_login_queued_payload).unwrap(),
+            serde_json::json!({
+                "credentialRevision": "cred-01",
+                "logoutInApp": true,
+            })
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(&logout_login_queued_payload),
             Some(("cred-01".into(), ViviReauthMode::LogoutLoginV3))
+        );
+        let logout_redetect_login_queued_payload =
+            vivi_reauth_queued_intent_payload("cred-01", ViviReauthMode::LogoutLoginRedetectV4);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&logout_redetect_login_queued_payload)
+                .unwrap(),
+            serde_json::json!({
+                "credentialRevision": "cred-01",
+                "logoutInApp": true,
+                "redetectAfterLogin": true,
+            })
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(&logout_redetect_login_queued_payload),
+            Some(("cred-01".into(), ViviReauthMode::LogoutLoginRedetectV4))
         );
         assert_eq!(
             vivi_reauth_queued_intent_fields(
@@ -14055,6 +14302,24 @@ mod tests {
         );
         assert_eq!(
             vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","logoutInApp":true,"redetectAfterLogin":false}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","logoutInApp":true,"redetectAfterLogin":"true"}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","redetectAfterLogin":true}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
                 r#"{"credentialRevision":"cred-01","logoutInApp":true,"extra":1}"#
             ),
             None
@@ -14062,6 +14327,12 @@ mod tests {
         assert_eq!(
             vivi_reauth_queued_intent_fields(
                 r#"{"credentialRevision":"cred-01","resetAppData":true,"extra":1}"#
+            ),
+            None
+        );
+        assert_eq!(
+            vivi_reauth_queued_intent_fields(
+                r#"{"credentialRevision":"cred-01","logoutInApp":true,"redetectAfterLogin":true,"extra":1}"#
             ),
             None
         );

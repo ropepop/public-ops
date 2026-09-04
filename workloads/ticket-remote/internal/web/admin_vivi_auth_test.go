@@ -62,9 +62,14 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"ownerViviAuth: true",
 		"client.saveViviCredentials(email, password, model.operationBaselineRevision, revision)",
 		"client.clearViviCredentials(model.operationBaselineRevision, revision)",
-		"client.requestViviReauthLogoutLogin(requestId, model.revision)",
+		"client.requestViviReauthLogoutLogin(requestId, model.revision, redetectAfterLogin)",
 		"client.requestViviReauthFullReset(requestId, model.revision)",
-		"newViviOperationId(fullReset ? 'vivi-full-reset' : 'vivi-logout-login'",
+		"'vivi-logout-redetect-login' : 'vivi-logout-login'",
+		"redetectAfterLogin: false",
+		"confirmationRedetectAfterLogin: false",
+		"model.confirmationRedetectAfterLogin = model.redetectAfterLogin === true",
+		"If the original ticket is unavailable, find the newest unused ticket",
+		"Only if that ticket is unavailable",
 		"Non-destructive ViVi account switch",
 		"signs out inside the app",
 		"selectViviReauthAttempt(attempts, model.operationRequestId)",
@@ -81,6 +86,7 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"ownerViviPrivateViewGapDisposition",
 		"ownerViviStateUpdateAllowed",
 		"ownerViviStatusRequiresHardRevoke",
+		"ownerViviInputIsUserEdit(event, documentRef.activeElement)",
 		"resetOwnerViviConnectionAuthority",
 		"resetOwnerViviCredentialCopies",
 		"resetOwnerViviSensitiveModel",
@@ -114,7 +120,9 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"status === 'owner_vivi_access_failed'",
 		"resetOwnerViviCredentialCopies(model)",
 		"ownerViewObserved: false",
+		"confirmationRedetectAfterLogin: false",
 		"confirm: ''",
+		"event.currentTarget === activeElement",
 	} {
 		if !strings.Contains(core, required) {
 			t.Fatalf("owner ViVi access policy missing %q", required)
@@ -129,6 +137,9 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"this.attachStateListeners(connection, generation)",
 		"if (!connectionIsCurrent()) return",
 		"ownerViviConnectionEventAllowed",
+		"redetectAfterLogin = false",
+		"version: redetectAfterLogin ? 4 : 3",
+		`this.callReducer("ownerRequestViviReauthLogoutLogin"`,
 	} {
 		if !strings.Contains(clientSource, required) {
 			t.Fatalf("Spacetime client connection-generation fence missing %q", required)
@@ -150,6 +161,7 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"saveViviCredentials", "clearViviCredentials", "requestViviReauthLogoutLogin", "requestViviReauthFullReset",
 		"ticketAdminViviAuthUi", "ownerViviCredentials", "viviCredentialState",
 		"Owner access changed", "Restoring the owner ViVi account connection", "pageshow", "location.reload",
+		"ownerViviInputIsUserEdit(event,documentRef.activeElement)", "event.currentTarget===activeElement",
 	} {
 		if !strings.Contains(built, required) {
 			t.Fatalf("built owner ViVi account asset missing %q; run make web-client-build", required)
