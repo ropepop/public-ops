@@ -280,7 +280,7 @@ func (s *Server) requestPhoneKeyframeWithRequirement(reason, requirement string,
 		}
 		accepted, dispatchNow := s.enqueueRequiredBackgroundKeyframe(request, time.Now())
 		if !accepted {
-			s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+			s.direct.recordRelayTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
 			return
 		}
 		s.direct.recordKeyframeRequested()
@@ -290,7 +290,7 @@ func (s *Server) requestPhoneKeyframeWithRequirement(reason, requirement string,
 		return
 	}
 	if background && !s.beginBackgroundKeyframe(time.Now(), requirement) {
-		s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+		s.direct.recordRelayTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
 		return
 	}
 	s.direct.recordKeyframeRequested()
@@ -364,7 +364,7 @@ func (s *Server) requestPhoneKeyframeNow(reason string) error {
 	}
 	background := backgroundKeyframeDedupEligible(reason)
 	if background && !s.beginBackgroundKeyframe(time.Now()) {
-		s.direct.recordClientTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
+		s.direct.recordRelayTelemetry("keyframe_duplicate_suppressed", cleanStreamControlText(reason, "keyframe"))
 		return nil
 	}
 	if background {
@@ -467,7 +467,7 @@ func backgroundKeyframeDedupEligible(reason string) bool {
 func (s *Server) sendPhoneKeyframe(reason string, startupTraceID ...string) error {
 	relayHealth := s.relay.Snapshot()
 	if relayHealth.Viewers > 0 && !relayHealth.Connected {
-		s.direct.recordClientTelemetry("keyframe_waiting_phone_connect", reason)
+		s.direct.recordRelayTelemetry("keyframe_waiting_phone_connect", reason)
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "warn", "keyframe_while_phone_disconnected", cleanStreamControlText(reason, "keyframe"), map[string]any{
 			"reason":       reason,
 			"viewerCount":  relayHealth.Viewers,
@@ -524,7 +524,7 @@ func (s *Server) requestPhoneRecovery(reason string) {
 		return
 	}
 	if s.liveStreamSuppressesBackgroundCommand("recover_stream", reason, now) {
-		s.direct.recordClientTelemetry("stream_recovery_live_suppressed", reason)
+		s.direct.recordRelayTelemetry("stream_recovery_live_suppressed", reason)
 		return
 	}
 	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_recovery_requested", cleanStreamControlText(reason, "recover"), map[string]any{
@@ -535,7 +535,7 @@ func (s *Server) requestPhoneRecovery(reason string) {
 		"streamState": relayHealth.StreamState,
 	})
 	if s.direct.startupGraceActive(now) && !relayHealth.Connected {
-		s.direct.recordClientTelemetry("stream_recovery_start_suppressed", reason)
+		s.direct.recordRelayTelemetry("stream_recovery_start_suppressed", reason)
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_recovery_suppressed_startup_grace", cleanStreamControlText(reason, "recover"), map[string]any{
 			"reason":    reason,
 			"connected": relayHealth.Connected,
@@ -543,14 +543,14 @@ func (s *Server) requestPhoneRecovery(reason string) {
 		return
 	}
 	if !s.beginStreamAutoRecovery(reason, now) {
-		s.direct.recordClientTelemetry("stream_recovery_command_suppressed", reason)
+		s.direct.recordRelayTelemetry("stream_recovery_command_suppressed", reason)
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_recovery_suppressed_rate_limit", cleanStreamControlText(reason, "recover"), map[string]any{
 			"reason": reason,
 		})
 		return
 	}
 	if relayHealth.Connected && s.connectedRecoveryShouldStayKeyframeOnly(reason, now) {
-		s.direct.recordClientTelemetry("stream_recovery_keyframe_only", reason)
+		s.direct.recordRelayTelemetry("stream_recovery_keyframe_only", reason)
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_recovery_keyframe_only", cleanStreamControlText(reason, "recover"), map[string]any{
 			"reason":      reason,
 			"viewerCount": relayHealth.Viewers,
@@ -581,10 +581,9 @@ func (s *Server) liveStreamSuppressesBackgroundCommand(commandType string, reaso
 	}
 	status := s.direct.streamStatus(now, s.relay.Snapshot())
 	live, _ := status["live"].(bool)
-	verdict := strings.TrimSpace(stringFromAny(status["streamVerdict"]))
 	activeClients := uint32FromAny(status["activeVideoClients"])
-	if (live || verdict == "live") && activeClients > 0 {
-		s.direct.recordClientTelemetry(commandType+"_live_suppressed", cleanReason)
+	if live && activeClients > 0 {
+		s.direct.recordRelayTelemetry(commandType+"_live_suppressed", cleanReason)
 		return true
 	}
 	return false

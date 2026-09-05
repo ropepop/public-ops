@@ -84,7 +84,10 @@ const CONTROL_CODE_FAST_READY_TTL_MS: i64 = 12_000;
 const CONTROL_CODE_FAST_STATE_TTL_MS: i64 = 30_000;
 const STREAM_VIEWER_FOCUS_TTL_MS: i64 = 90_000;
 const SAFE_JSON_MAX_BYTES: usize = 4096;
-const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 2_500;
+// Public/durable "live" authority is intentionally narrower than visual
+// continuity. LIVE_OK and DEGRADED frames may remain visible, but only a
+// conservatively timed LIVE_FRESH frame may suppress recovery work.
+const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 1_250;
 const STREAM_BACKGROUND_REPORT_MAX_AGE_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,31 +158,6 @@ macro_rules! purge_expired_rows {
             $deleted += 1;
         }
     }};
-}
-
-macro_rules! ticket_expiry_purgers {
-    ($( $name:ident($table:ident) |$ctx:ident, $ticket:ident, $touched:ident, $clock:ident|
-        $after:block )+) => {$(
-        fn $name(
-            $ctx: &ReducerContext,
-            ticket_id: &str,
-            $clock: &str,
-            batch_size: u32,
-        ) -> u32 {
-            let $ticket = clean_ticket_id(ticket_id);
-            let expiry = canonical_time($clock);
-            let table = $ctx.db.$table();
-            let rows: Vec<_> = table.ticketExpiresAt()
-                .filter((&$ticket, ..=expiry.as_str())).take(batch_size as usize).collect();
-            let mut $touched = Vec::<String>::new();
-            for row in &rows {
-                if !$touched.contains(&row.backendId) { $touched.push(row.backendId.clone()); }
-                table.id().delete(&row.id);
-            }
-            $after
-            rows.len().min(u32::MAX as usize) as u32
-        }
-    )+};
 }
 
 macro_rules! purge_ticket_history {
@@ -6047,17 +6025,9 @@ member_reducers! {
         sessionId: String, active: bool, reason: String; ticket = ticketId) |ticket, email, now| {
     let session_id = non_empty(&sessionId, &connection_session_id(ctx));
     let backend_id = clean_backend_id(&backendId);
-    let focus_reason = bounded_text(
-        &non_empty(
-            &reason,
-            if active {
-                "browser_visible"
-            } else {
-                "browser_hidden"
-            },
-        ),
-        120,
-    );
+    // Keep the schema-compatible reason argument, but focus is advisory
+    // presence telemetry and never owns the service's stream demand.
+    let _ = reason;
     upsert_stream_viewer_focus(
         ctx,
         &ticket.id,
@@ -6068,21 +6038,6 @@ member_reducers! {
         &now,
     );
     purge_expired_stream_viewer_focus_for_ticket_backend(ctx, &ticket.id, &backend_id, &now, 100);
-    let viewers = active_stream_viewer_focus_count(ctx, &ticket.id, &backend_id, &now);
-    if stream_desired_core_matches(ctx, &ticket.id, &backend_id, viewers > 0, viewers) {
-        return Ok(());
-    }
-    upsert_stream_desired_state(
-        ctx,
-        &ticket.id,
-        &backend_id,
-        viewers > 0,
-        viewers,
-        &focus_reason,
-        &now,
-        "browser",
-        &now,
-    );
     }
 }
 
@@ -7455,7 +7410,7 @@ pub fn ticketremote_append_stream_command(
     let command_reason = non_empty(&reason, "stream_command");
     let background = suppressible_background_stream_command(&command_type);
     if (background
-        && authoritative_stream_is_idle(ctx, &ticketId, &backendId, &now)
+        && authoritative_stream_is_idle(ctx, &ticketId, &backendId)
         && !idle_stream_command_is_allowed(&command_reason, &payloadJson))
         || (background
             && !stream_command_is_requester_scoped(&command_reason, &payloadJson)
@@ -9420,8 +9375,6 @@ expression_functions! {
         ctx.db.ticketremote_ticket_member().id().find(member_id(ticket, email))
             .map(|row| row.active && row.role == "owner")
             .unwrap_or(false);
-    fn stream_desired_core_equal(row: &TicketremoteStreamDesiredState,
-        active: bool, viewers: u32) -> bool = row.desiredActive == active && row.viewerCount == viewers;
     fn control_code_cleanup_preserves_terminal_failure(existing: &TicketremoteControlCodeRequest,
         status: &str, reason: &str) -> bool = control_code_terminal_failure_status(&existing.status)
             && status == existing.status && control_code_cleanup_reason(reason);
@@ -9444,9 +9397,6 @@ expression_functions! {
     fn json_i64(value: &serde_json::Value) -> Option<i64> = value.as_i64()
         .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
         .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()));
-    fn json_str(value: &serde_json::Value, key: &str) -> String = value.get(key)
-        .and_then(|raw| raw.as_str()).map(|raw| raw.trim().to_ascii_lowercase())
-        .unwrap_or_default();
     fn clean_role(value: &str) -> String = allowlisted(value, &["owner", "admin"], "member");
     fn clean_hdr_engine(_value: &str) -> String = "client_webgpu_v2".into();
     fn clean_hdr_display_boost(value: u32) -> u32 = match value {
@@ -9729,10 +9679,7 @@ fn live_relay_suppresses_background_stream_command(
         return false;
     }
     let id = phone_row_id(ticket_id, backend_id);
-    if relay_current_report_suppresses_background_stream_command(ctx, &id, now) {
-        return true;
-    }
-    phone_current_report_suppresses_background_stream_command(ctx, &id, now)
+    relay_current_report_suppresses_background_stream_command(ctx, &id, now)
 }
 
 fn stream_command_is_requester_scoped(reason: &str, payload_json: &str) -> bool {
@@ -9787,21 +9734,14 @@ fn idle_stream_command_is_allowed(reason: &str, payload_json: &str) -> bool {
         || reason.contains("public_connected")
 }
 
-fn authoritative_stream_is_idle(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-) -> bool {
+fn authoritative_stream_is_idle(ctx: &ReducerContext, ticket_id: &str, backend_id: &str) -> bool {
     let ticket_id = clean_ticket_id(ticket_id);
     let backend_id = clean_backend_id(backend_id);
     let id = phone_row_id(&ticket_id, &backend_id);
     let Some(desired) = ctx.db.ticketremote_stream_desired_state().id().find(&id) else {
         return false;
     };
-    !desired.desiredActive
-        && desired.viewerCount == 0
-        && active_stream_viewer_focus_count(ctx, &ticket_id, &backend_id, now) == 0
+    !desired.desiredActive && desired.viewerCount == 0
 }
 
 fn relay_current_report_suppresses_background_stream_command(
@@ -9812,85 +9752,93 @@ fn relay_current_report_suppresses_background_stream_command(
     let Some(report) = ctx.db.ticketremote_relay_current_report().id().find(id) else {
         return false;
     };
+    relay_current_report_is_live_for_background_suppression(&report, now)
+}
+
+fn relay_current_report_is_live_for_background_suppression(
+    report: &TicketremoteRelayCurrentReport,
+    now: &str,
+) -> bool {
     if report.videoClients == 0 || report.streamVerdict != "live" {
         return false;
     }
-    let report_age_ms = parse_time_ms(now).saturating_sub(parse_time_ms(&report.updatedAt));
+    let now_ms = parse_time_ms(now);
+    let updated_at_ms = parse_time_ms(&report.updatedAt);
+    if now_ms <= 0 || updated_at_ms <= 0 || updated_at_ms > now_ms {
+        return false;
+    }
+    let report_age_ms = now_ms - updated_at_ms;
     if !(0..=STREAM_BACKGROUND_REPORT_MAX_AGE_MS).contains(&report_age_ms) {
         return false;
     }
+    let Some(visual_age) = relay_last_frame_age_ms(report.lastFrameAt.as_deref(), now) else {
+        return false;
+    };
     let Ok(status) = serde_json::from_str::<serde_json::Value>(&report.statusJson) else {
-        return report_age_ms <= STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS;
+        return false;
     };
     let live = status
         .get("live")
         .and_then(|value| value.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let live_fresh = status
+        .get("freshnessState")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "LIVE_FRESH");
+    let visual_age_known = status
+        .get("lastFrameVisualAgeKnown")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let bounded_clock = status
+        .get("phoneClockBoundedCalibrated")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let tsf3 = status
+        .get("frameEnvelope")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "tsf3");
     let active_clients = status
         .get("activeVideoClients")
         .and_then(json_i64)
         .unwrap_or(report.videoClients as i64);
-    let visual_age = status
+    let max_age = match status.get("liveFrameMaxAgeMillis") {
+        None => STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS,
+        Some(value) => {
+            let Some(value) = json_i64(value).filter(|value| *value >= 0) else {
+                return false;
+            };
+            value.min(STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS)
+        }
+    };
+    let reported_visual_age = status
         .get("lastFrameVisualAgeMillis")
         .and_then(json_i64)
-        .unwrap_or(0)
-        .saturating_add(report_age_ms);
-    let max_age = status
-        .get("liveFrameMaxAgeMillis")
-        .and_then(json_i64)
-        .unwrap_or(STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS);
-    live && active_clients > 0 && visual_age >= 0 && visual_age <= max_age
+        .filter(|value| *value >= 0 && *value <= max_age);
+    live && live_fresh
+        && visual_age_known
+        && bounded_clock
+        && tsf3
+        && active_clients > 0
+        && reported_visual_age.is_some()
+        && visual_age <= max_age
 }
 
-fn phone_current_report_suppresses_background_stream_command(
-    ctx: &ReducerContext,
-    id: &String,
-    now: &str,
-) -> bool {
-    let Some(report) = ctx.db.ticketremote_phone_current_report().id().find(id) else {
-        return false;
-    };
-    if !report.desiredActive || !matches!(report.streamState.trim(), "streaming" | "live") {
-        return false;
-    }
-    let report_age_ms = parse_time_ms(now).saturating_sub(parse_time_ms(&report.updatedAt));
-    if !(0..=STREAM_BACKGROUND_REPORT_MAX_AGE_MS).contains(&report_age_ms) {
-        return false;
-    }
-    let Ok(status) = serde_json::from_str::<serde_json::Value>(&report.statusJson) else {
-        return false;
-    };
-    if status.get("streamActive").and_then(|value| value.as_bool()) == Some(false)
-        || status
-            .get("hardwareH264Active")
-            .and_then(|value| value.as_bool())
-            == Some(false)
+fn relay_public_stream_verdict(report: &TicketremoteRelayCurrentReport, now: &str) -> String {
+    if report.streamVerdict == "live"
+        && !relay_current_report_is_live_for_background_suppression(report, now)
     {
-        return false;
+        return "stale_recovering".into();
     }
-    if ["sessionState", "relayStreamState"]
-        .iter()
-        .map(|key| json_str(&status, key))
-        .any(|state| !state.is_empty() && !matches!(state.as_str(), "live" | "streaming"))
-        || {
-            let state = json_str(&status, "hardwareH264Visibility");
-            !state.is_empty() && state != "visible"
-        }
-    {
-        return false;
+    report.streamVerdict.clone()
+}
+
+fn relay_last_frame_age_ms(last_frame_at: Option<&str>, now: &str) -> Option<i64> {
+    let last_frame_at_ms = parse_time_ms(last_frame_at?.trim());
+    let now_ms = parse_time_ms(now);
+    if last_frame_at_ms <= 0 || now_ms <= 0 || last_frame_at_ms > now_ms {
+        return None;
     }
-    let watchdog_stage = json_str(&status, "streamWatchdogStage");
-    if ["recover", "restart", "fail"]
-        .iter()
-        .any(|token| watchdog_stage.contains(token))
-    {
-        return false;
-    }
-    ["activeVideoClients", "videoClients", "relayViewers"]
-        .iter()
-        .find_map(|key| status.get(key).and_then(json_i64))
-        .unwrap_or(0)
-        > 0
+    Some(now_ms - last_frame_at_ms)
 }
 
 fn to_base36(mut value: u32) -> String {
@@ -11474,24 +11422,6 @@ fn upsert_stream_viewer_focus(
     );
 }
 
-fn active_stream_viewer_focus_count(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-) -> u32 {
-    let ticket_id = clean_ticket_id(ticket_id);
-    let backend_id = clean_backend_id(backend_id);
-    let now_ms = parse_time_ms(now);
-    ctx.db
-        .ticketremote_stream_viewer_focus()
-        .ticketBackend()
-        .filter((&ticket_id, &backend_id))
-        .filter(|row| row.active && parse_time_ms(&row.expiresAt) > now_ms)
-        .count()
-        .min(u32::MAX as usize) as u32
-}
-
 fn upsert_stream_desired_state(
     ctx: &ReducerContext,
     ticket_id: &str,
@@ -11534,22 +11464,6 @@ fn upsert_stream_desired_state(
     let row = upsert_row!(ctx, ticketremote_stream_desired_state, row);
     upsert_stream_command_signal(ctx, &row.ticketId, &row.backendId, &row.revision, now);
     row
-}
-
-fn stream_desired_core_matches(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    desired_active: bool,
-    viewer_count: u32,
-) -> bool {
-    let id = phone_row_id(ticket_id, backend_id);
-    ctx.db
-        .ticketremote_stream_desired_state()
-        .id()
-        .find(&id)
-        .map(|row| stream_desired_core_equal(&row, desired_active, viewer_count))
-        .unwrap_or(false)
 }
 
 fn purge_pending_idle_background_commands(
@@ -12468,7 +12382,7 @@ fn upsert_relay_current_report(
     let ticket = ensure_ticket(ctx, ticket_id, "", now);
     let backend_id = clean_backend_id(backend_id);
     let id = phone_row_id(&ticket.id, &backend_id);
-    let row = TicketremoteRelayCurrentReport {
+    let mut row = TicketremoteRelayCurrentReport {
         id: id.clone(),
         ticketId: ticket.id,
         backendId: backend_id,
@@ -12480,6 +12394,9 @@ fn upsert_relay_current_report(
         updatedAt: now.into(),
         lastFrameAt: Some(bounded_text(last_frame_at.trim(), 80)),
     };
+    // An older or compromised reporter may still call LIVE_OK/DEGRADED
+    // "live". Never persist that broad continuity verdict as public authority.
+    row.streamVerdict = relay_public_stream_verdict(&row, now);
     if let Some(existing) = ctx.db.ticketremote_relay_current_report().id().find(&id)
         && same_fields!(existing, row; videoClients, streamVerdict, lastFrameAgoMillis, lastFrameAt, framesForwarded, statusJson)
     {
@@ -13269,14 +13186,24 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
     deleted
 }
 
-ticket_expiry_purgers! {
-    purge_expired_stream_viewer_focus_for_ticket(ticketremote_stream_viewer_focus)
-        |ctx, ticket, touched, now| {
-        for backend in &touched {
-            refresh_stream_desired_from_viewer_focus(ctx, &ticket, backend, now,
-                "viewer_focus_expired");
-        }
+fn purge_expired_stream_viewer_focus_for_ticket(
+    ctx: &ReducerContext,
+    ticket_id: &str,
+    now: &str,
+    batch_size: u32,
+) -> u32 {
+    let ticket_id = clean_ticket_id(ticket_id);
+    let expiry = canonical_time(now);
+    let table = ctx.db.ticketremote_stream_viewer_focus();
+    let rows: Vec<_> = table
+        .ticketExpiresAt()
+        .filter((&ticket_id, ..=expiry.as_str()))
+        .take(batch_size as usize)
+        .collect();
+    for row in &rows {
+        table.id().delete(&row.id);
     }
+    rows.len().min(u32::MAX as usize) as u32
 }
 
 fn purge_expired_stream_commands_for_ticket(
@@ -13384,33 +13311,223 @@ fn purge_expired_stream_viewer_focus_for_ticket_backend(
     rows.len().min(u32::MAX as usize) as u32
 }
 
-fn refresh_stream_desired_from_viewer_focus(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    backend_id: &str,
-    now: &str,
-    reason: &str,
-) {
-    let viewers = active_stream_viewer_focus_count(ctx, ticket_id, backend_id, now);
-    if stream_desired_core_matches(ctx, ticket_id, backend_id, viewers > 0, viewers) {
-        return;
-    }
-    upsert_stream_desired_state(
-        ctx,
-        ticket_id,
-        backend_id,
-        viewers > 0,
-        viewers,
-        reason,
-        now,
-        "cleanup",
-        now,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_current_report(last_frame_at: Option<&str>) -> TicketremoteRelayCurrentReport {
+        TicketremoteRelayCurrentReport {
+            id: "vivi-default:pixel".into(),
+            ticketId: "vivi-default".into(),
+            backendId: "pixel".into(),
+            videoClients: 1,
+            streamVerdict: "live".into(),
+            lastFrameAgoMillis: 0,
+            framesForwarded: "10".into(),
+            statusJson: serde_json::json!({
+                "live": true,
+                "freshnessState": "LIVE_FRESH",
+                "activeVideoClients": 1,
+                "lastFrameVisualAgeKnown": true,
+                "lastFrameVisualAgeMillis": 0,
+                "phoneClockBoundedCalibrated": true,
+                "frameEnvelope": "tsf3",
+                "liveFrameMaxAgeMillis": 2_500,
+            })
+            .to_string(),
+            updatedAt: "2026-09-04T12:00:10Z".into(),
+            lastFrameAt: last_frame_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn relay_background_suppression_uses_the_durable_frame_timestamp() {
+        let now = "2026-09-04T12:00:10Z";
+
+        let fresh = relay_current_report(Some("2026-09-04T12:00:09Z"));
+        assert!(relay_current_report_is_live_for_background_suppression(
+            &fresh, now
+        ));
+
+        let stale = relay_current_report(Some("2026-09-04T12:00:00Z"));
+        assert!(!relay_current_report_is_live_for_background_suppression(
+            &stale, now
+        ));
+    }
+
+    #[test]
+    fn relay_background_suppression_requires_conservative_live_fresh() {
+        let now = "2026-09-04T12:00:10Z";
+        for status_patch in [
+            serde_json::json!({"freshnessState": "LIVE_OK"}),
+            serde_json::json!({"freshnessState": "DEGRADED"}),
+            serde_json::json!({"lastFrameVisualAgeKnown": false}),
+            serde_json::json!({"phoneClockBoundedCalibrated": false}),
+            serde_json::json!({"frameEnvelope": "tsf2"}),
+        ] {
+            let mut report = relay_current_report(Some("2026-09-04T12:00:09Z"));
+            let mut status: serde_json::Value =
+                serde_json::from_str(&report.statusJson).expect("valid relay status fixture");
+            status
+                .as_object_mut()
+                .expect("object relay status fixture")
+                .extend(status_patch.as_object().expect("object patch").clone());
+            report.statusJson = status.to_string();
+            assert!(!relay_current_report_is_live_for_background_suppression(
+                &report, now
+            ));
+            assert_eq!(
+                relay_public_stream_verdict(&report, now),
+                "stale_recovering"
+            );
+        }
+
+        let fresh = relay_current_report(Some("2026-09-04T12:00:09Z"));
+        assert_eq!(relay_public_stream_verdict(&fresh, now), "live");
+    }
+
+    #[test]
+    fn relay_live_ok_continuity_remains_durable_but_never_authoritative() {
+        let now = "2026-09-04T12:00:10Z";
+        let mut report = relay_current_report(Some("2026-09-04T12:00:09Z"));
+        report.statusJson = serde_json::json!({
+            "streamVerdict": "stale_recovering",
+            "live": false,
+            "continuity": true,
+            "freshnessState": "LIVE_OK",
+            "fps": 1,
+            "sourceFps": 1,
+            "keyframeIntervalFrames": 1,
+            "frameEnvelope": "tsf3",
+            "allIntraConfigValid": true,
+            "streamEpoch": 7,
+            "lastFrameSequence": 42,
+            "lastFrameVisualAgeKnown": true,
+            "lastFrameVisualAgeMillis": 1_700,
+            "liveOKMaxAgeMillis": 2_000,
+            "phoneConnected": true,
+            "phoneDesired": true,
+            "phoneStreamState": "streaming",
+            "activeVideoClients": 1,
+            "phoneClockBoundedCalibrated": true,
+            "liveFrameMaxAgeMillis": 3_000,
+        })
+        .to_string();
+
+        assert!(!relay_current_report_is_live_for_background_suppression(
+            &report, now
+        ));
+        assert_eq!(
+            relay_public_stream_verdict(&report, now),
+            "stale_recovering"
+        );
+
+        let durable: serde_json::Value =
+            serde_json::from_str(&report.statusJson).expect("valid durable relay status");
+        for (key, want) in [
+            ("continuity", serde_json::json!(true)),
+            ("freshnessState", serde_json::json!("LIVE_OK")),
+            ("streamEpoch", serde_json::json!(7)),
+            ("lastFrameSequence", serde_json::json!(42)),
+            ("lastFrameVisualAgeMillis", serde_json::json!(1_700)),
+            ("phoneConnected", serde_json::json!(true)),
+            ("phoneDesired", serde_json::json!(true)),
+            ("phoneStreamState", serde_json::json!("streaming")),
+        ] {
+            assert_eq!(durable.get(key), Some(&want), "durable field {key}");
+        }
+    }
+
+    #[test]
+    fn background_stream_suppression_has_one_fresh_relay_authority() {
+        let source = include_str!("lib.rs");
+        let helper = source
+            .split("fn live_relay_suppresses_background_stream_command(")
+            .nth(1)
+            .and_then(|body| body.split("fn stream_command_is_requester_scoped(").next())
+            .expect("live relay suppression helper");
+        assert!(helper.contains("relay_current_report_suppresses_background_stream_command("));
+        assert!(!helper.contains("phone_current_report"));
+        let retired_phone_fallback = [
+            "fn phone_current_report_",
+            "suppresses_background_stream_command(",
+        ]
+        .concat();
+        assert!(!source.contains(&retired_phone_fallback));
+    }
+
+    #[test]
+    fn relay_background_suppression_fails_closed_without_a_valid_frame_timestamp() {
+        let now = "2026-09-04T12:00:10Z";
+        for last_frame_at in [None, Some("not-a-time"), Some("2026-09-04T12:00:11Z")] {
+            let report = relay_current_report(last_frame_at);
+            assert!(!relay_current_report_is_live_for_background_suppression(
+                &report, now
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_background_suppression_never_exceeds_the_server_owned_age_limit() {
+        let now = "2026-09-04T12:00:10Z";
+        let mut report = relay_current_report(Some("2026-09-04T12:00:07Z"));
+        report.statusJson = serde_json::json!({
+            "live": true,
+            "freshnessState": "LIVE_FRESH",
+            "activeVideoClients": 1,
+            "lastFrameVisualAgeKnown": true,
+            "lastFrameVisualAgeMillis": 0,
+            "phoneClockBoundedCalibrated": true,
+            "frameEnvelope": "tsf3",
+            "liveFrameMaxAgeMillis": 9_999_999,
+        })
+        .to_string();
+        assert!(!relay_current_report_is_live_for_background_suppression(
+            &report, now
+        ));
+
+        report.lastFrameAt = Some("2026-09-04T12:00:09Z".into());
+        assert!(relay_current_report_is_live_for_background_suppression(
+            &report, now
+        ));
+    }
+
+    #[test]
+    fn relay_background_suppression_rejects_invalid_advertised_age_limits() {
+        let now = "2026-09-04T12:00:10Z";
+        for max_age in [serde_json::json!(-1), serde_json::json!("not-a-number")] {
+            let mut report = relay_current_report(Some("2026-09-04T12:00:09Z"));
+            report.statusJson = serde_json::json!({
+                "live": true,
+                "freshnessState": "LIVE_FRESH",
+                "activeVideoClients": 1,
+                "lastFrameVisualAgeKnown": true,
+                "lastFrameVisualAgeMillis": 0,
+                "phoneClockBoundedCalibrated": true,
+                "frameEnvelope": "tsf3",
+                "liveFrameMaxAgeMillis": max_age,
+            })
+            .to_string();
+            assert!(!relay_current_report_is_live_for_background_suppression(
+                &report, now
+            ));
+        }
+
+        let mut missing = relay_current_report(Some("2026-09-04T12:00:09Z"));
+        missing.statusJson = serde_json::json!({
+            "live": true,
+            "freshnessState": "LIVE_FRESH",
+            "activeVideoClients": 1,
+            "lastFrameVisualAgeKnown": true,
+            "lastFrameVisualAgeMillis": 0,
+            "phoneClockBoundedCalibrated": true,
+            "frameEnvelope": "tsf3",
+        })
+        .to_string();
+        assert!(relay_current_report_is_live_for_background_suppression(
+            &missing, now
+        ));
+    }
 
     fn pending_atomic_ticket_action(target: &str) -> TicketremoteTicketActionV3 {
         TicketremoteTicketActionV3 {
@@ -14668,7 +14785,7 @@ mod tests {
         let generic_purger = source
             .split("macro_rules! purge_expired_rows")
             .nth(1)
-            .and_then(|body| body.split("macro_rules! ticket_expiry_purgers").next())
+            .and_then(|body| body.split("macro_rules! purge_ticket_history").next())
             .expect("generic indexed expiry purger");
         assert!(generic_purger.contains("ticketExpiresAt()"));
         assert!(generic_purger.contains("cleanup_remaining($limit, $deleted)"));
@@ -16198,21 +16315,36 @@ mod tests {
     }
 
     #[test]
-    fn presence_heartbeat_changes_desired_state_only_when_core_state_changes() {
-        let row = TicketremoteStreamDesiredState {
-            id: "vivi-default:pixel".into(),
-            ticketId: "vivi-default".into(),
-            backendId: "pixel".into(),
-            desiredActive: true,
-            viewerCount: 2,
-            reason: "browser_stream_heartbeat".into(),
-            revision: "revision-1".into(),
-            updatedBy: "browser".into(),
-            updatedAt: "2026-07-10T12:00:00Z".into(),
-        };
-        assert!(stream_desired_core_equal(&row, true, 2));
-        assert!(!stream_desired_core_equal(&row, true, 3));
-        assert!(!stream_desired_core_equal(&row, false, 2));
+    fn viewer_focus_is_advisory_and_cannot_own_stream_demand() {
+        let source = include_str!("lib.rs");
+        let reducer = source
+            .split("ticketremote_member_set_stream_focus(ctx;")
+            .nth(1)
+            .and_then(|body| body.split("macro_rules! member_stream_reducers").next())
+            .expect("member focus reducer body");
+        assert!(reducer.contains("upsert_stream_viewer_focus("));
+        assert!(reducer.contains("purge_expired_stream_viewer_focus_for_ticket_backend("));
+        assert!(!reducer.contains("upsert_stream_desired_state("));
+
+        let cleanup = source
+            .split("fn purge_expired_stream_viewer_focus_for_ticket(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn purge_expired_stream_commands_for_ticket(")
+                    .next()
+            })
+            .expect("focus expiry cleanup body");
+        assert!(!cleanup.contains("upsert_stream_desired_state("));
+
+        let idle_authority = source
+            .split("fn authoritative_stream_is_idle(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("fn relay_current_report_suppresses_background_stream_command(")
+                    .next()
+            })
+            .expect("authoritative idle helper body");
+        assert!(!idle_authority.contains("stream_viewer_focus"));
     }
 
     #[test]

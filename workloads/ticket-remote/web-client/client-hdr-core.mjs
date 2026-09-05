@@ -109,6 +109,16 @@ export function clientHDRFreshness(presented, current, now, limits = {}) {
   if (!(presentedEpoch > 0) || presentedEpoch !== currentEpoch) {
     return { fresh: false, reason: 'epoch_mismatch' };
   }
+  const presentedConfigGeneration = finiteNumber(presented.configGeneration);
+  const currentConfigGeneration = finiteNumber(current.configGeneration);
+  if (presentedConfigGeneration !== currentConfigGeneration) {
+    return {
+      fresh: false,
+      reason: 'config_generation_mismatch',
+      presentedConfigGeneration,
+      currentConfigGeneration
+    };
+  }
   const presentedSequence = finiteNumber(presented.sequence);
   const currentSequence = finiteNumber(current.sequence);
   const sourceSequenceLag = currentSequence - presentedSequence;
@@ -522,6 +532,7 @@ export class ClientHDRController {
     return {
       epoch: finiteNumber(metadata.epoch),
       sequence: finiteNumber(metadata.sequence),
+      configGeneration: finiteNumber(metadata.configGeneration),
       presentationOrdinal: finiteNumber(metadata.presentationOrdinal),
       visualAgeMillis: Math.max(0, finiteNumber(metadata.visualAgeMillis)),
       renderedAt: finiteNumber(metadata.renderedAt, this.now())
@@ -595,6 +606,7 @@ export class ClientHDRController {
       frame,
       epoch: finiteNumber(metadata.epoch),
       sequence: finiteNumber(metadata.sequence),
+      configGeneration: finiteNumber(metadata.configGeneration),
       presentationOrdinal: finiteNumber(metadata.presentationOrdinal),
       timestamp: finiteNumber(metadata.timestamp),
       visualAgeMillis: Math.max(0, finiteNumber(metadata.visualAgeMillis)),
@@ -626,6 +638,7 @@ export class ClientHDRController {
     candidate.committedSDRMetadata = this.sdrMetadata({
       epoch: finiteNumber(committedMetadata.epoch, candidate.epoch),
       sequence: finiteNumber(committedMetadata.sequence, candidate.sequence),
+      configGeneration: finiteNumber(committedMetadata.configGeneration, candidate.configGeneration),
       presentationOrdinal: finiteNumber(committedMetadata.presentationOrdinal, candidate.presentationOrdinal),
       visualAgeMillis: finiteNumber(committedMetadata.visualAgeMillis, candidate.visualAgeMillis),
       renderedAt: finiteNumber(committedMetadata.renderedAt, this.now())
@@ -637,7 +650,7 @@ export class ClientHDRController {
   mergeCommittedPresentation(presentation, candidate) {
     const committed = candidate && candidate.committedPresentationMetadata;
     if (!presentation || !committed) return presentation;
-    for (const key of ['epoch', 'sequence', 'presentationOrdinal', 'timestamp']) {
+    for (const key of ['epoch', 'sequence', 'configGeneration', 'presentationOrdinal', 'timestamp']) {
       if (Number.isFinite(Number(committed[key]))) presentation[key] = Number(committed[key]);
     }
     if (Number.isFinite(Number(committed.visualAgeMillis))) {
@@ -755,6 +768,7 @@ export class ClientHDRController {
     return {
       epoch: finiteNumber(result && result.epoch, candidate.epoch),
       sequence: finiteNumber(result && result.sequence, candidate.sequence),
+      configGeneration: finiteNumber(result && result.configGeneration, candidate.configGeneration),
       presentationOrdinal: finiteNumber(result && result.presentationOrdinal, candidate.presentationOrdinal),
       timestamp: finiteNumber(result && result.timestamp, candidate.timestamp),
       visualAgeMillis: Math.max(0, finiteNumber(result && result.visualAgeMillis, candidate.visualAgeMillis)),
@@ -949,6 +963,11 @@ export class ClientHDRController {
       if (!preparedFreshness.fresh) {
         this.discardPreparedCandidate(renderer, candidate, `prepared_${preparedFreshness.reason}`);
         if (this.pendingPresentation === completedPresentation) this.pendingPresentation = null;
+        // The page may revoke an expiring SDR watermark while a boost redraw
+        // is preparing. Discard that obsolete candidate without hardening the
+        // refresh already owned by the boost; a fresh picture must still pass
+        // every normal presentation gate before it can replace the surface.
+        if (this.fallbackKind === 'refresh' && preparedFreshness.reason === 'missing_watermark') return;
         this.latchFallback(preparedFreshness.reason);
         return;
       }
@@ -1418,6 +1437,7 @@ export class ClientHDRController {
         Number(Boolean(this.inFlight && !this.inFlight.released)),
       epoch: finiteNumber(this.presented && this.presented.epoch),
       sequence: finiteNumber(this.presented && this.presented.sequence),
+      configGeneration: finiteNumber(this.presented && this.presented.configGeneration),
       presentationOrdinal: finiteNumber(this.presented && this.presented.presentationOrdinal),
       sequenceLag: finiteNumber(this.freshness && this.freshness.sequenceLag),
       sourceSequenceLag: finiteNumber(this.freshness && this.freshness.sourceSequenceLag),

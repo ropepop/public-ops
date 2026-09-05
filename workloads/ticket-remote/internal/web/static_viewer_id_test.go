@@ -10,7 +10,7 @@ func TestStaticClientShowsAccountPublicIDsInViewerAndAdminLists(t *testing.T) {
 	admin := ticketRemoteSourceFile(t, "internal", "web", "static", "admin.html.tmpl")
 	presenceBody := substringBetween(t, source,
 		"function activeViewerPresence(state) {",
-		"  function renderViewerSummary(viewers, visibleViewerCount) {")
+		"  function renderPresence(viewers, visibleViewerCount) {")
 
 	if !strings.Contains(presenceBody, "viewer.publicId") {
 		t.Fatalf("public viewer presence must prefer account public IDs before falling back to ordinal labels")
@@ -35,6 +35,9 @@ func TestStaticClientKeepsArrowPresenceListMountedAcrossIdentifierRefresh(t *tes
 		}
 	}
 	for _, required := range []string{
+		"presenceState.visibleViewerCount = countValue",
+		"<strong>${() => `${presenceState.visibleViewerCount} lapā`}</strong>",
+		"<span>Skatītāji</span>",
 		"const nextViewers = active.map",
 		"if (!nextViewers.length && countValue > 0)",
 		"key: 'viewer-identifiers-pending'",

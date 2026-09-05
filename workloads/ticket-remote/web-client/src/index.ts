@@ -5,6 +5,7 @@ import {
   ownerViviConnectionEventAllowed,
   prepareOwnerViviAccessBeforeSubscribe,
 } from "../owner-vivi-access-core.js";
+import { relayLastFrameAgeMillis } from "./relay-current-report";
 
 installCspSafeSpacetimeCodecs();
 
@@ -117,14 +118,6 @@ function activeViewerFocusRows(rows: any[], ticketId: string, backendId: string)
       if (publicSort) return publicSort;
       return rowId(left).localeCompare(rowId(right));
     });
-}
-
-function ageMillisFromTimestamp(value: any): number {
-  const text = String(value || "").trim();
-  if (!text) return 0;
-  const at = Date.parse(text);
-  if (!Number.isFinite(at)) return 0;
-  return Math.max(0, Date.now() - at);
 }
 
 class TicketSpacetimeClient {
@@ -292,6 +285,8 @@ class TicketSpacetimeClient {
   }
 
   setStreamFocus(active: boolean, reason: string): Promise<void> {
+    // This heartbeat is advisory presence telemetry. The Ticket relay owns
+    // stream demand from admitted socket sessions and explicit prewarm work.
     const nextActive = Boolean(active);
     if (this.lastStreamFocusActive === nextActive) {
       return Promise.resolve();
@@ -317,14 +312,14 @@ class TicketSpacetimeClient {
     return this.streamAction("memberRecoverStream", reason);
   }
 
-  requestControlCode(digits: string, expectedFastRevision = ""): Promise<void> {
+  requestControlCode(digits: string, expectedFastRevision = "", beforeSubmit?: () => void): Promise<void> {
     return this.callReducer("memberRequestControlCode", {
       ticketId: this.cfg.ticketId,
       backendId: this.backendId(),
       sessionId: this.cfg.sessionId,
       digits,
       expectedFastRevision,
-    });
+    }, beforeSubmit);
   }
 
   recordActivityTick(): Promise<void> {
@@ -447,7 +442,7 @@ class TicketSpacetimeClient {
     attemptId?: string;
     expectedInteractionRevision?: string;
     scheduleId?: string;
-  }): Promise<void> {
+  }, beforeSubmit?: () => void): Promise<void> {
     return this.callReducer("memberRequestTicketActionV3", {
       version: 3,
       ticketId: this.cfg.ticketId,
@@ -459,7 +454,7 @@ class TicketSpacetimeClient {
       attemptId: args.attemptId || "",
       expectedInteractionRevision: args.expectedInteractionRevision || "",
       scheduleId: args.scheduleId || "",
-    });
+    }, beforeSubmit);
   }
 
   scheduleTicketActionV3(args: {
@@ -916,7 +911,9 @@ class TicketSpacetimeClient {
         videoClients: Number(relayReport.videoClients ?? relayReport.video_clients ?? 0),
         streamVerdict: String(relayReport.streamVerdict || relayReport.stream_verdict || ""),
         lastFrameAt: String(relayReport.lastFrameAt || relayReport.last_frame_at || ""),
-        lastFrameAgoMillis: Number(relayReport.lastFrameAgoMillis ?? relayReport.last_frame_ago_millis ?? ageMillisFromTimestamp(relayReport.lastFrameAt || relayReport.last_frame_at)),
+        // Keep the compatibility field in the projection, but derive its value
+        // only from the durable frame timestamp. The stored legacy value is 0.
+        lastFrameAgoMillis: relayLastFrameAgeMillis(relayReport),
         framesForwarded: String(relayReport.framesForwarded || relayReport.frames_forwarded || "0"),
         statusJson: String(relayReport.statusJson || relayReport.status_json || "{}"),
         updatedAt: String(relayReport.updatedAt || relayReport.updated_at || ""),
@@ -976,9 +973,10 @@ class TicketSpacetimeClient {
     await reducer(args);
   }
 
-  private async callReducer(name: string, args: Record<string, unknown>): Promise<void> {
+  private async callReducer(name: string, args: Record<string, unknown>, beforeSubmit?: () => void): Promise<void> {
     await this.whenLive(2000);
     const reducer = this.reducer(name);
+    beforeSubmit?.();
     await reducer(args);
   }
 

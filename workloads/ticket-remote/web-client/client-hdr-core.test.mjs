@@ -299,6 +299,11 @@ test('freshness requires matching epoch and bounded sequence and age lag', () =>
   assert.equal(clientHDRFreshness({ epoch: 7, sequence: 9, visualAgeMillis: 80, offeredAt: 100 }, current, 110).fresh, true);
   assert.equal(clientHDRFreshness({ epoch: 7, sequence: 8, visualAgeMillis: 80, offeredAt: 100 }, current, 110).reason, 'sequence_lag');
   assert.equal(clientHDRFreshness({ epoch: 6, sequence: 10, visualAgeMillis: 80, offeredAt: 100 }, current, 110).reason, 'epoch_mismatch');
+  assert.equal(clientHDRFreshness(
+    { epoch: 7, sequence: 10, configGeneration: 12, visualAgeMillis: 40, offeredAt: 100 },
+    { epoch: 7, sequence: 10, configGeneration: 13, visualAgeMillis: 40, renderedAt: 100 },
+    110
+  ).reason, 'config_generation_mismatch');
   assert.equal(clientHDRFreshness({ epoch: 7, sequence: 10, visualAgeMillis: 400, offeredAt: 100 }, current, 110).reason, 'visual_age');
   const boundaryCurrent = { epoch: 7, sequence: 10, visualAgeMillis: 0, renderedAt: 100 };
   assert.equal(clientHDRFreshness({ epoch: 7, sequence: 10, visualAgeMillis: 250, offeredAt: 100 }, boundaryCurrent, 100).fresh, true);
@@ -2131,30 +2136,36 @@ test('a missing pre-copy paint callback preserves an established keyframe-wait h
 
 test('coordinated commit paints matching SDR before atomically presenting prepared HDR', async () => {
   const order = [];
+  const activeConfigGeneration = 12;
   const coordinatedPaint = deferred();
   const state = harness({ autoRender: true, onPresent: () => order.push('hdr') });
   const closed = [];
   state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
   await tick();
   state.controller.noteSDRFrame({
-    epoch: 5, sequence: 40, presentationOrdinal: 40, visualAgeMillis: 940, renderedAt: 100
+    epoch: 5, sequence: 40, configGeneration: 11, presentationOrdinal: 40,
+    visualAgeMillis: 940, renderedAt: 100
   });
   state.controller.offerFrame(fakeFrame('initial', closed), {
-    epoch: 5, sequence: 40, presentationOrdinal: 40, visualAgeMillis: 940, offeredAt: 100
+    epoch: 5, sequence: 40, configGeneration: 11, presentationOrdinal: 40,
+    visualAgeMillis: 940, offeredAt: 100
   });
   await tick();
   assert.equal(state.controller.canCoordinateSDRFrame(), true);
   const transitionsBefore = state.controller.snapshot().surfaceTransitions;
   state.controller.waitForPaint = () => coordinatedPaint.promise;
   state.controller.offerFrame(fakeFrame('coordinated', closed), {
-    epoch: 5, sequence: 41, presentationOrdinal: 41, timestamp: 410,
+    epoch: 5, sequence: 41, configGeneration: activeConfigGeneration,
+    presentationOrdinal: 41, timestamp: 410,
     visualAgeMillis: 20, offeredAt: 100
   }, {
-    commitSDR: () => {
+    commitSDR: (_frame, candidate) => {
+      if (candidate.configGeneration !== activeConfigGeneration) return false;
       order.push('sdr');
       return {
         epoch: 5,
         sequence: 41,
+        configGeneration: activeConfigGeneration,
         presentationOrdinal: 314,
         timestamp: 411,
         visualAgeMillis: 12,
@@ -2174,6 +2185,7 @@ test('coordinated commit paints matching SDR before atomically presenting prepar
   await tick();
   assert.deepEqual(order.slice(-2), ['sdr', 'hdr']);
   assert.equal(state.controller.presented.sequence, 41);
+  assert.equal(state.controller.presented.configGeneration, activeConfigGeneration);
   assert.equal(state.controller.presented.presentationOrdinal, 314);
   assert.equal(state.controller.presented.timestamp, 411);
   assert.equal(state.controller.presented.visualAgeMillis, 12);
@@ -2186,6 +2198,7 @@ test('coordinated commit paints matching SDR before atomically presenting prepar
   assert.equal(state.controller.presented.displayReadyMillis, 16,
     'commit metadata cannot overwrite renderer display timing');
   assert.equal(state.controller.currentSDR.sequence, 41);
+  assert.equal(state.controller.currentSDR.configGeneration, activeConfigGeneration);
   assert.equal(state.controller.currentSDR.presentationOrdinal, 314);
   assert.equal(state.controller.currentSDR.renderedAt, 150);
   assert.equal(state.controller.snapshot().surfaceVisible, true);
@@ -2194,30 +2207,45 @@ test('coordinated commit paints matching SDR before atomically presenting prepar
   assert.deepEqual(closed, ['initial-clone', 'coordinated-clone']);
 });
 
-test('a superseded coordinated commit discards staging without touching either visible surface', async () => {
+test('a stale config generation rejects coordinated commit without touching either visible surface', async () => {
   const coordinatedPaint = deferred();
   const state = harness({ autoRender: true });
   const closed = [];
+  const activeConfigGeneration = 15;
+  let rejectedConfigGeneration = 0;
   state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
   await tick();
-  state.controller.noteSDRFrame({ epoch: 5, sequence: 50, presentationOrdinal: 50, visualAgeMillis: 20, renderedAt: 100 });
+  state.controller.noteSDRFrame({
+    epoch: 5, sequence: 50, configGeneration: activeConfigGeneration,
+    presentationOrdinal: 50, visualAgeMillis: 20, renderedAt: 100
+  });
   state.controller.offerFrame(fakeFrame('initial', closed), {
-    epoch: 5, sequence: 50, presentationOrdinal: 50, visualAgeMillis: 20, offeredAt: 100
+    epoch: 5, sequence: 50, configGeneration: activeConfigGeneration,
+    presentationOrdinal: 50, visualAgeMillis: 20, offeredAt: 100
   });
   await tick();
   const presentsBefore = state.renderers[0].presents;
   const transitionsBefore = state.controller.snapshot().surfaceTransitions;
   state.controller.waitForPaint = () => coordinatedPaint.promise;
   state.controller.offerFrame(fakeFrame('superseded', closed), {
-    epoch: 5, sequence: 51, presentationOrdinal: 51, visualAgeMillis: 20, offeredAt: 100
-  }, { commitSDR: () => false });
+    epoch: 5, sequence: 51, configGeneration: activeConfigGeneration - 1,
+    presentationOrdinal: 51, visualAgeMillis: 20, offeredAt: 100
+  }, {
+    commitSDR: (_frame, candidate) => {
+      rejectedConfigGeneration = candidate.configGeneration;
+      return candidate.configGeneration === activeConfigGeneration ? candidate : false;
+    }
+  });
   await tick();
   coordinatedPaint.resolve();
   await tick();
   assert.equal(state.renderers[0].discardedPreparedFrames, 1);
   assert.equal(state.renderers[0].presents, presentsBefore);
   assert.equal(state.controller.presented.sequence, 50);
+  assert.equal(state.controller.presented.configGeneration, activeConfigGeneration);
   assert.equal(state.controller.currentSDR.sequence, 50);
+  assert.equal(state.controller.currentSDR.configGeneration, activeConfigGeneration);
+  assert.equal(rejectedConfigGeneration, activeConfigGeneration - 1);
   assert.equal(state.controller.snapshot().surfaceTransitions, transitionsBefore);
   assert.equal(state.controller.snapshot().ownedFrameCount, 0);
   assert.deepEqual(closed, ['initial-clone', 'superseded-clone']);

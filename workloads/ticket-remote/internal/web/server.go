@@ -81,12 +81,45 @@ type Server struct {
 	lastStreamRecoveryFailure   string
 	lastStreamRecoveryCommandID string
 
-	relayProductMu         sync.Mutex
-	lastRelayStreamVerdict string
-	lastRelayDropTotal     uint64
-	relayReportWake        chan string
-	relayReportCancel      context.CancelFunc
-	relayReportDone        chan struct{}
+	relayProductMu          sync.Mutex
+	lastRelayStreamVerdict  string
+	lastRelayDropTotal      uint64
+	relayReportWake         chan string
+	relayReportCancel       context.CancelFunc
+	relayReportDone         chan struct{}
+	captureDemandMu         sync.Mutex
+	captureDemandSend       func(context.Context, uint64) (phone.CaptureDemandReceipt, error)
+	captureDemandSending    bool
+	captureDemandCancel     context.CancelFunc
+	captureDemandFence      uint64
+	captureDemandClosed     bool
+	captureDemandEpoch      uint64
+	captureDemandConnection uint64
+	captureDemandReceipt    phone.CaptureDemandReceipt
+	captureDemandExpiry     *time.Timer
+
+	phoneStateMu                sync.Mutex
+	phoneStatePending           *phoneStateUpdate
+	phoneStateEvents            []phoneStateUpdate
+	phoneStateEventReservations int
+	phoneStateEventInFlight     int
+	phoneStateLatest            state.PhoneInput
+	phoneStateSequence          uint64
+	phoneStateClosed            bool
+	phoneStateWake              chan struct{}
+	phoneStateCancel            context.CancelFunc
+	phoneStateDone              chan struct{}
+
+	phoneStateOverflowIncidentLatched   bool
+	phoneStateOverflowReconnectInFlight bool
+	phoneStateOverflowReconnectPending  bool
+
+	streamDesiredMu      sync.Mutex
+	streamDesiredPending *streamDesiredStateUpdate
+	streamDesiredClosed  bool
+	streamDesiredWake    chan struct{}
+	streamDesiredCancel  context.CancelFunc
+	streamDesiredDone    chan struct{}
 
 	streamDesiredReleaseMu    sync.Mutex
 	streamDesiredReleaseTimer *time.Timer
@@ -112,11 +145,6 @@ type client struct {
 	email          string
 	startupTraceID string
 
-	// All browser-bound writes are serialized by the per-client writer pump.
-	// sendMu is retained for source compatibility with older test fixtures; new
-	// code must enqueue through the pump instead of writing to conn directly.
-	sendMu sync.Mutex
-
 	clientLogMu          sync.Mutex
 	clientLogWindowStart time.Time
 	clientLogCount       int
@@ -124,42 +152,67 @@ type client struct {
 	videoMu             sync.Mutex
 	videoBroadcastReady bool
 
-	videoEpoch             uint64
-	videoLastWrittenSeq    uint64
-	videoInFlight          bool
-	videoInFlightEpoch     uint64
-	videoInFlightSeq       uint64
-	videoInFlightConfigGen uint64
-	videoConfigGeneration  uint64
-	videoWrittenEpoch      uint64
-	videoWrittenSequence   uint64
-	videoWrittenEvidence   []videoWrittenFrameEvidence
-	videoQueueBytes        int
-	videoQueue             []queuedVideoFrame
-	controlQueue           []queuedControlMessage
-	controlQueueBytes      int
-	writerWake             chan struct{}
-	writerDone             chan struct{}
-	writerCancel           context.CancelFunc
-	writerStartOnce        sync.Once
-	writerStopOnce         sync.Once
-	writerClosed           bool
-	writerCloseReason      string
-	onVideoFrameWritten    func(tsf2Metadata)
-	startupTraceOrderMu    sync.Mutex
-	feedbackMu             sync.Mutex
-	lastFeedbackAt         time.Time
-	lastFeedbackEpoch      uint64
-	lastFeedbackReceived   uint64
-	lastFeedbackDecoded    uint64
-	lastFeedbackRendered   uint64
-	lastFeedbackQueue      uint64
-	lastFeedbackAge        uint64
-	feedbackCount          uint64
-	feedbackDropped        uint64
-	feedbackState          string
-	feedbackCause          string
-	feedbackVisibility     string
+	videoEpoch               uint64
+	videoLastWrittenSeq      uint64
+	videoInFlight            bool
+	videoInFlightEpoch       uint64
+	videoInFlightSeq         uint64
+	videoInFlightConfigGen   uint64
+	videoConfigGeneration    uint64
+	videoConfigWrittenEpoch  uint64
+	videoConfigWrittenGen    uint64
+	videoWrittenEpoch        uint64
+	videoWrittenSequence     uint64
+	videoWrittenEvidence     []videoWrittenFrameEvidence
+	videoFeedbackVersion     int
+	videoV2FeedbackReceived  uint64
+	videoV2FeedbackDecoded   uint64
+	videoV2FeedbackRendered  uint64
+	videoV2FeedbackPresented uint64
+	videoV2Visibility        string
+	videoReceiptAwaiting     bool
+	videoReceiptEpoch        uint64
+	videoReceiptSequence     uint64
+	videoReceiptConfigGen    uint64
+	videoReceiptDeadlineAt   time.Time
+	videoResultPriorityPhase string
+	videoResultPriorityEpoch uint64
+	videoResultPrioritySeq   uint64
+	videoResultPriorityGen   uint64
+	videoResultPriorityUntil time.Time
+	videoResultPriorityTimer *time.Timer
+	videoQueueBytes          int
+	videoQueue               []queuedVideoFrame
+	controlQueue             []queuedControlMessage
+	controlQueueBytes        int
+	writerWake               chan struct{}
+	writerDone               chan struct{}
+	writerCancel             context.CancelFunc
+	writerStartOnce          sync.Once
+	writerStopOnce           sync.Once
+	writerClosed             bool
+	writerCloseReason        string
+	onVideoFrameWritten      func(tsf2Metadata)
+	onVideoConfigWritten     func(uint64, uint64)
+	startupTraceOrderMu      sync.Mutex
+	feedbackMu               sync.Mutex
+	lastFeedbackVersion      int
+	lastFeedbackAt           time.Time
+	lastFeedbackEpoch        uint64
+	lastFeedbackReceived     uint64
+	lastFeedbackDecoded      uint64
+	lastFeedbackRendered     uint64
+	lastFeedbackPresented    uint64
+	lastFeedbackQueue        uint64
+	lastFeedbackAge          uint64
+	lastFeedbackAgeKnown     bool
+	feedbackCount            uint64
+	feedbackDropped          uint64
+	feedbackState            string
+	feedbackCause            string
+	feedbackVisibility       string
+	lastBrowserClockProbeAt  time.Time
+	browserClockProbeDropped uint64
 
 	firstVideoFrameRendered bool
 }
@@ -173,7 +226,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-01-browser-captured-control-code-exact-hdr-result-all-intra-1fps-v149"
+	serverVersion                 = "ticket-remote-2026-09-05-browser-captured-control-code-hidden-viewer-anchor-v166"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -204,6 +257,8 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		return nil, err
 	}
 	relayReportCtx, relayReportCancel := context.WithCancel(context.Background())
+	phoneStateCtx, phoneStateCancel := context.WithCancel(context.Background())
+	streamDesiredCtx, streamDesiredCancel := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:                      cfg,
 		store:                    store,
@@ -224,20 +279,48 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		relayReportWake:          make(chan string, 1),
 		relayReportCancel:        relayReportCancel,
 		relayReportDone:          make(chan struct{}),
+		captureDemandSend:        relay.SendCaptureDemand,
+		phoneStateWake:           make(chan struct{}, 1),
+		phoneStateCancel:         phoneStateCancel,
+		phoneStateDone:           make(chan struct{}),
+		streamDesiredWake:        make(chan struct{}, 1),
+		streamDesiredCancel:      streamDesiredCancel,
+		streamDesiredDone:        make(chan struct{}),
 	}
 	relay.SetHandlers(s.handlePhoneMessage, s.handlePhoneDisconnect)
 	// Pixel owns Spacetime command execution. The server writes durable commands
 	// and uses the direct bridge relay only for video transport.
 	go s.relayReportLoop(relayReportCtx)
+	go s.phoneStateLoop(phoneStateCtx)
+	go s.streamDesiredStateLoop(streamDesiredCtx)
 	return s, nil
 }
 
 func (s *Server) Close() {
 	s.cancelIdleStreamDesiredRelease()
+	s.closeOrdinaryCaptureDemand()
+	s.stopStreamDesiredStateWriter()
 	if s.relayReportCancel != nil {
 		s.relayReportCancel()
 		select {
 		case <-s.relayReportDone:
+		case <-time.After(streamControlWriteTimeout + time.Second):
+		}
+	}
+	if s.phoneStateCancel != nil {
+		s.phoneStateMu.Lock()
+		s.phoneStateClosed = true
+		s.phoneStatePending = nil
+		s.phoneStateEvents = nil
+		s.phoneStateEventReservations = 0
+		s.phoneStateEventInFlight = 0
+		s.phoneStateLatest = state.PhoneInput{}
+		s.phoneStateOverflowIncidentLatched = false
+		s.phoneStateOverflowReconnectPending = false
+		s.phoneStateMu.Unlock()
+		s.phoneStateCancel()
+		select {
+		case <-s.phoneStateDone:
 		case <-time.After(streamControlWriteTimeout + time.Second):
 		}
 	}
@@ -1376,6 +1459,10 @@ func (s *Server) handleAdminPhoneBackend(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
+	if !s.browserWebSocketOriginAllowed(r) {
+		writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "bad_origin", Message: "WebSocket origin is not allowed."})
+		return
+	}
 	// A video connection wakes the phone, so it must use a current membership
 	// lookup rather than the short-lived page cache.
 	id, sessionID, _, ok := s.identifyMember(w, r)
@@ -1384,16 +1471,25 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	startupRun := browserStartupRunOrigin(r)
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		CompressionMode: websocket.CompressionDisabled,
-		Subprotocols:    []string{"ticket.video.v1"},
+		// The explicit schemeful PublicBaseURL check above is authoritative.
+		// Avoid a second Host-only check that is incorrect behind a trusted
+		// reverse proxy or Cloudflare Tunnel.
+		InsecureSkipVerify: true,
+		CompressionMode:    websocket.CompressionDisabled,
+		Subprotocols:       []string{"ticket.video.v1"},
 	})
 	if err != nil {
 		return
 	}
 	startupTraceReady := make(chan struct{})
 	startupTraceID := ""
+	videoSocketDetail := browserVideoSocketContext(r)
+	initialVisibility := ""
+	if visibility, _ := videoSocketDetail["visibility"].(string); visibility == "visible" || visibility == "hidden" {
+		initialVisibility = visibility
+	}
 	c := &client{
-		conn: conn, sessionID: sessionID, email: id.Email,
+		conn: conn, sessionID: sessionID, email: id.Email, videoV2Visibility: initialVisibility,
 		onVideoFrameWritten: func(meta tsf2Metadata) {
 			<-startupTraceReady
 			if startupTraceID == "" || !meta.ok {
@@ -1403,6 +1499,9 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 				s.direct.recordStartupPhaseOnceForTrace(startupTraceID, "first_forwarded_keyframe", fmt.Sprintf("epoch=%d sequence=%d", meta.epoch, meta.sequence))
 			}
 			s.direct.recordStartupPhaseOnceForTrace(startupTraceID, "first_forwarded_frame", fmt.Sprintf("epoch=%d sequence=%d keyframe=%t", meta.epoch, meta.sequence, meta.keyFrame))
+		},
+		onVideoConfigWritten: func(uint64, uint64) {
+			s.requestOrdinaryCaptureIfUseful()
 		},
 	}
 	if !s.tryAddClient(c) {
@@ -1421,7 +1520,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 		"video":   true,
 		"version": serverVersion,
 	}
-	for key, value := range browserVideoSocketContext(r) {
+	for key, value := range videoSocketDetail {
 		detail[key] = value
 	}
 	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_open", traceID, detail)
@@ -1439,13 +1538,35 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	c.startVideoWriter()
 	s.startupRunMu.Unlock()
 	s.publishRelayCurrentReportAsync("video_socket_open")
+	socketCtx, cancelSocket := context.WithCancel(r.Context())
+	socketActivity := make(chan struct{}, 1)
+	socketLivenessDone := make(chan struct{})
+	go func() {
+		defer close(socketLivenessDone)
+		if err := browserVideoLivenessLoop(
+			socketCtx,
+			conn,
+			socketActivity,
+			browserVideoLivenessIdle,
+			browserVideoLivenessTimeout,
+		); err != nil {
+			// Liveness belongs to this viewer only. Closing the connection
+			// unblocks its reader and enters the normal per-viewer teardown.
+			_ = conn.CloseNow()
+		}
+	}()
 	defer func() {
 		c.stopVideoWriter()
+		closeReason := c.videoWriterCloseReason()
+		if closeReason == "" {
+			closeReason = "reader_closed"
+		}
 		s.removeClient(c)
 		s.direct.removeVideoClient()
-		s.direct.recordStartupPhaseForTrace(startupTraceID, "video_socket_closed", fmt.Sprintf("active=%d", s.direct.activeVideoClientCount()))
+		s.direct.recordStartupPhaseForTrace(startupTraceID, "video_socket_closed", fmt.Sprintf("active=%d reason=%s", s.direct.activeVideoClientCount(), closeReason))
 		s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_closed", traceID, map[string]any{
 			"activeVideoClients": s.direct.activeVideoClientCount(),
+			"reason":             closeReason,
 		})
 		if !c.firstVideoFrameRendered {
 			s.retainRelayViewerForPublicOpenGrace(sessionID, publicOpenGraceHold, "video_socket_closed_before_first_frame", startupTraceID)
@@ -1455,15 +1576,21 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 		s.removeRelayViewer(sessionID)
 		_ = conn.Close(websocket.StatusNormalClosure, "closed")
 	}()
+	defer func() {
+		cancelSocket()
+		<-socketLivenessDone
+	}()
 	for {
-		typ, data, err := conn.Read(r.Context())
+		typ, data, err := conn.Read(socketCtx)
+		receivedAt := time.Now()
 		if err != nil {
 			return
 		}
+		signalBrowserVideoActivity(socketActivity)
 		if typ != websocket.MessageText {
 			continue
 		}
-		s.handleVideoStreamMessage(r.Context(), c, data)
+		s.handleVideoStreamMessage(r.Context(), c, data, receivedAt)
 	}
 }
 
@@ -1566,7 +1693,11 @@ func (s *Server) sendBrowserVideoWarmStart(c *client) {
 	s.requestPhoneKeyframe("browser_video_config_needed", startupTraceCorrelationID(c.startupTraceID), c.startupTraceID)
 }
 
-func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data []byte) {
+func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data []byte, received ...time.Time) {
+	receivedAt := time.Now()
+	if len(received) > 0 && !received[0].IsZero() {
+		receivedAt = received[0]
+	}
 	var msg map[string]any
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return
@@ -1614,12 +1745,19 @@ func (s *Server) handleVideoStreamMessage(ctx context.Context, c *client, data [
 		if !c.allowClientLog(now) || !s.allowBrowserClientLog(now) {
 			return
 		}
-		s.direct.recordClientTelemetry(event, detailText)
 		detail["video"] = true
 		s.recordRuntimeEventForSourceAsync("ticket_remote_browser", "info", event, safeRuntimeTraceID("browser", c.sessionID), detail)
 		return
 	case "stream_feedback":
-		s.handleStreamFeedback(c, data, time.Now())
+		s.handleStreamFeedback(c, data, receivedAt)
+		return
+	case "result_priority":
+		c.acceptResultPriority(data, receivedAt)
+		return
+	case "clock_probe":
+		if response, ok := c.browserClockProbeResponse(data, receivedAt); ok {
+			c.enqueueControl(response)
+		}
 		return
 	case "keyframe", "recover_stream":
 		return
@@ -1633,23 +1771,25 @@ func (s *Server) handleStreamFeedback(c *client, data []byte, now time.Time) {
 		return
 	}
 	outcome := c.acceptStreamFeedbackOutcome(data, now)
+	if outcome.receiptReleased || outcome.becameVisible {
+		s.requestOrdinaryCaptureIfUseful()
+	}
 	if !outcome.accepted {
 		return
 	}
 	if !outcome.transition {
 		return
 	}
-	s.direct.recordClientTelemetry("stream_feedback_transition", fmt.Sprintf(
-		"cause=%s state=%s received_delta=%d decoded_delta=%d rendered_delta=%d lag=%d queue=%d visual_age_ms=%d",
-		outcome.cause,
-		outcome.state,
-		outcome.receivedDelta,
-		outcome.decodedDelta,
-		outcome.renderedDelta,
-		outcome.lag,
-		outcome.queue,
-		outcome.visualAgeMillis,
-	))
+	s.recordRuntimeEventForSourceAsync("ticket_remote_browser", "info", "stream_feedback_transition", safeRuntimeTraceID("browser", c.sessionID), map[string]any{
+		"cause":           outcome.cause,
+		"state":           outcome.state,
+		"receivedDelta":   outcome.receivedDelta,
+		"decodedDelta":    outcome.decodedDelta,
+		"renderedDelta":   outcome.renderedDelta,
+		"lag":             outcome.lag,
+		"queue":           outcome.queue,
+		"visualAgeMillis": outcome.visualAgeMillis,
+	})
 }
 
 func (c *client) browserFrameMarkerMatchesSuccessfulWrite(detail map[string]any) bool {
@@ -1722,6 +1862,11 @@ func (s *Server) allowBrowserClientLog(now time.Time) bool {
 }
 
 func (s *Server) handlePhoneMessage(msg phone.Message) {
+	s.observeOrdinaryCaptureConnection(msg.ConnectionGeneration)
+	if msg.ClockProbe != nil {
+		s.direct.recordBoundedPhoneClock(*msg.ClockProbe)
+		return
+	}
 	if len(msg.Text) > 0 {
 		if s.handlePhoneText(msg.Text) {
 			return
@@ -1730,6 +1875,7 @@ func (s *Server) handlePhoneMessage(msg phone.Message) {
 		return
 	}
 	if len(msg.Binary) > 0 {
+		s.completeOrdinaryCaptureOpportunity()
 		if frame, ok := s.direct.recordFrameForBroadcast(msg.Binary); ok {
 			meta := parseTSF2(frame)
 			if meta.ok {
@@ -1743,10 +1889,12 @@ func (s *Server) handlePhoneMessage(msg phone.Message) {
 			}
 			s.broadcastFrame(frame)
 		}
+		s.requestOrdinaryCaptureIfUseful()
 	}
 }
 
 func (s *Server) handlePhoneDisconnect(err error) {
+	s.fenceOrdinaryCaptureDemand(0)
 	if err != nil && !expectedPhoneDisconnect(err) {
 		s.recordRuntimeErrorAsync("phone_stream_disconnected", "", err, nil)
 	}
@@ -1797,10 +1945,14 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 		return true
 	}
 	if msgType == "config" {
+		previousEpoch := s.direct.currentStreamEpoch()
 		raw = browserVideoConfigMessage(raw)
 		if !s.direct.setConfig(raw) {
 			s.direct.recordStartupPhase("phone_config_rejected", "reason=all_intra_contract_mismatch")
 			return true
+		}
+		if currentEpoch := s.direct.currentStreamEpoch(); currentEpoch != previousEpoch {
+			s.fenceOrdinaryCaptureDemand(currentEpoch)
 		}
 		s.direct.recordStartupPhaseOnce("phone_config_received", "config=true")
 		_, cachedKeyFrame := s.direct.warmStart()
@@ -1840,11 +1992,13 @@ func (s *Server) handlePhoneText(raw []byte) bool {
 			HealthJSON:   healthJSON,
 			Now:          now,
 		}
-		if err := s.store.UpdatePhoneStatus(context.Background(), phoneInput); err == nil {
-			s.cachePhoneStatusUpdate(phoneInput, s.relay.Snapshot())
-		} else {
-			s.recordRuntimeErrorAsync("phone_state_update_failed", backend.ID, err, map[string]any{"backendId": backend.ID})
-		}
+		s.enqueuePhoneStateUpdate(phoneStateUpdate{
+			replaceable:   true,
+			input:         phoneInput,
+			errorEvent:    "phone_state_update_failed",
+			correlationID: backend.ID,
+			errorDetail:   map[string]any{"backendId": backend.ID},
+		})
 		s.maybeRequestPhoneStart(data, "phone_health")
 	}
 	return false
@@ -1860,9 +2014,7 @@ func browserVideoConfigMessage(raw []byte) []byte {
 	}
 	payload["serverVersion"] = serverVersion
 	payload["assetVersion"] = assetVersion()
-	if _, ok := payload["feedbackVersion"]; !ok {
-		payload["feedbackVersion"] = 1
-	}
+	payload["feedbackVersion"] = 2
 	frameDependencyMode, _ := payload["frameDependencyMode"].(string)
 	if strings.EqualFold(strings.TrimSpace(frameDependencyMode), frameDependencyModeAllIntra) {
 		payload["frameDependencyMode"] = frameDependencyModeAllIntra
@@ -1917,11 +2069,19 @@ func (s *Server) handlePixelTicketStateEvent(msg map[string]any) {
 	if !ok {
 		return
 	}
+	eventDetail := map[string]any{
+		"requestId":   event.RequestID,
+		"ticketState": event.TicketState,
+	}
+	if !s.reservePhoneStateEvent(event.RequestID, eventDetail) {
+		return
+	}
 	if !s.direct.recordPixelTicketEvent(event) {
+		s.releasePhoneStateEventReservation()
 		return
 	}
 	s.rememberPixelTicketEvent(event)
-	s.updateStoredPhoneTicketEvent(event)
+	s.updateStoredPhoneTicketEvent(event, eventDetail)
 }
 
 func (s *Server) rememberPixelTicketEvent(event pixelTicketEvent) {
@@ -1980,14 +2140,16 @@ func (s *Server) mergePixelTicketEventIntoHealth(raw string, event pixelTicketEv
 	return string(body)
 }
 
-func (s *Server) updateStoredPhoneTicketEvent(event pixelTicketEvent) {
+func (s *Server) updateStoredPhoneTicketEvent(event pixelTicketEvent, eventDetail map[string]any) {
 	now := time.Now()
-	raw := ""
-	if cached, ok := s.cachedSnapshot(now); ok && cached.Phone != nil {
-		raw = cached.Phone.HealthJSON
+	backend := s.activePhoneBackend()
+	raw := s.pendingPhoneHealthJSON(backend.ID)
+	if raw == "" {
+		if cached, ok := s.cachedSnapshot(now); ok && cached.Phone != nil && cached.Phone.ID == backend.ID {
+			raw = cached.Phone.HealthJSON
+		}
 	}
 	healthJSON := s.mergePixelTicketEventIntoHealth(raw, event)
-	backend := s.activePhoneBackend()
 	phoneInput := state.PhoneInput{
 		TicketID:     s.cfg.TicketID,
 		BackendID:    backend.ID,
@@ -1997,14 +2159,13 @@ func (s *Server) updateStoredPhoneTicketEvent(event pixelTicketEvent) {
 		HealthJSON:   healthJSON,
 		Now:          now,
 	}
-	if err := s.store.UpdatePhoneStatus(context.Background(), phoneInput); err == nil {
-		s.cachePhoneStatusUpdate(phoneInput, s.relay.Snapshot())
-	} else {
-		s.recordRuntimeErrorAsync("phone_ticket_state_update_failed", event.RequestID, err, map[string]any{
-			"requestId":   event.RequestID,
-			"ticketState": event.TicketState,
-		})
-	}
+	s.enqueuePhoneStateUpdate(phoneStateUpdate{
+		reservedEvent: true,
+		input:         phoneInput,
+		errorEvent:    "phone_ticket_state_update_failed",
+		correlationID: event.RequestID,
+		errorDetail:   eventDetail,
+	})
 }
 
 func (s *Server) writeStateMutation(w http.ResponseWriter, r *http.Request, actor string, event string, snapshot state.Snapshot, err error, publicState bool) {
@@ -2319,6 +2480,17 @@ func (s *Server) requestOriginAllowed(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
+	return s.configuredOriginAllowed(origin)
+}
+
+// A browser media socket changes durable stream demand and wakes the phone.
+// Require its schemeful Origin even though ordinary GET navigation may omit it.
+func (s *Server) browserWebSocketOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	return origin != "" && s.configuredOriginAllowed(origin)
+}
+
+func (s *Server) configuredOriginAllowed(origin string) bool {
 	originURL, err := url.Parse(origin)
 	if err != nil || originURL.Scheme == "" || originURL.Host == "" || originURL.User != nil || originURL.Path != "" || originURL.RawQuery != "" || originURL.Fragment != "" {
 		return false

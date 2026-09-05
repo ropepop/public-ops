@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -16,9 +17,41 @@ import (
 	"ticketremote/internal/state"
 )
 
-func testAllIntraConfig(raw []byte) []byte {
+func testCanonicalSourceConfig(raw []byte) []byte {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	payload["codec"] = canonicalStreamCodec
+	payload["transport"] = canonicalStreamTransport
+	payload["captureMode"] = canonicalStreamCaptureMode
+	payload["captureSource"] = canonicalStreamCaptureSource
+	payload["captureMethod"] = canonicalStreamCaptureMethod
+	payload["rootCapture"] = true
+	payload["width"] = canonicalStreamWidth
+	payload["height"] = canonicalStreamHeight
+	payload["sourceWidth"] = canonicalStreamSourceWidth
+	payload["sourceHeight"] = canonicalStreamSourceHeight
+	payload["sourceLeftCrop"] = canonicalStreamLeftCrop
+	payload["sourceTopCrop"] = canonicalStreamTopCrop
+	payload["sourceRightCrop"] = canonicalStreamRightCrop
+	payload["sourceBottomCrop"] = canonicalStreamBottomCrop
+	payload["sourceVisibleWidth"] = canonicalStreamVisibleWidth
+	payload["sourceVisibleHeight"] = canonicalStreamVisibleHeight
+	payload["bitrate"] = canonicalStreamBitrate
+	payload["qualityProfile"] = canonicalStreamQualityProfile
+	payload["colorCorrection"] = canonicalStreamColorCorrection
+	payload["colorStandard"] = canonicalStreamColorStandard
+	strict, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return strict
+}
+
+func testAllIntraConfig(raw []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(testCanonicalSourceConfig(raw), &payload); err != nil {
 		return nil
 	}
 	payload["frameDependencyMode"] = frameDependencyModeAllIntra
@@ -48,14 +81,14 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 	if !hub.recordFrame(second) {
 		t.Fatal("second independent frame should be accepted for live latest-frame broadcast")
 	}
-	hub.recordClientTelemetry("h264_decoder_error", "bad keyframe")
-
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
 
 	if snapshot["path"] != "https_websocket_h264" {
 		t.Fatalf("unexpected path %v", snapshot["path"])
 	}
-	if snapshot["codec"] != "avc1.42E01E" || snapshot["transport"] != "h264-annexb" {
+	if snapshot["codec"] != canonicalStreamCodec || snapshot["transport"] != canonicalStreamTransport ||
+		snapshot["captureMode"] != canonicalStreamCaptureMode || snapshot["rootCapture"] != true ||
+		snapshot["width"] != canonicalStreamWidth || snapshot["height"] != canonicalStreamHeight {
 		t.Fatalf("unexpected stream config %#v", snapshot)
 	}
 	if snapshot["activeVideoClients"] != 1 ||
@@ -66,17 +99,18 @@ func TestDirectStreamTracksConfigFramesAndTelemetry(t *testing.T) {
 		snapshot["droppedStaleFrames"] != uint64(0) {
 		t.Fatalf("unexpected counters %#v", snapshot)
 	}
-	if snapshot["browserMediaError"] != "bad keyframe" {
-		t.Fatalf("media error = %q", snapshot["browserMediaError"])
+	if _, exists := snapshot["browserMediaError"]; exists {
+		t.Fatal("viewer-local error leaked into shared source health")
 	}
-	if snapshot["streamVerdict"] != "browser_decode_recovering" {
-		t.Fatalf("stream verdict = %q", snapshot["streamVerdict"])
+	if snapshot["streamVerdict"] == "live" || snapshot["live"] != false || snapshot["continuity"] != true {
+		t.Fatalf("legacy TSF2 frame gained public live authority instead of continuity-only status: %#v", snapshot)
 	}
 	if snapshot["phoneConnected"] != true || snapshot["phoneStreamState"] != "streaming" {
 		t.Fatalf("phone state missing %#v", snapshot)
 	}
 	config, keyFrame := hub.warmStart()
-	if !strings.Contains(string(config), `"transport":"h264-annexb"`) {
+	if !strings.Contains(string(config), `"transport":"hardware-h264-annexb"`) ||
+		!strings.Contains(string(config), `"captureMode":"root_hardware_h264"`) {
 		t.Fatalf("warm config missing: %q", string(config))
 	}
 	if meta := parseTSF2(keyFrame); !meta.ok || meta.epoch != 1 || meta.sequence != 2 || !meta.keyFrame {
@@ -617,15 +651,13 @@ func TestDirectStreamNormalDecoderTelemetryDoesNotMarkMediaError(t *testing.T) {
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
 	hub.recordFrame(key)
-	hub.recordClientTelemetry("h264_decoder_mode", "avc_adapter_configured")
-
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
 
-	if snapshot["browserMediaError"] != "" {
-		t.Fatalf("normal decoder telemetry should not become media error: %#v", snapshot)
+	if _, exists := snapshot["browserMediaError"]; exists {
+		t.Fatalf("browser diagnostics should not be in source health: %#v", snapshot)
 	}
-	if snapshot["streamVerdict"] != "live" {
-		t.Fatalf("normal decoder telemetry should keep stream live, got %q", snapshot["streamVerdict"])
+	if snapshot["streamVerdict"] == "live" || snapshot["continuity"] != true {
+		t.Fatalf("normal decoder telemetry should keep TSF2 continuity without live authority: %#v", snapshot)
 	}
 }
 
@@ -660,6 +692,7 @@ func TestDirectStreamWarmEncoderReusableRequiresFreshSameEpochStream(t *testing.
 
 	hub.mu.Lock()
 	hub.lastFrameAt = time.Now().Add(-3100 * time.Millisecond)
+	hub.lastFrameReceivedAt = hub.lastFrameAt
 	hub.mu.Unlock()
 	if hub.warmEncoderReusable(time.Now(), livePhone) {
 		t.Fatal("stale encoder evidence must not skip the ordered cold start")
@@ -694,29 +727,17 @@ func TestDirectStreamRecoveryTelemetryDoesNotMarkMediaError(t *testing.T) {
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
 	hub.recordFrame(key)
-	for _, event := range []string{
-		"decoder_error",
-		"h264_decoder_recovery_reset",
-		"h264_server_recover_requested",
-		"server_stale_frames",
-		"stale_video_frames",
-		"video_stream_restart",
-		"websocket_error",
-	} {
-		hub.recordClientTelemetry(event, "recovery detail")
-	}
-
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
 
-	if snapshot["browserMediaError"] != "" {
-		t.Fatalf("recovery telemetry should not become media error: %#v", snapshot)
+	if _, exists := snapshot["recentBrowserEvents"]; exists {
+		t.Fatalf("viewer-local recovery telemetry leaked into source health: %#v", snapshot)
 	}
-	if snapshot["streamVerdict"] != "live" {
-		t.Fatalf("recovery telemetry should keep stream live, got %q", snapshot["streamVerdict"])
+	if snapshot["streamVerdict"] == "live" || snapshot["continuity"] != true {
+		t.Fatalf("recovery telemetry should keep TSF2 continuity without live authority: %#v", snapshot)
 	}
 }
 
-func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
+func TestDirectStreamFreshTSF2FramesRetainContinuityDuringClientCountRace(t *testing.T) {
 	hub := newDirectStreamHub()
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":1,"phoneUptimeMillis":1000}`))
 	key := testTSF2FrameWithTimestamp(1, 1, true, 1000)
@@ -727,8 +748,8 @@ func TestDirectStreamFreshFramesRemainLiveDuringClientCountRace(t *testing.T) {
 	if snapshot["activeVideoClients"] != 0 {
 		t.Fatalf("test setup expected no active video clients: %#v", snapshot)
 	}
-	if snapshot["streamVerdict"] != "live" {
-		t.Fatalf("fresh streaming frames should stay live during client count race, got %q", snapshot["streamVerdict"])
+	if snapshot["streamVerdict"] == "live" || snapshot["live"] != false || snapshot["continuity"] != true {
+		t.Fatalf("fresh TSF2 frame lost continuity or gained authority during client count race: %#v", snapshot)
 	}
 }
 
@@ -748,6 +769,7 @@ func TestDirectStreamWarmStartKeepsStaleKeyFrameOutButStillPreconfiguresDecoder(
 	hub.recordFrame(testTSF2KeyFrameWithEpoch(7, 1, true))
 	hub.mu.Lock()
 	hub.lastFrameAt = time.Now().Add(-10 * time.Second)
+	hub.lastFrameReceivedAt = hub.lastFrameAt
 	hub.mu.Unlock()
 
 	config, keyFrame := hub.warmStart()
@@ -762,6 +784,7 @@ func TestDirectStreamDoesNotWarmStartKeyFramePastForwardAgeBudget(t *testing.T) 
 	hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000))
 	hub.mu.Lock()
 	hub.lastFrameAt = time.Now().Add(-1300 * time.Millisecond)
+	hub.lastFrameReceivedAt = hub.lastFrameAt
 	hub.mu.Unlock()
 
 	config, keyFrame := hub.warmStart()
@@ -778,6 +801,7 @@ func TestDirectStreamVerdictNeverLabelsOverThreeSecondsAsLive(t *testing.T) {
 	now := time.Now()
 	hub.mu.Lock()
 	hub.lastFrameAt = now.Add(-3100 * time.Millisecond)
+	hub.lastFrameReceivedAt = hub.lastFrameAt
 	hub.lastFrameVisualAgeMillis = int64((3100 * time.Millisecond) / time.Millisecond)
 	hub.lastFrameVisualAgeKnown = true
 	hub.mu.Unlock()
@@ -790,24 +814,27 @@ func TestDirectStreamVerdictNeverLabelsOverThreeSecondsAsLive(t *testing.T) {
 
 func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 	cases := []struct {
-		name          string
-		visualAge     time.Duration
-		wantFreshness string
-		wantLive      bool
+		name           string
+		visualAge      time.Duration
+		wantFreshness  string
+		wantLive       bool
+		wantContinuity bool
+		wantVerdict    string
 	}{
-		{name: "fresh", visualAge: 1250 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true},
-		{name: "fresh_plus_one", visualAge: 1251 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: true},
-		{name: "ok", visualAge: 2000 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: true},
-		{name: "ok_plus_one", visualAge: 2001 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: true},
-		{name: "degraded", visualAge: 3000 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: true},
-		{name: "stale", visualAge: 3001 * time.Millisecond, wantFreshness: "STALE", wantLive: false},
+		{name: "fresh", visualAge: 1250 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true, wantContinuity: true, wantVerdict: "live"},
+		{name: "fresh_plus_one", visualAge: 1251 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
+		{name: "ok", visualAge: 2000 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
+		{name: "ok_plus_one", visualAge: 2001 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
+		{name: "degraded", visualAge: 3000 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
+		{name: "stale", visualAge: 3001 * time.Millisecond, wantFreshness: "STALE", wantLive: false, wantContinuity: false, wantVerdict: "stale_recovering"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hub := newDirectStreamHub()
 			hub.addVideoClient()
-			setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
-			if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
+			setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))
+			recordTestBoundedPhoneClock(t, hub, 10_000_000)
+			if !hub.recordFrame(testTSF3Frame(7, 1, true, 10_000_000)) {
 				t.Fatal("fresh calibrated frame should be forwarded")
 			}
 			now := time.Now()
@@ -824,11 +851,11 @@ func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 			if status["live"] != tc.wantLive {
 				t.Fatalf("live = %#v want %v; status=%#v", status["live"], tc.wantLive, status)
 			}
-			if tc.wantLive && status["streamVerdict"] != "live" {
-				t.Fatalf("fresh frame should be live, got %#v", status)
+			if status["continuity"] != tc.wantContinuity {
+				t.Fatalf("continuity = %#v want %v; status=%#v", status["continuity"], tc.wantContinuity, status)
 			}
-			if !tc.wantLive && status["streamVerdict"] == "live" {
-				t.Fatalf("stale frame must not be live, got %#v", status)
+			if status["streamVerdict"] != tc.wantVerdict {
+				t.Fatalf("streamVerdict = %#v want %q; status=%#v", status["streamVerdict"], tc.wantVerdict, status)
 			}
 		})
 	}
@@ -837,7 +864,7 @@ func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 func TestDirectStreamRequiresStrictAllIntraAndRejectsDelta(t *testing.T) {
 	allIntra := newDirectStreamHub()
 	allIntra.addVideoClient()
-	if !allIntra.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+	if !allIntra.setConfig(browserVideoConfigMessage(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000}`)))) {
 		t.Fatal("valid all-intra config was rejected")
 	}
 	if !allIntra.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
@@ -859,7 +886,7 @@ func TestDirectStreamRequiresStrictAllIntraAndRejectsDelta(t *testing.T) {
 	}
 
 	missingMode := newDirectStreamHub()
-	if missingMode.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+	if missingMode.setConfig(browserVideoConfigMessage(testCanonicalSourceConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)))) {
 		t.Fatal("config without the explicit all-intra mode was accepted")
 	}
 	if missingMode.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
@@ -872,7 +899,7 @@ func TestDirectStreamRequiresStrictAllIntraAndRejectsDelta(t *testing.T) {
 
 	unknown := newDirectStreamHub()
 	unknown.addVideoClient()
-	if unknown.setConfig(browserVideoConfigMessage([]byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":720,"height":1482,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000,"frameDependencyMode":"gop","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))) {
+	if unknown.setConfig(browserVideoConfigMessage(testCanonicalSourceConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameDependencyMode":"gop","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)))) {
 		t.Fatal("unknown nonempty dependency mode must be rejected instead of receiving legacy compatibility")
 	}
 	if unknown.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000)) {
@@ -1000,7 +1027,7 @@ func TestDirectStreamRefreshesPhoneClockCalibrationFromAcceptedFrames(t *testing
 	}
 }
 
-func TestDirectStreamRecalibratesFromTimestampedFrameAfterGap(t *testing.T) {
+func TestDirectStreamDoesNotCalibrateDelayedFirstFrameToArrivalTimeAfterGap(t *testing.T) {
 	hub := newDirectStreamHub()
 	hub.addVideoClient()
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
@@ -1010,16 +1037,222 @@ func TestDirectStreamRecalibratesFromTimestampedFrameAfterGap(t *testing.T) {
 	hub.lastFrameVisualAgeKnown = false
 	hub.mu.Unlock()
 
-	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 16500)) {
-		t.Fatal("timestamped frame after a quiet gap should refresh phone clock calibration")
+	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 16500)) {
+		t.Fatal("a frame after a quiet gap must not establish its own arrival-time clock mapping")
 	}
 
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
-	if snapshot["droppedUncalibratedFrames"] != uint64(0) || snapshot["framesForwarded"] != uint64(1) {
-		t.Fatalf("gap recovery frame should be accepted: %#v", snapshot)
+	if snapshot["droppedUncalibratedFrames"] != uint64(1) || snapshot["framesForwarded"] != uint64(0) {
+		t.Fatalf("gap frame must remain uncalibrated until a fresh phone clock sample arrives: %#v", snapshot)
 	}
-	if snapshot["phoneClockCalibrated"] != true || snapshot["streamVerdict"] != "live" {
-		t.Fatalf("gap recovery frame should restore live calibrated status: %#v", snapshot)
+	if snapshot["phoneClockCalibrated"] != false || snapshot["streamVerdict"] == "live" {
+		t.Fatalf("gap frame must not restore live calibrated status by itself: %#v", snapshot)
+	}
+}
+
+func TestDirectStreamTSF3RewritesEveryStageToWallClock(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.addVideoClient()
+	if !hub.setConfig(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))) {
+		t.Fatal("strict TSF3 config should be accepted")
+	}
+	recordTestBoundedPhoneClock(t, hub, 10_000_000)
+	original := testTSF3Frame(7, 1, true, 10_000_000)
+	forwarded, ok := hub.recordFrameForBroadcast(original)
+	if !ok {
+		t.Fatal("fresh calibrated TSF3 frame should be forwarded")
+	}
+	meta := parseTSF2(forwarded)
+	if !meta.ok || meta.version != 3 || meta.headerBytes != tsf3HeaderBytes {
+		t.Fatalf("forwarded TSF3 metadata invalid: %#v", meta)
+	}
+	if meta.captureAttemptID != 101 || meta.codecGeneration != 5 {
+		t.Fatalf("TSF3 identity fields changed: %#v", meta)
+	}
+	stages := []uint64{meta.captureStartMicros, meta.captureCompleteMicros, meta.codecInputMicros, meta.codecOutputMicros, meta.recordEmissionMicros}
+	if stages[0] < wallClockMicrosFloor {
+		t.Fatalf("TSF3 stages were not rewritten to UTC wall time: %#v", stages)
+	}
+	for index := 1; index < len(stages); index++ {
+		if stages[index]-stages[index-1] != 1_000 {
+			t.Fatalf("TSF3 stage spacing changed: %#v", stages)
+		}
+	}
+	if meta.calibrationGeneration == 0 || meta.uncertaintyMicros > uint64(phoneClockUncertaintyMax/time.Microsecond) {
+		t.Fatalf("TSF3 calibration evidence invalid: generation=%d uncertainty=%d", meta.calibrationGeneration, meta.uncertaintyMicros)
+	}
+	if got := forwarded[tsf3HeaderBytes:]; string(got) != string(original[tsf3HeaderBytes:]) {
+		t.Fatalf("TSF3 payload changed: got=%x want=%x", got, original[tsf3HeaderBytes:])
+	}
+}
+
+func TestBoundedPhoneClockMappingUsesNTPInterval(t *testing.T) {
+	offset, uncertainty, ok := boundedPhoneClockMapping(phone.ClockProbeResult{
+		ServerSendUnixMicros:     1_000_000,
+		PhoneReceiveUptimeMicros: 100_000,
+		PhoneSendUptimeMicros:    102_000,
+		ServerReceiveUnixMicros:  1_010_000,
+	})
+	if !ok || offset != 904_000 || uncertainty != 4_000 {
+		t.Fatalf("bounded mapping = offset %d uncertainty %d ok=%t", offset, uncertainty, ok)
+	}
+}
+
+func TestDirectStreamTSF3RequiresFreshBoundedClockProbe(t *testing.T) {
+	hub := newDirectStreamHub()
+	if !hub.setConfig(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))) {
+		t.Fatal("strict TSF3 config should be accepted")
+	}
+	frame := testTSF3Frame(7, 1, true, 10_000_000)
+	if hub.recordFrame(frame) {
+		t.Fatal("one-way config clock sample granted TSF3 freshness authority")
+	}
+	recordTestBoundedPhoneClock(t, hub, 10_000_000)
+	if !hub.recordFrame(frame) {
+		t.Fatal("fresh bounded four-timestamp probe did not grant TSF3 authority")
+	}
+	hub.mu.Lock()
+	hub.lastBoundedPhoneClockAt = time.Now().Add(-(phoneClockCalibrationMaxAge + time.Millisecond))
+	hub.mu.Unlock()
+	if hub.recordFrame(testTSF3Frame(7, 2, true, 10_001_000)) {
+		t.Fatal("accepted frames prolonged expired bounded TSF3 clock authority")
+	}
+}
+
+func TestServerAppliesInitialPhoneClockProbeBeforeFirstTSF3Frame(t *testing.T) {
+	hub := newDirectStreamHub()
+	if !hub.setConfig(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))) {
+		t.Fatal("strict TSF3 config should be accepted")
+	}
+	server := &Server{direct: hub, clients: map[*client]struct{}{}}
+	captureUptimeMicros := int64(10_000_000)
+	nowMicros := time.Now().UnixMicro()
+	server.handlePhoneMessage(phone.Message{ClockProbe: &phone.ClockProbeResult{
+		ProbeID:                  "initial-probe",
+		ServerSendUnixMicros:     nowMicros - 2_000,
+		PhoneReceiveUptimeMicros: captureUptimeMicros + 5_000,
+		PhoneSendUptimeMicros:    captureUptimeMicros + 6_000,
+		ServerReceiveUnixMicros:  nowMicros,
+	}})
+	server.handlePhoneMessage(phone.Message{Binary: testTSF3Frame(7, 1, true, uint64(captureUptimeMicros))})
+
+	status := hub.snapshot(time.Now(), phone.Health{})
+	if status["framesForwarded"] != uint64(1) || status["lastFrameSequence"] != uint64(1) {
+		t.Fatalf("initial bounded probe did not authorize the first TSF3 frame: %#v", status)
+	}
+}
+
+func TestDirectStreamRejectsUnboundedClockProbeUncertainty(t *testing.T) {
+	hub := newDirectStreamHub()
+	now := time.Now().UnixMicro()
+	if hub.recordBoundedPhoneClock(phone.ClockProbeResult{
+		ServerSendUnixMicros:     now - int64(5*time.Second/time.Microsecond),
+		PhoneReceiveUptimeMicros: 10_000_000,
+		PhoneSendUptimeMicros:    10_001_000,
+		ServerReceiveUnixMicros:  now,
+	}) {
+		t.Fatal("clock probe wider than the uncertainty budget was accepted")
+	}
+	snapshot := hub.snapshot(time.Now(), phone.Health{})
+	if snapshot["phoneClockBoundedCalibrated"] != false || snapshot["phoneClockProbeRejections"] != uint64(1) {
+		t.Fatalf("rejected bounded probe diagnostics missing: %#v", snapshot)
+	}
+}
+
+func TestDirectStreamTSF3RejectsMalformedStagesAndTSF2StillWorks(t *testing.T) {
+	tsf3 := newDirectStreamHub()
+	if !tsf3.setConfig(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))) {
+		t.Fatal("strict TSF3 config should be accepted")
+	}
+	malformed := testTSF3Frame(7, 1, true, 10_000_000)
+	putUint64(malformed[53:61], 10_010_000)
+	putUint64(malformed[61:69], 10_003_000)
+	if tsf3.recordFrame(malformed) {
+		t.Fatal("out-of-order TSF3 stage timestamps must be rejected")
+	}
+
+	tsf2 := newDirectStreamHub()
+	if !setTestAllIntraConfig(tsf2, []byte(`{"type":"config","streamEpoch":8,"phoneUptimeMillis":20000}`)) {
+		t.Fatal("TSF2 config without an explicit envelope must remain compatible")
+	}
+	if !tsf2.recordFrame(testTSF2FrameWithTimestamp(8, 1, true, 20000)) {
+		t.Fatal("TSF2 frame must remain compatible")
+	}
+}
+
+func TestDirectStreamAdmissionIsStrictAndEpochFencesTheCache(t *testing.T) {
+	hub := newDirectStreamHub()
+	config := func(epoch, uptime uint64) bool {
+		raw := fmt.Sprintf(`{"type":"config","streamEpoch":%d,"phoneUptimeMillis":%d,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`, epoch, uptime)
+		return hub.setConfig(testAllIntraConfig([]byte(raw)))
+	}
+	if !config(7, 10_000) || !hub.recordFrame(testTSF2FrameWithTimestamp(7, 5, true, 10_000)) {
+		t.Fatal("initial epoch/frame should be accepted")
+	}
+	for _, sequence := range []uint64{5, 4} {
+		if hub.recordFrame(testTSF2FrameWithTimestamp(7, sequence, true, 10_001)) {
+			t.Fatalf("non-increasing sequence %d was accepted", sequence)
+		}
+	}
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 9, true, 10_002)) {
+		t.Fatal("a sequence gap to a newer independent frame should be accepted")
+	}
+	if !config(8, 10_003) {
+		t.Fatal("newer epoch config should be accepted")
+	}
+	_, warmFrame := hub.warmStart()
+	if len(warmFrame) != 0 {
+		t.Fatal("old epoch frame remained in the warm cache")
+	}
+	status := hub.streamStatus(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
+	if status["lastFrameSequence"] != uint64(0) || status["streamVerdict"] == "live" {
+		t.Fatalf("new epoch status reused old visual evidence: %#v", status)
+	}
+	if config(7, 10_004) {
+		t.Fatal("regressed config epoch was accepted without a phone restart")
+	}
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(8, 1, true, 10_003)) {
+		t.Fatal("first sequence in the new epoch should be accepted")
+	}
+	status = hub.streamStatus(time.Now(), phone.Health{})
+	if status["droppedNonMonotonicFrames"] != uint64(2) || status["regressedConfigDropCount"] != uint64(1) {
+		t.Fatalf("strict admission counters missing: %#v", status)
+	}
+}
+
+func TestDirectStreamCanonicalPayloadCapHasExactTSF2AndTSF3Boundaries(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		envelope string
+		frame    func() []byte
+	}{
+		{name: "tsf2", envelope: "tsf2", frame: func() []byte { return testTSF2FrameWithTimestamp(7, 1, true, 10_000) }},
+		{name: "tsf3", envelope: "tsf3", frame: func() []byte { return testTSF3Frame(7, 1, true, 10_000_000) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := newDirectStreamHub()
+			config := fmt.Sprintf(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":%q,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`, test.envelope)
+			if !hub.setConfig(testAllIntraConfig([]byte(config))) {
+				t.Fatal("config should be accepted")
+			}
+			if test.envelope == "tsf3" {
+				recordTestBoundedPhoneClock(t, hub, 10_000_000)
+			}
+			exact := test.frame()
+			meta := parseTSF2(exact)
+			exact = append(exact, make([]byte, int(phone.MaxVideoPayloadBytes)-(len(exact)-meta.headerBytes))...)
+			if !hub.recordFrame(exact) {
+				t.Fatalf("exact 2 MiB payload was rejected; total=%d", len(exact))
+			}
+			oversize := append(append([]byte(nil), exact...), 0)
+			if hub.recordFrame(oversize) {
+				t.Fatal("payload above the canonical 2 MiB cap was accepted")
+			}
+			status := hub.streamStatus(time.Now(), phone.Health{})
+			if status["droppedOversizeFrames"] != uint64(1) {
+				t.Fatalf("oversize drop was not reported: %#v", status)
+			}
+		})
 	}
 }
 
@@ -1062,7 +1295,7 @@ func TestDirectStreamRewritesFrameTimestampToEstimatedCaptureWallClock(t *testin
 
 func TestDirectStreamTracksLatestIndependentFrameAcrossSequenceGap(t *testing.T) {
 	hub := newDirectStreamHub()
-	hub.setConfig([]byte(`{"type":"config","codec":"avc1.42E01E","transport":"hardware-h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":41000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`))
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":41000}`))
 	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 41, true, 41000)) {
 		t.Fatal("first independent frame should be accepted")
 	}
@@ -1133,6 +1366,46 @@ func testTSF2FrameWithTimestamp(epoch uint64, sequence uint64, keyFrame bool, ti
 	putUint64(frame[13:21], sequence)
 	putUint64(frame[21:29], timestampMillis*1000)
 	return append(frame, 0x65, 0x88)
+}
+
+func testTSF3Frame(epoch uint64, sequence uint64, keyFrame bool, captureStartMicros uint64) []byte {
+	frame := make([]byte, tsf3HeaderBytes)
+	copy(frame[0:4], []byte("TSF3"))
+	if keyFrame {
+		frame[4] = tsf2FlagKeyframe
+	}
+	values := []uint64{
+		epoch,
+		sequence,
+		101,
+		5,
+		captureStartMicros,
+		captureStartMicros + 1_000,
+		captureStartMicros + 2_000,
+		captureStartMicros + 3_000,
+		captureStartMicros + 4_000,
+		77,
+		88,
+	}
+	for index, value := range values {
+		start := 5 + index*8
+		putUint64(frame[start:start+8], value)
+	}
+	return append(frame, 0x65, 0x88)
+}
+
+func recordTestBoundedPhoneClock(t *testing.T, hub *directStreamHub, captureUptimeMicros int64) {
+	t.Helper()
+	nowMicros := time.Now().UnixMicro()
+	if !hub.recordBoundedPhoneClock(phone.ClockProbeResult{
+		ProbeID:                  "test-probe",
+		ServerSendUnixMicros:     nowMicros - 2_000,
+		PhoneReceiveUptimeMicros: captureUptimeMicros + 5_000,
+		PhoneSendUptimeMicros:    captureUptimeMicros + 6_000,
+		ServerReceiveUnixMicros:  nowMicros,
+	}) {
+		t.Fatal("bounded phone clock fixture was rejected")
+	}
 }
 
 func putUint64(dst []byte, value uint64) {

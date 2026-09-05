@@ -24,6 +24,7 @@ import {
   completeTicketLocalRegisterSliderSession,
   handleTicketLocalRegisterSliderChange,
   isTicketActionV3RegistrationProofFresh,
+  isTicketActionV3RegistrationProofPresentable,
   observeTicketActionV3LocalRequest,
   releaseTicketLocalRegisterSliderOnTerminal,
   rebaseTicketCurrentProofDetectorFromAction,
@@ -44,10 +45,12 @@ import {
   ticketMemberLimitClockNow,
   ticketMemberLimitCountdown,
   ticketLocalRegisterSliderProofMatches,
-  ticketLocalRegisterSliderProofSnapshot,
+  ticketLocalRegisterSliderPresentationMatches,
+  ticketLocalRegisterSliderPresentationSnapshot,
   updateTicketLocalRegisterSliderPointerDirection,
   updateTicketMemberLimitClock,
   ticketSliderRegionV3ForAction,
+  ticketSliderRegionV3ForPresentation,
   ticketSliderRegionV3Layout
 } from './ticket-action-v3-core.mjs';
 
@@ -238,7 +241,6 @@ import {
   if (!emptyState || !startStreamButton || !emptyMessage) return;
   const streamResumeSpinner = document.getElementById('streamResumeSpinner');
   let experimentalMediaCanvas = document.getElementById('experimentalMediaCanvas');
-  const hdrHoldoverNotice = document.getElementById('hdrHoldoverNotice');
   const experimentalMediaMount = document.getElementById('experimentalMediaMount');
   const connectionState = requireElement('#connectionState', 'connectionState');
   const statusLine = requireElement('#statusLine', 'statusLine');
@@ -261,8 +263,6 @@ import {
   const ticketRegistrationLimitDetail = requireElement('#ticketRegistrationLimitDetail', 'ticketRegistrationLimitDetail');
   const ticketControlCodeLimitUsage = requireElement('#ticketControlCodeLimitUsage', 'ticketControlCodeLimitUsage');
   const ticketControlCodeLimitDetail = requireElement('#ticketControlCodeLimitDetail', 'ticketControlCodeLimitDetail');
-  const codeRequestState = requireElement('#codeRequestState', 'codeRequestState');
-  const codeRequestDetail = requireElement('#codeRequestDetail', 'codeRequestDetail');
   const codeDialog = requireElement('#controlCodeDialog', 'controlCodeDialog');
   const codeForm = requireElement('#controlCodeForm', 'controlCodeForm');
   const codeDigits = requireElement('#controlCodeDigits', 'controlCodeDigits');
@@ -273,12 +273,9 @@ import {
   const codeResultImage = requireElement('#controlCodeResultImage', 'controlCodeResultImage');
   const codeResultStatus = requireElement('#controlCodeResultStatus', 'controlCodeResultStatus');
   const codeResultValue = requireElement('#controlCodeResultValue', 'controlCodeResultValue');
-  const codeResultTimer = requireElement('#controlCodeResultTimer', 'controlCodeResultTimer');
   const codeResultClose = requireElement('#closeControlCodeResult', 'closeControlCodeResult');
   const controlCodeHotspot = requireElement('#controlCodeHotspot', 'controlCodeHotspot');
-  if (!presence || !requestCodeButton || !requestTicketResetButton || !requestTicketResetAndActivateButton || !activateTicketButton || !ticketRegisterOverlay || !ticketLocalRegisterSlider || !ticketViewSwitchButton || !ticketViewSwitchDetail || !ticketResetDetail || !ticketActivationAt || !ticketActivationTimer || !ticketLimitMode || !ticketRegistrationLimitUsage || !ticketRegistrationLimitDetail || !ticketControlCodeLimitUsage || !ticketControlCodeLimitDetail || !codeRequestState || !codeRequestDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultTimer || !codeResultClose || !controlCodeHotspot) return;
-  const viewerCount = document.getElementById('viewerCount');
-  const viewerCountDetail = document.getElementById('viewerCountDetail');
+  if (!presence || !requestCodeButton || !requestTicketResetButton || !requestTicketResetAndActivateButton || !activateTicketButton || !ticketRegisterOverlay || !ticketLocalRegisterSlider || !ticketViewSwitchButton || !ticketViewSwitchDetail || !ticketResetDetail || !ticketActivationAt || !ticketActivationTimer || !ticketLimitMode || !ticketRegistrationLimitUsage || !ticketRegistrationLimitDetail || !ticketControlCodeLimitUsage || !ticketControlCodeLimitDetail || !codeDialog || !codeForm || !codeDigits || !codeSubmit || !codeDialogClose || !codeError || !codeResultArea || !codeResultImage || !codeResultStatus || !codeResultValue || !codeResultClose || !controlCodeHotspot) return;
   const presenceListAnchorKey = 'viewer-list-anchor';
   const presenceState = reactive({ viewers: [], visibleViewerCount: 0, hasVisibleRows: false });
   let presenceMounted = false;
@@ -286,16 +283,10 @@ import {
   let videoWs = null;
   const experimentalMediaState = reactive({
     enabled: false,
-    status: 'Izslēgts',
-    preferenceStatus: 'Saglabātais HDR iestatījums: izslēgts.',
     label: 'HDR skats',
     engine: CLIENT_HDR_ENGINE,
-    engineStatus: 'HDR apstrāde: šī pārlūkprogramma.',
     boostSelectorAllowed: false,
-    engineSaving: false,
-    displayBoost: CLIENT_HDR_TARGET_DISPLAY_BOOST,
-    boostStatus: `Pārlūka HDR spilgtums: ${CLIENT_HDR_TARGET_DISPLAY_BOOST}×.`,
-    boostSaving: false
+    displayBoost: CLIENT_HDR_TARGET_DISPLAY_BOOST
   });
   let experimentalMediaMounted = false;
   let experimentalMediaCapabilityReady = false;
@@ -362,7 +353,6 @@ import {
       'hdr_preference_write'
     ),
     onStatus: (snapshot) => {
-      experimentalMediaState.preferenceStatus = experimentalHDRPreferenceStatus(snapshot);
       if (document.body) document.body.dataset.hdrPreference = String(snapshot && snapshot.phase || 'default');
     },
     onFailure: (failure) => {
@@ -376,8 +366,6 @@ import {
       'hdr_boost_write'
     ),
     onStatus: (snapshot) => {
-      experimentalMediaState.boostSaving = Boolean(snapshot && snapshot.inFlight);
-      experimentalMediaState.boostStatus = experimentalHDRBoostStatus(snapshot);
       if (document.body) document.body.dataset.hdrBoostPreference = String(snapshot && snapshot.phase || 'default');
     },
     onFailure: (failure) => {
@@ -386,6 +374,8 @@ import {
   });
   const activeVideoSockets = new Set();
   let reconnectTimer = null;
+  let videoReconnectTimer = null;
+  let videoReconnectAttempt = 0;
   let hiddenVideoCloseTimer = null;
   let hiddenStreamFocusTimer = null;
   let configured = false;
@@ -444,23 +434,36 @@ import {
   let lastHiddenAt = 0;
   let lastDecodedFrameAt = 0;
   let lastDecodedFrameSequence = 0;
+  let lastDecodedFrameConfigGeneration = 0;
   let lastPacketAt = 0;
   let lastPacketSequenceAdvancedAt = 0;
   let lastAcceptedFrameReceivedAt = 0;
   let lastAcceptedFrameVisualAgeMillis = 0;
+  let lastAcceptedFrameVisualAgeKnown = false;
+  let lastAcceptedFrameVisualAgeConservative = false;
+  let lastAcceptedFrameEnvelopeVersion = '';
   let lastAcceptedFrameQueuedAt = 0;
+  let lastAcceptedFrameConfigGeneration = 0;
   let lastRenderedFrameReceivedAt = 0;
   let lastRenderedFrameQueuedAt = 0;
   let lastRenderedFrameRenderedAt = 0;
   let lastRenderedFrameVisualAgeMillis = 0;
+  let lastRenderedFrameVisualAgeKnown = false;
+  let lastRenderedFrameVisualAgeConservative = false;
+  let lastRenderedFrameEnvelopeVersion = '';
   let lastRenderedFrameEpoch = 0;
   let lastRenderedFrameSequence = 0;
+  let lastRenderedFrameConfigGeneration = 0;
   let lastRenderedPresentationOrdinal = 0;
   // Unlike the stream-local presentation ordinal, this watermark deliberately
   // survives decoder/socket resets so a foreground admission can prove that
   // the authoritative SDR canvas was painted after the return boundary.
   let authoritativeSDRRenderSerial = 0;
   let lastRenderedFrameTimestamp = 0;
+  let streamActionFreshnessExpiryTimer = null;
+  let pendingBrowserAction = null;
+  let browserActionContextRevision = 0;
+  let codeInputRevision = 0;
   let lastRestartAt = 0;
   let lastRecoveryKeyframeAt = 0;
   let lastKeyframeCommandAt = 0;
@@ -486,6 +489,8 @@ import {
   let lastPacketTimestamp = 0;
   let lastAcceptedFrameSequence = 0;
   let lastAcceptedFrameTimestamp = 0;
+  let lastReceivedFrameSequence = 0;
+  let lastReceivedFrameConfigGeneration = 0;
   let firstFrameReceived = false;
   let firstDecodedTraceSent = false;
   let firstRenderedTraceSent = false;
@@ -506,12 +511,36 @@ import {
   let presentationFrameHandle = null;
   let presentationCoalescedFrames = 0;
   let decoderRejectedFrames = 0;
+  let staleIngressDroppedFrames = 0;
+  let lastStaleIngressDropAt = 0;
   let resyncDroppedFrames = 0;
   let feedbackTimer = null;
   let lastFeedbackSentAt = 0;
   let feedbackSentCount = 0;
   let feedbackSendFailureCount = 0;
   let feedbackImmediateKey = '';
+  let activeFeedbackVersion = 0;
+  let activeFeedbackConfigGeneration = 0;
+  let claimedEarlyFeedbackState = null;
+  let feedbackReceivedSequence = 0;
+  let feedbackDecodedSequence = 0;
+  let feedbackRenderedSequence = 0;
+  let feedbackPresentedSequence = 0;
+  let feedbackRenderedKeyframeSequence = 0;
+  let lastPresentedFrameConfigGeneration = 0;
+  let controlCodeResultPriorityPhase = '';
+  let controlCodeResultPriorityConfigGeneration = 0;
+  let controlCodeResultPriorityEpoch = 0;
+  let controlCodeResultPriorityMinSequence = 0;
+  let controlCodeResultPriorityDeadlineAt = 0;
+  let streamClockProbeCounter = 0;
+  let pendingStreamClockProbe = null;
+  let streamClockProbeTimer = null;
+  let streamClockBoundConfigGeneration = 0;
+  let streamClockBoundAt = 0;
+  let streamClockServerUpperUnixMicros = 0;
+  let streamClockOffsetMidpointMicros = 0;
+  let streamClockOffsetHalfWidthMicros = 0;
   let controlCodeResultCaptureTimer = null;
   let controlCodeResultCaptureRequestID = '';
   let controlCodeResultCapturedRequestID = '';
@@ -544,7 +573,7 @@ import {
   const locallyClosedControlCodeRequestIDs = new Set();
   let codeDialogOpen = false;
   let controlCodeDialogScrollLock = null;
-  let codeResultTickTimer = null;
+  let codeResultExpiryTimer = null;
   let activeResumeFlow = null;
   let hiddenDecoderTransientLogged = false;
   let activationReconnectBurstTimer = null;
@@ -553,13 +582,15 @@ import {
   let stableViewport = null;
   let idleDisconnected = false;
   let idleDisconnectTimer = null;
-  let streamLiveStaleGraceTimer = null;
+  let streamContinuityStaleGraceTimer = null;
   const intentionallyClosedVideoSockets = new WeakSet();
   const streamFirstFrameKeyframeMs = 2000;
   const streamLiveFreshMaxAgeMs = 1250;
   const streamLiveOkMaxAgeMs = 2000;
   const streamDegradedMaxAgeMs = 3000;
-  const streamLiveStaleGraceMs = 500;
+  const streamCurrentReportMaxAgeMs = 3500;
+  const streamCurrentReportMaxSequenceLag = 4;
+  const streamContinuityStaleGraceMs = 500;
   const streamStaleKeyframeMs = 3000;
   const streamStaleDecoderResetMs = 5000;
   const streamStaleVideoReconnectMs = 8000;
@@ -585,6 +616,8 @@ import {
   const recoveryDecoderResetDebounceMs = 5000;
   const recoveryVideoReconnectDebounceMs = 8000;
   const recoveryServerRecoverDebounceMs = 12000;
+  const videoReconnectBaseDelaysMs = Object.freeze([1000, 2000, 4000, 8000, 12000]);
+  const videoReconnectJitterRatio = 0.2;
   const controlCodeFingerprintGridWidth = 12;
   const controlCodeFingerprintGridHeight = 16;
   const controlCodeFingerprintDifferenceThreshold = 14;
@@ -593,6 +626,8 @@ import {
   const controlCodeResultInitialKeyframeDelayMs = 1250;
   const controlCodeCaptureKeyframeRetryMs = 5000;
   const controlCodeCaptureKeyframeRetryLimit = 2;
+  const controlCodeResultPriorityArmWindowMs = 5 * 60 * 1000;
+  const controlCodeResultPriorityMarkWindowMs = 5000;
   const controlCodeLowLatencyVisualAgeMs = 1250;
   const controlCodeLowLatencyDecodeQueueLimit = 1;
   const controlCodeResultImageReadyTimeoutMs = 1200;
@@ -606,9 +641,12 @@ import {
   const controlCodeGeneratedChipScanStepY = 0.005;
   const FRAME_ENVELOPE_MAGIC = 0x54534632;
   const FRAME_ENVELOPE_HEADER_BYTES = 29;
-  const streamFeedbackVersion = 1;
   const streamFeedbackIntervalMs = 500;
   const streamFeedbackHiddenIntervalMs = 2000;
+  const streamClockProbeIntervalMs = 5000;
+  const streamClockProbeRetryMs = 3000;
+  const streamClockBoundMaxAgeMs = 15000;
+  const streamMaxVideoPayloadBytes = 2 * 1024 * 1024;
   const streamDecoderQueueHardLimit = 4;
   const streamIngressFrameMaxAgeMs = 1250;
   const streamIngressMetadataLimit = 32;
@@ -634,7 +672,10 @@ import {
     const receivedAt = Number(independentFrame && independentFrame.receivedAt);
     const maxAgeMillis = Math.max(0, Number(early && early.maxFrameAgeMs || 1250));
     const receivedAgeMillis = Number.isFinite(receivedAt) ? Math.max(0, performance.now() - receivedAt) : Number.POSITIVE_INFINITY;
-    if (!metadata || !metadata.key || !independentFrame.data || independentFrame.data.byteLength > 2 * 1024 * 1024 || receivedAgeMillis > maxAgeMillis) return [];
+    const payloadBytes = Number(metadata && metadata.payloadBytes);
+    if (!metadata || !metadata.key || !independentFrame.data ||
+      !Number.isFinite(payloadBytes) || payloadBytes <= 0 || payloadBytes > streamMaxVideoPayloadBytes ||
+      receivedAgeMillis > maxAgeMillis) return [];
     return [independentFrame];
   }
 
@@ -655,6 +696,12 @@ import {
       }
       return null;
     }
+    claimedEarlyFeedbackState = {
+      version: Number(early.feedbackVersion || 0),
+      configGeneration: Number(early.feedbackConfigGeneration || 0),
+      receivedSequence: Number(early.feedbackReceivedSequence || 0),
+      epoch: Number(early.feedbackEpoch || early.streamEpoch || 0)
+    };
     return { socket, queued, openedAt: Number(early.openedAt || 0) };
   }
 
@@ -681,7 +728,7 @@ import {
     if (document.visibilityState === 'visible') {
       scheduleViewerIdleDisconnect('visible_idle_keepalive');
       clientLog('viewer_idle_visible_keepalive', reason || 'idle_timeout');
-      if (!streamHasFreshRenderedFrame()) {
+      if (!streamHasContinuityFrame()) {
         recoverAfterVisibilityResume('visible_idle_keepalive');
       }
       return;
@@ -920,52 +967,6 @@ import {
     }
   }
 
-  function setExperimentalMediaStatus(status) {
-    experimentalMediaState.status = String(status || 'Izslēgts');
-  }
-
-  function experimentalHDRPreferenceStatus(snapshot) {
-    const enabled = Boolean(snapshot && snapshot.enabled);
-    switch (String(snapshot && snapshot.phase || 'default')) {
-    case 'saving':
-      return 'Saglabā HDR izvēli kontā…';
-    case 'saved':
-      return 'HDR izvēle saglabāta; gaida konta apstiprinājumu.';
-    case 'failed':
-      return 'HDR izvēle darbojas šajā sesijā, bet kontā netika saglabāta.';
-    case 'synced':
-      return `Saglabātais HDR iestatījums: ${enabled ? 'ieslēgts' : 'izslēgts'}.`;
-    default:
-      return 'Saglabātais HDR iestatījums: izslēgts.';
-    }
-  }
-
-  function experimentalHDREngineStatus(engine, options) {
-    options = options || {};
-    if (options.saving) return 'Saglabā HDR apstrādes vietu kontā…';
-    if (engine === CLIENT_HDR_ENGINE) {
-      if (!experimentalClientCapabilityAllowed) return 'Pārlūka HDR šim kontam nav pieejams.';
-      if (!experimentalClientCapability.supported) return 'Pārlūka HDR šajā ierīcē nav pieejams; redzama parastā straume.';
-      return `HDR apstrāde: šī pārlūkprogramma (WebGPU, ${experimentalMediaState.displayBoost}×).`;
-    }
-    return 'HDR apstrāde: šī pārlūkprogramma.';
-  }
-
-  function experimentalHDRBoostStatus(snapshot) {
-    const boost = normalizeClientHDRDisplayBoost(snapshot && snapshot.boost);
-    switch (String(snapshot && snapshot.phase || 'default')) {
-    case 'saving':
-      return `Saglabā pārlūka HDR ${boost}× spilgtumu kontā…`;
-    case 'saved':
-      return `Pārlūka HDR ${boost}× saglabāts; gaida konta apstiprinājumu.`;
-    case 'failed':
-      return `Pārlūka HDR paliek ${boost}× šajā sesijā, bet kontā netika saglabāts.`;
-    case 'synced':
-      return `Saglabātais pārlūka HDR spilgtums: ${boost}×.`;
-    default:
-      return `Pārlūka HDR spilgtums: ${boost}×.`;
-    }
-  }
 
   const clientHDRDiagnosticMetricEvents = new Set([
     'settlement_started',
@@ -1008,7 +1009,6 @@ import {
       event === 'presented' || event === 'first_presented' || event === 'surface_transition') {
       renderTicketActionV3Controls(currentState);
     }
-    syncExperimentalClientHDRHoldoverNotice(event);
     if (event === 'fallback' || event === 'session_summary') {
       observeControlCodeHDRPresentationMetric(event, metric);
     }
@@ -1054,7 +1054,6 @@ import {
     if (event === 'presented') {
       if (metric.surfaceVisible && !metric.visualHoldover) {
         if (document.body) document.body.dataset.experimentalMedia = 'hdr-client-webgpu-preview';
-        setExperimentalMediaStatus(`HDR pārlūkā — ${experimentalMediaState.displayBoost}× WebGPU`);
       }
       observeControlCodeHDRPresentationMetric(event, metric);
       experimentalClientHDRMetricFrames += 1;
@@ -1102,7 +1101,6 @@ import {
 
   function refreshExperimentalClientCapability() {
     experimentalClientCapability = clientHDRCapability(window);
-    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
     return experimentalClientCapability;
   }
 
@@ -1139,35 +1137,11 @@ import {
     return experimentalMediaCanvas;
   }
 
-  function showExperimentalClientHDRHoldoverNotice() {
-    if (!hdrHoldoverNotice) return false;
-    hdrHoldoverNotice.hidden = false;
-    return true;
-  }
-
-  function hideExperimentalClientHDRHoldoverNotice() {
-    if (!hdrHoldoverNotice) return false;
-    hdrHoldoverNotice.hidden = true;
-    return true;
-  }
-
-  function syncExperimentalClientHDRHoldoverNotice(event) {
-    if (event === 'presentation_holdover' || event === 'holdover_release_deferred') {
-      return showExperimentalClientHDRHoldoverNotice();
-    }
-    if (event === 'presented' || event === 'first_presented' ||
-      event === 'fallback' || event === 'session_summary') {
-      return hideExperimentalClientHDRHoldoverNotice();
-    }
-    return false;
-  }
-
   function showExperimentalClientHDRSurface(visible, reason) {
     handleControlCodeHDRSurfaceChange(Boolean(visible), reason);
     if (!experimentalMediaCanvas) return;
     const current = experimentalMediaState.enabled && experimentalMediaState.engine === CLIENT_HDR_ENGINE;
     if (!current) {
-      hideExperimentalClientHDRHoldoverNotice();
       experimentalMediaCanvas.hidden = true;
       delete experimentalMediaCanvas.dataset.clientHdrSurface;
       delete experimentalMediaCanvas.dataset.clientHdrSurfaceReason;
@@ -1178,7 +1152,6 @@ import {
     experimentalMediaCanvas.dataset.clientHdrSurface = visible ? 'visible' : 'standby';
     experimentalMediaCanvas.dataset.clientHdrSurfaceReason = String(reason || (visible ? 'fresh' : 'fallback')).slice(0, 80);
     experimentalMediaCanvas.setAttribute('aria-hidden', visible ? 'false' : 'true');
-    if (!visible) hideExperimentalClientHDRHoldoverNotice();
   }
 
   function controlCodeExactHDRResultVisible() {
@@ -1223,7 +1196,7 @@ import {
       status && status.phoneDesired !== false && status.phoneConnected !== false &&
       String(status.phoneStreamState || '') === 'streaming' &&
       Number(status.activeVideoClients || 0) > 0 && !streamStatusStale(status) &&
-      freshness.liveLabeled && epoch > 0 && sequence > 0 && presentationOrdinal > 0 &&
+      freshness.actionFresh && epoch > 0 && sequence > 0 && presentationOrdinal > 0 &&
       Number(lastRenderedFrameEpoch || 0) === epoch &&
       Number(lastRenderedFrameSequence || 0) === sequence &&
       Number(lastRenderedPresentationOrdinal || 0) === presentationOrdinal &&
@@ -1322,23 +1295,18 @@ import {
         showExperimentalClientHDRSurface(visible, reason);
         if (visible && current) {
           if (document.body) document.body.dataset.experimentalMedia = 'hdr-client-webgpu-preview';
-          setExperimentalMediaStatus(`HDR pārlūkā — ${experimentalMediaState.displayBoost}× WebGPU`);
         } else if (current && document.body) {
           document.body.dataset.experimentalMedia = 'fallback-sdr';
-          setExperimentalMediaStatus('Parastā straume — gaida svaigu HDR kadru…');
         }
       },
       onStatus: (status, reason) => {
-        if (status === 'starting') setExperimentalMediaStatus('Sagatavo HDR pārlūkā…');
         if (status === 'ready') {
-          setExperimentalMediaStatus('Gaida svaigu HDR kadru pārlūkā…');
           if (hasRenderedFrame && typeof streamHasFreshRenderedFrame === 'function' && streamHasFreshRenderedFrame()) {
             offerCurrentSDRFrameToClientHDR('renderer_ready_sdr_seed');
           }
         }
         if (status === 'failed') {
           experimentalClientHDRFailed = true;
-          setExperimentalMediaStatus('Parastā straume — pārlūka HDR nav pieejams.');
           if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
           // A failure inside an in-progress recovery consumes that attempt's
           // one fresh-surface retry. A device loss after first_presented no
@@ -1374,12 +1342,10 @@ import {
     experimentalMediaPipeline = CLIENT_HDR_PIPELINE;
     refreshExperimentalClientCapability();
     if (!experimentalClientCapabilityAllowed || !experimentalClientCapability.supported) {
-      setExperimentalMediaStatus('Parastā straume — pārlūka HDR šajā ierīcē nav pieejams.');
       if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
       return false;
     }
     if (experimentalClientHDRFailed) {
-      setExperimentalMediaStatus('Parastā straume — izslēdz un ieslēdz HDR, lai mēģinātu vēlreiz.');
       return false;
     }
     const width = Math.max(1, Number(canvas.width || streamSize.width || 1));
@@ -1390,7 +1356,6 @@ import {
     });
     if (!hdrCanvas) {
       experimentalClientHDRFailed = true;
-      setExperimentalMediaStatus('Parastā straume — HDR virsma nav pieejama.');
       scheduleExperimentalMediaRendererRetry('hdr_canvas_unavailable');
       return false;
     }
@@ -1422,6 +1387,7 @@ import {
     const metadata = {
       epoch: Number(lastRenderedFrameEpoch || currentStreamEpoch || 0),
       sequence: Number(lastRenderedFrameSequence || 0),
+      configGeneration: Number(lastRenderedFrameConfigGeneration || 0),
       presentationOrdinal: Number(lastRenderedPresentationOrdinal || 0),
       timestamp,
       visualAgeMillis: Math.max(0, lastRenderedVisualAge(offeredAt)),
@@ -1452,7 +1418,6 @@ import {
   function applyExperimentalHDRBoost(value, meta) {
     const next = normalizeClientHDRDisplayBoost(value);
     experimentalMediaState.displayBoost = next;
-    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
     syncExperimentalMediaSelectors();
     if (!experimentalClientHDRController) return;
     const applied = experimentalClientHDRController.setDisplayBoost(next);
@@ -1470,8 +1435,6 @@ import {
     experimentalMediaEngineProjectionObserved = decision.ownerProjectionAvailable;
     experimentalMediaOwnerProjectionAvailable = decision.ownerProjectionAvailable;
     const changed = next !== experimentalMediaState.engine;
-    experimentalMediaState.engineSaving = false;
-    experimentalMediaState.engineStatus = experimentalHDREngineStatus(next);
     if (!changed) {
       syncExperimentalMediaSelectors();
       return;
@@ -1535,7 +1498,6 @@ import {
   }
 
   function hideExperimentalMediaCanvas() {
-    hideExperimentalClientHDRHoldoverNotice();
     if (experimentalMediaCanvas) {
       experimentalMediaCanvas.hidden = true;
       delete experimentalMediaCanvas.dataset.clientHdrSurface;
@@ -1563,7 +1525,6 @@ import {
       experimentalMediaState.enabled = false;
       experimentalMediaResumeRetryArmed = false;
     }
-    setExperimentalMediaStatus(options.status || 'Izslēgts');
   }
 
   function cancelExperimentalMediaStart() {
@@ -1800,11 +1761,21 @@ import {
   }
 
   function queueExperimentalMediaForegroundRecovery(attempt, delay) {
-    if (!foregroundRecoveryCurrent(attempt) || experimentalMediaForegroundRecoveryTimer) return false;
-    const remaining = Math.max(0, attempt.deadlineWallAt - Date.now());
+    if (!foregroundRecoveryCurrent(attempt)) return false;
+    const now = Date.now();
+    const remaining = Math.max(0, attempt.deadlineWallAt - now);
     const boundedDelay = Math.min(remaining, Math.max(0, Number(delay || 0)));
+    const scheduledWallAt = now + boundedDelay;
+    if (experimentalMediaForegroundRecoveryTimer) {
+      if (Number(attempt.reconcileScheduledWallAt || 0) <= scheduledWallAt) return false;
+      // A fresh picture's short authority window must not wait behind an
+      // older retry. Keep one earliest check inside the unchanged deadline.
+      clearExperimentalMediaForegroundRecoveryTimer();
+    }
+    attempt.reconcileScheduledWallAt = scheduledWallAt;
     experimentalMediaForegroundRecoveryTimer = setTimeout(() => {
       experimentalMediaForegroundRecoveryTimer = null;
+      attempt.reconcileScheduledWallAt = 0;
       reconcileExperimentalMediaForegroundRecovery(attempt);
     }, boundedDelay);
     return true;
@@ -2037,6 +2008,7 @@ import {
       foregroundPaintConfirmed: Boolean(
         options.foregroundConfirmed || experimentalMediaDocumentHasFocus()
       ),
+      reconcileScheduledWallAt: 0,
       reconcileRunning: false,
       cancelled: false
     };
@@ -2276,7 +2248,6 @@ import {
       if (!experimentalMediaState.enabled || document.visibilityState !== 'visible') return;
       const capability = refreshExperimentalClientCapability();
       if (!experimentalClientCapabilityAllowed || !capability.supported) {
-        setExperimentalMediaStatus('Parastā straume — gaida pārlūka HDR iespēju.');
         if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
         const transientDynamicRange = capability.videoFrame && capability.mainThreadCanvas && capability.webgpu &&
           capability.dynamicRangeLimit && !capability.highDynamicRange;
@@ -2417,10 +2388,7 @@ import {
             ${CLIENT_HDR_DISPLAY_BOOSTS.map((boost) => html`<option value="${boost}">${boost}×</option>`.key(boost))}
           </select>
         </label>
-        <p class="experimental-media-detail" aria-live="polite">${() => experimentalMediaState.status}</p>
-        <p class="experimental-media-detail" data-hdr-preference-status>${() => experimentalMediaState.preferenceStatus}</p>
-        <p class="experimental-media-detail" data-hdr-engine-status>${() => experimentalMediaState.engineStatus}</p>
-        <p class="experimental-media-detail" data-hdr-boost-status hidden="${() => experimentalMediaState.engine !== CLIENT_HDR_ENGINE}">${() => experimentalMediaState.boostStatus}</p>
+        <p class="experimental-media-detail">HDR padara biļetes attēlu spilgtāku šajā ekrānā.</p>
       </section>
     `(experimentalMediaMount);
     const toggle = document.getElementById('experimentalMediaToggle');
@@ -2487,7 +2455,6 @@ import {
     experimentalMediaCapabilityReady = experimentalClientCapabilityAllowed;
     if (!experimentalMediaCapabilityReady) return false;
     experimentalMediaCapabilityDiscoveryAttempt = 0;
-    experimentalMediaState.engineStatus = experimentalHDREngineStatus(experimentalMediaState.engine);
     mountExperimentalMediaControl();
     applyExperimentalMediaPreference(experimentalMediaPreferenceController.enabled, { reason: 'projection' });
     return true;
@@ -3002,6 +2969,17 @@ import {
     publishStreamDebug();
   }
 
+  function reconcileStreamResumeSpinner(freshness, reason) {
+    freshness = freshness || currentRenderedFreshness(performance.now());
+    const healthyCadenceContinuity = healthyOneFPSVisualContinuity(freshness);
+    if (!healthyCadenceContinuity && (reason || hasRenderedFrame)) {
+      showStreamResumeSpinner();
+    } else {
+      hideStreamResumeSpinner();
+    }
+    return healthyCadenceContinuity;
+  }
+
   function preserveCurrentFrame(reason) {
     if (!hasRenderedFrame || lastFrameAt <= 0 || canvas.width <= 0 || canvas.height <= 0) {
       return fallbackFrameAvailable;
@@ -3040,7 +3018,7 @@ import {
   }
 
   function showEmpty(message, showStart) {
-    clearStreamLiveStaleGrace();
+    clearStreamContinuityStaleGrace();
     hideStreamResumeSpinner();
     emptyMessage.textContent = localizePublicMessage(message);
     startStreamButton.hidden = !showStart;
@@ -3058,7 +3036,7 @@ import {
       emptyState.hidden = true;
       document.body.dataset.streamReady = 'true';
       setStatus(message);
-      showStreamResumeSpinner();
+      reconcileStreamResumeSpinner(null, 'stream_waiting');
       keepFirstScreenPinned();
       return;
     }
@@ -3072,7 +3050,6 @@ import {
     emptyState.hidden = true;
     document.body.dataset.streamReady = 'true';
     updateStreamFreshnessStatus('stream_recovery');
-    showStreamResumeSpinner();
     keepFirstScreenPinned();
   }
 
@@ -3085,9 +3062,7 @@ import {
     const wasEmptyVisible = !emptyState.hidden;
     emptyState.hidden = true;
     document.body.dataset.streamReady = 'true';
-    if (!streamStatusStale(freshStreamStatus(performance.now()) || latestStreamStatus)) {
-      hideStreamResumeSpinner();
-    }
+    reconcileStreamResumeSpinner(null, 'hide_empty');
     if (wasEmptyVisible) keepFirstScreenPinned();
   }
 
@@ -3142,8 +3117,12 @@ import {
     activationReconnectBurstTimer = null;
   }
 
+  function streamHasContinuityFrame() {
+    return currentRenderedFreshness(performance.now()).continuityPresentable;
+  }
+
   function streamHasFreshRenderedFrame() {
-    return currentRenderedFreshness(performance.now()).liveLabeled;
+    return currentRenderedFreshness(performance.now()).actionFresh;
   }
 
   function safeResumeLabel(value, fallback) {
@@ -3175,7 +3154,7 @@ import {
     return Object.assign({
       visibility: safeResumeLabel(document.visibilityState, 'unknown'),
       socket: ['connecting', 'open', 'closing', 'closed'][videoSocketState()] || 'none',
-      fresh: resumeBooleanLabel(streamHasFreshRenderedFrame()),
+      fresh: resumeBooleanLabel(streamHasContinuityFrame()),
       configured: resumeBooleanLabel(configured),
       decoder: resumeBooleanLabel(decoderConfigured)
     }, detail || {});
@@ -3283,7 +3262,7 @@ import {
   function runActivationReconnectBurst(reason, flow) {
     if (!flow || flow !== activeResumeFlow || flow.done) return;
     clearActivationReconnectBurst();
-    if (streamHasFreshRenderedFrame()) {
+    if (streamHasContinuityFrame()) {
       finishActivationResumeFlow('fresh_frame', flow);
       return;
     }
@@ -3399,8 +3378,10 @@ import {
   }
 
   function resetStreamState(options) {
-    clearStreamLiveStaleGrace();
+    clearStreamContinuityStaleGrace();
+    invalidateBrowserActionContext('stream_reset');
     cancelTicketRegisterSliderSession('stream_reset');
+    resetStreamFeedbackContract('stream_reset');
     const preserveFrame = Boolean(options && options.preserveFrame);
     if (preserveFrame) {
       preserveCurrentFrame('reset_stream_state');
@@ -3411,8 +3392,10 @@ import {
     videoConnectedAt = 0;
     lastFrameAt = 0;
     lastDecodedFrameAt = 0;
+    lastDecodedFrameConfigGeneration = 0;
     lastPacketAt = 0;
     lastPacketSequenceAdvancedAt = 0;
+    lastStaleIngressDropAt = 0;
     firstFrameReceived = false;
     needsKeyFrame = true;
     currentStreamEpoch = 0;
@@ -3423,7 +3406,11 @@ import {
     firstDecodedTraceSent = false;
     lastAcceptedFrameReceivedAt = 0;
     lastAcceptedFrameVisualAgeMillis = 0;
+    lastAcceptedFrameVisualAgeKnown = false;
+    lastAcceptedFrameVisualAgeConservative = false;
+    lastAcceptedFrameEnvelopeVersion = '';
     lastAcceptedFrameQueuedAt = 0;
+    lastAcceptedFrameConfigGeneration = 0;
     // A reconnect may preserve the old canvas while the next stream epoch is
     // negotiated.  The old rendered proof must not be compared with the new
     // epoch or it can hide a valid slider forever (or authorize controls over
@@ -3433,8 +3420,12 @@ import {
     lastRenderedFrameQueuedAt = 0;
     lastRenderedFrameRenderedAt = 0;
     lastRenderedFrameVisualAgeMillis = 0;
+    lastRenderedFrameVisualAgeKnown = false;
+    lastRenderedFrameVisualAgeConservative = false;
+    lastRenderedFrameEnvelopeVersion = '';
     lastRenderedFrameEpoch = 0;
     lastRenderedFrameSequence = 0;
+    lastRenderedFrameConfigGeneration = 0;
     lastRenderedPresentationOrdinal = 0;
     lastRenderedFrameTimestamp = 0;
     lastDecodedFrameSequence = 0;
@@ -3469,10 +3460,11 @@ import {
     closeDirectVideo();
     resetStreamState({ preserveFrame });
     showStreamRecovery();
-    setTimeout(connectDirectVideo, 250);
+    scheduleVideoReconnect(reason || 'stream_restart', { delayMs: 250, escalate: false, skipEarlyGrace: true });
   }
 
   function closeDirectVideo() {
+    cancelVideoReconnectSchedule(false);
     if (hiddenVideoCloseTimer) {
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
@@ -3483,6 +3475,7 @@ import {
     }
     preserveCurrentFrame('close_direct_video');
     closeDecoder();
+    resetStreamFeedbackContract('video_socket_closed');
     const sockets = new Set(activeVideoSockets);
     if (videoWs) sockets.add(videoWs);
     videoWs = null;
@@ -3574,6 +3567,53 @@ import {
     pauseVideoWhileHidden(reason || 'visibility_hidden');
   }
 
+  function cancelVideoReconnectSchedule(resetAttempt) {
+    if (videoReconnectTimer != null) clearTimeout(videoReconnectTimer);
+    videoReconnectTimer = null;
+    if (resetAttempt) videoReconnectAttempt = 0;
+  }
+
+  function resetVideoReconnectBackoff(reason) {
+    const recovering = videoReconnectTimer != null || videoReconnectAttempt > 0;
+    cancelVideoReconnectSchedule(true);
+    if (recovering) clientLog('video_reconnect_healthy', reason || 'fresh_frame');
+  }
+
+  function videoReconnectDelayMillis(attempt) {
+    const index = Math.min(Math.max(0, Number(attempt || 0)), videoReconnectBaseDelaysMs.length - 1);
+    const base = videoReconnectBaseDelaysMs[index];
+    const jitter = 1 + ((Math.random() * 2) - 1) * videoReconnectJitterRatio;
+    return Math.max(250, Math.round(base * jitter));
+  }
+
+  function scheduleVideoReconnect(reason, options) {
+    options = options || {};
+    if (idleDisconnected || streamUnsupported || videoReconnectTimer != null) return false;
+    if (!viewerIsForeground()) return false;
+    if (videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)) return false;
+    const delayMs = Number.isFinite(Number(options.delayMs))
+      ? Math.max(0, Math.round(Number(options.delayMs)))
+      : videoReconnectDelayMillis(videoReconnectAttempt);
+    if (options.escalate !== false) {
+      videoReconnectAttempt = Math.min(videoReconnectAttempt + 1, videoReconnectBaseDelaysMs.length - 1);
+    }
+    videoReconnectTimer = setTimeout(() => {
+      videoReconnectTimer = null;
+      if (idleDisconnected || streamUnsupported || !viewerIsForeground()) return;
+      if (videoWs && (videoWs.readyState === WebSocket.OPEN || videoWs.readyState === WebSocket.CONNECTING)) return;
+      connectDirectVideo({
+        skipEarlyGrace: Boolean(options.skipEarlyGrace),
+        scheduledReconnect: true
+      });
+    }, delayMs);
+    clientLog('video_reconnect_scheduled', JSON.stringify({
+      reason: reason || 'video_socket_closed',
+      delayMs,
+      attempt: videoReconnectAttempt
+    }));
+    return true;
+  }
+
   function connectDirectVideo(options) {
     options = options || {};
     if (idleDisconnected) return;
@@ -3581,6 +3621,8 @@ import {
       pauseVideoWhileHidden('connect_direct_video_hidden');
       return;
     }
+    if (videoReconnectTimer != null && !options.scheduledReconnect && !options.forceImmediate) return;
+    if (options.forceImmediate) cancelVideoReconnectSchedule(false);
     if (hiddenVideoCloseTimer) {
       clearTimeout(hiddenVideoCloseTimer);
       hiddenVideoCloseTimer = null;
@@ -3602,7 +3644,7 @@ import {
         closeEarlyVideo('fast_resume');
       } else {
       clientLog('early_video_connecting_grace', '');
-      setTimeout(connectDirectVideo, 250);
+      scheduleVideoReconnect('early_video_connecting_grace', { delayMs: 250, escalate: false });
       return;
       }
     }
@@ -3620,7 +3662,7 @@ import {
 	    if (!socket) {
       clientLog('video_socket_create_failed', 'safe_websocket_unavailable');
 	      showStreamRecovery();
-	      setTimeout(connectDirectVideo, 1500);
+	      scheduleVideoReconnect('video_socket_create_failed');
 	      return;
     }
     adoptVideoSocket(socket, [], 0, 'video_socket_open');
@@ -3632,6 +3674,7 @@ import {
       try { socket.close(1000, 'stale_video_socket'); } catch (_) {}
       return;
     }
+	  cancelVideoReconnectSchedule(false);
 	    if (videoConnectedAt <= 0) videoConnectedAt = performance.now();
     clientLog('video_socket_opened', JSON.stringify({
       reason: reason || 'video_socket_open',
@@ -3653,9 +3696,14 @@ import {
     publishCurrentStreamFocus(reason || 'video_socket_adopted');
     let videoMessageChain = Promise.resolve();
     function queueVideoSocketMessage(event, queued) {
+      const receivedEvent = {
+        data: event && event.data,
+        browserReceiveUnixMicros: Math.round(Date.now() * 1000),
+        browserReceiveAt: performance.now()
+      };
       videoMessageChain = videoMessageChain.then(() => {
         if (idleDisconnected || videoWs !== socket) return;
-        return handleVideoSocketMessage(event);
+        return handleVideoSocketMessage(receivedEvent);
       }).catch((error) => {
         if (idleDisconnected || videoWs !== socket) return;
         sendVideoClientLog('video_message_failed', error && error.message || (queued ? 'queued message failed' : 'message failed'));
@@ -3666,8 +3714,8 @@ import {
     socket.onmessage = (event) => queueVideoSocketMessage(event, false);
     socket.onclose = (event) => {
       activeVideoSockets.delete(socket);
-      if (videoWs === socket) videoWs = null;
-      publishCurrentStreamFocus('video_socket_closed');
+      const wasCurrentSocket = videoWs === socket;
+      if (wasCurrentSocket) videoWs = null;
       if (intentionallyClosedVideoSockets.has(socket)) {
         clientLog('video_socket_closed_intentional', JSON.stringify({
           code: event && event.code,
@@ -3676,6 +3724,8 @@ import {
         intentionallyClosedVideoSockets.delete(socket);
         return;
       }
+	    if (!wasCurrentSocket) return;
+      publishCurrentStreamFocus('video_socket_closed');
 	      clientLog('video_socket_closed', JSON.stringify({
         code: event && event.code,
         wasClean: event && event.wasClean,
@@ -3688,7 +3738,7 @@ import {
       resetStreamState({ preserveFrame: true });
       showStreamRecovery();
       if (viewerIsForeground()) {
-        setTimeout(connectDirectVideo, 1000);
+        scheduleVideoReconnect('video_socket_closed');
       }
     };
     socket.onerror = () => {
@@ -3727,28 +3777,215 @@ import {
     return Math.min(max, Math.round(numeric));
   }
 
+  function clearStreamClockBound() {
+    if (streamClockProbeTimer) clearTimeout(streamClockProbeTimer);
+    streamClockProbeTimer = null;
+    pendingStreamClockProbe = null;
+    streamClockBoundConfigGeneration = 0;
+    streamClockBoundAt = 0;
+    streamClockServerUpperUnixMicros = 0;
+    streamClockOffsetMidpointMicros = 0;
+    streamClockOffsetHalfWidthMicros = 0;
+  }
+
+  function resetStreamFeedbackContract(_reason) {
+    clearStreamClockBound();
+    resetControlCodeResultPriority();
+    activeFeedbackVersion = 0;
+    activeFeedbackConfigGeneration = 0;
+    feedbackReceivedSequence = 0;
+    feedbackDecodedSequence = 0;
+    feedbackRenderedSequence = 0;
+    feedbackPresentedSequence = 0;
+    feedbackRenderedKeyframeSequence = 0;
+    lastReceivedFrameSequence = 0;
+    lastReceivedFrameConfigGeneration = 0;
+    lastAcceptedFrameConfigGeneration = 0;
+    lastDecodedFrameConfigGeneration = 0;
+    lastRenderedFrameConfigGeneration = 0;
+    lastPresentedFrameConfigGeneration = 0;
+    lastFeedbackSentAt = 0;
+    updateStreamFreshnessStatus('feedback_reset');
+  }
+
+  function advertisedStreamFeedbackContract(config) {
+    const version = Number(config && config.feedbackVersion || 0);
+    if (version === 1) return { valid: true, version: 1, generation: 0 };
+    if (version !== 2) return { valid: version === 0, version: 0, generation: 0 };
+    const generation = Number(config && config.feedbackConfigGeneration || 0);
+    return {
+      valid: Number.isSafeInteger(generation) && generation > 0,
+      version: 2,
+      generation
+    };
+  }
+
+  function adoptClaimedEarlyFeedback(contract) {
+    const early = claimedEarlyFeedbackState;
+    claimedEarlyFeedbackState = null;
+    if (!early || contract.version !== 2 || early.version !== 2 ||
+      early.configGeneration !== contract.generation ||
+      !Number.isSafeInteger(early.receivedSequence) || early.receivedSequence < 0 ||
+      !Number.isSafeInteger(early.epoch) || early.epoch <= 0 ||
+      (currentStreamEpoch > 0 && early.epoch !== currentStreamEpoch)) return false;
+    if (!currentStreamEpoch) {
+      currentStreamEpoch = early.epoch;
+      if (lastDecoderConfig && Number(lastDecoderConfig.streamEpoch || 0) === 0) {
+        lastDecoderConfig = { ...lastDecoderConfig, streamEpoch: early.epoch, provisional: false };
+      }
+    }
+    feedbackReceivedSequence = early.receivedSequence;
+    return true;
+  }
+
+  function activateStreamFeedbackContract(config) {
+    const contract = advertisedStreamFeedbackContract(config);
+    if (!contract.valid) return false;
+    const changed = contract.version !== activeFeedbackVersion ||
+      contract.generation !== activeFeedbackConfigGeneration;
+    if (!changed) return true;
+    resetStreamFeedbackContract('config_changed');
+    activeFeedbackVersion = contract.version;
+    activeFeedbackConfigGeneration = contract.generation;
+    adoptClaimedEarlyFeedback(contract);
+    if (activeFeedbackVersion > 0) {
+      sendStreamFeedback('config_accepted', true);
+    }
+    if (activeFeedbackVersion === 2) {
+      sendStreamClockProbe('config_accepted');
+    }
+    return true;
+  }
+
+  function streamClockBoundIsCurrent(now) {
+    now = Number.isFinite(now) ? now : performance.now();
+    return Boolean(
+      activeFeedbackVersion === 2 && activeFeedbackConfigGeneration > 0 &&
+      streamClockBoundConfigGeneration === activeFeedbackConfigGeneration &&
+      streamClockBoundAt > 0 && now >= streamClockBoundAt &&
+      now - streamClockBoundAt <= streamClockBoundMaxAgeMs &&
+      Number.isSafeInteger(streamClockServerUpperUnixMicros) && streamClockServerUpperUnixMicros > 0
+    );
+  }
+
+  function streamClockServerUpperAt(now) {
+    now = Number.isFinite(now) ? now : performance.now();
+    if (!streamClockBoundIsCurrent(now)) return 0;
+    const elapsedMicros = Math.max(0, now - streamClockBoundAt) * 1000;
+    const serverUpper = streamClockServerUpperUnixMicros + elapsedMicros;
+    return Number.isSafeInteger(Math.round(serverUpper)) ? Math.round(serverUpper) : 0;
+  }
+
+  function scheduleStreamClockProbe(delayMillis) {
+    if (streamClockProbeTimer) clearTimeout(streamClockProbeTimer);
+    streamClockProbeTimer = null;
+    if (activeFeedbackVersion !== 2 || !(activeFeedbackConfigGeneration > 0)) return;
+    streamClockProbeTimer = setTimeout(() => {
+      streamClockProbeTimer = null;
+      sendStreamClockProbe('scheduled');
+    }, Math.max(0, Number(delayMillis || 0)));
+  }
+
+  function sendStreamClockProbe(_reason) {
+    if (activeFeedbackVersion !== 2 || !(activeFeedbackConfigGeneration > 0) ||
+      !videoWs || videoWs.readyState !== WebSocket.OPEN) return false;
+    const now = performance.now();
+    if (pendingStreamClockProbe && now - pendingStreamClockProbe.sentAt < streamClockProbeRetryMs) return false;
+    const clientSendUnixMicros = Math.round(Date.now() * 1000);
+    if (!Number.isSafeInteger(clientSendUnixMicros) || clientSendUnixMicros <= 0) return false;
+    streamClockProbeCounter += 1;
+    const probeId = `clock-${activeFeedbackConfigGeneration}-${streamClockProbeCounter}`.slice(0, 64);
+    const probe = {
+      type: 'clock_probe',
+      version: 1,
+      probeId,
+      configGeneration: activeFeedbackConfigGeneration,
+      clientSendUnixMicros
+    };
+    try {
+      videoWs.send(JSON.stringify(probe));
+      pendingStreamClockProbe = {
+        probeId,
+        configGeneration: activeFeedbackConfigGeneration,
+        clientSendUnixMicros,
+        sentAt: now
+      };
+      scheduleStreamClockProbe(streamClockProbeRetryMs);
+      return true;
+    } catch (_) {
+      scheduleStreamClockProbe(streamClockProbeRetryMs);
+      return false;
+    }
+  }
+
+  function handleStreamClockProbeResult(message, browserReceiveUnixMicros, browserReceiveAt) {
+    const pending = pendingStreamClockProbe;
+    const generation = Number(message && message.configGeneration || 0);
+    const clientSend = Number(message && message.clientSendUnixMicros || 0);
+    const serverReceive = Number(message && message.serverReceiveUnixMicros || 0);
+    const serverSend = Number(message && message.serverSendUnixMicros || 0);
+    const clientReceive = Number(browserReceiveUnixMicros || 0);
+    const receivedAt = Number(browserReceiveAt);
+    const validIntegers = [generation, clientSend, serverReceive, serverSend, clientReceive]
+      .every((value) => Number.isSafeInteger(value) && value > 0);
+    if (!pending || message.version !== 1 || String(message.probeId || '') !== pending.probeId ||
+      !validIntegers || generation !== activeFeedbackConfigGeneration ||
+      generation !== pending.configGeneration || clientSend !== pending.clientSendUnixMicros ||
+      serverSend < serverReceive || !Number.isFinite(receivedAt)) {
+      return false;
+    }
+    const lowerOffset = serverSend - clientReceive;
+    const upperOffset = serverReceive - clientSend;
+    if (!Number.isSafeInteger(lowerOffset) || !Number.isSafeInteger(upperOffset) || lowerOffset > upperOffset) {
+      return false;
+    }
+    const midpoint = (lowerOffset + upperOffset) / 2;
+    const halfWidth = (upperOffset - lowerOffset) / 2;
+    const serverUpper = clientReceive + midpoint + halfWidth;
+    if (!Number.isSafeInteger(Math.round(serverUpper)) || serverUpper <= 0) return false;
+    pendingStreamClockProbe = null;
+    streamClockBoundConfigGeneration = generation;
+    streamClockBoundAt = receivedAt;
+    streamClockServerUpperUnixMicros = Math.round(serverUpper);
+    streamClockOffsetMidpointMicros = midpoint;
+    streamClockOffsetHalfWidthMicros = halfWidth;
+    scheduleStreamClockProbe(streamClockProbeIntervalMs);
+    updateStreamFreshnessStatus('clock_calibrated');
+    publishStreamDebug();
+    return true;
+  }
+
   function sendStreamFeedback(reason, immediate) {
-    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return false;
+    if ((activeFeedbackVersion !== 1 && activeFeedbackVersion !== 2) ||
+      !videoWs || videoWs.readyState !== WebSocket.OPEN) return false;
     const now = performance.now();
     const interval = document.visibilityState === 'hidden' ? streamFeedbackHiddenIntervalMs : streamFeedbackIntervalMs;
     if (!immediate && now - lastFeedbackSentAt < interval) return false;
     const freshness = currentRenderedFreshness(now);
     const decoderQueue = clampFeedbackNumber(decoder && decoder.decodeQueueSize, 32);
+    const receivedSequence = Number(feedbackReceivedSequence || 0);
+    const decodedSequence = Math.min(receivedSequence, Number(feedbackDecodedSequence || 0));
+    const renderedSequence = Math.min(decodedSequence, Number(feedbackRenderedSequence || 0));
+    const presentedSequence = Math.min(renderedSequence, Number(feedbackPresentedSequence || 0));
+    const feedbackAgeKnown = Boolean(renderedSequence > 0 && freshness.visualAgeKnown &&
+      (activeFeedbackVersion === 1 || lastRenderedFrameConfigGeneration === activeFeedbackConfigGeneration));
     const payload = {
       type: 'stream_feedback',
-      version: streamFeedbackVersion,
+      version: activeFeedbackVersion,
       epoch: Number(currentStreamEpoch || 0),
-      receivedSequence: Number(lastAcceptedFrameSequence || lastPacketSequence || 0),
-      decodedSequence: Number(lastDecodedFrameSequence || lastRenderedFrameSequence || 0),
-      renderedSequence: Number(lastRenderedFrameSequence || 0),
-      // Keep the legacy field on the wire during the rolling upgrade. Every
-      // accepted frame is now independently decodable, so the rendered frame
-      // sequence is also the latest rendered keyframe sequence.
-      renderedKeyframeSequence: Number(lastRenderedFrameSequence || 0),
+      receivedSequence,
+      decodedSequence,
+      renderedSequence,
+      renderedKeyframeSequence: Math.min(renderedSequence, Number(feedbackRenderedKeyframeSequence || 0)),
       decoderQueueSize: decoderQueue,
-      renderedVisualAgeMillis: clampFeedbackNumber(freshness.visualAgeMillis, 60000),
+      renderedVisualAgeMillis: feedbackAgeKnown ? clampFeedbackNumber(freshness.visualAgeMillis, 60000) : 0,
       visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible'
     };
+    if (activeFeedbackVersion === 2) {
+      payload.configGeneration = activeFeedbackConfigGeneration;
+      payload.presentedSequence = presentedSequence;
+      payload.ageKnown = feedbackAgeKnown;
+    }
     try {
       videoWs.send(JSON.stringify(payload));
       lastFeedbackSentAt = now;
@@ -3763,6 +4000,192 @@ import {
 
   function scheduleStreamFeedback(reason) {
     sendStreamFeedback(reason || 'transition', true);
+  }
+
+  function resetControlCodeResultPriority() {
+    controlCodeResultPriorityPhase = '';
+    controlCodeResultPriorityConfigGeneration = 0;
+    controlCodeResultPriorityEpoch = 0;
+    controlCodeResultPriorityMinSequence = 0;
+    controlCodeResultPriorityDeadlineAt = 0;
+  }
+
+  function firstPositiveSafeInteger(...values) {
+    for (const value of values) {
+      const parsed = Number(value);
+      if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+    }
+    return 0;
+  }
+
+  function sendControlCodeResultPriority(phase, epoch, minSequence, force) {
+    phase = String(phase || '');
+    epoch = Number(epoch || 0);
+    minSequence = Number(minSequence || 0);
+    const generation = Number(activeFeedbackConfigGeneration || 0);
+    if (activeFeedbackVersion !== 2 || !Number.isSafeInteger(generation) || generation <= 0 ||
+      !Number.isSafeInteger(epoch) || epoch <= 0 || epoch !== Number(currentStreamEpoch || 0) ||
+      !Number.isSafeInteger(minSequence) || minSequence < 0 ||
+      (phase !== 'arm' && phase !== 'mark') || (phase === 'arm' && minSequence !== 0) ||
+      (phase === 'mark' && minSequence <= 0) || !videoWs || videoWs.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    const sameReservation = controlCodeResultPriorityPhase === phase &&
+      controlCodeResultPriorityConfigGeneration === generation &&
+      controlCodeResultPriorityEpoch === epoch &&
+      controlCodeResultPriorityMinSequence === minSequence;
+    if (!force && sameReservation) return true;
+    const payload = {
+      type: 'result_priority',
+      version: 1,
+      phase,
+      configGeneration: generation,
+      epoch
+    };
+    if (phase === 'mark') payload.minSequence = minSequence;
+    try {
+      videoWs.send(JSON.stringify(payload));
+      controlCodeResultPriorityPhase = phase;
+      controlCodeResultPriorityConfigGeneration = generation;
+      controlCodeResultPriorityEpoch = epoch;
+      controlCodeResultPriorityMinSequence = minSequence;
+      if (!sameReservation) {
+        controlCodeResultPriorityDeadlineAt = performance.now() +
+          (phase === 'arm' ? controlCodeResultPriorityArmWindowMs : controlCodeResultPriorityMarkWindowMs);
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearControlCodeResultPriority() {
+    const generation = Number(controlCodeResultPriorityConfigGeneration || 0);
+    const epoch = Number(controlCodeResultPriorityEpoch || 0);
+    const shouldSend = Boolean(controlCodeResultPriorityPhase && activeFeedbackVersion === 2 &&
+      generation > 0 && generation === Number(activeFeedbackConfigGeneration || 0) &&
+      epoch > 0 && epoch === Number(currentStreamEpoch || 0) &&
+      videoWs && videoWs.readyState === WebSocket.OPEN);
+    resetControlCodeResultPriority();
+    if (!shouldSend) return false;
+    try {
+      videoWs.send(JSON.stringify({
+        type: 'result_priority',
+        version: 1,
+        phase: 'clear',
+        configGeneration: generation,
+        epoch
+      }));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function reconcileControlCodeResultPriority(request) {
+    const requestID = String(request && request.requestId || '').trim();
+    const realOwnedRequest = Boolean(requestID && !requestID.startsWith('pending:') &&
+      isOwnedControlCodeRequest(request) && controlCodeRequestIsStillRelevant(request));
+    const status = String(request && request.status || '');
+    const resultAlreadyPainted = requestID && (
+      controlCodePreparedCaptureDisplayedRequestID === requestID ||
+      controlCodeResultCapturedRequestID === requestID
+    );
+    if (resultAlreadyPainted) {
+      clearControlCodeResultPriority();
+      return false;
+    }
+    const capturePending = request && request.captureRequired === true && request.captureAcknowledged !== true;
+    if (!realOwnedRequest || (!['queued', 'running'].includes(status) &&
+      !(status === 'succeeded' && capturePending))) {
+      clearControlCodeResultPriority();
+      return false;
+    }
+    const epoch = firstPositiveSafeInteger(
+      request && request.resultFrameEpoch,
+      request && request.streamEpoch,
+      request && request.frameEpoch,
+      currentStreamEpoch
+    );
+    if (!(epoch > 0) || epoch !== Number(currentStreamEpoch || 0)) return false;
+    if (status === 'queued' || status === 'running') {
+      return sendControlCodeResultPriority('arm', epoch, 0);
+    }
+    const markerSequence = firstPositiveSafeInteger(
+      request && request.resultMinFrameSequence,
+      request && request.minFrameSequence,
+      request && request.frameSequence
+    );
+    if (!(markerSequence > 0)) return sendControlCodeResultPriority('arm', epoch, 0);
+    if (controlCodeResultPriorityPhase === 'mark') {
+      return controlCodeResultPriorityConfigGeneration === Number(activeFeedbackConfigGeneration || 0) &&
+        controlCodeResultPriorityEpoch === epoch &&
+        controlCodeResultPriorityMinSequence === markerSequence;
+    }
+    // Retransmit arm once at the marker boundary. The relay treats an active
+    // duplicate as an idempotent no-op, while an expired reservation can be
+    // safely re-created before the one permitted mark transition.
+    if (!sendControlCodeResultPriority('arm', epoch, 0, true)) return false;
+    return sendControlCodeResultPriority('mark', epoch, markerSequence);
+  }
+
+  function controlCodeMediaReadSuppressed(now) {
+    now = Number.isFinite(now) ? now : performance.now();
+    const request = codeRequest;
+    const requestID = String(request && request.requestId || '').trim();
+    const phase = String(controlCodeResultPriorityPhase || '');
+    const status = String(request && request.status || '');
+    const capturePending = request && request.captureRequired === true && request.captureAcknowledged !== true;
+    const requestActive = ['queued', 'running'].includes(status) || (status === 'succeeded' && capturePending);
+    const exactTransport = activeFeedbackVersion === 2 && activeFeedbackConfigGeneration > 0 &&
+      controlCodeResultPriorityConfigGeneration === activeFeedbackConfigGeneration &&
+      currentStreamEpoch > 0 && controlCodeResultPriorityEpoch === currentStreamEpoch &&
+      videoWs && videoWs.readyState === WebSocket.OPEN;
+    const exactRequest = Boolean(requestID && !requestID.startsWith('pending:') &&
+      !locallyClosedControlCodeRequestIDs.has(requestID) && isOwnedControlCodeRequest(request) &&
+      controlCodeRequestIsStillRelevant(request) &&
+      controlCodePreparedCaptureDisplayedRequestID !== requestID &&
+      controlCodeResultCapturedRequestID !== requestID);
+    const markerSequence = firstPositiveSafeInteger(
+      request && request.resultMinFrameSequence,
+      request && request.minFrameSequence,
+      request && request.frameSequence
+    );
+    const requestEpoch = firstPositiveSafeInteger(
+      request && request.resultFrameEpoch,
+      request && request.streamEpoch,
+      request && request.frameEpoch,
+      currentStreamEpoch
+    );
+    const epochValid = requestEpoch > 0 && requestEpoch === currentStreamEpoch &&
+      controlCodeResultPriorityEpoch === requestEpoch;
+    const phaseValid = phase === 'arm'
+      ? controlCodeResultPriorityMinSequence === 0
+      : phase === 'mark' && markerSequence > 0 &&
+        controlCodeResultPriorityMinSequence === markerSequence;
+    const withinDeadline = controlCodeResultPriorityDeadlineAt > now;
+    if (requestActive && exactTransport && exactRequest && epochValid && phaseValid && withinDeadline) return true;
+    if (phase) clearControlCodeResultPriority();
+    return false;
+  }
+
+  function controlCodeReservedMediaBackendRecoveryAllowed(status, now) {
+    const sourceAge = serverFrameAge(status);
+    // Reserved viewer media can pause while the shared source still advances.
+    // Preserve recovery for a proved source stall, excluding its unknown-age sentinel.
+    const sourceStalled = status && status.activeVideoClients > 0 &&
+      Number.isFinite(sourceAge) && sourceAge > streamStaleServerRecoverMs &&
+      sourceAge < Number.MAX_SAFE_INTEGER;
+    if (!backendLooksRecoverable(status) && !sourceStalled) return false;
+    now = Number.isFinite(now) ? now : performance.now();
+    const statusEpoch = Number(status && status.streamEpoch || 0);
+    if (!Number.isSafeInteger(statusEpoch) || statusEpoch <= 0 ||
+      statusEpoch !== Number(currentStreamEpoch || 0)) return false;
+    const reportAt = Date.parse(String(status && status.updatedAt || ''));
+    const streamServerNowUnixMicros = streamClockServerUpperAt(now);
+    if (!Number.isFinite(reportAt) || !(streamServerNowUnixMicros > 0)) return false;
+    const reportAgeMillis = streamServerNowUnixMicros / 1000 - reportAt;
+    return reportAgeMillis >= -250 && reportAgeMillis <= streamCurrentReportMaxAgeMs;
   }
 
   function reportDecoderError(error, mode) {
@@ -3813,7 +4236,7 @@ import {
   function liveStreamSuppressesBackgroundRequest(reason) {
     const cleanReason = String(reason || '').toLowerCase();
     if (cleanReason.includes('control_code')) return false;
-    return streamHasFreshRenderedFrame();
+    return streamHasContinuityFrame();
   }
 
   function initialLoadDefersBrowserKeyframe(reason) {
@@ -3855,6 +4278,13 @@ import {
   function requestServerRecoveryDebounced(reason, force) {
     if (liveStreamSuppressesBackgroundRequest(reason)) return false;
     const now = performance.now();
+    const recoveryStatus = freshStreamStatus(now);
+    // Decoder errors, a closed browser socket, and a locally old canvas are
+    // browser-owned failures. They may recreate local media state and request
+    // a new independent picture, but only fresh server status can authorize a
+    // shared phone/source recovery.
+    if (!recoveryStatus ||
+      (!backendLooksRecoverable(recoveryStatus) && !streamStatusStale(recoveryStatus))) return false;
     if (!force && lastRecoveryServerRecoverAt > 0 && now - lastRecoveryServerRecoverAt < recoveryServerRecoverDebounceMs) return false;
     lastRecoveryServerRecoverAt = now;
     clientLog('stream_recovery_request', JSON.stringify({
@@ -3903,6 +4333,7 @@ import {
     // replacement decoder's metadata queue.
     decoderConfigureGeneration += 1;
     decoderGeneration += 1;
+    lastPresentedFrameConfigGeneration = 0;
     if (decoder) {
       try { decoder.close(); } catch (_) {}
       decoder = null;
@@ -4003,9 +4434,13 @@ import {
       needsKeyFrame = true;
       lastAcceptedFrameSequence = Number(lastRenderedFrameSequence || 0);
       lastAcceptedFrameTimestamp = Number(lastRenderedFrameTimestamp || 0);
+      lastAcceptedFrameConfigGeneration = Number(lastRenderedFrameConfigGeneration || 0);
       lastAcceptedFrameReceivedAt = 0;
       lastAcceptedFrameQueuedAt = 0;
       lastAcceptedFrameVisualAgeMillis = 0;
+      lastAcceptedFrameVisualAgeKnown = false;
+      lastAcceptedFrameVisualAgeConservative = false;
+      lastAcceptedFrameEnvelopeVersion = '';
       lastControlCodeDecoderBacklogResetKey = resetKey;
       sendVideoClientLog('control_code_decoder_backlog_reset', JSON.stringify({
         requestKey: accountPublicId(requestID),
@@ -4046,6 +4481,7 @@ import {
 
   function publishStreamDebug() {
     const controlCodeCapture = lastControlCodeCaptureDebug;
+    const streamFreshness = currentRenderedFreshness(performance.now());
     window.ticketStreamDebug = {
       pageVersion,
       configured,
@@ -4058,18 +4494,36 @@ import {
       lastPacketAt,
       lastDecodedFrameAt,
       lastPacketSequence,
+      lastReceivedFrameSequence,
       lastAcceptedFrameSequence,
       lastAcceptedFrameTimestamp,
       lastRenderedFrameEpoch,
       lastRenderedFrameSequence,
       lastRenderedFrameTimestamp,
-      feedbackVersion: streamFeedbackVersion,
+      feedbackVersion: activeFeedbackVersion,
+      feedbackConfigGeneration: activeFeedbackConfigGeneration,
+      feedbackReceivedSequence,
+      feedbackDecodedSequence,
+      feedbackRenderedSequence,
+      feedbackPresentedSequence,
+      videoReconnectScheduled: videoReconnectTimer != null,
+      videoReconnectAttempt,
+      clockBoundCurrent: streamClockBoundIsCurrent(performance.now()),
+      clockBoundHalfWidthMillis: Number((streamClockOffsetHalfWidthMicros / 1000).toFixed(3)),
       sourceFps: Number(lastDecoderConfig && (lastDecoderConfig.sourceFps || lastDecoderConfig.fps) || 1),
       keyframeIntervalFrames: Number(lastDecoderConfig && lastDecoderConfig.keyframeIntervalFrames || 1),
       decoderQueue: Number(decoder && decoder.decodeQueueSize || 0),
-      visualAgeMillis: Math.round(Number(lastRenderedFrameVisualAgeMillis || 0)),
+      visualAgeMillis: streamFreshness.visualAgeKnown
+        ? Math.round(Number(streamFreshness.visualAgeMillis || 0))
+        : -1,
+      visualAgeKnown: streamFreshness.visualAgeKnown,
+      visualAgeConservative: streamFreshness.visualAgeConservative,
+      frameEnvelopeVersion: String(lastRenderedFrameEnvelopeVersion || lastAcceptedFrameEnvelopeVersion || ''),
+      continuityPresentable: streamFreshness.continuityPresentable,
+      actionFresh: streamFreshness.actionFresh,
       presentationCoalescedFrames,
       decoderRejectedFrames,
+      staleIngressDroppedFrames,
       resyncDroppedFrames,
       feedbackSentCount,
       feedbackSendFailureCount,
@@ -4123,30 +4577,80 @@ import {
       document.body.dataset.streamFrameSequenceLag = String(Math.max(0, Number(lastAcceptedFrameSequence || 0) - Number(lastRenderedFrameSequence || 0)));
       document.body.dataset.streamPendingMetadata = String(Array.isArray(pendingFrameMetadata) ? pendingFrameMetadata.length : 0);
       document.body.dataset.streamDecoderQueue = String(Number(decoder && decoder.decodeQueueSize || 0));
-      document.body.dataset.streamRenderedVisualAge = String(Math.round(Number(lastRenderedFrameVisualAgeMillis || 0)));
-      document.body.dataset.streamAcceptedVisualAge = String(Math.round(Number(lastAcceptedFrameVisualAgeMillis || 0)));
+      document.body.dataset.streamRenderedVisualAge = lastRenderedFrameVisualAgeKnown
+        ? String(Math.round(Number(lastRenderedFrameVisualAgeMillis || 0)))
+        : '-1';
+      document.body.dataset.streamAcceptedVisualAge = lastAcceptedFrameVisualAgeKnown
+        ? String(Math.round(Number(lastAcceptedFrameVisualAgeMillis || 0)))
+        : '-1';
+      document.body.dataset.streamAgeConservative = String(Boolean(lastRenderedFrameVisualAgeConservative));
+      document.body.dataset.streamEnvelopeVersion = String(lastRenderedFrameEnvelopeVersion || lastAcceptedFrameEnvelopeVersion || '');
+      document.body.dataset.streamActionFresh = String(Boolean(streamFreshness.actionFresh));
+      document.body.dataset.streamStaleIngressDropped = String(staleIngressDroppedFrames);
+      document.body.dataset.streamFeedbackGeneration = String(activeFeedbackConfigGeneration);
+      document.body.dataset.streamFeedbackReceivedSequence = String(feedbackReceivedSequence);
+      document.body.dataset.streamFeedbackDecodedSequence = String(feedbackDecodedSequence);
+      document.body.dataset.streamFeedbackRenderedSequence = String(feedbackRenderedSequence);
+      document.body.dataset.streamFeedbackPresentedSequence = String(feedbackPresentedSequence);
+      document.body.dataset.streamClockBound = String(streamClockBoundIsCurrent(performance.now()));
     }
   }
 
   function readUint64(view, offset) {
-    return view.getUint32(offset) * 4294967296 + view.getUint32(offset + 4);
+    const high = view.getUint32(offset);
+    const low = view.getUint32(offset + 4);
+    if (high > 0x1fffff) return null;
+    return high * 4294967296 + low;
   }
 
   function parseFrameEnvelope(raw) {
+    if (!(raw instanceof ArrayBuffer)) return null;
     const data = new Uint8Array(raw);
     const view = new DataView(raw);
-    if (data.byteLength >= FRAME_ENVELOPE_HEADER_BYTES && view.getUint32(0) === FRAME_ENVELOPE_MAGIC) {
+    const magic = data.byteLength >= 4 ? view.getUint32(0) : 0;
+    if (data.byteLength > 93 && data.byteLength - 93 <= streamMaxVideoPayloadBytes && magic === 0x54534633) {
       const flags = view.getUint8(4);
-      return {
-        version: 'tsf2',
-        kind: (flags & 1) === 1 ? 'key' : 'delta',
-        epoch: readUint64(view, 5),
-        sequence: readUint64(view, 13),
-        timestamp: readUint64(view, 21),
-        data: data.slice(FRAME_ENVELOPE_HEADER_BYTES)
-      };
+      const values = [5, 13, 21, 29, 37, 45, 53, 61, 69, 77, 85]
+        .map((offset) => readUint64(view, offset));
+      if (!values.some((value) => value === null)) {
+        const [epoch, sequence, attempt, codecGeneration, captureStart, captureComplete,
+          codecInput, codecOutput, emission, calibrationGeneration, uncertainty] = values;
+        return {
+          version: 'tsf3',
+          kind: (flags & 1) === 1 ? 'key' : 'delta',
+          epoch,
+          sequence,
+          attempt,
+          codecGeneration,
+          captureStart,
+          captureComplete,
+          codecInput,
+          codecOutput,
+          emission,
+          calibrationGeneration,
+          uncertainty,
+          timestamp: captureStart,
+          data: data.slice(93)
+        };
+      }
+    } else if (data.byteLength > FRAME_ENVELOPE_HEADER_BYTES &&
+      data.byteLength - FRAME_ENVELOPE_HEADER_BYTES <= streamMaxVideoPayloadBytes && magic === FRAME_ENVELOPE_MAGIC) {
+      const flags = view.getUint8(4);
+      const epoch = readUint64(view, 5);
+      const sequence = readUint64(view, 13);
+      const timestamp = readUint64(view, 21);
+      if (epoch !== null && sequence !== null && timestamp !== null) {
+        return {
+          version: 'tsf2',
+          kind: (flags & 1) === 1 ? 'key' : 'delta',
+          epoch,
+          sequence,
+          timestamp,
+          data: data.slice(FRAME_ENVELOPE_HEADER_BYTES)
+        };
+      }
     }
-    sendVideoClientLog('invalid_tsf2_frame', `bytes=${data.byteLength}`);
+    sendVideoClientLog('invalid_tsf2_frame', `reason=invalid_frame_envelope bytes=${data.byteLength}`);
     showUnsupported('Video stream sent an invalid frame. Refresh and try again.');
     return null;
   }
@@ -4233,18 +4737,56 @@ import {
   }
 
   function acceptFreshFrame(frame) {
-    if (!frame) return false;
-    const now = performance.now();
+    const admission = evaluateFreshFrame(frame);
+    if (!admission) return false;
+    if (!commitFrameReceipt(frame, admission)) {
+      decoderRejectedFrames += 1;
+      return false;
+    }
+    commitFreshFrame(frame, admission);
+    return true;
+  }
+
+  function noteFramePacket(frame, now) {
+    if (!frame) return;
     lastPacketAt = now;
     if (frame.sequence && frame.sequence > lastPacketSequence) {
       lastPacketSequence = frame.sequence;
       lastPacketSequenceAdvancedAt = now;
     }
-    if (frame.timestamp) {
-      lastPacketTimestamp = frame.timestamp;
-    }
+    if (frame.timestamp) lastPacketTimestamp = frame.timestamp;
+  }
+
+  function frameVisualAgeAtAdmission(frame, now) {
+    const captureStart = Number(frame && frame.version === 'tsf3' ? frame.captureStart : 0);
+    const uncertaintyMicros = Number(frame && frame.version === 'tsf3' ? frame.uncertainty : -1);
+    const serverUpperUnixMicros = streamClockServerUpperAt(now);
+    const known = frame && frame.version === 'tsf3' &&
+      Number.isSafeInteger(captureStart) && captureStart > 0 &&
+      Number.isSafeInteger(uncertaintyMicros) && uncertaintyMicros >= 0 &&
+      serverUpperUnixMicros > 0;
+    return {
+      visualAgeMillis: known
+        ? (Math.max(0, serverUpperUnixMicros - captureStart) + uncertaintyMicros) / 1000
+        : 0,
+      visualAgeKnown: Boolean(known),
+      visualAgeConservative: Boolean(known),
+      envelopeVersion: String(frame && frame.version || '')
+    };
+  }
+
+  function evaluateFreshFrame(frame) {
+    if (!frame) return null;
+    const now = performance.now();
+    noteFramePacket(frame, now);
+    const frameEpoch = Number(frame.epoch || 0);
+    const frameSequence = Number(frame.sequence || 0);
+    const frameTimestamp = Number(frame.timestamp || 0);
+    if (!Number.isSafeInteger(frameEpoch) || frameEpoch <= 0 ||
+      !Number.isSafeInteger(frameSequence) || frameSequence <= 0 ||
+      !Number.isSafeInteger(frameTimestamp) || frameTimestamp <= 0) return null;
     if (currentStreamEpoch && frame.epoch && frame.epoch !== currentStreamEpoch) {
-      return false;
+      return null;
     }
     const frameDependencyMode = String(lastDecoderConfig && lastDecoderConfig.frameDependencyMode || '').toLowerCase();
     const allIntraConfigValid = frameDependencyMode === 'all_intra' &&
@@ -4260,7 +4802,18 @@ import {
       });
       requestKeyframeDebounced('all_intra_config_rejected', recoveryKeyframeDebounceMs, false);
       scheduleStreamFeedback('all_intra_config_rejected');
-      return false;
+      return null;
+    }
+    const advertisedEnvelope = String(lastDecoderConfig && lastDecoderConfig.frameEnvelope || '').toLowerCase();
+    if (advertisedEnvelope && advertisedEnvelope !== String(frame.version || '').toLowerCase()) {
+      needsKeyFrame = true;
+      sendVideoClientLog('invalid_tsf2_frame', {
+        reason: 'frame_envelope_mismatch',
+        advertisedEnvelope,
+        receivedEnvelope: String(frame.version || '')
+      });
+      scheduleStreamFeedback('frame_envelope_mismatch');
+      return null;
     }
     if (frame.kind !== 'key') {
       needsKeyFrame = true;
@@ -4271,12 +4824,27 @@ import {
       });
       requestKeyframeDebounced('all_intra_delta_rejected', recoveryKeyframeDebounceMs, false);
       scheduleStreamFeedback('all_intra_delta_rejected');
-      return false;
+      return null;
     }
-    if (frame.sequence && frame.sequence <= lastAcceptedFrameSequence) {
-      return false;
+    if (frame.sequence && frame.sequence <= Math.max(lastReceivedFrameSequence, lastAcceptedFrameSequence)) {
+      return null;
     }
-    const frameEpoch = Number(frame.epoch || 0);
+    const age = frameVisualAgeAtAdmission(frame, now);
+    return {
+      epoch: frameEpoch,
+      sequence: frameSequence,
+      timestamp: frameTimestamp,
+      receivedAt: now,
+      configGeneration: activeFeedbackConfigGeneration,
+      ...age
+    };
+  }
+
+  function commitFrameReceipt(frame, admission) {
+    if (!frame || !admission) return false;
+    const receiptGeneration = Number(admission.configGeneration || 0);
+    if (activeFeedbackVersion === 2 && receiptGeneration !== activeFeedbackConfigGeneration) return false;
+    const frameEpoch = Number(admission.epoch || 0);
     if (!currentStreamEpoch && frameEpoch > 0) {
       // A warm join can intentionally receive a provisional decoder config
       // with epoch 0 while the server waits for a fresh independent frame.
@@ -4285,13 +4853,29 @@ import {
         lastDecoderConfig = { ...lastDecoderConfig, streamEpoch: frameEpoch, provisional: false };
       }
     }
+    lastReceivedFrameSequence = Number(admission.sequence || 0);
+    lastReceivedFrameConfigGeneration = receiptGeneration;
+    if (activeFeedbackVersion > 0 &&
+      (activeFeedbackVersion === 1 || lastReceivedFrameConfigGeneration === activeFeedbackConfigGeneration)) {
+      feedbackReceivedSequence = Math.max(feedbackReceivedSequence, lastReceivedFrameSequence);
+      scheduleStreamFeedback('frame_received');
+    }
+    return true;
+  }
+
+  function commitFreshFrame(frame, admission) {
+    if (!frame || !admission) return false;
     needsKeyFrame = false;
-    if (frame.sequence) lastAcceptedFrameSequence = frame.sequence;
-    if (frame.timestamp) lastAcceptedFrameTimestamp = frame.timestamp;
-    const captureWallMillis = frame.timestamp ? frame.timestamp / 1000 : 0;
-    lastAcceptedFrameReceivedAt = now;
-    const calibratedServerNowMillis = Date.now() + (serverClockHasLiveSample ? serverClockSkewMs : 0);
-    lastAcceptedFrameVisualAgeMillis = captureWallMillis > 0 ? Math.max(0, calibratedServerNowMillis - captureWallMillis) : 0;
+    lastAcceptedFrameSequence = Number(admission.sequence || 0);
+    lastAcceptedFrameTimestamp = Number(admission.timestamp || 0);
+    lastAcceptedFrameReceivedAt = Number(admission.receivedAt || performance.now());
+    lastAcceptedFrameVisualAgeMillis = Number(admission.visualAgeMillis || 0);
+    lastAcceptedFrameVisualAgeKnown = Boolean(admission.visualAgeKnown);
+    lastAcceptedFrameVisualAgeConservative = Boolean(admission.visualAgeConservative);
+    lastAcceptedFrameEnvelopeVersion = String(admission.envelopeVersion || frame.version || '');
+    lastAcceptedFrameConfigGeneration = Number(admission.configGeneration || 0);
+    lastStaleIngressDropAt = 0;
+    resetVideoReconnectBackoff('fresh_frame');
     return true;
   }
 
@@ -4302,7 +4886,10 @@ import {
       timestamp: Number(frame && frame.timestamp || 0),
       keyFrame: frame && frame.kind === 'key',
       visualAgeMillis: Number(lastAcceptedFrameVisualAgeMillis || 0),
-      visualAgeKnown: Boolean(serverClockHasLiveSample),
+      visualAgeKnown: Boolean(lastAcceptedFrameVisualAgeKnown),
+      visualAgeConservative: Boolean(lastAcceptedFrameVisualAgeConservative),
+      envelopeVersion: String(lastAcceptedFrameEnvelopeVersion || ''),
+      configGeneration: Number(lastAcceptedFrameConfigGeneration || 0),
       receivedAt: lastAcceptedFrameReceivedAt,
       queuedAt: performance.now()
     };
@@ -4343,7 +4930,10 @@ import {
       sequence: lastAcceptedFrameSequence,
       timestamp: lastAcceptedFrameTimestamp,
       visualAgeMillis: Number(lastAcceptedFrameVisualAgeMillis || 0),
-      visualAgeKnown: Boolean(serverClockHasLiveSample),
+      visualAgeKnown: Boolean(lastAcceptedFrameVisualAgeKnown),
+      visualAgeConservative: Boolean(lastAcceptedFrameVisualAgeConservative),
+      envelopeVersion: String(lastAcceptedFrameEnvelopeVersion || ''),
+      configGeneration: Number(lastAcceptedFrameConfigGeneration || 0),
       receivedAt: lastAcceptedFrameReceivedAt,
       queuedAt: lastAcceptedFrameQueuedAt
     };
@@ -4505,7 +5095,23 @@ import {
       decoderRejectedFrames += 1;
       return;
     }
+    if (activeFeedbackVersion === 2 &&
+      Number(metadata.configGeneration || 0) !== activeFeedbackConfigGeneration) {
+      try { frame.close(); } catch (_) {}
+      decoderRejectedFrames += 1;
+      return;
+    }
+    lastDecodedFrameAt = decodedAtPerformanceMillis;
     lastDecodedFrameSequence = Number(metadata.sequence || lastDecodedFrameSequence || 0);
+    lastDecodedFrameConfigGeneration = Number(metadata.configGeneration || 0);
+    if (activeFeedbackVersion > 0 &&
+      (activeFeedbackVersion === 1 || lastDecodedFrameConfigGeneration === activeFeedbackConfigGeneration)) {
+      feedbackDecodedSequence = Math.max(
+        feedbackDecodedSequence,
+        Math.min(feedbackReceivedSequence, lastDecodedFrameSequence)
+      );
+      scheduleStreamFeedback('frame_decoded');
+    }
     if (!firstDecodedTraceSent) {
       firstDecodedTraceSent = true;
       sendVideoSocketClientLog('browser_first_frame_decoded', {
@@ -4546,6 +5152,10 @@ import {
       let msg;
       try { msg = JSON.parse(event.data); } catch (_) { return; }
       if (!checkServerVersion(msg)) return;
+      if (msg.type === 'clock_probe_result') {
+        handleStreamClockProbeResult(msg, event.browserReceiveUnixMicros, event.browserReceiveAt);
+        return;
+      }
       if (msg.type === 'config') {
         await configureDecoder(msg);
       }
@@ -4553,23 +5163,43 @@ import {
     }
     if (!configured) return;
     const frame = parseFrameEnvelope(event.data);
-    if (!acceptFreshFrame(frame)) {
+    const admission = evaluateFreshFrame(frame);
+    if (!admission) {
       decoderRejectedFrames += 1;
       if (frame && frame.kind !== 'key' && needsKeyFrame) resyncDroppedFrames += 1;
       return;
     }
-    lastAcceptedFrameQueuedAt = performance.now();
-    const sourceFrameTooOld = serverClockHasLiveSample && Number(lastAcceptedFrameVisualAgeMillis || 0) > streamIngressFrameMaxAgeMs;
-    if (Number(decoder && decoder.decodeQueueSize || 0) > streamDecoderQueueHardLimit || sourceFrameTooOld) {
+    // Receipt is a transport fact: this complete, structurally valid frame
+    // reached the current config/epoch in strict sequence. A source-age or
+    // local decoder drop below must not make the relay wait for it again.
+    if (!commitFrameReceipt(frame, admission)) {
+      decoderRejectedFrames += 1;
+      return;
+    }
+    const sourceFrameTooOld = admission.visualAgeKnown &&
+      Number(admission.visualAgeMillis || 0) > streamIngressFrameMaxAgeMs;
+    if (sourceFrameTooOld) {
+      // Every admitted picture is independently decodable. Dropping this one
+      // is sufficient; resetting the decoder would only turn delay into a
+      // visible interruption and cannot make the already-late picture newer.
+      staleIngressDroppedFrames += 1;
+      lastStaleIngressDropAt = performance.now();
+      decoderRejectedFrames += 1;
+      publishStreamDebug();
+      return;
+    }
+    if (Number(decoder && decoder.decodeQueueSize || 0) > streamDecoderQueueHardLimit) {
       clearFrameMetadata();
       needsKeyFrame = true;
-      const hardReason = sourceFrameTooOld ? 'visual_age_overflow' : 'decoder_queue_overflow';
+      const hardReason = 'decoder_queue_overflow';
       if (!resetDecoderForRecovery(hardReason)) {
         requestKeyframe(hardReason);
         scheduleStreamFeedback(hardReason);
       }
       return;
     }
+    commitFreshFrame(frame, admission);
+    lastAcceptedFrameQueuedAt = performance.now();
     if (decoderMode === 'avc') {
       decodeAvcFrame(frame);
       return;
@@ -4627,12 +5257,13 @@ import {
     latestStreamStatus = msg;
     lastStreamStatusAt = performance.now();
     const freshness = updateStreamFreshnessStatus('stream_status');
-    if (hasRenderedFrame && (streamStatusStale(msg) || !freshness.liveLabeled)) {
+    const healthyCadenceContinuity = healthyOneFPSVisualContinuity(freshness);
+    if (hasRenderedFrame && streamStatusStale(msg) && !healthyCadenceContinuity) {
       preserveCurrentFrame('stream_status_stale');
       redrawPreservedFrame();
       showStreamResumeSpinner();
     } else if (hasRenderedFrame) {
-      hideStreamResumeSpinner();
+      reconcileStreamResumeSpinner(freshness, 'stream_status');
     }
     // Surface the server's phone-engine readiness verdict to the user.
     // The server reports streamVerdict in {live, idle, preparing_phone,
@@ -4652,19 +5283,20 @@ import {
   }
 
   function decodedFrameHDRMetadata(frameMetadata, presentationOrdinal, renderedAt) {
-    const captureWallMillis = Number(frameMetadata && frameMetadata.timestamp || 0) / 1000;
     const metadataAge = frameMetadata && frameMetadata.visualAgeKnown
       ? Math.max(0, Number(frameMetadata.visualAgeMillis || 0))
-      : (captureWallMillis > 0 && serverClockHasLiveSample
-        ? Math.max(0, Date.now() + serverClockSkewMs - captureWallMillis)
-        : 0);
+      : 0;
     const receivedAt = Number(frameMetadata && frameMetadata.receivedAt || lastAcceptedFrameReceivedAt || renderedAt);
     return {
       epoch: Number(frameMetadata && frameMetadata.epoch || 0),
       sequence: Number(frameMetadata && frameMetadata.sequence || 0),
+      configGeneration: Number(frameMetadata && frameMetadata.configGeneration || 0),
       presentationOrdinal: Number(presentationOrdinal || 0),
       timestamp: Number(frameMetadata && frameMetadata.timestamp || 0),
       visualAgeMillis: metadataAge + Math.max(0, renderedAt - receivedAt),
+      visualAgeKnown: Boolean(frameMetadata && frameMetadata.visualAgeKnown),
+      visualAgeConservative: Boolean(frameMetadata && frameMetadata.visualAgeConservative),
+      envelopeVersion: String(frameMetadata && frameMetadata.envelopeVersion || ''),
       renderedAt,
       offeredAt: renderedAt,
       offeredWallMillis: Date.now()
@@ -4687,8 +5319,10 @@ import {
   function coordinatedDecodedFrameCanCommit(candidate) {
     const epoch = Number(candidate && candidate.epoch || 0);
     const sequence = Number(candidate && candidate.sequence || 0);
+    const configGeneration = Number(candidate && candidate.configGeneration || 0);
     const activeEpoch = Number(currentStreamEpoch || epoch);
-    if (!(epoch > 0) || !(sequence > 0) || (activeEpoch > 0 && activeEpoch !== epoch)) return false;
+    if (!(epoch > 0) || !(sequence > 0) || (activeEpoch > 0 && activeEpoch !== epoch) ||
+      (activeFeedbackVersion === 2 && configGeneration !== activeFeedbackConfigGeneration)) return false;
     if (Number(lastRenderedFrameEpoch || 0) === epoch && Number(lastRenderedFrameSequence || 0) >= sequence) return false;
     return true;
   }
@@ -4697,16 +5331,34 @@ import {
     const epoch = Number(candidate && candidate.epoch || 0);
     const sequence = Number(candidate && candidate.sequence || 0);
     const presentationOrdinal = Number(candidate && candidate.presentationOrdinal || 0);
+    const configGeneration = Number(candidate && candidate.configGeneration || 0);
     const timestamp = Number(candidate && candidate.timestamp || 0);
     return Boolean(
       expectedDecoderGeneration === decoderGeneration &&
       expectedSDRRenderSerial === authoritativeSDRRenderSerial &&
       epoch > 0 && sequence > 0 && presentationOrdinal > 0 &&
+      (activeFeedbackVersion !== 2 || configGeneration === activeFeedbackConfigGeneration) &&
       Number(lastRenderedFrameEpoch || 0) === epoch &&
       Number(lastRenderedFrameSequence || 0) === sequence &&
       Number(lastRenderedPresentationOrdinal || 0) === presentationOrdinal &&
       Number(lastRenderedFrameTimestamp || 0) === timestamp
     );
+  }
+
+  function commitControlCodeFeedbackPresentation(proof) {
+    const epoch = Number(proof && proof.candidateFrameEpoch || 0);
+    const sequence = Number(proof && proof.candidateFrameSequence || 0);
+    const configGeneration = Number(proof && proof.candidateFrameConfigGeneration || 0);
+    if (activeFeedbackVersion !== 2) return activeFeedbackVersion === 1;
+    if (configGeneration !== activeFeedbackConfigGeneration ||
+      epoch !== Number(currentStreamEpoch || 0) || !(sequence > 0) ||
+      sequence > feedbackRenderedSequence) return false;
+    lastPresentedFrameConfigGeneration = configGeneration;
+    feedbackPresentedSequence = Math.max(feedbackPresentedSequence, sequence);
+    scheduleStreamFeedback('control_code_result_presented');
+    clearControlCodeResultPriority();
+    publishStreamDebug();
+    return true;
   }
 
   function renderDecodedFrame(frame, source) {
@@ -4747,16 +5399,31 @@ import {
       lastRenderedPresentationOrdinal += 1;
       authoritativeSDRRenderSerial += 1;
       lastFrameAt = performance.now();
-      lastDecodedFrameAt = lastFrameAt;
-      lastDecodedFrameSequence = Number(frameMetadata.sequence || lastAcceptedFrameSequence || 0);
       lastRenderedFrameReceivedAt = Number(frameMetadata.receivedAt || lastAcceptedFrameReceivedAt || lastFrameAt);
       lastRenderedFrameQueuedAt = Number(frameMetadata.queuedAt || lastAcceptedFrameQueuedAt || lastFrameAt);
       lastRenderedFrameRenderedAt = lastFrameAt;
       lastRenderedFrameEpoch = Number(frameMetadata.epoch || 0);
       lastRenderedFrameSequence = Number(frameMetadata.sequence || 0);
+      lastRenderedFrameConfigGeneration = Number(frameMetadata.configGeneration || 0);
       lastRenderedFrameTimestamp = Number(frameMetadata.timestamp || 0);
       const hdrMetadata = decodedFrameHDRMetadata(frameMetadata, lastRenderedPresentationOrdinal, lastFrameAt);
       lastRenderedFrameVisualAgeMillis = hdrMetadata.visualAgeMillis;
+      lastRenderedFrameVisualAgeKnown = hdrMetadata.visualAgeKnown;
+      lastRenderedFrameVisualAgeConservative = hdrMetadata.visualAgeConservative;
+      lastRenderedFrameEnvelopeVersion = hdrMetadata.envelopeVersion;
+      if (activeFeedbackVersion > 0 &&
+        (activeFeedbackVersion === 1 || lastRenderedFrameConfigGeneration === activeFeedbackConfigGeneration)) {
+        feedbackRenderedSequence = Math.max(
+          feedbackRenderedSequence,
+          Math.min(feedbackDecodedSequence, lastRenderedFrameSequence)
+        );
+        if (frameMetadata.keyFrame) {
+          feedbackRenderedKeyframeSequence = Math.max(
+            feedbackRenderedKeyframeSequence,
+            feedbackRenderedSequence
+          );
+        }
+      }
       if (typeof experimentalClientHDRController !== 'undefined' && experimentalClientHDRController &&
         typeof experimentalMediaState !== 'undefined' && experimentalMediaState.enabled &&
         experimentalMediaState.engine === CLIENT_HDR_ENGINE &&
@@ -4791,6 +5458,7 @@ import {
       }
       firstFrameReceived = true;
       hasRenderedFrame = true;
+      scheduleStreamFeedback('frame_rendered');
       resetFirstFrameServerRecovery();
       const firstFrameDetail = {
         visualAgeMillis: Math.round(lastRenderedFrameVisualAgeMillis),
@@ -4815,7 +5483,6 @@ import {
       observeTicketCurrentProofFrame();
       updateControlCodeSubmitAvailability();
       publishStreamDebug();
-      scheduleStreamFeedback('frame_presented');
       return hdrMetadata;
     } catch (error) {
       sendVideoClientLog('decoded_frame_render_failed', `${source || 'decoder'}:${error && error.message || 'draw failed'}`);
@@ -4838,11 +5505,16 @@ import {
     options = options || {};
     const configureGeneration = ++decoderConfigureGeneration;
     const frameDependencyMode = String(config.frameDependencyMode || '').toLowerCase();
+    const frameEnvelope = String(config.frameEnvelope || 'tsf2').toLowerCase();
+    const feedbackContract = advertisedStreamFeedbackContract(config);
     if (frameDependencyMode !== 'all_intra' || Number(config.fps) !== 1 ||
-      Number(config.sourceFps) !== 1 || Number(config.keyframeIntervalFrames) !== 1) {
-      lastDecoderConfig = { ...config, frameDependencyMode };
+      Number(config.sourceFps) !== 1 || Number(config.keyframeIntervalFrames) !== 1 ||
+      (frameEnvelope !== 'tsf2' && frameEnvelope !== 'tsf3') || !feedbackContract.valid) {
+      lastDecoderConfig = { ...config, frameDependencyMode, frameEnvelope };
       needsKeyFrame = true;
-      sendVideoClientLog('invalid_tsf2_frame', { reason: 'all_intra_config_rejected' });
+      sendVideoClientLog('invalid_tsf2_frame', {
+        reason: feedbackContract.valid ? 'all_intra_config_rejected' : 'feedback_config_rejected'
+      });
       closeDecoder();
       showStreamRecovery();
       scheduleStreamFeedback('all_intra_config_rejected');
@@ -4889,11 +5561,16 @@ import {
     }
     const previousSequence = lastAcceptedFrameSequence;
     const previousTimestamp = lastAcceptedFrameTimestamp;
+    const previousAcceptedConfigGeneration = lastAcceptedFrameConfigGeneration;
+    const previousDecodedSequence = lastDecodedFrameSequence;
+    const previousDecodedConfigGeneration = lastDecodedFrameConfigGeneration;
+    const feedbackContractChanged = feedbackContract.version !== activeFeedbackVersion ||
+      feedbackContract.generation !== activeFeedbackConfigGeneration;
     const shouldPreserveFrame = Boolean(options.preserveFrame) || hasRenderedFrame || fallbackFrameAvailable;
     if (shouldPreserveFrame) {
       preserveCurrentFrame('configure_decoder');
     }
-    lastDecoderConfig = { ...config, frameDependencyMode: 'all_intra' };
+    lastDecoderConfig = { ...config, frameDependencyMode: 'all_intra', frameEnvelope };
     closeDecoder();
     decoderMode = preferAvc ? 'avc' : 'annexb';
     if (preferAvc) {
@@ -4916,14 +5593,33 @@ import {
       sourceVisibleHeight: Number(config.sourceVisibleHeight || config.sourceHeight || height) || height
     };
     currentStreamEpoch = Number(config.streamEpoch || 0);
-    lastAcceptedFrameSequence = options.preserveSequence ? previousSequence : 0;
-    lastAcceptedFrameTimestamp = options.preserveSequence ? previousTimestamp : 0;
+    const preserveSequence = Boolean(options.preserveSequence) && !feedbackContractChanged;
+    if (!preserveSequence) {
+      lastReceivedFrameSequence = 0;
+      lastReceivedFrameConfigGeneration = 0;
+    }
+    lastAcceptedFrameSequence = preserveSequence ? previousSequence : 0;
+    lastAcceptedFrameTimestamp = preserveSequence ? previousTimestamp : 0;
+    lastAcceptedFrameVisualAgeMillis = 0;
+    lastAcceptedFrameVisualAgeKnown = false;
+    lastAcceptedFrameVisualAgeConservative = false;
+    lastAcceptedFrameEnvelopeVersion = '';
+    lastAcceptedFrameConfigGeneration = preserveSequence ? previousAcceptedConfigGeneration : 0;
     clearFrameMetadata();
-    lastDecodedFrameSequence = options.preserveSequence ? previousSequence : 0;
+    lastDecodedFrameSequence = preserveSequence ? previousDecodedSequence : 0;
+    lastDecodedFrameConfigGeneration = preserveSequence ? previousDecodedConfigGeneration : 0;
     needsKeyFrame = true;
     configured = true;
     configuredAt = performance.now();
     firstFrameReceived = false;
+    if (feedbackContractChanged) {
+      invalidateBrowserActionContext('stream_config_changed');
+      cancelTicketRegisterSliderSession('stream_config_changed');
+    }
+    activateStreamFeedbackContract(config);
+    reconcileControlCodeResultPriority(codeRequest);
+    updateStreamFreshnessStatus('config_accepted');
+    renderTicketInteraction(currentState && currentState.ticketInteraction);
     resizeCanvasBox();
     if (preferAvc) {
       decoderConfigured = false;
@@ -5307,52 +6003,33 @@ import {
     return 0;
   }
 
-  function controlCodeDetailText(request) {
-    if (!request) return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
-    if (request.status === 'queued') {
-      const position = Number(request.queuePosition || 0);
-      if (position > 1) return `Rindā: ${position}. vieta`;
-      return localizePublicMessage(request.reason || request.message || 'waiting_for_stream_recovery');
+  function scheduleControlCodeExpiry(request) {
+    if (codeResultExpiryTimer) {
+      clearTimeout(codeResultExpiryTimer);
+      codeResultExpiryTimer = null;
     }
-    if (request.status === 'running') return 'Tālrunis īsi atver koda logu un atgriezīsies pie biļetes.';
-    if (request.status === 'succeeded') return 'Rezultāts redzams tikai tev 60 sekundes vai līdz to aizvērsi.';
-    if (request.status === 'failed') return localizePublicMessage(request.reason || request.message || 'Kodu neizdevās izveidot');
-    if (request.status === 'expired' || request.status === 'closed') return 'Vari pieprasīt jaunu kodu.';
-    return 'Ievadi 2-8 ciparus, tālrunis kodu izveidos automātiski.';
-  }
-
-  function scheduleControlCodeTicker(request) {
-    if (codeResultTickTimer) {
-      clearInterval(codeResultTickTimer);
-      codeResultTickTimer = null;
-    }
-    codeResultTimer.textContent = '';
     if (!request || request.status !== 'succeeded') return;
     const expiresAt = Date.parse(request.resultExpiresAt || '');
     if (!Number.isFinite(expiresAt)) return;
     const requestID = request.requestId;
-    const refresh = () => {
+    const expire = () => {
+      codeResultExpiryTimer = null;
       if (!codeRequest || codeRequest.requestId !== requestID || codeRequest.status !== 'succeeded') {
-        if (codeResultTickTimer) {
-          clearInterval(codeResultTickTimer);
-          codeResultTickTimer = null;
-        }
         return;
       }
       const remainingMs = expiresAt - (Date.now() + serverClockSkewMs);
-      if (remainingMs <= 0) {
-        if (codeResultTickTimer) {
-          clearInterval(codeResultTickTimer);
-          codeResultTickTimer = null;
-        }
-        codeResultTimer.textContent = '';
-        closeCurrentControlCode(false);
+      if (remainingMs > 0) {
+        codeResultExpiryTimer = setTimeout(expire, remainingMs);
         return;
       }
-      codeResultTimer.textContent = `${Math.ceil(remainingMs / 1000)}s`;
+      closeCurrentControlCode(false);
     };
-    refresh();
-    codeResultTickTimer = setInterval(refresh, 1000);
+    const remainingMs = expiresAt - (Date.now() + serverClockSkewMs);
+    if (remainingMs <= 0) {
+      expire();
+      return;
+    }
+    codeResultExpiryTimer = setTimeout(expire, remainingMs);
   }
 
   function setControlCodeResultVisible(visible) {
@@ -5452,13 +6129,14 @@ import {
 
   function clearControlCodeRequestLocalState(reason) {
     const requestID = String(codeRequest && codeRequest.requestId || '').trim();
+    clearControlCodeResultPriority();
     if (controlCodeCleanupPendingRequestID &&
       (!requestID || controlCodeCleanupPendingRequestID === requestID)) {
       controlCodeCleanupPendingRequestID = '';
     }
     codeRequest = null;
     clearControlCodeResultCapture();
-    scheduleControlCodeTicker(null);
+    scheduleControlCodeExpiry(null);
     if (requestID) clientLog('control_code_request_cleared', reason || 'authoritative_state');
   }
 
@@ -5839,8 +6517,12 @@ import {
 
   function controlCodeMarkerReady(request) {
     if (!request || request.status !== 'succeeded') return false;
-    const markerEpoch = Number(request.resultFrameEpoch || request.streamEpoch || 0);
-    const markerSequence = Number(request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence || 0);
+    const markerEpoch = firstPositiveSafeInteger(request.resultFrameEpoch, request.streamEpoch);
+    const markerSequence = firstPositiveSafeInteger(
+      request.resultMinFrameSequence,
+      request.minFrameSequence,
+      request.frameSequence
+    );
     if (!markerEpoch || !markerSequence || !hasRenderedFrame) return false;
     const renderedEpoch = controlCodeRenderedFrameEpoch();
     const renderedSequence = controlCodeRenderedFrameSequence();
@@ -5859,10 +6541,19 @@ import {
     const payload = Object.assign({
       requestKey: requestID ? accountPublicId(requestID) : '',
       status: String(request && request.status || ''),
-      markerEpoch: Number((proof && proof.markerEpoch) || (request && (request.resultFrameEpoch || request.streamEpoch)) || 0),
-      markerSequence: Number((proof && proof.markerSequence) || (request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence)) || 0),
-      candidateFrameEpoch: Number(proof && proof.candidateFrameEpoch || controlCodeRenderedFrameEpoch() || 0),
-      candidateFrameSequence: Number(proof && proof.candidateFrameSequence || controlCodeRenderedFrameSequence() || 0),
+      markerEpoch: firstPositiveSafeInteger(
+        proof && proof.markerEpoch,
+        request && request.resultFrameEpoch,
+        request && request.streamEpoch
+      ),
+      markerSequence: firstPositiveSafeInteger(
+        proof && proof.markerSequence,
+        request && request.resultMinFrameSequence,
+        request && request.minFrameSequence,
+        request && request.frameSequence
+      ),
+      candidateFrameEpoch: firstPositiveSafeInteger(proof && proof.candidateFrameEpoch, controlCodeRenderedFrameEpoch()),
+      candidateFrameSequence: firstPositiveSafeInteger(proof && proof.candidateFrameSequence, controlCodeRenderedFrameSequence()),
       safeGeneratedFrameCount: Number(proof && proof.safeGeneratedFrameCount || controlCodeSafeGeneratedFrameCount || 0),
       keyframeRetryCount: Number(lastControlCodeCaptureKeyframeRetryCount || 0)
     }, detail || {});
@@ -5955,8 +6646,15 @@ import {
 
   function controlCodeCandidateFrameProof(request) {
     const requestID = String(request && request.requestId || '').trim();
-    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
-    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    const markerEpoch = firstPositiveSafeInteger(
+      request && request.resultFrameEpoch,
+      request && request.streamEpoch
+    );
+    const markerSequence = firstPositiveSafeInteger(
+      request && request.resultMinFrameSequence,
+      request && request.minFrameSequence,
+      request && request.frameSequence
+    );
     const proof = {
       accepted: false,
       requestId: requestID,
@@ -5966,6 +6664,7 @@ import {
       markerReceivedAgeMillis: controlCodeMarkerReceivedAgeMillis(request),
       candidateFrameEpoch: controlCodeRenderedFrameEpoch(),
       candidateFrameSequence: controlCodeRenderedFrameSequence(),
+      candidateFrameConfigGeneration: Number(lastRenderedFrameConfigGeneration || 0),
       candidateAccepted: false,
       candidateRejectedReason: '',
       fingerprintDifferenceScore: 0,
@@ -6272,8 +6971,6 @@ import {
     codeResultValue.hidden = true;
     codeResultValue.textContent = '';
     codeResultValue.style.display = '';
-    codeResultTimer.hidden = false;
-    codeResultTimer.textContent = '';
     codeResultArea.dataset.status = 'succeeded';
     codeResultArea.style.background = '#000';
     let painted = false;
@@ -6305,6 +7002,7 @@ import {
       }
       if (!revealed) return false;
       if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
+      if (!commitControlCodeFeedbackPresentation(proof)) return false;
       painted = true;
       if (controlCodePreparedCaptureDisplayedRequestID !== requestID) {
         controlCodePreparedCaptureDisplayedRequestID = requestID;
@@ -6355,8 +7053,15 @@ import {
 
   function noteControlCodeMarkerWaiting(request) {
     const requestID = String(request && request.requestId || '').trim();
-    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
-    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    const markerEpoch = firstPositiveSafeInteger(
+      request && request.resultFrameEpoch,
+      request && request.streamEpoch
+    );
+    const markerSequence = firstPositiveSafeInteger(
+      request && request.resultMinFrameSequence,
+      request && request.minFrameSequence,
+      request && request.frameSequence
+    );
     lastControlCodeCaptureDebug = {
       requestId: requestID,
       resultProof: String(request && request.resultProof || '').trim(),
@@ -6514,6 +7219,7 @@ import {
   }
 
   function failControlCodeResultScreenshotWait() {
+    clearControlCodeResultPriority();
     if (controlCodeResultCaptureTimer) {
       clearTimeout(controlCodeResultCaptureTimer);
       controlCodeResultCaptureTimer = null;
@@ -6529,11 +7235,10 @@ import {
     codeResultValue.hidden = true;
     codeResultValue.textContent = '';
     codeResultValue.style.display = '';
-    codeResultTimer.hidden = false;
   }
 
   function maybeCaptureControlCodeResultImage() {
-    if (!codeRequest || codeRequest.status !== 'succeeded') return false;
+    if (!codeRequest || codeRequest.status !== 'succeeded' || codeRequest.captureAcknowledged === true) return false;
     const requestID = String(codeRequest.requestId || '').trim();
     if (!requestID || controlCodeResultCapturedRequestID === requestID) return false;
     if (locallyClosedControlCodeRequestIDs.has(requestID)) return false;
@@ -6581,6 +7286,16 @@ import {
   function waitForControlCodeResultScreenshot(request) {
     const requestID = String(request && request.requestId || '').trim();
     if (!requestID) return;
+    // The acknowledged image belongs to the page that captured it. A reload
+    // cannot reconstruct those private pixels from later ticket frames. Keep
+    // an existing local result, but never restart capture or keyframe demand.
+    if (request.captureAcknowledged === true) {
+      if (controlCodeResultCaptureTimer) clearTimeout(controlCodeResultCaptureTimer);
+      controlCodeResultCaptureTimer = null;
+      controlCodeResultCaptureRequestID = '';
+      controlCodeResultCaptureStartedAt = 0;
+      return;
+    }
     if (controlCodeResultCapturedRequestID === requestID) return;
     if (locallyClosedControlCodeRequestIDs.has(requestID)) return;
     const resultAlreadyDisplayed = controlCodeResultDisplayedForRequest(requestID);
@@ -6597,8 +7312,15 @@ import {
         codeResultImage.removeAttribute('src');
       }
     }
-    const markerEpoch = Number(request && (request.resultFrameEpoch || request.streamEpoch) || 0);
-    const markerSequence = Number(request && (request.resultMinFrameSequence || request.minFrameSequence || request.frameSequence) || 0);
+    const markerEpoch = firstPositiveSafeInteger(
+      request && request.resultFrameEpoch,
+      request && request.streamEpoch
+    );
+    const markerSequence = firstPositiveSafeInteger(
+      request && request.resultMinFrameSequence,
+      request && request.minFrameSequence,
+      request && request.frameSequence
+    );
     const markerLogKey = [requestID, markerEpoch, markerSequence].join(':');
     if (markerLogKey !== lastControlCodeMarkerReceivedLogKey) {
       lastControlCodeMarkerReceivedLogKey = markerLogKey;
@@ -6615,7 +7337,6 @@ import {
       codeResultValue.hidden = true;
       codeResultValue.textContent = '';
       codeResultValue.style.display = '';
-      codeResultTimer.hidden = false;
     } else {
       codeResultArea.dataset.status = 'waiting';
       codeResultArea.style.background = '';
@@ -6624,8 +7345,6 @@ import {
       codeResultValue.hidden = true;
       codeResultValue.textContent = '';
       codeResultValue.style.display = '';
-      codeResultTimer.hidden = true;
-      codeResultTimer.textContent = '';
       setControlCodeResultVisible(false);
     }
     keepControlCodeVideoAlive('control_code_wait_reconnect');
@@ -6699,6 +7418,7 @@ import {
     const nextRequest = request || codeRequest;
     const renderSignature = normalizedControlCodeRequestSignature(nextRequest);
     codeRequest = nextRequest;
+    reconcileControlCodeResultPriority(codeRequest);
     updateControlCodeSubmitAvailability();
     if (renderSignature === lastRenderedControlCodeRequestSignature) return;
     lastRenderedControlCodeRequestSignature = renderSignature;
@@ -6708,15 +7428,14 @@ import {
       controlCodeSubmitInFlight = false;
     }
     const busy = current && (current.status === 'queued' || current.status === 'running');
-    codeRequestState.textContent = controlCodeStatusText(current && current.status, current && current.reason);
-    codeRequestDetail.textContent = controlCodeDetailText(current);
-    if (requestID && !requestID.startsWith('pending:') && current && (busy || current.status === 'succeeded')) {
+    if (requestID && !requestID.startsWith('pending:') && current &&
+      (busy || (current.status === 'succeeded' && current.captureAcknowledged !== true))) {
       rememberControlCodeBaselineFrame(requestID);
     }
     if (busy) {
       keepControlCodeVideoAlive('control_code_request_active');
       if (controlCodeResultDisplayedForRequest(currentRequestID)) {
-        scheduleControlCodeTicker(current);
+        scheduleControlCodeExpiry(current);
         return;
       }
       // The submission path captured the raw-ticket baseline before the
@@ -6726,7 +7445,7 @@ import {
       // the real-request baseline before the succeeded row arrived.
       setControlCodeResultVisible(false);
       clearUnpaintedControlCodeResultImage(currentRequestID);
-      scheduleControlCodeTicker(current);
+      scheduleControlCodeExpiry(current);
       return;
     }
     if (!current || current.status === 'closed' || current.status === 'expired') {
@@ -6739,14 +7458,12 @@ import {
       codeResultValue.textContent = '';
       codeResultValue.style.display = '';
       codeResultArea.style.background = '';
-      codeResultTimer.hidden = false;
-      codeResultTimer.textContent = '';
-      scheduleControlCodeTicker(null);
+      scheduleControlCodeExpiry(null);
       return;
     }
     if (current.status === 'succeeded') {
       waitForControlCodeResultScreenshot(current);
-      scheduleControlCodeTicker(current);
+      scheduleControlCodeExpiry(current);
       return;
     }
     if (current.status === 'failed') {
@@ -6759,14 +7476,12 @@ import {
       codeResultValue.textContent = '';
       codeResultValue.style.display = '';
       codeResultArea.style.background = '';
-      codeResultTimer.hidden = false;
-      codeResultTimer.textContent = '';
-      scheduleControlCodeTicker(null);
+      scheduleControlCodeExpiry(null);
       return;
     }
     setControlCodeResultVisible(false);
     clearControlCodeResultCapture();
-    scheduleControlCodeTicker(null);
+    scheduleControlCodeExpiry(null);
   }
 
   function setDetailsPanelVisible(visible) {
@@ -6804,12 +7519,13 @@ import {
   }
 
   function openControlCodeDialog() {
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
+    if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden) return false;
+    if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;
+    if (!controlCodeDialogEntryReady()) {
       setStatus('Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.');
       updateControlCodeSubmitAvailability();
       return false;
     }
-    if (controlCodeMutationLaneBusy()) return;
     if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
       try {
         document.exitFullscreen().catch(() => {});
@@ -6831,6 +7547,8 @@ import {
   }
 
   function closeControlCodeDialog() {
+    codeInputRevision++;
+    cancelPendingBrowserAction('code_dialog_closed', 'control_code');
     codeDialogOpen = false;
     if (codeDialog.contains(document.activeElement) && typeof document.activeElement.blur === 'function') {
       try {
@@ -6861,33 +7579,34 @@ import {
       event.preventDefault();
       event.stopPropagation();
     }
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
-      setStatus('Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.');
-      updateControlCodeSubmitAvailability();
-      return false;
-    }
     if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden || ticketRegisterOverlayOccupiesHotspot()) return;
-    if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;
-    openControlCodeDialog();
+    if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;
+    return openControlCodeDialog();
   }
 
   async function submitControlCodeRequest() {
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
-      codeError.textContent = 'Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.';
-      updateControlCodeSubmitAvailability();
-      return false;
-    }
+    if (pendingBrowserAction || controlCodeMutationLaneBusy()) return false;
     const digits = sanitizeControlDigits(codeDigits.value);
     codeDigits.value = digits;
     if (digits.length < 2 || digits.length > 8) {
       codeError.textContent = 'Ievadi 2-8 ciparus.';
-      return;
+      return false;
     }
-    if (controlCodeMutationLaneBusy()) {
-      codeError.textContent = localizePublicMessage(
-        controlCodeRequestOccupiesQueue() ? 'request_in_progress' : 'ticket_action_in_progress'
-      );
-      return;
+    const revision = codeInputRevision;
+    return runBrowserActionWhenFresh({
+      kind: 'control_code', button: codeSubmit,
+      valid: () => codeDialogOpen && !codeDialog.hidden && codeInputRevision === revision &&
+        codeDigits.value === digits && !memberLimitBlocked('control_code') && !controlCodeMutationLaneBusy(true),
+      busy: controlCodeMutationLaneBusy,
+      submit: (browserIntentValid) => sendControlCodeRequest(digits, browserIntentValid)
+    });
+  }
+
+  async function sendControlCodeRequest(digits, browserIntentValid) {
+    if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {
+      codeError.textContent = 'Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.';
+      updateControlCodeSubmitAvailability();
+      return false;
     }
     const fastRevision = controlCodeFastRevisionForRequest();
     codeError.textContent = '';
@@ -6896,7 +7615,13 @@ import {
     pendingControlCodeBaselineFrameFingerprint = canvasRegionFingerprint(controlCodeFingerprintRegion());
     const submittedAt = performance.now();
     try {
-      await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision), 'control_code_request');
+      await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision, () => {
+        // Both client creation and its live subscription can outlive the
+        // picture that authorized the click. Recheck after both waits.
+        if (!browserIntentValid() || !revealAuthoritativeSDRForConsequentialControl()) {
+          throw new Error('Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.');
+        }
+      }), 'control_code_request');
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
       clientLog('control_code_submitted', JSON.stringify({
         digitCount: digits.length,
@@ -6929,6 +7654,7 @@ import {
   async function closeCurrentControlCode(openNext) {
     const request = codeRequest;
     const requestID = String(request && request.requestId || '').trim();
+    clearControlCodeResultPriority();
     const canCloseRequest = Boolean(requestID && (
       ownedControlCodeRequestIDs.has(String(requestID)) || isOwnedControlCodeRequest(request)
     ));
@@ -6950,7 +7676,7 @@ import {
     }
     setControlCodeResultVisible(false);
     clearControlCodeResultCapture();
-    scheduleControlCodeTicker(null);
+    scheduleControlCodeExpiry(null);
     if (requestID && codeRequest && String(codeRequest.requestId || '').trim() === requestID) {
       codeRequest = null;
     }
@@ -7064,7 +7790,6 @@ import {
     scheduleControlCodeFastStateExpiryCheck();
     const viewers = activeViewerPresence(state);
     const visibleViewerCount = Number.isFinite(Number(state.viewerCount)) ? Number(state.viewerCount) : viewers.length;
-    renderViewerSummary(viewers, visibleViewerCount);
     const relayStatus = relayReportToStreamStatus(state.relayCurrentReport);
     if (relayStatus) handleStreamStatus(relayStatus);
     reconcileControlCodeCleanupBarrier(state);
@@ -7246,6 +7971,7 @@ import {
   function ticketActionV3StreamSnapshot() {
     return {
       fresh: streamHasFreshRenderedFrame(),
+      configGeneration: Number(activeFeedbackConfigGeneration || 0),
       epoch: Number(currentStreamEpoch || lastRenderedFrameEpoch || 0),
       sequence: Number(lastRenderedFrameSequence || lastAcceptedFrameSequence || 0)
     };
@@ -7256,10 +7982,14 @@ import {
       experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return true;
     const snapshot = experimentalClientHDRController.snapshot();
     if (!snapshot || !snapshot.active || !snapshot.surfaceVisible) return true;
-    return snapshot.visualHoldover !== true && snapshot.proofFresh === true;
+    const stream = ticketActionV3StreamSnapshot();
+    return snapshot.visualHoldover !== true && snapshot.proofFresh === true &&
+      snapshot.presentationState === 'visible' && Number(snapshot.epoch) > 0 && Number(snapshot.sequence) > 0 &&
+      Number(snapshot.epoch) === stream.epoch && Number(snapshot.sequence) === stream.sequence;
   }
 
   function revealAuthoritativeSDRForConsequentialControl() {
+    if (!streamHasFreshRenderedFrame()) return false;
     if (!experimentalClientHDRController || !experimentalMediaState.enabled ||
       experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return true;
     const snapshot = experimentalClientHDRController.snapshot();
@@ -7267,6 +7997,142 @@ import {
     if (!clientHDRConsequentialControlProofReady()) return false;
     const stream = ticketActionV3StreamSnapshot();
     return experimentalClientHDRController.ensureExactProof(stream.epoch, stream.sequence);
+  }
+
+  function ticketActionV3RequiresFreshRenderedFrame(target) {
+    return !['open_latest_unactivated', 'redetect_latest', 'prove_current'].includes(String(target || ''));
+  }
+
+  function browserActionContext() {
+    const stream = ticketActionV3StreamSnapshot(), action = currentState && currentState.ticketAction;
+    return [browserActionContextRevision, stream.epoch, stream.configGeneration, ticketSliderVisualRevision,
+      String(action && action.actionId || ''), String(action && action.currentView || ''), String(action && action.status || ''),
+      String(action && action.streamEpoch || ''), String(action && action.frameSequence || '')];
+  }
+
+  function cancelPendingBrowserAction(reason, kind = '') {
+    const pending = pendingBrowserAction;
+    if (!pending || (kind && pending.kind !== kind)) return false;
+    pendingBrowserAction = null;
+    clearTimeout(pending.timer);
+    if (pending.button) pending.button.textContent = pending.label;
+    if (pending.cancel) pending.cancel();
+    const message = 'Darbība netika nosūtīta. Sagaidi svaigu attēlu un mēģini vēlreiz.';
+    if (pending.kind === 'control_code') { codeError.textContent = message; setStatus(message); }
+    else ticketActionV3LastUserMessage = message;
+    clientLog('browser_action_cancelled', reason);
+    // Direct input/lifecycle cancellation must release every control even if
+    // no new picture arrives. Defer to avoid re-entering an active render.
+    Promise.resolve().then(() => renderTicketActionV3Controls(currentState));
+    return true;
+  }
+
+  function invalidateBrowserActionContext(reason) {
+    browserActionContextRevision++;
+    cancelPendingBrowserAction(reason);
+  }
+
+  function reconcilePendingBrowserAction() {
+    const pending = pendingBrowserAction;
+    if (!pending) return;
+    const ready = () => {
+      if (pendingBrowserAction !== pending) return false;
+      if (performance.now() >= pending.deadline || !pending.contextValid() || pending.busy()) {
+        cancelPendingBrowserAction('fresh_frame_wait_cancelled');
+        return false;
+      }
+      if (!streamHasFreshRenderedFrame() || !clientHDRConsequentialControlProofReady() ||
+        (pending.requiresNewFrame && lastRenderedFrameSequence <= pending.sequence)) return false;
+      if (!pending.valid()) {
+        cancelPendingBrowserAction('fresh_frame_wait_cancelled');
+        return false;
+      }
+      return true;
+    };
+    if (pending.button) pending.button.textContent = 'Gaida svaigu kadru…';
+    if (!ready() || pending.scheduled) return;
+    pending.scheduled = true;
+    Promise.resolve().then(() => {
+      pending.scheduled = false;
+      if (!ready()) return false;
+      pendingBrowserAction = null;
+      clearTimeout(pending.timer);
+      if (pending.button) pending.button.textContent = pending.label;
+      return pending.submit(pending.valid);
+    }).catch((error) => {
+      clientLog('browser_action_submit_failed', error && error.message || 'submit failed');
+      renderTicketActionV3Controls(currentState);
+    });
+  }
+
+  function runBrowserActionWhenFresh(intent) {
+    if (pendingBrowserAction) return false;
+    const context = browserActionContext();
+    const contextValid = () => spacetimeStateFresh && document.visibilityState === 'visible' &&
+      configured && !idleDisconnected && !streamUnsupported &&
+      (typeof navigator === 'undefined' || navigator.onLine !== false) &&
+      videoWs && videoWs.readyState === WebSocket.OPEN && streamClockBoundIsCurrent(performance.now()) &&
+      browserActionContext().every((value, index) => value === context[index]);
+    const valid = () => contextValid() && intent.valid();
+    if (!valid() || intent.busy()) return false;
+    if (streamHasFreshRenderedFrame() && clientHDRConsequentialControlProofReady()) return intent.submit(valid);
+    if (!healthyOneFPSVisualContinuity()) return false;
+    // This local wait grants no picture authority. Admission still needs the
+    // current strict proof, even if the old picture expires while waiting.
+    const pending = { ...intent, contextValid, valid: () => healthyOneFPSVisualContinuity() && valid(),
+      deadline: performance.now() + 1100, scheduled: false,
+      sequence: lastRenderedFrameSequence, requiresNewFrame: !streamHasFreshRenderedFrame(),
+      label: intent.button && intent.button.textContent, timer: null };
+    pendingBrowserAction = pending;
+    pending.timer = setTimeout(() => {
+      if (pendingBrowserAction !== pending) return;
+      cancelPendingBrowserAction('fresh_frame_wait_expired');
+    }, 1100);
+    renderTicketActionV3Controls(currentState);
+    return false;
+  }
+
+  function currentBrowserSwitchAction() {
+    const rows = [...(currentState && currentState.ticketActions || [])];
+    const action = currentState && currentState.ticketAction;
+    if (action && !rows.some((row) => row.actionId === action.actionId)) rows.push(action);
+    return ticketActionV3SmartSwitchAction(rows, Date.now() + serverClockSkewMs);
+  }
+
+  function requestBrowserTicketAction(target, source, reason, sliderProof = null) {
+    const switching = ['show_recent_activated', 'return_to_latest_unactivated'].includes(target);
+    const switchAction = switching ? { ...currentBrowserSwitchAction() } : null;
+    const kind = sliderProof ? 'slider' : 'ticket';
+    const valid = () => {
+      if (target === 'register_current') {
+        const action = currentState && currentState.ticketAction;
+        return !activationPolicyBlocked(currentState) && isTicketActionV3RegistrationProofPresentable(
+          action, ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs) &&
+          (String(action && action.target || '') !== 'prove_current' || Boolean(currentTicketSliderPresentationRegion())) &&
+          (!sliderProof || ticketRegisterSliderPresentationStillMatches(sliderProof));
+      }
+      if (switching) {
+        const current = currentBrowserSwitchAction();
+        return Boolean(current && switchAction && current.actionId === switchAction.actionId &&
+          current.currentView === switchAction.currentView && current.switchExpiresAt === switchAction.switchExpiresAt &&
+          ticketActionV3SmartSwitchForView(current.currentView).target === target);
+      }
+      return target !== 'open_latest_and_register' || !activationPolicyBlocked(currentState);
+    };
+    return runBrowserActionWhenFresh({ kind, sliderProof,
+      button: sliderProof ? null : (switching ? ticketViewSwitchButton :
+        (target === 'register_current' ? activateTicketButton : requestTicketResetAndActivateButton)),
+      valid,
+      busy: () => controlCodeSubmitInFlight || ticketActionV3LocalRequestIsBusy() || controlCodeRequestOccupiesQueue() ||
+        (ticketActionV3Busy(currentState && currentState.ticketAction) &&
+          String(currentState && currentState.ticketAction && currentState.ticketAction.target || '') !== 'prove_current'),
+      cancel: sliderProof ? () => { ticketLocalRegisterSlider.value = '0'; } : null,
+      submit: (browserIntentValid) => sliderProof
+        ? submitCompletedTicketRegisterSlider(sliderProof, browserIntentValid)
+        : (target === 'register_current'
+          ? registerCurrentTicket(source, { browserIntentValid })
+          : requestTicketActionV3(target, source, reason, '', { browserIntentValid }))
+    });
   }
 
   function currentTicketSliderRegion(state = currentState) {
@@ -7278,15 +8144,26 @@ import {
     );
   }
 
-  function currentTicketRegisterSliderProof(state = currentState) {
-    return ticketLocalRegisterSliderProofSnapshot(
-      state && state.ticketAction || null,
-      state && state.ticketSliderRegion || null,
-      ticketActionV3StreamSnapshot(),
-      ticketSliderLayoutRevision,
-      ticketSliderVisualRevision,
-      Date.now() + serverClockSkewMs
-    );
+  function ticketRegisterSliderPresentationStream() {
+    const stream = ticketActionV3StreamSnapshot();
+    return { ...stream, healthyContinuity: healthyOneFPSVisualContinuity() };
+  }
+
+  function currentTicketSliderPresentationRegion(state = currentState) {
+    return ticketSliderRegionV3ForPresentation(state && state.ticketAction, state && state.ticketSliderRegion,
+      ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs);
+  }
+
+  function currentTicketRegisterSliderPresentationProof(state = currentState) {
+    return ticketLocalRegisterSliderPresentationSnapshot(state && state.ticketAction, state && state.ticketSliderRegion,
+      ticketRegisterSliderPresentationStream(), ticketSliderLayoutRevision, ticketSliderVisualRevision,
+      Date.now() + serverClockSkewMs);
+  }
+
+  function ticketRegisterSliderPresentationStillMatches(snapshot, state = currentState) {
+    return ticketLocalRegisterSliderPresentationMatches(snapshot, state && state.ticketAction, state && state.ticketSliderRegion,
+      ticketRegisterSliderPresentationStream(), ticketSliderLayoutRevision, ticketSliderVisualRevision,
+      Date.now() + serverClockSkewMs);
   }
 
   function ticketRegisterSliderProofStillMatches(snapshot, state = currentState) {
@@ -7310,7 +8187,8 @@ import {
 
   function cancelTicketRegisterSliderSession(reason, pointerId = null) {
     if (ticketLocalRegisterSliderState.inFlight) return false;
-    if (!cancelTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, pointerId)) return false;
+    const cancelledPending = cancelPendingBrowserAction(reason || 'slider_cancelled', 'slider');
+    if (!cancelTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, pointerId) && !cancelledPending) return false;
     suppressTicketRegisterSliderChangeForPointerEvent();
     ticketLocalRegisterSlider.value = '0';
     clientLog('ticket_slider_cancelled', reason || 'cancelled');
@@ -7342,7 +8220,7 @@ import {
     }
   }
 
-  function renderTicketRegisterOverlay(state, busy, controlBusy, registerReady) {
+  function renderTicketRegisterOverlay(state, busy, controlBusy) {
     if (ticketSliderRegionExpiryTimer) {
       clearTimeout(ticketSliderRegionExpiryTimer);
       ticketSliderRegionExpiryTimer = null;
@@ -7360,12 +8238,14 @@ import {
       ticketLocalRegisterSlider.setAttribute('aria-label', 'Biļetes reģistrācija notiek tālrunī');
       return ticketLocalRegisterSliderState.latchedProof;
     }
-    const region = currentTicketSliderRegion(state);
+    const pending = pendingBrowserAction && pendingBrowserAction.kind === 'slider' ? pendingBrowserAction : null;
+    const region = pending ? pending.sliderProof : currentTicketSliderPresentationRegion(state);
     if (ticketLocalRegisterSliderState.session &&
-      !ticketRegisterSliderProofStillMatches(ticketLocalRegisterSliderState.session.snapshot, state)) {
+      !ticketRegisterSliderPresentationStillMatches(ticketLocalRegisterSliderState.session.snapshot, state)) {
       cancelTicketRegisterSliderSession('proof_changed');
     }
-    if (!region || !registerReady || busy || controlBusy || !configured) {
+    if (!region || !spacetimeStateFresh || activationPolicyBlocked(state) ||
+      ((!pending) && (busy || controlBusy)) || !configured) {
       if (ticketLocalRegisterSliderState.session) {
         cancelTicketRegisterSliderSession('slider_became_unavailable');
       }
@@ -7377,10 +8257,14 @@ import {
       return null;
     }
     ticketRegisterOverlay.hidden = false;
-    ticketRegisterOverlay.dataset.registrationState = 'ready';
+    ticketRegisterOverlay.dataset.registrationState = pending ? 'waiting_fresh_frame' : 'ready';
     ticketRegisterOverlay.removeAttribute('aria-busy');
     ticketLocalRegisterSlider.setAttribute('aria-label', 'Velc pa labi vismaz 8 pikseļus mazāk nekā 45 grādu leņķī, lai reģistrētu atvērto biļeti; velc uz augšu vai leju, lai ritinātu lapu');
-    ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight);
+    ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight || (pendingBrowserAction && !pending));
+    if (pending) {
+      ticketLocalRegisterSlider.value = '100';
+      ticketLocalRegisterSlider.setAttribute('aria-label', 'Gaida svaigu biļetes kadru pirms reģistrācijas');
+    }
     const expiresAt = Date.parse(String(region.expiresAt || ''));
     const delay = expiresAt - (Date.now() + serverClockSkewMs);
     if (Number.isFinite(delay) && delay > 0) {
@@ -7576,6 +8460,8 @@ import {
   }
 
   function renderTicketActionV3Controls(state = currentState) {
+    reconcilePendingBrowserAction();
+    const waiting = Boolean(pendingBrowserAction);
     const action = state && state.ticketAction || null;
     const sliderActionRows = Array.isArray(state && state.ticketActions) ? [...state.ticketActions] : [];
     if (action && !sliderActionRows.some((row) => String(row && row.actionId || '') === String(action.actionId || ''))) {
@@ -7594,29 +8480,35 @@ import {
     const busy = ticketActionV3LocalRequestIsBusy() || ticketActionV3Busy(action);
     const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy() && ticketActionV3Busy(action) &&
       String(action && action.target || '') === 'prove_current');
-    const blockingBusy = busy && !backgroundProofBusy;
+    const blockingBusy = waiting || (busy && !backgroundProofBusy);
     const observedUserAction = ticketActionV3ExplicitResultForDisplay(
       state && state.ticketActions || [],
       ticketActionV3LastUserActionId,
       ticketActionV3LastUserAction
     );
-    if (observedUserAction && observedUserAction !== ticketActionV3LastUserAction) {
+    if (observedUserAction) {
+      if (['actionId', 'status', 'phase', 'reason', 'currentView'].some((field) =>
+        String(observedUserAction[field] || '') !== String(ticketActionV3LastUserAction && ticketActionV3LastUserAction[field] || ''))) {
+        ticketActionV3LastUserMessage = '';
+      }
       ticketActionV3LastUserAction = observedUserAction;
-      ticketActionV3LastUserMessage = '';
     }
     const statusAction = ticketActionV3LastUserAction || action;
     const statusBusy = ticketActionV3LastUserAction || ticketActionV3LastUserMessage
       ? ticketActionV3Busy(ticketActionV3LastUserAction)
       : blockingBusy;
-    const controlBusy = controlCodeRequestOccupiesQueue();
-    const region = currentTicketSliderRegion(state);
-    const proofReady = spacetimeStateFresh && ticketActionV3RegistrationProofIsFresh(action);
+    const controlBusy = controlCodeSubmitInFlight || controlCodeRequestOccupiesQueue();
+    const region = currentTicketSliderPresentationRegion(state);
+    const proofReady = spacetimeStateFresh && isTicketActionV3RegistrationProofPresentable(
+      action, ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs);
     const proveCurrentReady = String(action && action.target || '') !== 'prove_current' || Boolean(region);
     const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);
+    const streamActionFresh = streamHasFreshRenderedFrame();
     const hdrControlReady = clientHDRConsequentialControlProofReady();
+    const presentationReady = (streamActionFresh && hdrControlReady) || healthyOneFPSVisualContinuity();
     const connectionReason = 'Gaida dzīvu SpaceTime savienojumu.';
     const hdrControlReason = 'Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.';
-    const phoneBusyReason = backgroundProofBusy
+    const phoneBusyReason = waiting ? 'Gaida svaigu kadru…' : backgroundProofBusy
       ? 'Tālrunis pabeidz pašreizējā skata vizuālo pārbaudi.'
       : 'Tālrunis izpilda iepriekšējo biļetes darbību.';
     const controlBusyReason = 'Tālrunis izpilda kontroles koda darbību.';
@@ -7629,11 +8521,14 @@ import {
     }
     const openReason = !spacetimeStateFresh
       ? connectionReason
-      : (!hdrControlReady ? hdrControlReason : (controlBusy ? controlBusyReason : (blockingBusy ? phoneBusyReason : '')));
-    const activationReason = openReason || (activationPolicyBlocked(state) ? activationPolicyMessage(state) : '');
+      : (controlBusy ? controlBusyReason : (blockingBusy ? phoneBusyReason : ''));
+    const visualActionReason = !spacetimeStateFresh
+      ? connectionReason
+      : (!presentationReady ? hdrControlReason : openReason);
+    const activationReason = visualActionReason || (activationPolicyBlocked(state) ? activationPolicyMessage(state) : '');
     const registerReason = !spacetimeStateFresh
       ? connectionReason
-      : (!hdrControlReady
+      : (!presentationReady
         ? hdrControlReason
         : (controlBusy
         ? controlBusyReason
@@ -7645,13 +8540,12 @@ import {
               ? 'Atvērtā biļete ir apstiprināta; atjauno reģistrācijas slīdņa novietojumu.'
               : 'Vispirms vizuāli apstiprini atvērtu nereģistrētu biļeti.')))));
     setTicketButtonGate(requestTicketResetButton,
-      spacetimeStateFresh && hdrControlReady && !blockingBusy && !controlBusy, openReason);
+      spacetimeStateFresh && !blockingBusy && !controlBusy, openReason);
     setTicketButtonGate(requestTicketResetAndActivateButton,
-      spacetimeStateFresh && hdrControlReady && !blockingBusy && !controlBusy && !activationPolicyBlocked(state), activationReason);
+      spacetimeStateFresh && presentationReady && !blockingBusy && !controlBusy && !activationPolicyBlocked(state), activationReason);
     setTicketButtonGate(activateTicketButton,
-      hdrControlReady && !blockingBusy && !controlBusy && registerReady, registerReason);
-    renderTicketRegisterOverlay(state, blockingBusy, controlBusy,
-      hdrControlReady && registerReady && Boolean(region));
+      presentationReady && !blockingBusy && !controlBusy && registerReady, registerReason);
+    renderTicketRegisterOverlay(state, blockingBusy, controlBusy);
     for (const button of [requestTicketResetButton, requestTicketResetAndActivateButton, activateTicketButton]) {
       button.setAttribute('aria-busy', blockingBusy ? 'true' : 'false');
     }
@@ -7678,11 +8572,13 @@ import {
     const smartSwitch = ticketActionV3SmartSwitchForView(switchCurrentView);
     ticketViewSwitchButton.textContent = smartSwitch.label;
     ticketViewSwitchButton.dataset.target = smartSwitch.target;
-    if (switchAvailable && ticketViewSwitchButton.dataset.target && hdrControlReady && !blockingBusy && !controlBusy) {
+    if (spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target && presentationReady && !blockingBusy && !controlBusy) {
       ticketViewSwitchButton.disabled = false;
       ticketViewSwitchButton.removeAttribute('title');
       ticketViewSwitchDetail.textContent = 'Var pārslēgt skatu bez biļetes atkārtotas reģistrēšanas.';
-    } else if (!hdrControlReady) {
+    } else if (!spacetimeStateFresh) {
+      ticketViewSwitchDetail.textContent = connectionReason;
+    } else if (!presentationReady) {
       ticketViewSwitchDetail.textContent = hdrControlReason;
     } else if (blockingBusy) {
       ticketViewSwitchDetail.textContent = phoneBusyReason;
@@ -7731,11 +8627,20 @@ import {
       ticketResetDetail.textContent = 'Pieejams, kad tālrunis ir gatavs.';
     }
     updateControlCodeSubmitAvailability();
+    if (pendingBrowserAction && pendingBrowserAction.button) pendingBrowserAction.button.textContent = 'Gaida svaigu kadru…';
     maybeRequestTicketCurrentProof('state_rendered');
   }
 
   async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {
-    if (target !== 'prove_current' && !revealAuthoritativeSDRForConsequentialControl()) {
+    if (options.browserIntentValid && !options.browserIntentValid()) return false;
+    if (!spacetimeStateFresh) {
+      if (options.quiet !== true) {
+        ticketActionV3LastUserMessage = 'Gaida dzīvu SpaceTime savienojumu.';
+        renderTicketActionV3Controls(currentState);
+      }
+      return false;
+    }
+    if (ticketActionV3RequiresFreshRenderedFrame(target) && !revealAuthoritativeSDRForConsequentialControl()) {
       if (options.quiet !== true) {
         ticketActionV3LastUserMessage = 'Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.';
         renderTicketActionV3Controls(currentState);
@@ -7762,14 +8667,34 @@ import {
     }
     renderTicketActionV3Controls(currentState);
     try {
-      await runSpacetimeMutation((client) => client.requestTicketActionV3(ticketActionV3RequestArgs({
-        actionId,
-        target,
-        source,
-        reason,
-        attemptId: activation ? actionId : '',
-        expectedInteractionRevision: target === 'register_current' ? expectedInteractionRevision : ''
-      })), `ticket_action_v3_${target}`);
+      await runSpacetimeMutation((client) => {
+        const beforeSubmit = () => {
+          if (options.browserIntentValid && !options.browserIntentValid()) throw new Error('Darbības apstiprinājums ir mainījies. Mēģini vēlreiz.');
+          if (!spacetimeStateFresh) throw new Error('Gaida dzīvu SpaceTime savienojumu.');
+          if (ticketActionV3RequiresFreshRenderedFrame(target) && !revealAuthoritativeSDRForConsequentialControl()) {
+            throw new Error('Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.');
+          }
+          if (target === 'register_current') {
+            const admissionProof = currentState && currentState.ticketAction || null;
+            if (String(admissionProof && admissionProof.actionId || '') !== expectedInteractionRevision ||
+              !ticketActionV3RegistrationProofIsFresh(admissionProof) ||
+              (String(admissionProof && admissionProof.target || '') === 'prove_current' && !currentTicketSliderRegion(currentState))) {
+              throw new Error('Sagaidi svaigu vizuālu nereģistrētās biļetes apstiprinājumu.');
+            }
+            if (source === 'browser_slider' && !ticketRegisterSliderProofStillMatches(options.proofSnapshot, currentState)) {
+              throw new Error('Biļetes attēls mainījās vilkšanas laikā. Velc vēlreiz pēc svaiga apstiprinājuma.');
+            }
+          }
+        };
+        return client.requestTicketActionV3(ticketActionV3RequestArgs({
+          actionId,
+          target,
+          source,
+          reason,
+          attemptId: activation ? actionId : '',
+          expectedInteractionRevision: target === 'register_current' ? expectedInteractionRevision : ''
+        }), beforeSubmit);
+      }, `ticket_action_v3_${target}`);
       settleTicketActionV3LocalRequest(ticketActionV3LocalRequestState, true);
       scheduleTicketActionV3Reconcile(`ticket_action_v3_${target}_reconcile`);
       clientLog('ticket_action_v3_requested', target);
@@ -7816,7 +8741,7 @@ import {
       source,
       source === 'browser_slider' ? 'ticket_slider_completed' : 'ticket_register_button',
       revision,
-      source === 'browser_slider' ? { actionId: options.actionId } : {}
+      { browserIntentValid: options.browserIntentValid, ...(source === 'browser_slider' ? { actionId: options.actionId, proofSnapshot: options.proofSnapshot } : {}) }
     );
   }
 
@@ -7863,12 +8788,6 @@ import {
     return activeViewers(state && state.viewers || []).map((_viewer, index) => ({
       label: `Skatītājs ${index + 1}`
     }));
-  }
-
-  function renderViewerSummary(viewers, visibleViewerCount) {
-    const count = Number.isFinite(Number(visibleViewerCount)) ? Number(visibleViewerCount) : activeViewers(viewers).length;
-    if (viewerCount) viewerCount.textContent = String(count);
-    if (viewerCountDetail) viewerCountDetail.textContent = count === 1 ? 'cilvēks lapā' : 'cilvēki lapā';
   }
 
   function renderPresence(viewers, visibleViewerCount) {
@@ -7919,9 +8838,11 @@ import {
   }
 
   codeDigits.addEventListener('input', () => {
+    codeInputRevision++;
+    const cancelled = cancelPendingBrowserAction('code_input_changed', 'control_code');
     const cleaned = sanitizeControlDigits(codeDigits.value);
     if (codeDigits.value !== cleaned) codeDigits.value = cleaned;
-    codeError.textContent = '';
+    if (!cancelled) codeError.textContent = '';
     updateControlCodeSubmitAvailability();
     updateViewportVars();
   });
@@ -7934,14 +8855,14 @@ import {
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
-  requestTicketResetButton.addEventListener('click', () => requestTicketActionV3(
+  requestTicketResetButton.addEventListener('click', () => !pendingBrowserAction && !controlCodeSubmitInFlight && requestTicketActionV3(
     'open_latest_unactivated', 'browser_button', 'ticket_open_latest_unactivated'
   ));
-  requestTicketResetAndActivateButton.addEventListener('click', () => requestTicketActionV3(
+  requestTicketResetAndActivateButton.addEventListener('click', () => requestBrowserTicketAction(
     'open_latest_and_register', 'browser_button', 'ticket_open_latest_and_register'
   ));
-  activateTicketButton.addEventListener('click', () => registerCurrentTicket('browser_button'));
-  async function submitCompletedTicketRegisterSlider(proofSnapshot) {
+  activateTicketButton.addEventListener('click', () => requestBrowserTicketAction('register_current', 'browser_button', 'ticket_register_button'));
+  async function submitCompletedTicketRegisterSlider(proofSnapshot, browserIntentValid) {
     const actionId = ticketActionV3Id();
     const submitted = await handleTicketLocalRegisterSliderChange({
       slider: ticketLocalRegisterSlider,
@@ -7950,7 +8871,8 @@ import {
       proofSnapshot,
       submitRegisterCurrent: (source, exactActionId, exactProof) => registerCurrentTicket(source, {
         actionId: exactActionId,
-        proofSnapshot: exactProof
+        proofSnapshot: exactProof,
+        browserIntentValid
       }),
       render: () => renderTicketActionV3Controls(currentState)
     });
@@ -7960,34 +8882,33 @@ import {
 
   async function finishTicketRegisterSliderSession(event, kind) {
     const session = ticketLocalRegisterSliderState.session;
-    if (!session || session.kind !== kind || ticketLocalRegisterSliderState.inFlight) return false;
+    if (pendingBrowserAction || !session || session.kind !== kind || ticketLocalRegisterSliderState.inFlight) return false;
     if (kind === 'pointer' && Number(event && event.pointerId) !== session.pointerId) return false;
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
-      if (event && typeof event.preventDefault === 'function') event.preventDefault();
-      cancelTicketRegisterSliderSession('hdr_proof_not_fresh', event && event.pointerId);
-      ticketLocalRegisterSlider.value = '0';
-      return false;
-    }
-    const proofMatches = ticketRegisterSliderProofStillMatches(session.snapshot, currentState);
     const completedProof = completeTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       pointerId: event && event.pointerId,
       pointerClientX: event && event.clientX,
       pointerClientY: event && event.clientY,
       progress: Number(ticketLocalRegisterSlider.value || 0),
-      proofMatches
+      proofMatches: ticketRegisterSliderPresentationStillMatches(session.snapshot, currentState)
     });
     if (kind === 'pointer') suppressTicketRegisterSliderChangeForPointerEvent();
     if (!completedProof) {
       ticketLocalRegisterSlider.value = '0';
-      if (!proofMatches) clientLog('ticket_slider_cancelled', 'proof_changed_before_completion');
       return false;
     }
     ticketLocalRegisterSlider.value = '100';
-    return submitCompletedTicketRegisterSlider(completedProof);
+    const submitted = await requestBrowserTicketAction('register_current', 'browser_slider', 'ticket_slider_completed', completedProof);
+    if (!submitted && !pendingBrowserAction && !ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
+    return submitted;
   }
 
   ticketLocalRegisterSlider.addEventListener('pointerdown', (event) => {
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
+    if (pendingBrowserAction) {
+      event.preventDefault();
+      if (event.isPrimary === false) cancelPendingBrowserAction('secondary_pointer_down', 'slider');
+      return;
+    }
+    if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       event.preventDefault();
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
       ticketLocalRegisterSlider.value = '0';
@@ -8002,7 +8923,7 @@ import {
       cancelTicketRegisterSliderSession('non_primary_mouse_button');
       return;
     }
-    const snapshot = currentTicketRegisterSliderProof(currentState);
+    const snapshot = currentTicketRegisterSliderPresentationProof(currentState);
     const sliderRect = ticketLocalRegisterSlider.getBoundingClientRect();
     if (!beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       kind: 'pointer',
@@ -8024,10 +8945,6 @@ import {
       clientLog('ticket_slider_cancelled', 'page_scroll_direction');
     }
   }, { passive: true });
-  ticketLocalRegisterSlider.addEventListener('input', () => {
-    // The local range authorizes one durable action only after release. Never
-    // turn progress events into a second phone-control protocol.
-  });
   ticketLocalRegisterSlider.addEventListener('pointerup', (event) => {
     finishTicketRegisterSliderSession(event, 'pointer').catch((error) => {
       clientLog('ticket_slider_submit_failed', error && error.message || 'submit failed');
@@ -8038,7 +8955,11 @@ import {
   });
   ticketLocalRegisterSlider.addEventListener('keydown', (event) => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
+    if (pendingBrowserAction) {
+      event.preventDefault();
+      return;
+    }
+    if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       event.preventDefault();
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
       ticketLocalRegisterSlider.value = '0';
@@ -8047,7 +8968,7 @@ import {
     if (ticketLocalRegisterSliderState.inFlight || ticketLocalRegisterSliderState.session) return;
     beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       kind: 'keyboard',
-      snapshot: currentTicketRegisterSliderProof(currentState)
+      snapshot: currentTicketRegisterSliderPresentationProof(currentState)
     });
   });
   ticketLocalRegisterSlider.addEventListener('keyup', (event) => {
@@ -8057,16 +8978,14 @@ import {
     });
   });
   ticketLocalRegisterSlider.addEventListener('change', () => {
-    if (!revealAuthoritativeSDRForConsequentialControl()) {
+    if (pendingBrowserAction || ticketLocalRegisterSliderState.ignoreChange || ticketLocalRegisterSliderState.inFlight || ticketLocalRegisterSliderState.session) return;
+    if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
       ticketLocalRegisterSlider.value = '0';
       return;
     }
-    if (ticketLocalRegisterSliderState.ignoreChange || ticketLocalRegisterSliderState.inFlight ||
-      ticketLocalRegisterSliderState.session ||
-      Number(ticketLocalRegisterSlider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT
-    ) return;
-    const snapshot = currentTicketRegisterSliderProof(currentState);
+    if (Number(ticketLocalRegisterSlider.value || 0) < TICKET_LOCAL_REGISTER_SLIDER_COMPLETION_PERCENT) return;
+    const snapshot = currentTicketRegisterSliderPresentationProof(currentState);
     if (!beginTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       kind: 'keyboard',
       snapshot
@@ -8082,10 +9001,14 @@ import {
     });
   });
   ticketLocalRegisterSlider.addEventListener('blur', () => cancelTicketRegisterSliderSession('slider_blurred'));
-  window.addEventListener('blur', () => cancelTicketRegisterSliderSession('window_blurred'));
+  function cancelBrowserActionOnBlur() {
+    invalidateBrowserActionContext('window_blurred');
+    cancelTicketRegisterSliderSession('window_blurred');
+  }
+  window.addEventListener('blur', cancelBrowserActionOnBlur);
   ticketViewSwitchButton.addEventListener('click', () => {
     const target = String(ticketViewSwitchButton.dataset.target || '');
-    if (target) requestTicketActionV3(target, 'browser_smart_switch', `ticket_${target}`);
+    if (target) requestBrowserTicketAction(target, 'browser_smart_switch', `ticket_${target}`);
   });
   codeDialogClose.addEventListener('click', closeControlCodeDialog);
   codeDialog.addEventListener('click', (event) => {
@@ -8165,7 +9088,15 @@ import {
   function currentRenderedFreshness(now) {
     now = Number.isFinite(now) ? now : performance.now();
     const hasFrame = hasRenderedFrame && lastRenderedFrameRenderedAt > 0;
+    const visualAgeKnown = Boolean(hasFrame && lastRenderedFrameVisualAgeKnown);
+    const visualAgeConservative = Boolean(visualAgeKnown && lastRenderedFrameVisualAgeConservative);
     const visualAgeMillis = hasFrame ? lastRenderedVisualAge(now) : -1;
+    // A legacy TSF2 frame (or a TSF3 frame received before clock calibration)
+    // can still provide smooth visual continuity. Its source age remains
+    // explicitly unknown and therefore cannot authorize a phone action.
+    const continuityAgeMillis = visualAgeKnown
+      ? visualAgeMillis
+      : (hasFrame ? Math.max(0, now - lastRenderedFrameRenderedAt) : -1);
     const browserReceiveToDecodeMillis = hasFrame && lastRenderedFrameReceivedAt > 0 && lastRenderedFrameQueuedAt > 0
       ? Math.max(0, lastRenderedFrameQueuedAt - lastRenderedFrameReceivedAt)
       : -1;
@@ -8175,38 +9106,120 @@ import {
     const decoderQueueDelayMillis = browserReceiveToDecodeMillis >= 0 && decodeToRenderMillis >= 0
       ? browserReceiveToDecodeMillis + decodeToRenderMillis
       : -1;
-    const streamFreshnessState = hasFrame ? freshnessStateForVisualAge(visualAgeMillis) : 'STALE';
-    const liveLabeled = streamFreshnessState === 'LIVE_FRESH'
+    const streamFreshnessState = hasFrame ? freshnessStateForVisualAge(continuityAgeMillis) : 'STALE';
+    const renderedEpoch = Number(lastRenderedFrameEpoch || 0);
+    const renderedSequence = Number(lastRenderedFrameSequence || 0);
+    const activeEpoch = Number(currentStreamEpoch || renderedEpoch);
+    const clockBoundCurrent = streamClockBoundIsCurrent(now);
+    const continuityPresentable = streamFreshnessState === 'LIVE_FRESH'
       || streamFreshnessState === 'LIVE_OK'
       || streamFreshnessState === 'DEGRADED';
+    const liveLabeled = visualAgeConservative && clockBoundCurrent &&
+      streamFreshnessState === 'LIVE_FRESH';
+    const frameAuthorityMatches = renderedEpoch > 0 && renderedSequence > 0 &&
+      activeEpoch > 0 && renderedEpoch === activeEpoch &&
+      activeFeedbackVersion === 2 && activeFeedbackConfigGeneration > 0 &&
+      lastRenderedFrameConfigGeneration === activeFeedbackConfigGeneration &&
+      feedbackRenderedSequence >= renderedSequence;
+    const actionFresh = liveLabeled && frameAuthorityMatches;
     return {
       hasFrame,
       visualAgeMillis,
+      continuityAgeMillis,
+      visualAgeKnown,
+      visualAgeConservative,
+      clockBoundCurrent,
       browserReceiveToDecodeMillis,
       decodeToRenderMillis,
       decoderQueueDelayMillis,
       streamFreshnessState,
-      liveLabeled
+      continuityPresentable,
+      liveLabeled,
+      actionFresh
     };
   }
 
+  function healthyOneFPSVisualContinuity(freshness, now) {
+    now = Number.isFinite(now) ? now : performance.now();
+    freshness = freshness || currentRenderedFreshness(now);
+    if (!freshness.hasFrame || !['LIVE_FRESH', 'LIVE_OK'].includes(freshness.streamFreshnessState) ||
+      !freshness.visualAgeKnown || !freshness.visualAgeConservative ||
+      !freshness.clockBoundCurrent || Number(freshness.visualAgeMillis) > streamLiveOkMaxAgeMs) return false;
+    if (idleDisconnected || streamUnsupported || document.visibilityState !== 'visible') return false;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return false;
+
+    const config = lastDecoderConfig || {};
+    const renderedEpoch = Number(lastRenderedFrameEpoch || 0);
+    const renderedSequence = Number(lastRenderedFrameSequence || 0);
+    const activeEpoch = Number(currentStreamEpoch || 0);
+    if (String(config.frameEnvelope || '').toLowerCase() !== 'tsf3' ||
+      String(lastRenderedFrameEnvelopeVersion || '').toLowerCase() !== 'tsf3' ||
+      String(config.frameDependencyMode || '').toLowerCase() !== 'all_intra' ||
+      Number(config.fps) !== 1 || Number(config.sourceFps) !== 1 ||
+      Number(config.keyframeIntervalFrames) !== 1 ||
+      renderedEpoch <= 0 || renderedSequence <= 0 || activeEpoch !== renderedEpoch ||
+      Number(config.streamEpoch || 0) !== renderedEpoch || activeFeedbackVersion !== 2 ||
+      activeFeedbackConfigGeneration <= 0 ||
+      lastRenderedFrameConfigGeneration !== activeFeedbackConfigGeneration ||
+      feedbackRenderedSequence < renderedSequence) return false;
+
+    const status = freshStreamStatus(now);
+    const reportAt = Date.parse(String(status && status.updatedAt || ''));
+    const streamServerNowUnixMicros = streamClockServerUpperAt(now);
+    const reportAgeMillis = Number.isFinite(reportAt) && streamServerNowUnixMicros > 0
+      ? streamServerNowUnixMicros / 1000 - reportAt
+      : Number.POSITIVE_INFINITY;
+    const statusEpoch = Number(status && status.streamEpoch || 0);
+    const statusSequence = Number(status && status.lastFrameSequence || 0);
+    const statusVisualAgeMillis = Number(status && status.lastFrameVisualAgeMillis);
+    const advertisedLiveOKMaxAgeMillis = Number(status && status.liveOKMaxAgeMillis);
+    const liveOKAgeCeilingMillis = Math.min(streamLiveOkMaxAgeMs, advertisedLiveOKMaxAgeMillis);
+    if (!status || reportAgeMillis < -250 || reportAgeMillis > streamCurrentReportMaxAgeMs ||
+      status.phoneDesired !== true || status.phoneConnected !== true ||
+      String(status.phoneStreamState || '') !== 'streaming' ||
+      Number(status.activeVideoClients || 0) <= 0 ||
+      status.continuity !== true || status.allIntraConfigValid !== true ||
+      !['LIVE_FRESH', 'LIVE_OK'].includes(String(status.freshnessState || '')) ||
+      status.phoneClockBoundedCalibrated !== true || status.lastFrameVisualAgeKnown !== true ||
+      !Number.isFinite(advertisedLiveOKMaxAgeMillis) || advertisedLiveOKMaxAgeMillis <= 0 ||
+      advertisedLiveOKMaxAgeMillis > streamLiveOkMaxAgeMs ||
+      !Number.isFinite(statusVisualAgeMillis) || statusVisualAgeMillis < 0 ||
+      Number(freshness.visualAgeMillis) > liveOKAgeCeilingMillis ||
+      statusVisualAgeMillis > liveOKAgeCeilingMillis ||
+      String(status.frameEnvelope || '').toLowerCase() !== 'tsf3' ||
+      String(status.frameDependencyMode || '').toLowerCase() !== 'all_intra' ||
+      Number(status.fps) !== 1 || Number(status.sourceFps) !== 1 ||
+      Number(status.keyframeIntervalFrames) !== 1 || statusEpoch !== renderedEpoch ||
+      statusSequence <= 0 || Math.abs(statusSequence - renderedSequence) > streamCurrentReportMaxSequenceLag) {
+      return false;
+    }
+    return true;
+  }
+
+  function controlCodeDialogEntryReady() {
+    return (streamHasFreshRenderedFrame() && clientHDRConsequentialControlProofReady()) ||
+      healthyOneFPSVisualContinuity();
+  }
+
   function lastRenderedVisualAge(now) {
-    if (!hasRenderedFrame || lastRenderedFrameRenderedAt <= 0 || !Number.isFinite(lastRenderedFrameVisualAgeMillis)) {
+    if (!hasRenderedFrame || !lastRenderedFrameVisualAgeKnown || lastRenderedFrameRenderedAt <= 0 ||
+      !Number.isFinite(lastRenderedFrameVisualAgeMillis)) {
       return -1;
     }
     now = Number.isFinite(now) ? now : performance.now();
     return Math.max(0, lastRenderedFrameVisualAgeMillis + (now - lastRenderedFrameRenderedAt));
   }
 
-  function clearStreamLiveStaleGrace() {
-    if (!streamLiveStaleGraceTimer) return;
-    clearTimeout(streamLiveStaleGraceTimer);
-    streamLiveStaleGraceTimer = null;
+  function clearStreamContinuityStaleGrace() {
+    if (!streamContinuityStaleGraceTimer) return;
+    clearTimeout(streamContinuityStaleGraceTimer);
+    streamContinuityStaleGraceTimer = null;
   }
 
-  function streamLiveStaleGraceAllowed(freshness, reason) {
+  function streamContinuityStaleGraceAllowed(freshness, reason) {
     if (reason !== 'stream_status' || !freshness || !freshness.hasFrame) return false;
-    if (document.body.dataset.streamLive !== 'true') return false;
+    if (document.body.dataset.streamContinuity !== 'true') return false;
     if (idleDisconnected || streamUnsupported || !viewerIsForeground()) return false;
     if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return false;
     const status = freshStreamStatus(performance.now());
@@ -8216,20 +9229,20 @@ import {
     return !streamStatusStale(status);
   }
 
-  function streamPresentationLive(freshness, reason) {
-    if (freshness.liveLabeled) {
-      clearStreamLiveStaleGrace();
+  function streamPresentationContinuity(freshness, reason) {
+    if (freshness.continuityPresentable) {
+      clearStreamContinuityStaleGrace();
       return true;
     }
-    if (!streamLiveStaleGraceAllowed(freshness, reason)) {
-      clearStreamLiveStaleGrace();
+    if (!streamContinuityStaleGraceAllowed(freshness, reason)) {
+      clearStreamContinuityStaleGrace();
       return false;
     }
-    if (!streamLiveStaleGraceTimer) {
-      streamLiveStaleGraceTimer = setTimeout(() => {
-        streamLiveStaleGraceTimer = null;
+    if (!streamContinuityStaleGraceTimer) {
+      streamContinuityStaleGraceTimer = setTimeout(() => {
+        streamContinuityStaleGraceTimer = null;
         updateStreamFreshnessStatus('stream_stale_grace_expired');
-      }, streamLiveStaleGraceMs);
+      }, streamContinuityStaleGraceMs);
     }
     return true;
   }
@@ -8260,31 +9273,54 @@ import {
     if (clientHDRStreamInterruptionCanHold(reason) &&
       typeof controller.holdLastPresentation === 'function' &&
       controller.holdLastPresentation(fallbackReason)) {
-      showExperimentalClientHDRHoldoverNotice();
       if (document.body) document.body.dataset.experimentalMedia = 'hdr-client-webgpu-holdover';
-      setExperimentalMediaStatus('HDR pārlūkā — saglabāts spilgtais kadrs; gaida svaigu kadru…');
       return true;
     }
-    controller.markSDRStale(fallbackReason);
+    // A boost change hides HDR until its fresh redraw. Normal one-second
+    // picture expiry must revoke proof without turning that refresh into a
+    // hard failure whose two-frame recovery can never span the next expiry.
+    const healthyBoostRefresh = fallbackReason === 'sdr_stream_not_live' &&
+      controller.snapshot().fallbackKind === 'refresh' && healthyOneFPSVisualContinuity();
+    controller.markSDRStale(healthyBoostRefresh ? 'visual_age' : fallbackReason);
     return false;
   }
 
+  function scheduleStreamActionFreshnessExpiry(freshness, now) {
+    if (streamActionFreshnessExpiryTimer) clearTimeout(streamActionFreshnessExpiryTimer);
+    streamActionFreshnessExpiryTimer = null;
+    if (!freshness.actionFresh) return;
+    // The source picture may already be old when it is painted. Refresh the
+    // controls at its remaining authority deadline, not on the next picture
+    // or the one-second watchdog. A sooner clock expiry also revokes proof.
+    const remainingMillis = Math.min(
+      streamLiveFreshMaxAgeMs - freshness.visualAgeMillis,
+      streamClockBoundAt + streamClockBoundMaxAgeMs - now
+    );
+    if (!Number.isFinite(remainingMillis) || remainingMillis < 0) return;
+    streamActionFreshnessExpiryTimer = setTimeout(() => {
+      streamActionFreshnessExpiryTimer = null;
+      updateStreamFreshnessStatus('frame_authority_expired');
+    }, Math.floor(remainingMillis) + 1);
+  }
+
   function updateStreamFreshnessStatus(reason) {
-    const freshness = currentRenderedFreshness(performance.now());
-    const presentationLive = streamPresentationLive(freshness, reason);
+    const now = performance.now();
+    const freshness = currentRenderedFreshness(now);
+    scheduleStreamActionFreshnessExpiry(freshness, now);
+    const presentationContinuity = streamPresentationContinuity(freshness, reason);
+    const presentationLive = freshness.liveLabeled;
     const hdrFallbackReason = clientHDRSDRUnavailable(freshness, reason)
       ? 'sdr_stream_unavailable'
       : (!presentationLive ? 'sdr_stream_not_live' : '');
     if (hdrFallbackReason) reconcileClientHDRStreamContinuity(reason, hdrFallbackReason);
-    document.body.dataset.streamFreshness = freshness.streamFreshnessState;
+	    document.body.dataset.streamFreshness = freshness.streamFreshnessState;
 	    document.body.dataset.streamLive = presentationLive ? 'true' : 'false';
-	    if (!freshness.liveLabeled && (reason || hasRenderedFrame)) {
-	      showStreamResumeSpinner();
-	    } else if (freshness.liveLabeled) {
-	      hideStreamResumeSpinner();
-	      if (activeResumeFlow && !activeResumeFlow.done) finishActivationResumeFlow('fresh_frame');
-	    }
-    updateControlCodeSubmitAvailability();
+	    document.body.dataset.streamContinuity = presentationContinuity ? 'true' : 'false';
+	    document.body.dataset.streamActionFresh = freshness.actionFresh ? 'true' : 'false';
+    reconcileStreamResumeSpinner(freshness, reason);
+    if (freshness.liveLabeled && activeResumeFlow && !activeResumeFlow.done) finishActivationResumeFlow('fresh_frame');
+    if (currentState) renderTicketActionV3Controls(currentState);
+    else updateControlCodeSubmitAvailability();
     return freshness;
   }
 
@@ -8344,9 +9380,9 @@ import {
     return request.captureRequired === true && request.captureAcknowledged !== true;
   }
 
-  function controlCodeRequestOccupiesQueue() {
+  function controlCodeRequestOccupiesQueue(ignoreSubmitInFlight = false) {
     if (controlCodeCleanupPendingRequestID) return true;
-    if (controlCodeSubmitInFlight) return true;
+    if (!ignoreSubmitInFlight && controlCodeSubmitInFlight) return true;
     const requestsAvailable = Array.isArray(currentState && currentState.controlCodeRequests);
     const requests = requestsAvailable ? currentState.controlCodeRequests : [];
     const localRequestID = String(codeRequest && codeRequest.requestId || '').trim();
@@ -8362,8 +9398,8 @@ import {
     );
   }
 
-  function controlCodeMutationLaneBusy() {
-    return controlCodeRequestOccupiesQueue() ||
+  function controlCodeMutationLaneBusy(ignoreSubmitInFlight = false) {
+    return controlCodeRequestOccupiesQueue(ignoreSubmitInFlight) ||
       ticketInteractionIsBusy(currentState && currentState.ticketInteraction) ||
       ticketActionV3LocalRequestIsBusy() ||
       ticketActionV3Busy(currentState && currentState.ticketAction);
@@ -8374,21 +9410,24 @@ import {
     // Reset/reselect and an active slider claim occupy the same phone mutation
     // lane as control-code generation.  Use the authoritative interaction row
     // here so the UI cannot offer a request that the reducer will reject.
-    const busy = controlCodeMutationLaneBusy();
+    const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy();
     const limitBlocked = memberLimitBlocked('control_code');
+    const streamActionFresh = streamHasFreshRenderedFrame();
     const hdrControlReady = clientHDRConsequentialControlProofReady();
+    const dialogEntryReady = (streamActionFresh && hdrControlReady) || healthyOneFPSVisualContinuity();
     const digitCount = sanitizeControlDigits(codeDigits.value).length;
     const digitsValid = digitCount >= 2 && digitCount <= 8;
-    codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !hdrControlReady || !digitsValid;
-    codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';
-    if (controlCodeSubmitInFlight) {
+    codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !dialogEntryReady || !digitsValid;
+    codeSubmit.textContent = pendingBrowserAction && pendingBrowserAction.kind === 'control_code'
+      ? 'Gaida svaigu kadru…' : (controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu');
+    if (controlCodeSubmitInFlight || (pendingBrowserAction && pendingBrowserAction.kind === 'control_code')) {
       codeSubmit.setAttribute('aria-busy', 'true');
     } else {
       codeSubmit.removeAttribute('aria-busy');
     }
-    requestCodeButton.disabled = busy || limitBlocked || !hdrControlReady;
+    requestCodeButton.disabled = busy || limitBlocked || !dialogEntryReady || codeDialogOpen || !codeResultArea.hidden;
     const sliderOwnsHotspot = ticketRegisterOverlayOccupiesHotspot();
-    const hotspotUnavailable = busy || limitBlocked || !hdrControlReady || sliderOwnsHotspot ||
+    const hotspotUnavailable = busy || limitBlocked || !dialogEntryReady || sliderOwnsHotspot ||
       codeDialogOpen || !codeResultArea.hidden;
     controlCodeHotspot.disabled = hotspotUnavailable;
     controlCodeHotspot.setAttribute('aria-disabled', hotspotUnavailable ? 'true' : 'false');
@@ -8429,7 +9468,7 @@ import {
     }
     const hadStream = configured || lastDecodedFrameAt > 0 || lastPacketAt > 0 || latestStreamStatus;
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
-      connectDirectVideo();
+      scheduleVideoReconnect('foreground_video_socket_closed');
       if (hadStream) {
         requestServerRecoveryDebounced('foreground_video_socket_closed');
       }
@@ -8466,8 +9505,31 @@ import {
       return;
     }
 
+    // A reconnect can re-arm an owned result request before the replacement
+    // decoder receives its first frame. The relay intentionally reserves that
+    // socket too, so startup and ordinary stale-frame recovery share the guard.
+    if (controlCodeMediaReadSuppressed(now)) {
+      if (controlCodeReservedMediaBackendRecoveryAllowed(status, now)) {
+        requestServerRecoveryDebounced('control_code_reserved_media_backend_recover');
+      }
+      return;
+    }
+
     if (lastDecodedFrameAt === 0 && configuredAt > 0) {
       const firstFrameAge = now - configuredAt;
+      const staleIngressFlowing = lastStaleIngressDropAt > 0 &&
+        now - lastStaleIngressDropAt <= streamStaleKeyframeMs &&
+        lastPacketAt > 0 && now - lastPacketAt <= streamStaleKeyframeMs;
+      if (staleIngressFlowing) {
+        // Complete independent pictures are reaching this socket but are
+        // already outside their source-age budget. Recreating the decoder or
+        // ordered transport cannot make them newer. Keep authority revoked and
+        // let fresh server evidence remain the only shared-recovery trigger.
+        if (firstFrameAge > streamStaleServerRecoverMs || backendInactive) {
+          requestFirstFrameServerRecovery('stale_ingress_server_recover', 'configured');
+        }
+        return;
+      }
       if (firstFrameAge > streamFirstFrameKeyframeMs) {
         requestKeyframeDebounced('first_frame_timeout', recoveryKeyframeDebounceMs);
       }
@@ -8493,6 +9555,9 @@ import {
     const sequenceStalled = lastPacketAt > 0 && sequenceStalledAge > streamStaleKeyframeMs && decodedAge > streamStaleKeyframeMs;
     const localStaleAge = Math.max(decodedAge, renderedVisualAge, sequenceStalled ? sequenceStalledAge : 0);
     const serverStaleAge = serverStale ? serverAge : 0;
+    const staleIngressFlowing = lastStaleIngressDropAt > 0 &&
+      now - lastStaleIngressDropAt <= streamStaleKeyframeMs &&
+      lastPacketAt > 0 && now - lastPacketAt <= streamStaleKeyframeMs;
     const detail = streamRecoveryDetail({
       decodedAge,
       renderedVisualAge,
@@ -8504,10 +9569,22 @@ import {
       decodeToRenderMillis: freshness.decodeToRenderMillis,
       decoderQueueDelayMillis: freshness.decoderQueueDelayMillis,
       streamFreshnessState: freshness.streamFreshnessState,
+      continuityPresentable: freshness.continuityPresentable,
       liveLabeled: freshness.liveLabeled,
       activeVideoClients: status ? status.activeVideoClients : 0,
-      backendInactive
+      backendInactive,
+      staleIngressFlowing
     });
+    if (staleIngressFlowing) {
+      // New independent pictures are arriving but are already too old. A
+      // decoder reset or socket reconnect cannot remove upstream/network age
+      // and would interrupt the held picture. Shared recovery remains owned by
+      // independently stale/inactive server status below.
+      if (serverStaleAge > streamStaleServerRecoverMs || backendInactive) {
+        requestServerRecoveryDebounced('stale_ingress_server_recover');
+      }
+      return;
+    }
     if (localStaleAge <= streamStaleKeyframeMs) {
       if (serverStaleAge > streamStaleKeyframeMs) {
         if (requestKeyframeDebounced('server_stale_frames', recoveryKeyframeDebounceMs)) {
@@ -8645,7 +9722,7 @@ import {
     refreshSpacetimeStateAfterResume('network_online')
       .catch((error) => clientLog('spacetime_reconnect_failed', error && error.message));
     if (!videoWs || videoWs.readyState === WebSocket.CLOSED || videoWs.readyState === WebSocket.CLOSING) {
-      connectDirectVideo({ skipEarlyGrace: true });
+      connectDirectVideo({ skipEarlyGrace: true, forceImmediate: true });
     }
     chaseLiveStream();
     requestKeyframeDebounced('network_online_keyframe', 0, true);
@@ -8661,6 +9738,7 @@ import {
     window.visualViewport.addEventListener('scroll', updateViewportVars, { passive: true });
   }
   document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') invalidateBrowserActionContext('page_hidden');
     if (typeof refreshUserActivityTickSchedule === 'function') refreshUserActivityTickSchedule();
     scheduleStreamFeedback('visibility_change');
     if (document.visibilityState === 'visible') {
@@ -8689,7 +9767,7 @@ import {
 	      lastHiddenWallAt = Date.now();
 	      clearActivationReconnectBurst();
       pauseHiddenStreamAfterGrace('visibility_hidden');
-	      if (!hasRenderedFrame || !streamHasFreshRenderedFrame()) {
+      if (!hasRenderedFrame || !streamHasContinuityFrame()) {
 	        logResumeCheckpoint('activation_visibility_hidden_cold_shutdown', { reason: 'cold_open' }, flow);
 	      }
 	    }
@@ -8730,6 +9808,7 @@ import {
     recoverExperimentalMediaAfterNetworkOnline();
   });
   window.addEventListener('offline', () => {
+    invalidateBrowserActionContext('network_offline');
     if (typeof refreshUserActivityTickSchedule === 'function') refreshUserActivityTickSchedule();
     if (usesDirectSpacetimeAuth()) markSpacetimeStateUnconfirmed('network_offline');
     reconcileClientHDRStreamContinuity('network_offline', 'sdr_stream_unavailable');
@@ -8773,6 +9852,7 @@ import {
     followActivationResumeLifecycle('focus', 'focus');
   });
 	  window.addEventListener('pagehide', (event) => {
+      invalidateBrowserActionContext('page_hidden');
 	    if (typeof clearUserActivityTickTimer === 'function') clearUserActivityTickTimer();
 	    if (typeof armExperimentalMediaLifecycleResume === 'function') armExperimentalMediaLifecycleResume();
 	    if (typeof closeExperimentalMedia === 'function') closeExperimentalMedia({

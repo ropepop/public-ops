@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECONCILER="${REPO_ROOT}/infra/arbuzas/qbittorrent/reconcile-config.py"
 COMPOSE_PATH="${REPO_ROOT}/infra/arbuzas/docker/compose.yml"
 MEMORY_HEALTH="${REPO_ROOT}/infra/arbuzas/docker/images/qbittorrent-memory-health.sh"
+QBITTORRENT_DOCKERFILE="${REPO_ROOT}/infra/arbuzas/docker/images/qbittorrent.Dockerfile"
 tmpdir="$(mktemp -d "${REPO_ROOT}/.arbuzas-qbittorrent-test.XXXXXX")"
 trap 'rm -rf "${tmpdir}"' EXIT
 
@@ -139,6 +140,64 @@ for expected in (
 ):
     if expected not in housekeeper:
         raise SystemExit(f"qBittorrent housekeeper health is missing {expected!r}")
+PY
+
+python3 - "${QBITTORRENT_DOCKERFILE}" <<'PY'
+from pathlib import Path
+import sys
+
+dockerfile = Path(sys.argv[1]).read_text(encoding="utf-8")
+node_builder = (
+    "FROM node:22.22.1-bookworm-slim@sha256:"
+    "4f77a690f2f8946ab16fe1e791a3ac0667ae1c3575c3e4d0d4589e9ed5bfaf3d "
+    "AS vuetorrent-builder"
+)
+runtime = (
+    "FROM lscr.io/linuxserver/qbittorrent:5.2.3@sha256:"
+    "1a4641fa759dee784708ed277ece10adbbc5810ebb8bb9fdfe1cf00031f5ab2b"
+)
+source_digest = "af29d17312bcf0c1d8b496f96ae74e511cbf3d31a25071d38e7eb5b61c7dcfb4"
+original_dnd_digest = "1bd06f97b868cbea3d2d2bd7277e05163efd7ff326a357ca39e075e94ed4ee61"
+source_url = "https://github.com/VueTorrent/VueTorrent/archive/refs/tags/v2.34.1.tar.gz"
+overlay_copy = "COPY infra/arbuzas/docker/images/vuetorrent-2.34.1-overlay/"
+artifact_copy = "COPY --from=vuetorrent-builder /work/vuetorrent/vuetorrent /vuetorrent"
+
+for required in (
+    node_builder,
+    runtime,
+    f"ADD --checksum=sha256:{source_digest}",
+    source_url,
+    f"'{source_digest}'",
+    f"'{original_dnd_digest}'",
+    overlay_copy,
+    "npm ci;",
+    "npm test;",
+    "npm run build;",
+    "PWA worker is missing current asset",
+    artifact_copy,
+    'io.arbuzas.vuetorrent.patch="ios-drag-materialize-v1"',
+):
+    if required not in dockerfile:
+        raise SystemExit(f"qBittorrent image packaging is missing: {required}")
+
+if dockerfile.count("\nFROM ") != 2:
+    raise SystemExit("qBittorrent image must have exactly one builder and one runtime stage")
+if dockerfile.index(node_builder) > dockerfile.index(runtime):
+    raise SystemExit("VueTorrent builder must precede the qBittorrent runtime stage")
+if dockerfile.index(original_dnd_digest) > dockerfile.index(overlay_copy):
+    raise SystemExit("upstream DnDZone checksum must be verified before applying the overlay")
+if not (
+    dockerfile.index("npm ci;")
+    < dockerfile.index("npm test;")
+    < dockerfile.index("npm run build;")
+    < dockerfile.index(runtime)
+):
+    raise SystemExit("VueTorrent install, test, and build must run in order in the builder stage")
+if dockerfile.count("COPY --from=") != 1:
+    raise SystemExit("qBittorrent runtime must copy only one builder artifact")
+for retired in ("vuetorrent.zip", "releases/download/v2.34.1"):
+    if retired in dockerfile:
+        raise SystemExit(f"qBittorrent image still uses the retired prebuilt bundle: {retired}")
 PY
 
 mkdir -p "${tmpdir}/unsafe/config" "${tmpdir}/outside"

@@ -145,7 +145,7 @@ func TestLegacySafeOperationalLogSurfaceCannotWriteAndStillDrains(t *testing.T) 
 		}
 	}
 
-	cleanupBody := sourceBetween(t, source, "fn cleanup_expired(", "ticket_expiry_purgers! {")
+	cleanupBody := sourceBetween(t, source, "fn cleanup_expired(", "fn purge_expired_stream_viewer_focus_for_ticket(")
 	for _, forbidden := range []string{
 		"insert_safe_operational_log",
 		"cleanup_expired_completed",
@@ -442,13 +442,32 @@ func TestStreamViewerFocusUsesSafePublicIDs(t *testing.T) {
 	}
 	for _, required := range []string{
 		"upsert_stream_viewer_focus(",
-		"active_stream_viewer_focus_count(ctx, &ticket.id, &backend_id, &now)",
-		"viewers > 0",
 		"purge_expired_stream_viewer_focus_for_ticket_backend(",
 	} {
 		if !strings.Contains(reducerChunk, required) {
 			t.Fatalf("stream focus reducer missing presence marker %q", required)
 		}
+	}
+	for _, forbidden := range []string{
+		"upsert_stream_desired_state(",
+		"active_stream_viewer_focus_count(",
+		"viewers > 0",
+	} {
+		if strings.Contains(reducerChunk, forbidden) {
+			t.Fatalf("advisory stream focus must not own durable demand marker %q", forbidden)
+		}
+	}
+	focusCleanup := substringBetween(t, module,
+		"fn purge_expired_stream_viewer_focus_for_ticket(",
+		"fn purge_expired_stream_commands_for_ticket(")
+	if strings.Contains(focusCleanup, "upsert_stream_desired_state(") {
+		t.Fatal("focus expiry cleanup must not clear service-owned durable demand")
+	}
+	idleAuthority := substringBetween(t, module,
+		"fn authoritative_stream_is_idle(",
+		"fn relay_current_report_suppresses_background_stream_command(")
+	if strings.Contains(idleAuthority, "stream_viewer_focus") {
+		t.Fatal("advisory focus rows must not override service-owned idle authority")
 	}
 	for _, required := range []string{
 		"const STREAM_FOCUS_REFRESH_MS = 30000;",
@@ -466,7 +485,7 @@ func TestStreamViewerFocusUsesSafePublicIDs(t *testing.T) {
 	}
 }
 
-func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(t *testing.T) {
+func TestSpacetimeSuppressesServiceBackgroundCommandsOnlyForFreshRelayAndHonorsRequesterRecovery(t *testing.T) {
 	module := ticketRemoteSourceFile(t, "spacetimedb", "src", "lib.rs")
 	insertRequest := substringBetween(t, module,
 		"fn insert_control_code_public_request(",
@@ -511,6 +530,13 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 		"clean_reason.contains(\"control_code\")",
 		"report.videoClients == 0 || report.streamVerdict != \"live\"",
 		"STREAM_BACKGROUND_REPORT_MAX_AGE_MS",
+		"relay_last_frame_age_ms(report.lastFrameAt.as_deref(), now)",
+		"freshnessState",
+		"LIVE_FRESH",
+		"lastFrameVisualAgeKnown",
+		"phoneClockBoundedCalibrated",
+		"frameEnvelope",
+		"tsf3",
 		"lastFrameVisualAgeMillis",
 		"liveFrameMaxAgeMillis",
 	} {
@@ -527,22 +553,9 @@ func TestSpacetimeSuppressesServiceBackgroundCommandsButHonorsRequesterRecovery(
 			t.Fatalf("service stream command append reducer missing live suppression marker %q", required)
 		}
 	}
-	for _, required := range []string{
-		"ticketremote_phone_current_report().id().find(id)",
-		"report.desiredActive",
-		"streamActive",
-		"sessionState",
-		"relayStreamState",
-		"hardwareH264Active",
-		"hardwareH264Visibility",
-		"streamWatchdogStage",
-		"activeVideoClients",
-		"videoClients",
-		"relayViewers",
-	} {
-		if !strings.Contains(module, required) {
-			t.Fatalf("live phone suppression fallback missing %q", required)
-		}
+	retiredPhoneFallback := "fn phone_current_report_" + "suppresses_background_stream_command("
+	if strings.Contains(module, retiredPhoneFallback) {
+		t.Fatal("phone streaming state must not substitute for conservative relay frame freshness")
 	}
 	if !strings.Contains(module, `"fastRevision": bounded_text(expected_fast_revision, 160)`) {
 		t.Fatalf("the durable request must carry only the browser's fast-state handoff revision")

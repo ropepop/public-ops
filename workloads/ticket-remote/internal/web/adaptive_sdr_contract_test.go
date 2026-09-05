@@ -14,43 +14,57 @@ import (
 const (
 	allIntraSDRCodec               = "avc1.42C028"
 	allIntraSDRTransport           = "hardware-h264-annexb"
+	allIntraSDRCaptureMode         = "root_hardware_h264"
+	allIntraSDRCaptureSource       = "root_display_capture"
+	allIntraSDRCaptureMethod       = "app_process_mediacodec_surface_secure_screen_capture"
 	allIntraSDRWidth               = 994
 	allIntraSDRHeight              = 2046
 	allIntraSDRSourceWidth         = 1080
 	allIntraSDRSourceHeight        = 2424
+	allIntraSDRSourceLeftCrop      = 4
 	allIntraSDRSourceTopCrop       = 200
-	allIntraSDRSourceVisibleHeight = 2224
+	allIntraSDRSourceRightCrop     = 3
+	allIntraSDRSourceBottomCrop    = 3
+	allIntraSDRSourceVisibleWidth  = 1073
+	allIntraSDRSourceVisibleHeight = 2221
 	allIntraSDRBitrate             = 8_000_000
 	allIntraSDRFeedbackVersion     = 1
+	allIntraSDRQualityProfile      = "hardware_h264_crisp_all_intra_1fps"
+	allIntraSDRColorCorrection     = "red_blue_swap_high_brightness_sdr_gpu_paint_r1.08_g1.05_b1.03"
 	allIntraSDRColorStandard       = "bt709_limited_sdr"
-	allIntraSDRColorTransfer       = "sdr"
-	allIntraSDRColorMatrix         = "bt709"
 )
 
-var allIntraSDRConfigFixture = []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":994,"height":2046,"rootCapture":true,"sourceWidth":1080,"sourceHeight":2424,"sourceTopCrop":200,"sourceVisibleHeight":2224,"bitrate":8000000,"fps":1,"feedbackVersion":1,"sourceFps":1,"keyframeIntervalFrames":1,"frameDependencyMode":"all_intra","colorStandard":"bt709_limited_sdr","colorTransfer":"sdr","colorMatrix":"bt709","streamEpoch":7,"phoneUptimeMillis":10000}`)
+var allIntraSDRConfigFixture = []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","captureMode":"root_hardware_h264","captureSource":"root_display_capture","captureMethod":"app_process_mediacodec_surface_secure_screen_capture","width":994,"height":2046,"rootCapture":true,"sourceWidth":1080,"sourceHeight":2424,"sourceLeftCrop":4,"sourceTopCrop":200,"sourceRightCrop":3,"sourceBottomCrop":3,"sourceVisibleWidth":1073,"sourceVisibleHeight":2221,"bitrate":8000000,"qualityProfile":"hardware_h264_crisp_all_intra_1fps","fps":1,"feedbackVersion":1,"sourceFps":1,"keyframeIntervalFrames":1,"frameDependencyMode":"all_intra","colorCorrection":"red_blue_swap_high_brightness_sdr_gpu_paint_r1.08_g1.05_b1.03","colorStandard":"bt709_limited_sdr","streamEpoch":7,"phoneUptimeMillis":10000}`)
 
-var invalidAllIntraSDRConfigFixture = []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":994,"height":2046,"rootCapture":true,"sourceWidth":1080,"sourceHeight":2424,"sourceTopCrop":200,"sourceVisibleHeight":2224,"bitrate":8000000,"fps":10,"feedbackVersion":1,"sourceFps":10,"keyframeIntervalFrames":10,"frameDependencyMode":"all_intra","colorStandard":"bt709_limited_sdr","colorTransfer":"sdr","colorMatrix":"bt709","streamEpoch":8,"phoneUptimeMillis":11000}`)
+var invalidAllIntraSDRConfigFixture = []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","captureMode":"root_hardware_h264","captureSource":"root_display_capture","captureMethod":"app_process_mediacodec_surface_secure_screen_capture","width":994,"height":2046,"rootCapture":true,"sourceWidth":1080,"sourceHeight":2424,"sourceLeftCrop":4,"sourceTopCrop":200,"sourceRightCrop":3,"sourceBottomCrop":3,"sourceVisibleWidth":1073,"sourceVisibleHeight":2221,"bitrate":8000000,"qualityProfile":"hardware_h264_crisp_all_intra_1fps","fps":10,"feedbackVersion":1,"sourceFps":10,"keyframeIntervalFrames":10,"frameDependencyMode":"all_intra","colorCorrection":"red_blue_swap_high_brightness_sdr_gpu_paint_r1.08_g1.05_b1.03","colorStandard":"bt709_limited_sdr","streamEpoch":8,"phoneUptimeMillis":11000}`)
 
 type allIntraSDRConfig struct {
 	Type                   string `json:"type"`
 	Codec                  string `json:"codec"`
 	Transport              string `json:"transport"`
+	CaptureMode            string `json:"captureMode"`
+	CaptureSource          string `json:"captureSource"`
+	CaptureMethod          string `json:"captureMethod"`
 	Width                  int    `json:"width"`
 	Height                 int    `json:"height"`
 	RootCapture            bool   `json:"rootCapture"`
 	SourceWidth            int    `json:"sourceWidth"`
 	SourceHeight           int    `json:"sourceHeight"`
+	SourceLeftCrop         int    `json:"sourceLeftCrop"`
 	SourceTopCrop          int    `json:"sourceTopCrop"`
+	SourceRightCrop        int    `json:"sourceRightCrop"`
+	SourceBottomCrop       int    `json:"sourceBottomCrop"`
+	SourceVisibleWidth     int    `json:"sourceVisibleWidth"`
 	SourceVisibleHeight    int    `json:"sourceVisibleHeight"`
 	Bitrate                int    `json:"bitrate"`
+	QualityProfile         string `json:"qualityProfile"`
+	ColorCorrection        string `json:"colorCorrection"`
 	FPS                    int    `json:"fps"`
 	FeedbackVersion        int    `json:"feedbackVersion"`
 	SourceFPS              int    `json:"sourceFps"`
 	KeyframeIntervalFrames int    `json:"keyframeIntervalFrames"`
 	FrameDependencyMode    string `json:"frameDependencyMode"`
 	ColorStandard          string `json:"colorStandard"`
-	ColorTransfer          string `json:"colorTransfer"`
-	ColorMatrix            string `json:"colorMatrix"`
 	StreamEpoch            uint64 `json:"streamEpoch"`
 	PhoneUptimeMillis      int64  `json:"phoneUptimeMillis"`
 }
@@ -64,21 +78,43 @@ func decodeAllIntraSDRConfig(t *testing.T, raw []byte) allIntraSDRConfig {
 	return config
 }
 
+func allIntraSDRConfigWith(t *testing.T, field string, value any) []byte {
+	t.Helper()
+	var config map[string]any
+	if err := json.Unmarshal(allIntraSDRConfigFixture, &config); err != nil {
+		t.Fatal(err)
+	}
+	if value == nil {
+		delete(config, field)
+	} else {
+		config[field] = value
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 func TestAllIntraSDRPictureAndCadenceContract(t *testing.T) {
 	config := decodeAllIntraSDRConfig(t, allIntraSDRConfigFixture)
 	if config.Type != "config" || !config.RootCapture ||
 		config.Codec != allIntraSDRCodec || config.Transport != allIntraSDRTransport ||
+		config.CaptureMode != allIntraSDRCaptureMode ||
+		config.CaptureSource != allIntraSDRCaptureSource || config.CaptureMethod != allIntraSDRCaptureMethod ||
 		config.Width != allIntraSDRWidth || config.Height != allIntraSDRHeight ||
 		config.SourceWidth != allIntraSDRSourceWidth || config.SourceHeight != allIntraSDRSourceHeight ||
-		config.SourceTopCrop != allIntraSDRSourceTopCrop || config.SourceVisibleHeight != allIntraSDRSourceVisibleHeight ||
-		config.Bitrate != allIntraSDRBitrate {
+		config.SourceLeftCrop != allIntraSDRSourceLeftCrop || config.SourceTopCrop != allIntraSDRSourceTopCrop ||
+		config.SourceRightCrop != allIntraSDRSourceRightCrop || config.SourceBottomCrop != allIntraSDRSourceBottomCrop ||
+		config.SourceVisibleWidth != allIntraSDRSourceVisibleWidth || config.SourceVisibleHeight != allIntraSDRSourceVisibleHeight ||
+		config.Bitrate != allIntraSDRBitrate || config.QualityProfile != allIntraSDRQualityProfile ||
+		config.ColorCorrection != allIntraSDRColorCorrection {
 		t.Fatalf("unexpected fixed picture contract: %+v", config)
 	}
 	if config.FrameDependencyMode != frameDependencyModeAllIntra || config.FPS != 1 || config.SourceFPS != 1 || config.KeyframeIntervalFrames != 1 {
 		t.Fatalf("unexpected fixed all-intra cadence: %+v", config)
 	}
-	if config.FeedbackVersion != allIntraSDRFeedbackVersion ||
-		config.ColorStandard != allIntraSDRColorStandard || config.ColorTransfer != allIntraSDRColorTransfer || config.ColorMatrix != allIntraSDRColorMatrix {
+	if config.FeedbackVersion != allIntraSDRFeedbackVersion || config.ColorStandard != allIntraSDRColorStandard {
 		t.Fatalf("unexpected SDR signaling: %+v", config)
 	}
 }
@@ -101,6 +137,21 @@ func TestAllIntraBrowserConfigForwardingPreservesExactContract(t *testing.T) {
 }
 
 func TestAllIntraSourceConfigIsStrictAndFailsClosed(t *testing.T) {
+	t.Run("accept_implicit_tsf2", func(t *testing.T) {
+		if !newDirectStreamHub().setConfig(allIntraSDRConfigFixture) {
+			t.Fatal("canonical source config without frameEnvelope was not retained as TSF2 compatibility")
+		}
+	})
+
+	for _, envelope := range []string{frameEnvelopeTSF2, frameEnvelopeTSF3} {
+		t.Run("accept_"+envelope, func(t *testing.T) {
+			raw := allIntraSDRConfigWith(t, "frameEnvelope", envelope)
+			if !newDirectStreamHub().setConfig(raw) {
+				t.Fatalf("canonical %s source config was rejected", envelope)
+			}
+		})
+	}
+
 	tests := []struct {
 		name string
 		raw  []byte
@@ -108,6 +159,56 @@ func TestAllIntraSourceConfigIsStrictAndFailsClosed(t *testing.T) {
 		{"missing_mode", []byte(`{"type":"config","fps":1,"sourceFps":1,"keyframeIntervalFrames":1,"streamEpoch":7}`)},
 		{"unknown_mode", []byte(`{"type":"config","frameDependencyMode":"gop","fps":1,"sourceFps":1,"keyframeIntervalFrames":1,"streamEpoch":7}`)},
 		{"wrong_tuple", invalidAllIntraSDRConfigFixture},
+		{"missing_codec", allIntraSDRConfigWith(t, "codec", nil)},
+		{"wrong_codec", allIntraSDRConfigWith(t, "codec", "avc1.42E01E")},
+		{"missing_transport", allIntraSDRConfigWith(t, "transport", nil)},
+		{"wrong_transport", allIntraSDRConfigWith(t, "transport", "h264-annexb")},
+		{"wrong_capture_mode", allIntraSDRConfigWith(t, "captureMode", "software_h264")},
+		{"missing_capture_mode", allIntraSDRConfigWith(t, "captureMode", nil)},
+		{"missing_capture_source", allIntraSDRConfigWith(t, "captureSource", nil)},
+		{"wrong_capture_source", allIntraSDRConfigWith(t, "captureSource", "media_projection")},
+		{"missing_capture_method", allIntraSDRConfigWith(t, "captureMethod", nil)},
+		{"wrong_capture_method", allIntraSDRConfigWith(t, "captureMethod", "software_capture")},
+		{"missing_root_capture", allIntraSDRConfigWith(t, "rootCapture", nil)},
+		{"not_root_capture", allIntraSDRConfigWith(t, "rootCapture", false)},
+		{"missing_width", allIntraSDRConfigWith(t, "width", nil)},
+		{"wrong_width", allIntraSDRConfigWith(t, "width", 992)},
+		{"missing_height", allIntraSDRConfigWith(t, "height", nil)},
+		{"wrong_height", allIntraSDRConfigWith(t, "height", 2044)},
+		{"missing_source_width", allIntraSDRConfigWith(t, "sourceWidth", nil)},
+		{"wrong_source_width", allIntraSDRConfigWith(t, "sourceWidth", 1079)},
+		{"missing_source_height", allIntraSDRConfigWith(t, "sourceHeight", nil)},
+		{"wrong_source_height", allIntraSDRConfigWith(t, "sourceHeight", 2423)},
+		{"missing_source_left_crop", allIntraSDRConfigWith(t, "sourceLeftCrop", nil)},
+		{"wrong_source_left_crop", allIntraSDRConfigWith(t, "sourceLeftCrop", 3)},
+		{"missing_source_top_crop", allIntraSDRConfigWith(t, "sourceTopCrop", nil)},
+		{"wrong_source_top_crop", allIntraSDRConfigWith(t, "sourceTopCrop", 199)},
+		{"missing_source_right_crop", allIntraSDRConfigWith(t, "sourceRightCrop", nil)},
+		{"wrong_source_right_crop", allIntraSDRConfigWith(t, "sourceRightCrop", 2)},
+		{"missing_source_bottom_crop", allIntraSDRConfigWith(t, "sourceBottomCrop", nil)},
+		{"wrong_source_bottom_crop", allIntraSDRConfigWith(t, "sourceBottomCrop", 2)},
+		{"missing_source_visible_width", allIntraSDRConfigWith(t, "sourceVisibleWidth", nil)},
+		{"wrong_source_visible_width", allIntraSDRConfigWith(t, "sourceVisibleWidth", 1072)},
+		{"missing_source_visible_height", allIntraSDRConfigWith(t, "sourceVisibleHeight", nil)},
+		{"wrong_source_visible_height", allIntraSDRConfigWith(t, "sourceVisibleHeight", 2220)},
+		{"missing_bitrate", allIntraSDRConfigWith(t, "bitrate", nil)},
+		{"wrong_bitrate", allIntraSDRConfigWith(t, "bitrate", 7_999_999)},
+		{"missing_quality_profile", allIntraSDRConfigWith(t, "qualityProfile", nil)},
+		{"wrong_quality_profile", allIntraSDRConfigWith(t, "qualityProfile", "hardware_h264_crisp")},
+		{"missing_color_correction", allIntraSDRConfigWith(t, "colorCorrection", nil)},
+		{"wrong_color_correction", allIntraSDRConfigWith(t, "colorCorrection", "none")},
+		{"missing_color_standard", allIntraSDRConfigWith(t, "colorStandard", nil)},
+		{"wrong_color_standard", allIntraSDRConfigWith(t, "colorStandard", "bt709")},
+		{"missing_frame_dependency_mode", allIntraSDRConfigWith(t, "frameDependencyMode", nil)},
+		{"wrong_frame_dependency_mode", allIntraSDRConfigWith(t, "frameDependencyMode", "gop")},
+		{"missing_fps", allIntraSDRConfigWith(t, "fps", nil)},
+		{"wrong_fps", allIntraSDRConfigWith(t, "fps", 2)},
+		{"missing_source_fps", allIntraSDRConfigWith(t, "sourceFps", nil)},
+		{"wrong_source_fps", allIntraSDRConfigWith(t, "sourceFps", 2)},
+		{"missing_keyframe_interval", allIntraSDRConfigWith(t, "keyframeIntervalFrames", nil)},
+		{"wrong_keyframe_interval", allIntraSDRConfigWith(t, "keyframeIntervalFrames", 2)},
+		{"missing_stream_epoch", allIntraSDRConfigWith(t, "streamEpoch", nil)},
+		{"unsupported_envelope", allIntraSDRConfigWith(t, "frameEnvelope", "tsf4")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

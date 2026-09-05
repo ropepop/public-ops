@@ -8,6 +8,18 @@ import (
 
 func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 	page := ticketIndexTemplate(t)
+	source := ticketAppSource(t)
+	css := ticketRemoteSourceFile(t, "internal", "web", "static", "app.css")
+	for _, id := range []string{"codeRequestState", "codeRequestDetail", "viewerCount", "viewerCountDetail"} {
+		if strings.Contains(page, `id="`+id+`"`) || strings.Contains(source, "'"+id+"'") {
+			t.Fatalf("removed summary card must not remain in the page or its startup requirements: %s", id)
+		}
+	}
+	for _, selector := range []string{".panel-summary", ".code-summary"} {
+		if strings.Contains(page, selector) || strings.Contains(css, selector) {
+			t.Fatalf("removed summary cards must leave no unused styles: %s", selector)
+		}
+	}
 	for _, id := range []string{
 		`id="controlCodeHotspot"`,
 		`id="requestControlCode"`,
@@ -59,8 +71,6 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 	for _, required := range []string{
 		`:root {`,
 		`--ticket-controls-offset: var(--ticket-stage-height)`,
-		`.panel-summary .code-summary`,
-		`grid-column: auto`,
 	} {
 		if !strings.Contains(page, required) {
 			t.Fatalf("compact panel/safety-buffer layout missing %q", required)
@@ -76,6 +86,8 @@ func TestTicketPanelHasExplicitResetAndActivationActions(t *testing.T) {
 		`id="ticketLimitPanel"`,
 		`id="ticketRegistrationLimitUsage"`,
 		`id="ticketControlCodeLimitUsage"`,
+		`id="ticketControlCodeLimitDetail"`,
+		`id="presence"`,
 	}
 	last := -1
 	for _, label := range ordered {
@@ -144,8 +156,9 @@ func TestExplicitTicketActionsCanSupersedeBackgroundVisualProof(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, required := range []string{
 		"const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy()",
-		"const blockingBusy = busy && !backgroundProofBusy;",
-		"spacetimeStateFresh && hdrControlReady && !blockingBusy && !controlBusy",
+		"const blockingBusy = waiting || (busy && !backgroundProofBusy);",
+		"spacetimeStateFresh && !blockingBusy && !controlBusy, openReason",
+		"spacetimeStateFresh && presentationReady && !blockingBusy && !controlBusy",
 		"ticketActionV3Busy(currentAction) && !backgroundProofBusy",
 		"Pašreizējais skats tiek pārbaudīts fonā; atvēršanas darbības ir pieejamas.",
 	} {
@@ -161,14 +174,17 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"client.requestTicketActionV3(ticketActionV3RequestArgs({",
 		"'open_latest_unactivated', 'browser_button'",
 		"'open_latest_and_register', 'browser_button'",
-		"registerCurrentTicket('browser_button')",
+		"requestBrowserTicketAction('register_current', 'browser_button', 'ticket_register_button')",
+		"ticketActionV3RequiresFreshRenderedFrame(target)",
 		"target === 'register_current' ? expectedInteractionRevision : ''",
 		"attemptId: activation ? actionId : ''",
 		"statusView === 'latest_unactivated'",
 		"statusView === 'activated_current'",
 		"statusView === 'recent_activated'",
 		"Atvērtā biļete ir veiksmīgi reģistrēta un vizuāli apstiprināta.",
-		"hdrControlReady && registerReady && Boolean(region)",
+		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy)",
+		"const region = currentTicketSliderPresentationRegion(state)",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {",
 		"ticketSliderRegionV3ForAction(",
 		"ticketSliderRegionV3Layout(",
 	} {
@@ -240,7 +256,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 	source := ticketAppSource(t)
 	panelSlider := substringBetween(t, source,
-		"async function submitCompletedTicketRegisterSlider(proofSnapshot)",
+		"async function submitCompletedTicketRegisterSlider(proofSnapshot, browserIntentValid)",
 		"  ticketViewSwitchButton.addEventListener('click'")
 	for _, required := range []string{
 		"handleTicketLocalRegisterSliderChange({",
@@ -283,11 +299,11 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 	}
 	pointerMove := substringBetween(t, panelSlider,
 		"ticketLocalRegisterSlider.addEventListener('pointermove'",
-		"  ticketLocalRegisterSlider.addEventListener('input'")
+		"  ticketLocalRegisterSlider.addEventListener('pointerup'")
 	if !strings.Contains(pointerMove, "}, { passive: true });") {
 		t.Fatal("the slider-local direction observer must remain passive")
 	}
-	if !strings.Contains(panelSlider, "if (!revealAuthoritativeSDRForConsequentialControl()) {") ||
+	if !strings.Contains(panelSlider, "if (!currentTicketRegisterSliderPresentationProof(currentState)) {") ||
 		!strings.Contains(panelSlider, "event.preventDefault();") {
 		t.Fatal("a passive HDR holdover must cancel slider entry without starting a phone action")
 	}
@@ -343,10 +359,10 @@ func TestTicketPanelSliderAndSmartSwitchUseDirectTestedHandlers(t *testing.T) {
 func TestControlCodeBrowserGateIncludesEveryActiveV3Action(t *testing.T) {
 	source := ticketAppSource(t)
 	laneBusy := substringBetween(t, source,
-		"function controlCodeMutationLaneBusy() {",
+		"function controlCodeMutationLaneBusy(ignoreSubmitInFlight = false) {",
 		"  function updateControlCodeSubmitAvailability() {")
 	for _, required := range []string{
-		"controlCodeRequestOccupiesQueue()",
+		"controlCodeRequestOccupiesQueue(ignoreSubmitInFlight)",
 		"ticketInteractionIsBusy(currentState && currentState.ticketInteraction)",
 		"ticketActionV3LocalRequestIsBusy()",
 		"ticketActionV3Busy(currentState && currentState.ticketAction)",
@@ -355,19 +371,27 @@ func TestControlCodeBrowserGateIncludesEveryActiveV3Action(t *testing.T) {
 			t.Fatalf("control-code phone-lane gate missing %q", required)
 		}
 	}
-	if got := strings.Count(source, "if (controlCodeMutationLaneBusy())"); got != 2 {
-		t.Fatalf("dialog open and submit must both enforce the V3 lane gate; got %d guards", got)
+	for _, guard := range []string{
+		"if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;",
+		"if (pendingBrowserAction || controlCodeMutationLaneBusy()) return false;",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl())",
+		"if (!browserIntentValid() || !revealAuthoritativeSDRForConsequentialControl())",
+	} {
+		if !strings.Contains(source, guard) {
+			t.Fatalf("code local intent and strict submission must retain lane/proof guards, missing %q", guard)
+		}
 	}
+
 	availability := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
-	if !strings.Contains(availability, "const busy = controlCodeMutationLaneBusy()") ||
+	if !strings.Contains(availability, "const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy()") ||
 		!strings.Contains(availability, "requestCodeButton.disabled = busy") {
 		t.Fatal("the visible control-code button must disable from the shared V3 phone-lane gate")
 	}
 	for _, required := range []string{
 		"const sliderOwnsHotspot = ticketRegisterOverlayOccupiesHotspot()",
-		"const hotspotUnavailable = busy || limitBlocked || !hdrControlReady || sliderOwnsHotspot ||",
+		"const hotspotUnavailable = busy || limitBlocked || !dialogEntryReady || sliderOwnsHotspot ||",
 		"controlCodeHotspot.disabled = hotspotUnavailable",
 	} {
 		if !strings.Contains(availability, required) {
@@ -523,9 +547,9 @@ func TestTicketButtonActivationUsesSingleDurableReducerCalls(t *testing.T) {
 	for _, required := range []string{
 		"async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {})",
 		"client.requestTicketActionV3(ticketActionV3RequestArgs({",
-		"requestTicketResetAndActivateButton.addEventListener('click', () => requestTicketActionV3(",
+		"requestTicketResetAndActivateButton.addEventListener('click', () => requestBrowserTicketAction(",
 		"'open_latest_and_register', 'browser_button'",
-		"activateTicketButton.addEventListener('click', () => registerCurrentTicket('browser_button'))",
+		"activateTicketButton.addEventListener('click', () => requestBrowserTicketAction('register_current', 'browser_button', 'ticket_register_button'))",
 		"return requestTicketActionV3(",
 	} {
 		if !strings.Contains(source, required) {
@@ -585,7 +609,7 @@ func TestTicketControlCodeRequestClearsWhenAuthoritativeRowTerminates(t *testing
 		"const terminal = terminalWithoutFailure || localStatus === 'failed'",
 		"codeRequest = null",
 		"clearControlCodeResultCapture()",
-		"scheduleControlCodeTicker(null)",
+		"scheduleControlCodeExpiry(null)",
 	} {
 		if !strings.Contains(renderState+clearState, required) {
 			t.Fatalf("control-code terminal cleanup missing %q", required)
@@ -598,9 +622,9 @@ func TestTicketControlCodeRequestClearsWhenAuthoritativeRowTerminates(t *testing
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
 	mutationLaneBusy := substringBetween(t, source,
-		"function controlCodeMutationLaneBusy() {",
+		"function controlCodeMutationLaneBusy(ignoreSubmitInFlight = false) {",
 		"  function updateControlCodeSubmitAvailability() {")
-	if !strings.Contains(availability, "const busy = controlCodeMutationLaneBusy()") ||
+	if !strings.Contains(availability, "const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy()") ||
 		!strings.Contains(mutationLaneBusy, "ticketInteractionIsBusy(currentState && currentState.ticketInteraction)") {
 		t.Fatal("control-code admission must honor an active ticket interaction")
 	}
@@ -736,7 +760,7 @@ func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
 		"ticketCurrentProofRequestedScope = proofScope",
 		"renewBeforeMs: ticketCurrentProofRenewBeforeMs",
 		"slider_region_renewal",
-		"currentTicketRegisterSliderProof(state = currentState)",
+		"currentTicketRegisterSliderPresentationProof(state = currentState)",
 		"ticketRegisterSliderProofStillMatches(snapshot, state = currentState)",
 		"cancelTicketRegisterSliderSession('viewport_changed')",
 		"cancelTicketRegisterSliderSession('stream_reset')",
@@ -843,10 +867,14 @@ func TestTicketStateFailsClosedUntilFreshSnapshotAndNeverShowsOldActivation(t *t
 		"clientLog('spacetime_resume_reused'",
 		"if (spacetimeClient && typeof spacetimeClient.refresh === 'function')",
 		"renderTicketInteraction(spacetimeStateFresh ? state.ticketInteraction : null);",
-		"const proofReady = spacetimeStateFresh && ticketActionV3RegistrationProofIsFresh(action);",
+		"const proofReady = spacetimeStateFresh && isTicketActionV3RegistrationProofPresentable(",
 		"const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);",
-		"hdrControlReady && !blockingBusy && !controlBusy && registerReady",
-		"hdrControlReady && registerReady && Boolean(region)",
+		"spacetimeStateFresh && !blockingBusy && !controlBusy, openReason",
+		"presentationReady && !blockingBusy && !controlBusy && registerReady",
+		"((!pending) && (busy || controlBusy)) || !configured",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {",
+		"spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target",
+		"ticketViewSwitchDetail.textContent = connectionReason;",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("Ticket state freshness guard missing %q", required)

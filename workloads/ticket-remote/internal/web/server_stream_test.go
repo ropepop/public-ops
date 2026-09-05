@@ -63,6 +63,44 @@ func TestBrowserVideoSocketContextParsesOldPageQuery(t *testing.T) {
 	}
 }
 
+func TestBrowserVideoSocketRequiresConfiguredSameOriginBeforeWake(t *testing.T) {
+	phoneServer := httptest.NewServer(http.NotFoundHandler())
+	defer phoneServer.Close()
+	server, ticketServer, relay := newTicketRecoveryTestServer(t, phoneServer.URL)
+	defer server.Close()
+	defer ticketServer.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
+	for _, test := range []struct {
+		name   string
+		origin string
+	}{
+		{name: "missing"},
+		{name: "cross_origin", origin: "https://attacker.example"},
+		{name: "wrong_scheme", origin: "https://ticket.test"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
+			if test.origin != "" {
+				header.Set("Origin", test.origin)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, wsBase+"/api/v1/stream", &websocket.DialOptions{HTTPHeader: header})
+			if conn != nil {
+				_ = conn.Close(websocket.StatusNormalClosure, "unexpected acceptance")
+				t.Fatal("socket with invalid origin was accepted")
+			}
+			if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+				t.Fatalf("invalid origin response = %#v err=%v, want 403", response, err)
+			}
+		})
+	}
+	if health := relay.Snapshot(); health.Viewers != 0 || health.Desired {
+		t.Fatalf("rejected origins woke the phone relay: %#v", health)
+	}
+}
+
 func TestStreamPrewarmStartsPhoneRelayThroughWebsocket(t *testing.T) {
 	phoneCommands := make(chan string, 8)
 
@@ -1408,7 +1446,7 @@ func TestProvisionalWarmConfigIsSentWithoutStaleKeyframeWhileRelayDisconnected(t
 	}
 }
 
-func TestVideoClientLogsAreAcceptedAndSanitizedOnAuthenticatedVideoSocket(t *testing.T) {
+func TestVideoClientLogsDoNotMutateSharedSourceHealth(t *testing.T) {
 	server, ticketServer, relay := newStreamSharingTestServer(t)
 	defer ticketServer.Close()
 	defer relay.Close()
@@ -1425,28 +1463,13 @@ func TestVideoClientLogsAreAcceptedAndSanitizedOnAuthenticatedVideoSocket(t *tes
 		t.Fatalf("write client log: %v", err)
 	}
 
-	var event clientTelemetryEvent
-	var recent []clientTelemetryEvent
-	deadline := time.Now().Add(time.Second)
-	for event.Event == "" {
-		snapshot := server.direct.snapshot(time.Now(), phone.Health{})
-		recent, _ = snapshot["recentBrowserEvents"].([]clientTelemetryEvent)
-		for index := len(recent) - 1; index >= 0; index-- {
-			if recent[index].Event == "stream_started" {
-				event = recent[index]
-				break
-			}
-		}
-		if event.Event != "" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("validated client log was not accepted on the authenticated media socket: %#v", recent)
-		}
-		time.Sleep(5 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	snapshot := server.direct.snapshot(time.Now(), phone.Health{})
+	if _, exists := snapshot["recentBrowserEvents"]; exists {
+		t.Fatalf("viewer-local log leaked into shared source health: %#v", snapshot)
 	}
-	if !strings.Contains(event.Detail, "[redacted]") || strings.Contains(event.Detail, "123") {
-		t.Fatalf("client log detail was not sanitized: %#v", event)
+	if _, exists := snapshot["browserMediaError"]; exists {
+		t.Fatalf("viewer-local error leaked into shared source verdict: %#v", snapshot)
 	}
 }
 
@@ -1693,15 +1716,15 @@ func TestIndependentFramesAcceptSourceGapAndRejectDelta(t *testing.T) {
 	viewerConn := dialStreamTestClient(t, ctx, ticketServer.URL, "viewer-session")
 	defer viewerConn.Close(websocket.StatusNormalClosure, "test complete")
 	readyDeadline := time.Now().Add(time.Second)
+	var viewer *client
 	for {
-		ready := false
 		for _, live := range server.clientSnapshot() {
 			if live.sessionID == "viewer-session" && live.readyForVideoBroadcast() {
-				ready = true
+				viewer = live
 				break
 			}
 		}
-		if ready {
+		if viewer != nil {
 			break
 		}
 		if time.Now().After(readyDeadline) {
@@ -1715,6 +1738,23 @@ func TestIndependentFramesAcceptSourceGapAndRejectDelta(t *testing.T) {
 	server.handlePhoneMessage(phone.Message{Binary: firstFrame})
 	if got := readNextBinaryFrame(t, ctx, viewerConn); parseTSF2(got).sequence != 79 || !parseTSF2(got).keyFrame {
 		t.Fatalf("viewer independent frame = %x", got)
+	}
+	feedback := streamFeedbackV2Fixture(1, viewer.videoConfigGenerationSnapshot(), 79, 79, 79, 79, true)
+	if err := viewerConn.Write(ctx, websocket.MessageText, feedback); err != nil {
+		t.Fatalf("ack first independent frame: %v", err)
+	}
+	ackDeadline := time.Now().Add(time.Second)
+	for {
+		viewer.videoMu.Lock()
+		awaiting := viewer.videoReceiptAwaiting
+		viewer.videoMu.Unlock()
+		if !awaiting {
+			break
+		}
+		if time.Now().After(ackDeadline) {
+			t.Fatal("v2 receipt did not release the next independent frame")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	server.handlePhoneMessage(phone.Message{Binary: gapFrame})
 	if got := readNextTSF2Sequence(t, ctx, viewerConn, 95); !parseTSF2(got).keyFrame {
@@ -2016,7 +2056,7 @@ func TestVideoRecoverStreamWithConnectedRelayOnlyRequestsKeyframe(t *testing.T) 
 	defer ticketServer.Close()
 	defer relay.Close()
 
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
+	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}, "Origin": []string{"http://ticket.test"}}
 	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
@@ -2216,14 +2256,14 @@ func TestPhoneConfigForActiveViewerRequestsFreshKeyframe(t *testing.T) {
 	server.direct.mu.Unlock()
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
 
-	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
+	config := testAllIntraConfig([]byte(`{"type":"config","streamEpoch":42}`))
 	server.handlePhoneText(config)
 	server.handlePhoneText(config)
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "phone config viewer-required keyframe")
 	if got := countPhoneSignalsWithin(phoneSignals, "keyframe", 250*time.Millisecond); got != 0 {
 		t.Fatalf("repeated phone configs bypassed keyframe coalescing: %d extra requests", got)
 	}
-	newEpochConfig := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":43,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
+	newEpochConfig := testAllIntraConfig([]byte(`{"type":"config","streamEpoch":43}`))
 	server.handlePhoneText(newEpochConfig)
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "new config epoch viewer-required keyframe")
 }
@@ -2261,22 +2301,9 @@ func TestStreamFeedbackTransitionsAreDiagnosticOnly(t *testing.T) {
 	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 120, 120, 120, 111, 0, 100), now)
 	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 126, 125, 120, 1, 6, 3_100), now.Add(500*time.Millisecond))
 
-	feedbackEvents := func() []clientTelemetryEvent {
-		t.Helper()
-		hub.mu.Lock()
-		defer hub.mu.Unlock()
-		var events []clientTelemetryEvent
-		for _, event := range hub.recentBrowserEvents {
-			if event.Event == "stream_feedback_transition" {
-				events = append(events, event)
-			}
-		}
-		return events
-	}
-	events := feedbackEvents()
-	if len(events) != 1 || !strings.Contains(events[0].Detail, "cause=decoder_queue_hard") ||
-		!strings.Contains(events[0].Detail, "state=congested") {
-		t.Fatalf("diagnostic pressure transition telemetry=%#v", events)
+	feedback := viewer.feedbackSnapshot()
+	if feedback["feedbackCause"] != "decoder_queue_hard" || feedback["feedbackState"] != "congested" {
+		t.Fatalf("per-viewer diagnostic pressure state=%#v", feedback)
 	}
 	viewer.videoMu.Lock()
 	if len(viewer.videoQueue) != 0 || len(viewer.controlQueue) != 0 || viewer.videoLastWrittenSeq != 120 {
@@ -2285,9 +2312,9 @@ func TestStreamFeedbackTransitionsAreDiagnosticOnly(t *testing.T) {
 	}
 	viewer.videoMu.Unlock()
 	server.handleStreamFeedback(viewer, streamFeedbackFixture(7, 127, 127, 127, 0, 0, 100), now.Add(time.Second))
-	events = feedbackEvents()
-	if len(events) != 2 || !strings.Contains(events[1].Detail, "cause=healthy") || !strings.Contains(events[1].Detail, "state=flowing") {
-		t.Fatalf("diagnostic recovery telemetry=%#v", events)
+	feedback = viewer.feedbackSnapshot()
+	if feedback["feedbackCause"] != "healthy" || feedback["feedbackState"] != "flowing" {
+		t.Fatalf("per-viewer diagnostic recovery state=%#v", feedback)
 	}
 }
 
@@ -2332,7 +2359,7 @@ func TestPhoneConfigReplaysMatchingCachedKeyframeToEveryViewer(t *testing.T) {
 			viewerB: {},
 		},
 	}
-	config := []byte(`{"type":"config","codec":"avc1.42C028","transport":"hardware-h264-annexb","width":900,"height":1852,"rootCapture":true,"streamEpoch":42,"phoneUptimeMillis":10000,"frameDependencyMode":"all_intra","fps":1,"sourceFps":1,"keyframeIntervalFrames":1}`)
+	config := testAllIntraConfig([]byte(`{"type":"config","streamEpoch":42,"phoneUptimeMillis":10000}`))
 	hub.setConfig(config)
 	keyframe := testTSF2FrameWithTimestamp(42, 77, true, 10000)
 	if !hub.recordFrame(keyframe) {
@@ -2464,7 +2491,8 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	}
 
 	now := time.Now()
-	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000}`))
+	setTestAllIntraConfig(server.direct, []byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))
+	recordTestBoundedPhoneClock(t, server.direct, 10_000_000)
 	server.direct.mu.Lock()
 	server.direct.streamEpoch = 7
 	server.direct.lastFrameAt = now
@@ -2472,13 +2500,15 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	server.direct.lastFrameSequence = 42
 	server.direct.lastFrameVisualAgeMillis = 100
 	server.direct.lastFrameVisualAgeKnown = true
-	server.direct.lastBrowserMediaError = ""
 	server.direct.mu.Unlock()
 	server.backgroundKeyframeMu.Lock()
 	server.backgroundKeyframeInFlight = false
 	server.lastBackgroundKeyframeAt = time.Time{}
 	server.backgroundKeyframeMu.Unlock()
 	drainPhoneSignals(phoneSignals, 150*time.Millisecond)
+	if status := server.direct.streamStatus(time.Now(), server.relay.Snapshot()); status["live"] != true || status["streamVerdict"] != "live" {
+		t.Fatalf("strict TSF3 suppression fixture is not authoritatively live: %#v", status)
+	}
 
 	if err := server.requestPhoneKeyframeNow("stale_video_frames"); err != nil {
 		t.Fatalf("background keyframe suppression returned error: %v", err)
@@ -2515,6 +2545,29 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 		t.Fatalf("control-code keyframe returned error: %v", err)
 	}
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "control-code keyframe")
+
+	// A held picture just outside LIVE_FRESH remains useful continuity, but it
+	// must not suppress a recovery command as though it still had live authority.
+	now = time.Now()
+	server.direct.mu.Lock()
+	server.direct.lastFrameAt = now
+	server.direct.lastFrameReceivedAt = now
+	server.direct.lastFrameVisualAgeMillis = durationMillis(liveFreshMaxAge) + 1
+	server.direct.lastFrameVisualAgeKnown = true
+	server.direct.mu.Unlock()
+	status := server.direct.streamStatus(now, server.relay.Snapshot())
+	if status["freshnessState"] != freshnessLiveOK || status["live"] != false ||
+		status["continuity"] != true || status["streamVerdict"] == "live" {
+		t.Fatalf("continuity-only frame retained live recovery authority: %#v", status)
+	}
+	server.backgroundKeyframeMu.Lock()
+	server.backgroundKeyframeInFlight = false
+	server.lastBackgroundKeyframeAt = time.Time{}
+	server.backgroundKeyframeMu.Unlock()
+	if err := server.requestPhoneKeyframeNow("stale_video_frames"); err != nil {
+		t.Fatalf("continuity-only recovery keyframe returned error: %v", err)
+	}
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "continuity-only recovery keyframe")
 }
 
 func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *websocket.Conn) {
@@ -2579,7 +2632,7 @@ func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *webs
 	ticketServer := httptest.NewServer(server)
 	t.Cleanup(ticketServer.Close)
 
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
+	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}, "Origin": []string{"http://ticket.test"}}
 	wsBase := "ws" + strings.TrimPrefix(ticketServer.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -2923,7 +2976,7 @@ func dialStreamTestClient(t *testing.T, ctx context.Context, serverURL string, s
 func dialStreamTestClientForRun(t *testing.T, ctx context.Context, serverURL string, sessionID string, runOrigin string) *websocket.Conn {
 	t.Helper()
 	wsBase := "ws" + strings.TrimPrefix(serverURL, "http")
-	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}}
+	header := http.Header{"X-Ticket-Remote-Email": []string{"ticket@jolkins.id.lv"}, "Origin": []string{"http://ticket.test"}}
 	header.Add("Cookie", "ticket_remote_session="+sessionID)
 	options := &websocket.DialOptions{HTTPHeader: header}
 	if runOrigin != "" {

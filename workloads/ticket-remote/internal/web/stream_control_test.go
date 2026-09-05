@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,10 @@ type streamDesiredRecordingStore struct {
 	relayReports chan<- state.RelayCurrentReportInput
 	commands     chan<- state.StreamCommandInput
 	logs         chan<- state.SafeOperationalLogInput
+	desiredMu    sync.Mutex
+	desiredCalls int
+	desiredStart chan<- struct{}
+	desiredBlock <-chan struct{}
 }
 
 func (s *streamDesiredRecordingStore) AppendStreamCommand(ctx context.Context, input state.StreamCommandInput) error {
@@ -48,6 +54,23 @@ func (s *streamDesiredRecordingStore) UpdateRelayCurrentReport(ctx context.Conte
 }
 
 func (s *streamDesiredRecordingStore) SetStreamDesiredState(ctx context.Context, input state.StreamDesiredStateInput) error {
+	s.desiredMu.Lock()
+	s.desiredCalls++
+	call := s.desiredCalls
+	s.desiredMu.Unlock()
+	if call == 1 && s.desiredBlock != nil {
+		if s.desiredStart != nil {
+			select {
+			case s.desiredStart <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.desiredBlock:
+		}
+	}
 	if err := s.Store.SetStreamDesiredState(ctx, input); err != nil {
 		return err
 	}
@@ -183,6 +206,68 @@ func TestRelayViewerPublishesDesiredActiveAndTrace(t *testing.T) {
 	}
 }
 
+func TestStreamDesiredWriterCannotFinishStaleIdleAfterNewActiveState(t *testing.T) {
+	desired := make(chan state.StreamDesiredStateInput, 4)
+	firstStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{
+		desired:      desired,
+		desiredStart: firstStarted,
+		desiredBlock: releaseFirst,
+	})
+
+	idleResult := make(chan bool, 1)
+	go func() {
+		idleResult <- server.releaseStreamDesiredIfNoVideoClients("blocked_idle_release")
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("idle desired-state write did not reach the store")
+	}
+
+	server.addRelayViewer("new-active-session")
+	server.addRelayViewer("newest-active-session")
+	select {
+	case got := <-desired:
+		t.Fatalf("new active state bypassed the blocked sole writer: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	var first state.StreamDesiredStateInput
+	select {
+	case first = <-desired:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the unblocked idle write")
+	}
+	var second state.StreamDesiredStateInput
+	select {
+	case second = <-desired:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the newer active write")
+	}
+	if first.DesiredActive || first.ViewerCount != 0 {
+		t.Fatalf("first write = %#v, want the already-started idle transition", first)
+	}
+	if !second.DesiredActive || second.ViewerCount != 2 {
+		t.Fatalf("final write = %#v, want the newer active transition", second)
+	}
+	select {
+	case got := <-desired:
+		t.Fatalf("superseded intermediate viewer count was not coalesced: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case ok := <-idleResult:
+		if !ok {
+			t.Fatal("blocked idle write did not complete successfully")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle release did not finish after the store was unblocked")
+	}
+}
+
 func TestRelayReportEventsAreCoalescedByOneServerReporter(t *testing.T) {
 	if relayReportHeartbeat <= time.Second || relayReportHeartbeat > 5*time.Second {
 		t.Fatalf("relay heartbeat = %s, want a bounded cadence above one write per second", relayReportHeartbeat)
@@ -201,6 +286,107 @@ func TestRelayReportEventsAreCoalescedByOneServerReporter(t *testing.T) {
 	case report := <-reports:
 		t.Fatalf("burst produced a duplicate relay report: %#v", report)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestRelayReportPersistsConservativeTSF3SourceAgeAndSeparateReceiptTime(t *testing.T) {
+	reports := make(chan state.RelayCurrentReportInput, 1)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{relayReports: reports})
+	if !server.direct.setConfig(testAllIntraConfig([]byte(`{"type":"config","streamEpoch":7,"phoneUptimeMillis":10000,"frameEnvelope":"tsf3"}`))) {
+		t.Fatal("strict TSF3 config was rejected")
+	}
+	recordTestBoundedPhoneClock(t, server.direct, 10_000_000)
+	if !server.direct.recordFrame(testTSF3Frame(7, 1, true, 10_000_000)) {
+		t.Fatal("bounded TSF3 frame was rejected")
+	}
+	if err := server.publishRelayCurrentReport(context.Background(), time.Now(), "test_source_age"); err != nil {
+		t.Fatal(err)
+	}
+	report := <-reports
+	conservative, err := time.Parse(time.RFC3339Nano, report.LastFrameAt)
+	if err != nil {
+		t.Fatalf("parse durable lastFrameAt %q: %v", report.LastFrameAt, err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(report.StatusJSON), &status); err != nil {
+		t.Fatal(err)
+	}
+	received, err := time.Parse(time.RFC3339Nano, stringFromAny(status["lastFrameReceivedAt"]))
+	if err != nil {
+		t.Fatalf("parse receipt time: %v (%#v)", err, status)
+	}
+	estimate, err := time.Parse(time.RFC3339Nano, stringFromAny(status["lastFrameSourceEstimateAt"]))
+	if err != nil {
+		t.Fatalf("parse source estimate: %v (%#v)", err, status)
+	}
+	uncertaintyMillis, ok := status["lastFrameUncertaintyMillis"].(float64)
+	if !ok || uncertaintyMillis < 0 {
+		t.Fatalf("source uncertainty missing: %#v", status)
+	}
+	if conservative.After(estimate) || !received.After(conservative) {
+		t.Fatalf("durable age is not conservative/source-based: conservative=%s estimate=%s received=%s uncertainty_ms=%v", conservative, estimate, received, uncertaintyMillis)
+	}
+}
+
+func TestCompactRelayReportPreservesBrowserContinuityContract(t *testing.T) {
+	status := map[string]any{
+		"streamVerdict":            "stale_recovering",
+		"live":                     false,
+		"continuity":               true,
+		"freshnessState":           freshnessLiveOK,
+		"fps":                      1,
+		"sourceFps":                1,
+		"keyframeIntervalFrames":   1,
+		"frameEnvelope":            frameEnvelopeTSF3,
+		"allIntraConfigValid":      true,
+		"streamEpoch":              uint64(7),
+		"lastFrameSequence":        uint64(42),
+		"lastFrameVisualAgeKnown":  true,
+		"lastFrameVisualAgeMillis": int64(1_700),
+		"liveOKMaxAgeMillis":       durationMillis(liveOKMaxAge),
+		"phoneConnected":           true,
+		"phoneDesired":             true,
+		"phoneStreamState":         "streaming",
+		"lastFrameAgoMillis":       int64(20),
+		"lastKeyFrameAgoMillis":    int64(20),
+		"startupTrace":             []any{"large internal trace"},
+	}
+
+	encoded, err := json.Marshal(compactRelayCurrentReportStatus(status))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var browserDetail map[string]any
+	if err := json.Unmarshal(encoded, &browserDetail); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"streamVerdict":            "stale_recovering",
+		"live":                     false,
+		"continuity":               true,
+		"freshnessState":           freshnessLiveOK,
+		"fps":                      float64(1),
+		"sourceFps":                float64(1),
+		"keyframeIntervalFrames":   float64(1),
+		"frameEnvelope":            frameEnvelopeTSF3,
+		"allIntraConfigValid":      true,
+		"streamEpoch":              float64(7),
+		"lastFrameSequence":        float64(42),
+		"lastFrameVisualAgeKnown":  true,
+		"lastFrameVisualAgeMillis": float64(1_700),
+		"liveOKMaxAgeMillis":       float64(durationMillis(liveOKMaxAge)),
+		"phoneConnected":           true,
+		"phoneDesired":             true,
+		"phoneStreamState":         "streaming",
+	} {
+		if got := browserDetail[key]; got != want {
+			t.Fatalf("browser continuity field %q = %#v, want %#v; detail=%#v", key, got, want, browserDetail)
+		}
+	}
+	for _, omitted := range []string{"startupTrace", "lastFrameAgoMillis", "lastKeyFrameAgoMillis"} {
+		if _, ok := browserDetail[omitted]; ok {
+			t.Fatalf("compact relay report retained %q: %#v", omitted, browserDetail)
+		}
 	}
 }
 

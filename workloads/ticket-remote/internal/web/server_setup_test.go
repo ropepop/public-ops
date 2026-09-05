@@ -842,7 +842,7 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"ownedControlCodeRequestIDs.has(String(requestID))",
 		"control_code_message_ignored",
 		"function closeCurrentControlCode(openNext)",
-		"client.requestControlCode(digits,fastRevision)",
+		"client.requestControlCode(digits,fastRevision,()=>",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"ownerPublicId:localPublicID",
 		"codeResultArea.addEventListener('click'",
@@ -1015,8 +1015,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		".control-code-result",
 		".code-dialog",
 		".code-dialog-field input",
-		".panel-summary",
-		".panel-summary-item",
 		".presence-header",
 		"left:calc(var(--stream-left,0px) + 20px)",
 		"top:calc(var(--stream-top,0px) + 20px)",
@@ -1090,8 +1088,6 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		`minlength="2"`,
 		`id="closeControlCodeResult"`,
 		`class="control-code-close" type="button"`,
-		`id="viewerCount"`,
-		`id="viewerCountDetail"`,
 		`name="theme-color" content="#020304"`,
 		`aria-hidden="true"`,
 		`draggable="false" hidden`,
@@ -1141,8 +1137,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if strings.Contains(js, "['touchstart', 'touchmove']") {
 		t.Fatalf("ticket viewer should not block all touch movement; vertical scroll must remain available")
 	}
-	if !strings.Contains(serverVersion, "browser-captured-control-code") {
-		t.Fatalf("ticket page version should name the browser-captured control-code path, got %q", serverVersion)
+	if serverVersion != "ticket-remote-2026-09-05-browser-captured-control-code-hidden-viewer-anchor-v166" {
+		t.Fatalf("ticket page version should identify the bounded cadence-continuity rollout, got %q", serverVersion)
 	}
 	if strings.Contains(serverVersion, "root-image") || strings.Contains(serverVersion, "phone-image") {
 		t.Fatalf("ticket page version should not name the superseded phone-image path, got %q", serverVersion)
@@ -1309,7 +1305,9 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		"decodeToRenderMillis:",
 		"decoderQueueDelayMillis:",
 		"streamFreshnessState:",
+		"continuityPresentable:",
 		"liveLabeled:",
+		"const liveLabeled = visualAgeConservative && clockBoundCurrent && streamFreshnessState === 'LIVE_FRESH'",
 		"streamFreshnessState === 'DEGRADED'",
 		"LIVE_FRESH",
 		"LIVE_OK",
@@ -1411,12 +1409,11 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 		"locallyClosedControlCodeRequestIDs.add(String(requestID))",
 		"return String(value || '').replace(/\\D/g, '')",
 		"digits.length < 2 || digits.length > 8",
-		"client.requestControlCode(digits,fastRevision)",
+		"client.requestControlCode(digits,fastRevision,()=>",
 		"renderControlCodeRequest({requestId:`pending:${Date.now()}`",
 		"closeCurrentControlCode(false)",
-		"scheduleControlCodeTicker(current)",
+		"scheduleControlCodeExpiry(current)",
 		"codeResultValue.hidden=true",
-		"codeResultTimer.hidden=false",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"publicPresence=Array.isArray(state&&state.viewerPresence)",
 		"activeViewers(state&&state.viewers||[])",
@@ -1439,9 +1436,9 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	for _, snippet := range []string{
 		"function requestControlCodeFromHotspot(event)",
 		"if(codeDialogOpen||!codeDialog.hidden||!codeResultArea.hidden||ticketRegisterOverlayOccupiesHotspot())return",
-		"if(controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
+		"if(pendingBrowserAction||controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
 		"const sliderOwnsHotspot=ticketRegisterOverlayOccupiesHotspot()",
-		"const hotspotUnavailable=busy||limitBlocked||!hdrControlReady||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
+		"const hotspotUnavailable=busy||limitBlocked||!dialogEntryReady||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
 		"controlCodeHotspot.disabled=hotspotUnavailable",
 	} {
 		if !staticContains(js, snippet) {
@@ -1615,7 +1612,7 @@ func TestSpacetimeAuthDirectClientContract(t *testing.T) {
 		"/api/v1/auth/start",
 		"clearLocalAuthState()",
 		"/api/v1/auth/session",
-		"client.requestControlCode(digits,fastRevision)",
+		"client.requestControlCode(digits,fastRevision,()=>",
 		"client.closeControlCode(requestID,\"browser_closed\")",
 		"usesDirectSpacetimeAuth()",
 		"publishCurrentStreamFocus('public_connected')",

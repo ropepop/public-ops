@@ -10,6 +10,11 @@ func TestTicketViewerHDRForegroundCoordinatorFencesRestoresAndWaitsForFreshSDR(t
 	coordinator := substringBetween(t, source,
 		"function reportExperimentalMediaForegroundRecovery(attempt, phase, reason) {",
 		"  function scheduleExperimentalMediaCapabilityRetry(reason, attempt, forceCanvasReset) {")
+	freshness := substringBetween(t, source,
+		"function freshnessStateForVisualAge(ageMs) {",
+		"  function healthyOneFPSVisualContinuity(freshness, now) {") + substringBetween(t, source,
+		"function lastRenderedVisualAge(now) {",
+		"  function clearStreamContinuityStaleGrace() {")
 
 	runTicketJavaScript(t, `
 const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
@@ -26,7 +31,7 @@ const originalDateNow = Date.now;
 Date.now = () => wallNow;
 const timers = [];
 function setTimeout(callback, millis) {
-  const timer = { callback, millis, cancelled: false };
+  const timer = { callback, millis, at: wallNow + millis, cancelled: false, fired: false };
   timers.push(timer);
   return timer;
 }
@@ -63,6 +68,21 @@ let authoritativeSDRRenderSerial = 10;
 let currentStreamEpoch = 7;
 let lastRenderedFrameEpoch = 7;
 let lastRenderedFrameSequence = 30;
+let lastRenderedFrameRenderedAt = wallNow;
+let lastRenderedFrameVisualAgeMillis = 700;
+let lastRenderedFrameVisualAgeKnown = true;
+let lastRenderedFrameVisualAgeConservative = true;
+let lastRenderedFrameReceivedAt = wallNow;
+let lastRenderedFrameQueuedAt = wallNow;
+let lastRenderedFrameConfigGeneration = 8;
+const activeFeedbackVersion = 2;
+const activeFeedbackConfigGeneration = 8;
+let feedbackRenderedSequence = 30;
+let clockBoundCurrent = true;
+let useActualFreshness = false;
+const streamLiveFreshMaxAgeMs = 1250;
+const streamLiveOkMaxAgeMs = 2000;
+const streamDegradedMaxAgeMs = 3000;
 const experimentalMediaForegroundRecoveryWindowMillis = 12000;
 const experimentalMediaForegroundRecoveryRetryDelays = Object.freeze([0, 250, 750, 1500, 3000]);
 const experimentalMediaForegroundSuspensionGapMillis = 2500;
@@ -75,6 +95,7 @@ let controllerActive = true;
 let controllerReady = true;
 let closes = 0;
 let starts = 0;
+const startTimes = [];
 let versionChecks = 0;
 let versionResult = true;
 let fetchDeferred = null;
@@ -87,7 +108,10 @@ let experimentalClientHDRController = {
   snapshot() { return { active: controllerActive, ready: controllerReady, surfaceVisible: true }; }
 };
 function clientHDRMeasurement(event, _a, _b, detail) { metrics.push({ event, detail }); }
-function streamHasFreshRenderedFrame() { return true; }
+function streamClockBoundIsCurrent() { return clockBoundCurrent; }
+function streamHasFreshRenderedFrame() {
+  return useActualFreshness ? currentRenderedFreshness(wallNow).actionFresh : true;
+}
 function experimentalHDRSurfacePresentationAllowed() { return true; }
 function experimentalMediaDocumentHasFocus() { return documentFocused; }
 function controlCodeHDRFreezeTargetActive() { return false; }
@@ -128,6 +152,7 @@ function resumeExperimentalMediaForLifecycle(reason) {
 }
 function scheduleExperimentalMediaStart(reason, options) {
   starts += 1;
+  startTimes.push({ at: wallNow, sourceAge: useActualFreshness ? lastRenderedVisualAge(wallNow) : 0 });
   experimentalMediaCanvasResetGeneration = experimentalMediaLifecycleGeneration;
   controllerActive = true;
   controllerReady = false;
@@ -139,7 +164,7 @@ function deferred() {
   return { promise, resolve };
 }
 function check(value, message) { if (!value) throw new Error(message); }
-`+coordinator+`
+`+freshness+coordinator+`
 
 (async () => {
   check(beginExperimentalMediaForegroundRecovery('pageshow_persisted') === true,
@@ -375,6 +400,110 @@ function check(value, message) { if (!value) throw new Error(message); }
   await reconcileExperimentalMediaForegroundRecovery(staleFocus);
   check(starts === 3 && staleFocus.canvasStarted,
     'paint-scoped foreground evidence did not bypass stale iOS document focus');
+
+  // Execute the real timer queue and browser freshness predicate. At one FPS,
+  // pictures arriving 700 ms old have only 550 ms left to admit HDR. The old
+  // 3-second retry can stay exactly between those fresh windows forever.
+  useActualFreshness = true;
+  documentFocused = true;
+  experimentalMediaForegroundCanvasStabilityMillis = 1000;
+  async function advanceTo(destination) {
+    let iterations = 0;
+    while (true) {
+      const next = timers.filter((timer) => !timer.cancelled && !timer.fired && timer.at <= destination)
+        .sort((left, right) => left.at - right.at)[0];
+      if (!next) break;
+      check(++iterations < 1000, 'foreground retry queue spun without advancing time');
+      wallNow = next.at;
+      next.fired = true;
+      next.callback();
+      await flush();
+    }
+    wallNow = destination;
+    await flush();
+  }
+  function resetCadence() {
+    invalidateExperimentalMediaForegroundRecovery('cadence_case');
+    for (const timer of timers) timer.cancelled = true;
+    wallNow += 20000;
+    hasRenderedFrame = false;
+    controllerActive = false;
+    currentStreamEpoch = 7;
+    lastRenderedFrameEpoch = 7;
+    lastRenderedFrameConfigGeneration = 8;
+    lastRenderedFrameVisualAgeKnown = true;
+    lastRenderedFrameVisualAgeConservative = true;
+    clockBoundCurrent = true;
+    beginExperimentalMediaForegroundRecovery('preference_projection_restore');
+    return experimentalMediaForegroundRecovery;
+  }
+  async function frameAt(at, invalidate) {
+    await advanceTo(at);
+    hasRenderedFrame = true;
+    lastRenderedFrameRenderedAt = wallNow;
+    lastRenderedFrameReceivedAt = wallNow;
+    lastRenderedFrameQueuedAt = wallNow;
+    lastRenderedFrameVisualAgeMillis = 700;
+    lastRenderedFrameVisualAgeKnown = true;
+    lastRenderedFrameVisualAgeConservative = true;
+    lastRenderedFrameEpoch = currentStreamEpoch;
+    lastRenderedFrameConfigGeneration = activeFeedbackConfigGeneration;
+    clockBoundCurrent = true;
+    lastRenderedFrameSequence += 1;
+    feedbackRenderedSequence = lastRenderedFrameSequence;
+    authoritativeSDRRenderSerial += 1;
+    if (invalidate) invalidate();
+    noteExperimentalMediaForegroundFrame();
+    const pendingTimer = experimentalMediaForegroundRecoveryTimer;
+    noteExperimentalMediaForegroundFrame();
+    check(experimentalMediaForegroundRecoveryTimer === pendingTimer,
+      'duplicate immediate frame notification replaced the owning timer');
+    queueExperimentalMediaForegroundRecovery(experimentalMediaForegroundRecovery, 3000);
+    check(experimentalMediaForegroundRecoveryTimer === pendingTimer,
+      'a later retry postponed an already queued fresh-frame check');
+    await advanceTo(at);
+    check(timers.filter((timer) => !timer.cancelled && !timer.fired).length <= 2,
+      'HDR recovery retained more than one retry and its absolute deadline');
+  }
+  for (const interval of [1000, 950, 1050, 1100]) {
+    const beforeStarts = starts;
+    const attempt = resetCadence();
+    const firstArrivalAt = wallNow + 1800;
+    const originalDeadline = attempt.deadlineWallAt;
+    let frames = 0;
+    for (let at = firstArrivalAt; at < originalDeadline; at += interval) {
+      await frameAt(at);
+      frames += 1;
+      if (starts > beforeStarts && foregroundRecoveryCurrent(attempt)) {
+        completeExperimentalMediaForegroundRecovery('first_presented');
+      }
+    }
+    await advanceTo(originalDeadline);
+    check(starts === beforeStarts + 1,
+      'fresh pictures never expedited the stale retry phase: ' + JSON.stringify({ interval, frames, starts: starts - beforeStarts }));
+    const initialization = startTimes[beforeStarts];
+    check(initialization.at === firstArrivalAt && initialization.sourceAge === 700,
+      'HDR missed the first legal fresh picture: ' + JSON.stringify({ interval, initialization, firstArrivalAt }));
+    check(attempt.deadlineWallAt === originalDeadline,
+      'fresh pictures extended the original foreground recovery deadline');
+  }
+  for (const [label, invalidate] of [
+    ['expired source', () => { lastRenderedFrameVisualAgeMillis = 1251; }],
+    ['unknown source age', () => { lastRenderedFrameVisualAgeKnown = false; }],
+    ['uncertain clock', () => { clockBoundCurrent = false; }],
+    ['old epoch', () => { lastRenderedFrameEpoch = currentStreamEpoch - 1; }],
+    ['old config', () => { lastRenderedFrameConfigGeneration = activeFeedbackConfigGeneration - 1; }]
+  ]) {
+    const beforeStarts = starts;
+    const attempt = resetCadence();
+    const firstArrivalAt = wallNow + 1800;
+    await frameAt(firstArrivalAt, invalidate);
+    check(starts === beforeStarts && attempt.phase === 'fresh_sdr_wait',
+      label + ' bypassed strict authority when expediting recovery');
+    await frameAt(firstArrivalAt + 1000);
+    check(starts === beforeStarts + 1, label + ' prevented a later proved fresh picture from recovering');
+    completeExperimentalMediaForegroundRecovery('first_presented');
+  }
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
@@ -395,6 +524,7 @@ func TestTicketViewerHDROnlineRecoveryPreservesHeldSurfaceAndReconnects(t *testi
 		"  window.addEventListener('blur', () => {")
 
 	runTicketJavaScript(t, `
+function invalidateBrowserActionContext() {}
 const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
 const WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
 const handlers = {};
@@ -466,6 +596,7 @@ function connectDirectVideo() {
   connects += 1;
   videoWs = { readyState: WebSocket.CONNECTING };
 }
+function scheduleVideoReconnect() { return true; }
 function chaseLiveStream() { chases += 1; }
 function requestKeyframeDebounced() { keyframes += 1; return true; }
 function refreshUserActivityTickSchedule() {}
@@ -558,6 +689,7 @@ func TestTicketViewerHDRLifecycleHandlersClassifyPersistedAndClusteredReturns(t 
 		"  window.addEventListener('load', () => keepFirstScreenPinned(true));")
 
 	runTicketJavaScript(t, `
+function invalidateBrowserActionContext() {}
 const handlers = {};
 const order = [];
 const document = {
@@ -617,6 +749,7 @@ function resumeBooleanLabel(value) { return value ? 'yes' : 'no'; }
 function clearActivationReconnectBurst() {}
 function pauseHiddenStreamAfterGrace() {}
 function streamHasFreshRenderedFrame() { return true; }
+function streamHasContinuityFrame() { return true; }
 function keepFirstScreenPinned() {}
 function chaseLiveStream() {}
 function followActivationResumeLifecycle() {}

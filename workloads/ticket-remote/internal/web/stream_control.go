@@ -16,18 +16,126 @@ const (
 	streamKeyframeCommandTTL  = 30 * time.Second
 )
 
+type streamDesiredStateResult struct {
+	written bool
+	err     error
+}
+
+type streamDesiredStateUpdate struct {
+	active      bool
+	viewerCount int
+	reason      string
+	source      string
+	result      chan streamDesiredStateResult
+}
+
 func (s *Server) publishStreamDesiredStateAsync(active bool, viewerCount int, reason string, source string) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
-		defer cancel()
-		if err := s.publishStreamDesiredState(ctx, active, viewerCount, reason, source); err != nil {
-			s.recordRuntimeErrorAsync("stream_desired_state_publish_failed", source, err, map[string]any{
-				"reason":      reason,
-				"active":      active,
-				"viewerCount": viewerCount,
-			})
+	s.enqueueStreamDesiredState(active, viewerCount, reason, source, nil)
+}
+
+func (s *Server) enqueueStreamDesiredState(active bool, viewerCount int, reason string, source string, result chan streamDesiredStateResult) bool {
+	if s == nil || s.store == nil || s.streamDesiredWake == nil {
+		completeStreamDesiredState(result, streamDesiredStateResult{})
+		return false
+	}
+	if viewerCount < 0 {
+		viewerCount = 0
+	}
+	update := &streamDesiredStateUpdate{
+		active:      active,
+		viewerCount: viewerCount,
+		reason:      cleanStreamControlText(reason, "stream_state"),
+		source:      cleanStreamControlText(source, "ticket_remote"),
+		result:      result,
+	}
+	s.streamDesiredMu.Lock()
+	if s.streamDesiredClosed {
+		s.streamDesiredMu.Unlock()
+		completeStreamDesiredState(result, streamDesiredStateResult{})
+		return false
+	}
+	superseded := s.streamDesiredPending
+	s.streamDesiredPending = update
+	s.streamDesiredMu.Unlock()
+	// Pending state is newest-only. A write already in flight is allowed to
+	// finish, then this one is necessarily written after it by the sole writer.
+	completeStreamDesiredState(supersededResult(superseded), streamDesiredStateResult{})
+	select {
+	case s.streamDesiredWake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func supersededResult(update *streamDesiredStateUpdate) chan streamDesiredStateResult {
+	if update == nil {
+		return nil
+	}
+	return update.result
+}
+
+func completeStreamDesiredState(result chan streamDesiredStateResult, outcome streamDesiredStateResult) {
+	if result == nil {
+		return
+	}
+	result <- outcome
+	close(result)
+}
+
+func (s *Server) takePendingStreamDesiredState() *streamDesiredStateUpdate {
+	s.streamDesiredMu.Lock()
+	defer s.streamDesiredMu.Unlock()
+	update := s.streamDesiredPending
+	s.streamDesiredPending = nil
+	return update
+}
+
+func (s *Server) streamDesiredStateLoop(ctx context.Context) {
+	defer close(s.streamDesiredDone)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.streamDesiredWake:
 		}
-	}()
+		for {
+			update := s.takePendingStreamDesiredState()
+			if update == nil {
+				break
+			}
+			writeCtx, cancel := context.WithTimeout(ctx, streamControlWriteTimeout)
+			err := s.publishStreamDesiredState(writeCtx, update.active, update.viewerCount, update.reason, update.source)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				s.recordRuntimeErrorAsync("stream_desired_state_publish_failed", update.source, err, map[string]any{
+					"reason":      update.reason,
+					"active":      update.active,
+					"viewerCount": update.viewerCount,
+				})
+			}
+			completeStreamDesiredState(update.result, streamDesiredStateResult{written: err == nil, err: err})
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) stopStreamDesiredStateWriter() {
+	if s == nil || s.streamDesiredCancel == nil {
+		return
+	}
+	s.streamDesiredMu.Lock()
+	s.streamDesiredClosed = true
+	pending := s.streamDesiredPending
+	s.streamDesiredPending = nil
+	s.streamDesiredMu.Unlock()
+	completeStreamDesiredState(supersededResult(pending), streamDesiredStateResult{})
+	s.streamDesiredCancel()
+	select {
+	case <-s.streamDesiredDone:
+	case <-time.After(streamControlWriteTimeout + time.Second):
+	}
 }
 
 func (s *Server) publishStreamDesiredState(ctx context.Context, active bool, viewerCount int, reason string, source string) error {
@@ -287,23 +395,33 @@ func (s *Server) scheduleIdleStreamDesiredRelease(reason string) {
 
 func (s *Server) releaseStreamDesiredIfNoVideoClients(reason string) bool {
 	s.streamLifecycleMu.Lock()
-	defer s.streamLifecycleMu.Unlock()
 	if s.store == nil {
+		s.streamLifecycleMu.Unlock()
 		return false
 	}
 	if s.streamDemandStillPresent() {
+		s.streamLifecycleMu.Unlock()
 		return false
 	}
 	reason = cleanStreamControlText(reason, "relay_no_video_clients")
-	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
-	defer cancel()
-	if err := s.publishStreamDesiredState(ctx, false, 0, reason, "ticket_remote_relay"); err != nil {
-		s.recordRuntimeErrorAsync("stream_desired_state_idle_release_failed", reason, err, map[string]any{"reason": reason})
+	result := make(chan streamDesiredStateResult, 1)
+	queued := s.enqueueStreamDesiredState(false, 0, reason, "ticket_remote_relay", result)
+	s.streamLifecycleMu.Unlock()
+	if !queued {
+		return false
+	}
+	outcome := <-result
+	if !outcome.written || outcome.err != nil {
+		if outcome.err != nil {
+			s.recordRuntimeErrorAsync("stream_desired_state_idle_release_failed", reason, outcome.err, map[string]any{"reason": reason})
+		}
 		return false
 	}
 	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "stream_desired_state_idle_released", reason, map[string]any{
 		"reason": reason,
 	})
+	ctx, cancel := context.WithTimeout(context.Background(), streamControlWriteTimeout)
+	defer cancel()
 	if err := s.publishRelayCurrentReport(ctx, time.Now(), reason); err != nil {
 		s.recordRuntimeErrorAsync("relay_report_idle_release_failed", reason, err, map[string]any{"reason": reason})
 	}
@@ -362,7 +480,7 @@ func (s *Server) appendStreamCommand(ctx context.Context, commandType string, re
 		s.streamLifecycleMu.RLock()
 		defer s.streamLifecycleMu.RUnlock()
 		if !s.streamDemandStillPresent() {
-			s.direct.recordClientTelemetry("stream_command_suppressed_no_demand", cleanStreamControlText(commandType, "command"))
+			s.direct.recordRelayTelemetry("stream_command_suppressed_no_demand", cleanStreamControlText(commandType, "command"))
 			return "", nil
 		}
 	}

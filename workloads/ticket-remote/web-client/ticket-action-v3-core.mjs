@@ -93,6 +93,16 @@ export function ticketLocalRegisterSliderProofSnapshot(
   now = Date.now()
 ) {
   const currentRegion = ticketSliderRegionV3ForAction(action, region, stream, now);
+  return ticketLocalRegisterSliderRegionSnapshot(currentRegion, stream, layoutRevision, visualRevision);
+}
+
+export function ticketLocalRegisterSliderPresentationSnapshot(action, region, stream, layoutRevision = 0, visualRevision = 0, now = Date.now()) {
+  return ticketLocalRegisterSliderRegionSnapshot(
+    ticketSliderRegionV3ForPresentation(action, region, stream, now), stream, layoutRevision, visualRevision
+  );
+}
+
+function ticketLocalRegisterSliderRegionSnapshot(currentRegion, stream, layoutRevision, visualRevision) {
   if (!currentRegion) return null;
   return {
     proofActionId: String(currentRegion.proofActionId || ''),
@@ -103,6 +113,7 @@ export function ticketLocalRegisterSliderProofSnapshot(
     topBasisPoints: Number(currentRegion.topBasisPoints),
     rightBasisPoints: Number(currentRegion.rightBasisPoints),
     bottomBasisPoints: Number(currentRegion.bottomBasisPoints),
+    configGeneration: Number(stream && stream.configGeneration || 0),
     layoutRevision: Math.max(0, Math.trunc(Number(layoutRevision) || 0)),
     visualRevision: Math.max(0, Math.trunc(Number(visualRevision) || 0))
   };
@@ -126,6 +137,16 @@ export function ticketLocalRegisterSliderProofMatches(
     visualRevision,
     now
   );
+  return ticketLocalRegisterSliderSnapshotsMatch(snapshot, current);
+}
+
+export function ticketLocalRegisterSliderPresentationMatches(snapshot, action, region, stream, layoutRevision = 0, visualRevision = 0, now = Date.now()) {
+  return ticketLocalRegisterSliderSnapshotsMatch(snapshot,
+    ticketLocalRegisterSliderPresentationSnapshot(action, region, stream, layoutRevision, visualRevision, now));
+}
+
+function ticketLocalRegisterSliderSnapshotsMatch(snapshot, current) {
+  if (!snapshot) return false;
   if (!current) return false;
   return [
     'proofActionId',
@@ -136,6 +157,7 @@ export function ticketLocalRegisterSliderProofMatches(
     'topBasisPoints',
     'rightBasisPoints',
     'bottomBasisPoints',
+    'configGeneration',
     'layoutRevision',
     'visualRevision'
   ].every((field) => current[field] === snapshot[field]);
@@ -526,10 +548,19 @@ export async function handleTicketLocalRegisterSliderChange({
 }
 
 export function isTicketActionV3RegistrationProofFresh(action, stream, now = Date.now()) {
+  return Boolean(stream && stream.fresh === true && ticketActionV3RegistrationProofMatchesStream(action, stream, now));
+}
+
+export function isTicketActionV3RegistrationProofPresentable(action, stream, now = Date.now()) {
+  return Boolean(stream && (stream.fresh === true || stream.healthyContinuity === true) &&
+    ticketActionV3RegistrationProofMatchesStream(action, stream, now));
+}
+
+function ticketActionV3RegistrationProofMatchesStream(action, stream, now) {
   if (!action || String(action.status || '') !== 'succeeded' ||
     String(action.currentView || '') !== 'latest_unactivated' ||
     !REGISTRATION_PROOF_TARGETS.has(String(action.target || '')) ||
-    !String(action.actionId || '').trim() || !stream || stream.fresh !== true
+    !String(action.actionId || '').trim() || !stream
   ) return false;
   const proofEpoch = Number(action.streamEpoch || 0);
   const proofSequence = Number(action.frameSequence || 0);
@@ -542,6 +573,17 @@ export function isTicketActionV3RegistrationProofFresh(action, stream, now = Dat
 
 export function ticketSliderRegionV3ForAction(action, region, stream, now = Date.now()) {
   if (!isTicketActionV3RegistrationProofFresh(action, stream, now) || !region) return null;
+  return ticketSliderRegionV3MatchingProof(action, region, now);
+}
+
+// Presentation and a local gesture confer no authority to register. Admission
+// continues through the strict fresh helpers above and immediately before send.
+export function ticketSliderRegionV3ForPresentation(action, region, stream, now = Date.now()) {
+  if (!isTicketActionV3RegistrationProofPresentable(action, stream, now) || !region) return null;
+  return ticketSliderRegionV3MatchingProof(action, region, now);
+}
+
+function ticketSliderRegionV3MatchingProof(action, region, now) {
   const expiresAt = Date.parse(String(region.expiresAt || ''));
   const left = Number(region.leftBasisPoints);
   const top = Number(region.topBasisPoints);

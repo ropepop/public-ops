@@ -3,14 +3,189 @@ package phone
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"nhooyr.io/websocket"
 )
+
+func TestRelaySendsInitialClockProbeBeforeLongTicker(t *testing.T) {
+	requestSeen := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		for {
+			typ, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			if typ != websocket.MessageText {
+				continue
+			}
+			var request map[string]any
+			if json.Unmarshal(data, &request) != nil || request["type"] != "clock_probe" {
+				continue
+			}
+			requestSeen <- request
+			response, _ := json.Marshal(map[string]any{
+				"type":                     "clock_probe_result",
+				"probeId":                  request["probeId"],
+				"serverSendUnixMicros":     request["serverSendUnixMicros"],
+				"phoneReceiveUptimeMicros": 10_000_000,
+				"phoneSendUptimeMicros":    10_001_000,
+			})
+			_ = conn.Write(r.Context(), websocket.MessageText, response)
+		}
+	}))
+	defer server.Close()
+
+	results := make(chan *ClockProbeResult, 1)
+	relay := NewRelay(RelayConfig{
+		// A one-hour periodic interval makes this test fail unless connection
+		// startup sends the first probe immediately.
+		BaseURL: server.URL, ClockProbeInterval: time.Hour,
+		LivenessIdle: time.Second, ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+	})
+	relay.SetHandlers(func(message Message) {
+		if message.ClockProbe != nil {
+			results <- message.ClockProbe
+		}
+	}, nil)
+	relay.AddViewer()
+	defer relay.Close()
+
+	select {
+	case request := <-requestSeen:
+		probeID, _ := request["probeId"].(string)
+		if !validClockProbeID(probeID) || request["serverSendUnixMicros"].(float64) <= 0 {
+			t.Fatalf("invalid relay clock probe request: %#v", request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not send a clock probe")
+	}
+	select {
+	case result := <-results:
+		if !validClockProbeID(result.ProbeID) || result.ServerSendUnixMicros <= 0 ||
+			result.ServerReceiveUnixMicros < result.ServerSendUnixMicros ||
+			result.PhoneReceiveUptimeMicros != 10_000_000 || result.PhoneSendUptimeMicros != 10_001_000 {
+			t.Fatalf("invalid validated clock probe result: %#v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not publish the validated clock probe result")
+	}
+}
+
+func TestClockProbeIDValidationIsStrictAndBounded(t *testing.T) {
+	if !validClockProbeID("probe-1.a:b_c") {
+		t.Fatal("safe bounded probe id was rejected")
+	}
+	for _, value := range []string{"", "bad id", "bad/segment", strings.Repeat("a", ClockProbeIDMaxBytes+1)} {
+		if validClockProbeID(value) {
+			t.Fatalf("unsafe probe id %q was accepted", value)
+		}
+	}
+}
+
+func TestRelayCaptureDemandIsStrictSerializedAndConnectionScoped(t *testing.T) {
+	connections := make(chan struct{}, 3)
+	demands := make(chan map[string]any, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		connections <- struct{}{}
+		for {
+			typ, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			if typ != websocket.MessageText {
+				continue
+			}
+			var payload map[string]any
+			if json.Unmarshal(data, &payload) == nil && payload["type"] == "capture_demand" {
+				demands <- payload
+			}
+		}
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL: server.URL, ClockProbeInterval: time.Hour, LivenessIdle: time.Hour,
+		ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour,
+	})
+	if _, err := relay.SendCaptureDemand(context.Background(), 7); err == nil {
+		t.Fatal("capture demand was written without a current phone connection")
+	}
+	relay.AddViewer()
+	defer relay.Close()
+	select {
+	case <-connections:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial phone connection was not established")
+	}
+	waitRelayConnected(t, relay)
+
+	first, err := relay.SendCaptureDemand(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("send first capture demand: %v", err)
+	}
+	second, err := relay.SendCaptureDemand(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("send second capture demand: %v", err)
+	}
+	if first.Generation != 1 || second.Generation != 2 || first.ConnectionGeneration == 0 || second.ConnectionGeneration != first.ConnectionGeneration {
+		t.Fatalf("capture demand generations are not connection scoped: first=%#v second=%#v", first, second)
+	}
+	for generation := 1; generation <= 2; generation++ {
+		select {
+		case demand := <-demands:
+			if len(demand) != 5 || demand["type"] != "capture_demand" || demand["version"] != float64(1) ||
+				demand["streamEpoch"] != float64(7) || demand["generation"] != float64(generation) ||
+				demand["ttlMillis"] != float64(CaptureDemandTTL.Milliseconds()) {
+				t.Fatalf("invalid strict capture demand %d: %#v", generation, demand)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("capture demand %d was not received", generation)
+		}
+	}
+
+	relay.Reconnect("test capture demand generation reset")
+	select {
+	case <-connections:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement phone connection was not established")
+	}
+	waitRelayConnected(t, relay)
+	replacement, err := relay.SendCaptureDemand(context.Background(), 8)
+	if err != nil {
+		t.Fatalf("send replacement-connection capture demand: %v", err)
+	}
+	if replacement.Generation != 1 || replacement.ConnectionGeneration == first.ConnectionGeneration {
+		t.Fatalf("replacement connection did not fence/reset generation: first=%#v replacement=%#v", first, replacement)
+	}
+}
+
+func waitRelayConnected(t *testing.T, relay *Relay) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !relay.Snapshot().Connected {
+		if time.Now().After(deadline) {
+			t.Fatal("relay did not publish connected state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 func TestRelayCarriesOnlyBoundedStartupTraceOnPrivateVideoHandshake(t *testing.T) {
 	type requestEvidence struct {
@@ -177,6 +352,59 @@ func TestRelayCorrelationRefreshDoesNotRestartInFlightMediaHandshake(t *testing.
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("private video handshake attempts = %d, want exactly one", got)
 	}
+}
+
+func TestRelayEnsureActiveDoesNotRestartInFlightMediaHandshake(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stream" {
+			http.NotFound(w, r)
+			return
+		}
+		attempts.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL:           server.URL,
+		RequestTimeout:    2 * time.Second,
+		ReconnectMinDelay: time.Hour,
+		ReconnectMaxDelay: time.Hour,
+	})
+	relay.AddViewer()
+	defer relay.Close()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first private media handshake did not start")
+	}
+	if !relay.EnsureActive("parallel browser wake") {
+		t.Fatal("active desired connection loop was not recognized")
+	}
+	select {
+	case <-started:
+		t.Fatal("ensure-active restarted the in-flight private media handshake")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("private media handshake attempts = %d, want exactly one", got)
+	}
+	close(release)
 }
 
 func TestRelaySupersededDialCannotReplaceNewerReconnect(t *testing.T) {
@@ -527,6 +755,134 @@ func TestRelayAcceptsLargePhoneFramesFromVideoPath(t *testing.T) {
 	}
 }
 
+func TestRelayUsesCanonicalVideoMessageCap(t *testing.T) {
+	exact := bytes.Repeat([]byte{0x5a}, int(MaxVideoMessageBytes))
+	oversize := bytes.Repeat([]byte{0x6b}, int(MaxVideoMessageBytes)+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		if err := conn.Write(r.Context(), websocket.MessageBinary, exact); err != nil {
+			return
+		}
+		_ = conn.Write(r.Context(), websocket.MessageBinary, oversize)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	messages := make(chan int, 2)
+	disconnected := make(chan error, 1)
+	relay := NewRelay(RelayConfig{BaseURL: server.URL, ReconnectMinDelay: time.Hour, ReconnectMaxDelay: time.Hour})
+	relay.SetHandlers(func(message Message) {
+		if len(message.Binary) > 0 {
+			messages <- len(message.Binary)
+		}
+	}, func(err error) { disconnected <- err })
+	relay.AddViewer()
+	defer relay.Close()
+
+	select {
+	case size := <-messages:
+		if size != int(MaxVideoMessageBytes) {
+			t.Fatalf("first admitted message size = %d, want %d", size, MaxVideoMessageBytes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("message at the canonical cap was not admitted")
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message above the canonical cap did not terminate the source connection")
+	}
+	select {
+	case size := <-messages:
+		t.Fatalf("oversize message reached the handler with %d bytes", size)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestReconnectJitterStaysWithinEqualJitterBounds(t *testing.T) {
+	for _, delay := range []time.Duration{time.Millisecond, 500 * time.Millisecond, 5 * time.Second} {
+		for range 100 {
+			got := jitterReconnectDelay(delay)
+			if got < delay/2 || got > delay {
+				t.Fatalf("jitterReconnectDelay(%s) = %s, want [%s,%s]", delay, got, delay/2, delay)
+			}
+		}
+	}
+}
+
+func TestRelayLivenessPingKeepsResponsiveQuietConnection(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL: server.URL, ReconnectMinDelay: 10 * time.Millisecond, ReconnectMaxDelay: 20 * time.Millisecond,
+		LivenessIdle: 20 * time.Millisecond, LivenessTimeout: 100 * time.Millisecond,
+	})
+	relay.reconnectJitter = func(delay time.Duration) time.Duration { return delay }
+	relay.AddViewer()
+	defer relay.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for !relay.Snapshot().Connected && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !relay.Snapshot().Connected {
+		t.Fatal("relay did not establish the quiet connection")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := attempts.Load(); got != 1 || !relay.Snapshot().Connected {
+		t.Fatalf("responsive ping/pong connection was recycled: attempts=%d health=%#v", got, relay.Snapshot())
+	}
+}
+
+func TestRelayLivenessTimeoutReconnectsStalledQuietConnection(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "test complete")
+		// Deliberately do not read: the peer cannot process and answer Ping.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	relay := NewRelay(RelayConfig{
+		BaseURL: server.URL, ReconnectMinDelay: 5 * time.Millisecond, ReconnectMaxDelay: 10 * time.Millisecond,
+		LivenessIdle: 15 * time.Millisecond, LivenessTimeout: 25 * time.Millisecond,
+	})
+	relay.reconnectJitter = func(delay time.Duration) time.Duration { return delay }
+	relay.AddViewer()
+	defer relay.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("stalled quiet connection was not replaced; attempts=%d health=%#v", got, relay.Snapshot())
+	}
+}
+
 func TestRelayDoesNotUseControlOrSessionEndpoints(t *testing.T) {
 	videoConnected := make(chan struct{}, 1)
 	unexpected := make(chan string, 1)
@@ -587,7 +943,11 @@ func TestRelayDelaysVideoCloseAcrossBriefViewerGap(t *testing.T) {
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "test complete")
 		videoConnected <- struct{}{}
-		_, _, _ = conn.Read(r.Context())
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				break
+			}
+		}
 		videoClosed <- struct{}{}
 	}))
 	defer server.Close()
