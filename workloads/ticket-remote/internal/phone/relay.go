@@ -122,6 +122,7 @@ type Relay struct {
 	videoConnectionGeneration uint64
 	captureDemandGeneration   uint64
 	cancelLoop                context.CancelFunc
+	loopContext               context.Context
 	idleStop                  *time.Timer
 	idleStopping              bool
 	idleStopDone              chan struct{}
@@ -239,8 +240,7 @@ func (r *Relay) AddViewer(startupTraceCorrelationID ...string) {
 		r.viewers++
 		if !r.desired || (!r.connected && r.cancelLoop == nil) {
 			r.desired = true
-			ctx, cancel := context.WithCancel(context.Background())
-			r.cancelLoop = cancel
+			ctx := r.newConnectLoopLocked()
 			go r.connectLoop(ctx)
 		}
 		r.mu.Unlock()
@@ -281,9 +281,7 @@ func (r *Relay) EnsureActive(reason string) bool {
 	r.connected = false
 	r.desired = true
 	r.lastError = reason
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(context.Background())
-	r.cancelLoop = cancel
+	ctx = r.newConnectLoopLocked()
 	r.mu.Unlock()
 
 	if videoConn != nil {
@@ -405,9 +403,7 @@ func (r *Relay) SwitchBackend(backend Backend) {
 	r.cfg.BaseURL = cleanBaseURL
 	var ctx context.Context
 	if shouldReconnect {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(context.Background())
-		r.cancelLoop = cancel
+		ctx = r.newConnectLoopLocked()
 	}
 	r.mu.Unlock()
 
@@ -452,7 +448,39 @@ func (r *Relay) Snapshot() Health {
 	}
 }
 
+// newConnectLoopLocked assigns one owner before a loop can start or finish.
+func (r *Relay) newConnectLoopLocked() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	r.loopContext = ctx
+	r.cancelLoop = cancel
+	return ctx
+}
+
+func (r *Relay) finishConnectLoop(ctx context.Context) {
+	r.mu.Lock()
+	if r.loopContext != ctx {
+		r.mu.Unlock()
+		return
+	}
+	if r.cancelLoop != nil {
+		r.cancelLoop()
+	}
+	r.cancelLoop = nil
+	r.loopContext = nil
+	// A viewer may arrive after the loop decides to exit but before this cleanup.
+	// Transfer ownership here so that viewer cannot be left without a retry loop.
+	var next context.Context
+	if r.desired && r.viewers > 0 {
+		next = r.newConnectLoopLocked()
+	}
+	r.mu.Unlock()
+	if next != nil {
+		go r.connectLoop(next)
+	}
+}
+
 func (r *Relay) connectLoop(ctx context.Context) {
+	defer r.finishConnectLoop(ctx)
 	delay := r.cfg.ReconnectMinDelay
 	for {
 		if ctx.Err() != nil || !r.shouldRun() {

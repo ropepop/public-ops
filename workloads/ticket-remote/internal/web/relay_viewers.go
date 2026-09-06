@@ -290,8 +290,13 @@ func (s *Server) retainRelaysForDuration(sessionID string, hold time.Duration, r
 }
 
 func (s *Server) retainRelaysForDurationInternal(sessionID string, hold time.Duration, retain bool, reason string, allowOwnerReplacement bool, startupTraceID ...string) bool {
+	return s.retainRelayLeaseForDuration(sessionID, sessionID, hold, retain, reason, allowOwnerReplacement, startupTraceID...)
+}
+
+func (s *Server) retainRelayLeaseForDuration(leaseID, sessionID string, hold time.Duration, retain bool, reason string, allowOwnerReplacement bool, startupTraceID ...string) bool {
 	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
+	leaseID = strings.TrimSpace(leaseID)
+	if sessionID == "" || leaseID == "" {
 		return false
 	}
 	if retain {
@@ -315,8 +320,8 @@ func (s *Server) retainRelaysForDurationInternal(sessionID string, hold time.Dur
 	}
 	if retain {
 		reason = cleanStreamControlText(reason, "prewarm")
-		existing := s.streamPrewarmTimers[sessionID]
-		existingOwner := s.streamPrewarmOwners[sessionID]
+		existing := s.streamPrewarmTimers[leaseID]
+		existingOwner := s.streamPrewarmOwners[leaseID]
 		if existing != nil && existingOwner != requestedTraceID && !allowOwnerReplacement {
 			s.mu.Unlock()
 			return false
@@ -327,11 +332,16 @@ func (s *Server) retainRelaysForDurationInternal(sessionID string, hold time.Dur
 			shouldChangeViewer = true
 		}
 		timer = time.AfterFunc(hold, func() {
+			s.startupLeaseMu.Lock()
+			defer s.startupLeaseMu.Unlock()
 			shouldRemoveViewer := false
 			s.mu.Lock()
-			if s.streamPrewarmTimers[sessionID] == timer {
-				delete(s.streamPrewarmTimers, sessionID)
-				delete(s.streamPrewarmOwners, sessionID)
+			if s.streamPrewarmTimers[leaseID] == timer {
+				delete(s.streamPrewarmTimers, leaseID)
+				delete(s.streamPrewarmOwners, leaseID)
+				if reason == "page_open_warm" {
+					delete(s.streamPageOpenWarmUntil, sessionID)
+				}
 				shouldRemoveViewer = true
 			}
 			s.mu.Unlock()
@@ -352,26 +362,78 @@ func (s *Server) retainRelaysForDurationInternal(sessionID string, hold time.Dur
 				s.removeRelayViewer(sessionID)
 			}
 		})
-		s.streamPrewarmTimers[sessionID] = timer
+		s.streamPrewarmTimers[leaseID] = timer
 		if traceContextProvided {
-			s.streamPrewarmOwners[sessionID] = requestedTraceID
+			s.streamPrewarmOwners[leaseID] = requestedTraceID
 		}
 	} else {
-		if existing := s.streamPrewarmTimers[sessionID]; existing != nil {
-			existingOwner := s.streamPrewarmOwners[sessionID]
+		if existing := s.streamPrewarmTimers[leaseID]; existing != nil {
+			existingOwner := s.streamPrewarmOwners[leaseID]
 			if (traceContextProvided && existingOwner != requestedTraceID) ||
 				(!traceContextProvided && existingOwner != "") {
 				s.mu.Unlock()
 				return false
 			}
 			existing.Stop()
-			delete(s.streamPrewarmTimers, sessionID)
-			delete(s.streamPrewarmOwners, sessionID)
+			delete(s.streamPrewarmTimers, leaseID)
+			delete(s.streamPrewarmOwners, leaseID)
 			shouldChangeViewer = true
 		}
 	}
 	s.mu.Unlock()
 	return shouldChangeViewer
+}
+
+// Page warmth uses the existing timed lease owner with a distinct timer key.
+// Its reference still belongs to the real session, so socket/grace references
+// remain independently releasable without counting another viewer.
+func (s *Server) retainRelayViewerForPageOpen(sessionID string, openedAt, now time.Time) {
+	sessionID = strings.TrimSpace(sessionID)
+	deadline := openedAt.Add(streamPageOpenWarmHold)
+	if sessionID == "" || openedAt.IsZero() || !deadline.After(now) {
+		return
+	}
+	s.startupLeaseMu.Lock()
+	defer s.startupLeaseMu.Unlock()
+	s.streamLifecycleMu.Lock()
+	defer s.streamLifecycleMu.Unlock()
+	hold := time.Until(deadline)
+	if hold <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if !deadline.After(s.streamPageOpenWarmUntil[sessionID]) {
+		s.mu.Unlock()
+		return
+	}
+	if s.streamPageOpenWarmUntil == nil {
+		s.streamPageOpenWarmUntil = map[string]time.Time{}
+	}
+	s.streamPageOpenWarmUntil[sessionID] = deadline
+	s.mu.Unlock()
+	if s.retainRelayLeaseForDuration("page_open_warm:"+sessionID, sessionID, hold, true, "page_open_warm", false) {
+		s.addRelayViewerLocked(sessionID, "", "")
+	}
+}
+
+func (s *Server) pageOpenWarmSnapshot(now time.Time) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	var latest time.Time
+	for _, deadline := range s.streamPageOpenWarmUntil {
+		if deadline.After(now) {
+			count++
+			if deadline.After(latest) {
+				latest = deadline
+			}
+		}
+	}
+	expiresAt := ""
+	if !latest.IsZero() {
+		expiresAt = latest.UTC().Format(time.RFC3339Nano)
+	}
+	return map[string]any{"retainedSessions": count, "expiresAt": expiresAt}
 }
 
 func (s *Server) removeRelayViewer(sessionID string) {

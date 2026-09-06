@@ -1,5 +1,6 @@
 /* Current Ticket page: live picture, oval only after that picture, swipe to register, in-app fresh unused ticket, control-code request. Start from CURRENT.md. Generated output is internal/web/static/app.js. */
 import { html, reactive } from '@arrow-js/core';
+import { phoneControlNow, phoneControlReady, phoneRegistrationRegion, phoneRegistrationSnapshot, phoneRegistrationMatches } from './phone-control-core.mjs';
 import { ExperimentalHDRPreferenceController } from './experimental-hdr-preference.mjs';
 import { ClientHDRBoostPreferenceController } from './client-hdr-boost-preference.mjs';
 import {
@@ -23,15 +24,9 @@ import {
   cancelTicketLocalRegisterSliderSession,
   completeTicketLocalRegisterSliderSession,
   handleTicketLocalRegisterSliderChange,
-  isTicketActionV3RegistrationProofFresh,
-  isTicketActionV3RegistrationProofPresentable,
   observeTicketActionV3LocalRequest,
   releaseTicketLocalRegisterSliderOnTerminal,
-  rebaseTicketCurrentProofDetectorFromAction,
-  resetTicketLocalRegisterSliderState,
   settleTicketActionV3LocalRequest,
-  ticketCurrentProofFingerprintChanged,
-  ticketCurrentProofRequestNeeded,
   ticketControlCodeVisualRecoveryRequired,
   ticketActionV3ActivationTerminalMessage,
   ticketActionV3ExplicitResultForDisplay,
@@ -44,13 +39,8 @@ import {
   ticketMemberLimitBlocks,
   ticketMemberLimitClockNow,
   ticketMemberLimitCountdown,
-  ticketLocalRegisterSliderProofMatches,
-  ticketLocalRegisterSliderPresentationMatches,
-  ticketLocalRegisterSliderPresentationSnapshot,
   updateTicketLocalRegisterSliderPointerDirection,
   updateTicketMemberLimitClock,
-  ticketSliderRegionV3ForAction,
-  ticketSliderRegionV3ForPresentation,
   ticketSliderRegionV3Layout
 } from './ticket-action-v3-core.mjs';
 
@@ -196,7 +186,6 @@ import {
   let spacetimeClientStatus = 'idle';
   let spacetimeStateFresh = false;
   let spacetimeStateRefreshTimer = null;
-  let spacetimeStateRefreshStartedAt = 0;
   const spacetimeStateRefreshTimeoutMs = 5000;
   let spacetimeDirectUnavailableLogged = false;
   let directSpacetimeToken = '';
@@ -290,6 +279,7 @@ import {
   });
   let experimentalMediaMounted = false;
   let experimentalMediaCapabilityReady = false;
+  let experimentalMediaBootstrapValidated = false;
   let experimentalClientCapabilityAllowed = false;
   let experimentalMediaEngineProjectionObserved = false;
   let experimentalMediaBoostProjectionObserved = false;
@@ -335,7 +325,6 @@ import {
   let experimentalClientHDRPaintWaitFailures = 0;
   let experimentalClientHDRCloneFailures = 0;
   let experimentalMediaCanvasContextKind = '';
-  let experimentalMediaPipeline = '';
   const experimentalMediaVisibleSettleFrames = 2;
   const experimentalMediaVisibleSettleTimeoutMillis = 250;
   const experimentalMediaForegroundSuspensionGapMillis = 2500;
@@ -349,8 +338,7 @@ import {
   const experimentalMediaPreferenceController = new ExperimentalHDRPreferenceController({
     applyEnabled: (enabled, meta) => applyExperimentalMediaPreference(enabled, meta),
     persistEnabled: (enabled) => runSpacetimeMutation(
-      (client) => client.setHDRPreference(Boolean(enabled)),
-      'hdr_preference_write'
+      (client) => client.setHDRPreference(Boolean(enabled))
     ),
     onStatus: (snapshot) => {
       if (document.body) document.body.dataset.hdrPreference = String(snapshot && snapshot.phase || 'default');
@@ -362,8 +350,7 @@ import {
   const experimentalHDRBoostPreferenceController = new ClientHDRBoostPreferenceController({
     applyBoost: (boost, meta) => applyExperimentalHDRBoost(boost, meta),
     persistBoost: (boost) => runSpacetimeMutation(
-      (client) => client.setHDRDisplayBoost(boost),
-      'hdr_boost_write'
+      (client) => client.setHDRDisplayBoost(boost)
     ),
     onStatus: (snapshot) => {
       if (document.body) document.body.dataset.hdrBoostPreference = String(snapshot && snapshot.phase || 'default');
@@ -399,33 +386,10 @@ import {
     ignoreChange: false
   };
   let ticketSliderLayoutRevision = 0;
-  let ticketSliderVisualRevision = 0;
   let ticketLimitPresentationTimer = null;
   let ticketMemberLimitClock = null;
   let ticketSliderRegionExpiryTimer = null;
-  const ticketCurrentProofRenewBeforeMs = 15_000;
-  let ticketCurrentProofInFlight = false;
-  let ticketCurrentProofLastActionId = '';
-  let ticketCurrentProofRequestedScope = '';
-  let ticketCurrentProofLastRequestAt = 0;
-  let ticketCurrentProofLastSampleAt = 0;
-  const ticketCurrentProofVisualState = {
-    rebasedActionId: '',
-    fingerprint: null,
-    candidateFingerprint: null,
-    stableChangeCount: 0,
-    changePending: false,
-    resumePending: true
-  };
-  const ticketCurrentProofSampleIntervalMs = 1000;
-  const ticketCurrentProofRequestCooldownMs = 3000;
-  const ticketCurrentProofFingerprintCanvas = document.createElement('canvas');
-  ticketCurrentProofFingerprintCanvas.width = 8;
-  ticketCurrentProofFingerprintCanvas.height = 12;
-  const ticketCurrentProofFingerprintContext = ticketCurrentProofFingerprintCanvas.getContext('2d', {
-    alpha: false,
-    willReadFrequently: true
-  });
+  let phoneControlExpiryTimer = null;
   let connectedAt = 0;
   let videoSocketCreatedAt = 0;
   let videoConnectedAt = 0;
@@ -461,7 +425,6 @@ import {
   let authoritativeSDRRenderSerial = 0;
   let lastRenderedFrameTimestamp = 0;
   let streamActionFreshnessExpiryTimer = null;
-  let pendingBrowserAction = null;
   let browserActionContextRevision = 0;
   let codeInputRevision = 0;
   let lastRestartAt = 0;
@@ -486,7 +449,6 @@ import {
   let needsKeyFrame = true;
   let currentStreamEpoch = 0;
   let lastPacketSequence = 0;
-  let lastPacketTimestamp = 0;
   let lastAcceptedFrameSequence = 0;
   let lastAcceptedFrameTimestamp = 0;
   let lastReceivedFrameSequence = 0;
@@ -514,7 +476,6 @@ import {
   let staleIngressDroppedFrames = 0;
   let lastStaleIngressDropAt = 0;
   let resyncDroppedFrames = 0;
-  let feedbackTimer = null;
   let lastFeedbackSentAt = 0;
   let feedbackSentCount = 0;
   let feedbackSendFailureCount = 0;
@@ -527,7 +488,6 @@ import {
   let feedbackRenderedSequence = 0;
   let feedbackPresentedSequence = 0;
   let feedbackRenderedKeyframeSequence = 0;
-  let lastPresentedFrameConfigGeneration = 0;
   let controlCodeResultPriorityPhase = '';
   let controlCodeResultPriorityConfigGeneration = 0;
   let controlCodeResultPriorityEpoch = 0;
@@ -539,7 +499,6 @@ import {
   let streamClockBoundConfigGeneration = 0;
   let streamClockBoundAt = 0;
   let streamClockServerUpperUnixMicros = 0;
-  let streamClockOffsetMidpointMicros = 0;
   let streamClockOffsetHalfWidthMicros = 0;
   let controlCodeResultCaptureTimer = null;
   let controlCodeResultCaptureRequestID = '';
@@ -585,8 +544,8 @@ import {
   let streamContinuityStaleGraceTimer = null;
   const intentionallyClosedVideoSockets = new WeakSet();
   const streamFirstFrameKeyframeMs = 2000;
-  const streamLiveFreshMaxAgeMs = 1250;
-  const streamLiveOkMaxAgeMs = 2000;
+  const streamLiveFreshMaxAgeMs = 3000;
+  const streamLiveOkMaxAgeMs = streamLiveFreshMaxAgeMs;
   const streamDegradedMaxAgeMs = 3000;
   const streamCurrentReportMaxAgeMs = 3500;
   const streamCurrentReportMaxSequenceLag = 4;
@@ -628,7 +587,7 @@ import {
   const controlCodeCaptureKeyframeRetryLimit = 2;
   const controlCodeResultPriorityArmWindowMs = 5 * 60 * 1000;
   const controlCodeResultPriorityMarkWindowMs = 5000;
-  const controlCodeLowLatencyVisualAgeMs = 1250;
+  const controlCodeLowLatencyVisualAgeMs = 3000;
   const controlCodeLowLatencyDecodeQueueLimit = 1;
   const controlCodeResultImageReadyTimeoutMs = 1200;
   const controlCodeResultPaintFrameTimeoutMs = 500;
@@ -648,7 +607,8 @@ import {
   const streamClockBoundMaxAgeMs = 15000;
   const streamMaxVideoPayloadBytes = 2 * 1024 * 1024;
   const streamDecoderQueueHardLimit = 4;
-  const streamIngressFrameMaxAgeMs = 1250;
+  // Browser receipt and action proof share the three-second source-age limit.
+  const streamIngressFrameMaxAgeMs = 3000;
   const streamIngressMetadataLimit = 32;
 
   function closeEarlyVideo(reason) {
@@ -670,7 +630,7 @@ import {
     const independentFrame = queued[queued.length - 1];
     const metadata = independentFrame && independentFrame.meta;
     const receivedAt = Number(independentFrame && independentFrame.receivedAt);
-    const maxAgeMillis = Math.max(0, Number(early && early.maxFrameAgeMs || 1250));
+    const maxAgeMillis = Math.max(0, Number(early && early.maxFrameAgeMs || 3000));
     const receivedAgeMillis = Number.isFinite(receivedAt) ? Math.max(0, performance.now() - receivedAt) : Number.POSITIVE_INFINITY;
     const payloadBytes = Number(metadata && metadata.payloadBytes);
     if (!metadata || !metadata.key || !independentFrame.data ||
@@ -1312,7 +1272,7 @@ import {
           // one fresh-surface retry. A device loss after first_presented no
           // longer has an owning attempt, so start a new bounded coordinator
           // attempt instead of waiting for an unrelated lifecycle event.
-          if (!scheduleExperimentalMediaActiveFailureRecovery(reason || 'renderer_failed')) {
+          if (!scheduleExperimentalMediaActiveFailureRecovery()) {
             scheduleExperimentalMediaRendererRetry(reason || 'renderer_failed');
           }
         }
@@ -1339,7 +1299,6 @@ import {
       return true;
     }
     hideExperimentalMediaCanvas();
-    experimentalMediaPipeline = CLIENT_HDR_PIPELINE;
     refreshExperimentalClientCapability();
     if (!experimentalClientCapabilityAllowed || !experimentalClientCapability.supported) {
       if (document.body) document.body.dataset.experimentalMedia = 'fallback-sdr';
@@ -1519,7 +1478,6 @@ import {
       experimentalMediaRendererRetryTimer = null;
     }
     if (experimentalClientHDRController) experimentalClientHDRController.dispose(options.status || 'disabled');
-    experimentalMediaPipeline = '';
     hideExperimentalMediaCanvas();
     if (!options.keepEnabled) {
       experimentalMediaState.enabled = false;
@@ -1901,6 +1859,11 @@ import {
         return false;
       }
       attempt.capabilityOutcome = 'ready';
+      if (!attempt.gpuPreparationRequested) {
+        attempt.gpuPreparationRequested = true;
+        const preparedController = ensureExperimentalClientHDRController();
+        preparedController.prepare();
+      }
       if (!foregroundAttemptHasFreshSDR(attempt)) {
         reportExperimentalMediaForegroundRecovery(attempt, 'fresh_sdr_wait', attempt.reason);
         return false;
@@ -1988,16 +1951,16 @@ import {
       baselineSDRRenderSerial: Number(authoritativeSDRRenderSerial || 0),
       startedWallAt,
       lastTriggerWallAt: startedWallAt,
-      canvasNotBeforeWallAt: startedWallAt + experimentalMediaForegroundCanvasStabilityMillis,
+      canvasNotBeforeWallAt: startedWallAt + (experimentalMediaLifecycleGeneration > 0 ? experimentalMediaForegroundCanvasStabilityMillis : 0),
       deadlineWallAt: startedWallAt + experimentalMediaForegroundRecoveryWindowMillis,
       reason: String(reason || 'foreground').slice(0, 80),
       triggers: [String(reason || 'foreground').slice(0, 80)],
       phase: 'version_check',
       reportedPhase: '',
       reportedReason: '',
-      versionChecked: false,
+      versionChecked: experimentalMediaBootstrapValidated && experimentalMediaLifecycleGeneration === 0,
       versionOutcome: 'pending',
-      serverCapabilityChecked: false,
+      serverCapabilityChecked: experimentalMediaCapabilityReady,
       capabilityOutcome: 'pending',
       versionAbortController: null,
       reloadRequested: false,
@@ -2192,7 +2155,7 @@ import {
     return true;
   }
 
-  function scheduleExperimentalMediaActiveFailureRecovery(reason) {
+  function scheduleExperimentalMediaActiveFailureRecovery() {
     if (!experimentalMediaPreferenceController.enabled || !experimentalMediaState.enabled ||
       document.visibilityState !== 'visible' || experimentalMediaPresentationRegionBlocked ||
       !experimentalHDRSurfacePresentationAllowed() || controlCodeHDRFreezeTargetActive()) return false;
@@ -2290,11 +2253,6 @@ import {
     pending.fallbackTimer = setTimeout(settle, experimentalMediaVisibleSettleTimeoutMillis);
     waitVisibleFrames(experimentalMediaVisibleSettleFrames);
     return true;
-  }
-
-  function connectExperimentalMedia(reason, options) {
-    if (!experimentalMediaState.enabled) return false;
-    return scheduleExperimentalMediaStart(reason || 'connect', options);
   }
 
   function armExperimentalMediaLifecycleResume() {
@@ -2447,7 +2405,7 @@ import {
       boostContractMatches;
     experimentalMediaState.boostSelectorAllowed = experimentalMediaAccountProjectionAvailable;
     if (!experimentalMediaEngineProjectionObserved) {
-      experimentalMediaState.engine = resolveCapabilityHDREngine(advertisedEngines, payload.selectedEngine);
+      experimentalMediaState.engine = resolveCapabilityHDREngine(advertisedEngines);
     }
     if (!experimentalMediaBoostProjectionObserved) {
       experimentalHDRBoostPreferenceController.observe(payload.selectedDisplayBoost);
@@ -2511,7 +2469,16 @@ import {
     }
   }
 
-  if (cfg.experimentalMediaCandidate === true) discoverExperimentalMediaCapability();
+  function initializeExperimentalMedia() {
+    const bootstrap = cfg.experimentalMediaBootstrap;
+    if (bootstrap && bootstrap.accountScopeId === cfg.accountScopeId &&
+      applyExperimentalMediaCapabilityPayload({ ok: true }, bootstrap.capability, 0)) {
+      experimentalMediaBootstrapValidated = true;
+      if (bootstrap.preferenceKnown === true) experimentalMediaPreferenceController.observe(bootstrap.enabled);
+      return;
+    }
+    if (cfg.experimentalMediaCandidate === true) discoverExperimentalMediaCapability();
+  }
 
   const publicMessageTranslations = new Map([
     ['Ticket server is starting', 'Biļetes serveris startējas'],
@@ -2607,11 +2574,11 @@ import {
 
   function renderTicketStateAsUnconfirmed() {
     renderTicketInteraction(null);
+    renderTicketActionV3Controls(currentState);
   }
 
   function markSpacetimeStateUnconfirmed(reason) {
     spacetimeStateFresh = false;
-    spacetimeStateRefreshStartedAt = Date.now();
     clearSpacetimeStateRefreshTimer();
     renderTicketStateAsUnconfirmed();
     spacetimeStateRefreshTimer = setTimeout(() => {
@@ -2627,7 +2594,6 @@ import {
 
   function markSpacetimeStateFresh() {
     spacetimeStateFresh = true;
-    spacetimeStateRefreshStartedAt = 0;
     clearSpacetimeStateRefreshTimer();
     document.body.dataset.ticketStateFresh = 'true';
   }
@@ -3400,7 +3366,6 @@ import {
     needsKeyFrame = true;
     currentStreamEpoch = 0;
     lastPacketSequence = 0;
-    lastPacketTimestamp = 0;
     lastAcceptedFrameSequence = 0;
     lastAcceptedFrameTimestamp = 0;
     firstDecodedTraceSent = false;
@@ -3489,7 +3454,7 @@ import {
   function controlCodeKeepsVideoAliveWhileHidden() {
     if (!codeRequest) return false;
     const status = String(codeRequest.status || '');
-    if (status === 'queued' || status === 'running') return true;
+    if (status === 'queued' || status === 'running' || status === 'generated') return true;
     if (status !== 'succeeded') return false;
     const requestID = String(codeRequest.requestId || '').trim();
     if (!requestID) return false;
@@ -3784,7 +3749,6 @@ import {
     streamClockBoundConfigGeneration = 0;
     streamClockBoundAt = 0;
     streamClockServerUpperUnixMicros = 0;
-    streamClockOffsetMidpointMicros = 0;
     streamClockOffsetHalfWidthMicros = 0;
   }
 
@@ -3803,7 +3767,6 @@ import {
     lastAcceptedFrameConfigGeneration = 0;
     lastDecodedFrameConfigGeneration = 0;
     lastRenderedFrameConfigGeneration = 0;
-    lastPresentedFrameConfigGeneration = 0;
     lastFeedbackSentAt = 0;
     updateStreamFreshnessStatus('feedback_reset');
   }
@@ -3947,7 +3910,6 @@ import {
     streamClockBoundConfigGeneration = generation;
     streamClockBoundAt = receivedAt;
     streamClockServerUpperUnixMicros = Math.round(serverUpper);
-    streamClockOffsetMidpointMicros = midpoint;
     streamClockOffsetHalfWidthMicros = halfWidth;
     scheduleStreamClockProbe(streamClockProbeIntervalMs);
     updateStreamFreshnessStatus('clock_calibrated');
@@ -4096,7 +4058,7 @@ import {
       return false;
     }
     const capturePending = request && request.captureRequired === true && request.captureAcknowledged !== true;
-    if (!realOwnedRequest || (!['queued', 'running'].includes(status) &&
+    if (!realOwnedRequest || (!['queued', 'running', 'generated'].includes(status) &&
       !(status === 'succeeded' && capturePending))) {
       clearControlCodeResultPriority();
       return false;
@@ -4108,7 +4070,7 @@ import {
       currentStreamEpoch
     );
     if (!(epoch > 0) || epoch !== Number(currentStreamEpoch || 0)) return false;
-    if (status === 'queued' || status === 'running') {
+    if (status === 'queued' || status === 'running' || status === 'generated') {
       return sendControlCodeResultPriority('arm', epoch, 0);
     }
     const markerSequence = firstPositiveSafeInteger(
@@ -4136,7 +4098,7 @@ import {
     const phase = String(controlCodeResultPriorityPhase || '');
     const status = String(request && request.status || '');
     const capturePending = request && request.captureRequired === true && request.captureAcknowledged !== true;
-    const requestActive = ['queued', 'running'].includes(status) || (status === 'succeeded' && capturePending);
+    const requestActive = ['queued', 'running', 'generated'].includes(status) || (status === 'succeeded' && capturePending);
     const exactTransport = activeFeedbackVersion === 2 && activeFeedbackConfigGeneration > 0 &&
       controlCodeResultPriorityConfigGeneration === activeFeedbackConfigGeneration &&
       currentStreamEpoch > 0 && controlCodeResultPriorityEpoch === currentStreamEpoch &&
@@ -4161,10 +4123,12 @@ import {
       controlCodeResultPriorityEpoch === requestEpoch;
     const phaseValid = phase === 'arm'
       ? controlCodeResultPriorityMinSequence === 0
-      : phase === 'mark' && markerSequence > 0 &&
+      : phase === 'mark' && status === 'succeeded' && capturePending && markerSequence > 0 &&
         controlCodeResultPriorityMinSequence === markerSequence;
     const withinDeadline = controlCodeResultPriorityDeadlineAt > now;
-    if (requestActive && exactTransport && exactRequest && epochValid && phaseValid && withinDeadline) return true;
+    if (requestActive && exactTransport && exactRequest && epochValid && phaseValid && withinDeadline) {
+      return phase === 'mark';
+    }
     if (phase) clearControlCodeResultPriority();
     return false;
   }
@@ -4262,7 +4226,7 @@ import {
       videoState: videoWs ? videoWs.readyState : -1,
       frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
     }));
-    runSpacetimeMutation((client) => client.requestKeyframe(reason || 'browser_request'), reason || 'keyframe')
+    runSpacetimeMutation((client) => client.requestKeyframe(reason || 'browser_request'))
       .catch((error) => clientLog('keyframe_request_failed', `${reason || 'keyframe'}:${error && error.message || 'failed'}`));
     return true;
   }
@@ -4294,7 +4258,7 @@ import {
       videoState: videoWs ? videoWs.readyState : -1,
       frameAgeMs: lastFrameAt > 0 ? Math.round(performance.now() - lastFrameAt) : null
     }));
-    runSpacetimeMutation((client) => client.recoverStream(reason || 'browser_recovery'), reason || 'recover_stream')
+    runSpacetimeMutation((client) => client.recoverStream(reason || 'browser_recovery'))
       .catch((error) => clientLog('stream_recover_request_failed', `${reason || 'recover'}:${error && error.message || 'failed'}`));
     return true;
   }
@@ -4333,7 +4297,6 @@ import {
     // replacement decoder's metadata queue.
     decoderConfigureGeneration += 1;
     decoderGeneration += 1;
-    lastPresentedFrameConfigGeneration = 0;
     if (decoder) {
       try { decoder.close(); } catch (_) {}
       decoder = null;
@@ -4484,6 +4447,15 @@ import {
     const streamFreshness = currentRenderedFreshness(performance.now());
     window.ticketStreamDebug = {
       pageVersion,
+      phoneControl: {
+        subscribed: Boolean(currentState && currentState.phoneControlState),
+        clockCurrent: Number.isFinite(currentPhoneControlTime()),
+        clockNow: currentPhoneControlTime(),
+        observationAt: String(currentState && currentState.phoneControlState && currentState.phoneControlState.observedAt || ''),
+        expiresAt: String(currentState && currentState.phoneControlState && currentState.phoneControlState.expiresAt || ''),
+        phoneReady: Boolean(currentState && currentState.phoneControlState && currentState.phoneControlState.ready),
+        ready: currentPhoneControlReady(),
+      },
       configured,
       streamReady: document.body.dataset.streamReady,
       transport: 'https-websocket-h264',
@@ -4736,17 +4708,6 @@ import {
     return avcDescription;
   }
 
-  function acceptFreshFrame(frame) {
-    const admission = evaluateFreshFrame(frame);
-    if (!admission) return false;
-    if (!commitFrameReceipt(frame, admission)) {
-      decoderRejectedFrames += 1;
-      return false;
-    }
-    commitFreshFrame(frame, admission);
-    return true;
-  }
-
   function noteFramePacket(frame, now) {
     if (!frame) return;
     lastPacketAt = now;
@@ -4754,7 +4715,6 @@ import {
       lastPacketSequence = frame.sequence;
       lastPacketSequenceAdvancedAt = now;
     }
-    if (frame.timestamp) lastPacketTimestamp = frame.timestamp;
   }
 
   function frameVisualAgeAtAdmission(frame, now) {
@@ -4961,7 +4921,7 @@ import {
     const request = codeRequest;
     if (!request) return false;
     const status = String(request.status || '');
-    if (status === 'queued' || status === 'running') return true;
+    if (status === 'queued' || status === 'running' || status === 'generated') return true;
     const requestID = String(request.requestId || '').trim();
     return Boolean(requestID && controlCodeResultCaptureRequestID === requestID && controlCodeResultCapturedRequestID !== requestID);
   }
@@ -5353,7 +5313,6 @@ import {
     if (configGeneration !== activeFeedbackConfigGeneration ||
       epoch !== Number(currentStreamEpoch || 0) || !(sequence > 0) ||
       sequence > feedbackRenderedSequence) return false;
-    lastPresentedFrameConfigGeneration = configGeneration;
     feedbackPresentedSequence = Math.max(feedbackPresentedSequence, sequence);
     scheduleStreamFeedback('control_code_result_presented');
     clearControlCodeResultPriority();
@@ -5480,7 +5439,6 @@ import {
       updateStreamFreshnessStatus('frame_rendered');
       noteExperimentalMediaForegroundFrame();
       renderTicketInteraction(currentState && currentState.ticketInteraction);
-      observeTicketCurrentProofFrame();
       updateControlCodeSubmitAvailability();
       publishStreamDebug();
       return hdrMetadata;
@@ -5910,7 +5868,7 @@ import {
     return refreshSpacetimeState(reason || 'visibility_resume').then(() => true);
   }
 
-  async function runSpacetimeMutation(action, reason) {
+  async function runSpacetimeMutation(action) {
     await connectSpacetimeState();
     if (!spacetimeClient) throw new Error('Spacetime connection is unavailable.');
     await action(spacetimeClient);
@@ -5964,12 +5922,12 @@ import {
   }
 
   function publishStreamFocus(active, reason) {
-    runSpacetimeMutation((client) => client.setStreamFocus(Boolean(active), reason || (active ? 'browser_visible' : 'browser_hidden')), reason || 'stream_focus')
+    runSpacetimeMutation((client) => client.setStreamFocus(Boolean(active), reason || (active ? 'browser_visible' : 'browser_hidden')))
       .catch((error) => clientLog('stream_focus_failed', `${reason || 'focus'}:${error && error.message || 'failed'}`));
   }
 
   function refreshMemberLimitProjection(reason) {
-    runSpacetimeMutation((client) => client.refreshLimitState(), reason || 'member_limit_refresh')
+    runSpacetimeMutation((client) => client.refreshLimitState())
       .catch((error) => clientLog('member_limit_refresh_failed', `${reason || 'refresh'}:${error && error.message || 'failed'}`));
   }
 
@@ -5999,6 +5957,7 @@ import {
   function controlCodeStatusRank(status) {
     if (status === 'queued') return 1;
     if (status === 'running') return 2;
+    if (status === 'generated') return 3;
     if (status === 'succeeded' || status === 'failed' || status === 'expired' || status === 'closed') return 4;
     return 0;
   }
@@ -6119,12 +6078,25 @@ import {
       experimentalMediaPreferenceController.enabled && document.visibilityState === 'visible' &&
       !experimentalMediaPresentationRegionBlocked && !experimentalMediaPresentationRecoveryPending &&
       !regionRecoveryStarted) {
-      beginExperimentalMediaForegroundRecovery('control_code_result_released', {
-        forceCanvasReset: true,
-        foregroundConfirmed: true
-      });
+      resumeClientHDRAfterControlCodeResult();
     }
     publishStreamDebug();
+  }
+
+  function resumeClientHDRAfterControlCodeResult() {
+    const controller = experimentalClientHDRController;
+    if (controller && controller.snapshot().active) {
+      // The result froze a healthy renderer; it did not suspend the page.
+      // Hand the latest fresh live picture back to that same renderer.
+      if (!offerCurrentSDRFrameToClientHDR('control_code_result_released')) {
+        controller.markSDRStale('control_code_result_waiting_for_fresh_live_frame');
+      }
+      return;
+    }
+    beginExperimentalMediaForegroundRecovery('control_code_result_released', {
+      forceCanvasReset: true,
+      foregroundConfirmed: true
+    });
   }
 
   function clearControlCodeRequestLocalState(reason) {
@@ -7145,7 +7117,7 @@ import {
       Number(proof.candidateFrameEpoch || 0),
       Number(proof.candidateFrameSequence || 0),
       String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
-    ), 'control_code_browser_capture');
+    ));
     controlCodeCaptureTrace('control_code_browser_capture_ack_sent', request, proof, {
       acceptedReason: String(proof.acceptedReason || 'candidate_frame_at_or_after_phone_marker_and_generated_visual')
     });
@@ -7427,7 +7399,7 @@ import {
     if (current && ['succeeded', 'failed', 'closed', 'expired'].includes(String(current.status || ''))) {
       controlCodeSubmitInFlight = false;
     }
-    const busy = current && (current.status === 'queued' || current.status === 'running');
+    const busy = current && (current.status === 'queued' || current.status === 'running' || current.status === 'generated');
     if (requestID && !requestID.startsWith('pending:') && current &&
       (busy || (current.status === 'succeeded' && current.captureAcknowledged !== true))) {
       rememberControlCodeBaselineFrame(requestID);
@@ -7520,7 +7492,7 @@ import {
 
   function openControlCodeDialog() {
     if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden) return false;
-    if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;
+    if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;
     if (!controlCodeDialogEntryReady()) {
       setStatus('Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.');
       updateControlCodeSubmitAvailability();
@@ -7548,7 +7520,6 @@ import {
 
   function closeControlCodeDialog() {
     codeInputRevision++;
-    cancelPendingBrowserAction('code_dialog_closed', 'control_code');
     codeDialogOpen = false;
     if (codeDialog.contains(document.activeElement) && typeof document.activeElement.blur === 'function') {
       try {
@@ -7580,12 +7551,12 @@ import {
       event.stopPropagation();
     }
     if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden || ticketRegisterOverlayOccupiesHotspot()) return;
-    if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;
+    if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;
     return openControlCodeDialog();
   }
 
   async function submitControlCodeRequest() {
-    if (pendingBrowserAction || controlCodeMutationLaneBusy()) return false;
+    if (controlCodeMutationLaneBusy()) return false;
     const digits = sanitizeControlDigits(codeDigits.value);
     codeDigits.value = digits;
     if (digits.length < 2 || digits.length > 8) {
@@ -7593,22 +7564,24 @@ import {
       return false;
     }
     const revision = codeInputRevision;
-    return runBrowserActionWhenFresh({
+    const contextRevision = String(currentState && currentState.phoneControlState && currentState.phoneControlState.contextRevision || '');
+    return runBrowserAction({
       kind: 'control_code', button: codeSubmit,
       valid: () => codeDialogOpen && !codeDialog.hidden && codeInputRevision === revision &&
-        codeDigits.value === digits && !memberLimitBlocked('control_code') && !controlCodeMutationLaneBusy(true),
+        String(currentState && currentState.phoneControlState && currentState.phoneControlState.contextRevision || '') === contextRevision &&
+        codeDigits.value === digits && currentPhoneControlReady() && !memberLimitBlocked('control_code') && !controlCodeMutationLaneBusy(true),
       busy: controlCodeMutationLaneBusy,
       submit: (browserIntentValid) => sendControlCodeRequest(digits, browserIntentValid)
     });
   }
 
   async function sendControlCodeRequest(digits, browserIntentValid) {
-    if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {
+    if (!browserIntentValid() || controlCodeMutationLaneBusy() || !currentPhoneControlReady()) {
       codeError.textContent = 'Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.';
       updateControlCodeSubmitAvailability();
       return false;
     }
-    const fastRevision = controlCodeFastRevisionForRequest();
+    const fastRevision = String(currentState && currentState.phoneControlState && currentState.phoneControlState.contextRevision || '');
     codeError.textContent = '';
     controlCodeSubmitInFlight = true;
     updateControlCodeSubmitAvailability();
@@ -7616,12 +7589,11 @@ import {
     const submittedAt = performance.now();
     try {
       await runSpacetimeMutation((client) => client.requestControlCode(digits, fastRevision, () => {
-        // Both client creation and its live subscription can outlive the
-        // picture that authorized the click. Recheck after both waits.
-        if (!browserIntentValid() || !revealAuthoritativeSDRForConsequentialControl()) {
+        // Recheck the exact phone context after connection and subscription waits.
+        if (!browserIntentValid() || !currentPhoneControlReady()) {
           throw new Error('Sagaidi svaigu tiešraides kadru, pirms pieprasi kontroles kodu.');
         }
-      }), 'control_code_request');
+      }));
       const mutationLatencyMs = Math.round(performance.now() - submittedAt);
       clientLog('control_code_submitted', JSON.stringify({
         digitCount: digits.length,
@@ -7682,7 +7654,7 @@ import {
     }
     if (requestID && canCloseRequest) {
       try {
-        await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'), 'control_code_close');
+        await runSpacetimeMutation((client) => client.closeControlCode(requestID, 'browser_closed'));
       } catch (error) {
         clientLog('control_code_close_failed', error && error.message || 'close failed');
       }
@@ -7960,136 +7932,26 @@ import {
     return ticketActionV3OccupiesPhone(action);
   }
 
-  function ticketActionV3RegistrationProofIsFresh(action) {
-    return isTicketActionV3RegistrationProofFresh(
-      action,
-      ticketActionV3StreamSnapshot(),
-      Date.now() + serverClockSkewMs
-    );
+  function currentPhoneControlTime(state = currentState) {
+    return phoneControlNow(state && state.controlClock, performance.now(), Date.now());
   }
 
-  function ticketActionV3StreamSnapshot() {
-    return {
-      fresh: streamHasFreshRenderedFrame(),
-      configGeneration: Number(activeFeedbackConfigGeneration || 0),
-      epoch: Number(currentStreamEpoch || lastRenderedFrameEpoch || 0),
-      sequence: Number(lastRenderedFrameSequence || lastAcceptedFrameSequence || 0)
-    };
-  }
-
-  function clientHDRConsequentialControlProofReady() {
-    if (!experimentalClientHDRController || !experimentalMediaState.enabled ||
-      experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return true;
-    const snapshot = experimentalClientHDRController.snapshot();
-    if (!snapshot || !snapshot.active || !snapshot.surfaceVisible) return true;
-    const stream = ticketActionV3StreamSnapshot();
-    return snapshot.visualHoldover !== true && snapshot.proofFresh === true &&
-      snapshot.presentationState === 'visible' && Number(snapshot.epoch) > 0 && Number(snapshot.sequence) > 0 &&
-      Number(snapshot.epoch) === stream.epoch && Number(snapshot.sequence) === stream.sequence;
-  }
-
-  function revealAuthoritativeSDRForConsequentialControl() {
-    if (!streamHasFreshRenderedFrame()) return false;
-    if (!experimentalClientHDRController || !experimentalMediaState.enabled ||
-      experimentalMediaState.engine !== CLIENT_HDR_ENGINE) return true;
-    const snapshot = experimentalClientHDRController.snapshot();
-    if (!snapshot || !snapshot.active || !snapshot.surfaceVisible) return true;
-    if (!clientHDRConsequentialControlProofReady()) return false;
-    const stream = ticketActionV3StreamSnapshot();
-    return experimentalClientHDRController.ensureExactProof(stream.epoch, stream.sequence);
-  }
-
-  function ticketActionV3RequiresFreshRenderedFrame(target) {
-    return !['open_latest_unactivated', 'redetect_latest', 'prove_current'].includes(String(target || ''));
-  }
-
-  function browserActionContext() {
-    const stream = ticketActionV3StreamSnapshot(), action = currentState && currentState.ticketAction;
-    return [browserActionContextRevision, stream.epoch, stream.configGeneration, ticketSliderVisualRevision,
-      String(action && action.actionId || ''), String(action && action.currentView || ''), String(action && action.status || ''),
-      String(action && action.streamEpoch || ''), String(action && action.frameSequence || '')];
-  }
-
-  function cancelPendingBrowserAction(reason, kind = '') {
-    const pending = pendingBrowserAction;
-    if (!pending || (kind && pending.kind !== kind)) return false;
-    pendingBrowserAction = null;
-    clearTimeout(pending.timer);
-    if (pending.button) pending.button.textContent = pending.label;
-    if (pending.cancel) pending.cancel();
-    const message = 'Darbība netika nosūtīta. Sagaidi svaigu attēlu un mēģini vēlreiz.';
-    if (pending.kind === 'control_code') { codeError.textContent = message; setStatus(message); }
-    else ticketActionV3LastUserMessage = message;
-    clientLog('browser_action_cancelled', reason);
-    // Direct input/lifecycle cancellation must release every control even if
-    // no new picture arrives. Defer to avoid re-entering an active render.
-    Promise.resolve().then(() => renderTicketActionV3Controls(currentState));
-    return true;
+  function currentPhoneControlReady(state = currentState) {
+    return spacetimeStateFresh && phoneControlReady(state && state.phoneControlState, currentPhoneControlTime(state));
   }
 
   function invalidateBrowserActionContext(reason) {
     browserActionContextRevision++;
-    cancelPendingBrowserAction(reason);
+    cancelTicketRegisterSliderSession(reason);
   }
 
-  function reconcilePendingBrowserAction() {
-    const pending = pendingBrowserAction;
-    if (!pending) return;
-    const ready = () => {
-      if (pendingBrowserAction !== pending) return false;
-      if (performance.now() >= pending.deadline || !pending.contextValid() || pending.busy()) {
-        cancelPendingBrowserAction('fresh_frame_wait_cancelled');
-        return false;
-      }
-      if (!streamHasFreshRenderedFrame() || !clientHDRConsequentialControlProofReady() ||
-        (pending.requiresNewFrame && lastRenderedFrameSequence <= pending.sequence)) return false;
-      if (!pending.valid()) {
-        cancelPendingBrowserAction('fresh_frame_wait_cancelled');
-        return false;
-      }
-      return true;
-    };
-    if (pending.button) pending.button.textContent = 'Gaida svaigu kadru…';
-    if (!ready() || pending.scheduled) return;
-    pending.scheduled = true;
-    Promise.resolve().then(() => {
-      pending.scheduled = false;
-      if (!ready()) return false;
-      pendingBrowserAction = null;
-      clearTimeout(pending.timer);
-      if (pending.button) pending.button.textContent = pending.label;
-      return pending.submit(pending.valid);
-    }).catch((error) => {
-      clientLog('browser_action_submit_failed', error && error.message || 'submit failed');
-      renderTicketActionV3Controls(currentState);
-    });
-  }
-
-  function runBrowserActionWhenFresh(intent) {
-    if (pendingBrowserAction) return false;
-    const context = browserActionContext();
-    const contextValid = () => spacetimeStateFresh && document.visibilityState === 'visible' &&
-      configured && !idleDisconnected && !streamUnsupported &&
+  function runBrowserAction(intent) {
+    const revision = browserActionContextRevision;
+    const valid = () => spacetimeStateFresh && document.visibilityState === 'visible' &&
       (typeof navigator === 'undefined' || navigator.onLine !== false) &&
-      videoWs && videoWs.readyState === WebSocket.OPEN && streamClockBoundIsCurrent(performance.now()) &&
-      browserActionContext().every((value, index) => value === context[index]);
-    const valid = () => contextValid() && intent.valid();
+      browserActionContextRevision === revision && intent.valid();
     if (!valid() || intent.busy()) return false;
-    if (streamHasFreshRenderedFrame() && clientHDRConsequentialControlProofReady()) return intent.submit(valid);
-    if (!healthyOneFPSVisualContinuity()) return false;
-    // This local wait grants no picture authority. Admission still needs the
-    // current strict proof, even if the old picture expires while waiting.
-    const pending = { ...intent, contextValid, valid: () => healthyOneFPSVisualContinuity() && valid(),
-      deadline: performance.now() + 1100, scheduled: false,
-      sequence: lastRenderedFrameSequence, requiresNewFrame: !streamHasFreshRenderedFrame(),
-      label: intent.button && intent.button.textContent, timer: null };
-    pendingBrowserAction = pending;
-    pending.timer = setTimeout(() => {
-      if (pendingBrowserAction !== pending) return;
-      cancelPendingBrowserAction('fresh_frame_wait_expired');
-    }, 1100);
-    renderTicketActionV3Controls(currentState);
-    return false;
+    return intent.submit(valid);
   }
 
   function currentBrowserSwitchAction() {
@@ -8105,10 +7967,7 @@ import {
     const kind = sliderProof ? 'slider' : 'ticket';
     const valid = () => {
       if (target === 'register_current') {
-        const action = currentState && currentState.ticketAction;
-        return !activationPolicyBlocked(currentState) && isTicketActionV3RegistrationProofPresentable(
-          action, ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs) &&
-          (String(action && action.target || '') !== 'prove_current' || Boolean(currentTicketSliderPresentationRegion())) &&
+        return !activationPolicyBlocked(currentState) && Boolean(currentTicketSliderRegion()) &&
           (!sliderProof || ticketRegisterSliderPresentationStillMatches(sliderProof));
       }
       if (switching) {
@@ -8119,7 +7978,7 @@ import {
       }
       return target !== 'open_latest_and_register' || !activationPolicyBlocked(currentState);
     };
-    return runBrowserActionWhenFresh({ kind, sliderProof,
+    return runBrowserAction({ kind, sliderProof,
       button: sliderProof ? null : (switching ? ticketViewSwitchButton :
         (target === 'register_current' ? activateTicketButton : requestTicketResetAndActivateButton)),
       valid,
@@ -8136,46 +7995,26 @@ import {
   }
 
   function currentTicketSliderRegion(state = currentState) {
-    return ticketSliderRegionV3ForAction(
-      state && state.ticketAction || null,
-      state && state.ticketSliderRegion || null,
-      ticketActionV3StreamSnapshot(),
-      Date.now() + serverClockSkewMs
-    );
-  }
-
-  function ticketRegisterSliderPresentationStream() {
-    const stream = ticketActionV3StreamSnapshot();
-    return { ...stream, healthyContinuity: healthyOneFPSVisualContinuity() };
+    return spacetimeStateFresh
+      ? phoneRegistrationRegion(state && state.phoneControlState, currentPhoneControlTime(state)) : null;
   }
 
   function currentTicketSliderPresentationRegion(state = currentState) {
-    return ticketSliderRegionV3ForPresentation(state && state.ticketAction, state && state.ticketSliderRegion,
-      ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs);
+    return hasRenderedFrame ? currentTicketSliderRegion(state) : null;
   }
 
   function currentTicketRegisterSliderPresentationProof(state = currentState) {
-    return ticketLocalRegisterSliderPresentationSnapshot(state && state.ticketAction, state && state.ticketSliderRegion,
-      ticketRegisterSliderPresentationStream(), ticketSliderLayoutRevision, ticketSliderVisualRevision,
-      Date.now() + serverClockSkewMs);
+    return spacetimeStateFresh && hasRenderedFrame
+      ? phoneRegistrationSnapshot(state && state.phoneControlState, ticketSliderLayoutRevision, currentPhoneControlTime(state)) : null;
   }
 
   function ticketRegisterSliderPresentationStillMatches(snapshot, state = currentState) {
-    return ticketLocalRegisterSliderPresentationMatches(snapshot, state && state.ticketAction, state && state.ticketSliderRegion,
-      ticketRegisterSliderPresentationStream(), ticketSliderLayoutRevision, ticketSliderVisualRevision,
-      Date.now() + serverClockSkewMs);
+    return spacetimeStateFresh && phoneRegistrationMatches(snapshot, state && state.phoneControlState,
+      ticketSliderLayoutRevision, currentPhoneControlTime(state));
   }
 
   function ticketRegisterSliderProofStillMatches(snapshot, state = currentState) {
-    return ticketLocalRegisterSliderProofMatches(
-      snapshot,
-      state && state.ticketAction || null,
-      state && state.ticketSliderRegion || null,
-      ticketActionV3StreamSnapshot(),
-      ticketSliderLayoutRevision,
-      ticketSliderVisualRevision,
-      Date.now() + serverClockSkewMs
-    );
+    return ticketRegisterSliderPresentationStillMatches(snapshot, state);
   }
 
   function suppressTicketRegisterSliderChangeForPointerEvent() {
@@ -8187,8 +8026,7 @@ import {
 
   function cancelTicketRegisterSliderSession(reason, pointerId = null) {
     if (ticketLocalRegisterSliderState.inFlight) return false;
-    const cancelledPending = cancelPendingBrowserAction(reason || 'slider_cancelled', 'slider');
-    if (!cancelTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, pointerId) && !cancelledPending) return false;
+    if (!cancelTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, pointerId)) return false;
     suppressTicketRegisterSliderChangeForPointerEvent();
     ticketLocalRegisterSlider.value = '0';
     clientLog('ticket_slider_cancelled', reason || 'cancelled');
@@ -8238,14 +8076,13 @@ import {
       ticketLocalRegisterSlider.setAttribute('aria-label', 'Biļetes reģistrācija notiek tālrunī');
       return ticketLocalRegisterSliderState.latchedProof;
     }
-    const pending = pendingBrowserAction && pendingBrowserAction.kind === 'slider' ? pendingBrowserAction : null;
-    const region = pending ? pending.sliderProof : currentTicketSliderPresentationRegion(state);
+    const region = currentTicketSliderPresentationRegion(state);
     if (ticketLocalRegisterSliderState.session &&
       !ticketRegisterSliderPresentationStillMatches(ticketLocalRegisterSliderState.session.snapshot, state)) {
       cancelTicketRegisterSliderSession('proof_changed');
     }
     if (!region || !spacetimeStateFresh || activationPolicyBlocked(state) ||
-      ((!pending) && (busy || controlBusy)) || !configured) {
+      (busy || controlBusy) || !configured) {
       if (ticketLocalRegisterSliderState.session) {
         cancelTicketRegisterSliderSession('slider_became_unavailable');
       }
@@ -8257,189 +8094,23 @@ import {
       return null;
     }
     ticketRegisterOverlay.hidden = false;
-    ticketRegisterOverlay.dataset.registrationState = pending ? 'waiting_fresh_frame' : 'ready';
+    ticketRegisterOverlay.dataset.registrationState = 'ready';
     ticketRegisterOverlay.removeAttribute('aria-busy');
     ticketLocalRegisterSlider.setAttribute('aria-label', 'Velc pa labi vismaz 8 pikseļus mazāk nekā 45 grādu leņķī, lai reģistrētu atvērto biļeti; velc uz augšu vai leju, lai ritinātu lapu');
-    ticketLocalRegisterSlider.disabled = Boolean(ticketLocalRegisterSliderState.inFlight || (pendingBrowserAction && !pending));
-    if (pending) {
-      ticketLocalRegisterSlider.value = '100';
-      ticketLocalRegisterSlider.setAttribute('aria-label', 'Gaida svaigu biļetes kadru pirms reģistrācijas');
-    }
+    ticketLocalRegisterSlider.disabled = ticketLocalRegisterSliderState.inFlight;
     const expiresAt = Date.parse(String(region.expiresAt || ''));
-    const delay = expiresAt - (Date.now() + serverClockSkewMs);
+    const delay = expiresAt - currentPhoneControlTime(state);
     if (Number.isFinite(delay) && delay > 0) {
-      const cooldownDelay = ticketCurrentProofLastRequestAt + ticketCurrentProofRequestCooldownMs - Date.now();
-      const renewalDelay = Math.max(0, delay - ticketCurrentProofRenewBeforeMs, cooldownDelay);
       ticketSliderRegionExpiryTimer = setTimeout(() => {
         ticketSliderRegionExpiryTimer = null;
-        ticketCurrentProofVisualState.resumePending = true;
         renderTicketActionV3Controls(currentState);
-        maybeRequestTicketCurrentProof('slider_region_renewal');
-      }, Math.max(25, Math.min(renewalDelay + 25, 60_000)));
+      }, Math.max(1, delay + 1));
     }
     return region;
   }
 
   function ticketActionV3LocalRequestIsBusy() {
     return ticketActionV3LocalRequestBusy(ticketActionV3LocalRequestState);
-  }
-
-  function sampleTicketCurrentProofFingerprint() {
-    if (!ticketCurrentProofFingerprintContext || !hasRenderedFrame || !canvas.width || !canvas.height) return null;
-    try {
-      ticketCurrentProofFingerprintContext.drawImage(
-        canvas,
-        0,
-        0,
-        ticketCurrentProofFingerprintCanvas.width,
-        ticketCurrentProofFingerprintCanvas.height
-      );
-      const pixels = ticketCurrentProofFingerprintContext.getImageData(
-        0,
-        0,
-        ticketCurrentProofFingerprintCanvas.width,
-        ticketCurrentProofFingerprintCanvas.height
-      ).data;
-      const values = [];
-      for (let index = 0; index < pixels.length; index += 4) {
-        const cell = index / 4;
-        const column = cell % ticketCurrentProofFingerprintCanvas.width;
-        const row = Math.floor(cell / ticketCurrentProofFingerprintCanvas.width);
-        // Ignore the central upper ticket-code area. The ordinary rotating
-        // Aztec animation is not a meaningful Ticket view change and must not
-        // cause background re-detection or make controls flicker.
-        if (row >= 1 && row <= 5 && column >= 2 && column <= 5) continue;
-        values.push(Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114));
-      }
-      return {
-        epoch: Number(lastRenderedFrameEpoch || currentStreamEpoch || 0),
-        sequence: Number(lastRenderedFrameSequence || 0),
-        values
-      };
-    } catch (error) {
-      clientLog('ticket_current_proof_sample_failed', error && error.message || 'sample failed');
-      return null;
-    }
-  }
-
-  function observeTicketCurrentProofFrame() {
-    if (document.visibilityState !== 'visible' || !streamHasFreshRenderedFrame()) return;
-    const now = Date.now();
-    const epoch = Number(lastRenderedFrameEpoch || currentStreamEpoch || 0);
-    if (!(epoch > 0)) return;
-    if (ticketCurrentProofVisualState.fingerprint && ticketCurrentProofVisualState.fingerprint.epoch !== epoch) {
-      ticketCurrentProofVisualState.fingerprint = null;
-      ticketCurrentProofVisualState.candidateFingerprint = null;
-      ticketCurrentProofVisualState.stableChangeCount = 0;
-      ticketCurrentProofVisualState.changePending = false;
-    }
-    if (now - ticketCurrentProofLastSampleAt >= ticketCurrentProofSampleIntervalMs) {
-      ticketCurrentProofLastSampleAt = now;
-      const sample = sampleTicketCurrentProofFingerprint();
-      if (sample) {
-        if (!ticketCurrentProofVisualState.fingerprint) {
-          ticketCurrentProofVisualState.fingerprint = sample;
-        } else if (ticketCurrentProofFingerprintChanged(ticketCurrentProofVisualState.fingerprint.values, sample.values)) {
-          if (ticketCurrentProofVisualState.candidateFingerprint &&
-            !ticketCurrentProofFingerprintChanged(ticketCurrentProofVisualState.candidateFingerprint.values, sample.values)) {
-            ticketCurrentProofVisualState.stableChangeCount += 1;
-          } else {
-            ticketCurrentProofVisualState.candidateFingerprint = sample;
-            ticketCurrentProofVisualState.stableChangeCount = 1;
-          }
-          if (ticketCurrentProofVisualState.stableChangeCount >= 2) {
-            ticketCurrentProofVisualState.fingerprint = sample;
-            ticketCurrentProofVisualState.candidateFingerprint = null;
-            ticketCurrentProofVisualState.changePending = true;
-            ticketSliderVisualRevision += 1;
-            cancelTicketRegisterSliderSession('visual_view_changed');
-          }
-        } else {
-          ticketCurrentProofVisualState.candidateFingerprint = null;
-          ticketCurrentProofVisualState.stableChangeCount = 0;
-        }
-      }
-    }
-    maybeRequestTicketCurrentProof('frame_observed');
-  }
-
-  async function maybeRequestTicketCurrentProof(reason) {
-    if (!spacetimeStateFresh) return false;
-    const stream = ticketActionV3StreamSnapshot();
-    const proofScope = `${String(cfg.backendId || 'pixel')}:${Number(stream.epoch || 0)}`;
-    const currentAction = currentState && currentState.ticketAction || null;
-    const currentActionId = String(currentAction && currentAction.actionId || '').trim();
-    const rebaseCandidate = String(currentAction && currentAction.phase || '') === 'complete' && currentActionId &&
-      currentActionId !== String(ticketCurrentProofVisualState.rebasedActionId || '').trim() &&
-      ticketSliderRegionV3ForAction(
-        currentAction,
-        currentState && currentState.ticketSliderRegion || null,
-        stream,
-        Date.now() + serverClockSkewMs
-      );
-    const rebased = Boolean(rebaseCandidate) && rebaseTicketCurrentProofDetectorFromAction(
-      ticketCurrentProofVisualState,
-      {
-        action: currentAction,
-        region: rebaseCandidate,
-        stream,
-        sample: sampleTicketCurrentProofFingerprint(),
-        now: Date.now() + serverClockSkewMs
-      }
-    );
-    if (rebased) ticketCurrentProofRequestedScope = proofScope;
-    if (ticketCurrentProofInFlight ||
-      Date.now() - ticketCurrentProofLastRequestAt < ticketCurrentProofRequestCooldownMs) return false;
-    const ownUnknownAwaitingChange = Boolean(ticketCurrentProofLastActionId &&
-      String(currentAction && currentAction.actionId || '') === ticketCurrentProofLastActionId &&
-      String(currentAction && currentAction.target || '') === 'prove_current' &&
-      ['succeeded', 'failed', 'needs_attention'].includes(String(currentAction && currentAction.status || '')) &&
-      String(currentAction && currentAction.currentView || '') === 'unknown');
-    if (!ticketCurrentProofRequestNeeded({
-      visible: document.visibilityState === 'visible',
-      stream,
-      action: currentAction,
-      region: currentState && currentState.ticketSliderRegion || null,
-      now: Date.now() + serverClockSkewMs,
-      requestedEpoch: ticketCurrentProofRequestedScope === proofScope ? Number(stream.epoch || 0) : 0,
-      stableChangeCount: ticketCurrentProofVisualState.changePending ? 2 : ticketCurrentProofVisualState.stableChangeCount,
-      resumed: ticketCurrentProofVisualState.resumePending,
-      renewBeforeMs: ticketCurrentProofRenewBeforeMs,
-      // A failed or completed control-code request can leave a visual cleanup
-      // checkpoint on the phone. Only the explicit Open action is allowed to
-      // recover it; an automatic proof must not reclaim the phone lane first.
-      recoveryRequired: controlCodeVisualRecoveryRequired(),
-      // A reconnect caused by this exact failed proof is not itself a visual
-      // change. Wait for two agreeing changed frames before trying again.
-      unknownAwaitingChange: ownUnknownAwaitingChange
-    })) return false;
-    ticketCurrentProofInFlight = true;
-    ticketCurrentProofLastRequestAt = Date.now();
-    const actionId = ticketActionV3Id();
-    ticketCurrentProofLastActionId = actionId;
-    try {
-      const accepted = await requestTicketActionV3(
-        'prove_current',
-        'browser_auto_proof',
-        'ticket_action_requested',
-        '',
-        { quiet: true, actionId }
-      );
-      if (accepted) {
-        ticketCurrentProofRequestedScope = proofScope;
-        ticketCurrentProofVisualState.resumePending = false;
-        ticketCurrentProofVisualState.stableChangeCount = 0;
-        ticketCurrentProofVisualState.candidateFingerprint = null;
-        ticketCurrentProofVisualState.changePending = false;
-        clientLog('ticket_current_proof_requested', reason || 'automatic');
-      }
-      if (!accepted && ticketCurrentProofLastActionId === actionId) {
-        ticketCurrentProofLastActionId = '';
-      }
-      return accepted;
-    } finally {
-      ticketCurrentProofInFlight = false;
-    }
   }
 
   function scheduleTicketActionV3Reconcile(reason) {
@@ -8460,8 +8131,13 @@ import {
   }
 
   function renderTicketActionV3Controls(state = currentState) {
-    reconcilePendingBrowserAction();
-    const waiting = Boolean(pendingBrowserAction);
+    if (phoneControlExpiryTimer) clearTimeout(phoneControlExpiryTimer);
+    phoneControlExpiryTimer = null;
+    const controlExpiry = Date.parse(String(state && state.phoneControlState && state.phoneControlState.expiresAt || ''));
+    const controlDelay = controlExpiry - currentPhoneControlTime(state);
+    if (Number.isFinite(controlDelay) && controlDelay > 0) {
+      phoneControlExpiryTimer = setTimeout(() => renderTicketActionV3Controls(currentState), controlDelay + 1);
+    }
     const action = state && state.ticketAction || null;
     const sliderActionRows = Array.isArray(state && state.ticketActions) ? [...state.ticketActions] : [];
     if (action && !sliderActionRows.some((row) => String(row && row.actionId || '') === String(action.actionId || ''))) {
@@ -8480,7 +8156,7 @@ import {
     const busy = ticketActionV3LocalRequestIsBusy() || ticketActionV3Busy(action);
     const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy() && ticketActionV3Busy(action) &&
       String(action && action.target || '') === 'prove_current');
-    const blockingBusy = waiting || (busy && !backgroundProofBusy);
+    const blockingBusy = busy || Boolean(state && state.phoneControlState && state.phoneControlState.busy);
     const observedUserAction = ticketActionV3ExplicitResultForDisplay(
       state && state.ticketActions || [],
       ticketActionV3LastUserActionId,
@@ -8498,19 +8174,9 @@ import {
       ? ticketActionV3Busy(ticketActionV3LastUserAction)
       : blockingBusy;
     const controlBusy = controlCodeSubmitInFlight || controlCodeRequestOccupiesQueue();
-    const region = currentTicketSliderPresentationRegion(state);
-    const proofReady = spacetimeStateFresh && isTicketActionV3RegistrationProofPresentable(
-      action, ticketRegisterSliderPresentationStream(), Date.now() + serverClockSkewMs);
-    const proveCurrentReady = String(action && action.target || '') !== 'prove_current' || Boolean(region);
-    const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);
-    const streamActionFresh = streamHasFreshRenderedFrame();
-    const hdrControlReady = clientHDRConsequentialControlProofReady();
-    const presentationReady = (streamActionFresh && hdrControlReady) || healthyOneFPSVisualContinuity();
+    const registerReady = Boolean(currentTicketSliderRegion(state)) && !activationPolicyBlocked(state);
     const connectionReason = 'Gaida dzīvu SpaceTime savienojumu.';
-    const hdrControlReason = 'Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.';
-    const phoneBusyReason = waiting ? 'Gaida svaigu kadru…' : backgroundProofBusy
-      ? 'Tālrunis pabeidz pašreizējā skata vizuālo pārbaudi.'
-      : 'Tālrunis izpilda iepriekšējo biļetes darbību.';
+    const phoneBusyReason = 'Tālrunis izpilda iepriekšējo darbību.';
     const controlBusyReason = 'Tālrunis izpilda kontroles koda darbību.';
     function setTicketButtonGate(button, enabled, reason) {
       button.disabled = !enabled;
@@ -8522,29 +8188,14 @@ import {
     const openReason = !spacetimeStateFresh
       ? connectionReason
       : (controlBusy ? controlBusyReason : (blockingBusy ? phoneBusyReason : ''));
-    const visualActionReason = !spacetimeStateFresh
-      ? connectionReason
-      : (!presentationReady ? hdrControlReason : openReason);
-    const activationReason = visualActionReason || (activationPolicyBlocked(state) ? activationPolicyMessage(state) : '');
-    const registerReason = !spacetimeStateFresh
-      ? connectionReason
-      : (!presentationReady
-        ? hdrControlReason
-        : (controlBusy
-        ? controlBusyReason
-        : (blockingBusy
-          ? phoneBusyReason
-          : (activationPolicyBlocked(state)
-            ? activationPolicyMessage(state)
-            : (proofReady && !region
-              ? 'Atvērtā biļete ir apstiprināta; atjauno reģistrācijas slīdņa novietojumu.'
-              : 'Vispirms vizuāli apstiprini atvērtu nereģistrētu biļeti.')))));
+    const activationReason = openReason || (activationPolicyBlocked(state) ? activationPolicyMessage(state) : '');
+    const registerReason = activationReason || 'Gaida tālruņa apstiprinājumu par atvērto biļeti.';
     setTicketButtonGate(requestTicketResetButton,
       spacetimeStateFresh && !blockingBusy && !controlBusy, openReason);
     setTicketButtonGate(requestTicketResetAndActivateButton,
-      spacetimeStateFresh && presentationReady && !blockingBusy && !controlBusy && !activationPolicyBlocked(state), activationReason);
+      spacetimeStateFresh && !blockingBusy && !controlBusy && !activationPolicyBlocked(state), activationReason);
     setTicketButtonGate(activateTicketButton,
-      presentationReady && !blockingBusy && !controlBusy && registerReady, registerReason);
+      !blockingBusy && !controlBusy && registerReady, registerReason);
     renderTicketRegisterOverlay(state, blockingBusy, controlBusy);
     for (const button of [requestTicketResetButton, requestTicketResetAndActivateButton, activateTicketButton]) {
       button.setAttribute('aria-busy', blockingBusy ? 'true' : 'false');
@@ -8572,14 +8223,13 @@ import {
     const smartSwitch = ticketActionV3SmartSwitchForView(switchCurrentView);
     ticketViewSwitchButton.textContent = smartSwitch.label;
     ticketViewSwitchButton.dataset.target = smartSwitch.target;
-    if (spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target && presentationReady && !blockingBusy && !controlBusy) {
+    if (spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target && !blockingBusy && !controlBusy) {
       ticketViewSwitchButton.disabled = false;
       ticketViewSwitchButton.removeAttribute('title');
       ticketViewSwitchDetail.textContent = 'Var pārslēgt skatu bez biļetes atkārtotas reģistrēšanas.';
     } else if (!spacetimeStateFresh) {
       ticketViewSwitchDetail.textContent = connectionReason;
-    } else if (!presentationReady) {
-      ticketViewSwitchDetail.textContent = hdrControlReason;
+
     } else if (blockingBusy) {
       ticketViewSwitchDetail.textContent = phoneBusyReason;
     } else if (controlBusy) {
@@ -8627,8 +8277,6 @@ import {
       ticketResetDetail.textContent = 'Pieejams, kad tālrunis ir gatavs.';
     }
     updateControlCodeSubmitAvailability();
-    if (pendingBrowserAction && pendingBrowserAction.button) pendingBrowserAction.button.textContent = 'Gaida svaigu kadru…';
-    maybeRequestTicketCurrentProof('state_rendered');
   }
 
   async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {
@@ -8636,13 +8284,6 @@ import {
     if (!spacetimeStateFresh) {
       if (options.quiet !== true) {
         ticketActionV3LastUserMessage = 'Gaida dzīvu SpaceTime savienojumu.';
-        renderTicketActionV3Controls(currentState);
-      }
-      return false;
-    }
-    if (ticketActionV3RequiresFreshRenderedFrame(target) && !revealAuthoritativeSDRForConsequentialControl()) {
-      if (options.quiet !== true) {
-        ticketActionV3LastUserMessage = 'Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.';
         renderTicketActionV3Controls(currentState);
       }
       return false;
@@ -8671,14 +8312,9 @@ import {
         const beforeSubmit = () => {
           if (options.browserIntentValid && !options.browserIntentValid()) throw new Error('Darbības apstiprinājums ir mainījies. Mēģini vēlreiz.');
           if (!spacetimeStateFresh) throw new Error('Gaida dzīvu SpaceTime savienojumu.');
-          if (ticketActionV3RequiresFreshRenderedFrame(target) && !revealAuthoritativeSDRForConsequentialControl()) {
-            throw new Error('Sagaidi svaigu tiešraides kadru, pirms vadi tālruni.');
-          }
           if (target === 'register_current') {
-            const admissionProof = currentState && currentState.ticketAction || null;
-            if (String(admissionProof && admissionProof.actionId || '') !== expectedInteractionRevision ||
-              !ticketActionV3RegistrationProofIsFresh(admissionProof) ||
-              (String(admissionProof && admissionProof.target || '') === 'prove_current' && !currentTicketSliderRegion(currentState))) {
+            const admissionProof = currentTicketSliderRegion();
+            if (!admissionProof || admissionProof.contextRevision !== expectedInteractionRevision) {
               throw new Error('Sagaidi svaigu vizuālu nereģistrētās biļetes apstiprinājumu.');
             }
             if (source === 'browser_slider' && !ticketRegisterSliderProofStillMatches(options.proofSnapshot, currentState)) {
@@ -8694,7 +8330,7 @@ import {
           attemptId: activation ? actionId : '',
           expectedInteractionRevision: target === 'register_current' ? expectedInteractionRevision : ''
         }), beforeSubmit);
-      }, `ticket_action_v3_${target}`);
+      });
       settleTicketActionV3LocalRequest(ticketActionV3LocalRequestState, true);
       scheduleTicketActionV3Reconcile(`ticket_action_v3_${target}_reconcile`);
       clientLog('ticket_action_v3_requested', target);
@@ -8718,9 +8354,8 @@ import {
   }
 
   async function registerCurrentTicket(source, options = {}) {
-    const proofAction = currentState && currentState.ticketAction || null;
-    if (!ticketActionV3RegistrationProofIsFresh(proofAction) ||
-      (String(proofAction && proofAction.target || '') === 'prove_current' && !currentTicketSliderRegion(currentState))) {
+    const proofAction = currentTicketSliderRegion();
+    if (!proofAction) {
       ticketActionV3LastUserActionId = '';
       ticketActionV3LastUserAction = null;
       ticketActionV3LastUserMessage = 'Sagaidi svaigu vizuālu nereģistrētās biļetes apstiprinājumu.';
@@ -8734,7 +8369,7 @@ import {
       renderTicketActionV3Controls(currentState);
       return false;
     }
-    const revision = String(proofAction.actionId || '').trim();
+    const revision = String(proofAction.contextRevision || '').trim();
     if (!revision) return false;
     return requestTicketActionV3(
       'register_current',
@@ -8839,10 +8474,9 @@ import {
 
   codeDigits.addEventListener('input', () => {
     codeInputRevision++;
-    const cancelled = cancelPendingBrowserAction('code_input_changed', 'control_code');
     const cleaned = sanitizeControlDigits(codeDigits.value);
     if (codeDigits.value !== cleaned) codeDigits.value = cleaned;
-    if (!cancelled) codeError.textContent = '';
+    codeError.textContent = '';
     updateControlCodeSubmitAvailability();
     updateViewportVars();
   });
@@ -8855,7 +8489,7 @@ import {
   });
   requestCodeButton.addEventListener('click', () => openControlCodeDialog());
   controlCodeHotspot.addEventListener('click', requestControlCodeFromHotspot);
-  requestTicketResetButton.addEventListener('click', () => !pendingBrowserAction && !controlCodeSubmitInFlight && requestTicketActionV3(
+  requestTicketResetButton.addEventListener('click', () => !controlCodeSubmitInFlight && requestTicketActionV3(
     'open_latest_unactivated', 'browser_button', 'ticket_open_latest_unactivated'
   ));
   requestTicketResetAndActivateButton.addEventListener('click', () => requestBrowserTicketAction(
@@ -8882,7 +8516,7 @@ import {
 
   async function finishTicketRegisterSliderSession(event, kind) {
     const session = ticketLocalRegisterSliderState.session;
-    if (pendingBrowserAction || !session || session.kind !== kind || ticketLocalRegisterSliderState.inFlight) return false;
+    if (!session || session.kind !== kind || ticketLocalRegisterSliderState.inFlight) return false;
     if (kind === 'pointer' && Number(event && event.pointerId) !== session.pointerId) return false;
     const completedProof = completeTicketLocalRegisterSliderSession(ticketLocalRegisterSliderState, {
       pointerId: event && event.pointerId,
@@ -8898,16 +8532,11 @@ import {
     }
     ticketLocalRegisterSlider.value = '100';
     const submitted = await requestBrowserTicketAction('register_current', 'browser_slider', 'ticket_slider_completed', completedProof);
-    if (!submitted && !pendingBrowserAction && !ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
+    if (!submitted && !ticketLocalRegisterSliderState.inFlight) ticketLocalRegisterSlider.value = '0';
     return submitted;
   }
 
   ticketLocalRegisterSlider.addEventListener('pointerdown', (event) => {
-    if (pendingBrowserAction) {
-      event.preventDefault();
-      if (event.isPrimary === false) cancelPendingBrowserAction('secondary_pointer_down', 'slider');
-      return;
-    }
     if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       event.preventDefault();
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
@@ -8955,10 +8584,6 @@ import {
   });
   ticketLocalRegisterSlider.addEventListener('keydown', (event) => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) return;
-    if (pendingBrowserAction) {
-      event.preventDefault();
-      return;
-    }
     if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       event.preventDefault();
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
@@ -8978,7 +8603,7 @@ import {
     });
   });
   ticketLocalRegisterSlider.addEventListener('change', () => {
-    if (pendingBrowserAction || ticketLocalRegisterSliderState.ignoreChange || ticketLocalRegisterSliderState.inFlight || ticketLocalRegisterSliderState.session) return;
+    if (ticketLocalRegisterSliderState.ignoreChange || ticketLocalRegisterSliderState.inFlight || ticketLocalRegisterSliderState.session) return;
     if (!currentTicketRegisterSliderPresentationProof(currentState)) {
       cancelTicketRegisterSliderSession('hdr_proof_not_fresh');
       ticketLocalRegisterSlider.value = '0';
@@ -9198,8 +8823,7 @@ import {
   }
 
   function controlCodeDialogEntryReady() {
-    return (streamHasFreshRenderedFrame() && clientHDRConsequentialControlProofReady()) ||
-      healthyOneFPSVisualContinuity();
+    return currentPhoneControlReady();
   }
 
   function lastRenderedVisualAge(now) {
@@ -9374,7 +8998,7 @@ import {
     if (expiresAt && Date.now() + serverClockSkewMs > expiresAt + 1000) return false;
     const status = String(request.status || '');
     if (status === 'closed' || status === 'expired' || status === 'failed') return false;
-    if (status === 'queued' || status === 'running') return true;
+    if (status === 'queued' || status === 'running' || status === 'generated') return true;
     if (status !== 'succeeded') return false;
     if (request.cleanupPending === true) return true;
     return request.captureRequired === true && request.captureAcknowledged !== true;
@@ -9410,17 +9034,16 @@ import {
     // Reset/reselect and an active slider claim occupy the same phone mutation
     // lane as control-code generation.  Use the authoritative interaction row
     // here so the UI cannot offer a request that the reducer will reject.
-    const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy();
+    const busy = controlCodeMutationLaneBusy();
     const limitBlocked = memberLimitBlocked('control_code');
-    const streamActionFresh = streamHasFreshRenderedFrame();
-    const hdrControlReady = clientHDRConsequentialControlProofReady();
-    const dialogEntryReady = (streamActionFresh && hdrControlReady) || healthyOneFPSVisualContinuity();
+    const dialogEntryReady = currentPhoneControlReady();
     const digitCount = sanitizeControlDigits(codeDigits.value).length;
     const digitsValid = digitCount >= 2 && digitCount <= 8;
     codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !dialogEntryReady || !digitsValid;
-    codeSubmit.textContent = pendingBrowserAction && pendingBrowserAction.kind === 'control_code'
-      ? 'Gaida svaigu kadru…' : (controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu');
-    if (controlCodeSubmitInFlight || (pendingBrowserAction && pendingBrowserAction.kind === 'control_code')) {
+    requestCodeButton.textContent = codeRequest && codeRequest.status === 'generated'
+      ? 'Kods izveidots — gaida attēlu…' : 'Pieprasīt kontroles kodu';
+    codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';
+    if (controlCodeSubmitInFlight) {
       codeSubmit.setAttribute('aria-busy', 'true');
     } else {
       codeSubmit.removeAttribute('aria-busy');
@@ -9505,9 +9128,8 @@ import {
       return;
     }
 
-    // A reconnect can re-arm an owned result request before the replacement
-    // decoder receives its first frame. The relay intentionally reserves that
-    // socket too, so startup and ordinary stale-frame recovery share the guard.
+    // Only delivery of an actual marked result briefly reserves this socket.
+    // Queued/running requests keep ordinary pictures and recovery available.
     if (controlCodeMediaReadSuppressed(now)) {
       if (controlCodeReservedMediaBackendRecoveryAllowed(status, now)) {
         requestServerRecoveryDebounced('control_code_reserved_media_backend_recover');
@@ -9748,7 +9370,6 @@ import {
 	      }
 	      hiddenDecoderTransientLogged = false;
       refreshMemberLimitProjection('visibility_resume_limit_refresh');
-      ticketCurrentProofVisualState.resumePending = true;
       noteViewerActivity(null, 'visibility_visible');
       if (hiddenStreamFocusTimer) {
         clearTimeout(hiddenStreamFocusTimer);
@@ -9790,7 +9411,6 @@ import {
 	    if (typeof scheduleExperimentalMediaForegroundReturnConfirmation === 'function') {
 	      scheduleExperimentalMediaForegroundReturnConfirmation(event && event.persisted ? 'pageshow_persisted' : 'pageshow');
 	    }
-	    ticketCurrentProofVisualState.resumePending = true;
 	    const resumedFromIdle = noteViewerActivity(event, 'pageshow');
     keepFirstScreenPinned(true);
     const restored = event.persisted || lastHiddenAt > 0 || (typeof document !== 'undefined' && document.wasDiscarded === true);
@@ -9843,7 +9463,6 @@ import {
       lastHiddenWallAt > 0
     );
     if (focusRestored) {
-      ticketCurrentProofVisualState.resumePending = true;
       recoverAfterVisibilityResume('focus');
       return;
     }
@@ -9890,7 +9509,7 @@ import {
       spacetimeClient.heartbeat(active, active ? 'browser_stream_heartbeat' : 'browser_no_stream_heartbeat');
     }
   }, 15000);
-  feedbackTimer = setInterval(() => sendStreamFeedback('interval', false), 500);
+  setInterval(() => sendStreamFeedback('interval', false), 500);
   setInterval(() => {
     noteExperimentalMediaForegroundPulse();
     chaseLiveStream();
@@ -9900,6 +9519,7 @@ import {
   updateDetailsReveal();
   resizeCanvasBox();
   scheduleViewerIdleDisconnect('initial_load');
+	  initializeExperimentalMedia();
 	  showQuietStreamLoading();
 	  connectSpacetimeState().catch((error) => clientLog('spacetime_connect_failed', error && error.message));
 	  connect();

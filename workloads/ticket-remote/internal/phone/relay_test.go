@@ -1110,14 +1110,74 @@ func TestRelayAddViewerRestartsDesiredButDisconnectedLoop(t *testing.T) {
 	relay.mu.Lock()
 	relay.desired = true
 	relay.connected = false
-	relay.cancelLoop = nil
+	ctx := relay.newConnectLoopLocked()
 	relay.mu.Unlock()
+	// The last viewer left during the warm hold, then the phone disconnected.
+	relay.connectLoop(ctx)
 
 	relay.AddViewer()
 	select {
 	case <-videoConnected:
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not reconnect desired disconnected video path after viewer join")
+	}
+}
+
+func TestRelayFinishedLoopDoesNotKeepRetryOwnership(t *testing.T) {
+	relay := NewRelay(RelayConfig{BaseURL: "http://127.0.0.1:1"})
+	defer relay.Close()
+	relay.desired = true
+	ctx := relay.newConnectLoopLocked()
+	// During a warm hold the last viewer can leave just as a phone disconnect ends
+	// connectOnce. The loop exits while desired remains true for the next viewer.
+	relay.connectLoop(ctx)
+	if relay.cancelLoop != nil {
+		t.Fatal("finished reconnect loop still claims retry ownership; a new viewer cannot restart it")
+	}
+}
+
+func TestRelayFinishedOldLoopPreservesNewOwner(t *testing.T) {
+	relay := NewRelay(RelayConfig{BaseURL: "http://127.0.0.1:1"})
+	defer relay.Close()
+	old := relay.newConnectLoopLocked()
+	relay.cancelLoop()
+	current := relay.newConnectLoopLocked()
+	relay.finishConnectLoop(old)
+	if relay.loopContext != current || relay.cancelLoop == nil || current.Err() != nil {
+		t.Fatal("finished old loop disturbed the replacement owner")
+	}
+}
+
+func TestRelayViewerArrivingDuringLoopExitGetsReplacement(t *testing.T) {
+	relay := NewRelay(RelayConfig{BaseURL: "http://127.0.0.1:1"})
+	defer relay.Close()
+	dialed := make(chan struct{}, 2)
+	relay.dialWebsocket = func(ctx context.Context, _ string, _ *websocket.DialOptions) (*websocket.Conn, *http.Response, error) {
+		dialed <- struct{}{}
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+	relay.desired = true
+	old := relay.newConnectLoopLocked()
+	// Simulate a new viewer between shouldRun returning false and loop cleanup.
+	relay.viewers = 1
+	relay.finishConnectLoop(old)
+	relay.finishConnectLoop(old)
+	select {
+	case <-dialed:
+	case <-time.After(time.Second):
+		t.Fatal("new viewer was left without a reconnect loop")
+	}
+	relay.mu.Lock()
+	current := relay.loopContext
+	relay.mu.Unlock()
+	if current == old || current == nil || !relay.EnsureActive("viewer wake") {
+		t.Fatal("new viewer did not receive an active replacement owner")
+	}
+	select {
+	case <-dialed:
+		t.Fatal("loop cleanup or viewer wake created a duplicate dial")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 

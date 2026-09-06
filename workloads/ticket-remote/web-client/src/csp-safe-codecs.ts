@@ -1,7 +1,5 @@
 import {
   AlgebraicType,
-  BinaryReader,
-  BinaryWriter,
   ConnectionId,
   Identity,
   ProductType,
@@ -212,10 +210,4 @@ export function installCspSafeSpacetimeCodecs(): void {
   SumType.makeSerializer = sumSerializer;
   SumType.makeDeserializer = sumDeserializer;
   Object.defineProperty(product, installedMarker, { value: true });
-}
-
-export function cspSafeCodecRoundTrip(type: AlgebraicTypeType, value: unknown, typespace?: Typespace): unknown {
-  const writer = new BinaryWriter(64);
-  AlgebraicType.makeSerializer(type, typespace)(writer, value);
-  return AlgebraicType.makeDeserializer(type, typespace)(new BinaryReader(writer.getBuffer()));
 }

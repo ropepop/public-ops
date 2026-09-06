@@ -10,7 +10,7 @@
     "test:client-hdr-boost-preference": "node --test ./client-hdr-boost-preference.test.mjs",
     "test:client-hdr": "node --test ./client-hdr-core.test.mjs ./client-hdr-renderer.test.mjs ./client-hdr-diagnostic.test.mjs",
     "test:client-hdr-real-gpu:serve": "python3 -m http.server 4173 --bind 127.0.0.1",
-    "test:ticket-actions-v3": "node --test ./ticket-action-v3-core.test.mjs ./ticket-stream-source.test.mjs ./ticket-hit-target-browser.test.mjs ./ticket-slider-continuity.test.mjs ./ticket-slider-hdr-readiness.test.mjs ./pending-browser-action-source.test.mjs",
+    "test:ticket-actions-v3": "node --test ./phone-control-core.test.mjs ./ticket-action-v3-core.test.mjs ./ticket-stream-source.test.mjs ./ticket-hit-target-browser.test.mjs ./ticket-slider-continuity.test.mjs ./ticket-slider-hdr-readiness.test.mjs ./pending-browser-action-source.test.mjs",
     "test:relay-current-report": "node --test ./relay-current-report.test.ts",
     "test:admin-schedule": "node --test ./admin-schedule-browser.test.mjs",
     "test:admin-statistics": "node --test ./admin-statistics-source.test.mjs ./admin-statistics-browser.test.mjs",

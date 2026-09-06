@@ -6,6 +6,7 @@ import {
   prepareOwnerViviAccessBeforeSubscribe,
 } from "../owner-vivi-access-core.js";
 import { relayLastFrameAgeMillis } from "./relay-current-report";
+import { phoneControlNow } from "../phone-control-core.mjs";
 
 installCspSafeSpacetimeCodecs();
 
@@ -137,6 +138,8 @@ class TicketSpacetimeClient {
   private resolveLivePromise: (() => void) | null = null;
   private rejectLivePromise: ((error: Error) => void) | null = null;
   private latestActivationDecisions: any[] = [];
+  private controlClock: { serverUpperAtReceipt: number; receivedMonotonic: number; receivedWall: number } | null = null;
+  private controlClockRefresh: Promise<void> | null = null;
   private activationDecisionWaiters = new Map<string, {
     resolve: (decision: any) => void;
     reject: (error: Error) => void;
@@ -191,6 +194,7 @@ class TicketSpacetimeClient {
         })
         .onDisconnect(() => {
           if (generation !== this.connectionGeneration) return;
+          this.invalidateControlClock();
           this.connected = false;
           this.conn = null;
           this.rejectLive(new Error("Spacetime connection disconnected"));
@@ -200,6 +204,7 @@ class TicketSpacetimeClient {
         })
         .onConnectError((_ctx, error) => {
           if (generation !== this.connectionGeneration) return;
+          this.invalidateControlClock();
           this.connected = false;
           this.conn = null;
           this.rejectLive(new Error(error && String(error) || "Spacetime connection failed"));
@@ -225,6 +230,7 @@ class TicketSpacetimeClient {
 
   disconnect(markDisconnected = true): void {
     this.connectionGeneration += 1;
+    this.invalidateControlClock();
     this.rejectLive(new Error("Spacetime connection stopped"));
     if (this.reconnectTimer) {
       window.clearTimeout(this.reconnectTimer);
@@ -313,12 +319,19 @@ class TicketSpacetimeClient {
   }
 
   requestControlCode(digits: string, expectedFastRevision = "", beforeSubmit?: () => void): Promise<void> {
-    return this.callReducer("memberRequestControlCode", {
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
+    return this.requestPhoneCommand(`control_code_${crypto.randomUUID()}`, "control_code", expectedFastRevision, {
       sessionId: this.cfg.sessionId,
       digits,
-      expectedFastRevision,
+    }, beforeSubmit);
+  }
+
+  private requestPhoneCommand(commandId: string, operation: string, contextRevision: string,
+    payload: Record<string, string>, beforeSubmit?: () => void): Promise<void> {
+    const clock = phoneControlNow(this.controlClock, performance.now(), Date.now());
+    return this.callReducer("memberCommand", {
+      version: 1, ticketId: this.cfg.ticketId, backendId: this.backendId(),
+      commandId, operation, contextRevision, issuedAt: new Date(Number.isFinite(clock) ? clock : Date.now()).toISOString(),
+      payloadJson: JSON.stringify(payload),
     }, beforeSubmit);
   }
 
@@ -355,36 +368,19 @@ class TicketSpacetimeClient {
     });
   }
 
-  requestViviReauth(requestId: string, credentialRevision: string): Promise<void> {
-    return this.callReducer("ownerRequestViviReauth", {
-      version: 1,
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      requestId,
-      credentialRevision,
-    });
-  }
-
   requestViviReauthLogoutLogin(
     requestId: string,
     credentialRevision: string,
     redetectAfterLogin = false,
   ): Promise<void> {
-    return this.callReducer("ownerRequestViviReauthLogoutLogin", {
-      version: redetectAfterLogin ? 4 : 3,
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      requestId,
+    return this.requestPhoneCommand(requestId,
+      redetectAfterLogin ? "vivi_logout_login_redetect" : "vivi_logout_login", "", {
       credentialRevision,
     });
   }
 
   requestViviReauthFullReset(requestId: string, credentialRevision: string): Promise<void> {
-    return this.callReducer("ownerRequestViviReauthFullReset", {
-      version: 2,
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      requestId,
+    return this.requestPhoneCommand(requestId, "vivi_full_reset", "", {
       credentialRevision,
     });
   }
@@ -428,10 +424,33 @@ class TicketSpacetimeClient {
     });
   }
 
+  private invalidateControlClock(): void {
+    this.controlClock = null;
+    // The SDK does not settle pending reducer promises when its socket closes.
+    // A new connection must not inherit the old single-flight refresh.
+    this.controlClockRefresh = null;
+  }
+
   refreshLimitState(): Promise<void> {
-    return this.callReducer("memberRefreshLimitState", {
-      ticketId: this.cfg.ticketId,
-    });
+    if (this.controlClockRefresh) return this.controlClockRefresh;
+    const connection = this.conn;
+    const generation = this.connectionGeneration;
+    const started = performance.now();
+    const task = this.callReducer("memberRefreshLimitState", { ticketId: this.cfg.ticketId }).then(() => {
+      if (connection !== this.conn || generation !== this.connectionGeneration || !connection) return;
+      const row = tableRows(tableAccessor(connection.db, "member_limit_state"))
+        .find((candidate) => rowTicketId(candidate) === this.cfg.ticketId &&
+          candidate.ownerPublicId === accountPublicId(this.cfg.email));
+      const received = performance.now();
+      const server = Date.parse(String(row && row.serverAt || ""));
+      if (!Number.isFinite(server) || received - started > 2000) return;
+      // The complete round trip bounds response age without assuming the device's wall clock.
+      this.controlClock = { serverUpperAtReceipt: server + received - started,
+        receivedMonotonic: received, receivedWall: Date.now() };
+      this.publishFocusedState();
+    }).finally(() => { if (this.controlClockRefresh === task) this.controlClockRefresh = null; });
+    this.controlClockRefresh = task;
+    return task;
   }
 
   requestTicketActionV3(args: {
@@ -443,17 +462,9 @@ class TicketSpacetimeClient {
     expectedInteractionRevision?: string;
     scheduleId?: string;
   }, beforeSubmit?: () => void): Promise<void> {
-    return this.callReducer("memberRequestTicketActionV3", {
-      version: 3,
-      ticketId: this.cfg.ticketId,
-      backendId: this.backendId(),
-      actionId: args.actionId,
-      target: args.target,
+    return this.requestPhoneCommand(args.actionId, args.target, args.expectedInteractionRevision || "", {
       source: args.source,
       reason: args.reason,
-      attemptId: args.attemptId || "",
-      expectedInteractionRevision: args.expectedInteractionRevision || "",
-      scheduleId: args.scheduleId || "",
     }, beforeSubmit);
   }
 
@@ -557,6 +568,7 @@ class TicketSpacetimeClient {
     const queries = [
       `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
       `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_phone_control_state WHERE id = ${backendRow}`,
       `SELECT * FROM ticketremote_control_code_fast_state WHERE id = ${backendRow}`,
       `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
       `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
@@ -615,11 +627,17 @@ class TicketSpacetimeClient {
 
   private publishFocusedState(): void {
     if (!this.isReady()) return;
+    if (!Number.isFinite(phoneControlNow(this.controlClock, performance.now(), Date.now())) ||
+      (this.controlClock && performance.now() - this.controlClock.receivedMonotonic >= 25000)) {
+      void this.refreshLimitState().catch(() => {});
+    }
     const db = this.requireConnection().db;
     const backendRow = `${this.cfg.ticketId}:${this.backendId()}`;
     const desired = tableRows(tableAccessor(db, "stream_desired_state"))
       .find((row) => rowId(row) === backendRow) || null;
     const phoneReport = tableRows(tableAccessor(db, "phone_current_report"))
+      .find((row) => rowId(row) === backendRow) || null;
+    const phoneControlState = tableRows(tableAccessor(db, "phone_control_state"))
       .find((row) => rowId(row) === backendRow) || null;
     const controlCodeFastState = tableRows(tableAccessor(db, "control_code_fast_state"))
       .find((row) => rowId(row) === backendRow) || null;
@@ -752,7 +770,7 @@ class TicketSpacetimeClient {
     );
     const phoneDesiredState = String(desired && (desired.desiredActive ?? desired.desired_active) ? "streaming" : "idle");
     const phoneLastSeenAt = String(phoneReport && (phoneReport.updatedAt || phoneReport.updated_at) || "");
-    const reportedViewerCount = Number(desired && (desired.viewerCount ?? desired.viewer_count) || relayReport && (relayReport.videoClients ?? relayReport.video_clients) || 0);
+    const reportedViewerCount = Number(relayReport && (relayReport.videoClients ?? relayReport.video_clients) || 0);
     const viewerCount = Math.max(Number.isFinite(reportedViewerCount) ? reportedViewerCount : 0, viewerPresence.length);
     this.handlers.onState?.({
       ticket: {
@@ -890,6 +908,12 @@ class TicketSpacetimeClient {
       // follows its exact request and computes phone-lane busy from every row.
       viviReauthAttempt: viviReauthAttempts[0] || null,
       activationDecisions,
+      controlClock: this.controlClock,
+      phoneControlState: phoneControlState ? {
+        ...phoneControlState,
+        sessionGeneration: String(phoneControlState.sessionGeneration),
+        observationSequence: String(phoneControlState.observationSequence),
+      } : null,
       ticketActions,
       ticketAction: ticketActions[0] || null,
       ticketSliderRegion: ticketSliderRegion ? {
@@ -947,7 +971,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    const names = ["stream_desired_state", "phone_current_report", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state"];
+    const names = ["stream_desired_state", "phone_current_report", "phone_control_state", "control_code_fast_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_interaction", "activation_eligibility", "activation_decision", "ticket_action_v3", "ticket_slider_region_v3", "member_hdr_state", "member_hdr_engine_state", "member_hdr_boost_state", "member_limit_state"];
     if (this.cfg.ownerViviAuth) {
       names.push("vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials");
     }

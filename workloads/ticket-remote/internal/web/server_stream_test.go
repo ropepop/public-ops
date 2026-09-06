@@ -2546,8 +2546,8 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	}
 	waitForPhoneSignal(t, phoneSignals, "keyframe", "control-code keyframe")
 
-	// A held picture just outside LIVE_FRESH remains useful continuity, but it
-	// must not suppress a recovery command as though it still had live authority.
+	// A held picture just outside the three-second freshness window must not
+	// suppress a recovery command as though it still had live authority.
 	now = time.Now()
 	server.direct.mu.Lock()
 	server.direct.lastFrameAt = now
@@ -2556,18 +2556,18 @@ func TestLiveStreamSuppressesBackgroundRecoveryCommands(t *testing.T) {
 	server.direct.lastFrameVisualAgeKnown = true
 	server.direct.mu.Unlock()
 	status := server.direct.streamStatus(now, server.relay.Snapshot())
-	if status["freshnessState"] != freshnessLiveOK || status["live"] != false ||
-		status["continuity"] != true || status["streamVerdict"] == "live" {
-		t.Fatalf("continuity-only frame retained live recovery authority: %#v", status)
+	if status["freshnessState"] != freshnessStale || status["live"] != false ||
+		status["continuity"] != false || status["streamVerdict"] == "live" {
+		t.Fatalf("expired frame retained live recovery authority: %#v", status)
 	}
 	server.backgroundKeyframeMu.Lock()
 	server.backgroundKeyframeInFlight = false
 	server.lastBackgroundKeyframeAt = time.Time{}
 	server.backgroundKeyframeMu.Unlock()
 	if err := server.requestPhoneKeyframeNow("stale_video_frames"); err != nil {
-		t.Fatalf("continuity-only recovery keyframe returned error: %v", err)
+		t.Fatalf("expired recovery keyframe returned error: %v", err)
 	}
-	waitForPhoneSignal(t, phoneSignals, "keyframe", "continuity-only recovery keyframe")
+	waitForPhoneSignal(t, phoneSignals, "keyframe", "expired recovery keyframe")
 }
 
 func newTicketVideoStreamTestServer(t *testing.T) (*Server, <-chan string, *websocket.Conn) {

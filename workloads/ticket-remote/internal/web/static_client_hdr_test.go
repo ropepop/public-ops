@@ -380,9 +380,6 @@ func TestTicketViewerDetailsVisibilityKeepsPresentedHDRSurfaceAlive(t *testing.T
 	presentation := substringBetween(t, source,
 		"function experimentalHDRSurfacePresentationAllowed() {",
 		"  function experimentalMediaDocumentHasFocus() {")
-	actionGate := substringBetween(t, source,
-		"function clientHDRConsequentialControlProofReady() {",
-		"  function currentTicketSliderRegion(state = currentState) {")
 	updateDetails := substringBetween(t, source,
 		"function updateDetailsReveal() {",
 		"  function keepFirstScreenPinned(force) {")
@@ -458,7 +455,7 @@ function updateControlCodeSubmitAvailability() {}
 function ticketActionV3StreamSnapshot() { return { epoch: 5, sequence: 31 }; }
 function streamHasFreshRenderedFrame() { return true; }
 function check(value, message) { if (!value) throw new Error(message); }
-`+presentation+actionGate+updateDetails+`
+`+presentation+updateDetails+`
 
 updateDetailsReveal();
 check(experimentalHDRSurfacePresentationAllowed() === true &&
@@ -482,8 +479,6 @@ check(experimentalMediaCanvas === originalCanvas &&
 check(experimentalClientHDRController.snapshot().rendererGeneration === 7 &&
   experimentalClientHDRController.snapshot().rendererIdentity === rendererIdentity &&
   experimentalClientHDRController.snapshot().surfaceVisible === true &&
-  clientHDRConsequentialControlProofReady() === true &&
-  revealAuthoritativeSDRForConsequentialControl() === true &&
   scrollIntoViewCalls === 0,
   'details scroll recreated, hid, pinned, or made the fresh panel controls unusable');
 window.scrollY = 0;
@@ -683,224 +678,34 @@ func TestTicketViewerSpinnerReplacesHDRHoldoverNotice(t *testing.T) {
 	}
 }
 
-func TestTicketViewerConsequentialControlsTreatHDRHoldoverAsPassive(t *testing.T) {
+func TestTicketViewerControlsHaveNoHDRAdmissionDependency(t *testing.T) {
 	source := ticketAppSource(t)
-	gate := substringBetween(t, source,
-		"function clientHDRConsequentialControlProofReady() {",
-		"  function currentTicketSliderRegion(state = currentState) {")
+	for _, retired := range []string{"clientHDRConsequentialControlProofReady", "revealAuthoritativeSDRForConsequentialControl", "ticketActionV3RequiresFreshRenderedFrame"} {
+		if strings.Contains(source, retired) {
+			t.Fatalf("retired media admission dependency remains: %s", retired)
+		}
+	}
 	request := substringBetween(t, source,
 		"async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {",
 		"  async function registerCurrentTicket(source, options = {}) {")
-	actionProofPolicy := substringBetween(t, source,
-		"function ticketActionV3RequiresFreshRenderedFrame(target) {",
-		"  function currentTicketSliderRegion(state = currentState) {")
-	sliderHandlers := substringBetween(t, source,
-		"ticketLocalRegisterSlider.addEventListener('pointerdown', (event) => {",
-		"  ticketLocalRegisterSlider.addEventListener('blur', () => cancelTicketRegisterSliderSession('slider_blurred'));")
-
-	runTicketJavaScript(t, `
-const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
-const experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
-let controllerSnapshot = {
-  active: true,
-  surfaceVisible: true,
-  visualHoldover: false,
-  proofFresh: true,
-  presentationState: 'visible',
-  epoch: 7,
-  sequence: 42
-};
-let exactProof = true;
-let exactProofCalls = 0;
-const experimentalClientHDRController = {
-  snapshot() { return { ...controllerSnapshot }; },
-  ensureExactProof() { exactProofCalls += 1; return exactProof; }
-};
-function ticketActionV3StreamSnapshot() { return { epoch: 7, sequence: 42 }; }
-function streamHasFreshRenderedFrame() { return true; }
-function check(value, message) { if (!value) throw new Error(message); }
-`+gate+`
-
-check(clientHDRConsequentialControlProofReady() === true &&
-  revealAuthoritativeSDRForConsequentialControl() === true && exactProofCalls === 1,
-  'fresh exact HDR proof did not authorize a consequential control');
-controllerSnapshot.visualHoldover = true;
-controllerSnapshot.proofFresh = false;
-check(clientHDRConsequentialControlProofReady() === false &&
-  revealAuthoritativeSDRForConsequentialControl() === false && exactProofCalls === 1,
-  'held HDR remained active visual authority for a consequential control');
-controllerSnapshot.active = false;
-check(clientHDRConsequentialControlProofReady() === true &&
-  revealAuthoritativeSDRForConsequentialControl() === true && exactProofCalls === 1,
-  'authoritative SDR fallback was incorrectly blocked by inactive HDR');
-controllerSnapshot.active = true;
-controllerSnapshot.surfaceVisible = false;
-check(revealAuthoritativeSDRForConsequentialControl() === true && exactProofCalls === 1,
-  'authoritative SDR fallback was incorrectly required to prove hidden HDR');
-`)
-
-	runTicketJavaScript(t, `
-let revealAllowed = false;
-let localRequests = 0;
-let mutations = 0;
-let renders = 0;
-let ticketActionV3LastUserMessage = '';
-let ticketActionV3LastUserActionId = '';
-let ticketActionV3LastUserAction = null;
-let currentState = { ticketAction: null };
-let spacetimeStateFresh = false;
-const ticketActionV3LocalRequestState = {};
-function revealAuthoritativeSDRForConsequentialControl() { return revealAllowed; }
-function renderTicketActionV3Controls() { renders += 1; }
-function ticketActionV3Busy() { return false; }
-function ticketActionV3LocalRequestIsBusy() { return false; }
-function ticketActionV3Id() { return 'action-1'; }
-function beginTicketActionV3LocalRequest() { localRequests += 1; return true; }
-function settleTicketActionV3LocalRequest() {}
-function ticketActionV3RequestArgs(value) { return value; }
-function runSpacetimeMutation() { mutations += 1; return Promise.resolve(); }
-function scheduleTicketActionV3Reconcile() {}
-function clientLog() {}
-function localizePublicMessage(value) { return value; }
-`+actionProofPolicy+request+`
-
-(async () => {
-  const staleStateAccepted = await requestTicketActionV3(
-    'open_latest_unactivated', 'browser_button', 'test_holdover'
-  );
-  if (staleStateAccepted !== false || localRequests !== 0 || mutations !== 0 ||
-      !ticketActionV3LastUserMessage.includes('SpaceTime')) {
-    throw new Error('semantic open escaped the fresh durable-state gate');
-  }
-
-  spacetimeStateFresh = true;
-  for (const target of ['open_latest_unactivated', 'redetect_latest']) {
-    const accepted = await requestTicketActionV3(target, 'browser_button', 'semantic_action');
-    if (accepted !== true) throw new Error(target + ' incorrectly required a rendered frame');
-  }
-  if (localRequests !== 2 || mutations !== 2) {
-    throw new Error('semantic actions did not reach the one durable mutation path');
-  }
-
-  for (const target of ['open_latest_and_register', 'register_current',
-    'show_recent_activated', 'return_to_latest_unactivated']) {
-    const accepted = await requestTicketActionV3(target, 'browser_button', 'picture_relative');
-    if (accepted !== false) throw new Error(target + ' escaped the exact rendered-frame gate');
-  }
-  if (localRequests !== 2 || mutations !== 2 ||
-      !ticketActionV3LastUserMessage.includes('svaigu tiešraides kadru')) {
-    throw new Error('picture-relative holdover rejection changed durable state');
-  }
-
-  revealAllowed = true;
-  const accepted = await requestTicketActionV3(
-    'register_current', 'browser_button', 'fresh_exact_frame'
-  );
-  if (accepted !== true || localRequests !== 3 || mutations !== 3) {
-    throw new Error('fresh exact rendered proof did not admit registration');
-  }
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-`)
-
-	runTicketJavaScript(t, `
-const handlers = {};
-let revealAllowed = false;
-let cancelled = 0;
-let sessions = 0;
-const currentState = {};
-const pendingBrowserAction = null;
-const ticketLocalRegisterSliderState = { inFlight: false, session: null, ignoreChange: false };
-const ticketLocalRegisterSlider = {
-  value: '75',
-  addEventListener(name, callback) { handlers[name] = callback; },
-  getBoundingClientRect() { return { left: 0, width: 100 }; }
-};
-function revealAuthoritativeSDRForConsequentialControl() { return revealAllowed; }
-function cancelTicketRegisterSliderSession() { cancelled += 1; return true; }
-function beginTicketLocalRegisterSliderSession() { sessions += 1; return true; }
-function currentTicketRegisterSliderPresentationProof() { return null; }
-function finishTicketRegisterSliderSession() { return Promise.resolve(false); }
-function updateTicketLocalRegisterSliderPointerDirection() { return ''; }
-function clientLog() {}
-function check(value, message) { if (!value) throw new Error(message); }
-`+sliderHandlers+`
-
-for (const [name, event] of [
-  ['pointerdown', { isPrimary: true, pointerType: 'touch', pointerId: 1, clientX: 10, clientY: 10,
-    preventDefault() { this.prevented = true; } }],
-  ['keydown', { key: 'ArrowRight', preventDefault() { this.prevented = true; } }],
-  ['change', {}]
-]) {
-  handlers[name](event);
-  if (name !== 'change' && event.prevented !== true) throw new Error(name + ' was not cancelled');
-}
-
-check(sessions === 0 && ticketLocalRegisterSlider.value === '0' && cancelled === 3,
-  'holdover started a pointer, keyboard, or native-change slider session');
-`)
-
-	renderControls := substringBetween(t, source,
-		"function renderTicketActionV3Controls(state = currentState) {",
-		"  async function requestTicketActionV3(target, source, reason, expectedInteractionRevision = '', options = {}) {")
-	for _, needle := range []string{
-		"const hdrControlReady = clientHDRConsequentialControlProofReady();",
-		"spacetimeStateFresh && !blockingBusy && !controlBusy, openReason",
-		"spacetimeStateFresh && presentationReady && !blockingBusy",
-		"presentationReady && !blockingBusy && !controlBusy && registerReady",
-		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy)",
-		"spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target && presentationReady",
-	} {
-		if !strings.Contains(renderControls, needle) {
-			t.Fatalf("consequential controls lost the HDR holdover gate: missing %q", needle)
+	for _, required := range []string{"if (!spacetimeStateFresh)", "const admissionProof = currentTicketSliderRegion();", "admissionProof.contextRevision !== expectedInteractionRevision", "ticketRegisterSliderProofStillMatches(options.proofSnapshot, currentState)"} {
+		if !strings.Contains(request, required) {
+			t.Fatalf("direct command lost admission guard: %s", required)
 		}
 	}
-	report := substringBetween(t, source,
-		"function reportClientHDRMetric(event, detail) {",
-		"  function refreshExperimentalClientCapability() {")
-	if !strings.Contains(report, "event === 'presentation_holdover'") ||
-		!strings.Contains(report, "event === 'presented'") ||
-		!strings.Contains(report, "renderTicketActionV3Controls(currentState);") {
-		t.Fatal("control disabled state is not refreshed when HDR enters or leaves holdover")
-	}
+	// Executable source tests exercise delayed video/HDR, gesture expiry, replacement
+	// context and connection loss in web-client/pending-browser-action-source.test.mjs
+	// and ticket-slider-continuity.test.mjs.
 }
 
-func TestTicketViewerControlCodeEntryPointsArePassiveDuringHDRHoldover(t *testing.T) {
+func TestTicketViewerControlCodeEntryUsesPhoneReadiness(t *testing.T) {
 	source := ticketAppSource(t)
-	openDialog := substringBetween(t, source,
-		"function openControlCodeDialog() {",
-		"  function closeControlCodeDialog() {")
-	hotspot := substringBetween(t, source,
-		"function requestControlCodeFromHotspot(event) {",
-		"  async function submitControlCodeRequest() {")
-	submit := substringBetween(t, source,
-		"async function submitControlCodeRequest() {",
-		"  async function closeCurrentControlCode(openNext) {")
 	availability := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
-	for name, body := range map[string]string{"dialog": openDialog, "hotspot": hotspot} {
-		if strings.Contains(body, "revealAuthoritativeSDRForConsequentialControl()") {
-			t.Fatalf("passive control-code %s must not reveal or require exact SDR authority", name)
-		}
-	}
-	if !strings.Contains(openDialog, "if (!controlCodeDialogEntryReady()) {") ||
-		!strings.Contains(submit, "if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {") {
-		t.Fatal("dialog entry must use healthy continuity while submit retains exact fresh proof")
-	}
-	for _, required := range []string{
-		"const hdrControlReady = clientHDRConsequentialControlProofReady();",
-		"codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !dialogEntryReady || !digitsValid;",
-		"const dialogEntryReady = (streamActionFresh && hdrControlReady) || healthyOneFPSVisualContinuity();",
-		"requestCodeButton.disabled = busy || limitBlocked || !dialogEntryReady || codeDialogOpen || !codeResultArea.hidden;",
-		"const hotspotUnavailable = busy || limitBlocked || !dialogEntryReady || sliderOwnsHotspot ||",
-	} {
-		if !strings.Contains(availability, required) {
-			t.Fatalf("control-code availability lost passive HDR holdover gating: missing %q", required)
-		}
-	}
-
 	runTicketJavaScript(t, `
-let hdrReady = false;
+let phoneReady = false;
+let codeRequest = null;
 let codeDialogOpen = false;
 let controlCodeSubmitInFlight = false;
 const pendingBrowserAction = null;
@@ -918,7 +723,7 @@ function renderControlCodeFastStateDataset() {}
 function controlCodeMutationLaneBusy() { return false; }
 function memberLimitBlocked() { return false; }
 function streamHasFreshRenderedFrame() { return true; }
-function clientHDRConsequentialControlProofReady() { return hdrReady; }
+function currentPhoneControlReady() { return phoneReady; }
 function healthyOneFPSVisualContinuity() { return false; }
 function sanitizeControlDigits(value) { return String(value || '').replace(/\D/g, ''); }
 function ticketRegisterOverlayOccupiesHotspot() { return false; }
@@ -927,11 +732,11 @@ function check(value, message) { if (!value) throw new Error(message); }
 
 updateControlCodeSubmitAvailability();
 check(codeSubmit.disabled && requestCodeButton.disabled && controlCodeHotspot.disabled,
-  'held HDR left a control-code surface visibly actionable');
-hdrReady = true;
+  'unready phone left a control-code surface actionable');
+phoneReady = true;
 updateControlCodeSubmitAvailability();
 check(!requestCodeButton.disabled && !controlCodeHotspot.disabled,
-  'authoritative SDR unnecessarily blocked control-code entry');
+  'ready phone did not enable control-code entry without media proof');
 codeDialogOpen = true;
 updateControlCodeSubmitAvailability();
 check(!codeSubmit.disabled && controlCodeHotspot.disabled,
@@ -1364,7 +1169,7 @@ func TestTicketViewerRetriesColdCapabilityDiscoveryAndRestoresSavedHDR(t *testin
 	source := ticketAppSource(t)
 	discovery := substringBetween(t, source,
 		"function fetchExperimentalMediaCapability() {",
-		"  if (cfg.experimentalMediaCandidate === true) discoverExperimentalMediaCapability();")
+		"  function initializeExperimentalMedia() {")
 
 	runTicketJavaScript(t, `
 const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
@@ -1759,5 +1564,51 @@ func TestTicketViewerHDRDescriptionIsStaticAndSimple(t *testing.T) {
 		if strings.Contains(source, obsolete) {
 			t.Fatalf("HDR still exposes changing diagnostic text: %s", obsolete)
 		}
+	}
+}
+
+func TestTicketViewerUsesAccountHDRBootstrapBeforeNetworkStartup(t *testing.T) {
+	source := ticketAppSource(t)
+	bootstrap := substringBetween(t, source, "function initializeExperimentalMedia() {", "  const publicMessageTranslations = new Map([")
+	runTicketJavaScript(t, `
+const cfg = { accountScopeId: 'member', experimentalMediaCandidate: true };
+let experimentalMediaBootstrapValidated = false;
+let fetches = 0;
+let validContract = true;
+const observed = [];
+const experimentalMediaPreferenceController = { observe(value) { observed.push(value); } };
+function applyExperimentalMediaCapabilityPayload(response, payload) {
+  return response.ok && payload && payload.valid === validContract;
+}
+function discoverExperimentalMediaCapability() { fetches++; }
+function check(value, message) { if (!value) throw new Error(message); }
+`+bootstrap+`
+for (const enabled of [true, false]) {
+ cfg.experimentalMediaBootstrap = { accountScopeId: 'member', preferenceKnown: true, enabled, capability: {valid: true} };
+ initializeExperimentalMedia();
+ check(experimentalMediaBootstrapValidated && observed.at(-1) === enabled && fetches === 0,
+  'saved preference did not initialize without extra network work');
+}
+const count = observed.length;
+cfg.experimentalMediaBootstrap.preferenceKnown = false;
+initializeExperimentalMedia();
+check(observed.length === count && fetches === 0, 'unknown preference was treated as a saved choice');
+for (const invalid of [
+ {accountScopeId: 'different-account', preferenceKnown: true, enabled: true, capability: {valid: true}},
+ {accountScopeId: 'member', preferenceKnown: true, enabled: true, capability: {valid: false}},
+ undefined
+]) {
+ cfg.experimentalMediaBootstrap = invalid;
+ experimentalMediaBootstrapValidated = false;
+ initializeExperimentalMedia();
+ check(!experimentalMediaBootstrapValidated && observed.length === count,
+  'invalid bootstrap contaminated saved preference');
+}
+check(fetches === 3, 'invalid or missing bootstrap did not use bounded discovery');
+`)
+	start := strings.LastIndex(source, "initializeExperimentalMedia();")
+	connect := strings.LastIndex(source, "connectSpacetimeState(")
+	if start < 0 || connect < start {
+		t.Fatal("HDR bootstrap must initialize before database startup")
 	}
 }

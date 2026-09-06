@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import * as core from './ticket-action-v3-core.mjs';
+import * as phoneCore from './phone-control-core.mjs';
 
 const source = readFileSync(new URL('./ticket-app-source.js', import.meta.url), 'utf8');
 function between(start, end) {
@@ -11,8 +12,8 @@ function between(start, end) {
   return source.slice(from, to);
 }
 
-function harness() {
-  const context = vm.createContext({ ...core, NativeDate: Date });
+function harness({ hdrReady = true } = {}) {
+  const context = vm.createContext({ ...core, ...phoneCore, NativeDate: Date, hdrReady });
   vm.runInContext(`
     let now = 10000, wall = 1800000000000, arrivedAt = now;
     const Date = { now: () => wall, parse: NativeDate.parse };
@@ -20,7 +21,7 @@ function harness() {
     let timerId = 0; const timers = new Map();
     function setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, at: now + delay }); return id; }
     function clearTimeout(id) { timers.delete(id); }
-    let connected = true, clockKnown = true, configured = true, spacetimeStateFresh = true;
+    let hasRenderedFrame = true, connected = true, clockKnown = true, configured = true, spacetimeStateFresh = true;
     let currentStreamEpoch = 7, lastRenderedFrameEpoch = 7, lastRenderedFrameSequence = 10;
     let lastAcceptedFrameSequence = 10, activeFeedbackConfigGeneration = 8;
     let ticketSliderLayoutRevision = 0, ticketSliderVisualRevision = 0, serverClockSkewMs = 0;
@@ -36,17 +37,22 @@ function harness() {
     const streamLiveOkMaxAgeMs = 2000;
     const expiresAt = new NativeDate(wall + 60000).toISOString();
     const currentState = {
+      controlClock: { serverUpperAtReceipt: wall, receivedMonotonic: now, receivedWall: wall },
+      phoneControlState: { sessionId: 'pc-test', sessionGeneration: '1', contextRevision: 'pc-test:1',
+        observationSequence: '1', view: 'unactivated_detail', ready: true, busy: false,
+        observedAt: new NativeDate(wall).toISOString(), expiresAt: new NativeDate(wall + 3000).toISOString(),
+        leftBasisPoints: 1000, topBasisPoints: 7000, rightBasisPoints: 9000, bottomBasisPoints: 8000 },
       ticketAction: { actionId: 'synthetic-proof', target: 'prove_current', status: 'succeeded',
         currentView: 'latest_unactivated', streamEpoch: 7, frameSequence: 10, expiresAt },
       ticketSliderRegion: { proofActionId: 'synthetic-proof', streamEpoch: 7, frameSequence: 10,
         expiresAt, leftBasisPoints: 1000, topBasisPoints: 7000, rightBasisPoints: 9000, bottomBasisPoints: 8000 }
     };
     function currentRenderedFreshness() { return { visualAgeMillis: 700 + now - arrivedAt }; }
-    function streamHasFreshRenderedFrame() { return connected && clockKnown && configured && 700 + now - arrivedAt <= 1250; }
+    function streamHasFreshRenderedFrame() { return connected && clockKnown && configured && 700 + now - arrivedAt <= 3000; }
     function healthyOneFPSVisualContinuity() { return connected && clockKnown && configured && 700 + now - arrivedAt <= 2000; }
     const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
     const experimentalMediaState = { enabled: true, engine: CLIENT_HDR_ENGINE };
-    let hdrSequence = 10, proofChecks = 0;
+    let hdrSequence = hdrReady ? 10 : 9, proofChecks = 0;
     const experimentalClientHDRController = {
       snapshot() { return { active: true, surfaceVisible: true, presentationState: 'visible',
         visualHoldover: false, proofFresh: true, epoch: 7, sequence: hdrSequence }; },
@@ -68,10 +74,10 @@ function harness() {
     function ticketActionV3LocalRequestIsBusy() { return busy; }
     function ticketActionV3Busy() { return busy; }
     function controlCodeRequestOccupiesQueue() { return codeBusy; }
-    function renderTicketActionV3Controls() { reconcilePendingBrowserAction(); renderTicketRegisterOverlay(currentState, busy, codeBusy, streamHasFreshRenderedFrame()); }
+    function renderTicketActionV3Controls() { renderTicketRegisterOverlay(currentState, busy, codeBusy, streamHasFreshRenderedFrame()); }
     let ticketActionV3LastUserMessage = '';
     function ticketActionV3Id() { return 'synthetic-registration'; }
-    ${between('function ticketActionV3RegistrationProofIsFresh(action) {', '  function ticketActionV3LocalRequestIsBusy() {')}
+    ${between('function currentPhoneControlTime(state = currentState) {', '  function ticketActionV3LocalRequestIsBusy() {')}
     async function registerCurrentTicket(_source, options) {
       assertStrictAdmission(options.proofSnapshot);
       admissions++;
@@ -80,8 +86,8 @@ function harness() {
       return true;
     }
     function assertStrictAdmission(snapshot) {
-      if (!spacetimeStateFresh || busy || codeBusy || quotaBlocked || !streamHasFreshRenderedFrame() ||
-        !ticketRegisterSliderProofStillMatches(snapshot) || !clientHDRConsequentialControlProofReady()) throw new Error('unsafe admission');
+      if (!spacetimeStateFresh || busy || codeBusy || quotaBlocked ||
+        !ticketRegisterSliderProofStillMatches(snapshot)) throw new Error('unsafe admission');
     }
     ${between('async function submitCompletedTicketRegisterSlider(proofSnapshot, browserIntentValid) {', "  ticketViewSwitchButton.addEventListener('click'")}
     function advance(ms) {
@@ -101,6 +107,10 @@ function harness() {
     renderTicketActionV3Controls();
     globalThis.api = {
       advance, emit,
+      renew() { currentState.phoneControlState.observationSequence = '2';
+        currentState.phoneControlState.observedAt = new NativeDate(wall).toISOString();
+        currentState.phoneControlState.expiresAt = new NativeDate(wall + 3000).toISOString();
+        renderTicketActionV3Controls(); },
       arrive(hdrReady = true) { arrivedAt = now; lastRenderedFrameSequence++; if (hdrReady) hdrSequence = lastRenderedFrameSequence; renderTicketActionV3Controls(); },
       presentHDR() { hdrSequence = lastRenderedFrameSequence; renderTicketActionV3Controls(); },
       sample: () => ({ hidden: ticketRegisterOverlay.hidden, disabled: ticketLocalRegisterSlider.disabled,
@@ -111,13 +121,13 @@ function harness() {
       rejectAdmission() { rejectAdmission = true; },
       progress(value = '100') { ticketLocalRegisterSlider.value = value; },
       invalidate(kind) {
-        if (kind === 'disconnect') connected = false;
+        if (kind === 'disconnect') spacetimeStateFresh = false;
         if (kind === 'clock') clockKnown = false;
         if (kind === 'config') activeFeedbackConfigGeneration++;
         if (kind === 'epoch') currentStreamEpoch++;
-        if (kind === 'proof') currentState.ticketAction.actionId = 'other-proof';
-        if (kind === 'region') currentState.ticketSliderRegion.leftBasisPoints++;
-        if (kind === 'expiry') currentState.ticketSliderRegion.expiresAt = new NativeDate(wall).toISOString();
+        if (kind === 'proof') currentState.phoneControlState.contextRevision = 'pc-test:2';
+        if (kind === 'region') currentState.phoneControlState.leftBasisPoints++;
+        if (kind === 'expiry') currentState.phoneControlState.expiresAt = new NativeDate(wall).toISOString();
         if (kind === 'resize') { ticketSliderLayoutRevision++; cancelTicketRegisterSliderSession('viewport_resize'); }
         if (kind === 'visual') ticketSliderVisualRevision++;
         if (kind === 'quota') quotaBlocked = true;
@@ -133,7 +143,7 @@ function harness() {
 
 const settle = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 
-test('healthy one-second pictures preserve a real overlay and gesture across the strict freshness deadline', async () => {
+test('healthy one-second pictures preserve a real overlay and gesture across the former freshness deadline', async () => {
   for (const interval of [950, 1000, 1100]) {
     const api = harness();
     assert.equal(api.sample().hidden, false);
@@ -150,60 +160,36 @@ test('healthy one-second pictures preserve a real overlay and gesture across the
   }
 });
 
-test('qualified release in the gap waits locally for one matching fresh HDR paint, including native change', async () => {
+test('source observation expiry stops a gesture even while pictures continue', async () => {
+  for (const elapsed of [2999, 3000, 3001]) {
+    const api = harness(); api.emit('pointerdown'); api.progress(); api.advance(elapsed);
+    api.arrive(); api.emit('pointerup'); await settle();
+    assert.equal(api.sample().submissions.length, elapsed < 3000 ? 1 : 0);
+  }
+});
+
+test('delayed HDR and stale video do not delay a qualified gesture with fresh phone state', async () => {
   for (const kind of ['pointer', 'keyboard']) {
-    const api = harness();
-    api.advance(600); api.emit(kind === 'pointer' ? 'pointerdown' : 'keydown'); api.progress();
-    api.advance(200); api.emit(kind === 'pointer' ? 'pointerup' : 'keyup');
-    api.emit('change'); api.emit(kind === 'pointer' ? 'pointerup' : 'keyup');
-    if (kind === 'pointer') {
-      api.emit('pointermove', { clientX: 0, clientY: 80 });
-      api.emit('pointermove', { clientX: 9, clientY: 10 });
-    }
-    assert.equal(api.sample().state, 'waiting_fresh_frame');
-    assert.equal(api.sample().submissions.length, 0);
-    assert.equal(api.sample().proofChecks, 0);
-    api.advance(250); api.arrive(false);
-    assert.equal(api.sample().pending, true);
-    assert.equal(api.sample().proofChecks, 0);
-    api.presentHDR(); api.presentHDR();
-    assert.equal(api.sample().submissions.length, 0, 'render must finish before the single claimed admission');
-    await settle();
+    const api = harness({ hdrReady: false });
+    api.advance(2800); api.renew();
+    api.emit(kind === 'pointer' ? 'pointerdown' : 'keydown'); api.progress();
+    api.advance(800); api.emit(kind === 'pointer' ? 'pointerup' : 'keyup'); await settle();
     assert.equal(api.sample().submissions.length, 1);
-    assert.equal(api.sample().submissions[0].age, 700);
+    assert.equal(api.sample().proofChecks, 0);
     api.emit('change'); api.presentHDR(); await settle();
     assert.equal(api.sample().submissions.length, 1);
   }
 });
 
-test('released slider keeps its frozen geometry after the old picture expires until one fresh successor', async () => {
-  const api = harness();
-  api.emit('pointerdown'); api.progress(); api.advance(800); api.emit('pointerup');
-  api.advance(850); // Held picture is now 2350 ms old; the release is still within 1100 ms.
-  assert.equal(api.sample().pending, true);
-  assert.equal(api.sample().state, 'waiting_fresh_frame');
-  assert.equal(api.sample().hidden, false);
-  assert.equal(api.sample().value, '100');
-  assert.equal(api.sample().submissions.length, 0);
-  api.advance(45); api.arrive(); await settle();
-  assert.equal(api.sample().submissions.length, 1);
-  assert.equal(api.sample().submissions[0].age, 700);
-  api.advance(2000); api.arrive(); await settle();
-  assert.equal(api.sample().submissions.length, 1);
-});
-
-test('pending completion expires or cancels on changed proof, uncertainty, policy, or interruption without submitting', async () => {
-  for (const reason of ['timeout', 'disconnect', 'clock', 'config', 'epoch', 'proof', 'region', 'expiry',
-    'resize', 'visual', 'quota', 'busy', 'codeBusy', 'blur', 'pointercancel', 'secondPointer']) {
-    const api = harness();
-    api.emit('pointerdown'); api.progress(); api.advance(800); api.emit('pointerup');
-    assert.equal(api.sample().pending, true, reason);
-    if (reason === 'timeout') api.advance(1100);
-    else if (reason === 'pointercancel') api.emit('pointercancel');
+test('changed context, geometry, connection, policy, or cancelled gesture cannot submit later', async () => {
+  for (const reason of ['disconnect', 'proof', 'region', 'expiry', 'resize', 'quota', 'busy', 'codeBusy',
+    'blur', 'pointercancel', 'secondPointer']) {
+    const api = harness({ hdrReady: false });
+    api.emit('pointerdown'); api.progress();
+    if (reason === 'pointercancel') api.emit('pointercancel');
     else if (reason === 'secondPointer') api.emit('pointerdown', { pointerId: 2, isPrimary: false });
     else api.invalidate(reason);
-    api.arrive(); api.presentHDR(); await settle();
-    assert.equal(api.sample().session, false, reason);
+    api.emit('pointerup'); api.arrive(); api.presentHDR(); await settle();
     assert.equal(api.sample().submissions.length, 0, reason);
   }
 });

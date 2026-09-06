@@ -36,6 +36,7 @@ import {
 // Import all reducer arg schemas
 import TicketremoteAdminScheduleTicketActionV3Reducer from "./ticketremote_admin_schedule_ticket_action_v_3_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "./ticketremote_member_close_control_code_reducer";
+import TicketremoteMemberCommandReducer from "./ticketremote_member_command_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "./ticketremote_member_confirm_control_code_browser_capture_reducer";
 import TicketremoteMemberRecordActivityTickReducer from "./ticketremote_member_record_activity_tick_reducer";
 import TicketremoteMemberRecoverStreamReducer from "./ticketremote_member_recover_stream_reducer";
@@ -71,6 +72,7 @@ import TicketremoteMemberHdrEngineStateRow from "./ticketremote_member_hdr_engin
 import TicketremoteMemberHdrStateRow from "./ticketremote_member_hdr_state_table";
 import TicketremoteMemberLimitStateRow from "./ticketremote_member_limit_state_table";
 import TicketremoteOwnerViviCredentialsRow from "./ticketremote_owner_vivi_credentials_table";
+import TicketremotePhoneControlStateRow from "./ticketremote_phone_control_state_table";
 import TicketremotePhoneCurrentReportRow from "./ticketremote_phone_current_report_table";
 import TicketremoteRelayCurrentReportRow from "./ticketremote_relay_current_report_table";
 import TicketremoteStreamDesiredStateRow from "./ticketremote_stream_desired_state_table";
@@ -329,6 +331,21 @@ const tablesSchema = __schema({
       { name: 'ticketremote_member_limit_state_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TicketremoteMemberLimitStateRow),
+  ticketremote_phone_control_state: __table({
+    name: 'ticketremote_phone_control_state',
+    indexes: [
+      { accessor: 'id', name: 'ticketremote_phone_control_state_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'ticketBackend', name: 'ticketremote_phone_control_state_ticket_id_backend_id_idx_btree', algorithm: 'btree', columns: [
+        'ticketId',
+        'backendId',
+      ] },
+    ],
+    constraints: [
+      { name: 'ticketremote_phone_control_state_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TicketremotePhoneControlStateRow),
   ticketremote_phone_current_report: __table({
     name: 'ticketremote_phone_current_report',
     indexes: [
@@ -545,6 +562,7 @@ const tablesSchema = __schema({
 const reducersSchema = __reducers(
   __reducerSchema("ticketremote_admin_schedule_ticket_action_v3", TicketremoteAdminScheduleTicketActionV3Reducer),
   __reducerSchema("ticketremote_member_close_control_code", TicketremoteMemberCloseControlCodeReducer),
+  __reducerSchema("ticketremote_member_command", TicketremoteMemberCommandReducer),
   __reducerSchema("ticketremote_member_confirm_control_code_browser_capture", TicketremoteMemberConfirmControlCodeBrowserCaptureReducer),
   __reducerSchema("ticketremote_member_record_activity_tick", TicketremoteMemberRecordActivityTickReducer),
   __reducerSchema("ticketremote_member_recover_stream", TicketremoteMemberRecoverStreamReducer),

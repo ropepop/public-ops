@@ -900,3 +900,23 @@ test('a failed submit surfaces the error and disposal releases the reduced resou
   assert.equal(state.stats.contextUnconfigureCount >= 1, true);
   assert.equal(state.stats.deviceDestroyCount, 1);
 });
+
+test('GPU preparation compiles once without a canvas or pixels and sizes the surface only at initialization', async () => {
+  const gpu = fakeGPU();
+  const renderer = new ClientHDRRenderer({ environment: gpu.environment });
+  const first = renderer.prepare();
+  assert.equal(renderer.prepare(), first);
+  await first;
+  assert.equal(renderer.canvas, null);
+  assert.equal(gpu.stats.pipelines.length, 1);
+  assert.equal(gpu.stats.textureDescriptors.length, 0);
+  assert.equal(gpu.stats.submits, 0);
+  await renderer.initialize({ canvas: gpu.canvas, width: 540, height: 1112, boost: 4 });
+  assert.equal(gpu.stats.pipelines.length, 1, 'initialization must reuse prepared graphics resources');
+  assert.equal(gpu.stats.textureDescriptors.length, 1);
+  assert.equal(gpu.stats.textureDescriptors[0].size.width, 540);
+  assert.equal(gpu.stats.textureDescriptors[0].size.height, 1112);
+  assert.equal(gpu.stats.submits, 0, 'preparation cannot manufacture or present a picture');
+  renderer.dispose();
+  assert.equal(gpu.stats.deviceDestroyCount, 1);
+});

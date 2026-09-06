@@ -148,7 +148,7 @@ func (c *client) canUseOrdinaryCapture(epoch uint64) bool {
 	}
 	c.videoMu.Lock()
 	defer c.videoMu.Unlock()
-	if c.resultPriorityActiveLocked(time.Now()) {
+	if c.resultPriorityActiveLocked(time.Now()) && c.videoResultPriorityPhase == resultPriorityMark {
 		return false
 	}
 	inFlightReceiptObserved := c.videoInFlight &&

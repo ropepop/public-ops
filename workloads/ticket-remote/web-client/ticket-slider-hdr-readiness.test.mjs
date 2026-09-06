@@ -10,28 +10,22 @@ import {
 const root = new URL('.', import.meta.url);
 const controllerTests = readFileSync(new URL('client-hdr-core.test.mjs', root), 'utf8');
 const helperSource = controllerTests.slice(controllerTests.indexOf('function deferred()'),
-  controllerTests.indexOf("test('v2 engine"));
+  controllerTests.indexOf("test('HDR uses the supported browser engine"));
 assert.ok(helperSource.includes('function harness('), 'use the existing real-controller test harness');
 const { harness, deferred, tick, fakeFrame } = new Function('ClientHDRController',
   `${helperSource}\nreturn { harness, deferred, tick, fakeFrame };`)(ClientHDRController);
 const pageSource = readFileSync(new URL('ticket-app-source.js', root), 'utf8');
-const gateStart = pageSource.indexOf('  function clientHDRConsequentialControlProofReady()');
-const gateEnd = pageSource.indexOf('  function ticketActionV3RequiresFreshRenderedFrame(', gateStart);
-assert.ok(gateStart >= 0 && gateEnd > gateStart, 'exercise the actual page readiness and admission functions');
-const makePageGate = new Function('experimentalClientHDRController', 'experimentalMediaState',
-  'CLIENT_HDR_ENGINE', 'streamHasFreshRenderedFrame', 'ticketActionV3StreamSnapshot',
-  `${pageSource.slice(gateStart, gateEnd)}\nreturn {
-    ready: clientHDRConsequentialControlProofReady,
-    admit: revealAuthoritativeSDRForConsequentialControl
-  };`);
+const makePageGate = new Function('currentPhoneControlReady',
+  `${pageSource.slice(pageSource.indexOf('  function controlCodeDialogEntryReady()'),
+    pageSource.indexOf('  function lastRenderedVisualAge('))}\nreturn { ready: controlCodeDialogEntryReady, admit: controlCodeDialogEntryReady };`);
 
-test('a new SDR picture awaiting HDR present completion cannot invite a control or hide HDR', async t => {
+test('pending HDR presentation does not delay current phone authority or hide HDR', async t => {
   const completion = deferred();
   const state = harness({ autoRender: true, presentCompletionGates: [null, null, completion.promise] });
   const closed = [];
   let sdrSequence = 20;
-  const gate = makePageGate(state.controller, { enabled: true, engine: CLIENT_HDR_ENGINE },
-    CLIENT_HDR_ENGINE, () => true, () => ({ epoch: 4, sequence: sdrSequence }));
+  let phoneReady = true;
+  const gate = makePageGate(() => phoneReady);
   try {
     state.controller.start({ canvas: state.canvas, width: 720, height: 1482 });
     await tick();
@@ -61,8 +55,9 @@ test('a new SDR picture awaiting HDR present completion cannot invite a control 
     t.diagnostic(JSON.stringify({ pendingPresentation: true, ready, admitted,
       surfaceRemainsVisible: after.surfaceVisible,
       addedSurfaceTransitions: after.surfaceTransitions - before.surfaceTransitions }));
-    assert.equal(ready, false, 'the new SDR identity has no matching completed HDR proof yet');
-    assert.equal(admitted, false, 'an attempted control must remain local');
+    assert.equal(ready, true, 'phone readiness is independent of pending HDR');
+    assert.equal(admitted, true, 'direct state permits submission immediately');
+    phoneReady = false; assert.equal(gate.ready(), false); phoneReady = true;
     assert.equal(after.surfaceVisible, true, 'checking readiness must not reveal SDR');
     assert.equal(after.surfaceTransitions, before.surfaceTransitions, 'no fallback blink');
 

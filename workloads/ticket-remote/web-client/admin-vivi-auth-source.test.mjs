@@ -74,14 +74,14 @@ test('ViVi attempt focus and busy state use the complete safe attempt list', () 
   assert.equal(viviReauthMode({ requestId: 'unknown-01' }), 'unknown');
 });
 
-test('Spacetime client keeps version 3 as the default and selects version 4 on the same reducer only for fallback re-detection', () => {
+test('Spacetime client keeps standard account switch as default and explicitly selects fallback in the common command', () => {
   const clientSource = readFileSync(fileURLToPath(new URL('./src/index.ts', import.meta.url)), 'utf8');
   const method = clientSource
     .split('requestViviReauthLogoutLogin(')[1]
     ?.split('requestViviReauthFullReset(')[0] || '';
 
   assert.match(method, /redetectAfterLogin = false/);
-  assert.match(method, /this\.callReducer\("ownerRequestViviReauthLogoutLogin"/);
-  assert.match(method, /version: redetectAfterLogin \? 4 : 3/);
+  assert.match(method, /this\.requestPhoneCommand\(requestId,/);
+  assert.match(method, /redetectAfterLogin \? "vivi_logout_login_redetect" : "vivi_logout_login"/);
   assert.doesNotMatch(method, /redetectAfterLogin:/);
 });

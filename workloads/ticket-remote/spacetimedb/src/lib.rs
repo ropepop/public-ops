@@ -11,6 +11,11 @@ use spacetimedb::{
     ViewContext,
 };
 
+mod phone_control;
+use phone_control::*;
+mod command;
+use command::require_legacy_phone_admission;
+
 fn account_scope_id(email: &str) -> String {
     let normalized = email.trim().to_ascii_lowercase();
     Sha256::digest(normalized.as_bytes())
@@ -87,7 +92,7 @@ const SAFE_JSON_MAX_BYTES: usize = 4096;
 // Public/durable "live" authority is intentionally narrower than visual
 // continuity. LIVE_OK and DEGRADED frames may remain visible, but only a
 // conservatively timed LIVE_FRESH frame may suppress recovery work.
-const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 1_250;
+const STREAM_BACKGROUND_SUPPRESS_FALLBACK_MAX_AGE_MS: i64 = 3_000;
 const STREAM_BACKGROUND_REPORT_MAX_AGE_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1873,6 +1878,14 @@ fn ticket_action_v3_has_registration_authority(
     proof_action_id: &str,
     now: &str,
 ) -> bool {
+    // New commands bind the current phone observation, not a video-backed
+    // historical action. Retained V3 commands keep their original authority
+    // until the coordinated producer cutover has drained them.
+    if proof_action_id.starts_with("pc-") {
+        return ctx.db.ticketremote_phone_control_state().id()
+            .find(phone_row_id(ticket_id, backend_id))
+            .is_some_and(|row| phone_control_registration_ready(&row, proof_action_id, now));
+    }
     if !valid_schedule_identifier(proof_action_id) {
         return false;
     }
@@ -4279,8 +4292,6 @@ fn ticket_action_v3_is_activation_refresh_proof(
         && action.target == "open_latest_unactivated"
         && action.status == "succeeded"
         && action.currentView == "latest_unactivated"
-        && action.streamEpoch != "0"
-        && action.frameSequence != "0"
 }
 
 struct ActivationRefreshTerminalReconciliation {
@@ -6085,6 +6096,12 @@ fn admit_control_code_request_impl(
 ) -> Result<(), String> {
     let backend_id = clean_backend_id(backend_id);
     let fast_state_id = control_code_fast_state_id(ticket_id, &backend_id);
+    if expected_fast_revision.starts_with("pc-") && !ctx.db.ticketremote_phone_control_state()
+        .id().find(phone_row_id(ticket_id, &backend_id))
+        .map(|row| phone_control::phone_control_ready(&row, expected_fast_revision, now))
+        .unwrap_or(false) {
+        return Err("phone_control_context_changed".into());
+    }
     let fast_state = ctx
         .db
         .ticketremote_control_code_fast_state()
@@ -6176,6 +6193,7 @@ member_reducers! {
     ticketremote_member_request_control_code(ctx; ticketId: String, backendId: String,
         sessionId: String, digits: String, expectedFastRevision: String; ticket = ticketId)
         |ticket, email, now| {
+    require_legacy_phone_admission(ctx, &ticket.id, &backendId)?;
     let session_id = non_empty(&sessionId, &connection_session_id(ctx));
     let clean_digits = digits
         .chars()
@@ -6207,6 +6225,7 @@ member_reducers! {
     ticketremote_member_request_ticket_reset(ctx; ticketId: String, backendId: String,
         resetRequestId: String, reason: String; ticket = ticketId)
         |ticket, email, now| {
+    require_legacy_phone_admission(ctx, &ticket.id, &backendId)?;
     request_ticket_reset_impl(
         ctx,
         &ticket.id,
@@ -6230,6 +6249,7 @@ pub fn ticketremote_member_request_ticket_reset_v2(
     reason: String,
     attemptId: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
@@ -6260,6 +6280,7 @@ pub fn ticketremote_member_request_ticket_action_v3(
     expectedInteractionRevision: String,
     scheduleId: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
@@ -6284,6 +6305,7 @@ member_reducers! {
     ticketremote_member_activate_ticket_button(ctx; ticketId: String, backendId: String,
         interactionRevision: String, controlId: String, inputSequence: String;
         ticket = ticketId) |ticket, email, now| {
+    require_legacy_phone_admission(ctx, &ticket.id, &backendId)?;
     activate_ticket_button_impl(
         ctx,
         &ticket.id,
@@ -6309,6 +6331,7 @@ pub fn ticketremote_member_activate_ticket_button_v2(
     inputSequence: String,
     attemptId: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
@@ -6332,6 +6355,7 @@ member_reducers! {
         holdDurationMillis: u32, horizontalTravelCss: u32, verticalTravelCss: u32,
         initialProgress: u32; ticket = ticketId)
         |ticket, email, now| {
+    require_legacy_phone_admission(ctx, &ticket.id, &backendId)?;
     claim_ticket_slider_impl(
         ctx,
         &ticket.id,
@@ -6365,6 +6389,7 @@ pub fn ticketremote_member_claim_ticket_slider_v2(
     initialProgress: u32,
     attemptId: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
     let email = client_email_from_auth(ctx, &ticket.id)?;
@@ -6391,6 +6416,7 @@ member_reducers! {
         interactionRevision: String, controlId: String, inputSequence: String,
         inputPhase: String, progress: u32; ticket = ticketId)
         |ticket, email, now| {
+    require_legacy_phone_admission(ctx, &ticket.id, &backendId)?;
     let backend_id = clean_backend_id(&backendId);
     let mut current = current_ticket_interaction(ctx, &ticket.id, &backend_id, &now);
     if current.interactionRevision != bounded_text(&interactionRevision, 160) ||
@@ -6747,6 +6773,7 @@ pub fn ticketremote_owner_request_vivi_reauth(
     requestId: String,
     credentialRevision: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     if version != 1 {
         return Err("unsupported_vivi_reauth_version".into());
     }
@@ -6772,6 +6799,7 @@ pub fn ticketremote_owner_request_vivi_reauth_full_reset(
     requestId: String,
     credentialRevision: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     if version != 2 {
         return Err("unsupported_vivi_reauth_version".into());
     }
@@ -6797,6 +6825,7 @@ pub fn ticketremote_owner_request_vivi_reauth_logout_login(
     requestId: String,
     credentialRevision: String,
 ) -> Result<(), String> {
+    require_legacy_phone_admission(ctx, &ticketId, &backendId)?;
     let mode = vivi_reauth_logout_login_mode(version, &requestId)?;
     owner_request_vivi_reauth(
         ctx,
@@ -7511,6 +7540,26 @@ pub fn ticketremote_complete_control_code_cleanup_ready(
     if !request.captureAcknowledged || !matches!(request.status.as_str(), "succeeded" | "closed") {
         return Err("control_code_cleanup_not_authorized".into());
     }
+    if revision.starts_with("pc-") {
+        let current = ctx.db.ticketremote_phone_control_state().id()
+            .find(phone_row_id(&ticket.id, &backend_id))
+            .ok_or("phone_control_session_required")?;
+        if !revision.starts_with(&format!("{}:", current.sessionId)) {
+            return Err("phone_control_session_changed".into());
+        }
+        // The service emits this only after raw-detail proof, durable checkpoint
+        // clearance and panel finalization. This is a result, not a readiness lease.
+        // The independent observation publisher remains the only readiness owner.
+        update_control_code_public_request(ctx, request_id, ControlCodeChanges {
+            captureRequired: Some(false), cleanupPending: Some(false),
+            reason: Some("phone_visual_cleanup_complete".into()),
+            expiresAt: Some(control_code_result_expires_at(&now)),
+            ..Default::default()
+        }, &now);
+        promote_ticket_action_v3_queue(ctx, &ticket.id, &backend_id, &now);
+        return Ok(());
+    }
+    // Removed after older phone producers and in-flight control requests drain.
     let stream_epoch = bounded_frame_ordinal(&streamEpoch);
     let frame_sequence = bounded_frame_ordinal(&frameSequence);
     if stream_epoch == "0" || frame_sequence == "0" {
@@ -7875,12 +7924,9 @@ fn ticket_action_v3_terminal_facts(
     }
     let stream_epoch = bounded_frame_ordinal(stream_epoch);
     let frame_sequence = bounded_frame_ordinal(frame_sequence);
-    let visual_proof_required = status == "succeeded"
-        || matches!(phase.as_str(), "no_transition" | "retry_not_dispatched")
-        || reason == "ticket_action_latest_not_detected";
-    if visual_proof_required && (stream_epoch == "0" || frame_sequence == "0") {
-        return Err("ticket_action_terminal_visual_proof_required".into());
-    }
+    // Only the authenticated phone service can settle this immutable command.
+    // Typed outcomes are proved from unencoded observations; media ordinals are
+    // optional presentation metadata and cannot withhold a completed outcome.
     let attempt_id = attempt_id.trim();
     if !attempt_id.is_empty() && !valid_schedule_identifier(attempt_id) {
         return Err("invalid_activation_attempt_id".into());
@@ -8920,6 +8966,9 @@ pub fn ticketremote_update_control_code_request(
         return Ok(());
     }
     let mut clean_status = safe_token(&status, &existing.status);
+    if !control_code_status_update_allowed(&existing.status, &clean_status) {
+        return Ok(());
+    }
     let incoming_reason = bounded_text(&non_empty(&reason, &existing.reason), 200);
     let preserve_captured_success = existing.status == "succeeded"
         && existing.captureAcknowledged
@@ -8988,6 +9037,26 @@ pub fn ticketremote_update_control_code_request(
     }
     Ok(())
 }
+
+// Queue delivery may prioritize a terminal result ahead of retained progress.
+// Such late progress must never revive or regress an already-settled request.
+fn control_code_status_update_allowed(current: &str, incoming: &str) -> bool {
+    fn rank(status: &str) -> u8 {
+        match status {
+            "queued" => 1,
+            "running" => 2,
+            "generated" => 3,
+            "succeeded" | "failed" => 4,
+            "closed" | "expired" => 5,
+            _ => 0,
+        }
+    }
+    if control_code_terminal_failure_status(current) && incoming != current {
+        return control_code_terminal_failure_status(incoming) && rank(incoming) >= rank(current);
+    }
+    rank(incoming) >= rank(current) && rank(incoming) > 0
+}
+
 
 fn owned_control_code_request(
     ctx: &ReducerContext,
@@ -9247,9 +9316,7 @@ fn validate_vivi_reauth_service_report_mode(
     if status == "succeeded"
         && (phase != "complete"
             || !v4_reason
-            || proof_source != "phone_visual"
-            || stream_epoch == "0"
-            || frame_sequence == "0")
+            || proof_source != "phone_visual")
     {
         return Err("vivi_reauth_v4_success_proof_invalid".into());
     }
@@ -9515,7 +9582,7 @@ expression_functions! {
     fn control_code_request_occupies_phone(row: &TicketremoteControlCodeRequest, clock: &str) -> bool = {
         if parse_time_ms(&row.expiresAt) <= parse_time_ms(clock) { return false; }
         if matches!(row.status.as_str(), "closed" | "expired" | "failed") { return false; }
-        matches!(row.status.as_str(), "queued" | "running")
+        matches!(row.status.as_str(), "queued" | "running" | "generated")
             || (row.status == "succeeded" && (row.cleanupPending
                 || (row.captureRequired && !row.captureAcknowledged)))
     };
@@ -13183,6 +13250,8 @@ fn cleanup_expired(ctx: &ReducerContext, ticket_id: &str, now: &str, batch_size:
         deleted += viewer_focus_deleted;
     }
     purge_ticket_history!(ctx, &ticket.id, expiry_bound.as_str(), limit, deleted);
+    deleted += command::purge_command_receipts(ctx, &ticket.id, expiry_bound.as_str(),
+        cleanup_remaining(limit, deleted));
     deleted
 }
 
@@ -13470,7 +13539,7 @@ mod tests {
     #[test]
     fn relay_background_suppression_never_exceeds_the_server_owned_age_limit() {
         let now = "2026-09-04T12:00:10Z";
-        let mut report = relay_current_report(Some("2026-09-04T12:00:07Z"));
+        let mut report = relay_current_report(Some("2026-09-04T12:00:06.999Z"));
         report.statusJson = serde_json::json!({
             "live": true,
             "freshnessState": "LIVE_FRESH",
@@ -13486,10 +13555,33 @@ mod tests {
             &report, now
         ));
 
-        report.lastFrameAt = Some("2026-09-04T12:00:09Z".into());
+        report.lastFrameAt = Some("2026-09-04T12:00:07Z".into());
         assert!(relay_current_report_is_live_for_background_suppression(
             &report, now
         ));
+    }
+
+    #[test]
+    fn relay_background_suppression_accepts_three_second_pictures_only() {
+        let now = "2026-09-04T12:00:10Z";
+        for advertised in [None, Some(3_000), Some(9_999)] {
+            for age in [1_251, 2_500, 3_000, 3_001] {
+                let mut report = relay_current_report(Some("2026-09-04T12:00:07Z"));
+                let mut status: serde_json::Value = serde_json::from_str(&report.statusJson).unwrap();
+                status["lastFrameVisualAgeMillis"] = serde_json::json!(age);
+                if let Some(limit) = advertised {
+                    status["liveFrameMaxAgeMillis"] = serde_json::json!(limit);
+                } else {
+                    status.as_object_mut().unwrap().remove("liveFrameMaxAgeMillis");
+                }
+                report.statusJson = status.to_string();
+                assert_eq!(
+                    relay_current_report_is_live_for_background_suppression(&report, now),
+                    age <= 3_000,
+                    "age={age}, advertised={advertised:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -13640,7 +13732,7 @@ mod tests {
         .unwrap();
         assert_eq!(retry_not_dispatched.phase, "retry_not_dispatched");
 
-        assert_eq!(
+        assert!(
             ticket_action_v3_terminal_facts(
                 "register_current",
                 "needs_attention",
@@ -13654,8 +13746,7 @@ mod tests {
                 "proof-1",
                 "",
                 "2026-09-03T10:00:06Z",
-            ),
-            Err("ticket_action_terminal_visual_proof_required".into())
+            ).is_ok()
         );
         assert_eq!(
             ticket_action_v3_terminal_facts(
@@ -13675,7 +13766,7 @@ mod tests {
             Err("ticket_action_terminal_phase_result_mismatch".into())
         );
 
-        assert_eq!(
+        assert!(
             ticket_action_v3_terminal_facts(
                 "register_current",
                 "succeeded",
@@ -13689,8 +13780,7 @@ mod tests {
                 "proof-1",
                 "activation-1",
                 "2026-09-03T10:00:06Z",
-            ),
-            Err("ticket_action_terminal_visual_proof_required".into())
+            ).is_ok()
         );
         assert_eq!(
             ticket_action_v3_terminal_facts(
@@ -15987,6 +16077,9 @@ mod tests {
         assert_eq!(result.history_outcome, "succeeded");
 
         action.frameSequence = "0".into();
+        let without_video = activation_refresh_terminal_reconciliation(&action, &schedule, now).unwrap();
+        assert_eq!(without_video.schedule_status, "succeeded");
+        action.currentView = "unknown".into();
         let invalid = activation_refresh_terminal_reconciliation(&action, &schedule, now)
             .expect("a terminal row must never be re-enqueued even when its proof is invalid");
         assert_eq!(invalid.schedule_status, "failed");
@@ -17820,6 +17913,23 @@ mod tests {
             "2026-08-24T12:15:00.001Z",
             now
         ));
+    }
+
+    #[test]
+    fn control_code_delivery_cannot_regress_a_generated_or_terminal_result() {
+        assert!(control_code_status_update_allowed("running", "generated"));
+        assert!(control_code_status_update_allowed("generated", "succeeded"));
+        assert!(control_code_status_update_allowed("generated", "failed"));
+        assert!(control_code_status_update_allowed("succeeded", "succeeded"));
+        assert!(control_code_status_update_allowed("succeeded", "failed"));
+        for current in ["generated", "succeeded", "failed", "closed", "expired"] {
+            for progress in ["queued", "running"] {
+                assert!(!control_code_status_update_allowed(current, progress));
+            }
+        }
+        for current in ["failed", "closed", "expired"] {
+            assert!(!control_code_status_update_allowed(current, "succeeded"));
+        }
     }
 
     #[test]

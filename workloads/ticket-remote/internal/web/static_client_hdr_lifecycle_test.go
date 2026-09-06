@@ -55,6 +55,7 @@ let experimentalMediaForegroundPulseWallAt = wallNow;
 let experimentalMediaForegroundSuspensionGap = false;
 let experimentalMediaCanvasGeneration = 9;
 let experimentalMediaCanvasResetGeneration = 4;
+let experimentalMediaBootstrapValidated = false;
 let experimentalMediaCapabilityReady = true;
 let experimentalClientCapabilityAllowed = true;
 let experimentalClientHDRFailed = false;
@@ -80,8 +81,8 @@ const activeFeedbackConfigGeneration = 8;
 let feedbackRenderedSequence = 30;
 let clockBoundCurrent = true;
 let useActualFreshness = false;
-const streamLiveFreshMaxAgeMs = 1250;
-const streamLiveOkMaxAgeMs = 2000;
+const streamLiveFreshMaxAgeMs = 3000;
+const streamLiveOkMaxAgeMs = 3000;
 const streamDegradedMaxAgeMs = 3000;
 const experimentalMediaForegroundRecoveryWindowMillis = 12000;
 const experimentalMediaForegroundRecoveryRetryDelays = Object.freeze([0, 250, 750, 1500, 3000]);
@@ -115,6 +116,7 @@ function streamHasFreshRenderedFrame() {
 function experimentalHDRSurfacePresentationAllowed() { return true; }
 function experimentalMediaDocumentHasFocus() { return documentFocused; }
 function controlCodeHDRFreezeTargetActive() { return false; }
+function ensureExperimentalClientHDRController() { return { prepare() {} }; }
 function refreshExperimentalClientCapability() {
   return { supported: localCapabilitySupported, videoFrame: true, mainThreadCanvas: true, webgpu: true,
     dynamicRangeLimit: true, highDynamicRange: localCapabilitySupported };
@@ -488,7 +490,7 @@ function check(value, message) { if (!value) throw new Error(message); }
       'fresh pictures extended the original foreground recovery deadline');
   }
   for (const [label, invalidate] of [
-    ['expired source', () => { lastRenderedFrameVisualAgeMillis = 1251; }],
+    ['expired source', () => { lastRenderedFrameVisualAgeMillis = 3001; }],
     ['unknown source age', () => { lastRenderedFrameVisualAgeKnown = false; }],
     ['uncertain clock', () => { clockBoundCurrent = false; }],
     ['old epoch', () => { lastRenderedFrameEpoch = currentStreamEpoch - 1; }],
@@ -1408,10 +1410,10 @@ check(starts.length === 1 && experimentalMediaCanvasResetGeneration === 7 && exp
 func TestTicketViewerHDREstablishedDeviceLossStartsNewBoundedAttempt(t *testing.T) {
 	source := ticketAppSource(t)
 	recovery := substringBetween(t, source,
-		"function scheduleExperimentalMediaActiveFailureRecovery(reason) {",
+		"function scheduleExperimentalMediaActiveFailureRecovery() {",
 		"  function scheduleExperimentalMediaStart(reason, options) {")
 	if !strings.Contains(source,
-		"if (!scheduleExperimentalMediaActiveFailureRecovery(reason || 'renderer_failed'))") {
+		"if (!scheduleExperimentalMediaActiveFailureRecovery())") {
 		t.Fatal("renderer failure status is not routed through active-session bounded recovery")
 	}
 
@@ -1443,16 +1445,16 @@ function controlCodeHDRFreezeTargetActive() { return false; }
 function check(value, message) { if (!value) throw new Error(message); }
 `+recovery+`
 
-check(scheduleExperimentalMediaActiveFailureRecovery('device_lost') === true && timers.length === 1,
+check(scheduleExperimentalMediaActiveFailureRecovery() === true && timers.length === 1,
   'established device loss did not schedule a fresh bounded recovery');
-check(scheduleExperimentalMediaActiveFailureRecovery('device_lost_repeat') === true && timers.length === 1,
+check(scheduleExperimentalMediaActiveFailureRecovery() === true && timers.length === 1,
   'duplicate failure notification scheduled more than one recovery');
 check(timers[0].millis === 0, 'active failure recovery was not handed to a fresh coordinator turn');
 timers[0].callback();
 check(begins.length === 1 && begins[0].reason === 'renderer_failure' &&
   begins[0].options.forceCanvasReset === true && experimentalMediaResumeRetryArmed,
   'device loss did not create a fresh-surface coordinator attempt');
-check(scheduleExperimentalMediaActiveFailureRecovery('failure_inside_attempt') === false,
+check(scheduleExperimentalMediaActiveFailureRecovery() === false,
   'failure inside an owning attempt bypassed its single renderer retry');
 `)
 }
@@ -1464,11 +1466,12 @@ func TestTicketViewerHDRStableVisibleStartCancelsStaleCallbacks(t *testing.T) {
 		"  function clearExperimentalMediaDynamicRangeRecovery() {")
 	start := substringBetween(t, source,
 		"function scheduleExperimentalMediaStart(reason, options) {",
-		"  function connectExperimentalMedia(reason, options) {")
+		"  function armExperimentalMediaLifecycleResume() {")
 
 	runTicketJavaScript(t, `
 const document = { visibilityState: 'visible', body: { dataset: {} } };
 let experimentalMediaState = { enabled: true };
+let experimentalMediaBootstrapValidated = false;
 let experimentalMediaCapabilityReady = true;
 let experimentalClientHDRController = null;
 let experimentalMediaStartGeneration = 0;
@@ -1536,4 +1539,31 @@ check(starts.length === 1 && starts[0].forceCanvasReset === true &&
   experimentalMediaLastStartReason === 'replacement',
   'replacement did not start exactly once after two visible opportunities');
 `)
+}
+
+func TestHealthyCadenceUsesTheSameThreeSecondBoundaryAsLiveFrames(t *testing.T) {
+	source := ticketAppSource(t)
+	continuity := substringBetween(t, source, "function healthyOneFPSVisualContinuity(freshness, now) {", "  function controlCodeDialogEntryReady() {")
+	constants := substringBetween(t, source, "const streamLiveFreshMaxAgeMs =", "  const streamDegradedMaxAgeMs =")
+	runTicketJavaScript(t, constants+`
+ const document = {visibilityState:'visible'};
+ const navigator = {onLine:true};
+ const idleDisconnected = false, streamUnsupported = false;
+ const WebSocket = {OPEN:1}, videoWs = {readyState:1};
+ const lastDecoderConfig = {frameEnvelope:'tsf3',frameDependencyMode:'all_intra',fps:1,sourceFps:1,keyframeIntervalFrames:1,streamEpoch:7};
+ const lastRenderedFrameEpoch = 7, lastRenderedFrameSequence = 42, currentStreamEpoch = 7;
+ const lastRenderedFrameEnvelopeVersion = 'tsf3', activeFeedbackVersion = 2;
+ const activeFeedbackConfigGeneration = 1, lastRenderedFrameConfigGeneration = 1, feedbackRenderedSequence = 42;
+ const streamCurrentReportMaxAgeMs = 3500, streamCurrentReportMaxSequenceLag = 4;
+ const status = {updatedAt:'2026-09-06T12:00:00Z',phoneDesired:true,phoneConnected:true,phoneStreamState:'streaming',activeVideoClients:1,continuity:true,allIntraConfigValid:true,freshnessState:'LIVE_FRESH',phoneClockBoundedCalibrated:true,lastFrameVisualAgeKnown:true,liveOKMaxAgeMillis:3000,lastFrameVisualAgeMillis:2500,frameEnvelope:'tsf3',frameDependencyMode:'all_intra',fps:1,sourceFps:1,keyframeIntervalFrames:1,streamEpoch:7,lastFrameSequence:42};
+ function freshStreamStatus() {return status;}
+ function streamClockServerUpperAt() {return Date.parse(status.updatedAt)*1000;}
+ const freshness = {hasFrame:true,streamFreshnessState:'LIVE_FRESH',visualAgeKnown:true,visualAgeConservative:true,clockBoundCurrent:true,visualAgeMillis:2500};
+ `+continuity+`
+ if (!healthyOneFPSVisualContinuity(freshness,1000)) throw new Error('healthy 2500ms frame showed recovery');
+ freshness.visualAgeMillis = 3000;
+ if (!healthyOneFPSVisualContinuity(freshness,1000)) throw new Error('exact 3000ms boundary rejected');
+ freshness.visualAgeMillis = 3001;
+ if (healthyOneFPSVisualContinuity(freshness,1000)) throw new Error('stale 3001ms frame passed');
+ `)
 }

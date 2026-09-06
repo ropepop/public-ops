@@ -45,11 +45,12 @@ type Server struct {
 	authTmpl          *template.Template
 	hdrDiagnosticTmpl *template.Template
 
-	mu                  sync.Mutex
-	clients             map[*client]struct{}
-	relayViewerRefs     map[string]int
-	streamPrewarmTimers map[string]*time.Timer
-	streamPrewarmOwners map[string]string
+	mu                      sync.Mutex
+	clients                 map[*client]struct{}
+	relayViewerRefs         map[string]int
+	streamPrewarmTimers     map[string]*time.Timer
+	streamPrewarmOwners     map[string]string
+	streamPageOpenWarmUntil map[string]time.Time
 
 	stateMu       sync.RWMutex
 	cachedState   state.Snapshot
@@ -226,13 +227,14 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-05-browser-captured-control-code-hidden-viewer-anchor-v166"
+	serverVersion                 = "ticket-remote-2026-09-06-independent-phone-control-gentle-wave-v180"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
 
 	streamRecoveryCommandCooldown = 10 * time.Second
 	streamPrewarmHold             = 30 * time.Second
+	streamPageOpenWarmHold        = 30 * time.Minute
 	publicOpenGraceHold           = 30 * time.Second
 	streamDesiredIdleReleaseGrace = 60 * time.Second
 	streamPrewarmHTTPStartTimeout = 5 * time.Second
@@ -297,6 +299,16 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 }
 
 func (s *Server) Close() {
+	s.startupLeaseMu.Lock()
+	s.mu.Lock()
+	for key, timer := range s.streamPrewarmTimers {
+		timer.Stop()
+		delete(s.streamPrewarmTimers, key)
+	}
+	s.streamPrewarmOwners = nil
+	s.streamPageOpenWarmUntil = nil
+	s.mu.Unlock()
+	s.startupLeaseMu.Unlock()
 	s.cancelIdleStreamDesiredRelease()
 	s.closeOrdinaryCaptureDemand()
 	s.stopStreamDesiredStateWriter()
@@ -466,12 +478,14 @@ func handleRetiredTicketRoute(w http.ResponseWriter) {
 
 func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
 	startupRun := newStartupRunOrigin()
+	openedAt := time.Now()
 	if s.usesSpacetimeAuth() {
 		id, sessionID, snapshot, ok := s.identifyMemberFromRequest(w, r, memberLookupOptions{
 			optional:     true,
 			cachedFirst:  true,
 			prewarm:      "index_auth_prewarm",
 			startupRun:   startupRun,
+			openedAt:     openedAt,
 			writeSession: true,
 		})
 		if ok {
@@ -489,6 +503,7 @@ func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
 		cachedFirst:  true,
 		prewarm:      "index_auth_prewarm",
 		startupRun:   startupRun,
+		openedAt:     openedAt,
 	})
 	if !ok {
 		return
@@ -549,6 +564,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot s
 		"phone":               phoneHealth,
 		"activePhoneBackend":  s.activePhoneBackend(),
 		"directStream":        s.direct.snapshot(streamNow, phoneHealth),
+		"pageOpenWarm":        s.pageOpenWarmSnapshot(streamNow),
 		"experimentalMedia": map[string]any{
 			"enabled":         true,
 			"browserOnly":     true,
@@ -813,6 +829,7 @@ func redactSnapshotForHealth(snapshot state.Snapshot) state.Snapshot {
 	snapshot.PageActivityDaily = nil
 	snapshot.MemberHDREngines = nil
 	snapshot.MemberHDRBoosts = nil
+	snapshot.MemberHDRPreferences = nil
 	snapshot.Members = append([]state.Member(nil), snapshot.Members...)
 	for index := range snapshot.Members {
 		snapshot.Members[index].AccountScopeID = ""
@@ -899,6 +916,14 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Ide
 	config := s.publicBrowserConfig(id, sessionID, snapshot, true)
 	_, active := snapshot.Member(id.Email)
 	config["experimentalMediaCandidate"] = active
+	if active {
+		enabled, known := snapshot.HDRPreferenceForAccountScope(ticketAccountScopeID(id.Email))
+		config["experimentalMediaBootstrap"] = map[string]any{
+			"accountScopeId": ticketAccountScopeID(id.Email),
+			"enabled":        enabled, "preferenceKnown": known,
+			"capability": experimentalMediaCapability(id, snapshot),
+		}
+	}
 	if startupRun = boundedStartupRunOrigin(startupRun); startupRun != "" {
 		config["startupRunOrigin"] = startupRun
 	}
@@ -2275,6 +2300,7 @@ type memberLookupOptions struct {
 	optional     bool
 	prewarm      string
 	startupRun   string
+	openedAt     time.Time
 	requireFresh bool
 }
 
@@ -2307,7 +2333,7 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 					s.startupRunMu.Lock()
 					startupTraceID := s.direct.startStartupTraceForRun(sessionID, opts.startupRun, "authenticated_index_accepted")
 					s.startupRunMu.Unlock()
-					go s.prewarmAfterFreshMembership(id, sessionForPrewarm, scheduleReason, startupTraceID)
+					go s.prewarmAfterFreshMembership(id, sessionForPrewarm, scheduleReason, startupTraceID, opts.openedAt)
 				}
 				return id, sessionID, cachedSnapshot, true
 			}
@@ -2336,6 +2362,7 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 		startupTraceID := s.direct.startStartupTraceForRun(sessionID, opts.startupRun, "authenticated_index_accepted")
 		s.direct.recordStartupPhaseOnceForTrace(startupTraceID, "authenticated_index_accepted", "membership=current")
 		s.prewarmStreamForSession(sessionID, opts.prewarm, startupTraceID)
+		s.retainRelayViewerForPageOpen(sessionID, opts.openedAt, time.Now())
 	}
 	return id, sessionID, snapshot, true
 }
@@ -2344,7 +2371,7 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 // treating cached membership as authorization to wake the phone.  The lookup
 // intentionally bypasses snapshotWithCache, whose fallback is useful for page
 // availability but would violate the prewarm trust boundary.
-func (s *Server) prewarmAfterFreshMembership(id auth.Identity, sessionID string, reason string, startupTraceID string) {
+func (s *Server) prewarmAfterFreshMembership(id auth.Identity, sessionID string, reason string, startupTraceID string, openedAt time.Time) {
 	if s == nil || s.store == nil || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -2369,6 +2396,7 @@ func (s *Server) prewarmAfterFreshMembership(id auth.Identity, sessionID string,
 	defer s.startupRunMu.Unlock()
 	s.direct.recordStartupPhaseOnceForTrace(startupTraceID, "authenticated_index_accepted", "membership=current")
 	s.prewarmStreamForSession(sessionID, reason, startupTraceID)
+	s.retainRelayViewerForPageOpen(sessionID, openedAt, time.Now())
 }
 
 func (s *Server) redirectHTTPToHTTPS(w http.ResponseWriter, r *http.Request) bool {

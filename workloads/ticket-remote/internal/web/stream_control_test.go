@@ -328,6 +328,40 @@ func TestRelayReportPersistsConservativeTSF3SourceAgeAndSeparateReceiptTime(t *t
 	}
 }
 
+func TestRelayReportIncludesBoundedPageWarmthWithoutSessionIdentity(t *testing.T) {
+	reports := make(chan state.RelayCurrentReportInput, 2)
+	server := newStreamControlTestServer(t, &streamDesiredRecordingStore{relayReports: reports})
+	now := time.Now()
+	server.mu.Lock()
+	server.streamPageOpenWarmUntil = map[string]time.Time{"private-session": now.Add(streamPageOpenWarmHold)}
+	server.mu.Unlock()
+	for _, at := range []time.Time{now, now.Add(streamPageOpenWarmHold)} {
+		if err := server.publishRelayCurrentReport(context.Background(), at, "warm_observation"); err != nil {
+			t.Fatal(err)
+		}
+		report := <-reports
+		if strings.Contains(report.StatusJSON, "private-session") {
+			t.Fatal("warm report leaked session identity")
+		}
+		var status struct {
+			PageOpenWarm struct {
+				RetainedSessions int    `json:"retainedSessions"`
+				ExpiresAt        string `json:"expiresAt"`
+			} `json:"pageOpenWarm"`
+		}
+		if err := json.Unmarshal([]byte(report.StatusJSON), &status); err != nil {
+			t.Fatal(err)
+		}
+		wantCount, wantExpiry := 1, now.Add(streamPageOpenWarmHold).UTC().Format(time.RFC3339Nano)
+		if !at.Equal(now) {
+			wantCount, wantExpiry = 0, ""
+		}
+		if status.PageOpenWarm.RetainedSessions != wantCount || status.PageOpenWarm.ExpiresAt != wantExpiry {
+			t.Fatalf("warm projection = %#v, want count=%d expiry=%s", status.PageOpenWarm, wantCount, wantExpiry)
+		}
+	}
+}
+
 func TestCompactRelayReportPreservesBrowserContinuityContract(t *testing.T) {
 	status := map[string]any{
 		"streamVerdict":            "stale_recovering",

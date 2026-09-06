@@ -58,8 +58,9 @@ type queuedVideoFrame struct {
 
 // resultPriority is a requester-local scheduling hint. It intentionally carries
 // no request, account, or control-code data: the authenticated browser only
-// reserves its own existing one-frame slot and later supplies the public stream
-// marker that already fences exact result presentation.
+// arms its own existing one-frame slot and later supplies the public stream
+// marker that already fences exact result presentation. Arming does not pause
+// ordinary media; only the marked result takes delivery priority.
 type resultPriority struct {
 	Type             string `json:"type"`
 	Version          int    `json:"version"`
@@ -160,7 +161,7 @@ func (c *client) resultPriorityActiveLocked(now time.Time) bool {
 }
 
 func (c *client) resultPriorityAllowsQueuedFrameLocked(now time.Time) bool {
-	if !c.resultPriorityActiveLocked(now) {
+	if !c.resultPriorityActiveLocked(now) || c.videoResultPriorityPhase == resultPriorityArm {
 		return true
 	}
 	if c.videoResultPriorityPhase != resultPriorityMark || len(c.videoQueue) == 0 {
@@ -241,10 +242,8 @@ func (c *client) acceptResultPriority(data []byte, now time.Time) bool {
 			c.videoMu.Unlock()
 			return accepted
 		}
-		// Discard the pre-request pending picture, then keep only the newest
-		// subsequent picture in the existing slot while writes are reserved.
-		c.videoQueue = nil
-		c.videoQueueBytes = 0
+		// Until the result marker exists, keep ordinary delivery and its
+		// existing bounded queue and receipt credit unchanged.
 		c.videoResultPriorityPhase = resultPriorityArm
 		c.videoResultPrioritySeq = 0
 		deadline = now.Add(resultPriorityWorkflowWindow)

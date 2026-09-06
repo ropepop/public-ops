@@ -56,7 +56,7 @@ func TestStreamControlCutoverUsesSpacetimeCommandsAndVideoOnlyRelay(t *testing.T
 			"identifyMember(w, r)",
 		},
 		"static/spacetime-client.js": {
-			"this.callReducer(\"memberRequestControlCode\"",
+			"this.callReducer(\"memberCommand\"",
 			"this.callReducer(\"memberConfirmControlCodeBrowserCapture\"",
 			"this.callReducer(\"memberCloseControlCode\"",
 		},

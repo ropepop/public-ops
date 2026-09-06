@@ -715,7 +715,7 @@ func TestTicketSliderUsesVisibleShortLivedVisualGeometryWithoutAProgressProtocol
 		}
 	}
 	for _, required := range []string{
-		"ticketSliderRegionV3ForAction(",
+		"phoneRegistrationRegion(",
 		"ticketSliderRegionV3Layout(",
 		"handleTicketLocalRegisterSliderChange({",
 		"submitRegisterCurrent: (source, exactActionId, exactProof) => registerCurrentTicket(source, {",

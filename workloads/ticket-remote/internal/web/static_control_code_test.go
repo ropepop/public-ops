@@ -425,7 +425,7 @@ func TestControlCodeCaptureRetriesAreBounded(t *testing.T) {
 		"const controlCodeResultInitialKeyframeDelayMs = 1250;",
 		"const controlCodeCaptureKeyframeRetryMs = 5000;",
 		"const controlCodeCaptureKeyframeRetryLimit = 2;",
-		"const controlCodeLowLatencyVisualAgeMs = 1250;",
+		"const controlCodeLowLatencyVisualAgeMs = 3000;",
 		"const controlCodeLowLatencyDecodeQueueLimit = 1;",
 		"const keyframeCommandMinIntervalMs = 2500;",
 		"let lastKeyframeCommandAt = 0;",
@@ -968,8 +968,8 @@ ticketCurrentProofVisualState.resumePending = false;
 handlers.focus();
 check(recoveryRuns === 3, 'focus-only restore must run the full hidden lifecycle recovery');
 check(keyframeRequests === 3, 'focus-only restore must request one recovery keyframe');
-check(ticketCurrentProofVisualState.resumePending,
-  'focus-only restore must refresh the current ticket proof');
+check(!ticketCurrentProofVisualState.resumePending,
+  'focus-only restore must not launch a browser visual-proof request');
 check(lastHiddenAt === 0 && lastHiddenWallAt === 0,
   'focus-only restore must consume the hidden lifecycle timestamps');
 
@@ -1384,8 +1384,12 @@ func TestTicketEarlySocketRevalidatesRetainedKeyframeWhenClaimed(t *testing.T) {
 	if !strings.Contains(template, "early.maxFrameAgeMs = earlyMaxFrameAgeMs;") {
 		t.Fatal("head socket must expose its independent-frame freshness bound to the app claim path")
 	}
+	earlyLimit := substringBetween(t, template, "var earlyMaxFrameAgeMs = ", ";") + ";"
+	if earlyLimit != "var earlyMaxFrameAgeMs = 3000;" {
+		t.Fatal("early browser pictures must use the three-second age limit")
+	}
 
-	runTicketJavaScript(t, `
+	runTicketJavaScript(t, earlyLimit+`
 let monotonic = 100;
 const wallStart = 1000000;
 const performance = { now: () => monotonic };
@@ -1409,7 +1413,7 @@ function makeEarly(receivedAt) {
 	      receivedAt: receivedAt + 1
 	    }],
 	    queueBytes: 60,
-	    maxFrameAgeMs: 1250,
+	    maxFrameAgeMs: earlyMaxFrameAgeMs,
     openedAt: receivedAt,
     claimed: false,
     error: false,
@@ -1425,7 +1429,18 @@ check(freshClaim && freshClaim.queued.length === 2,
 check(freshClaim.queued[1].meta.sequence === 2,
   'claim path did not select the newest independent frame');
 
-monotonic = 1300;
+for (const age of [1251, 2500, 3000]) {
+  for (const useFallback of [false, true]) {
+    monotonic = 11 + age;
+    const boundaryEarly = makeEarly(10);
+    if (useFallback) delete boundaryEarly.maxFrameAgeMs;
+    window.TICKET_EARLY_VIDEO = boundaryEarly;
+    const boundaryClaim = claimEarlyVideoSocket();
+    check(boundaryClaim && boundaryClaim.queued.length === 2,
+      age + ' ms retained picture must survive claim, fallback=' + useFallback);
+  }
+}
+monotonic = 3012;
 const expiredEarly = makeEarly(10);
 window.TICKET_EARLY_VIDEO = expiredEarly;
 const expiredClaim = claimEarlyVideoSocket();
@@ -1439,9 +1454,13 @@ Date.now = originalDateNow;
 
 func TestTicketViewerFreshIngressDropsStaleAllIntraWithoutResetAndKeepsHardQueueLimit(t *testing.T) {
 	source := ticketAppSource(t)
+	ingressLimit := substringBetween(t, source, "const streamIngressFrameMaxAgeMs = ", ";") + ";"
+	if ingressLimit != "const streamIngressFrameMaxAgeMs = 3000;" {
+		t.Fatal("browser ingress must allow three-second pictures")
+	}
 	acceptFrame := substringBetween(t, source,
-		"function acceptFreshFrame(frame) {",
-		"  function queueFrameMetadata(frame) {")
+		"function noteFramePacket(frame, now) {",
+		"  function queueFrameMetadata(frame) {") + ticketFrameAdmissionTestHarness
 	handleMessage := substringBetween(t, source,
 		"async function handleVideoSocketMessage(event) {",
 		"  function decodeAvcFrame(frame) {")
@@ -1456,7 +1475,7 @@ func TestTicketViewerFreshIngressDropsStaleAllIntraWithoutResetAndKeepsHardQueue
 		t.Fatal("stale-frame shedding and decoder queue hard-limit protection must remain active")
 	}
 
-	runTicketJavaScript(t, `
+	runTicketJavaScript(t, ingressLimit+`
 let now = 100;
 const wallStart = 1000000;
 const performance = { now: () => now };
@@ -1490,7 +1509,6 @@ let decoderRejectedFrames = 0;
 let resyncDroppedFrames = 0;
 let avcAdapterTried = true;
 const streamDecoderQueueHardLimit = 4;
-const streamIngressFrameMaxAgeMs = 1250;
 const recoveryKeyframeDebounceMs = 2000;
 const frames = [];
 const decoded = [];
@@ -1531,18 +1549,28 @@ function switchToAvcAdapter() {}
   check(decoded.length === 1 && decoded[0] === 1, 'old painted canvas rejected a valid incoming keyframe');
   check(freshnessQueries === 0, 'incoming frame path consulted rendered canvas age');
 
-  frames.push({ version: 'tsf3', kind: 'key', epoch: 1, sequence: 2, captureStart: (wallStart + now - 1500) * 1000, uncertainty: 0, timestamp: (wallStart + now - 1500) * 1000, data: new Uint8Array([2]) });
+  frames.push({ version: 'tsf3', kind: 'key', epoch: 1, sequence: 2, captureStart: (wallStart + now - 3001) * 1000, uncertainty: 0, timestamp: (wallStart + now - 3001) * 1000, data: new Uint8Array([2]) });
   await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
   check(decoded.length === 1, 'genuinely stale incoming frame reached the decoder');
   check(!needsKeyFrame, 'dropping an independent stale frame unnecessarily requested a keyframe');
   check(staleIngressDroppedFrames === 1, 'stale ingress drop was not recorded');
+  check(feedbackReceivedSequence === 2, 'stale picture receipt must still be acknowledged');
   check(resetReasons.length === 0, 'an independent stale frame unnecessarily reset the decoder');
   check(metadataClears === 0, 'an independent stale frame unnecessarily cleared decoder metadata');
+
+  for (const [index, age] of [1251, 2500, 3000].entries()) {
+    const sequence = index + 3;
+    frames.push({ version: 'tsf3', kind: 'key', epoch: 1, sequence, captureStart: (wallStart + now - age) * 1000, uncertainty: 0, timestamp: (wallStart + now - age) * 1000, data: new Uint8Array([sequence]) });
+    await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
+    check(decoded[decoded.length - 1] === sequence, age + ' ms picture did not decode');
+    check(lastAcceptedFrameVisualAgeMillis === age, 'picture age was not preserved');
+    check(feedbackReceivedSequence === sequence, 'accepted picture receipt was not acknowledged');
+  }
 
   decoder.decodeQueueSize = 5;
   frames.push({ version: 'tsf3', kind: 'key', epoch: 1, sequence: 10, captureStart: (wallStart + now) * 1000, uncertainty: 0, timestamp: (wallStart + now) * 1000, data: new Uint8Array([10]) });
   await handleVideoSocketMessage({ data: new ArrayBuffer(1) });
-  check(decoded.length === 1, 'decoder queue hard limit did not stop a congested frame');
+  check(decoded.length === 4, 'decoder queue hard limit did not stop a congested frame');
   check(needsKeyFrame, 'decoder queue overflow must return to keyframe-only recovery');
   check(resetReasons.length === 1 && resetReasons[0] === 'decoder_queue_overflow',
     'decoder queue overflow must retain its bounded reset path');
@@ -1560,8 +1588,8 @@ function switchToAvcAdapter() {}
 func TestTicketViewerProvisionalConfigBindsFirstKeyframeEpochBeforeFeedback(t *testing.T) {
 	source := ticketAppSource(t)
 	acceptFrame := substringBetween(t, source,
-		"function acceptFreshFrame(frame) {",
-		"  function queueFrameMetadata(frame) {")
+		"function noteFramePacket(frame, now) {",
+		"  function queueFrameMetadata(frame) {") + ticketFrameAdmissionTestHarness
 	sendFeedback := substringBetween(t, source,
 		"function sendStreamFeedback(reason, immediate) {",
 		"  function scheduleStreamFeedback(reason) {")
@@ -1628,14 +1656,14 @@ function streamClockServerUpperAt() { return 0; }
 function resetVideoReconnectBackoff() {}
 `+acceptFrame+sendFeedback+`
 const delta = { kind: 'delta', epoch: 42, sequence: 1, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(delta) === false, 'provisional decoder bound to a delta frame');
+check(admitTestFrame(delta) === false, 'provisional decoder bound to a delta frame');
 check(keyframeReasons.length === 1 && keyframeReasons[0] === 'all_intra_delta_rejected',
   'unexpected delta did not request one independent refresh');
 check(currentStreamEpoch === 0 && lastDecoderConfig.streamEpoch === 0,
   'rejected delta changed the provisional epoch');
 
 const keyframe = { kind: 'key', epoch: 42, sequence: 2, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(keyframe) === true, 'fresh recovery keyframe was rejected');
+check(admitTestFrame(keyframe) === true, 'fresh recovery keyframe was rejected');
 check(currentStreamEpoch === 42, 'first recovery keyframe did not bind the live epoch');
 check(lastDecoderConfig.streamEpoch === 42 && lastDecoderConfig.provisional === false,
   'decoder recovery config retained the provisional epoch');
@@ -1652,7 +1680,7 @@ check(sentFeedback.renderedKeyframeSequence === 2,
   'rolling compatibility field did not mirror the latest rendered independent frame');
 
 const wrongEpochKeyframe = { kind: 'key', epoch: 43, sequence: 3, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(wrongEpochKeyframe) === false,
+check(admitTestFrame(wrongEpochKeyframe) === false,
   'later mismatched epoch was accepted after provisional binding');
 check(currentStreamEpoch === 42, 'mismatched frame replaced the bound epoch');
 Date.now = originalDateNow;
@@ -1662,8 +1690,8 @@ Date.now = originalDateNow;
 func TestTicketViewerRequiresStrictAllIntraAndAcceptsIndependentSequenceGaps(t *testing.T) {
 	source := ticketAppSource(t)
 	acceptFrame := substringBetween(t, source,
-		"function acceptFreshFrame(frame) {",
-		"  function queueFrameMetadata(frame) {")
+		"function noteFramePacket(frame, now) {",
+		"  function queueFrameMetadata(frame) {") + ticketFrameAdmissionTestHarness
 	configureDecoder := substringBetween(t, source,
 		"async function configureDecoder(config, options) {",
 		"  function configureAvcDecoderFromDescription(config, description) {")
@@ -1720,9 +1748,9 @@ function streamClockServerUpperAt() { return 0; }
 function resetVideoReconnectBackoff() {}
 `+acceptFrame+`
 const key = { kind: 'key', epoch: 7, sequence: 1, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(key) === true, 'all-intra keyframe was rejected');
+check(admitTestFrame(key) === true, 'all-intra keyframe was rejected');
 const delta = { kind: 'delta', epoch: 7, sequence: 2, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(delta) === false, 'all-intra delta was accepted');
+check(admitTestFrame(delta) === false, 'all-intra delta was accepted');
 check(lastAcceptedFrameSequence === 1 && needsKeyFrame === true,
   'all-intra delta changed accepted sequence authority');
 check(keyframeReasons.length === 1 && keyframeReasons[0] === 'all_intra_delta_rejected',
@@ -1731,18 +1759,18 @@ check(feedbackReasons.length === 1 && logEvents[0] === 'invalid_tsf2_frame',
   'all-intra delta rejection was not observable');
 
 const gappedIndependent = { kind: 'key', epoch: 7, sequence: 10, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(gappedIndependent) === true,
+check(admitTestFrame(gappedIndependent) === true,
   'independently decodable frame was rejected because its source sequence had a gap');
 check(lastAcceptedFrameSequence === 10 && needsKeyFrame === false,
   'gapped independent frame did not become decoder authority');
 const olderIndependent = { kind: 'key', epoch: 7, sequence: 9, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(olderIndependent) === false,
+check(admitTestFrame(olderIndependent) === false,
   'older independent frame replaced the newest sequence authority');
 
 lastDecoderConfig = { streamEpoch: 7, fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 needsKeyFrame = false;
 const missingModeKey = { kind: 'key', epoch: 7, sequence: 11, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(missingModeKey) === false,
+check(admitTestFrame(missingModeKey) === false,
   'config without explicit all-intra mode was accepted');
 check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
   'missing dependency mode changed accepted sequence authority');
@@ -1750,7 +1778,7 @@ check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
 lastDecoderConfig = { streamEpoch: 7, frameDependencyMode: 'gop', fps: 1, sourceFps: 1, keyframeIntervalFrames: 1 };
 needsKeyFrame = false;
 const unknownModeKey = { kind: 'key', epoch: 7, sequence: 12, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(unknownModeKey) === false,
+check(admitTestFrame(unknownModeKey) === false,
   'main viewer admitted a frame under an unknown nonempty dependency mode');
 check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
   'unknown dependency mode changed accepted sequence authority');
@@ -1760,7 +1788,7 @@ check(keyframeReasons.length === 3 && keyframeReasons[1] === 'all_intra_config_r
 lastDecoderConfig = { streamEpoch: 7, frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1, keyframeIntervalFrames: 2 };
 needsKeyFrame = false;
 const wrongCadenceKey = { kind: 'key', epoch: 7, sequence: 13, timestamp: (wallStart + now) * 1000 };
-check(acceptFreshFrame(wrongCadenceKey) === false,
+check(admitTestFrame(wrongCadenceKey) === false,
   'main viewer admitted a non-1/1/1 all-intra config');
 check(lastAcceptedFrameSequence === 10 && needsKeyFrame === true,
   'wrong all-intra cadence changed accepted sequence authority');
@@ -2128,8 +2156,8 @@ func TestTicketViewerAcceptsSourceSequenceGapsBetweenIndependentFrames(t *testin
 		"function readUint64(view, offset) {",
 		"  function isAppleWebKit() {")
 	acceptFrame := substringBetween(t, source,
-		"function acceptFreshFrame(frame) {",
-		"  function queueFrameMetadata(frame) {")
+		"function noteFramePacket(frame, now) {",
+		"  function queueFrameMetadata(frame) {") + ticketFrameAdmissionTestHarness
 	handleMessage := substringBetween(t, source,
 		"async function handleVideoSocketMessage(event) {",
 		"  function decodeAvcFrame(frame) {")
@@ -2146,7 +2174,7 @@ const FRAME_ENVELOPE_MAGIC = 0x54534632;
 const FRAME_ENVELOPE_HEADER_BYTES = 29;
 const streamMaxVideoPayloadBytes = 2 * 1024 * 1024;
 const streamDecoderQueueHardLimit = 4;
-const streamIngressFrameMaxAgeMs = 1250;
+const streamIngressFrameMaxAgeMs = 3000;
 const recoveryKeyframeDebounceMs = 2000;
 let activeFeedbackVersion = 0;
 let activeFeedbackConfigGeneration = 0;
@@ -3123,7 +3151,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 			t.Fatalf("ordinary browser rendering must not launch redundant preparation %q", forbidden)
 		}
 	}
-	if !strings.Contains(openDialog, "if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;") {
+	if !strings.Contains(openDialog, "if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;") {
 		t.Fatalf("dialog entry must use the shared phone-mutation lane guard")
 	}
 	for _, required := range []string{
@@ -3155,7 +3183,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 	}
 	for _, needle := range []string{
 		"let controlCodeSubmitInFlight = false;",
-		"const fastRevision = controlCodeFastRevisionForRequest();",
+		"const fastRevision = String(currentState && currentState.phoneControlState && currentState.phoneControlState.contextRevision || '');",
 		"return revision && controlCodeFastStateFresh(state) ? revision : '';",
 		"client.requestControlCode(digits, fastRevision, () => {",
 		"fastReady: controlCodeFastStateFresh()",
@@ -3188,9 +3216,9 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"const digitCount = sanitizeControlDigits(codeDigits.value).length;",
 		"const digitsValid = digitCount >= 2 && digitCount <= 8;",
 		"const limitBlocked = memberLimitBlocked('control_code');",
-		"const hdrControlReady = clientHDRConsequentialControlProofReady();",
+		"const dialogEntryReady = currentPhoneControlReady();",
 		"codeSubmit.disabled = !codeDialogOpen || busy || limitBlocked || !dialogEntryReady || !digitsValid;",
-		"? 'Gaida svaigu kadru…' : (controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu');",
+		"codeSubmit.textContent = controlCodeSubmitInFlight ? 'Nosūta…' : 'Izveidot kodu';",
 		"codeSubmit.setAttribute('aria-busy', 'true');",
 		"requestCodeButton.disabled = busy || limitBlocked || !dialogEntryReady || codeDialogOpen || !codeResultArea.hidden;",
 	} {
@@ -3212,7 +3240,7 @@ func TestControlCodeQueuesImmediatelyWhileFastPathWarms(t *testing.T) {
 		"document.documentElement.style.setProperty('--ticket-hotspot-width', `${stageViewport.width * 0.5}px`);",
 		"document.documentElement.style.setProperty('--ticket-hotspot-height', `${stageViewport.height * 0.25}px`);",
 		"if (codeDialogOpen || !codeDialog.hidden || !codeResultArea.hidden || ticketRegisterOverlayOccupiesHotspot()) return;",
-		"if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;",
+		"if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return;",
 		"openControlCodeDialog();",
 	} {
 		if !strings.Contains(source, needle) && !strings.Contains(hotspotRequest, needle) {
@@ -3510,7 +3538,7 @@ func TestControlCodeUsesDirectSpacetimeReducerFlow(t *testing.T) {
 
 	clientSource := ticketRemoteSourceFile(t, "internal", "web", "static", "spacetime-client.js")
 	for _, needle := range []string{
-		"this.callReducer(\"memberRequestControlCode\"",
+		"this.callReducer(\"memberCommand\"",
 		"this.callReducer(\"memberConfirmControlCodeBrowserCapture\"",
 		"this.callReducer(\"memberCloseControlCode\"",
 	} {
@@ -4430,3 +4458,14 @@ func runTicketJavaScript(t *testing.T, source string) {
 		t.Fatalf("browser behavior script failed: %v\n%s", err, output)
 	}
 }
+
+// Compose production admission stages for unit boundary cases. Separate tests exercise the
+// actual WebSocket receive path, without depending on the retired page wrapper.
+const ticketFrameAdmissionTestHarness = `
+function admitTestFrame(frame) {
+  const admission = evaluateFreshFrame(frame);
+  if (!admission || !commitFrameReceipt(frame, admission)) return false;
+  commitFreshFrame(frame, admission);
+  return true;
+}
+`

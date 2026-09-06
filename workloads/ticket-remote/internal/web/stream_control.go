@@ -235,6 +235,7 @@ func (s *Server) publishRelayCurrentReport(ctx context.Context, now time.Time, r
 	}
 	backend := s.activePhoneBackend()
 	status := s.direct.streamStatus(now, s.relay.Snapshot())
+	status["pageOpenWarm"] = s.pageOpenWarmSnapshot(now)
 	status["reportReason"] = cleanStreamControlText(reason, "relay_report")
 	for key, value := range s.streamAutoRecoveryStatus(now) {
 		status[key] = value

@@ -138,8 +138,8 @@ func TestAdminViviAuthSourceUsesDirectAuthoritativeStateWithoutBrowserPersistenc
 		"if (!connectionIsCurrent()) return",
 		"ownerViviConnectionEventAllowed",
 		"redetectAfterLogin = false",
-		"version: redetectAfterLogin ? 4 : 3",
-		`this.callReducer("ownerRequestViviReauthLogoutLogin"`,
+		`redetectAfterLogin ? "vivi_logout_login_redetect" : "vivi_logout_login"`,
+		`this.requestPhoneCommand(requestId,`,
 	} {
 		if !strings.Contains(clientSource, required) {
 			t.Fatalf("Spacetime client connection-generation fence missing %q", required)

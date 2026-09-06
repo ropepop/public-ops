@@ -1,3 +1,4 @@
+import * as phoneControlCore from './phone-control-core.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -22,6 +23,90 @@ function writeUint64(view, offset, value) {
   view.setUint32(offset, Number(numeric >> 32n));
   view.setUint32(offset + 4, Number(numeric & 0xffffffffn));
 }
+
+test('closing an HDR code result reuses the healthy live renderer and rejects stale seeds', () => {
+  const helper = between('  function resumeClientHDRAfterControlCodeResult() {',
+    '  function clearControlCodeRequestLocalState(reason) {');
+  for (const [active, fresh, expected] of [
+    [true, true, ['offer']], [true, false, ['offer', 'stale']],
+    [false, true, ['recover']],
+  ]) {
+    const events = [];
+    const context = vm.createContext({
+      experimentalClientHDRController: {
+        snapshot: () => ({ active }), markSDRStale: () => events.push('stale'),
+      },
+      offerCurrentSDRFrameToClientHDR: () => { events.push('offer'); return fresh; },
+      beginExperimentalMediaForegroundRecovery: () => events.push('recover'),
+    });
+    vm.runInContext(`${helper}\nresumeClientHDRAfterControlCodeResult();`, context);
+    assert.deepEqual(events, expected);
+  }
+});
+
+test('reconnect abandons an unresolved clock refresh and ignores late replies from the old socket', async () => {
+  const start = spacetimeClientSource.indexOf('class TicketSpacetimeClient {');
+  const end = spacetimeClientSource.indexOf('(window as any).TicketSpacetime =', start);
+  const compiled = transformSync(spacetimeClientSource.slice(start, end) +
+    '\nglobalThis.Client = TicketSpacetimeClient;', { loader: 'ts', target: 'es2022' }).code;
+  let monotonic = 100;
+  const row = { ticketId: 'test-ticket', ownerPublicId: 'test-owner', serverAt: '2026-09-06T12:00:00Z' };
+  const context = vm.createContext({
+    window: { clearTimeout }, performance: { now: () => monotonic },
+    tableRows: (rows) => rows, tableAccessor: (db) => db.rows,
+    rowTicketId: (candidate) => candidate.ticketId, accountPublicId: () => 'test-owner',
+  });
+  vm.runInContext(compiled, context);
+  const client = new context.Client({ ticketId: 'test-ticket', email: 'test@example.invalid' }, {});
+  const pending = [];
+  client.callReducer = () => new Promise((resolve) => pending.push(resolve));
+  let publications = 0;
+  client.publishFocusedState = () => { publications++; };
+  client.conn = { db: { rows: [row] }, disconnect() {} };
+  client.connected = true;
+  const oldRefresh = client.refreshLimitState();
+  assert.equal(client.refreshLimitState(), oldRefresh, 'one socket coalesces its refresh');
+  client.disconnect(false);
+  assert.equal(client.controlClock, null);
+  client.conn = { db: { rows: [row] }, disconnect() {} };
+  client.connected = true;
+  const newRefresh = client.refreshLimitState();
+  assert.notEqual(newRefresh, oldRefresh, 'a lost old reply cannot lock the new connection');
+  assert.equal(pending.length, 2);
+  pending[0]();
+  await oldRefresh;
+  assert.equal(client.controlClock, null, 'old socket cannot restore clock authority');
+  assert.equal(client.controlClockRefresh, newRefresh, 'old finally cannot clear the new refresh');
+  monotonic = 150;
+  pending[1]();
+  await newRefresh;
+  assert.equal(client.controlClock.serverUpperAtReceipt, Date.parse(row.serverAt) + 50);
+  assert.equal(client.controlClockRefresh, null);
+  assert.equal(publications, 1);
+});
+
+test('visible viewer count excludes warm relay leases while retaining desired-state demand', () => {
+  const start = spacetimeClientSource.indexOf('    const reportedViewerCount =');
+  const end = spacetimeClientSource.indexOf('    this.handlers.onState?.({', start);
+  const desiredStart = spacetimeClientSource.indexOf('      streamDesired: desired ? {', end);
+  const desiredEnd = spacetimeClientSource.indexOf('      phoneCurrentReport:', desiredStart);
+  assert.ok(start >= 0 && end > start && desiredStart > end && desiredEnd > desiredStart);
+  for (const [desired, relayReport, present, expected] of [
+    [{ viewerCount: 2 }, { videoClients: 1 }, 1, 1],
+    [{ viewerCount: 2 }, { videoClients: 0 }, 0, 0],
+    [{ viewer_count: 4 }, { video_clients: 2 }, 1, 2],
+    [{ viewerCount: 4 }, null, 1, 1],
+    [{ viewerCount: 4 }, { videoClients: Number.NaN }, 2, 2],
+    [{ viewerCount: 4 }, { videoClients: -1 }, 0, 0],
+  ]) {
+    const context = vm.createContext({ desired, relayReport, viewerPresence: Array(present).fill({}) });
+    vm.runInContext(`${spacetimeClientSource.slice(start, end)}
+      globalThis.observed = { viewerCount, ${spacetimeClientSource.slice(desiredStart, desiredEnd)} };
+    `, context);
+    assert.equal(context.observed.viewerCount, expected);
+    assert.equal(context.observed.streamDesired.viewerCount, desired.viewerCount ?? desired.viewer_count);
+  }
+});
 
 function parserHarness() {
   const logs = [];
@@ -107,7 +192,9 @@ test('every uint64 field fails closed above JavaScript safe integer range', () =
 });
 
 test('valid stale receipt ACKs immediately while malformed, wrong epoch, and wrong generation do not', async () => {
-  const acceptFrame = between('function acceptFreshFrame(frame) {', '  function queueFrameMetadata(frame) {');
+  const ingressLimit = source.match(/const streamIngressFrameMaxAgeMs = (\d+);/);
+  assert.equal(Number(ingressLimit?.[1]), 3000);
+  const acceptFrame = between('function noteFramePacket(frame, now) {', '  function queueFrameMetadata(frame) {');
   const handleMessage = between('async function handleVideoSocketMessage(event) {', '  function decodeAvcFrame(frame) {');
   const context = vm.createContext({ ArrayBuffer, Number, Uint8Array, console });
   vm.runInContext(`
@@ -144,7 +231,7 @@ test('valid stale receipt ACKs immediately while malformed, wrong epoch, and wro
     let avcAdapterTried = true;
     let videoWs = null;
     const streamDecoderQueueHardLimit = 4;
-    const streamIngressFrameMaxAgeMs = 1250;
+    ${ingressLimit[0]}
     const recoveryKeyframeDebounceMs = 2000;
     const frames = [];
     const decoded = [];
@@ -182,8 +269,8 @@ test('valid stale receipt ACKs immediately while malformed, wrong epoch, and wro
   `, context);
   context.streamTest.frames.push({
     version: 'tsf3', kind: 'key', epoch: 1, sequence: 1,
-    captureStart: (1_000_000 + 100 - 1400) * 1000, uncertainty: 100_000,
-    timestamp: (1_000_000 + 100 - 1400) * 1000, data: new Uint8Array([1])
+    captureStart: (1_000_000 + 100 - 2901) * 1000, uncertainty: 100_000,
+    timestamp: (1_000_000 + 100 - 2901) * 1000, data: new Uint8Array([1])
   });
   await context.streamTest.handleVideoSocketMessage({ data: new ArrayBuffer(1) });
   assert.equal(context.streamTest.staleIngressDroppedFrames, 1);
@@ -231,9 +318,29 @@ test('valid stale receipt ACKs immediately while malformed, wrong epoch, and wro
   assert.deepEqual(Array.from(context.streamTest.resetReasons), ['decoder_queue_overflow']);
   assert.equal(context.streamTest.metadataClears, 1);
   assert.equal(context.streamTest.feedbackReceivedSequence, 3);
+  context.streamTest.decoder.decodeQueueSize = 0;
+  for (const [index, age] of [1251, 2500, 3000].entries()) {
+    const sequence = index + 4;
+    context.streamTest.frames.push({
+      version: 'tsf3', kind: 'key', epoch: 1, sequence,
+      captureStart: (1_000_000 + 100 - age + 100) * 1000, uncertainty: 100_000,
+      timestamp: (1_000_000 + 100 - age + 100) * 1000, data: new Uint8Array([sequence])
+    });
+    await context.streamTest.handleVideoSocketMessage({ data: new ArrayBuffer(1) });
+    assert.equal(context.streamTest.acceptedVisualAgeMillis, age);
+    assert.equal(context.streamTest.decoded.at(-1), sequence, `${age} ms picture must decode`);
+    assert.equal(context.streamTest.feedbackReceivedSequence, sequence);
+  }
+  assert.deepEqual(Array.from(context.streamTest.decoded), [2, 4, 5, 6]);
+  assert.equal(context.streamTest.staleIngressDroppedFrames, 1);
 });
 
 test('continuity stays available while consequential action authority fails closed', () => {
+  const freshnessLimits = ['streamLiveFreshMaxAgeMs', 'streamLiveOkMaxAgeMs', 'streamDegradedMaxAgeMs']
+    .map((name) => source.match(new RegExp(`const ${name} = ([^;]+);`)));
+  assert.ok(freshnessLimits.every(Boolean));
+  assert.deepEqual(vm.runInNewContext(`${freshnessLimits.map((match) => match[0]).join("\n")}
+    [streamLiveFreshMaxAgeMs, streamLiveOkMaxAgeMs, streamDegradedMaxAgeMs].join(",")`), "3000,3000,3000");
   const context = vm.createContext({ Number });
   vm.runInContext(`
     let now = 1100;
@@ -253,9 +360,7 @@ test('continuity stays available while consequential action authority fails clos
     let lastRenderedFrameConfigGeneration = 8;
     let feedbackRenderedSequence = 10;
     let clockCurrent = true;
-    const streamLiveFreshMaxAgeMs = 1250;
-    const streamLiveOkMaxAgeMs = 2000;
-    const streamDegradedMaxAgeMs = 3000;
+    ${freshnessLimits.map((match) => match[0]).join('\n')}
     function streamClockBoundIsCurrent() { return clockCurrent; }
     ${between('function freshnessStateForVisualAge(ageMs) {', '  function clearStreamContinuityStaleGrace() {')}
     globalThis.freshnessAPI = {
@@ -285,17 +390,24 @@ test('continuity stays available while consequential action authority fails clos
   assert.equal(fresh.continuityPresentable, true);
   assert.equal(fresh.liveLabeled, true);
   assert.equal(fresh.actionFresh, true);
+  for (const age of [1251, 2500, 3000]) {
+    context.freshnessAPI.setSourceAge(true, true, age - 100);
+    const delayed = context.freshnessAPI.currentRenderedFreshness(1100);
+    assert.equal(delayed.visualAgeMillis, age);
+    assert.equal(delayed.continuityPresentable, true);
+    assert.equal(delayed.actionFresh, true, `${age} ms picture must authorize phone actions`);
+  }
   context.freshnessAPI.setSourceAge(true, true, 1400);
   const liveOK = context.freshnessAPI.currentRenderedFreshness(1100);
-  assert.equal(liveOK.streamFreshnessState, 'LIVE_OK');
+  assert.equal(liveOK.streamFreshnessState, 'LIVE_FRESH');
   assert.equal(liveOK.continuityPresentable, true);
-  assert.equal(liveOK.liveLabeled, false);
-  assert.equal(liveOK.actionFresh, false);
+  assert.equal(liveOK.liveLabeled, true);
+  assert.equal(liveOK.actionFresh, true);
   context.freshnessAPI.setSourceAge(true, true, 2400);
   const degraded = context.freshnessAPI.currentRenderedFreshness(1100);
-  assert.equal(degraded.streamFreshnessState, 'DEGRADED');
+  assert.equal(degraded.streamFreshnessState, 'LIVE_FRESH');
   assert.equal(degraded.continuityPresentable, true);
-  assert.equal(degraded.liveLabeled, false);
+  assert.equal(degraded.liveLabeled, true);
   context.freshnessAPI.setSourceAge(true, true, 3100);
   assert.equal(context.freshnessAPI.currentRenderedFreshness(1100).continuityPresentable, false);
   context.freshnessAPI.setSourceAge(true, true, 100);
@@ -315,164 +427,6 @@ test('continuity stays available while consequential action authority fails clos
   assert.equal(context.freshnessAPI.currentRenderedFreshness(1100).actionFresh, false);
 });
 
-test('healthy one-FPS continuity permits local code intent without premature submission', async () => {
-  const context = vm.createContext({ Date, Math, Number, Promise, console });
-  vm.runInContext(`
-    let monotonicNow = 1100;
-    let wallNow = 1_800_000_000_000;
-    Date.now = () => wallNow;
-    const performance = { now: () => monotonicNow };
-    function setTimeout() { return 1; }
-    function clearTimeout() {}
-    const WebSocket = { OPEN: 1 };
-    let videoWs = { readyState: WebSocket.OPEN };
-    const classList = { add() {}, remove() {} };
-    const document = {
-      visibilityState: 'visible', fullscreenElement: null, activeElement: null,
-      body: { classList }
-    };
-    const navigator = { onLine: true };
-    const streamLiveOkMaxAgeMs = 2000;
-    const streamCurrentReportMaxAgeMs = 3500;
-    const streamCurrentReportMaxSequenceLag = 4;
-    const configured = true;
-    function streamClockBoundIsCurrent() { return currentFreshness.clockBoundCurrent; }
-    let idleDisconnected = false;
-    let streamUnsupported = false;
-    let serverClockSkewMs = 0;
-    let lastDecoderConfig = {
-      frameEnvelope: 'tsf3', frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1,
-      keyframeIntervalFrames: 1, streamEpoch: 7
-    };
-    let lastRenderedFrameEnvelopeVersion = 'tsf3';
-    let lastRenderedFrameEpoch = 7;
-    let lastRenderedFrameSequence = 10;
-    let currentStreamEpoch = 7;
-    let activeFeedbackVersion = 2;
-    let activeFeedbackConfigGeneration = 8;
-    let lastRenderedFrameConfigGeneration = 8;
-    let feedbackRenderedSequence = 10;
-    let lastStreamStatusAt = monotonicNow;
-    let latestStreamStatus = {
-      updatedAt: new Date(wallNow - 100).toISOString(),
-      phoneDesired: true, phoneConnected: true, phoneStreamState: 'streaming',
-      activeVideoClients: 1, phoneClockBoundedCalibrated: true,
-      continuity: true, allIntraConfigValid: true, freshnessState: 'LIVE_OK', liveOKMaxAgeMillis: 2000,
-      lastFrameVisualAgeKnown: true, lastFrameVisualAgeMillis: 1250,
-      frameEnvelope: 'tsf3', frameDependencyMode: 'all_intra', fps: 1, sourceFps: 1,
-      keyframeIntervalFrames: 1, streamEpoch: 7, lastFrameSequence: 10
-    };
-    let currentFreshness = {
-      hasFrame: true, streamFreshnessState: 'LIVE_OK', visualAgeKnown: true,
-      visualAgeConservative: true, clockBoundCurrent: true, visualAgeMillis: 1400
-    };
-    let strictFresh = false;
-    let hdrReady = false;
-    let busy = false;
-    let quotaBlocked = false;
-    let sliderOverlap = false;
-    let reducerCalls = 0;
-    let codeDialogOpen = false;
-    let controlCodeSubmitInFlight = false;
-    let pendingBrowserAction = null, browserActionContextRevision = 0, codeInputRevision = 0;
-    let pendingControlCodeBaselineFrameFingerprint = null;
-    const localPublicID = 'member';
-    const canvas = {};
-    const codeDialog = { hidden: true };
-    const codeResultArea = { hidden: true };
-    const codeError = { textContent: '' };
-    const codeDigits = { value: '42', focus() {} };
-    const codeSubmit = { disabled: false, textContent: '', setAttribute() {}, removeAttribute() {} };
-    const requestCodeButton = { disabled: false };
-    const controlCodeHotspot = { disabled: false, setAttribute() {} };
-    function freshStreamStatus(now) {
-      if (!latestStreamStatus || now - lastStreamStatusAt > streamCurrentReportMaxAgeMs) return null;
-      return latestStreamStatus;
-    }
-    function streamClockServerUpperAt() { return wallNow * 1000; }
-    function currentRenderedFreshness() { return currentFreshness; }
-    function streamHasFreshRenderedFrame() { return strictFresh; }
-    function clientHDRConsequentialControlProofReady() { return hdrReady; }
-    function revealAuthoritativeSDRForConsequentialControl() { return strictFresh && hdrReady; }
-    function controlCodeMutationLaneBusy() { return busy; }
-    const currentState = {}, ticketSliderVisualRevision = 0;
-    const spacetimeStateFresh = true;
-    function ticketActionV3StreamSnapshot() { return { epoch: 7, configGeneration: 8 }; }
-    function renderTicketActionV3Controls() { reconcilePendingBrowserAction(); updateControlCodeSubmitAvailability(); }
-    function ticketActionV3LocalRequestIsBusy() { return false; }
-    let ticketActionV3LastUserMessage = '';
-    ${between('function browserActionContext() {', '  function currentBrowserSwitchAction() {')}
-    function memberLimitBlocked() { return quotaBlocked; }
-    function ticketRegisterOverlayOccupiesHotspot() { return sliderOverlap; }
-    function sanitizeControlDigits(value) { return String(value || '').replace(/\\D/g, ''); }
-    function renderControlCodeFastStateDataset() {}
-    function setStatus() {}
-    function lockControlCodeDialogScroll() {}
-    function updateViewportVars() {}
-    function resizeCanvasBox() {}
-    function controlCodeFastRevisionForRequest() { return ''; }
-    function canvasRegionFingerprint() { return 'fingerprint'; }
-    function controlCodeFingerprintRegion() { return {}; }
-    function clientLog() {}
-    function localizePublicMessage(value) { return value; }
-    function renderControlCodeRequest() {}
-    function closeControlCodeDialog() { codeDialogOpen = false; codeDialog.hidden = true; }
-    function runSpacetimeMutation(callback) {
-      callback({ requestControlCode(_digits, _revision, beforeSubmit) { beforeSubmit(); reducerCalls += 1; } });
-      return Promise.resolve();
-    }
-    ${between('function healthyOneFPSVisualContinuity(freshness, now) {', '  function lastRenderedVisualAge(now) {')}
-    ${between('function openControlCodeDialog() {', '  function closeControlCodeDialog() {')}
-    ${between('function requestControlCodeFromHotspot(event) {', '  async function submitControlCodeRequest() {')}
-    ${between('async function submitControlCodeRequest() {', '  async function closeCurrentControlCode(openNext) {')}
-    ${between('function updateControlCodeSubmitAvailability() {', '  function reconnectVideoForRecovery(reason) {')}
-    globalThis.holdoverAPI = {
-      healthyOneFPSVisualContinuity, controlCodeDialogEntryReady, openControlCodeDialog,
-      requestControlCodeFromHotspot, submitControlCodeRequest, updateControlCodeSubmitAvailability,
-      resetDialog() { codeDialogOpen = false; codeDialog.hidden = true; },
-      cancelPending() { cancelPendingBrowserAction('fixture_cancel'); },
-      setFreshness(value) { currentFreshness = { ...currentFreshness, ...value }; },
-      setStrict(value) { strictFresh = value; hdrReady = value; },
-      setDigits(value) { codeDigits.value = value; },
-      setStatusField(key, value) { latestStreamStatus[key] = value; },
-      setReportAge(age) { latestStreamStatus.updatedAt = new Date(wallNow - age).toISOString(); },
-      setLocalField(key, value) {
-        if (key === 'videoOpen') videoWs.readyState = value ? WebSocket.OPEN : 3;
-        if (key === 'epoch') lastRenderedFrameEpoch = value;
-        if (key === 'sequence') lastRenderedFrameSequence = value;
-      },
-      controls() { return { requestDisabled: requestCodeButton.disabled, hotspotDisabled: controlCodeHotspot.disabled, submitDisabled: codeSubmit.disabled, dialogOpen: codeDialogOpen }; },
-      reducerCalls: () => reducerCalls
-    };
-  `, context);
-
-  const api = context.holdoverAPI;
-  for (const visualAgeMillis of [1251, 1400, 1999]) {
-    api.setFreshness({ visualAgeMillis });
-    assert.equal(api.healthyOneFPSVisualContinuity(), true, `healthy jitter age ${visualAgeMillis} lost continuity`);
-  }
-  api.setReportAge(3000);
-  assert.equal(api.healthyOneFPSVisualContinuity(), true, 'current durable report interval caused a between-frame flap');
-  api.setReportAge(100);
-  api.setFreshness({ visualAgeMillis: 1400 });
-  api.updateControlCodeSubmitAvailability();
-  assert.deepEqual({ ...api.controls() }, { requestDisabled: false, hotspotDisabled: false, submitDisabled: true, dialogOpen: false });
-  assert.equal(api.openControlCodeDialog(), true);
-  api.resetDialog();
-  assert.equal(api.requestControlCodeFromHotspot({ preventDefault() {}, stopPropagation() {} }), true);
-  assert.equal(await api.submitControlCodeRequest(), false);
-  assert.equal(api.reducerCalls(), 0, 'LIVE_OK dialog entry reached the reducer');
-
-  api.cancelPending();
-  api.setStrict(true);
-  api.setDigits('42');
-  api.setFreshness({ streamFreshnessState: 'LIVE_FRESH', visualAgeMillis: 100 });
-  api.updateControlCodeSubmitAvailability();
-  assert.equal(api.controls().submitDisabled, false, `fresh exact proof did not restore submit: ${JSON.stringify(api.controls())}`);
-  await api.submitControlCodeRequest();
-  assert.equal(api.reducerCalls(), 1, 'fresh recovery did not produce exactly one reducer call');
-});
-
 function deferredAdmissionHarness() {
   const clientMethod = (start, end) => {
     const from = spacetimeClientSource.indexOf(start);
@@ -484,12 +438,12 @@ function deferredAdmissionHarness() {
     cfg = { ticketId: 'synthetic-ticket', sessionId: 'synthetic-session' };
     backendId() { return 'synthetic-backend'; }
     whenLive() { reachedLiveWait(); return liveConnection; }
-    reducer(name) { return (args) => calls.push(name === 'memberRequestControlCode' ? 'control_code' : args.target); }
+    reducer(name) { return (args) => calls.push(args.operation); }
     ${clientMethod('  requestControlCode(digits:', '  recordActivityTick()')}
     ${clientMethod('  requestTicketActionV3(args:', '  scheduleTicketActionV3(args:')}
     ${clientMethod('  private async callReducer(name:', '  private streamAction(name:')}
   }`, { loader: 'ts', target: 'es2022' }).code;
-  const context = vm.createContext({ ...ticketActionCore, Date, Math, Number, Promise });
+  const context = vm.createContext({ ...ticketActionCore, ...phoneControlCore, crypto: { randomUUID: () => "synthetic-uuid" }, Date, Math, Number, Promise });
   vm.runInContext(`
     let now = 1000;
     const performance = { now: () => now };
@@ -511,7 +465,7 @@ function deferredAdmissionHarness() {
     let lastRenderedFrameRenderedAt = now;
     let lastRenderedFrameVisualAgeKnown = true;
     let lastRenderedFrameVisualAgeConservative = true;
-    let lastRenderedFrameVisualAgeMillis = 1200;
+    let lastRenderedFrameVisualAgeMillis = 2950;
     let lastRenderedFrameReceivedAt = now;
     let lastRenderedFrameQueuedAt = now;
     let lastRenderedFrameEpoch = 7;
@@ -521,7 +475,7 @@ function deferredAdmissionHarness() {
     let activeFeedbackConfigGeneration = 8;
     let lastRenderedFrameConfigGeneration = 8;
     let feedbackRenderedSequence = 10;
-    const streamLiveFreshMaxAgeMs = 1250;
+    ${source.match(/const streamLiveFreshMaxAgeMs = (\d+);/)[0]}
     const streamLiveOkMaxAgeMs = 2000;
     const streamDegradedMaxAgeMs = 3000;
     let clockCurrent = true;
@@ -539,6 +493,11 @@ function deferredAdmissionHarness() {
     let ticketSliderVisualRevision = 0;
     const expiresAt = new Date(Date.now() + 60_000).toISOString();
     const currentState = {
+      controlClock: { serverUpperAtReceipt: Date.now(), receivedMonotonic: now, receivedWall: Date.now() },
+      phoneControlState: { sessionId: 'pc-test', sessionGeneration: '1', contextRevision: 'pc-test:1',
+        view: 'unactivated_detail', ready: true, busy: false, observedAt: new Date(Date.now() - 1).toISOString(),
+        expiresAt: new Date(Date.now() + 2999).toISOString(), leftBasisPoints: 1000, topBasisPoints: 2000,
+        rightBasisPoints: 9000, bottomBasisPoints: 3000 },
       ticketAction: { actionId: 'proved-ticket', target: 'prove_current', status: 'succeeded',
         currentView: 'latest_unactivated', streamEpoch: 7, frameSequence: 10, expiresAt },
       ticketSliderRegion: { proofActionId: 'proved-ticket', streamEpoch: 7, frameSequence: 10,
@@ -585,7 +544,7 @@ function deferredAdmissionHarness() {
     ${between('function streamHasFreshRenderedFrame() {', '  function safeResumeLabel(value, fallback) {')}
     ${between('function freshnessStateForVisualAge(ageMs) {', '  function healthyOneFPSVisualContinuity(freshness, now) {')}
     ${between('function lastRenderedVisualAge(now) {', '  function clearStreamContinuityStaleGrace() {')}
-    ${between('async function runSpacetimeMutation(action, reason) {', '  function userActivityTickEligible() {')}
+    ${between('async function runSpacetimeMutation(action) {', '  function userActivityTickEligible() {')}
     ${between('async function submitControlCodeRequest() {', '  async function closeCurrentControlCode(openNext) {')}
     ${between('function ticketActionV3Id() {', '  function suppressTicketRegisterSliderChangeForPointerEvent() {')}
     ${between('async function requestTicketActionV3(target, source, reason, expectedInteractionRevision', '  function selectServerClockSample(state) {')}
@@ -605,9 +564,9 @@ function deferredAdmissionHarness() {
       expireClock() { clockCurrent = false; },
       loseHDRProof() { hdrExact = false; },
       loseState() { spacetimeStateFresh = false; },
-      changeTicket() { currentState.ticketAction = { ...currentState.ticketAction, actionId: 'different-ticket' }; },
-      expireTicketProof() { currentState.ticketAction.expiresAt = new Date(Date.now() - 1).toISOString(); },
-      changeRegion() { currentState.ticketSliderRegion.leftBasisPoints += 1; },
+      changeTicket() { currentState.phoneControlState.contextRevision = 'pc-test:2'; },
+      expireTicketProof() { currentState.phoneControlState.expiresAt = new Date(Date.now() - 1).toISOString(); },
+      changeRegion() { currentState.phoneControlState.leftBasisPoints += 1; },
       resize() { ticketSliderLayoutRevision += 1; },
       changeVisual() { ticketSliderVisualRevision += 1; },
       submit(target) {
@@ -630,7 +589,7 @@ function deferredAdmissionHarness() {
   return context.admission;
 }
 
-test('phone-changing submissions recheck 1.25-second and exact HDR authority after connection awaits', async () => {
+test('video and HDR changes during connection waits cannot delay commands authorized by phone state', async () => {
   const targets = ['control_code', 'register_current', 'open_latest_and_register',
     'show_recent_activated', 'return_to_latest_unactivated', 'pointer_slider', 'keyboard_slider'];
   for (const target of targets) {
@@ -647,26 +606,24 @@ test('phone-changing submissions recheck 1.25-second and exact HDR authority aft
         api[invalidation]();
         api.connect();
         await pending;
-        assert.deepEqual(Array.from(api.calls()), [], `${label} was admitted`);
-        assert.equal(api.latched(), false, `${label} retained its local latch`);
-        assert.ok(api.error(), `${label} was silently rejected`);
+        assert.deepEqual(Array.from(api.calls()), [target.endsWith('_slider') ? 'register_current' : target], label);
       }
     }
     const api = deferredAdmissionHarness();
     const pending = api.submit(target);
     api.reachBoundary();
-    assert.equal(api.age(), 1250);
+    assert.equal(api.age(), 3000);
     api.connect();
     await pending;
     assert.deepEqual(Array.from(api.calls()), [target.endsWith('_slider') ? 'register_current' : target],
-      `${target} did not admit exactly once at the existing 1250 ms boundary`);
+      `${target} did not admit exactly once at the 3000 ms boundary`);
   }
 });
 
 test('registration rechecks the original ticket and completed slider proof after connection awaits', async () => {
   for (const target of ['register_current', 'pointer_slider', 'keyboard_slider']) {
     const invalidations = ['changeTicket', 'expireTicketProof', 'loseState'];
-    if (target.endsWith('_slider')) invalidations.push('changeRegion', 'resize', 'changeVisual');
+    if (target.endsWith('_slider')) invalidations.push('changeRegion', 'resize');
     for (const waitStage of ['page_connect', 'client_live']) {
       for (const invalidation of invalidations) {
         const api = deferredAdmissionHarness();
@@ -687,8 +644,8 @@ test('registration rechecks the original ticket and completed slider proof after
   }
 });
 
-test('non-activating opening and automatic proof retain their existing admission policy', async () => {
-  for (const target of ['open_latest_unactivated', 'redetect_latest', 'prove_current']) {
+test('explicit non-activating opening works without a fresh picture', async () => {
+  for (const target of ['open_latest_unactivated', 'redetect_latest']) {
     const api = deferredAdmissionHarness();
     const pending = api.submit(target);
     api.expireFrame();
@@ -714,6 +671,9 @@ test('one-FPS status and recovery paths keep the spinner calm between real frame
     }
     function clearTimeout(id) { timers.delete(id); }
     let streamActionFreshnessExpiryTimer = null;
+    let phoneControlExpiryTimer = null;
+    function currentPhoneControlTime() { return wallNow; }
+    function currentPhoneControlReady() { return true; }
     let streamClockBoundAt = monotonicNow;
     const streamClockBoundMaxAgeMs = 15000;
     const WebSocket = { OPEN: 1 };
@@ -724,7 +684,7 @@ test('one-FPS status and recovery paths keep the spinner calm between real frame
     const startStreamButton = { hidden: true };
     const emptyState = { hidden: true };
     const document = { visibilityState: 'visible', body: { dataset: {} } };
-    const streamLiveFreshMaxAgeMs = 1250;
+    ${source.match(/const streamLiveFreshMaxAgeMs = (\d+);/)[0]}
     const streamLiveOkMaxAgeMs = 2000;
     const streamDegradedMaxAgeMs = 3000;
     const streamCurrentReportMaxAgeMs = 3500;
@@ -925,9 +885,9 @@ test('one-FPS status and recovery paths keep the spinner calm between real frame
       assert.equal(freshness.visualAgeMillis, 700 + sampleAt);
       assert.equal(status.lastFrameVisualAgeMillis, freshness.visualAgeMillis);
       assert.equal(status.freshnessState, freshness.streamFreshnessState);
-      assert.equal(status.streamVerdict, sampleAt <= 550 ? 'live' : 'stale_recovering');
+      assert.equal(status.streamVerdict, 'live');
       assert.equal(api.dialogEntryReady(), true, `passive entry closed at ${sampleAt} ms of ${interval} ms interval`);
-      assert.equal(freshness.actionFresh, sampleAt <= 550,
+      assert.equal(freshness.actionFresh, true,
         `strict action authority was wrong at ${sampleAt} ms of ${interval} ms interval`);
       assert.equal(api.sampleEveryPath(), '',
         `spinner flapped at ${sampleAt} ms of ${interval} ms frame interval`);
@@ -948,12 +908,12 @@ test('one-FPS status and recovery paths keep the spinner calm between real frame
   api.advance(100);
   assert.equal(api.controls().register, false, 'clock authority ended before its inclusive deadline');
   api.advance(1);
-  assert.equal(api.controls().register, true, 'clock expiry did not revoke the enabled controls');
+  assert.equal(api.controls().register, false, 'media clock expiry must not revoke phone authority');
   assert.equal(api.timers(), 0);
   api.recalibrateClock();
   assert.equal(api.controls().register, false, 'new clock authority did not refresh a still-fresh picture');
   api.invalidateConfiguration();
-  assert.equal(api.controls().register, true);
+  assert.equal(api.controls().register, false);
   assert.equal(api.timers(), 0, 'configuration invalidation retained a frame expiry timer');
   api.restoreConfiguration();
   assert.equal(api.controls().register, false);
@@ -976,10 +936,10 @@ test('one-FPS status and recovery paths keep the spinner calm between real frame
   assert.equal(api.spinnerHidden(), false,
     'durable business clock skew masked a relay report older than its fixed TTL');
   api.losePictureTiming();
-  assert.equal(api.controls().register, true, 'unknown picture timing left registration enabled');
+  assert.equal(api.controls().register, false, 'unknown video timing must not revoke phone authority');
   assert.equal(api.timers(), 0, 'unknown picture timing retained its previous expiry timer');
   api.clearPicture();
-  assert.equal(api.controls().register, true, 'reset picture retained registration authority');
+  assert.equal(api.controls().register, false, 'video reset must not revoke phone authority');
   assert.equal(api.timers(), 0);
 });
 
@@ -1089,7 +1049,6 @@ test('feedback v2 contract and clock interval execute with exact wire semantics'
     let lastAcceptedFrameConfigGeneration = 0;
     let lastDecodedFrameConfigGeneration = 0;
     let lastRenderedFrameConfigGeneration = 0;
-    let lastPresentedFrameConfigGeneration = 0;
     let controlCodeResultPriorityPhase = '';
     let controlCodeResultPriorityConfigGeneration = 0;
     let controlCodeResultPriorityEpoch = 0;
@@ -1187,7 +1146,6 @@ test('presented sequence is result-only and remains bound to exact config and ep
     let activeFeedbackVersion = 2;
     let activeFeedbackConfigGeneration = 5;
     let currentStreamEpoch = 7;
-    let lastPresentedFrameConfigGeneration = 0;
     let feedbackRenderedSequence = 12;
     let feedbackPresentedSequence = 0;
     let priorityClearCount = 0;
@@ -1198,7 +1156,7 @@ test('presented sequence is result-only and remains bound to exact config and ep
     ${between('function commitControlCodeFeedbackPresentation(proof) {', '  function renderDecodedFrame(frame, source) {')}
     globalThis.presentationAPI = {
       commitControlCodeFeedbackPresentation,
-      state() { return { feedbackPresentedSequence, lastPresentedFrameConfigGeneration,
+      state() { return { feedbackPresentedSequence,
         feedbackReasons: [...feedbackReasons], priorityClearCount }; },
       changeGeneration(value) { activeFeedbackConfigGeneration = value; },
       changeVersion(value) { activeFeedbackVersion = value; }
@@ -1212,7 +1170,6 @@ test('presented sequence is result-only and remains bound to exact config and ep
   }), true);
   assert.deepEqual(JSON.parse(JSON.stringify(context.presentationAPI.state())), {
     feedbackPresentedSequence: 12,
-    lastPresentedFrameConfigGeneration: 5,
     feedbackReasons: ['control_code_result_presented'],
     priorityClearCount: 1
   });
@@ -1221,7 +1178,7 @@ test('presented sequence is result-only and remains bound to exact config and ep
   assert.equal(context.presentationAPI.commitControlCodeFeedbackPresentation({
     candidateFrameEpoch: 7, candidateFrameSequence: 13, candidateFrameConfigGeneration: 5
   }), false);
-  assert.equal(context.presentationAPI.state().lastPresentedFrameConfigGeneration, 5);
+  assert.equal(context.presentationAPI.state().feedbackPresentedSequence, 12);
   context.presentationAPI.changeVersion(1);
   assert.equal(context.presentationAPI.commitControlCodeFeedbackPresentation({}), true);
   assert.equal(context.presentationAPI.state().feedbackPresentedSequence, 12);
@@ -1657,14 +1614,12 @@ test('browser-local failure cannot trigger shared source recovery without indepe
   });
 });
 
-test('source keeps exact HDR/action gates and local-only browser recovery ownership', () => {
+test('source keeps media freshness separate from controls and recovery local to the browser', () => {
   assert.match(source, /function streamHasContinuityFrame\(\) \{\s*return currentRenderedFreshness\(performance\.now\(\)\)\.continuityPresentable;/);
   assert.match(source, /function streamHasFreshRenderedFrame\(\) \{\s*return currentRenderedFreshness\(performance\.now\(\)\)\.actionFresh;/);
   assert.match(source, /const presentationContinuity = streamPresentationContinuity\(freshness, reason\);\s*const presentationLive = freshness\.liveLabeled;/);
   assert.match(source, /document\.body\.dataset\.streamLive = presentationLive \? 'true' : 'false';\s*document\.body\.dataset\.streamContinuity = presentationContinuity \? 'true' : 'false';/);
-  assert.match(source, /function revealAuthoritativeSDRForConsequentialControl\(\) \{\s*if \(!streamHasFreshRenderedFrame\(\)\) return false;/);
   assert.match(source, /freshness\.actionFresh && epoch > 0 && sequence > 0 && presentationOrdinal > 0/);
-  assert.match(source, /experimentalClientHDRController\.ensureExactProof\(stream\.epoch, stream\.sequence\)/);
   assert.match(source, /if \(!recoveryStatus \|\|\s*\(!backendLooksRecoverable\(recoveryStatus\) && !streamStatusStale\(recoveryStatus\)\)\) return false;/);
   assert.match(source, /if \(staleIngressFlowing\) \{[\s\S]*return;\s*\}/);
   assert.match(source, /activeFeedbackVersion === 2 && configGeneration !== activeFeedbackConfigGeneration/);
@@ -1800,7 +1755,7 @@ test('actual startup SDR seed and next decoded frame keep one HDR config generat
   controller.dispose('test_complete');
 });
 
-test('control-code reserved media suppresses only local watchdog recovery within its exact bounds', () => {
+test('control-code arm keeps stream recovery active and only marked result delivery has bounded suppression', () => {
   const watchdog = between('function chaseLiveStream() {', '\n\t  function recoverAfterVisibilityResume(reason) {');
   const priorityGuard = between('function controlCodeMediaReadSuppressed(now) {', '  function reportDecoderError(error, mode) {');
   const context = vm.createContext({ Date, JSON, Number });
@@ -1892,7 +1847,18 @@ test('control-code reserved media suppresses only local watchdog recovery within
     ${watchdog}
     globalThis.reservedWatchdog = {
       chaseLiveStream,
+      suppressed: () => controlCodeMediaReadSuppressed(now),
       state: () => ({ keyframes, decoderResets, reconnects, serverRecoveries, clears }),
+      resetRecoveryCounts() { keyframes = 0; decoderResets = 0; reconnects = 0; serverRecoveries = 0; clears = 0; },
+      queued() { codeRequest = { ...codeRequest, status: 'queued' }; },
+      freshPicture(interval) {
+        now += interval; serverNow += interval;
+        lastDecodedFrameAt = now - 700; lastPacketAt = now; lastPacketSequenceAdvancedAt = now;
+        latestStreamStatus = { ...latestStreamStatus, lastFrameAgoMillis: 0,
+          updatedAt: new Date(serverNow - 100).toISOString() };
+      },
+      stalledPicture() { lastDecodedFrameAt = now - 9000; lastPacketAt = now - 9000;
+        lastPacketSequenceAdvancedAt = now - 9000; },
       startup() { lastDecodedFrameAt = 0; lastPacketAt = 0; lastPacketSequenceAdvancedAt = 0; },
       decoded() { lastDecodedFrameAt = 10_000; lastPacketAt = 10_000; lastPacketSequenceAdvancedAt = 10_000; },
       failBackend() { latestStreamStatus = { ...latestStreamStatus, phoneConnected: false,
@@ -1948,6 +1914,31 @@ test('control-code reserved media suppresses only local watchdog recovery within
   `, context);
 
   const api = context.reservedWatchdog;
+  for (const status of ['queued', 'running']) {
+    api.activate();
+    if (status === 'queued') api.queued();
+    for (const interval of [950, 1000, 1050, 1100]) {
+      for (let frame = 0; frame < 5; frame += 1) {
+        api.freshPicture(interval);
+        assert.equal(api.suppressed(), false, `${status} arm still paused ordinary watchdog recovery`);
+        api.chaseLiveStream();
+        assert.deepEqual(JSON.parse(JSON.stringify(api.state())), {
+          keyframes: 0, decoderResets: 0, reconnects: 0, serverRecoveries: 0, clears: 0
+        }, `${status} healthy pictures caused recovery or destroyed the armed marker`);
+      }
+    }
+    api.stalledPicture();
+    api.chaseLiveStream();
+    assert.deepEqual(JSON.parse(JSON.stringify(api.state())), {
+      keyframes: 1, decoderResets: 1, reconnects: 1, serverRecoveries: 0, clears: 0
+    }, `${status} arm blocked recovery from a real local stall`);
+    api.startup();
+    api.chaseLiveStream();
+    assert.equal(api.state().keyframes, 2, `${status} arm blocked replacement-decoder recovery`);
+    api.resetRecoveryCounts();
+  }
+  api.decoded();
+  api.mark();
   api.chaseLiveStream();
   assert.deepEqual(JSON.parse(JSON.stringify(api.state())), {
     keyframes: 0, decoderResets: 0, reconnects: 0, serverRecoveries: 0, clears: 0
@@ -2117,7 +2108,7 @@ test('pre-first-decoded stale ingress does not churn the decoder or socket', () 
   assert.equal(context.watchdog.state().reconnects, 1);
 });
 
-test('a changed HDR boost survives page expiry between one-second pictures without gaining stale authority', async () => {
+test('HDR boost stays fresh between one-second pictures and loses authority after three seconds', async () => {
   async function fixture(options = {}) {
     let clock = 20000;
     let context;
@@ -2220,7 +2211,7 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
       const activeResumeFlow = null;
       const currentState = null;
       let streamActionFreshnessExpiryTimer = null;
-      const streamLiveFreshMaxAgeMs = 1250;
+      ${source.match(/const streamLiveFreshMaxAgeMs = (\d+);/)[0]}
       const streamLiveOkMaxAgeMs = 2000;
       const streamDegradedMaxAgeMs = 3000;
       const streamCurrentReportMaxAgeMs = 3500;
@@ -2287,7 +2278,7 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
           if (kind === 'hidden') document.visibilityState = 'hidden';
           if (kind === 'result') resultFrozen = true;
           if (kind === 'busy') busy = true;
-          if (kind === 'old_picture') lastRenderedFrameVisualAgeMillis = 2100;
+          if (kind === 'old_picture') lastRenderedFrameVisualAgeMillis = 3001;
           if (kind === 'missing_status') status = null;
           if (kind === 'old_status') status.updatedAt = String(Date.now() - 4000);
         },
@@ -2321,22 +2312,23 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
     const initial = state.controller.snapshot();
     for (let frame = 0; frame < 5; frame += 1) {
       const presentations = state.presents();
+      const frameTransitions = state.controller.snapshot().surfaceTransitions;
       let elapsed = 0;
       for (const sampleAt of [0, 250, 550, 551, 700, interval - 1]) {
         await state.advance(sampleAt - elapsed);
         elapsed = sampleAt;
         state.api.update();
         const snapshot = state.controller.snapshot();
-        const fresh = sampleAt <= 550;
+        const fresh = 700 + sampleAt <= 3000;
         assert.equal(state.api.freshness().visualAgeMillis, 700 + sampleAt);
         assert.equal(state.api.freshness().actionFresh, fresh,
-          `${interval}/${frame}/${sampleAt}: picture authority exceeded 1250 ms`);
+          `${interval}/${frame}/${sampleAt}: picture authority exceeded 3000 ms`);
         assert.equal(snapshot.proofFresh, fresh);
         assert.equal(state.controller.ensureExactProof(snapshot.epoch, snapshot.sequence), fresh,
           `${interval}/${frame}/${sampleAt}: held HDR authorized exact proof`);
         assert.equal(snapshot.surfaceVisible, true,
           `${interval}/${frame}/${sampleAt}: healthy expiry hid the HDR canvas`);
-        assert.equal(snapshot.surfaceTransitions, initial.surfaceTransitions,
+        assert.equal(snapshot.surfaceTransitions, frameTransitions,
           `${interval}/${frame}/${sampleAt}: healthy cadence switched HDR/SDR surfaces`);
         assert.equal(snapshot.rendererGeneration, initial.rendererGeneration);
         assert.equal(state.presents(), presentations, 'expiry redrew the retained picture');
@@ -2347,61 +2339,38 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
       await state.settle();
       assert.equal(state.controller.snapshot().surfaceVisible, true);
       assert.equal(state.controller.snapshot().proofFresh, true);
-      assert.equal(state.controller.snapshot().surfaceTransitions, initial.surfaceTransitions);
     }
     state.controller.dispose('test_complete');
   }
 
-  for (const interval of [950, 1000, 1050, 1100]) {
-    const state = await fixture();
-    // Choose once during the expired-but-healthy interval, as in the live failure.
-    await state.advance(700);
-    assert.equal(state.api.freshness().actionFresh, false);
-    state.api.choose(2);
-    assert.equal(state.controller.snapshot().fallbackKind, 'refresh');
-    state.api.update();
-    assert.equal(state.api.seed(), false, 'expired source cannot authorize a boost redraw');
-    await state.advance(interval - 700);
-    assert.equal(state.api.next(), true);
-    await state.settle();
-    assert.equal(state.controller.snapshot().surfaceVisible, true, `${interval} ms: boost stayed on SDR`);
-    assert.equal(state.controller.snapshot().selectedDisplayBoost, 2);
-    assert.equal(state.controller.snapshot().presentationState, 'visible');
-    assert.ok(state.metrics.some(({ event, detail }) => event === 'presented' && detail.selectedDisplayBoost === 2));
-    for (let sample = 0; sample < 4; sample += 1) {
-      await state.advance(551);
-      assert.equal(state.api.freshness().actionFresh, false);
-      assert.equal(state.controller.snapshot().proofFresh, false);
-      assert.equal(state.api.seed(), false);
-      await state.advance(interval - 551);
-      state.api.next(); await state.settle();
-      assert.equal(state.controller.snapshot().presentationState, 'visible');
-    }
-    state.controller.dispose('test_complete');
-  }
+  const expiring = await fixture();
+  await expiring.advance(2300);
+  assert.equal(expiring.api.freshness().visualAgeMillis, 3000);
+  assert.equal(expiring.api.freshness().actionFresh, true);
+  assert.equal(expiring.controller.snapshot().proofFresh, true);
+  await expiring.advance(1);
+  assert.equal(expiring.api.freshness().visualAgeMillis, 3001);
+  assert.equal(expiring.api.freshness().actionFresh, false);
+  assert.equal(expiring.controller.snapshot().proofFresh, false);
+  assert.equal(expiring.api.seed(), false, 'expired picture authorized HDR redraw');
+  expiring.api.next(); await expiring.settle();
+  assert.equal(expiring.controller.snapshot().proofFresh, true);
+  expiring.controller.dispose('test_complete');
 
-  for (const { stage, interval } of ['gpu', 'paint'].flatMap((stage) =>
-    [950, 1000, 1050, 1100].map((interval) => ({ stage, interval })))) {
+  for (const stage of ['gpu', 'paint']) {
     const state = await fixture();
-    await state.advance(540);
-    assert.equal(state.api.freshness().visualAgeMillis, 1240);
-    state.defer(stage);
-    state.api.choose(2);
-    await state.settle();
+    await state.advance(2290);
+    assert.equal(state.api.freshness().visualAgeMillis, 2990);
+    state.defer(stage); state.api.choose(2); await state.settle();
     const before = state.presents();
-    await state.advance(20); // The actual page timer revokes source authority at 1,251 ms.
+    await state.advance(20);
     assert.equal(state.api.freshness().actionFresh, false);
-    assert.equal(state.controller.snapshot().fallbackKind, 'refresh');
-    assert.equal(state.controller.currentSDR, null);
     state.complete(); await state.settle();
-    assert.equal(state.presents(), before, `${stage}: expired preparation changed the canvas`);
+    assert.equal(state.presents(), before, stage + ': expired preparation changed canvas');
     assert.equal(state.controller.snapshot().proofFresh, false);
-    assert.equal(state.controller.snapshot().fallbackKind, 'refresh',
-      `${stage}: expired preparation hardened the pending boost refresh`);
-    await state.advance(interval - 560);
     state.api.next(); await state.settle();
-    assert.equal(state.controller.snapshot().presentationState, 'visible',
-      `${stage}: next fresh picture did not recover the boost`);
+    state.api.next(); await state.settle(); // Hard recovery requires two fresh pictures.
+    assert.equal(state.controller.snapshot().presentationState, 'visible');
     assert.equal(state.controller.snapshot().selectedDisplayBoost, 2);
     state.controller.dispose('test_complete');
   }
@@ -2410,10 +2379,10 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
     for (const invalid of ['unknown', 'clock', 'config', 'epoch', 'disconnected', 'hidden',
       'old_picture', 'missing_status', 'old_status']) {
       const state = await fixture();
-      await state.advance(540); state.defer(stage); state.api.choose(2); await state.settle();
+      await state.advance(2290); state.defer(stage); state.api.choose(2); await state.settle();
       const before = state.presents();
       await state.advance(20); state.api.block(invalid); state.api.update();
-      assert.equal(state.controller.snapshot().fallbackKind, 'hard');
+      assert.equal(state.controller.snapshot().fallbackKind, 'hard', `${stage}/${invalid}`);
       state.complete(); await state.settle();
       assert.equal(state.presents(), before, `${stage}/${invalid}: revoked candidate changed the canvas`);
       assert.equal(state.controller.snapshot().fallbackKind, 'hard',
@@ -2425,7 +2394,7 @@ test('a changed HDR boost survives page expiry between one-second pictures witho
 
   for (const invalid of ['unknown', 'clock', 'config', 'epoch', 'disconnected', 'hidden', 'old_picture', 'missing_status', 'old_status']) {
     const state = await fixture();
-    await state.advance(700); state.api.choose(2); state.api.block(invalid); state.api.update();
+    await state.advance(2310); state.api.choose(2); state.api.block(invalid); state.api.update();
     assert.equal(state.controller.snapshot().fallbackKind, 'hard', `${invalid} kept boost refresh authority`);
     assert.equal(state.controller.snapshot().surfaceVisible, false);
     assert.equal(state.api.seed(), false);

@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -166,5 +167,73 @@ func TestBuiltClientHDRUsesFullColorSurfaceContract(t *testing.T) {
 		if strings.Contains(built, forbidden) {
 			t.Fatalf("built browser HDR client retained obsolete handshake %q; run make web-client-build", forbidden)
 		}
+	}
+}
+
+func TestIndexBootstrapsOnlyActiveAccountHDRPreference(t *testing.T) {
+	const email = "person@example.com"
+	scope := ticketAccountScopeID(email)
+	for _, tc := range []struct {
+		name                   string
+		active, known, enabled bool
+	}{
+		{"saved on", true, true, true}, {"saved off", true, true, false},
+		{"not yet loaded", true, false, false}, {"inactive", false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTicketSetupTestServer(t, "pixel")
+			t.Cleanup(server.Close)
+			// Exercise the real index handler with an inspectable template boundary.
+			server.indexTmpl = template.Must(template.New("config").Parse("<script>{{.ConfigJSON}}</script>"))
+			snapshot := state.Snapshot{
+				Members:              []state.Member{{Email: email, Role: state.RoleMember, Active: tc.active}},
+				MemberHDRPreferences: []state.MemberHDRPreference{{AccountScopeID: "other-account", Enabled: true}},
+				MemberHDRBoosts:      []state.MemberHDRBoost{{AccountScopeID: scope, SelectedDisplayBoost: 5}},
+			}
+			if tc.known {
+				snapshot.MemberHDRPreferences = append(snapshot.MemberHDRPreferences, state.MemberHDRPreference{AccountScopeID: scope, Enabled: tc.enabled})
+			}
+			rec := httptest.NewRecorder()
+			id := auth.Identity{Email: email}
+			server.handleIndex(rec, httptest.NewRequest(http.MethodGet, "/", nil), id, "test-session", snapshot, "")
+			var cfg map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(strings.TrimSuffix(strings.TrimPrefix(rec.Body.String(), "<script>"), "</script>")), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			bootstrap, present := cfg["experimentalMediaBootstrap"]
+			if present != tc.active {
+				t.Fatalf("bootstrap presence = %v", present)
+			}
+			if !tc.active {
+				return
+			}
+			var payload struct {
+				AccountScopeID string          `json:"accountScopeId"`
+				Enabled        bool            `json:"enabled"`
+				Known          bool            `json:"preferenceKnown"`
+				Capability     json.RawMessage `json:"capability"`
+			}
+			if err := json.Unmarshal(bootstrap, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.AccountScopeID != scope || payload.Enabled != tc.enabled || payload.Known != tc.known {
+				t.Fatalf("wrong account preference: %s", bootstrap)
+			}
+			capability := httptest.NewRecorder()
+			server.handleExperimentalMediaCapability(capability, httptest.NewRequest(http.MethodGet, "/api/v1/experimental-media/capability", nil), id, "", snapshot)
+			if strings.TrimSpace(string(payload.Capability)) != strings.TrimSpace(capability.Body.String()) {
+				t.Fatal("bootstrap display contract differs from capability route")
+			}
+			if strings.Contains(rec.Body.String(), "other-account") {
+				t.Fatal("another account leaked into page config")
+			}
+			health := redactSnapshotForHealth(snapshot)
+			if len(health.MemberHDRPreferences) != 0 {
+				t.Fatal("health exposed account preferences")
+			}
+			if len(snapshot.MemberHDRPreferences) == 0 {
+				t.Fatal("health redaction mutated the original snapshot")
+			}
+		})
 	}
 }

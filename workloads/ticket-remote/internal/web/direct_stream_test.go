@@ -783,13 +783,13 @@ func TestDirectStreamDoesNotWarmStartKeyFramePastForwardAgeBudget(t *testing.T) 
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 	hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 10000))
 	hub.mu.Lock()
-	hub.lastFrameAt = time.Now().Add(-1300 * time.Millisecond)
+	hub.lastFrameAt = time.Now().Add(-3100 * time.Millisecond)
 	hub.lastFrameReceivedAt = hub.lastFrameAt
 	hub.mu.Unlock()
 
 	config, keyFrame := hub.warmStart()
 	if !strings.Contains(string(config), `"streamEpoch":0`) || len(keyFrame) > 0 {
-		t.Fatalf("warm start must not replay a keyframe older than the 1250ms forward budget: config=%q key=%x", string(config), keyFrame)
+		t.Fatalf("warm start must not replay a keyframe older than the 3000ms forward budget: config=%q key=%x", string(config), keyFrame)
 	}
 }
 
@@ -821,11 +821,8 @@ func TestDirectStreamReportsFreshnessStateFromVisualAge(t *testing.T) {
 		wantContinuity bool
 		wantVerdict    string
 	}{
-		{name: "fresh", visualAge: 1250 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true, wantContinuity: true, wantVerdict: "live"},
-		{name: "fresh_plus_one", visualAge: 1251 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
-		{name: "ok", visualAge: 2000 * time.Millisecond, wantFreshness: "LIVE_OK", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
-		{name: "ok_plus_one", visualAge: 2001 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
-		{name: "degraded", visualAge: 3000 * time.Millisecond, wantFreshness: "DEGRADED", wantLive: false, wantContinuity: true, wantVerdict: "stale_recovering"},
+		{name: "two_seconds", visualAge: 2000 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true, wantContinuity: true, wantVerdict: "live"},
+		{name: "fresh_boundary", visualAge: 3000 * time.Millisecond, wantFreshness: "LIVE_FRESH", wantLive: true, wantContinuity: true, wantVerdict: "live"},
 		{name: "stale", visualAge: 3001 * time.Millisecond, wantFreshness: "STALE", wantLive: false, wantContinuity: false, wantVerdict: "stale_recovering"},
 	}
 	for _, tc := range cases {
@@ -951,8 +948,8 @@ func TestDirectStreamDropsPhoneFramesPastForwardAgeBudget(t *testing.T) {
 	hub.addVideoClient()
 	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
 
-	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 8700)) {
-		t.Fatal("bridge must drop phone frames older than the 1250ms forwarding budget")
+	if hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 6900)) {
+		t.Fatal("bridge must drop phone frames older than the 3000ms forwarding budget")
 	}
 
 	snapshot := hub.snapshot(time.Now(), phone.Health{Connected: true, Desired: true, Viewers: 1, StreamState: "streaming"})
@@ -1458,4 +1455,31 @@ func newDirectTestServer(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	return server
+}
+
+func TestDirectStreamWarmCacheThreeSecondBoundary(t *testing.T) {
+	now := time.Now()
+	for _, age := range []time.Duration{2 * time.Second, 3 * time.Second, 3001 * time.Millisecond} {
+		hub := newDirectStreamHub()
+		hub.streamEpoch = 7
+		hub.lastConfig = []byte(`{"streamEpoch":7}`)
+		hub.lastFrame = []byte{1}
+		hub.lastFrameEpoch = 7
+		hub.lastFrameAt = now
+		hub.lastFrameReceivedAt = now.Add(-age)
+		hub.lastFrameVisualAgeKnown = true
+		hub.lastFrameVisualAgeMillis = 0
+		if got := hub.warmKeyFrameAllowedLocked(now); got != (age <= 3*time.Second) {
+			t.Fatalf("warm cache age %s: allowed=%t", age, got)
+		}
+	}
+}
+
+func TestDirectStreamForwardsTwoSecondOldPhoneFrame(t *testing.T) {
+	hub := newDirectStreamHub()
+	hub.addVideoClient()
+	setTestAllIntraConfig(hub, []byte(`{"type":"config","codec":"avc1.42E01E","transport":"h264-annexb","width":540,"height":1212,"rootCapture":true,"streamEpoch":7,"phoneUptimeMillis":10000}`))
+	if !hub.recordFrame(testTSF2FrameWithTimestamp(7, 1, true, 8000)) {
+		t.Fatal("bridge rejected a two-second-old frame inside the three-second forwarding budget")
+	}
 }

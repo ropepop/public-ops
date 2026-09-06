@@ -12,11 +12,11 @@ import (
 
 const (
 	liveFrameMaxAge                = 3000 * time.Millisecond
-	liveFreshMaxAge                = 1250 * time.Millisecond
-	liveOKMaxAge                   = 2000 * time.Millisecond
-	warmStartFrameFreshness        = 1250 * time.Millisecond
-	warmStartKeyFreshness          = 1250 * time.Millisecond
-	bridgeForwardFrameMaxAge       = 1250 * time.Millisecond
+	liveFreshMaxAge                = liveFrameMaxAge
+	liveOKMaxAge                   = liveFrameMaxAge
+	warmStartFrameFreshness        = liveFrameMaxAge
+	warmStartKeyFreshness          = liveFrameMaxAge
+	bridgeForwardFrameMaxAge       = liveFrameMaxAge
 	phoneClockCalibrationMaxAge    = 5 * time.Second
 	phoneClockFutureTolerance      = 250 * time.Millisecond
 	phoneClockFutureAdjustMax      = 2 * time.Second

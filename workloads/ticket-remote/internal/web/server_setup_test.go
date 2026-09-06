@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -171,6 +172,164 @@ func TestSpacetimeConnectionHooksDoNotCreateViewerPresence(t *testing.T) {
 func TestStreamPrewarmUsesBrowserSessionLease(t *testing.T) {
 	if got := streamPrewarmRelayLeaseID(" session-a "); got != "session-a" {
 		t.Fatalf("stream prewarm lease = %q, want session-a", got)
+	}
+}
+
+func TestPageOpenWarmLeaseIsIndependentOfGraceAndSocketLifetimes(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	t.Cleanup(server.Close)
+	openedAt := time.Now()
+	server.retainRelayViewerForPageOpen("session-a", openedAt, openedAt)
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Second, "video_socket_open")
+	server.releaseRelayViewerPublicOpenGrace("session-a", "stream_first_rendered_frame")
+	if got := server.relay.Snapshot().Viewers; got != 1 {
+		t.Fatalf("warm lease inflated the real session count: %d", got)
+	}
+	server.removeRelayViewer("session-a")
+	if got := server.relay.Snapshot().Viewers; got != 1 || !server.streamDemandStillPresent() {
+		t.Fatalf("socket departure cancelled page warmth: viewers=%d", got)
+	}
+	if server.releaseStreamDesiredIfNoVideoClients("test") {
+		t.Fatal("warm page lease allowed durable idle release")
+	}
+	wantDeadline := openedAt.Add(30 * time.Minute)
+	assertDeadline := func() {
+		t.Helper()
+		status := server.pageOpenWarmSnapshot(openedAt)
+		if status["retainedSessions"] != 1 || status["expiresAt"] != wantDeadline.UTC().Format(time.RFC3339Nano) {
+			t.Fatalf("warm deadline = %#v, want one session until %s", status, wantDeadline)
+		}
+	}
+	assertDeadline()
+	// Ordinary media reconnect and its first picture do not constitute a page opening.
+	server.addRelayViewer("session-a")
+	server.retainRelayViewerForPublicOpenGrace("session-a", time.Second, "video_socket_open")
+	server.releaseRelayViewerPublicOpenGrace("session-a", "stream_first_rendered_frame")
+	server.removeRelayViewer("session-a")
+	assertDeadline()
+	// A later authenticated opening extends the one timer; a late older lookup cannot shorten it.
+	newOpening := openedAt.Add(time.Minute)
+	server.retainRelayViewerForPageOpen("session-a", newOpening, newOpening)
+	wantDeadline = newOpening.Add(30 * time.Minute)
+	server.retainRelayViewerForPageOpen("session-a", openedAt, newOpening)
+	assertDeadline()
+	server.mu.Lock()
+	refs, timers := server.relayViewerRefs["session-a"], len(server.streamPrewarmTimers)
+	server.mu.Unlock()
+	if refs != 1 || timers != 1 {
+		t.Fatalf("reopening accumulated warm owners: refs=%d timers=%d", refs, timers)
+	}
+}
+
+func TestPageOpenWarmExpiryUsesOpeningDeadlineAndPreservesActiveViewer(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			server := newTicketSetupTestServer(t, "pixel")
+			t.Cleanup(server.Close)
+			if active {
+				server.addRelayViewer("session-a")
+			}
+			now := time.Now()
+			// Fresh membership completed with only 30 ms remaining from the original opening.
+			openedAt := now.Add(-streamPageOpenWarmHold + 30*time.Millisecond)
+			server.retainRelayViewerForPageOpen("session-a", openedAt, now)
+			if server.pageOpenWarmSnapshot(now)["expiresAt"] != openedAt.Add(streamPageOpenWarmHold).UTC().Format(time.RFC3339Nano) {
+				t.Fatal("membership delay reset the opening deadline")
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				server.mu.Lock()
+				remaining := len(server.streamPageOpenWarmUntil)
+				server.mu.Unlock()
+				wantViewers := 0
+				if active {
+					wantViewers = 1
+				}
+				if remaining == 0 && server.relay.Snapshot().Viewers == wantViewers {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("warm expiry retained a lease or removed the active socket: leases=%d viewers=%d", remaining, server.relay.Snapshot().Viewers)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
+	}
+	server := newTicketSetupTestServer(t, "pixel")
+	t.Cleanup(server.Close)
+	now := time.Now()
+	for _, openedAt := range []time.Time{{}, now.Add(-streamPageOpenWarmHold)} {
+		server.retainRelayViewerForPageOpen("session-a", openedAt, now)
+	}
+	if server.relay.Snapshot().Viewers != 0 || server.pageOpenWarmSnapshot(now)["retainedSessions"] != 0 {
+		t.Fatal("unknown or expired opening created a fresh warm lease")
+	}
+}
+
+func TestPageOpenWarmRenewalFencesAnAlreadyDueExpiry(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	t.Cleanup(server.Close)
+	now := time.Now()
+	server.retainRelayViewerForPageOpen("session-a", now.Add(-streamPageOpenWarmHold+20*time.Millisecond), now)
+	key := "page_open_warm:session-a"
+	// Hold the actual renewal boundary while the old timer fires. Its callback
+	// must not delete the deadline between updating it and replacing the timer.
+	func() {
+		server.startupLeaseMu.Lock()
+		defer server.startupLeaseMu.Unlock()
+		server.mu.Lock()
+		oldTimer := server.streamPrewarmTimers[key]
+		server.mu.Unlock()
+		deadline := time.Now().Add(time.Second)
+		for oldTimer.Stop() {
+			oldTimer.Reset(time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
+			if time.Now().After(deadline) {
+				t.Fatal("old expiry did not become due")
+			}
+		}
+		server.mu.Lock()
+		retained := server.streamPrewarmTimers[key] == oldTimer && !server.streamPageOpenWarmUntil["session-a"].IsZero()
+		server.mu.Unlock()
+		if !retained {
+			t.Fatal("due expiry changed a lease while renewal owned its boundary")
+		}
+		// Replace the timer inside that same boundary, as the real renewal does.
+		server.mu.Lock()
+		server.streamPageOpenWarmUntil["session-a"] = now.Add(streamPageOpenWarmHold)
+		server.mu.Unlock()
+		if server.retainRelayLeaseForDuration(key, "session-a", streamPageOpenWarmHold, true, "page_open_warm", false) {
+			t.Fatal("replacing the warm timer requested a duplicate viewer reference")
+		}
+	}()
+	time.Sleep(10 * time.Millisecond)
+	status := server.pageOpenWarmSnapshot(time.Now())
+	if status["retainedSessions"] != 1 || status["expiresAt"] != now.Add(streamPageOpenWarmHold).UTC().Format(time.RFC3339Nano) ||
+		server.relay.Snapshot().Viewers != 1 {
+		t.Fatalf("stale expiry removed the replacement lease: %#v", status)
+	}
+}
+
+func TestPageOpenWarmDoesNotExtendItsDeadlineWhileWaitingForLeaseOwnership(t *testing.T) {
+	server := newTicketSetupTestServer(t, "pixel")
+	t.Cleanup(server.Close)
+	server.startupLeaseMu.Lock()
+	now := time.Now()
+	openedAt := now.Add(-streamPageOpenWarmHold + 20*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.retainRelayViewerForPageOpen("session-a", openedAt, now)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	server.startupLeaseMu.Unlock()
+	<-done
+	server.mu.Lock()
+	leases := len(server.streamPrewarmTimers)
+	server.mu.Unlock()
+	if leases != 0 || server.relay.Snapshot().Viewers != 0 {
+		t.Fatal("waiting for the owner created a lease after its opening deadline")
 	}
 }
 
@@ -1137,8 +1296,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 	if strings.Contains(js, "['touchstart', 'touchmove']") {
 		t.Fatalf("ticket viewer should not block all touch movement; vertical scroll must remain available")
 	}
-	if serverVersion != "ticket-remote-2026-09-05-browser-captured-control-code-hidden-viewer-anchor-v166" {
-		t.Fatalf("ticket page version should identify the bounded cadence-continuity rollout, got %q", serverVersion)
+	if serverVersion != "ticket-remote-2026-09-06-independent-phone-control-gentle-wave-v180" {
+		t.Fatalf("ticket page version should identify the independent-control rollout, got %q", serverVersion)
 	}
 	if strings.Contains(serverVersion, "root-image") || strings.Contains(serverVersion, "phone-image") {
 		t.Fatalf("ticket page version should not name the superseded phone-image path, got %q", serverVersion)
@@ -1266,8 +1425,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(serverVersion, "browser-captured-control-code") {
-		t.Fatalf("ticket page version should name the browser-captured control-code path, got %q", serverVersion)
+	if !strings.Contains(serverVersion, "independent-phone-control") {
+		t.Fatalf("ticket page version should name the current phone-control path, got %q", serverVersion)
 	}
 	if strings.Contains(serverVersion, "root-image") || strings.Contains(serverVersion, "phone-image") {
 		t.Fatalf("ticket page version should not name the superseded phone-image path, got %q", serverVersion)
@@ -1292,8 +1451,8 @@ func TestTicketViewerKeepsSafariOnCodeRequestPath(t *testing.T) {
 		}
 	}
 	for _, snippet := range []string{
-		"const streamLiveFreshMaxAgeMs = 1250",
-		"const streamLiveOkMaxAgeMs = 2e3",
+		"const streamLiveFreshMaxAgeMs = 3e3",
+		"const streamLiveOkMaxAgeMs = streamLiveFreshMaxAgeMs",
 		"const streamDegradedMaxAgeMs = 3e3",
 		"function freshnessStateForVisualAge(ageMs)",
 		"function currentRenderedFreshness(now)",
@@ -1436,7 +1595,7 @@ func TestTicketViewerCodeDialogUsesNumericRequestFlow(t *testing.T) {
 	for _, snippet := range []string{
 		"function requestControlCodeFromHotspot(event)",
 		"if(codeDialogOpen||!codeDialog.hidden||!codeResultArea.hidden||ticketRegisterOverlayOccupiesHotspot())return",
-		"if(pendingBrowserAction||controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
+		"if(controlCodeMutationLaneBusy()||memberLimitBlocked('control_code'))return",
 		"const sliderOwnsHotspot=ticketRegisterOverlayOccupiesHotspot()",
 		"const hotspotUnavailable=busy||limitBlocked||!dialogEntryReady||sliderOwnsHotspot||codeDialogOpen||!codeResultArea.hidden",
 		"controlCodeHotspot.disabled=hotspotUnavailable",

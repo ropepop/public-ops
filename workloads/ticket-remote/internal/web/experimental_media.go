@@ -16,11 +16,15 @@ func (s *Server) handleExperimentalMediaCapability(w http.ResponseWriter, r *htt
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	writeJSON(w, http.StatusOK, experimentalMediaCapability(id, snapshot))
+}
+
+func experimentalMediaCapability(id auth.Identity, snapshot state.Snapshot) map[string]any {
 	selectedDisplayBoost := uint32(experimentalHDRTargetDisplayBoost)
 	if _, ok := snapshot.Member(id.Email); ok {
 		selectedDisplayBoost = snapshot.HDRDisplayBoostForAccountScope(ticketAccountScopeID(id.Email))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"ok":                   true,
 		"allowed":              true,
 		"pipelineVersion":      "webgpu-mainthread-edr-v2",
@@ -34,5 +38,5 @@ func (s *Server) handleExperimentalMediaCapability(w http.ResponseWriter, r *htt
 		"selectedEngine":       "client_webgpu_v2",
 		"clientPipeline":       "webgpu-mainthread-edr-v2",
 		"presentationKind":     "sdr_to_edr",
-	})
+	}
 }

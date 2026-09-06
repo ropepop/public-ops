@@ -2,14 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AlgebraicType,
+  BinaryReader,
+  BinaryWriter,
   Timestamp,
   type AlgebraicTypeType,
   type ProductTypeType,
 } from "spacetimedb";
 import {
-  cspSafeCodecRoundTrip,
   installCspSafeSpacetimeCodecs,
 } from "./src/csp-safe-codecs.ts";
+
+function cspSafeCodecRoundTrip(type: AlgebraicTypeType, value: unknown, typespace?: { types: AlgebraicTypeType[] }): unknown {
+  const writer = new BinaryWriter(64);
+  AlgebraicType.makeSerializer(type, typespace)(writer, value);
+  return AlgebraicType.makeDeserializer(type, typespace)(new BinaryReader(writer.getBuffer()));
+}
 
 function withFunctionConstructorBlocked(run: () => void): void {
   const originalFunction = globalThis.Function;

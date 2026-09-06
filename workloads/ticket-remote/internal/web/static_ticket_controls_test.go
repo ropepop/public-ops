@@ -131,7 +131,7 @@ func TestHealthyVisibilityResumePreservesTheLiveSpacetimeSubscription(t *testing
 	source := ticketAppSource(t)
 	resume := substringBetween(t, source,
 		"function refreshSpacetimeStateAfterResume(reason) {",
-		"  async function runSpacetimeMutation(action, reason) {")
+		"  async function runSpacetimeMutation(action) {")
 	runTicketJavaScript(t, `
 let spacetimeClient = {};
 let spacetimeStateFresh = true;
@@ -156,9 +156,9 @@ func TestExplicitTicketActionsCanSupersedeBackgroundVisualProof(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, required := range []string{
 		"const backgroundProofBusy = Boolean(!ticketActionV3LocalRequestIsBusy()",
-		"const blockingBusy = waiting || (busy && !backgroundProofBusy);",
+		"const blockingBusy = busy || Boolean(state && state.phoneControlState && state.phoneControlState.busy);",
 		"spacetimeStateFresh && !blockingBusy && !controlBusy, openReason",
-		"spacetimeStateFresh && presentationReady && !blockingBusy && !controlBusy",
+		"spacetimeStateFresh && !blockingBusy && !controlBusy && !activationPolicyBlocked(state)",
 		"ticketActionV3Busy(currentAction) && !backgroundProofBusy",
 		"Pašreizējais skats tiek pārbaudīts fonā; atvēršanas darbības ir pieejamas.",
 	} {
@@ -175,7 +175,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"'open_latest_unactivated', 'browser_button'",
 		"'open_latest_and_register', 'browser_button'",
 		"requestBrowserTicketAction('register_current', 'browser_button', 'ticket_register_button')",
-		"ticketActionV3RequiresFreshRenderedFrame(target)",
+		"admissionProof.contextRevision !== expectedInteractionRevision",
 		"target === 'register_current' ? expectedInteractionRevision : ''",
 		"attemptId: activation ? actionId : ''",
 		"statusView === 'latest_unactivated'",
@@ -184,8 +184,8 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		"Atvērtā biļete ir veiksmīgi reģistrēta un vizuāli apstiprināta.",
 		"renderTicketRegisterOverlay(state, blockingBusy, controlBusy)",
 		"const region = currentTicketSliderPresentationRegion(state)",
-		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {",
-		"ticketSliderRegionV3ForAction(",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !currentPhoneControlReady()) {",
+		"phoneRegistrationRegion(",
 		"ticketSliderRegionV3Layout(",
 	} {
 		if !strings.Contains(source, required) {
@@ -215,7 +215,7 @@ func TestTicketActionV3ControlsUseDirectReducerAndLocalOnlySlider(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, required := range []string{
-		"requestTicketActionV3", "memberRequestTicketActionV3", "ticketremote_ticket_action_v3",
+		"requestTicketActionV3", "memberCommand", "ticketremote_ticket_action_v3",
 		"ticketremote_ticket_slider_region_v_3",
 		"ticketremote_member_limit_state", "memberRefreshLimitState", "memberSetLimitPreference",
 		"ticketremote_member_hdr_state", "memberRefreshHdrState", "memberSetHdrPreference",
@@ -372,10 +372,10 @@ func TestControlCodeBrowserGateIncludesEveryActiveV3Action(t *testing.T) {
 		}
 	}
 	for _, guard := range []string{
-		"if (pendingBrowserAction || controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;",
-		"if (pendingBrowserAction || controlCodeMutationLaneBusy()) return false;",
-		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl())",
-		"if (!browserIntentValid() || !revealAuthoritativeSDRForConsequentialControl())",
+		"if (controlCodeMutationLaneBusy() || memberLimitBlocked('control_code')) return false;",
+		"if (controlCodeMutationLaneBusy()) return false;",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !currentPhoneControlReady())",
+		"if (!browserIntentValid() || !currentPhoneControlReady())",
 	} {
 		if !strings.Contains(source, guard) {
 			t.Fatalf("code local intent and strict submission must retain lane/proof guards, missing %q", guard)
@@ -385,7 +385,7 @@ func TestControlCodeBrowserGateIncludesEveryActiveV3Action(t *testing.T) {
 	availability := substringBetween(t, source,
 		"function updateControlCodeSubmitAvailability() {",
 		"  function reconnectVideoForRecovery(reason) {")
-	if !strings.Contains(availability, "const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy()") ||
+	if !strings.Contains(availability, "const busy = controlCodeMutationLaneBusy()") ||
 		!strings.Contains(availability, "requestCodeButton.disabled = busy") {
 		t.Fatal("the visible control-code button must disable from the shared V3 phone-lane gate")
 	}
@@ -624,7 +624,7 @@ func TestTicketControlCodeRequestClearsWhenAuthoritativeRowTerminates(t *testing
 	mutationLaneBusy := substringBetween(t, source,
 		"function controlCodeMutationLaneBusy(ignoreSubmitInFlight = false) {",
 		"  function updateControlCodeSubmitAvailability() {")
-	if !strings.Contains(availability, "const busy = Boolean(pendingBrowserAction) || controlCodeMutationLaneBusy()") ||
+	if !strings.Contains(availability, "const busy = controlCodeMutationLaneBusy()") ||
 		!strings.Contains(mutationLaneBusy, "ticketInteractionIsBusy(currentState && currentState.ticketInteraction)") {
 		t.Fatal("control-code admission must honor an active ticket interaction")
 	}
@@ -738,58 +738,23 @@ func TestTicketLimitProjectionRefreshesFromSpacetimeOnVisibleResume(t *testing.T
 	}
 }
 
-func TestTicketSliderRequiresExactFreshGeometryAndAutoProof(t *testing.T) {
+func TestTicketSliderUsesFreshPhoneContextWithoutAutomaticVisualProof(t *testing.T) {
 	source := ticketAppSource(t)
 	for _, required := range []string{
-		"function currentTicketSliderRegion(state = currentState)",
-		"ticketSliderRegionV3ForAction(",
-		"ticketSliderRegionV3Layout(",
-		"ticketRegisterOverlay.hidden = true",
-		"ticketRegisterOverlay.hidden = false",
-		"function observeTicketCurrentProofFrame()",
-		"const ticketCurrentProofSampleIntervalMs = 1000;",
-		"const ticketCurrentProofRequestCooldownMs = 3000;",
-		"Date.now() - ticketCurrentProofLastRequestAt < ticketCurrentProofRequestCooldownMs",
-		"ticketCurrentProofVisualState.stableChangeCount >= 2",
-		"ticketCurrentProofVisualState.changePending = true",
-		"'prove_current'",
-		"'browser_auto_proof'",
-		"ticketCurrentProofVisualState.resumePending = true",
-		"const proofScope = `${String(cfg.backendId || 'pixel')}:${Number(stream.epoch || 0)}`",
-		"requestedEpoch: ticketCurrentProofRequestedScope === proofScope ? Number(stream.epoch || 0) : 0",
-		"ticketCurrentProofRequestedScope = proofScope",
-		"renewBeforeMs: ticketCurrentProofRenewBeforeMs",
-		"slider_region_renewal",
-		"currentTicketRegisterSliderPresentationProof(state = currentState)",
-		"ticketRegisterSliderProofStillMatches(snapshot, state = currentState)",
-		"cancelTicketRegisterSliderSession('viewport_changed')",
-		"cancelTicketRegisterSliderSession('stream_reset')",
-		"ticketLocalRegisterSlider.addEventListener('blur'",
-		"window.addEventListener('blur'",
-		"ticketRegisterOverlay.dataset.registrationState = 'registering'",
+		"phoneRegistrationRegion(state && state.phoneControlState, currentPhoneControlTime(state))",
+		"phoneRegistrationSnapshot(state && state.phoneControlState, ticketSliderLayoutRevision, currentPhoneControlTime(state))",
+		"phoneRegistrationMatches(snapshot, state && state.phoneControlState,",
+		"ticketSliderRegionV3Layout(", "ticketRegisterOverlay.hidden = true", "ticketRegisterOverlay.hidden = false",
+		"cancelTicketRegisterSliderSession('viewport_changed')", "ticketLocalRegisterSlider.addEventListener('blur'",
 		"releaseTicketLocalRegisterSliderOnTerminal(",
-		"row >= 1 && row <= 5 && column >= 2 && column <= 5",
-		"backendId: cfg.backendId || 'pixel'",
-		"rebaseTicketCurrentProofDetectorFromAction(",
 	} {
 		if !strings.Contains(source, required) {
-			t.Fatalf("visual proof/over-stream slider contract missing %q", required)
+			t.Fatalf("phone context slider guard missing %q", required)
 		}
 	}
-	core := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.mjs")
-	coreTest := ticketRemoteSourceFile(t, "web-client", "ticket-action-v3-core.test.mjs")
-	for _, required := range []string{
-		"String(region.proofActionId || '') !== String(action.actionId || '')",
-		"String(region.streamEpoch || '') !== String(action.streamEpoch || '')",
-		"String(region.frameSequence || '') !== String(action.frameSequence || '')",
-		"expiresAt <= Number(now)",
-		"two agreeing significant frame changes override a still-fresh proof",
-		"the same retained frame-change trigger is admitted once the phone is idle",
-		"slider session binds exact proof, stream epoch, frame, region, viewport, and visual revisions",
-		"pointer cancellation and second pointers fail closed",
-	} {
-		if !strings.Contains(core+coreTest, required) {
-			t.Fatalf("exact auto-proof test contract missing %q", required)
+	for _, retired := range []string{"observeTicketCurrentProofFrame", "maybeRequestTicketCurrentProof", "browser_auto_proof", "ticketCurrentProofSampleIntervalMs"} {
+		if strings.Contains(source, retired) {
+			t.Fatalf("browser visual proof poller remains: %s", retired)
 		}
 	}
 }
@@ -816,26 +781,8 @@ func TestTicketSliderLeavesOrdinaryScrollToThePageAndCancelsOnConfirmedVisualCha
 		strings.Contains(visualViewport, "window.visualViewport.addEventListener('scroll', resizeCanvasBox") {
 		t.Fatal("visual viewport scrolling must not run the resize path that cancels slider sessions")
 	}
-	observe := substringBetween(t, source,
-		"function observeTicketCurrentProofFrame() {",
-		"  async function maybeRequestTicketCurrentProof(reason) {")
-	for _, required := range []string{
-		"ticketCurrentProofVisualState.stableChangeCount >= 2",
-		"ticketSliderVisualRevision += 1",
-		"cancelTicketRegisterSliderSession('visual_view_changed')",
-		"maybeRequestTicketCurrentProof('frame_observed')",
-	} {
-		if !strings.Contains(observe, required) {
-			t.Fatalf("confirmed visual-change slider fence missing %q", required)
-		}
-	}
-	if strings.Index(observe, "cancelTicketRegisterSliderSession('visual_view_changed')") >
-		strings.Index(observe, "maybeRequestTicketCurrentProof('frame_observed')") {
-		t.Fatal("the active slider must cancel before any cooldown-delayed proof request")
-	}
-	if strings.Count(source, "ticketSliderVisualRevision,") < 2 {
-		t.Fatal("pointer-down snapshot and pointer-up match must bind the same visual revision")
-	}
+	// Context replacement and expiry are exercised against the actual page source
+	// in ticket-slider-continuity.test.mjs, without a browser fingerprint poller.
 
 	change := substringBetween(t, source,
 		"ticketLocalRegisterSlider.addEventListener('change'",
@@ -867,12 +814,12 @@ func TestTicketStateFailsClosedUntilFreshSnapshotAndNeverShowsOldActivation(t *t
 		"clientLog('spacetime_resume_reused'",
 		"if (spacetimeClient && typeof spacetimeClient.refresh === 'function')",
 		"renderTicketInteraction(spacetimeStateFresh ? state.ticketInteraction : null);",
-		"const proofReady = spacetimeStateFresh && isTicketActionV3RegistrationProofPresentable(",
-		"const registerReady = proofReady && proveCurrentReady && !activationPolicyBlocked(state);",
+		"? phoneRegistrationRegion(state && state.phoneControlState, currentPhoneControlTime(state)) : null;",
+		"const registerReady = Boolean(currentTicketSliderRegion(state)) && !activationPolicyBlocked(state);",
 		"spacetimeStateFresh && !blockingBusy && !controlBusy, openReason",
-		"presentationReady && !blockingBusy && !controlBusy && registerReady",
-		"((!pending) && (busy || controlBusy)) || !configured",
-		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !revealAuthoritativeSDRForConsequentialControl()) {",
+		"!blockingBusy && !controlBusy && registerReady",
+		"!blockingBusy && !controlBusy && registerReady",
+		"if (!browserIntentValid() || controlCodeMutationLaneBusy() || !currentPhoneControlReady()) {",
 		"spacetimeStateFresh && switchAvailable && ticketViewSwitchButton.dataset.target",
 		"ticketViewSwitchDetail.textContent = connectionReason;",
 	} {

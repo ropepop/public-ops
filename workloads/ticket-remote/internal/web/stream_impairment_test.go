@@ -457,7 +457,7 @@ func runImpairmentGrid(t *testing.T, losses []float64) {
 				name := fmt.Sprintf("bw_%gMbps/rtt_%dms/loss_%g_pct/%s", bandwidth, rttMillis, loss, class)
 				t.Run(name, func(t *testing.T) {
 					harness := newImpairmentHarness(t, func(time.Duration) impairmentPath { return path })
-					result := harness.run(6*time.Second, 8*time.Second)
+					result := harness.run(12*time.Second, 15*time.Second)
 					if result.maxSlots > 2 || result.maxPending > 1 {
 						t.Fatalf("unbounded scheduler state: slots=%d pending=%d", result.maxSlots, result.maxPending)
 					}
@@ -563,8 +563,9 @@ func TestVideoWriterDeterministicBlackholeExpiresAndRecovers(t *testing.T) {
 			t.Fatalf("blackholed sequence %d was presented at %s", presentation.sequence, presentation.at)
 		}
 	}
-	if recovered, ok := firstPresentationAtOrAfter(result.presented, 7*time.Second); !ok || recovered.at > 10*time.Second {
-		t.Fatalf("blackhole recovery missed two capture opportunities: presentation=%#v ok=%t", recovered, ok)
+	fastDelay, _ := fast.browserArrivalDelay()
+	if recovered, ok := firstPresentationAtOrAfter(result.presented, 7*time.Second); !ok || recovered.at > 7*time.Second+liveFreshMaxAge+impairmentCapturePeriod+fastDelay+impairmentPresentationDelay {
+		t.Fatalf("blackhole recovery exceeded freshness timeout and next capture opportunity: presentation=%#v ok=%t", recovered, ok)
 	}
 }
 

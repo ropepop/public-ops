@@ -175,7 +175,7 @@ func TestSourceFreshnessAndStopClearPendingFrame(t *testing.T) {
 	viewer := &client{}
 	viewer.videoQueue = []queuedVideoFrame{{
 		meta: tsf2Metadata{ok: true, keyFrame: true, epoch: 1, sequence: 1},
-		data: []byte{1}, queuedAt: time.Now().Add(-100 * time.Millisecond), visualAge: 1200 * time.Millisecond,
+		data: []byte{1}, queuedAt: time.Now().Add(-100 * time.Millisecond), visualAge: 2950 * time.Millisecond,
 	}}
 	viewer.videoQueueBytes = 1
 	if item, ok := viewer.nextVideoWriteItem(); ok || item.frame != nil {
@@ -397,7 +397,7 @@ func TestFeedbackV2ReceiptUsesIndependentLivenessTimeout(t *testing.T) {
 	_, _ = viewer.nextVideoWriteItem()
 	frame := queuedTestFrame(7, 10, true, viewer.videoConfigGenerationSnapshot())
 	writtenAt := time.Now()
-	frame.queuedAt = writtenAt.Add(-1200 * time.Millisecond)
+	frame.queuedAt = writtenAt.Add(-(liveFreshMaxAge - 50*time.Millisecond))
 	viewer.noteVideoFrameWrittenAt(frame, writtenAt)
 	viewer.videoMu.Lock()
 	receiptDeadline := viewer.videoReceiptDeadlineAt
@@ -501,7 +501,6 @@ func TestResultPriorityUsesOneViewerLocalSlotAndExactMarker(t *testing.T) {
 		videoEpoch: 7, videoConfigGeneration: 2, videoFeedbackVersion: 2,
 		videoConfigWrittenEpoch: 7, videoConfigWrittenGen: 2,
 	}
-	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 10, true, 10_000))
 	if !viewer.acceptResultPriority(resultPriorityFixture(resultPriorityArm, 2, 7, 0), now) {
 		t.Fatal("current requester-local arm was rejected")
 	}
@@ -512,8 +511,8 @@ func TestResultPriorityUsesOneViewerLocalSlotAndExactMarker(t *testing.T) {
 	if !activeAfterFiveSeconds || !armDeadline.Equal(now.Add(resultPriorityWorkflowWindow)) {
 		t.Fatalf("workflow reservation expired before a long-running request could produce a marker: active=%t deadline=%s", activeAfterFiveSeconds, armDeadline)
 	}
-	if viewer.canUseOrdinaryCapture(7) {
-		t.Fatal("armed result viewer retained ordinary capture demand")
+	if !viewer.canUseOrdinaryCapture(7) {
+		t.Fatal("waiting for a result marker suppressed ordinary capture demand")
 	}
 	if !other.canUseOrdinaryCapture(7) {
 		t.Fatal("one viewer's result priority changed another viewer's credit")
@@ -530,8 +529,8 @@ func TestResultPriorityUsesOneViewerLocalSlotAndExactMarker(t *testing.T) {
 	if queued != 1 || queuedSequence != 12 {
 		t.Fatalf("arm did not retain only the newest candidate: count=%d sequence=%d", queued, queuedSequence)
 	}
-	if item, ok := viewer.nextVideoWriteItem(); ok || item.frame != nil {
-		t.Fatalf("frame escaped before the exact result marker: %#v", item)
+	if !viewer.videoWriterHasRunnableWork() {
+		t.Fatal("waiting for a result marker suppressed ordinary frame delivery")
 	}
 	markerAt := now.Add(6 * time.Second)
 	if !viewer.acceptResultPriority(resultPriorityFixture(resultPriorityMark, 2, 7, 12), markerAt) {
@@ -543,9 +542,71 @@ func TestResultPriorityUsesOneViewerLocalSlotAndExactMarker(t *testing.T) {
 	if !markDeadline.Equal(markerAt.Add(resultPriorityDeliveryWindow)) {
 		t.Fatalf("exact-result delivery budget did not begin at marker: deadline=%s", markDeadline)
 	}
+	if viewer.canUseOrdinaryCapture(7) {
+		t.Fatal("marked result viewer retained ordinary capture demand")
+	}
 	item, ok := viewer.nextVideoWriteItem()
 	if !ok || item.frame == nil || item.frame.meta.sequence != 12 {
 		t.Fatalf("exact marked result candidate was not released: %#v", item)
+	}
+}
+
+func TestArmedResultPriorityPreservesPendingFramesAndReceiptCredit(t *testing.T) {
+	viewer := &client{
+		videoEpoch: 7, videoConfigGeneration: 2, videoFeedbackVersion: 2,
+		videoConfigWrittenEpoch: 7, videoConfigWrittenGen: 2,
+	}
+	t.Cleanup(func() {
+		viewer.videoMu.Lock()
+		viewer.clearResultPriorityLocked()
+		viewer.videoMu.Unlock()
+	})
+	now := time.Now()
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 10, true, 10_000))
+	if !viewer.acceptResultPriority(resultPriorityFixture(resultPriorityArm, 2, 7, 0), now) {
+		t.Fatal("current arm was rejected")
+	}
+	first, ok := viewer.nextVideoWriteItem()
+	if !ok || first.frame == nil || first.frame.meta.sequence != 10 {
+		t.Fatal("arming discarded or blocked the ordinary frame already awaiting delivery")
+	}
+	viewer.noteVideoFrameWrittenAt(*first.frame, now)
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 11, true, 11_000))
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 12, true, 12_000))
+	if _, ok := viewer.nextVideoWriteItem(); ok || viewer.canUseOrdinaryCapture(7) {
+		t.Fatal("arming bypassed the outstanding ordinary receipt debt")
+	}
+	if !viewer.acceptStreamFeedback(streamFeedbackV2Fixture(7, 2, 10, 10, 10, 0, true), now.Add(time.Millisecond)) {
+		t.Fatal("ordinary receipt was rejected during result preparation")
+	}
+	next, ok := viewer.nextVideoWriteItem()
+	if !ok || next.frame == nil || next.frame.meta.sequence != 12 {
+		t.Fatal("ordinary receipt did not release the newest of the bounded pending frames")
+	}
+	viewer.noteVideoFrameWrittenAt(*next.frame, now.Add(2*time.Millisecond))
+	if !viewer.acceptStreamFeedback(streamFeedbackV2Fixture(7, 2, 12, 12, 12, 0, true), now.Add(3*time.Millisecond)) ||
+		!viewer.canUseOrdinaryCapture(7) {
+		t.Fatal("ordinary receipt did not restore capture demand while the request remained armed")
+	}
+	viewer.videoMu.Lock()
+	phase := viewer.videoResultPriorityPhase
+	deadline := viewer.videoResultPriorityUntil
+	viewer.videoMu.Unlock()
+	if phase != resultPriorityArm || !deadline.Equal(now.Add(resultPriorityWorkflowWindow)) {
+		t.Fatal("ordinary feedback cleared or extended the pending result marker reservation")
+	}
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 13, true, 13_000))
+	if !viewer.acceptResultPriority(resultPriorityFixture(resultPriorityMark, 2, 7, 14), now.Add(4*time.Millisecond)) {
+		t.Fatal("result marker was rejected after ordinary delivery")
+	}
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 13, true, 13_000))
+	if _, ok := viewer.nextVideoWriteItem(); ok || viewer.canUseOrdinaryCapture(7) {
+		t.Fatal("marked reservation allowed a pre-marker picture or ordinary demand")
+	}
+	viewer.enqueueVideoFrame(testTSF2FrameWithTimestamp(7, 14, true, 14_000))
+	marked, ok := viewer.nextVideoWriteItem()
+	if !ok || marked.frame == nil || marked.frame.meta.sequence != 14 {
+		t.Fatal("the matching result picture could not use its reserved slot")
 	}
 }
 
@@ -708,5 +769,24 @@ func TestBrowserClockProbeResponseIsGenerationFencedStrictAndRateLimited(t *test
 	unsafeID := []byte(`{"type":"clock_probe","version":1,"probeId":"bad/id","configGeneration":1,"clientSendUnixMicros":1700000000000000}`)
 	if _, ok := viewer.browserClockProbeResponse(unsafeID, receivedAt.Add(2*time.Second)); ok {
 		t.Fatal("unsafe browser clock probe id was accepted")
+	}
+}
+
+func TestFrameVisualAgeAcceptsThreeSecondBoundary(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for _, age := range []time.Duration{2 * time.Second, 3 * time.Second, 3001 * time.Millisecond} {
+		meta := tsf2Metadata{timestamp: uint64(now.Add(-age).UnixMicro())}
+		actual, fresh := frameVisualAge(meta, now)
+		if actual != age || fresh != (age <= 3*time.Second) {
+			t.Fatalf("age %s: actual=%s fresh=%t", age, actual, fresh)
+		}
+		frame := queuedVideoFrame{queuedAt: now, visualAge: age}
+		if stale := queuedFrameExpired(frame, now); stale != (age > 3*time.Second) {
+			t.Fatalf("age %s: queued stale=%t", age, stale)
+		}
+	}
+	frame := queuedVideoFrame{queuedAt: now.Add(-250 * time.Millisecond), visualAge: 2 * time.Second}
+	if got, want := videoFrameWriteDeadline(frame, now), now.Add(750*time.Millisecond); !got.Equal(want) {
+		t.Fatalf("two-second frame deadline=%s want=%s", got, want)
 	}
 }

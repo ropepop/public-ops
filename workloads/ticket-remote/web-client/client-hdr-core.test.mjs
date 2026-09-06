@@ -7,13 +7,11 @@ import {
   CLIENT_HDR_PIPELINE,
   CLIENT_HDR_RENDERER_INIT_TIMEOUT_MILLIS,
   CLIENT_HDR_SETTLEMENT_TIMEOUT_MILLIS,
-  LEGACY_CLIENT_HDR_ENGINE,
   ClientHDRController,
   clientHDRCapability,
   clientHDREngineProjectionDecision,
   clientHDRFreshness,
   normalizeClientHDRDisplayBoost,
-  normalizeHDREngine,
   offerClientHDRCanvasFrame,
   resolveCapabilityHDREngine
 } from './client-hdr-core.mjs';
@@ -247,7 +245,7 @@ function harness(options = {}) {
   };
 }
 
-test('v2 engine normalization maps every legacy or invalid value to browser v2', () => {
+test('HDR uses the supported browser engine and bounded display boosts', () => {
   assert.equal(CLIENT_HDR_ENGINE, 'client_webgpu_v2');
   assert.equal(CLIENT_HDR_PIPELINE, 'webgpu-mainthread-edr-v2');
   assert.equal(CLIENT_HDR_PAINT_WAIT_TIMEOUT_MILLIS, 2000);
@@ -258,11 +256,8 @@ test('v2 engine normalization maps every legacy or invalid value to browser v2',
   for (const retired of [1, 8, 10, 12, 14, 16, null, 'invalid']) {
     assert.equal(normalizeClientHDRDisplayBoost(retired), 4);
   }
-  assert.equal(normalizeHDREngine(CLIENT_HDR_ENGINE), CLIENT_HDR_ENGINE);
-  assert.equal(normalizeHDREngine(LEGACY_CLIENT_HDR_ENGINE), CLIENT_HDR_ENGINE);
-  assert.equal(normalizeHDREngine('unknown'), CLIENT_HDR_ENGINE);
-  assert.equal(resolveCapabilityHDREngine([CLIENT_HDR_ENGINE], LEGACY_CLIENT_HDR_ENGINE), CLIENT_HDR_ENGINE);
-  assert.equal(resolveCapabilityHDREngine([], CLIENT_HDR_ENGINE), '');
+  assert.equal(resolveCapabilityHDREngine([CLIENT_HDR_ENGINE]), CLIENT_HDR_ENGINE);
+  assert.equal(resolveCapabilityHDREngine([]), '');
   assert.deepEqual(clientHDREngineProjectionDecision({
     ownerProjectionAvailable: true,
     engine: CLIENT_HDR_ENGINE
@@ -2738,4 +2733,62 @@ test('disposing an in-flight frame releases it immediately and does not double-c
   operation.reject(new Error('renderer_disposed'));
   await tick();
   assert.deepEqual(closed, ['in-flight-clone']);
+});
+
+test('prepared GPU ownership transfers into the first renderer session and is disposed on background', async () => {
+  const created = [], surfaces = [];
+  const controller = new ClientHDRController({
+    rendererFactory: () => {
+      const renderer = {
+        prepareCalls: 0, initializeCalls: 0, disposed: false,
+        prepare() { this.prepareCalls++; return Promise.resolve(); },
+        initialize() { this.initializeCalls++; return Promise.resolve({}); },
+        dispose() { this.disposed = true; }
+      };
+      created.push(renderer);
+      return renderer;
+    },
+    onSurface: visible => surfaces.push(visible)
+  });
+  assert.equal(controller.prepare(), true);
+  assert.equal(controller.prepare(), true);
+  await tick();
+  assert.equal(created.length, 1);
+  assert.equal(created[0].prepareCalls, 1);
+  assert.equal(controller.snapshot().active, false);
+  assert.equal(surfaces.includes(true), false);
+  assert.equal(controller.start({canvas: {getContext() {}}, width: 540, height: 1112}), true);
+  await tick();
+  assert.equal(created.length, 1);
+  assert.equal(created[0].initializeCalls, 1);
+  assert.equal(created[0].disposed, false);
+  assert.equal(controller.snapshot().ready, true);
+  assert.equal(surfaces.includes(true), false, 'prepared resources have no presentation authority');
+  controller.dispose('hidden');
+  assert.equal(created[0].disposed, true);
+  controller.prepare();
+  const abandoned = created[1];
+  controller.dispose('hidden_before_picture');
+  await tick();
+  assert.equal(abandoned.disposed, true);
+  assert.equal(controller.preparingRenderer, null);
+});
+
+test('stalled GPU preparation is bounded and late completion cannot revive its ownership', async () => {
+  const gate = deferred(), timers = [];
+  let disposed = 0;
+  const controller = new ClientHDRController({
+    rendererFactory: () => ({prepare: () => gate.promise, dispose: () => {disposed++;}}),
+    setTimer: (callback, millis) => {const timer = {callback, millis}; timers.push(timer); return timer;},
+    clearTimer: timer => {timer.cleared = true;}
+  });
+  controller.prepare();
+  assert.equal(timers[0].millis, CLIENT_HDR_RENDERER_INIT_TIMEOUT_MILLIS);
+  timers[0].callback();
+  assert.equal(disposed, 1);
+  assert.equal(controller.preparingRenderer, null);
+  gate.resolve();
+  await tick();
+  assert.equal(controller.preparingRenderer, null);
+  assert.equal(controller.snapshot().active, false);
 });

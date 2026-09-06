@@ -6,10 +6,7 @@ import {
   ClientHDRRenderer
 } from './client-hdr-renderer.mjs';
 
-export const LEGACY_CLIENT_HDR_ENGINE = 'client_webgpu_v1';
 export const CLIENT_HDR_ENGINE = 'client_webgpu_v2';
-// Source-compatibility alias while generated clients age out. It no longer
-// names a server runtime; every legacy selection resolves to browser v2.
 export const CLIENT_HDR_PIPELINE = 'webgpu-mainthread-edr-v2';
 export const CLIENT_HDR_PRESENTATION_KIND = 'sdr_to_edr';
 export const CLIENT_HDR_TARGET_DISPLAY_BOOST = 4;
@@ -24,11 +21,7 @@ export function normalizeClientHDRDisplayBoost(value) {
   return CLIENT_HDR_DISPLAY_BOOSTS.includes(boost) ? boost : CLIENT_HDR_TARGET_DISPLAY_BOOST;
 }
 
-export function normalizeHDREngine(value) {
-  return CLIENT_HDR_ENGINE;
-}
-
-export function resolveCapabilityHDREngine(allowedEngines, selectedEngine) {
+export function resolveCapabilityHDREngine(allowedEngines) {
   const clientAllowed = Array.isArray(allowedEngines) && allowedEngines.includes(CLIENT_HDR_ENGINE);
   return clientAllowed ? CLIENT_HDR_ENGINE : '';
 }
@@ -148,6 +141,8 @@ export function clientHDRFreshness(presented, current, now, limits = {}) {
 
 export class ClientHDRController {
   constructor(options = {}) {
+    this.preparingRenderer = null;
+    this.preparationTimer = null;
     this.rendererFactory = options.rendererFactory || ((rendererOptions) => new ClientHDRRenderer(rendererOptions));
     this.rendererEnvironment = options.rendererEnvironment || globalThis;
     this.now = options.now || (() => performance.now());
@@ -240,16 +235,59 @@ export class ClientHDRController {
     return { offered: 0, rendered: 0, coalesced: 0, dropped: 0, failures: 0 };
   }
 
+  prepare() {
+    if (this.active || this.preparingRenderer) return true;
+    let renderer;
+    try {
+      renderer = this.rendererFactory({
+        environment: this.rendererEnvironment, now: this.now, wallNow: this.wallNow,
+        setTimer: this.setTimer, clearTimer: this.clearTimer,
+        gpuCompletionTimeoutMillis: this.gpuCompletionTimeoutMillis
+      });
+      if (!renderer || typeof renderer.prepare !== 'function') {
+        if (renderer) renderer.dispose();
+        return false;
+      }
+      this.preparingRenderer = renderer;
+      const discard = () => {
+        if (this.preparingRenderer !== renderer) return;
+        this.takePreparedRenderer();
+        try { renderer.dispose(); } catch (_) {}
+      };
+      this.preparationTimer = this.setTimer(discard, this.rendererInitTimeoutMillis);
+      Promise.resolve(renderer.prepare()).then(() => {
+        if (this.preparingRenderer !== renderer) return;
+        if (this.preparationTimer !== null) this.clearTimer(this.preparationTimer);
+        this.preparationTimer = null;
+        this.onMetric('renderer_prepared', this.snapshot());
+      }).catch(discard);
+      return true;
+    } catch (_) {
+      if (this.preparingRenderer === renderer) this.takePreparedRenderer();
+      try { if (renderer) renderer.dispose(); } catch (_) {}
+      return false;
+    }
+  }
+
+  takePreparedRenderer() {
+    const renderer = this.preparingRenderer;
+    this.preparingRenderer = null;
+    if (this.preparationTimer !== null) this.clearTimer(this.preparationTimer);
+    this.preparationTimer = null;
+    return renderer;
+  }
+
   start({ canvas, width, height, boost = CLIENT_HDR_TARGET_DISPLAY_BOOST }) {
     if (!canvas || typeof canvas.getContext !== 'function') {
       this.fail('main_thread_canvas_unavailable');
       return false;
     }
+    const preparedRenderer = this.takePreparedRenderer();
     this.dispose('restart');
     const generation = ++this.generation;
     let renderer;
     try {
-      renderer = this.rendererFactory({
+      const rendererOptions = {
         environment: this.rendererEnvironment,
         now: this.now,
         wallNow: this.wallNow,
@@ -264,7 +302,13 @@ export class ClientHDRController {
           this.captureRendererMetric(detail);
           this.onMetric(event, Object.assign(this.snapshot(), detail || {}));
         }
-      });
+      };
+      renderer = preparedRenderer || this.rendererFactory(rendererOptions);
+      // Preparation owns no visible surface; start attaches this session's callbacks.
+      if (preparedRenderer) {
+        renderer.onFailure = rendererOptions.onFailure;
+        renderer.onMetric = rendererOptions.onMetric;
+      }
     } catch (_) {
       this.fail('renderer_start_failed');
       return false;
@@ -1353,6 +1397,8 @@ export class ClientHDRController {
   }
 
   dispose(reason = 'disabled') {
+    const preparing = this.takePreparedRenderer();
+    try { if (preparing) preparing.dispose(); } catch (_) {}
     this.cancelRendererInitTimeout();
     this.cancelSettlementWatchdog();
     this.cancelRecoveryPaintCheck();
