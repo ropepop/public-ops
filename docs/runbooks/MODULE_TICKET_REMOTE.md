@@ -20,7 +20,7 @@ Rollback must preserve recorded outcomes: pause admissions and reconcile/drain w
 
 ## Start / Stop / Restart
 
-Owners can use **Sleep / cold mode** on `/admin` for a real cold-opening test, including while viewers are connected. It cancels the 30-minute warm timer, clears capture demand and relay pictures, proves Pixel capture/lease release, then reloads the viewer pages once. Ordinary page openings retain the normal warm hold afterward. The admin page stays open and shows stopping, cold confirmation, reloading, and live/asleep or failure. Existing actions or cleanup reject the request immediately. An unproved stop remains paused; investigate it before explicitly retrying.
+Owners can use **Sleep / cold mode** on `/admin` for a real cold-opening test, including while viewers are connected. It cancels the 30-minute warm timer, clears capture demand and relay pictures, proves Pixel capture/lease release, then reconnects the viewer pages in place. Ordinary page openings retain the normal warm hold afterward. The admin page stays open and shows stopping, cold confirmation, reconnecting, and live/asleep or failure. Existing actions or cleanup reject the request immediately. An unproved stop remains paused; investigate it before explicitly retrying.
 
 Cold restart progress uses the additive `coldRestart*` fields on `ticketremote_stream_desired_state`. The sidecar forwards that existing database subscription over one authenticated local event stream. The relay reconciles a retained operation after restart and never releases the barrier from `desiredActive=false` alone. Keep the same production database and use `--delete-data=never` for this additive update. Install the compatible Pixel and relay/browser consumers before exposing the button.
 

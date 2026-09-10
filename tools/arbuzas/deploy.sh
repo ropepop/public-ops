@@ -8272,11 +8272,12 @@ validate_remote_ticket_remote_workload_health() {
     }; wait_until_ok runtime_oidc_ok" \
     ticket_remote
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
-    "wait_until_ok compose exec -T ticket_remote sh -lc 'set -e
+    "compose exec -T ticket_remote sh -lc 'set -e
       binary=/usr/local/bin/ticket-remote
       app_js=\$(mktemp)
       trap \"rm -f \\\"\${app_js}\\\"\" EXIT
-      curl -fsS \"http://127.0.0.1:\${TICKET_REMOTE_WEB_PORT:-9338}/static/app.js\" > \"\${app_js}\"
+      cat > \"\${app_js}\"
+      test -s \"\${app_js}\"
       grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"localStorage|ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
@@ -8314,7 +8315,7 @@ validate_remote_ticket_remote_workload_health() {
       grep -aF \"VideoDecoder\" \"\${binary}\" >/dev/null
       grep -aF \"EncodedVideoChunk\" \"\${binary}\" >/dev/null
       grep -aF \"tsf3\" \"\${binary}\" >/dev/null
-    '" \
+    ' < '${remote_release_dir}/workloads/ticket-remote/internal/web/static/app.js'" \
     ticket_remote
 }
 

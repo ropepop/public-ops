@@ -33,13 +33,6 @@ func writeNoStoreHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
 }
 
-func writeStaticAssetHeaders(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("CDN-Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("Cloudflare-CDN-Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-}
-
 func writeHTMLHeaders(w http.ResponseWriter, nonce string) {
 	writeNoStoreHeaders(w)
 	writeSecurityHeaders(w, nonce)

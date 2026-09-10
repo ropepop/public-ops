@@ -314,14 +314,87 @@
 
 .admin-statistics-entry {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
   border-radius: 6px;
   padding: 5px 6px;
   color: #dceaff;
   background: #13294a;
   font-variant-numeric: tabular-nums;
+}
+
+.admin-statistics-entry-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.admin-statistics-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  row-gap: 2px;
+  color: #bdcde0;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+}
+
+.admin-statistics-metric {
+  min-width: 0;
+}
+
+.admin-statistics-ratio {
+  white-space: nowrap;
+}
+
+.admin-statistics-metric + .admin-statistics-metric::before {
+  content: '·';
+  margin-right: 6px;
+  color: #8192a8;
+}
+
+.admin-statistics-action-summary:empty {
+  display: none;
+}
+
+.admin-statistics-action-summary .admin-statistics-metrics {
+  font-size: 13px;
+  color: #dceaff;
+}
+
+.admin-statistics-count-key,
+.admin-statistics-tracking-note {
+  margin: 0;
+  color: #aebdd0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.admin-statistics-tracking-note {
+  color: #94a6bb;
+}
+
+.admin-statistics-day-totals {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  min-width: 0;
+}
+
+.admin-statistics-day-totals .admin-statistics-metrics {
+  justify-content: flex-end;
+}
+
+.admin-statistics-table .admin-statistics-day > .admin-statistics-metrics {
+  margin-top: 4px;
 }
 
 .admin-statistics-entry.is-inactive {
@@ -333,6 +406,7 @@
   color: #8fb8ff;
   font-weight: 800;
   letter-spacing: .04em;
+  overflow-wrap: anywhere;
 }
 
 .admin-statistics-entry-duration {
@@ -425,5 +499,21 @@
 
   .admin-statistics-active-hour-entries .admin-statistics-entry {
     min-width: min(100%, 112px);
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .admin-statistics-day-meta {
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .admin-statistics-day-label {
+    flex: 1 1 100px;
+  }
+
+  .admin-statistics-day-chevron {
+    flex: 0 0 8px;
   }
 }

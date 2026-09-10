@@ -4,7 +4,6 @@ import "io/fs"
 
 var (
 	indexHTML         = mustReadTemplate("static/index.html.tmpl")
-	authRedirectHTML  = mustReadTemplate("static/auth-redirect.html.tmpl")
 	adminHTML         = mustReadTemplate("static/admin.html.tmpl")
 	hdrDiagnosticHTML = mustReadTemplate("diagnostic/hdr-diagnostic.html.tmpl")
 )

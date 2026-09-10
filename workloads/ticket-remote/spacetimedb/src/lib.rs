@@ -18,6 +18,8 @@ use command::require_legacy_phone_admission;
 mod maintenance;
 use maintenance::{maintenance_paused, require_new_phone_admission};
 mod cold_restart;
+mod action_statistics;
+use action_statistics::*;
 
 fn account_scope_id(email: &str) -> String {
     let normalized = email.trim().to_ascii_lowercase();
@@ -190,6 +192,7 @@ macro_rules! purge_ticket_history {
             ticketremote_ticket_slider_region_v3,
             ticketremote_member_limit_event,
             ticketremote_member_daily_activity,
+            ticketremote_member_daily_actions,
         );
     }};
 }
@@ -1387,6 +1390,21 @@ cloned_projection! {
 }
 
 cloned_projection! {
+    TicketremoteServiceMemberDailyActions from TicketremoteMemberDailyActions
+        with service_member_daily_actions_from_row {
+        id: String, ticketId: String, accountScopeId: String, day: String,
+        registrationAttempts: Vec<u32>, registrationSuccesses: Vec<u32>,
+        controlCodeAttempts: Vec<u32>, controlCodeSuccesses: Vec<u32>, expiresAt: String
+    }
+}
+cloned_projection! {
+    TicketremoteServiceActionStatisticsTracking from TicketremoteActionStatisticsTracking
+        with service_action_statistics_tracking_from_row {
+        id: String, startedAt: String
+    }
+}
+
+cloned_projection! {
     TicketremoteServicePhone from TicketremotePhoneBackend with service_phone_from_row {
         id: String, ticketId: String, backendId: String, attachName: String, baseUrl: String,
         desiredState: String, streamState: String, healthJson: String, lastError: String,
@@ -1504,6 +1522,18 @@ service_views! {
     |ctx, ticket| {
         ctx.db.ticketremote_member_daily_activity().ticketDay().filter((&ticket,))
             .map(|row| service_member_daily_activity_from_row(&row)).collect()
+    }
+    ticketremote_service_member_daily_actions =>
+        ticketremote_service_member_daily_actions_view -> TicketremoteServiceMemberDailyActions
+    |ctx, ticket| {
+        ctx.db.ticketremote_member_daily_actions().ticketDay().filter((&ticket,))
+            .map(|row| service_member_daily_actions_from_row(&row)).collect()
+    }
+    ticketremote_service_action_statistics_tracking =>
+        ticketremote_service_action_statistics_tracking_view -> TicketremoteServiceActionStatisticsTracking
+    |ctx, ticket| {
+        ctx.db.ticketremote_action_statistics_tracking().id().find(&ticket)
+            .map(|row| vec![service_action_statistics_tracking_from_row(&row)]).unwrap_or_default()
     }
     ticketremote_service_phone_backend => ticketremote_service_phone_backend_view -> TicketremoteServicePhone
     |ctx, ticket| {
@@ -4909,6 +4939,7 @@ pub fn ticketremote_service_bootstrap(
     require_service(ctx)?;
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, &displayName, &now);
+    action_statistics::ensure_tracking(ctx, &ticket.id);
     register_service_identity(ctx, ticket.id.clone(), &now);
     let email = clean_email(&adminEmail);
     let members = ctx.db.ticketremote_ticket_member();
@@ -5790,6 +5821,9 @@ pub fn ticketremote_finalize_ticket_action_v3(
         finalize_ticket_action_v3_scheduled_result(ctx, &command, &action, &facts, &now)?;
     }
 
+    if facts.status == "succeeded" {
+        action_statistics::record_success(ctx, &ticket.id, &backend_id, action_id);
+    }
     let terminal = TicketremoteTicketActionV3 {
         status: facts.status,
         phase: facts.phase,
@@ -5953,6 +5987,12 @@ pub fn ticketremote_update_control_code_request(
     let succeeded = clean_status == "succeeded";
     let clean_result_proof = clean_control_code_result_proof(&resultProof);
     let clean_result_proof_at = bounded_text(resultProofAt.trim(), 80);
+    if succeeded {
+        if let Some(command) = ctx.db.ticketremote_stream_command().id()
+            .find(format!("{}:generate_control_code", requestId.trim())) {
+            action_statistics::record_success(ctx, &ticket.id, &command.backendId, requestId.trim());
+        }
+    }
     update_control_code_public_request(
         ctx,
         &requestId,
@@ -6897,10 +6937,14 @@ fn member_activity_bucket(timestamp: Timestamp) -> Result<MemberActivityBucket, 
 }
 
 fn member_activity_bucket_from_utc(utc: DateTime<Utc>) -> Result<MemberActivityBucket, String> {
+    member_activity_bucket_with_retention(utc, MEMBER_ACTIVITY_RETENTION_DAYS)
+}
+
+fn member_activity_bucket_with_retention(utc: DateTime<Utc>, retention_days: u64) -> Result<MemberActivityBucket, String> {
     let local = utc.with_timezone(&Riga);
     let day = local.date_naive();
     let expiry_day = day
-        .checked_add_days(Days::new(MEMBER_ACTIVITY_RETENTION_DAYS))
+        .checked_add_days(Days::new(retention_days))
         .ok_or_else(|| "activity expiry outside supported range".to_string())?;
     let expiry_midnight = expiry_day
         .and_hms_opt(0, 0, 0)

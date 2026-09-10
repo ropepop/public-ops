@@ -30,6 +30,11 @@ pub struct TicketremoteCommandReceipt {
     pub fingerprint: String,
     pub createdAt: String,
     pub expiresAt: String,
+    // Old receipts remain uncounted during a data-preserving module update.
+    #[default(None::<String>)]
+    pub statisticsKind: Option<String>,
+    #[default(false)]
+    pub statisticsSucceeded: bool,
 }
 
 fn command_payload(operation: &str, payload: &str) -> Result<serde_json::Value, String> {
@@ -219,6 +224,13 @@ pub fn ticketremote_member_command(
             )?;
         }
     }
+    // Some ticket rejections intentionally commit a visible terminal row and
+    // return Ok. Only a real dispatched/queued command is an accepted attempt.
+    let accepted = operation != "register_current" || ctx.db.ticketremote_stream_command().id()
+        .find(ticket_action_v3_command_id(&ticket.id, &backend, &commandId)).is_some();
+    let statistics_kind = if accepted {
+        action_statistics::record_attempt(ctx, &ticket.id, &email, &operation, field("source"))
+    } else { None };
     ctx.db
         .ticketremote_command_receipt()
         .insert(TicketremoteCommandReceipt {
@@ -230,6 +242,8 @@ pub fn ticketremote_member_command(
             fingerprint,
             createdAt: clock.clone(),
             expiresAt: add_ms(&clock, HISTORY_TTL_MS),
+            statisticsKind: statistics_kind,
+            statisticsSucceeded: false,
         });
     Ok(())
 }

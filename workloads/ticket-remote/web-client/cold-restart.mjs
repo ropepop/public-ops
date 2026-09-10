@@ -2,8 +2,8 @@ const blockedPhases = new Set(['quiescing', 'stopping', 'confirmed', 'failed']);
 const completePhases = new Set(['reloading', 'asleep', 'live']);
 
 export class ColdRestartPage {
-  constructor({ openedAt, hidden, pause, reload, recall, remember }) {
-    Object.assign(this, { openedAt, hidden, pause, reload, recall, remember });
+  constructor({ openedAt, hidden, pause, restart, recall, remember }) {
+    Object.assign(this, { openedAt, hidden, pause, restart, recall, remember });
     this.blocked = false;
     this.phase = '';
     this.operationId = '';
@@ -35,7 +35,7 @@ export class ColdRestartPage {
     const id = this.pending;
     this.pending = '';
     this.remember(id);
-    this.reload();
+    this.restart();
     return true;
   }
 }

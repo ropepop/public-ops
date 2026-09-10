@@ -98,6 +98,7 @@ export class Presentation {
         if (status === 'ready') this.seedHDR();
         if (status === 'failed') {
           this.hdrBlocked = true;
+          this.surface(false);
           this.handlers.onFailure?.(reason || 'hdr_failed');
         }
       },

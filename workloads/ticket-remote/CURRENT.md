@@ -19,7 +19,7 @@ Registration policy is per authenticated account: at most one admitted registrat
 
 Each freshly authorized page opening retains the shared stream for 30 minutes from that opening, even after its browser disconnects. A later page opening renews that session's warm hold; media reconnects and first-frame presentation do not. Active viewers retain their own stream demand beyond that deadline. The warm hold does not add a visible viewer and requires no continuous browser frame delivery while nobody is watching.
 
-The owner-only **Sleep / cold mode** control on `/admin` is the deliberate exception: it cancels the actual page-warm and startup timers, blocks new phone admissions and all rewarming, clears relay pictures, and asks the existing Pixel lifecycle owner to stop capture and release its secure-capture lease. One operation ID and its progress live in the existing stream desired-state row. The matching phone acknowledgement and the relay's empty/disabled state must both be proved before existing viewer pages reload once; hidden pages reload on return. No-viewer completion leaves the phone asleep. A 15-second unproved shutdown remains paused and reports failure; it never silently retries. New ordinary openings then create the normal 30-minute hold again. Existing phone work, including queued work and cleanup, causes immediate rejection instead of queuing a stop.
+The owner-only **Sleep / cold mode** control on `/admin` is the deliberate exception: it cancels the actual page-warm and startup timers, blocks new phone admissions and all rewarming, clears relay pictures, and asks the existing Pixel lifecycle owner to stop capture and release its secure-capture lease. One operation ID and its progress live in the existing stream desired-state row. The matching phone acknowledgement and the relay's empty/disabled state must both be proved before existing viewer pages reconnect in place; hidden pages reconnect on return. No-viewer completion leaves the phone asleep. A 15-second unproved shutdown remains paused and reports failure; it never silently retries. New ordinary openings then create the normal 30-minute hold again. Existing phone work, including queued work and cleanup, causes immediate rejection instead of queuing a stop.
 
 An admitted demand-idle encoder is reusable even when its last picture expired. Reuse never permits stale picture presentation. The phone watchdog measures a missing requested picture from its first successful demand dispatch; repeated permits cannot extend that deadline. Replacement helpers within an admitted session do not wait for an already-consumed activation signal. The browser records one bounded navigation-to-first-presentation/ten-distinct-pictures summary in shared private operational logging.
 
@@ -36,6 +36,34 @@ The HDR settings show one fixed explanation alongside the existing switch and br
 - Deep stream/capture note: `pixel-phone/docs/architecture/TICKET_STREAMING_ARCHITECTURE.md`. Open it only when the stream path itself is the task.
 
 Generated copies such as `internal/web/static/app.js` and `internal/web/static/spacetime-client.js` are build output. Edit the source, then rebuild.
+
+## Administrator statistics
+
+`/admin?tab=statistics` shows the last 30 Europe/Riga calendar days of viewing
+time and accepted slider-registration/control-code requests. Each action count
+is successful/accepted. Only `register_current` from `browser_slider` contributes
+registration counts; menu actions do not. Code success means confirmed phone
+generation, not browser presentation or inspector use. Queued requests count at
+acceptance, including later failures; blocked submissions do not count.
+
+The existing command receipt owns the counted kind, original requester/time, and
+success deduplication. Private `ticketremote_member_daily_actions` rows contain
+four hourly counter arrays and expire after 30 calendar days. The private
+tracking watermark starts at service bootstrap or the first counted admission
+and is retained across deployments. Receipts created before tracking have no
+counted kind, so delayed old results cannot create unpaired successes. Existing
+viewing history keeps its prior retention. The administrator snapshot receives
+these aggregates through service-only views; member and health responses exclude
+them. No code digits, tickets, new event log, browser request, or poller is added.
+
+Edit `web-client/admin-statistics-source.js` and rebuild. The same entry renderer
+serves compact and detailed views, with counts only where attempts exist. Run
+`make test`, `make spacetime-build`, `make web-client-build`, and
+`make statistics-test`. The latter uses synthetic loopback browser pages and a
+temporary database/module copy, including an old-schema migration check; never
+publish the fixture module. Publish the additive production module with
+`--delete-data=never` before deploying the sidecar/web service. Keep receipt
+defaults for old retained rows; they carry no legacy execution path.
 
 ## Do not start here
 
@@ -91,3 +119,21 @@ waiting for warm-session expiry. See the [measured resource report](../../../pix
 - Browser v178 abandons any in-flight readiness-clock refresh when its database connection ends. A replacement connection must acquire its own clock; late old responses cannot restore authority or clear the new refresh. This prevents a lost reducer reply from leaving registration and code controls disabled after reconnect. The ready slider uses a 5% base and has a passive white sweep over a three-second cycle (v180), with half the previous white-wave opacity; reduced-motion mode disables the sweep. It does not animate during registration or alter input geometry.
 
 - The slider white sweep uses the active stream HDR brightness boost, preserving its 19% alpha and three-second motion, with the existing SDR and reduced-motion fallback. Its small transparent canvas shares the stream device and paints only when shown, resized, or its boost changes. The upper-left loading spinner uses 50% opacity in all modes.
+
+- Browser v183 sizes the stream from the full layout viewport so the on-screen keyboard overlays the picture without shrinking either SDR or HDR. Only the control-code entry dialog follows the smaller visual viewport; normal window and orientation resizing still update the picture.
+
+- Browser v184 opens that dialog without a dimming veil or broad shadow. It holds the existing page position through focus and keyboard viewport panning, then restores normal scrolling when the dialog closes.
+
+- Server v186 redirects signed-out viewer and admin requests directly to the existing sign-in route, retaining their path and query. Login no longer loads the viewer bundle against an empty page. Verify fresh and stale-cookie redirects with `TestSignedOutPagesReachLoginWithoutJavaScript` and complete a private-browser sign-in.
+
+  Deployed as `ticket-login-20260909-v186` on 9 September. Required builds/tests and standard production validation passed. A fresh email-link login in private Brave and a subsequent reload both reached the live ticket with advancing `LIVE_FRESH` pictures; served asset hashes matched. The task's private and email windows were closed, preserving the original browser session. No Ticket action was submitted during this login verification.
+
+## Continuous browser recovery
+
+Server v188 requires a current approved membership for every `/static/*` file, including old versioned URLs, and sends no-store headers for browsers and shared caches. Login remains independent of these files. `TestStaticFilesRequireCurrentMembership` covers the embedded file inventory, expired and removed sessions, conditional requests, and unavailable membership state. Purge the `ticket.jolkins.id.lv/static/` CDN prefix when deploying this change to remove previously public copies.
+
+Deployed as `ticket-private-static-20260910-v188` on 10 September. Required builds/tests and standard production validation passed; the stale-code deployment check now reads the release bundle because anonymous downloads are forbidden. The Cloudflare dashboard purged the static prefix. All 11 authenticated asset hashes matched the build with no-store headers, 46 public old/new-version and conditional probes returned 401, and fresh private-Brave email login showed the live ticket. A separate signed-in reload reached `LIVE_FRESH` without console errors. Test windows were closed without submitting Ticket actions or changing normal sessions.
+
+Browser v187 keeps one reconnect attempt in flight, retries failed attempts after one second without a limit, and abandons an attempt after ten seconds without current database state/clock and a fresh presented picture. The existing spinner covers interruptions; the optional reconnect error appears only after thirty seconds of continuous visible downtime. Hidden time does not count, returning or going online expedites recovery, and visible viewing has no inactivity cutoff. Success clears the outage immediately. Only a changed product version automatically reloads the page. Expired authentication offers sign-in after the grace period while session checks continue. Owner cold completion resumes connections in place after the existing proof barrier; it does not renew the page-opening warm lease.
+
+HDR failures keep the ordinary picture working while HDR retries, preserving the saved preference. Reconnects never resubmit phone commands; pending results retain their identity, and abandoned callbacks cannot affect replacement connections. Browser fault coverage lives in the loopback-only recovery test and uses simulated services and decoder output with the real page and canvas presentation.

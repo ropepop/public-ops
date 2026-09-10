@@ -1,4 +1,9 @@
 .PHONY: test build tidy spacetime-install spacetime-build spacetime-test activation-report spacetime-sidecar-bindings spacetime-sidecar-bindings-check spacetime-sidecar-build spacetime-sidecar-test web-client-install web-client-build client-hdr-real-gpu-serve docker-image-build clean-local
+.PHONY: statistics-test
+
+statistics-test:
+	python3 ./scripts/test-action-statistics.py
+	cd ./web-client && npm run test:statistics-browser
 
 SPACETIME ?= $(HOME)/.local/bin/spacetime
 

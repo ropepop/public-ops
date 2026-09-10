@@ -10,7 +10,7 @@ export function mountColdRestart(mount) {
     quiescing: 'Stopping — cancelling the warm timer and closing streams…',
     stopping: 'Stopping — waiting for the phone to release capture…',
     confirmed: 'Cold confirmed — capture is fully stopped.',
-    reloading: 'Cold confirmed. Reloading viewer pages…',
+    reloading: 'Cold confirmed. Reconnecting viewers…',
     asleep: 'Cold confirmed. Asleep until the next page opens.',
     live: 'Live — the stream has returned from cold mode.',
     failed: 'Cold shutdown could not be proved. Streaming remains paused. Check the phone before trying again.'
@@ -42,7 +42,7 @@ export function mountColdRestart(mount) {
     finally { model.sending = false; }
   };
   html`<div class="admin-section-header"><div><h2>Stream sleep</h2>
-    <p class="admin-muted">Briefly interrupts viewers, cancels the warm timer, fully stops capture, then reloads open viewer pages from cold.</p></div>
+    <p class="admin-muted">Briefly interrupts viewers, cancels the warm timer, fully stops capture, then reconnects open viewer pages from cold.</p></div>
     <button class="primary" type="button" disabled="${() => !model.ready || model.sending || model.busy || running()}"
       @click="${begin}">Sleep / cold mode</button></div>
     <p class="admin-muted admin-action-status" role="status" aria-live="polite">${() => model.message}</p>`(mount);

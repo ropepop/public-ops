@@ -515,6 +515,10 @@ class TicketSpacetimeClient {
       currentConnection: this.conn,
     });
     this.subscription = connection.subscriptionBuilder()
+      .onError(() => {
+        if (!connectionIsCurrent()) return;
+        this.handlers.onStatus?.("subscription_failed");
+      })
       .onApplied(() => {
         if (!connectionIsCurrent()) return;
         this.reconnectAttempted = false;
@@ -579,7 +583,7 @@ class TicketSpacetimeClient {
     const updatedAt = relayReport?.updatedAt || phoneReport?.updatedAt || new Date().toISOString();
     this.handlers.onState?.({
       ticket: { id: ticketId, displayName: "ViVi timed ticket", updatedAt },
-      viewerCount: Math.max(Number(relayReport?.videoClients || 0), viewerPresence.length),
+      viewerCount: viewerPresence.length,
       viewerPresence,
       phone: {
         id: backendId, attachName: backendId,

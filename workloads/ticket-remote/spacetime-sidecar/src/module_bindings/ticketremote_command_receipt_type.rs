@@ -15,6 +15,8 @@ pub struct TicketremoteCommandReceipt {
     pub fingerprint: String,
     pub created_at: String,
     pub expires_at: String,
+    pub statistics_kind: Option<String>,
+    pub statistics_succeeded: bool,
 }
 
 impl __sdk::InModule for TicketremoteCommandReceipt {
@@ -33,6 +35,8 @@ pub struct TicketremoteCommandReceiptCols {
     pub fingerprint: __sdk::__query_builder::Col<TicketremoteCommandReceipt, String>,
     pub created_at: __sdk::__query_builder::Col<TicketremoteCommandReceipt, String>,
     pub expires_at: __sdk::__query_builder::Col<TicketremoteCommandReceipt, String>,
+    pub statistics_kind: __sdk::__query_builder::Col<TicketremoteCommandReceipt, Option<String>>,
+    pub statistics_succeeded: __sdk::__query_builder::Col<TicketremoteCommandReceipt, bool>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteCommandReceipt {
@@ -47,6 +51,11 @@ impl __sdk::__query_builder::HasCols for TicketremoteCommandReceipt {
             fingerprint: __sdk::__query_builder::Col::new(table_name, "fingerprint"),
             created_at: __sdk::__query_builder::Col::new(table_name, "created_at"),
             expires_at: __sdk::__query_builder::Col::new(table_name, "expires_at"),
+            statistics_kind: __sdk::__query_builder::Col::new(table_name, "statistics_kind"),
+            statistics_succeeded: __sdk::__query_builder::Col::new(
+                table_name,
+                "statistics_succeeded",
+            ),
         }
     }
 }

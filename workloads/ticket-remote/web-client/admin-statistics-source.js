@@ -77,6 +77,44 @@ function normalizedTick(value) {
   return Math.min(tick, Number.MAX_SAFE_INTEGER);
 }
 
+const ACTION_METRICS = [
+  { key: 'registration', shortLabel: 'Reg', label: 'Registrations', accessibleLabel: 'Slider registration' },
+  { key: 'controlCode', shortLabel: 'Code', label: 'Control codes', accessibleLabel: 'Control-code generation' }
+];
+
+function emptyCounts() {
+  return { registrationAttempts: 0, registrationSuccesses: 0, controlCodeAttempts: 0, controlCodeSuccesses: 0 };
+}
+
+function addCounts(total, counts) {
+  for (const { key } of ACTION_METRICS) {
+    for (const suffix of ['Attempts', 'Successes']) {
+      const field = `${key}${suffix}`;
+      total[field] = Math.min(Number.MAX_SAFE_INTEGER, total[field] + counts[field]);
+    }
+  }
+}
+
+function metricsFor(counts) {
+  return ACTION_METRICS.filter(({ key }) => counts[`${key}Attempts`] > 0).map((metric) => ({
+    ...metric,
+    text: `${counts[`${metric.key}Successes`]}/${counts[`${metric.key}Attempts`]}`,
+    description: `${metric.accessibleLabel}: ${counts[`${metric.key}Successes`]} successful, ${counts[`${metric.key}Attempts`]} accepted requests`
+  }));
+}
+
+function trackingStartLabel(value, timeZone) {
+  const date = new Date(value);
+  if (!value || !Number.isFinite(date.getTime())) return 'Action tracking has not started yet.';
+  let time;
+  try {
+    time = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(date);
+  } catch (_) {
+    return trackingStartLabel(value, DEFAULT_TIME_ZONE);
+  }
+  return `Action counts since ${currentCalendarDay(value, timeZone)} at ${time} (${timeZone}).`;
+}
+
 export function buildActivityStatisticsModel(payload = {}) {
   const timeZone = String(payload.timeZone || DEFAULT_TIME_ZONE).trim() || DEFAULT_TIME_ZONE;
   const dayCount = integerInRange(payload.days, DEFAULT_DAY_COUNT, 1, 90);
@@ -102,8 +140,12 @@ export function buildActivityStatisticsModel(payload = {}) {
     members.push(member);
   }
 
-  const ticksByCell = new Map();
-  const scopesWithVisibleActivity = new Set();
+  const cells = new Map();
+  const cellFor = (day, hour, accountScopeId) => {
+    const key = `${day}|${hour}|${accountScopeId}`;
+    if (!cells.has(key)) cells.set(key, { day, hour, accountScopeId, ticks: 0, ...emptyCounts() });
+    return cells.get(key);
+  };
   for (const row of Array.isArray(payload.pageActivityDaily) ? payload.pageActivityDaily : []) {
     const day = normalizedDay(row && row.day);
     const accountScopeId = normalizedScope(row && row.accountScopeId);
@@ -112,34 +154,53 @@ export function buildActivityStatisticsModel(payload = {}) {
     for (let hour = 0; hour < 24; hour += 1) {
       const ticks = normalizedTick(hourlyTicks[hour]);
       if (ticks === 0) continue;
-      scopesWithVisibleActivity.add(accountScopeId);
-      const key = `${day}|${hour}|${accountScopeId}`;
-      ticksByCell.set(key, Math.min(Number.MAX_SAFE_INTEGER, (ticksByCell.get(key) || 0) + ticks));
+      const cell = cellFor(day, hour, accountScopeId);
+      cell.ticks = Math.min(Number.MAX_SAFE_INTEGER, cell.ticks + ticks);
     }
   }
 
+  for (const row of Array.isArray(payload.actionActivityDaily) ? payload.actionActivityDaily : []) {
+    const day = normalizedDay(row && row.day);
+    const scope = normalizedScope(row && row.accountScopeId);
+    if (!visibleDays.has(day) || !scope) continue;
+    for (let hour = 0; hour < 24; hour += 1) {
+      const counts = emptyCounts();
+      for (const { key } of ACTION_METRICS) {
+        counts[`${key}Attempts`] = normalizedTick(row[`${key}Attempts`]?.[hour]);
+        counts[`${key}Successes`] = Math.min(counts[`${key}Attempts`], normalizedTick(row[`${key}Successes`]?.[hour]));
+      }
+      if (counts.registrationAttempts || counts.controlCodeAttempts) addCounts(cellFor(day, hour, scope), counts);
+    }
+  }
+
+  const entriesByHour = new Map();
+  for (const cell of cells.values()) {
+    let member = memberByScope.get(cell.accountScopeId);
+    if (!member) {
+      member = { accountScopeId: cell.accountScopeId, shortId: shortActivityID(null, cell.accountScopeId), email: '', active: false };
+      members.push(member);
+      memberByScope.set(cell.accountScopeId, member);
+    }
+    const seconds = cell.ticks * secondsPerTick;
+    const key = `${cell.day}|${cell.hour}`;
+    if (!entriesByHour.has(key)) entriesByHour.set(key, []);
+    entriesByHour.get(key).push({ ...member, ...cell, seconds, duration: seconds ? formatActivityDuration(seconds) : '', metrics: metricsFor(cell) });
+  }
+
   let totalSeconds = 0;
+  const totals = emptyCounts();
   const activeScopes = new Set();
   const days = dayKeys.map((day, dayIndex) => {
     let dayTotalSeconds = 0;
+    const dayTotals = emptyCounts();
     const hours = Array.from({ length: 24 }, (_, hour) => {
-      const entries = [];
-      for (const member of members) {
-        const ticks = ticksByCell.get(`${day}|${hour}|${member.accountScopeId}`) || 0;
-        if (ticks === 0) continue;
-        const seconds = ticks * secondsPerTick;
-        dayTotalSeconds += seconds;
-        totalSeconds += seconds;
-        activeScopes.add(member.accountScopeId);
-        entries.push({
-          accountScopeId: member.accountScopeId,
-          shortId: member.shortId,
-          email: member.email,
-          active: member.active,
-          ticks,
-          seconds,
-          duration: formatActivityDuration(seconds)
-        });
+      const entries = entriesByHour.get(`${day}|${hour}`) || [];
+      for (const entry of entries) {
+        dayTotalSeconds += entry.seconds;
+        totalSeconds += entry.seconds;
+        activeScopes.add(entry.accountScopeId);
+        addCounts(dayTotals, entry);
+        addCounts(totals, entry);
       }
       entries.sort((left, right) => left.shortId.localeCompare(right.shortId));
       return { hour, label: String(hour).padStart(2, '0'), entries };
@@ -153,14 +214,16 @@ export function buildActivityStatisticsModel(payload = {}) {
       panelId: `adminStatisticsDayPanel${day.replace(/-/g, '')}`,
       hours,
       activeHours,
+      ...dayTotals,
+      metrics: metricsFor(dayTotals),
       totalSeconds: dayTotalSeconds,
-      totalDuration: formatActivityDuration(dayTotalSeconds)
+      totalDuration: dayTotalSeconds ? formatActivityDuration(dayTotalSeconds) : ''
     };
   });
   const activeDays = days.filter((day) => day.activeHours.length > 0);
 
   const legend = members
-    .filter((member) => scopesWithVisibleActivity.has(member.accountScopeId))
+    .filter((member) => activeScopes.has(member.accountScopeId))
     .sort((left, right) => left.shortId.localeCompare(right.shortId) || left.email.localeCompare(right.email));
 
   return {
@@ -170,11 +233,38 @@ export function buildActivityStatisticsModel(payload = {}) {
     days,
     activeDays,
     legend,
-    hasActiveActivity: totalSeconds > 0,
+    hasActiveActivity: activeDays.length > 0,
+    ...totals,
+    metrics: metricsFor(totals),
+    trackingStartLabel: trackingStartLabel(payload.actionStatisticsStartedAt, timeZone),
     activeUserCount: activeScopes.size,
     totalSeconds,
     totalDuration: formatActivityDuration(totalSeconds)
   };
+}
+
+function renderMetrics(metrics, fullLabels = false) {
+  return metrics.length === 0 ? '' : html`
+    <span class="admin-statistics-metrics">
+      ${metrics.map((metric) => html`
+        <span class="admin-statistics-metric" role="img" aria-label="${metric.description}">
+          <span aria-hidden="true">${fullLabels ? metric.label : metric.shortLabel} <span class="admin-statistics-ratio">${metric.text}</span></span>
+        </span>
+      `.key(metric.key))}
+    </span>
+  `;
+}
+
+function renderEntry(entry) {
+  return html`
+    <span class="${entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${`${entry.email || entry.shortId}${entry.active ? '' : ' · Inactive'}`}">
+      <span class="admin-statistics-entry-main">
+        <span class="admin-statistics-entry-id">${entry.shortId}</span>
+        ${entry.duration ? html`<span class="admin-statistics-entry-duration">${entry.duration}</span>` : ''}
+      </span>
+      ${renderMetrics(entry.metrics)}
+    </span>
+  `.key(entry.accountScopeId);
 }
 
 export function mountActivityStatistics(documentRef = document) {
@@ -192,7 +282,8 @@ export function mountActivityStatistics(documentRef = document) {
   } catch (_) {
     payload = {};
   }
-  const model = reactive(buildActivityStatisticsModel(payload));
+  // This page is a snapshot. Only view selection/expansion changes after mount.
+  const model = buildActivityStatisticsModel(payload);
   const viewRef = documentRef.defaultView || (typeof window !== 'undefined' ? window : null);
   let compactViewQuery = null;
   try {
@@ -218,6 +309,9 @@ export function mountActivityStatistics(documentRef = document) {
         <span>·</span>
         <span><strong>${() => model.totalDuration}</strong> measured use</span>
       </div>
+      <div class="admin-statistics-action-summary">${renderMetrics(model.metrics, true)}</div>
+      <p class="admin-statistics-count-key">Counts = successful / accepted requests. Reg = slider registration; Code = code generation.</p>
+      <p class="admin-statistics-tracking-note">${model.trackingStartLabel} Requests without success may be pending, failed, or unconfirmed.</p>
       ${() => model.hasActiveActivity ? '' : html`
         <p class="admin-statistics-empty">No activity was recorded in this 30-day window.</p>
       `}
@@ -257,7 +351,10 @@ export function mountActivityStatistics(documentRef = document) {
                 >
                   <span class="admin-statistics-day-label">${day.displayLabel}</span>
                   <span class="admin-statistics-day-meta">
-                    <span class="admin-statistics-day-duration">${day.totalDuration}</span>
+                    <span class="admin-statistics-day-totals">
+                      ${day.totalDuration ? html`<span class="admin-statistics-day-duration">${day.totalDuration}</span>` : ''}
+                      ${renderMetrics(day.metrics)}
+                    </span>
                     <span class="admin-statistics-day-chevron" aria-hidden="true"></span>
                   </span>
                 </button>
@@ -274,12 +371,7 @@ export function mountActivityStatistics(documentRef = document) {
                     <li class="admin-statistics-active-hour" data-statistics-active-hour="${hour.hour}">
                       <span class="admin-statistics-active-hour-label">${hour.label}:00–${hour.label}:59</span>
                       <div class="admin-statistics-entry-list admin-statistics-active-hour-entries">
-                        ${() => hour.entries.map((entry) => html`
-                          <span class="${entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${entry.active ? entry.email : `${entry.email} · Inactive`}">
-                            <span class="admin-statistics-entry-id">${entry.shortId}</span>
-                            <span class="admin-statistics-entry-duration">${entry.duration}</span>
-                          </span>
-                        `.key(entry.accountScopeId))}
+                        ${() => hour.entries.map(renderEntry)}
                       </div>
                     </li>
                   `.key(hour.hour))}
@@ -300,7 +392,7 @@ export function mountActivityStatistics(documentRef = document) {
         hidden="${() => viewState.mode !== 'table'}"
       >
         <table class="admin-statistics-table">
-          <caption>Foreground activity in five-second intervals, grouped by Europe/Riga calendar day and hour.</caption>
+          <caption>Page use and accepted actions, grouped by Europe/Riga calendar day and hour. Action results use the original request hour.</caption>
           <thead>
             <tr>
               <th class="admin-statistics-day" scope="col">Date</th>
@@ -310,16 +402,11 @@ export function mountActivityStatistics(documentRef = document) {
           <tbody>
             ${() => model.days.map((day) => html`
               <tr>
-                <th class="admin-statistics-day" scope="row">${day.day}</th>
+                <th class="admin-statistics-day" scope="row"><span>${day.day}</span>${renderMetrics(day.metrics)}</th>
                 ${() => day.hours.map((hour) => html`
                   <td class="admin-statistics-hour-cell">
                     <div class="admin-statistics-entry-list">
-                      ${() => hour.entries.map((entry) => html`
-                        <span class="${entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${entry.active ? entry.email : `${entry.email} · Inactive`}">
-                          <span class="admin-statistics-entry-id">${entry.shortId}</span>
-                          <span class="admin-statistics-entry-duration">${entry.duration}</span>
-                        </span>
-                      `.key(entry.accountScopeId))}
+                      ${() => hour.entries.map(renderEntry)}
                     </div>
                   </td>
                 `.key(hour.hour))}
@@ -368,24 +455,12 @@ export function mountActivityStatistics(documentRef = document) {
 
   if (viewToggle) viewToggle.addEventListener('click', toggleView);
   if (compactView) compactView.addEventListener('click', toggleDay);
-  if (compactViewQuery) {
-    if (typeof compactViewQuery.addEventListener === 'function') {
-      compactViewQuery.addEventListener('change', useResponsiveDefault);
-    } else if (typeof compactViewQuery.addListener === 'function') {
-      compactViewQuery.addListener(useResponsiveDefault);
-    }
-  }
+  if (compactViewQuery) compactViewQuery.addEventListener('change', useResponsiveDefault);
 
   const cleanup = () => {
     if (viewToggle) viewToggle.removeEventListener('click', toggleView);
     if (compactView) compactView.removeEventListener('click', toggleDay);
-    if (compactViewQuery) {
-      if (typeof compactViewQuery.removeEventListener === 'function') {
-        compactViewQuery.removeEventListener('change', useResponsiveDefault);
-      } else if (typeof compactViewQuery.removeListener === 'function') {
-        compactViewQuery.removeListener(useResponsiveDefault);
-      }
-    }
+    if (compactViewQuery) compactViewQuery.removeEventListener('change', useResponsiveDefault);
     mount.ticketActivityStatisticsCleanup = null;
   };
   mount.ticketActivityStatisticsCleanup = cleanup;

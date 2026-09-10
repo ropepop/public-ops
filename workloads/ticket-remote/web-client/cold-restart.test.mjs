@@ -6,20 +6,20 @@ function page(openedAt = 1000) {
   const events = [];
   let hidden = false, remembered = '';
   const controller = new ColdRestartPage({ openedAt, hidden: () => hidden,
-    pause: () => events.push('pause'), reload: () => events.push('reload'),
+    pause: () => events.push('pause'), restart: () => events.push('restart'),
     recall: () => remembered, remember: id => { remembered = id; } });
   return { controller, events, hide: value => { hidden = value; } };
 }
 const row = phase => ({ coldRestartId: 'operation-a', coldRestartPhase: phase,
   coldRestartStartedAt: new Date(2000).toISOString() });
 
-test('active page pauses once and reloads only after both cold proofs', () => {
+test('active page pauses once and restarts only after both cold proofs', () => {
   const { controller: c, events } = page();
   for (const phase of ['quiescing','stopping','stopping','confirmed']) c.update(row(phase));
   assert.deepEqual(events, ['pause']);
   assert.equal(c.blocked,true);
-  for (const phase of ['reloading','reloading','live']) c.update(row(phase));
-  assert.deepEqual(events,['pause','reload']);
+  for (const phase of ['restarting','restarting','live']) c.update(row(phase));
+  assert.deepEqual(events,['pause','restart']);
 });
 test('hidden page waits for visibility, including one that missed the stop updates', () => {
   const { controller:c, events, hide } = page();
@@ -29,7 +29,7 @@ test('hidden page waits for visibility, including one that missed the stop updat
   hide(false);
   assert.equal(c.resume(),true);
   assert.equal(c.resume(),false);
-  assert.deepEqual(events,['reload']);
+  assert.deepEqual(events,['restart']);
 });
 test('failed shutdown stays paused and never invents a cold completion', () => {
   const { controller:c, events } = page();
@@ -39,7 +39,7 @@ test('failed shutdown stays paused and never invents a cold completion', () => {
   assert.equal(c.blocked,true);
   assert.deepEqual(events,['pause']);
 });
-test('a new navigation does not reload for an older completed operation', () => {
+test('a new navigation does not restart for an older completed operation', () => {
   const { controller:c, events } = page(3000);
   c.update(row('live'));
   assert.deepEqual(events,[]);

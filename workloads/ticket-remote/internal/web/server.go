@@ -42,7 +42,6 @@ type Server struct {
 	diagnostic        fs.FS
 	indexTmpl         *template.Template
 	adminTmpl         *template.Template
-	authTmpl          *template.Template
 	hdrDiagnosticTmpl *template.Template
 
 	mu                      sync.Mutex
@@ -164,7 +163,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-08-warm-reuse-cold-restart-v182"
+	serverVersion                 = "ticket-remote-2026-09-10-private-static-v188"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -203,7 +202,6 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 		diagnostic:          diagnosticSub,
 		indexTmpl:           template.Must(template.New("index").Parse(indexHTML)),
 		adminTmpl:           template.Must(template.New("admin").Parse(adminHTML)),
-		authTmpl:            template.Must(template.New("auth").Parse(authRedirectHTML)),
 		hdrDiagnosticTmpl:   template.Must(template.New("hdr-diagnostic").Parse(hdrDiagnosticHTML)),
 		clients:             map[*client]struct{}{},
 		relayViewerRefs:     map[string]int{},
@@ -289,12 +287,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.handleHealth(w, r, snapshot)
 		})
 	case strings.HasPrefix(path, "/static/"):
-		if strings.TrimSpace(r.URL.Query().Get("v")) == "" {
-			writeNoStoreHeaders(w)
-		} else {
-			writeStaticAssetHeaders(w)
-		}
-		http.StripPrefix("/static/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
+		writeNoStoreHeaders(w)
+		s.withMember(w, r, func(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
+			http.StripPrefix("/static/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
+		})
 	case retiredTicketRoute(path):
 		handleRetiredTicketRoute(w)
 	case path == "/api/v1/stream":
@@ -414,7 +410,7 @@ func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
 			s.handleIndex(w, r, id, sessionID, snapshot, startupRun)
 			return
 		}
-		s.handleUnauthIndex(w)
+		s.handleUnauthIndex(w, r)
 		return
 	}
 	id, sessionID, snapshot, ok := s.identifyMemberFromRequest(w, r, memberLookupOptions{
@@ -434,7 +430,7 @@ func (s *Server) handleAdminShell(w http.ResponseWriter, r *http.Request) {
 	if s.usesSpacetimeAuth() {
 		id, sessionID, snapshot, ok := s.identifyMemberFromRequest(nil, r, memberLookupOptions{optional: true})
 		if !ok {
-			s.handleUnauthIndex(w)
+			s.handleUnauthIndex(w, r)
 			return
 		}
 		if !snapshot.IsAdmin(id.Email) {
@@ -450,14 +446,11 @@ func (s *Server) handleAdminShell(w http.ResponseWriter, r *http.Request) {
 	s.withAdmin(w, r, s.handleAdminPage)
 }
 
-func (s *Server) handleUnauthIndex(w http.ResponseWriter) {
-	nonce := randomID()
-	s.writeHTMLHeaders(w, nonce)
-	_ = s.authTmpl.Execute(w, map[string]any{
-		"AssetVersion": assetVersion(),
-		"ConfigJSON":   template.JS(mustJSON(s.publicBrowserConfig(auth.Identity{}, "", state.Snapshot{}, false))),
-		"Nonce":        nonce,
-	})
+func (s *Server) handleUnauthIndex(w http.ResponseWriter, r *http.Request) {
+	// Signed-out pages have no ticket DOM and must not load the viewer app to log in.
+	writeNoStoreHeaders(w)
+	returnTo := safeReturnPath(r.URL.RequestURI())
+	http.Redirect(w, r, "/api/v1/auth/start?returnTo="+url.QueryEscape(returnTo), http.StatusFound)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot state.Snapshot) {
@@ -578,6 +571,8 @@ func (s *Server) ensurePhoneStreamStarted(reason string) {
 
 func redactSnapshotForHealth(snapshot state.Snapshot) state.Snapshot {
 	snapshot.PageActivityDaily = nil
+	snapshot.ActionActivityDaily = nil
+	snapshot.ActionStatisticsStartedAt = ""
 	snapshot.MemberHDRBoosts = nil
 	snapshot.MemberHDRPreferences = nil
 	snapshot.Members = append([]state.Member(nil), snapshot.Members...)
@@ -732,11 +727,15 @@ func ticketAccountScopeID(email string) string {
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
 	nonce := randomID()
 	s.writeHTMLHeaders(w, nonce)
-	adminTab := "overview"
 	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("tab")), "statistics") {
-		adminTab = "statistics"
+		_ = s.adminTmpl.Execute(w, map[string]any{
+			"AssetVersion":   assetVersion(),
+			"IsStatistics":   true,
+			"StatisticsJSON": template.JS(mustJSON(adminStatisticsPayload(snapshot))),
+			"Nonce":          nonce,
+		})
+		return
 	}
-	isStatistics := adminTab == "statistics"
 	member, _ := snapshot.Member(id.Email)
 	members := make([]adminMemberPageRow, 0, len(snapshot.Members))
 	viewers := 0
@@ -760,24 +759,23 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 	activeBackend := s.activePhoneBackend()
 	rawStateSnapshot := snapshot
 	rawStateSnapshot.PageActivityDaily = nil
+	rawStateSnapshot.ActionActivityDaily = nil
+	rawStateSnapshot.ActionStatisticsStartedAt = ""
 	rawStateSnapshot.Members = append([]state.Member(nil), snapshot.Members...)
 	for index := range rawStateSnapshot.Members {
 		rawStateSnapshot.Members[index].AccountScopeID = ""
 	}
 	pageData := map[string]any{
-		"AssetVersion":   assetVersion(),
-		"AdminTab":       adminTab,
-		"IsStatistics":   isStatistics,
-		"Email":          id.Email,
-		"IsOwner":        isOwner,
-		"Members":        members,
-		"ViewerCount":    viewers,
-		"Phone":          phoneHealth,
-		"Backends":       s.configuredPhoneBackends(),
-		"ActiveBackend":  activeBackend.ID,
-		"RawState":       mustJSON(map[string]any{"state": rawStateSnapshot, "phone": phoneHealth}),
-		"StatisticsJSON": template.JS(mustJSON(adminStatisticsPayload(snapshot))),
-		"Nonce":          nonce,
+		"AssetVersion":  assetVersion(),
+		"Email":         id.Email,
+		"IsOwner":       isOwner,
+		"Members":       members,
+		"ViewerCount":   viewers,
+		"Phone":         phoneHealth,
+		"Backends":      s.configuredPhoneBackends(),
+		"ActiveBackend": activeBackend.ID,
+		"RawState":      mustJSON(map[string]any{"state": rawStateSnapshot, "phone": phoneHealth}),
+		"Nonce":         nonce,
 		"AdminConfigJSON": template.JS(mustJSON(map[string]any{
 			"ticketId":  s.cfg.TicketID,
 			"backendId": activeBackend.ID,
@@ -798,12 +796,14 @@ func adminStatisticsPayload(snapshot state.Snapshot) map[string]any {
 		}
 	}
 	return map[string]any{
-		"members":           members,
-		"pageActivityDaily": snapshot.PageActivityDaily,
-		"serverTime":        snapshot.ServerTime,
-		"timeZone":          "Europe/Riga",
-		"days":              30,
-		"secondsPerTick":    5,
+		"members":                   members,
+		"pageActivityDaily":         snapshot.PageActivityDaily,
+		"actionActivityDaily":       snapshot.ActionActivityDaily,
+		"actionStatisticsStartedAt": snapshot.ActionStatisticsStartedAt,
+		"serverTime":                snapshot.ServerTime,
+		"timeZone":                  "Europe/Riga",
+		"days":                      30,
+		"secondsPerTick":            5,
 	}
 }
 

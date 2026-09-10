@@ -75,8 +75,9 @@ export class MediaSession {
     this.failed = false;
   }
 
-  open(early = null) {
+  open(early = null, ownerGeneration = 0) {
     this.close();
+    this.ownerGeneration = ownerGeneration;
     this.failed = false;
     this.startedAt = performance.now();
     this.lastPacketAt = this.startedAt;
@@ -93,7 +94,7 @@ export class MediaSession {
     socket.binaryType = 'arraybuffer';
     socket.onmessage = (event) => { if (generation === this.generation) this.receive(event.data); };
     socket.onopen = () => this.handlers.onStatus?.('connected');
-    socket.onerror = () => this.fail('video_connection_failed');
+    socket.onerror = () => { if (generation === this.generation) this.fail('video_connection_failed'); };
     socket.onclose = () => { if (generation === this.generation) this.fail('video_connection_closed'); };
     if (early?.opening) this.receive(early.opening);
     if (early?.config) this.receive(early.config);
@@ -127,7 +128,7 @@ export class MediaSession {
   fail(reason) {
     if (this.failed) return;
     this.failed = true;
-    this.handlers.onFailure?.(reason);
+    this.handlers.onFailure?.(reason, this.ownerGeneration);
   }
 
   receive(raw) {
@@ -169,6 +170,7 @@ export class MediaSession {
     this.received = picture.sequence;
     this.lastPacketAt = performance.now();
     picture.configGeneration = this.config.feedbackConfigGeneration;
+    picture.sessionGeneration = this.generation;
     // Receipt is independent of freshness and local decode success.
     this.feedback();
     this.waiting = picture;
@@ -176,7 +178,9 @@ export class MediaSession {
   }
 
   age(picture, now = performance.now()) {
-    if (!picture || !this.clock || now < this.clock.at || now - this.clock.at > 15000) return Infinity;
+    if (!picture || picture.sessionGeneration !== this.generation || picture.epoch !== this.epoch ||
+      picture.configGeneration !== this.config?.feedbackConfigGeneration || !this.clock ||
+      now < this.clock.at || now - this.clock.at > 15000) return Infinity;
     return (Math.max(0, this.clock.upper + (now - this.clock.at) * 1000 - picture.captureStart) + picture.uncertainty) / 1000;
   }
 
@@ -248,7 +252,7 @@ export class MediaSession {
   }
 
   noteRendered(metadata, presented = false) {
-    if (metadata.configGeneration !== this.config?.feedbackConfigGeneration || metadata.epoch !== this.epoch) return;
+    if (metadata.sessionGeneration !== this.generation || metadata.configGeneration !== this.config?.feedbackConfigGeneration || metadata.epoch !== this.epoch) return;
     this.rendered = metadata;
     if (presented) this.presented = metadata.sequence;
     this.feedback();
