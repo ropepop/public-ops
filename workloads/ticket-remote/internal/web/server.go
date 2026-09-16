@@ -163,7 +163,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-10-private-static-v188"
+	serverVersion                 = "ticket-remote-2026-09-16-hdr-frame-reset-v201"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -788,24 +788,6 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 	_ = s.adminTmpl.Execute(w, pageData)
 }
 
-func adminStatisticsPayload(snapshot state.Snapshot) map[string]any {
-	members := append([]state.Member(nil), snapshot.Members...)
-	for index := range members {
-		if strings.TrimSpace(members[index].AccountScopeID) == "" && strings.TrimSpace(members[index].Email) != "" {
-			members[index].AccountScopeID = ticketAccountScopeID(members[index].Email)
-		}
-	}
-	return map[string]any{
-		"members":                   members,
-		"pageActivityDaily":         snapshot.PageActivityDaily,
-		"actionActivityDaily":       snapshot.ActionActivityDaily,
-		"actionStatisticsStartedAt": snapshot.ActionStatisticsStartedAt,
-		"serverTime":                snapshot.ServerTime,
-		"timeZone":                  "Europe/Riga",
-		"days":                      30,
-		"secondsPerTick":            5,
-	}
-}
 
 type adminMemberPageRow struct {
 	state.Member

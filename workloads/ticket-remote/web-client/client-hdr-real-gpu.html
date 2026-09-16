@@ -16,7 +16,7 @@
 </head>
 <body>
   <h1>Ticket Browser HDR real-GPU test</h1>
-  <p>This developer test sends realistic Ticket red, orange, green, blue, gray, near-black, and black alongside RGB primaries, CMY secondaries, mixed color, and white through the production shader at every supported boost, then reads the real <code>rgba16float</code> WebGPU output back.</p>
+  <p>This developer test sends ticket colors, black, white, pale grays, and 12px footer lettering through the production shader at ordinary brightness and every HDR setting. It reads the real <code>rgba16float</code> output back and checks every pixel’s contrast relative to white. This does not measure the physical display.</p>
   <div id="surfaces"></div>
   <pre id="result" aria-live="polite">Running…</pre>
   <script type="module" src="./client-hdr-real-gpu.mjs"></script>

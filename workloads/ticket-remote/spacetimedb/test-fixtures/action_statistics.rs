@@ -156,6 +156,18 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
     let ticket = format!("stats-{case}");
     fixture_setup(ctx, &ticket);
     match case.as_str() {
+        "row-reuse" => {
+            for (revision, configured) in [("first", false), ("replacement", true)] {
+                let row = upsert_vivi_credential_state(ctx, &ticket, "pixel", configured, revision, &now(ctx));
+                let stored = ctx.db.ticketremote_vivi_credential_state().id().find(&row.id).unwrap();
+                assert_eq!(row.revision, revision);
+                assert_eq!(row.configured, configured);
+                assert!(same_fields!(stored, row; id, ticketId, backendId, configured, revision, updatedAt));
+            }
+            let renamed = ensure_ticket(ctx, &ticket, "Renamed fixture", &now(ctx));
+            assert_eq!(renamed.displayName, "Renamed fixture");
+            assert_eq!(ctx.db.ticketremote_ticket().id().find(&renamed.id).unwrap().displayName, renamed.displayName);
+        }
         "registration" => {
             fixture_command(
                 ctx,

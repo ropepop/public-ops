@@ -18,15 +18,15 @@ use command::require_legacy_phone_admission;
 mod maintenance;
 use maintenance::{maintenance_paused, require_new_phone_admission};
 mod cold_restart;
+mod idle_refresh;
+mod member_activity;
+use member_activity::*;
 mod action_statistics;
 use action_statistics::*;
 
 fn account_scope_id(email: &str) -> String {
     let normalized = email.trim().to_ascii_lowercase();
-    Sha256::digest(normalized.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
 const DEFAULT_TICKET_ID: &str = "vivi-default";
@@ -105,13 +105,12 @@ macro_rules! same_fields {
 macro_rules! upsert_row {
     ($ctx:expr, $table:ident, $row:expr) => {{
         let row = $row;
-        let id = row.id.clone();
-        if $ctx.db.$table().id().find(&id).is_some() {
-            $ctx.db.$table().id().update(row.clone());
+        let table = $ctx.db.$table();
+        if table.id().find(&row.id).is_some() {
+            table.id().update(row)
         } else {
-            $ctx.db.$table().insert(row.clone());
+            table.insert(row)
         }
-        row
     }};
 }
 
@@ -1596,6 +1595,7 @@ fn ticket_action_v3_target(value: &str) -> String {
             "show_recent_activated",
             "return_to_latest_unactivated",
             "redetect_latest",
+            "refresh_current_ticket",
         ],
         "",
     )
@@ -1634,6 +1634,14 @@ fn ticket_action_v3_public_reason(value: &str, fallback: &str) -> String {
         value,
         &[
             "ticket_action_queued",
+            "idle_refresh_requested",
+            "idle_refresh_viewer_returned",
+            "idle_refresh_missed_cycle",
+            "idle_refresh_phone_busy",
+            "idle_refresh_blocked",
+            "ticket_action_current_ticket_refreshed",
+            "ticket_action_idle_refresh_cancelled",
+            "ticket_action_idle_refresh_unavailable",
             "ticket_action_requested",
             "ticket_action_updated",
             "ticket_action_rejected",
@@ -2029,8 +2037,7 @@ fn ticket_action_v3_upsert_pending(
     if let Some(existing) = ctx.db.ticketremote_ticket_action_v3().id().find(&id) {
         return existing;
     }
-    ctx.db.ticketremote_ticket_action_v3().insert(row.clone());
-    row
+    ctx.db.ticketremote_ticket_action_v3().insert(row)
 }
 
 fn ticket_action_v3_finish_without_command(
@@ -2159,7 +2166,7 @@ fn insert_vivi_reauth_attempt(
         completedAt: String::new(),
         expiresAt: add_ms(now, HISTORY_TTL_MS),
     };
-    table.insert(row.clone());
+    let row = table.insert(row);
     upsert_vivi_reauth_owner(
         ctx,
         &row.id,
@@ -3257,12 +3264,7 @@ fn refresh_member_limit_state(
         updatedAt: now.into(),
         serverAt: now.into(),
     };
-    let table = ctx.db.ticketremote_member_limit_state();
-    if table.id().find(&row.id).is_some() {
-        table.id().update(row.clone());
-    } else {
-        table.insert(row.clone());
-    }
+    let row = upsert_row!(ctx, ticketremote_member_limit_state, row);
     replace_policy_boundary_timer(
         ctx,
         &ticket_id,
@@ -3959,7 +3961,7 @@ fn request_ticket_action_v3_impl(
         return Err("invalid_ticket_action_id".into());
     }
     let target = ticket_action_v3_target(target);
-    if target.is_empty() {
+    if target.is_empty() || target == "refresh_current_ticket" {
         return Err("invalid_ticket_action_target".into());
     }
     let source = allowlisted(
@@ -5001,6 +5003,7 @@ pub fn ticketremote_service_bootstrap(
     reconcile_pending_scheduled_redetect_timers(ctx, &now);
     reconcile_activation_refresh_timers(ctx, &now);
     cleanup_expired(ctx, &ticket.id, &now, CLEANUP_BATCH_SIZE);
+    idle_refresh::reconcile_ticket(ctx, &ticket.id, &now);
     Ok(())
 }
 
@@ -5020,6 +5023,7 @@ pub fn ticketremote_scheduled_cleanup_expired(
         arg.batchSize.min(CLEANUP_BATCH_SIZE)
     };
     cleanup_expired(ctx, &arg.ticketId, &now, batch_size);
+    idle_refresh::reconcile_ticket(ctx, &arg.ticketId, &now);
     Ok(())
 }
 
@@ -5741,6 +5745,14 @@ pub fn ticketremote_finalize_ticket_action_v3(
         .ticketremote_stream_command()
         .id()
         .find(&expected_command_id);
+    // History retention must not strand an old phone transport receipt. With
+    // neither durable row remaining, acknowledge only the fixed, aged-out idle
+    // command identity; no outcome or current phone state is recreated.
+    if action.is_none() && command.is_none()
+        && idle_refresh::purged_result_matches(action_id, &facts, &now)
+    {
+        return Ok(());
+    }
     let action = action.ok_or_else(|| "ticket_action_not_found".to_string())?;
     if action.target != facts.target {
         return Err("ticket_action_target_mismatch".into());
@@ -5766,6 +5778,21 @@ pub fn ticketremote_finalize_ticket_action_v3(
         bottomBasisPoints
     ]));
     if ticket_action_v3_terminal(&action.status) {
+        // A command can expire or be cancelled after Pixel fetched it. Its
+        // correlated receipt must drain the phone's durable result journal even
+        // after command TTL cleanup; acknowledgement grants no physical action.
+        if idle_refresh::cancelled_result_matches(&action, &facts) {
+            ctx.db.ticketremote_ticket_action_v3().id().update(TicketremoteTicketActionV3 {
+                terminalFingerprint: Some(terminal_fingerprint),
+                updatedAt: now.clone(),
+                expiresAt: add_ms(&now, HISTORY_TTL_MS),
+                ..action
+            });
+            ctx.db.ticketremote_stream_command().id().delete(&expected_command_id);
+            upsert_stream_command_signal(ctx, &ticket.id, &backend_id, action_id, &now);
+            promote_ticket_action_v3_queue(ctx, &ticket.id, &backend_id, &now);
+            return Ok(());
+        }
         return if command.is_none()
             && action.terminalFingerprint.as_deref() == Some(&terminal_fingerprint)
         {
@@ -6921,129 +6948,6 @@ fn parse_time_micros(value: &str) -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MemberActivityBucket {
-    day: String,
-    hour: usize,
-    tick_slot: i64,
-    expires_at: String,
-}
-
-fn member_activity_bucket(timestamp: Timestamp) -> Result<MemberActivityBucket, String> {
-    let micros = timestamp.to_micros_since_unix_epoch();
-    let utc = DateTime::<Utc>::from_timestamp_micros(micros)
-        .ok_or_else(|| "activity timestamp outside supported range".to_string())?;
-    member_activity_bucket_from_utc(utc)
-}
-
-fn member_activity_bucket_from_utc(utc: DateTime<Utc>) -> Result<MemberActivityBucket, String> {
-    member_activity_bucket_with_retention(utc, MEMBER_ACTIVITY_RETENTION_DAYS)
-}
-
-fn member_activity_bucket_with_retention(utc: DateTime<Utc>, retention_days: u64) -> Result<MemberActivityBucket, String> {
-    let local = utc.with_timezone(&Riga);
-    let day = local.date_naive();
-    let expiry_day = day
-        .checked_add_days(Days::new(retention_days))
-        .ok_or_else(|| "activity expiry outside supported range".to_string())?;
-    let expiry_midnight = expiry_day
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| "activity expiry boundary unavailable".to_string())?;
-    let expiry_local = match Riga.from_local_datetime(&expiry_midnight) {
-        LocalResult::Single(value) => value,
-        // Europe/Riga has no modern midnight transition, but choosing the
-        // earliest occurrence keeps the boundary deterministic if that ever
-        // changes in the timezone database.
-        LocalResult::Ambiguous(earliest, _) => earliest,
-        LocalResult::None => return Err("activity expiry boundary unavailable".into()),
-    };
-    let expires_at = iso(Timestamp::from_micros_since_unix_epoch(
-        expiry_local.with_timezone(&Utc).timestamp_micros(),
-    ));
-    Ok(MemberActivityBucket {
-        day: format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day()),
-        hour: local.hour() as usize,
-        tick_slot: utc
-            .timestamp_micros()
-            .div_euclid(MEMBER_ACTIVITY_TICK_SLOT_MICROS),
-        expires_at,
-    })
-}
-
-fn member_activity_row_id(ticket_id: &str, account_scope_id: &str, day: &str) -> String {
-    format!(
-        "{}:{}:{}",
-        clean_ticket_id(ticket_id),
-        account_scope_id.trim(),
-        day.trim()
-    )
-}
-
-fn apply_member_activity_tick(
-    hourly_ticks: &mut Vec<u32>,
-    last_tick_slot: &mut i64,
-    hour: usize,
-    tick_slot: i64,
-) -> bool {
-    if hour >= MEMBER_ACTIVITY_HOURS_PER_DAY || tick_slot <= *last_tick_slot {
-        return false;
-    }
-    hourly_ticks.resize(MEMBER_ACTIVITY_HOURS_PER_DAY, 0);
-    hourly_ticks.truncate(MEMBER_ACTIVITY_HOURS_PER_DAY);
-    hourly_ticks[hour] = hourly_ticks[hour].saturating_add(1);
-    *last_tick_slot = tick_slot;
-    true
-}
-
-fn upsert_member_activity_tick(
-    ctx: &ReducerContext,
-    ticket_id: &str,
-    email: &str,
-    observed_at: &str,
-    bucket: &MemberActivityBucket,
-) {
-    let ticket_id = clean_ticket_id(ticket_id);
-    let account_scope_id = account_scope_id(email);
-    let id = member_activity_row_id(&ticket_id, &account_scope_id, &bucket.day);
-    let table = ctx.db.ticketremote_member_daily_activity();
-    if let Some(mut existing) = table.id().find(&id) {
-        if !apply_member_activity_tick(
-            &mut existing.hourlyTicks,
-            &mut existing.lastTickSlot,
-            bucket.hour,
-            bucket.tick_slot,
-        ) {
-            return;
-        }
-        existing.lastTickAt = observed_at.into();
-        existing.updatedAt = observed_at.into();
-        existing.expiresAt = bucket.expires_at.clone();
-        table.id().update(existing);
-        return;
-    }
-
-    let mut hourly_ticks = vec![0; MEMBER_ACTIVITY_HOURS_PER_DAY];
-    let mut last_tick_slot = i64::MIN;
-    let accepted = apply_member_activity_tick(
-        &mut hourly_ticks,
-        &mut last_tick_slot,
-        bucket.hour,
-        bucket.tick_slot,
-    );
-    debug_assert!(accepted);
-    table.insert(TicketremoteMemberDailyActivity {
-        id,
-        ticketId: ticket_id,
-        accountScopeId: account_scope_id,
-        day: bucket.day.clone(),
-        hourlyTicks: hourly_ticks,
-        lastTickSlot: last_tick_slot,
-        firstTickAt: observed_at.into(),
-        lastTickAt: observed_at.into(),
-        updatedAt: observed_at.into(),
-        expiresAt: bucket.expires_at.clone(),
-    });
-}
 
 fn stream_start_admitted(
     command: &str,
@@ -7268,8 +7172,7 @@ fn ensure_ticket(
                 updatedAt: now.into(),
                 ..existing
             };
-            table.id().update(updated.clone());
-            return updated;
+            return table.id().update(updated);
         }
         return existing;
     }
@@ -7279,8 +7182,7 @@ fn ensure_ticket(
         createdAt: now.into(),
         updatedAt: now.into(),
     };
-    table.insert(ticket.clone());
-    ticket
+    table.insert(ticket)
 }
 
 fn stream_viewer_focus_id(
@@ -8480,6 +8382,7 @@ fn upsert_stream_viewer_focus(
     let id = stream_viewer_focus_id(&ticket_id, &backend_id, &public_id, session_id);
     if !active {
         ctx.db.ticketremote_stream_viewer_focus().id().delete(&id);
+        idle_refresh::reconcile(ctx, &ticket_id, &backend_id, now);
         return;
     }
     upsert_row!(
@@ -8487,14 +8390,15 @@ fn upsert_stream_viewer_focus(
         ticketremote_stream_viewer_focus,
         TicketremoteStreamViewerFocus {
             id,
-            ticketId: ticket_id,
-            backendId: backend_id,
+            ticketId: ticket_id.clone(),
+            backendId: backend_id.clone(),
             publicId: public_id,
             active: true,
             lastSeenAt: now.into(),
             expiresAt: stream_viewer_focus_expires_at(now),
         }
     );
+    idle_refresh::reconcile(ctx, &ticket_id, &backend_id, now);
 }
 
 fn upsert_stream_desired_state(
@@ -8657,7 +8561,7 @@ fn insert_stream_command(
         updatedAt: now.into(),
         expiresAt: command_expires_at(now, ttl_ms),
     };
-    table.insert(row.clone());
+    let row = table.insert(row);
     upsert_stream_command_signal(ctx, &ticket.id, &backend_id, &revision, now);
     row
 }
@@ -8754,6 +8658,9 @@ fn update_stream_command_status(
     let Some(command) = table.id().find(command_id.trim().to_string()) else {
         return;
     };
+    if status == "dispatched" && !matches!(command.status.as_str(), "pending" | "dispatched") {
+        return;
+    }
     cold_restart::acknowledge(ctx, &command, status, reason, now);
     let terminal = status != "dispatched";
     if terminal {
@@ -9105,10 +9012,7 @@ fn insert_control_code_public_request(
         captureFrameEpoch: "0".into(),
         captureFrameSequence: "0".into(),
     };
-    ctx.db
-        .ticketremote_control_code_request()
-        .insert(row.clone());
-    row
+    ctx.db.ticketremote_control_code_request().insert(row)
 }
 
 #[derive(Default)]

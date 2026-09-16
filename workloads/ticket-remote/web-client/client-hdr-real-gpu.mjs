@@ -4,10 +4,10 @@ import {
   CLIENT_HDR_FALLBACK_COLOR_SPACE,
   CLIENT_HDR_INTERNAL_IDENTITY_BOOST,
   CLIENT_HDR_LINEAR_COLOR_SPACE,
-  CLIENT_HDR_SHADER,
-  mapClientHDRLinearRGB
+  CLIENT_HDR_SHADER
 } from './client-hdr-renderer.mjs';
 import { SLIDER_WAVE_SHADER } from './slider-hdr-wave.mjs';
+import { drawHDRContrastFixture, HDR_CONTRAST_GRAYS } from './client-hdr-contrast-fixture.mjs';
 
 async function checkWave(device, path) {
   const canvas = document.createElement('canvas');
@@ -51,7 +51,9 @@ async function checkWave(device, path) {
 }
 
 const LEVELS = Object.freeze([CLIENT_HDR_INTERNAL_IDENTITY_BOOST, ...CLIENT_HDR_ALLOWED_BOOSTS]);
-const ROW_BYTES = 256;
+const SOURCE_WIDTH = 360;
+const SOURCE_HEIGHT = 300;
+const ROW_BYTES = Math.ceil(SOURCE_WIDTH * 8 / 256) * 256;
 const SOURCE_SAMPLES = Object.freeze([
   { label: 'dark-gray', encoded: [64, 64, 64] },
   { label: 'light-gray', encoded: [160, 160, 160] },
@@ -70,7 +72,8 @@ const SOURCE_SAMPLES = Object.freeze([
   { label: 'yellow', encoded: [255, 255, 0] },
   { label: 'orange', encoded: [255, 128, 0] },
   { label: 'mixed-color', encoded: [64, 128, 224] },
-  { label: 'white', encoded: [255, 255, 255] }
+  { label: 'white', encoded: [255, 255, 255] },
+  ...HDR_CONTRAST_GRAYS.map((gray) => ({ label: `footer-gray-${gray}`, encoded: [gray, gray, gray] }))
 ]);
 const MUST_ENTER_EDR_AT_SIX = new Set(['ticket-red', 'ticket-orange', 'ticket-green', 'ticket-blue']);
 
@@ -137,11 +140,10 @@ function configuredExactly(context, colorSpace) {
 function makeSampleFrame() {
   if (typeof VideoFrame !== 'function') throw new UnsupportedPathError('video_frame_unavailable');
   const source = document.createElement('canvas');
-  source.width = SOURCE_SAMPLES.length;
-  source.height = 1;
-  const context = source.getContext('2d', { alpha: false });
+  drawHDRContrastFixture(source);
+  const context = source.getContext('2d', { alpha: false, colorSpace: 'srgb' });
   if (!context) throw new UnsupportedPathError('source_canvas_unavailable');
-  const pixels = context.createImageData(source.width, source.height);
+  const pixels = context.createImageData(SOURCE_SAMPLES.length, 1);
   SOURCE_SAMPLES.forEach((sample, index) => {
     const offset = index * 4;
     pixels.data[offset] = sample.encoded[0];
@@ -149,14 +151,17 @@ function makeSampleFrame() {
     pixels.data[offset + 2] = sample.encoded[2];
     pixels.data[offset + 3] = 255;
   });
-  context.putImageData(pixels, 0, 0);
-  return new VideoFrame(source, { timestamp: 0 });
+  context.putImageData(pixels, 0, SOURCE_HEIGHT - 1);
+  return {
+    frame: new VideoFrame(source, { timestamp: 0 }),
+    pixels: context.getImageData(0, 0, SOURCE_WIDTH, SOURCE_HEIGHT).data
+  };
 }
 
 async function runPath(path) {
   const canvas = document.createElement('canvas');
-  canvas.width = SOURCE_SAMPLES.length;
-  canvas.height = LEVELS.length;
+  canvas.width = SOURCE_WIDTH;
+  canvas.height = SOURCE_HEIGHT * LEVELS.length;
   canvas.dataset.path = path.label;
   canvas.style.setProperty('dynamic-range-limit', 'no-limit');
   document.getElementById('surfaces').append(canvas);
@@ -196,7 +201,8 @@ async function runPath(path) {
       primitive: { topology: 'triangle-list' }
     });
     const sampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
-    frame = makeSampleFrame();
+    const source = makeSampleFrame();
+    frame = source.frame;
     const externalTexture = device.importExternalTexture({ source: frame, colorSpace: CLIENT_HDR_FALLBACK_COLOR_SPACE });
     const bindGroups = LEVELS.map((level) => {
       const paramsBuffer = device.createBuffer({
@@ -215,7 +221,7 @@ async function runPath(path) {
       });
     });
     readbackBuffer = device.createBuffer({
-      size: ROW_BYTES * LEVELS.length,
+      size: ROW_BYTES * canvas.height,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
     });
 
@@ -234,14 +240,15 @@ async function runPath(path) {
       });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroup);
-      pass.setScissorRect(0, index, SOURCE_SAMPLES.length, 1);
+      pass.setViewport(0, index * SOURCE_HEIGHT, SOURCE_WIDTH, SOURCE_HEIGHT, 0, 1);
+      pass.setScissorRect(0, index * SOURCE_HEIGHT, SOURCE_WIDTH, SOURCE_HEIGHT);
       pass.draw(3);
       pass.end();
     });
     encoder.copyTextureToBuffer(
       { texture },
-      { buffer: readbackBuffer, bytesPerRow: ROW_BYTES, rowsPerImage: LEVELS.length },
-      [SOURCE_SAMPLES.length, LEVELS.length, 1]
+      { buffer: readbackBuffer, bytesPerRow: ROW_BYTES, rowsPerImage: canvas.height },
+      [SOURCE_WIDTH, canvas.height, 1]
     );
     device.queue.submit([encoder.finish()]);
     frame.close();
@@ -253,7 +260,7 @@ async function runPath(path) {
     await readbackBuffer.mapAsync(GPUMapMode.READ);
     const data = new DataView(readbackBuffer.getMappedRange());
     const pixels = LEVELS.map((_level, row) => SOURCE_SAMPLES.map((_sample, column) => {
-      const offset = row * ROW_BYTES + column * 8;
+      const offset = ((row + 1) * SOURCE_HEIGHT - 1) * ROW_BYTES + column * 8;
       return [0, 2, 4, 6].map((channelOffset) => halfToFloat(data.getUint16(offset + channelOffset, true)));
     }));
     pixels.forEach((row, levelIndex) => {
@@ -261,7 +268,7 @@ async function runPath(path) {
       row.forEach((pixel, sampleIndex) => {
         const sample = SOURCE_SAMPLES[sampleIndex];
         const sourceLinearRGB = sample.encoded.map(srgbByteToLinear);
-        const mappedLinearRGB = mapClientHDRLinearRGB(sourceLinearRGB, LEVELS[levelIndex]);
+        const mappedLinearRGB = sourceLinearRGB.map((channel) => channel * level);
         for (let channel = 0; channel < 3; channel += 1) {
           const expected = path.encoded ? extendedSrgb(mappedLinearRGB[channel]) : mappedLinearRGB[channel];
           if (!closeEnough(pixel[channel], expected, 0.025)) {
@@ -294,13 +301,42 @@ async function runPath(path) {
           if (level === 6 && MUST_ENTER_EDR_AT_SIX.has(sample.label) && !(outputPeak > 1)) {
             throw new Error(`ticket_color_did_not_enter_edr:${path.label}:${sample.label}`);
           }
-          if (level === 6 && sample.label === 'ticket-near-black' && outputPeak / sourcePeak >= 1.1) {
-            throw new Error(`near_black_lift_too_large:${path.label}`);
-          }
         }
       });
       if (!(row[1][0] > row[0][0])) throw new Error(`gray_separation_lost:${path.label}:${levelIndex}`);
     });
+    // Independent contrast oracle: after dividing by measured white, every
+    // source pixel must match SDR, including antialiased 12px lettering.
+    // This checks external-texture conversion as well as the production shader.
+    let maxRelativeError = 0;
+    let maxSourceByteError = 0;
+    for (let row = 0; row < LEVELS.length; row += 1) {
+      const white = pixels[row][17][0];
+      const whiteLinear = path.encoded ? extendedSrgbToLinear(white) : white;
+      if (!closeEnough(whiteLinear, LEVELS[row], 0.015)) throw new Error(`white_peak_changed:${path.label}:${row}`);
+      for (let y = 0; y < SOURCE_HEIGHT; y += 1) {
+        for (let x = 0; x < SOURCE_WIDTH; x += 1) {
+          for (let channel = 0; channel < 3; channel += 1) {
+            const offset = (row * SOURCE_HEIGHT + y) * ROW_BYTES + x * 8 + channel * 2;
+            const value = halfToFloat(data.getUint16(offset, true));
+            const linear = path.encoded ? extendedSrgbToLinear(value) : value;
+            const expected = srgbByteToLinear(source.pixels[(y * SOURCE_WIDTH + x) * 4 + channel]);
+            const error = Math.abs(linear / whiteLinear - expected);
+            const byteError = Math.abs(extendedSrgb(linear / whiteLinear) - extendedSrgb(expected)) * 255;
+            maxRelativeError = Math.max(maxRelativeError, error);
+            maxSourceByteError = Math.max(maxSourceByteError, byteError);
+            // Allow one source byte of external-texture rounding plus float16
+            // encoding error; still require each near-white step to stay distinct.
+            if (!Number.isFinite(error) || byteError > 1.5) throw new Error(`pixel_contrast_changed:${path.label}:${row}:${x}:${y}:${channel}:${error}:byteError=${byteError}`);
+          }
+        }
+      }
+      const grays = pixels[row].slice(18).map((pixel) => path.encoded ? extendedSrgbToLinear(pixel[0]) : pixel[0]);
+      if (!grays.every((gray, index) => gray < whiteLinear && (index === 0 || gray > grays[index - 1]))) {
+        throw new Error(`pale_gray_separation_lost:${path.label}:${row}`);
+      }
+    }
+    readbackBuffer.unmap();
     return {
       label: path.label,
       result: 'passed',
@@ -308,6 +344,7 @@ async function runPath(path) {
       encoding: path.encoded ? 'extended-srgb' : 'linear-light',
       hdrWave: await checkWave(device, path),
       levels: Array.from(LEVELS),
+      contrast: { pixelsChecked: SOURCE_WIDTH * SOURCE_HEIGHT * LEVELS.length, maxRelativeError, maxSourceByteError, smallestTextPixels: 12 },
       samples: SOURCE_SAMPLES.map((sample) => sample.label),
       output: pixels.map((row) => row.map((pixel) => pixel.slice(0, 3).map((value) => Number(value.toFixed(4)))))
     };

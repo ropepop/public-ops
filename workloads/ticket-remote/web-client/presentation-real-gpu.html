@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ticket HDR recovery test</title>
+<style>
+  body { background: #111; color: #eee; font: 16px system-ui; }
+  #stage { position: relative; width: 248px; height: 511px; }
+  #stage canvas { position: absolute; width: 100%; height: 100%; dynamic-range-limit: no-limit; }
+  #experimentalMediaCanvas { z-index: 2; }
+  #experimentalMediaHoldover { z-index: 3; }
+  [data-client-hdr-surface="standby"], [hidden] { visibility: hidden; }
+  [data-client-hdr-surface="visible"] { visibility: visible; }
+</style>
+<h1>Ticket HDR recovery test</h1>
+<p>Synthetic pixels, real presentation controller and GPU. No Ticket connection or phone actions.</p>
+<button id="run">Run ten returns</button>
+<pre id="result">Ready</pre>
+<div id="stage"><canvas id="screen" width="994" height="2046"></canvas><canvas id="experimentalMediaCanvas" width="994" height="2046"></canvas></div>
+<div id="resultArea" hidden><img id="resultImage" hidden></div>
+<script type="module" src="./presentation-real-gpu.mjs"></script>

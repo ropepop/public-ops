@@ -4,9 +4,6 @@ export const CLIENT_HDR_FALLBACK_COLOR_SPACE = 'srgb';
 export const CLIENT_HDR_ALLOWED_BOOSTS = Object.freeze([2, 3, 4, 5, 6]);
 export const CLIENT_HDR_DEFAULT_BOOST = 4;
 export const CLIENT_HDR_INTERNAL_IDENTITY_BOOST = 1;
-export const CLIENT_HDR_COLOR_EXPANSION_EXPONENT = 3;
-export const CLIENT_HDR_REQUEST_PATCH_PEAK = 1.25;
-export const CLIENT_HDR_REQUEST_PATCH_EDGE = 0.002;
 export const CLIENT_HDR_GPU_COMPLETION_TIMEOUT_MILLIS = 1500;
 export const CLIENT_HDR_DISPLAY_REFRESH_TIMEOUT_MILLIS = 2000;
 
@@ -19,8 +16,6 @@ struct VertexOutput {
 struct HDRParams {
   options: vec4<f32>,
 }
-
-const COLOR_EXPANSION_EXPONENT: f32 = 3.0;
 
 @group(0) @binding(0) var sourceFrame: texture_external;
 @group(0) @binding(1) var sourceSampler: sampler;
@@ -53,19 +48,6 @@ fn linearToExtendedSrgb(value: vec3<f32>) -> vec3<f32> {
   return select(high, low, safe <= vec3<f32>(0.0031308));
 }
 
-// Give every non-black color a bounded HDR lift. The brightest linear channel
-// selects one scalar gain for all RGB channels, preserving hue and channel
-// ratios. The ease-out anchor keeps exact black at zero and limits near-black
-// lift while letting ordinary red, orange, and other colors enter EDR.
-fn colorGain(linearRGB: vec3<f32>, requestedBoost: f32) -> f32 {
-  let boostValid = requestedBoost >= 1.0 && requestedBoost <= 6.0;
-  let selectedBoost = select(1.0, requestedBoost, boostValid);
-  let sourcePeak = max(linearRGB.r, max(linearRGB.g, linearRGB.b));
-  let blackDistance = clamp(1.0 - sourcePeak, 0.0, 1.0);
-  let colorWeight = 1.0 - pow(blackDistance, COLOR_EXPANSION_EXPONENT);
-  return 1.0 + (selectedBoost - 1.0) * colorWeight;
-}
-
 fn encodeCanvas(linear: vec3<f32>) -> vec3<f32> {
   return select(linear, linearToExtendedSrgb(linear), hdr.options.y > 0.5);
 }
@@ -78,7 +60,9 @@ fn fragmentMain(fragmentIn: VertexOutput) -> @location(0) vec4<f32> {
     vec3<f32>(1.0)
   );
   let linearRGB = srgbToLinear(encodedRGB);
-  let mappedLinearRGB = linearRGB * colorGain(linearRGB, hdr.options.x);
+  // One linear-light multiplier preserves gray/white contrast and RGB ratios.
+  // The external texture is sRGB encoded; decode once before applying gain.
+  let mappedLinearRGB = linearRGB * hdr.options.x;
   let edrRequestSample = hdr.options.z > 0.5 &&
     fragmentIn.uv.x >= 0.0 && fragmentIn.uv.x < 0.002 &&
     fragmentIn.uv.y >= 0.0 && fragmentIn.uv.y < 0.002;
@@ -92,10 +76,6 @@ function finiteNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function clamp(value, minimum, maximum) {
-  return Math.min(maximum, Math.max(minimum, finiteNumber(value, minimum)));
-}
-
 export function isClientHDRBoost(value) {
   const boost = Number(value);
   return Number.isFinite(boost) && CLIENT_HDR_ALLOWED_BOOSTS.includes(boost);
@@ -105,36 +85,6 @@ function requireClientHDRBoost(value) {
   const boost = Number(value);
   if (!isClientHDRBoost(boost)) throw new Error('hdr_boost_invalid');
   return boost;
-}
-
-function requireClientHDRMappingBoost(value) {
-  const boost = Number(value);
-  if (boost === CLIENT_HDR_INTERNAL_IDENTITY_BOOST || isClientHDRBoost(boost)) return boost;
-  throw new Error('hdr_boost_invalid');
-}
-
-export function mapClientHDRLuminance(value, boost = CLIENT_HDR_DEFAULT_BOOST) {
-  const linear = clamp(value, 0, 1);
-  const selectedBoost = requireClientHDRMappingBoost(boost);
-  const colorWeight = 1 - (1 - linear) ** CLIENT_HDR_COLOR_EXPANSION_EXPONENT;
-  return linear * (1 + (selectedBoost - 1) * colorWeight);
-}
-
-export function mapClientHDRLinearRGB(rgb, boost = CLIENT_HDR_DEFAULT_BOOST, options = {}) {
-  const selectedBoost = requireClientHDRMappingBoost(boost);
-  const linear = Array.from(rgb || [], (value) => clamp(value, 0, 1)).slice(0, 3);
-  while (linear.length < 3) linear.push(0);
-  const coordinate = Array.from(options.uv || [], (value) => finiteNumber(value, 1)).slice(0, 2);
-  while (coordinate.length < 2) coordinate.push(1);
-  if (options.requestPatch === true &&
-    coordinate[0] >= 0 && coordinate[0] < CLIENT_HDR_REQUEST_PATCH_EDGE &&
-    coordinate[1] >= 0 && coordinate[1] < CLIENT_HDR_REQUEST_PATCH_EDGE) {
-    return [CLIENT_HDR_REQUEST_PATCH_PEAK, CLIENT_HDR_REQUEST_PATCH_PEAK, CLIENT_HDR_REQUEST_PATCH_PEAK];
-  }
-  const peak = Math.max(linear[0], linear[1], linear[2]);
-  const mappedPeak = mapClientHDRLuminance(peak, selectedBoost);
-  const scalarGain = peak > 0 ? mappedPeak / peak : 1;
-  return linear.map((channel) => channel * scalarGain);
 }
 
 function gpuErrorReason(prefix, error) {
@@ -650,6 +600,7 @@ export class ClientHDRRenderer {
     this.prepared = false;
     try {
       await this.submitAndWait((device) => {
+        this.context.configure(this.context.getConfiguration());
         const encoder = device.createCommandEncoder();
         encoder.copyTextureToTexture(
           { texture: this.stagingTexture }, { texture: this.context.getCurrentTexture() },

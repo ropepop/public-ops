@@ -33,6 +33,43 @@ function rendererWith(queue, validation) {
   return { renderer, failures, pops: () => pops };
 }
 
+test('every frame configures and submits the prepared picture without yielding or replacing resources', async () => {
+  const { renderer } = rendererWith({ promise: Promise.resolve() }, { promise: Promise.resolve(null) });
+  const events = [], configuration = { device: renderer.device }, texture = {};
+  renderer.canvas = { width: 10, height: 20 };
+  renderer.stagingTexture = { destroy() { events.push('release'); } };
+  renderer.context = {
+    getConfiguration: () => configuration,
+    configure(value) {
+      assert.equal(value, configuration);
+      events.push('configure');
+      queueMicrotask(() => events.push('yield'));
+    },
+    getCurrentTexture() { events.push('texture'); return texture; },
+    unconfigure() { events.push('unconfigure'); }
+  };
+  renderer.device.createCommandEncoder = () => ({
+    copyTextureToTexture(source, target) {
+      assert.equal(source.texture, renderer.stagingTexture);
+      assert.equal(target.texture, texture);
+      events.push('copy');
+    },
+    finish: () => ({})
+  });
+  renderer.device.queue.submit = () => events.push('submit');
+  const device = renderer.device, staging = renderer.stagingTexture;
+  for (let index = 0; index < 3; index++) {
+    events.length = 0;
+    renderer.prepared = true;
+    await renderer.present();
+    assert.deepEqual(events, ['configure', 'texture', 'copy', 'submit', 'yield']);
+    assert.equal(renderer.device, device);
+    assert.equal(renderer.stagingTexture, staging);
+  }
+  renderer.dispose();
+  assert.deepEqual(events.slice(-2), ['release', 'unconfigure']);
+});
+
 test('GPU submission waits for queue completion and validation, and rejects invalid work', async () => {
   const queue = deferred(), validation = deferred();
   const { renderer, failures, pops } = rendererWith(queue, validation);

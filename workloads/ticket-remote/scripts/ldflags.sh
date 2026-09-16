@@ -41,4 +41,4 @@ fi
 
 build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-printf '%s' "-X ticketremote/internal/version.Commit=$commit -X ticketremote/internal/version.BuildTime=$build_time -X ticketremote/internal/version.Dirty=$dirty -X ticketremote/internal/version.ReleaseID=$release_id -X ticketremote/internal/version.SourceSHA256=$source_sha256"
+printf '%s' "-s -w -X ticketremote/internal/version.Commit=$commit -X ticketremote/internal/version.BuildTime=$build_time -X ticketremote/internal/version.Dirty=$dirty -X ticketremote/internal/version.ReleaseID=$release_id -X ticketremote/internal/version.SourceSHA256=$source_sha256"

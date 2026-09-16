@@ -549,23 +549,6 @@ func currentVisualAgeMillis(now time.Time, observedAt time.Time, observedAgeMill
 	return observedAgeMillis + elapsedMillis, true
 }
 
-func (h *directStreamHub) recordRelayTelemetry(event, detail string) {
-	event = trimLogField(event, 96)
-	if event == "" {
-		return
-	}
-	telemetry := relayTelemetryEvent{
-		Event: event, Detail: trimLogField(detail, 500), At: time.Now().UTC().Format(time.RFC3339),
-	}
-	h.mu.Lock()
-	h.lastRelayEvent = telemetry
-	h.recentRelayEvents = append(h.recentRelayEvents, telemetry)
-	if len(h.recentRelayEvents) > 12 {
-		h.recentRelayEvents = append([]relayTelemetryEvent(nil), h.recentRelayEvents[len(h.recentRelayEvents)-12:]...)
-	}
-	h.mu.Unlock()
-}
-
 func durationMillis(value time.Duration) int64 {
 	return int64(value / time.Millisecond)
 }

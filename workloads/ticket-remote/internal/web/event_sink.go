@@ -274,7 +274,7 @@ func decodeBrowserClientLog(data []byte) (string, map[string]any, string, bool) 
 			detail["openingClass"] = kind
 		}
 	} else {
-		for _, key := range []string{"reason", "pageVersion"} {
+		for _, key := range []string{"reason", "errorKind", "pageVersion"} {
 			if value, ok := inputDetail[key].(string); ok {
 				detail[key] = redactOperationalLogText(value)
 			}

@@ -142,12 +142,12 @@ export async function renderBraveDOM(browser, url, options = {}) {
     '--disable-background-networking',
     '--disable-default-apps',
     '--disable-extensions',
-    '--disable-gpu',
     '--no-default-browser-check',
     '--no-first-run',
     '--remote-debugging-port=0',
     `--user-data-dir=${profile}`
   ];
+  if (!options.gpu) args.push('--disable-gpu');
   if (options.windowSize) args.push(`--window-size=${options.windowSize}`);
   args.push('about:blank');
 

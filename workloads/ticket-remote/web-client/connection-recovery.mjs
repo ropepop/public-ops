@@ -2,6 +2,40 @@ export const RECOVERY_ERROR_MS = 30000;
 export const RECOVERY_ATTEMPT_MS = 10000;
 export const RECOVERY_RETRY_MS = 1000;
 
+// Page-lifetime receipt history survives transport replacement. This clock
+// measures visible silence, not picture freshness or command readiness.
+export class FrameSilence {
+  constructor(now = performance.now()) {
+    this.at = now;
+    this.active = false;
+    this.elapsed = 0;
+    this.picture = null;
+    this.receivedAt = -Infinity;
+  }
+
+  step(now, active = this.active) {
+    if (this.active) this.elapsed += Math.max(0, now - this.at);
+    this.at = now;
+    this.active = active;
+  }
+
+  receive(picture, receivedAt, now = performance.now()) {
+    if (!this.active || !Number.isFinite(receivedAt) || receivedAt > now || receivedAt < this.receivedAt ||
+      (this.picture?.epoch === picture.epoch && picture.sequence <= this.picture.sequence)) return false;
+    this.step(now);
+    // A buffered startup frame keeps its arrival time. Previously hidden time
+    // cannot exceed the visible silence already accumulated by this owner.
+    this.elapsed = Math.min(this.elapsed, Math.max(0, now - receivedAt));
+    this.picture = { epoch: picture.epoch, sequence: picture.sequence };
+    this.receivedAt = receivedAt;
+    return true;
+  }
+
+  get showError() {
+    return this.active && this.elapsed >= RECOVERY_ERROR_MS;
+  }
+}
+
 // The page's existing tick drives this owner. Callbacks own resources, never retries.
 export class ConnectionRecovery {
   constructor({ start, stop, now = performance.now() }) {

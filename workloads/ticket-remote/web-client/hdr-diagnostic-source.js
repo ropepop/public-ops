@@ -1,5 +1,6 @@
 import { html, reactive } from '@arrow-js/core';
 import { renderClientHDRDiagnosticPatches } from './client-hdr-diagnostic.mjs';
+import { mountHDRComparison } from './client-hdr-comparison.mjs';
 
 const mount = document.getElementById('hdrDiagnosticMount');
 if (mount) {
@@ -17,6 +18,7 @@ if (mount) {
   });
 
   html`
+    <section id="hdrContrastMount" class="card"></section>
     <section class="card" aria-labelledby="capability-heading">
       <h2 id="capability-heading">Browser signals</h2>
       <dl class="status-grid">
@@ -50,6 +52,7 @@ if (mount) {
   `(mount);
 
   document.documentElement.dataset.ticketHdrDiagnosticUi = 'arrow';
+  mountHDRComparison(document.getElementById('hdrContrastMount'));
   const patchCanvas = document.getElementById('hdrDiagnosticPatches');
   const fileInput = document.getElementById('hdrDiagnosticFile');
   const standardImage = document.getElementById('hdrDiagnosticStandardImage');

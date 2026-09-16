@@ -73,10 +73,7 @@ fn command_fingerprint(
     payload: &serde_json::Value,
 ) -> String {
     let canonical = serde_json::json!([operation, context, issued_at, payload]).to_string();
-    Sha256::digest(canonical.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
 fn command_time_valid(issued_at: &str, clock: &str) -> bool {
@@ -287,6 +284,7 @@ mod tests {
         assert!(command_payload("control_code", r#"{"password":"no"}"#).is_err());
         assert!(command_payload("register_current", r#"{"source":1}"#).is_err());
         assert!(command_payload("prove_current", "{}").is_err());
+        assert!(command_payload("refresh_current_ticket", "{}").is_err());
         assert!(command_payload("unknown", "{}").is_err());
     }
 

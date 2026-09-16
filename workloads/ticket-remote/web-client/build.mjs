@@ -91,6 +91,8 @@ for (const relativeFile of readdirSync(generatedDir, { recursive: true })) {
 await build({
   entryPoints: [path.join(__dirname, "src", "index.ts")],
   bundle: true,
+  minify: true,
+  keepNames: true,
   banner: {
     js: generatedBanner,
   },

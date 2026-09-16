@@ -1,6 +1,89 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ConnectionRecovery } from './connection-recovery.mjs';
+import { ConnectionRecovery, FrameSilence } from './connection-recovery.mjs';
+import { MediaSession } from './media-session.mjs';
+
+test('new receipts alone reset the visible silence deadline, independently of connection health', () => {
+  const clock = new FrameSilence(0);
+  const { loop, step } = fixture();
+  clock.step(0, true);
+  step(0);
+  for (let now = 1000; now <= 29000; now += 1000) {
+    clock.step(now);
+    step(now);
+    loop.wake(now);
+  }
+  assert.equal(clock.receive({ epoch: 7, sequence: 1 }, 29000, 29000), true);
+  clock.step(30000);
+  assert.equal(clock.elapsed, 1000);
+  assert.equal(clock.showError, false);
+  step(30000, true); // A healthy connection cannot move the separate receipt deadline.
+  clock.step(58999); assert.equal(clock.showError, false);
+  clock.step(59000); assert.equal(clock.showError, true);
+  clock.receive({ epoch: 7, sequence: 2 }, 59000, 59000);
+  assert.equal(clock.showError, false);
+  assert.equal(clock.elapsed, 0);
+});
+
+test('silence pauses while hidden or intentionally paused and buffered frames retain their arrival time', () => {
+  const clock = new FrameSilence(0);
+  clock.step(0, true);
+  clock.step(10000, false);
+  clock.step(70000, true);
+  assert.equal(clock.elapsed, 10000);
+  clock.step(89999); assert.equal(clock.showError, false);
+  clock.step(90000); assert.equal(clock.showError, true);
+  clock.step(91000, false); assert.equal(clock.showError, false);
+  assert.equal(clock.receive({ epoch: 7, sequence: 1 }, 95000, 95000), false);
+  clock.step(100000, true); assert.equal(clock.showError, true);
+  clock.receive({ epoch: 7, sequence: 1 }, 100000, 100000);
+  assert.equal(clock.elapsed, 0);
+  const buffered = new FrameSilence(0);
+  buffered.step(0, true);
+  buffered.receive({ epoch: 7, sequence: 1 }, 1000, 10000);
+  assert.equal(buffered.elapsed, 9000);
+  buffered.step(30999); assert.equal(buffered.showError, false);
+  buffered.step(31000); assert.equal(buffered.showError, true);
+});
+
+test('validated frame receipt precedes decoding; transport resets, invalid frames and replay do not renew silence', () => {
+  const clock = new FrameSilence(0);
+  clock.step(0, true);
+  let now = 1000, decoded = 0;
+  const media = new MediaSession({}, { onReceived: (picture, at) => clock.receive(picture, at, now) });
+  media.feedback = () => {};
+  media.decodeNewest = () => { decoded++; assert.equal(clock.receivedAt, now); };
+  media.config = { feedbackConfigGeneration: 1 };
+  media.epoch = 7;
+  function raw(epoch, sequence) {
+    const bytes = new ArrayBuffer(94), view = new DataView(bytes);
+    view.setUint32(0, 0x54534633); view.setUint8(4, 1);
+    [epoch, sequence, 1, 1, 1000, 1001, 1002, 1003, 1004, 1, 1]
+      .forEach((value, index) => view.setBigUint64(5 + index * 8, BigInt(value)));
+    return bytes;
+  }
+  media.receive(raw(7, 10), now);
+  assert.equal(decoded, 1);
+  now = 5000;
+  media.receive(raw(8, 11), now);
+  media.receive(new ArrayBuffer(93), now);
+  media.receive(raw(7, 9), now);
+  assert.equal(decoded, 1);
+  media.close();
+  media.config = { feedbackConfigGeneration: 2 };
+  media.epoch = 7;
+  media.decodeNewest = () => { decoded++; };
+  media.receive(raw(7, 10), now);
+  assert.equal(clock.receivedAt, 1000);
+  assert.equal(clock.receive({ epoch: 7, sequence: 11 }, 6000, now), false);
+  clock.step(31000); assert.equal(clock.showError, true);
+  now = 31000;
+  // A phone reboot can start a new epoch with a lower monotonic origin.
+  media.epoch = 2;
+  media.received = 0;
+  media.receive(raw(2, 1), now);
+  assert.equal(clock.showError, false);
+});
 
 function fixture() {
   const starts = [], stops = [];

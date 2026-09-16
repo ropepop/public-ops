@@ -32,7 +32,6 @@ export class ClientHDRController {
     this.ready = false;
     this.active = false;
     this.visible = true;
-    this.regionVisible = true;
     this.boost = 4;
     this.pending = null;
     this.inFlight = null;
@@ -42,6 +41,7 @@ export class ClientHDRController {
     this.activated = false;
     this.surfaceVisible = false;
     this.initTimer = null;
+    this.presentationGeneration = 0;
   }
 
   start({ canvas, width, height, boost = 4 }) {
@@ -78,27 +78,23 @@ export class ClientHDRController {
     if (!visible) this.holdLastPresentation();
   }
 
-  setStreamRegionVisible(visible) {
-    this.regionVisible = Boolean(visible);
-    if (!visible) this.holdLastPresentation();
-  }
-
   noteSDRFrame(metadata) {
     this.currentSDR = metadata;
   }
 
   holdLastPresentation() {
+    this.presentationGeneration++;
     this.confirmed = false;
     close(this.pending);
     this.pending = null;
   }
 
-  offerFrame(frame, metadata, { commitSDR } = {}) {
-    if (!this.active || !this.visible || !this.regionVisible) return false;
+  offerFrame(frame, metadata, { commitSDR, retainedResult = false } = {}) {
+    if (!this.active || !this.visible) return false;
     let owned;
     try { owned = frame.clone(); } catch { return false; }
     close(this.pending);
-    this.pending = { ...metadata, frame: owned, boost: this.boost, commitSDR,
+    this.pending = { ...metadata, frame: owned, boost: this.boost, commitSDR, retainedResult,
       offeredAt: Number(metadata.offeredAt ?? performance.now()),
       visualAgeMillis: Number(metadata.visualAgeMillis ?? Infinity) };
     this.dispatch();
@@ -111,11 +107,13 @@ export class ClientHDRController {
     this.pending = null;
     this.inFlight = candidate;
     const renderer = this.renderer, generation = this.generation;
+    const presentationGeneration = this.presentationGeneration;
     const current = () => generation === this.generation && this.active &&
-      this.visible && this.regionVisible && this.boost === candidate.boost &&
+      presentationGeneration === this.presentationGeneration &&
+      this.visible && this.boost === candidate.boost &&
       this.options.canRevealSurface?.() !== false &&
       this.options.canReleaseHoldover?.(candidate) !== false &&
-      Number.isFinite(age(candidate)) && age(candidate) <= 3000;
+      (candidate.retainedResult || (Number.isFinite(age(candidate)) && age(candidate) <= 3000));
     const copy = async (opportunities) => {
       if (!current()) return false;
       this.presented = candidate;
@@ -149,7 +147,7 @@ export class ClientHDRController {
       this.activated = true;
       this.options.onMetric?.('presented', this.snapshot());
     } catch (error) {
-      if (generation === this.generation && this.visible && this.regionVisible) {
+      if (generation === this.generation && this.visible) {
         this.fail(String(error?.message || 'hdr_render_failed').slice(0, 80));
       }
     } finally {
@@ -176,27 +174,37 @@ export class ClientHDRController {
     const matches = picture && sdr && picture.epoch === sdr.epoch &&
       picture.sequence === sdr.sequence && picture.configGeneration === sdr.configGeneration;
     return { active: this.active, ready: this.ready, surfaceVisible: this.surfaceVisible,
+      displayConfirmed: Boolean(this.confirmed && this.visible && matches),
       epoch: picture?.epoch || 0, sequence: picture?.sequence || 0,
-      proofFresh: Boolean(this.confirmed && this.visible && this.regionVisible && matches && age(picture) <= 3000) };
+      proofFresh: Boolean(this.confirmed && this.visible && matches &&
+        !picture.retainedResult && age(picture) <= 3000) };
   }
 
   fail(reason) {
     if (!this.active) return;
-    this.dispose();
+    this.suspend();
     this.options.onStatus?.('failed', reason);
   }
 
-  dispose() {
+  // Stop work without destroying the last displayed surface. Presentation owns
+  // its lifetime until a replacement is ready (or the display device is lost).
+  suspend() {
     this.generation++;
     clearTimeout(this.initTimer);
     this.initTimer = null;
-    this.renderer?.dispose();
-    this.renderer = null;
+    this.renderer?.cancelGPUCompletionWaits('renderer_suspended');
+    this.renderer?.cancelCompositorSettlementWaits('renderer_suspended');
     close(this.pending);
     this.pending = null;
     // The running sequence releases its own frame in finally after cancellation.
     this.inFlight = null;
     this.active = this.ready = this.confirmed = this.activated = false;
+  }
+
+  dispose() {
+    this.suspend();
+    this.renderer?.dispose();
+    this.renderer = null;
     this.currentSDR = this.presented = null;
     this.surface(false);
   }

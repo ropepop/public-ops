@@ -98,7 +98,7 @@ export class MediaSession {
     socket.onclose = () => { if (generation === this.generation) this.fail('video_connection_closed'); };
     if (early?.opening) this.receive(early.opening);
     if (early?.config) this.receive(early.config);
-    if (early?.frame) this.receive(early.frame);
+    if (early?.frame) this.receive(early.frame, early.frameReceivedAt);
   }
 
   close() {
@@ -131,7 +131,7 @@ export class MediaSession {
     this.handlers.onFailure?.(reason, this.ownerGeneration);
   }
 
-  receive(raw) {
+  receive(raw, receivedAt = performance.now()) {
     if (typeof raw === 'string') {
       if (raw.length > 65536) return this.fail('invalid_video_config');
       let message;
@@ -173,6 +173,7 @@ export class MediaSession {
     picture.sessionGeneration = this.generation;
     // Receipt is independent of freshness and local decode success.
     this.feedback();
+    this.handlers.onReceived?.(picture, receivedAt, this.ownerGeneration);
     this.waiting = picture;
     this.decodeNewest();
   }

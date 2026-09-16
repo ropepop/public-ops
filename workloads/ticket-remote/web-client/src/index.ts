@@ -152,6 +152,7 @@ class TicketSpacetimeClient {
     this.manuallyDisconnected = false;
     this.createLivePromise();
     this.connected = false;
+    this.lastStreamFocusActive = null;
     this.handlers.onStatus?.("connecting");
     try {
       const builder = DbConnection.builder()
@@ -185,14 +186,14 @@ class TicketSpacetimeClient {
             this.handlers.onStatus?.("owner_vivi_access_failed", error && String(error));
           });
         })
-        .onDisconnect(() => {
+        .onDisconnect((_ctx, error) => {
           if (generation !== this.connectionGeneration) return;
           this.invalidateControlClock();
           this.connected = false;
           this.conn = null;
           this.rejectLive(new Error("Spacetime connection disconnected"));
           if (this.manuallyDisconnected) return;
-          this.handlers.onStatus?.("reconnecting");
+          this.handlers.onStatus?.("reconnecting", error && String(error));
           this.scheduleReconnect();
         })
         .onConnectError((_ctx, error) => {
@@ -255,6 +256,7 @@ class TicketSpacetimeClient {
     }
     this.lastStreamFocusActive = active;
     this.lastHeartbeatAt = now;
+    const generation = this.connectionGeneration;
     const reducer = this.reducer("memberSetStreamFocus");
     Promise.resolve(reducer({
       ticketId: this.cfg.ticketId,
@@ -263,6 +265,7 @@ class TicketSpacetimeClient {
       active,
       reason: reason || (active ? "browser_stream_heartbeat" : "browser_no_stream_heartbeat"),
     })).catch((error) => {
+      if (generation !== this.connectionGeneration || !this.isReady()) return;
       this.lastStreamFocusActive = null;
       this.handlers.onStatus?.("heartbeat_failed", error && String(error));
     });
@@ -286,8 +289,9 @@ class TicketSpacetimeClient {
     }, beforeSubmit);
   }
 
-  recordActivityTick(): Promise<void> {
-    return this.callReducer("memberRecordActivityTick", {
+  async recordActivityTick(): Promise<void> {
+    // Viewing samples must never wait for a later connection or hidden page.
+    return this.callReducerOnConnection(this.requireConnection(), "memberRecordActivityTick", {
       ticketId: this.cfg.ticketId,
     });
   }
@@ -515,9 +519,9 @@ class TicketSpacetimeClient {
       currentConnection: this.conn,
     });
     this.subscription = connection.subscriptionBuilder()
-      .onError(() => {
+      .onError((ctx) => {
         if (!connectionIsCurrent()) return;
-        this.handlers.onStatus?.("subscription_failed");
+        this.handlers.onStatus?.("subscription_failed", ctx.event && String(ctx.event));
       })
       .onApplied(() => {
         if (!connectionIsCurrent()) return;

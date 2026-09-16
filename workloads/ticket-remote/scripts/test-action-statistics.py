@@ -82,7 +82,7 @@ def main():
                 run(["spacetime", "publish", *args, "--bin-path", str(baseline_wasm), "--delete-data=never", "statistics-fixture"], cwd=directory)
                 run(["spacetime", "call", *args, "statistics-fixture", "fixture_migration_seed"], cwd=directory)
                 run(["spacetime", "publish", *args, "--bin-path", str(current_wasm), "--delete-data=never", "statistics-fixture"], cwd=directory)
-                for case in ["migration", "registration", "queued", "queued-rejected", "rejected", "menu", "code", "queued-code", "original-hour", "expired", "rollback", "assert-rollback"]:
+                for case in ["row-reuse", "migration", "registration", "queued", "queued-rejected", "rejected", "menu", "code", "queued-code", "original-hour", "expired", "rollback", "assert-rollback"]:
                     run(["spacetime", "call", *args, "statistics-fixture", "fixture_statistics_case", case], cwd=directory,
                         expected_error="fixture_expected_rollback" if case == "rollback" else None)
                     print(f"PASS {case}", flush=True)

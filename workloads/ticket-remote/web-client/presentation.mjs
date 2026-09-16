@@ -17,11 +17,14 @@ export class Presentation {
     this.controller = null;
     this.enabled = false;
     this.boost = 4;
-    this.visible = true;
-    this.regionVisible = true;
+    this.visible = !document.hidden;
     this.ordinal = 0;
     this.generation = 0;
     this.hdrBlocked = false;
+    this.holdover = null;
+    this.displayedHDR = null;
+    this.recovering = false;
+    this.recoveryStartedAt = 0;
   }
 
   size(width, height) {
@@ -40,8 +43,12 @@ export class Presentation {
     this.enabled = Boolean(enabled);
     this.boost = normalizeClientHDRDisplayBoost(boost);
     if (!this.enabled) {
+      this.generation++;
       this.controller?.dispose();
       this.controller = null;
+      this.releaseHoldover();
+      this.displayedHDR = null;
+      this.recovering = false;
       this.surface(false);
     } else if (changed) {
       this.hdrBlocked = false;
@@ -52,16 +59,12 @@ export class Presentation {
     }
   }
 
-  setVisible(visible, regionVisible = this.regionVisible) {
+  setVisible(visible) {
     const returning = visible && !this.visible;
-    const returningRegion = visible && regionVisible && !this.regionVisible;
     this.visible = visible;
-    this.regionVisible = regionVisible;
     this.controller?.setDocumentVisible(visible);
-    this.controller?.setStreamRegionVisible(regionVisible);
-    if (!visible) this.controller?.holdLastPresentation('page_hidden');
-    if (returning || (returningRegion && !this.controller)) this.restartHDR();
-    else if (returningRegion) this.seedHDR();
+    if (!visible) this.controller?.suspend();
+    if (returning) this.recoverHDR();
   }
 
   surface(visible) {
@@ -69,62 +72,134 @@ export class Presentation {
     hdrCanvas.hidden = !this.enabled;
     hdrCanvas.dataset.clientHdrSurface = visible && this.enabled ? 'visible' : 'standby';
     hdrCanvas.setAttribute('aria-hidden', visible && this.enabled ? 'false' : 'true');
-    document.body.dataset.experimentalMedia = visible && this.enabled ? 'hdr-client-webgpu-preview' : 'fallback-sdr';
-    if (!visible && this.frozen?.displayed) {
-      resultArea.dataset.presentation = 'sdr';
-      resultImage.hidden = false;
+    document.body.dataset.experimentalMedia = (visible || this.holdover) && this.enabled
+      ? 'hdr-client-webgpu-preview' : this.recovering ? 'hdr-recovering' : 'fallback-sdr';
+    document.body.dataset.hdrRecovering = String(this.recovering);
+    if (!visible && !this.holdover && this.frozen?.displayed) {
+      resultArea.dataset.presentation = this.recovering ? 'recovering' : 'sdr';
+      resultImage.hidden = this.recovering;
     }
   }
 
   restartHDR() {
+    if (!this.enabled) return;
     this.generation++;
-    this.controller?.dispose();
+    if (this.displayedHDR && !this.holdover) {
+      this.controller?.suspend();
+      this.holdover = { canvas: this.elements.hdrCanvas, controller: this.controller };
+      this.holdover.canvas.id = 'experimentalMediaHoldover';
+    } else this.controller?.dispose();
     this.controller = null;
-    this.surface(false);
-    if (!this.enabled || !this.visible || !this.regionVisible || this.hdrBlocked || !clientHDRCapability().supported) return;
+    this.displayedHDR = null;
+    this.recovering = this.enabled;
+    this.recoveryStartedAt = performance.now();
+    document.body.dataset.hdrStatus = 'starting';
     const old = this.elements.hdrCanvas;
     const canvas = old.cloneNode(false);
+    canvas.id = 'experimentalMediaCanvas';
+    canvas.dataset.clientHdrSurface = 'standby';
+    canvas.setAttribute('aria-hidden', 'true');
     canvas.width = this.elements.canvas.width;
     canvas.height = this.elements.canvas.height;
-    old.replaceWith(canvas);
+    if (old === this.holdover?.canvas) old.before(canvas);
+    else old.replaceWith(canvas);
     this.elements.hdrCanvas = canvas;
+    this.surface(false);
+    if (!this.enabled || !clientHDRCapability().supported) {
+      this.recovering = Boolean(this.holdover);
+      this.surface(false);
+      return;
+    }
+    if (!this.visible || this.hdrBlocked) return;
     const generation = this.generation;
     const controller = new ClientHDRController({
-      canRevealSurface: () => this.enabled && this.visible && this.regionVisible,
-      canReleaseHoldover: () => !this.frozen || Boolean(this.frozen.presenting),
+      canRevealSurface: () => this.enabled && this.visible,
+      canReleaseHoldover: (candidate) => Boolean(candidate.retainedResult
+        ? this.frozen?.displayed && samePicture(this.frozen.metadata, candidate)
+        : this.handlers.age(candidate) <= MAX_PICTURE_AGE_MS &&
+          (!this.frozen || (this.frozen.presenting && samePicture(this.frozen.metadata, candidate)))),
       onSurface: (visible) => { if (generation === this.generation) this.surface(visible); },
       onStatus: (status, reason) => {
         if (generation !== this.generation) return;
+        document.body.dataset.hdrStatus = status;
+        if (reason) document.body.dataset.hdrFailure = reason;
         if (status === 'ready') this.seedHDR();
         if (status === 'failed') {
           this.hdrBlocked = true;
+          this.recovering = true;
+          // Lost devices cannot retain a trustworthy surface.
+          if (reason === 'device_lost') {
+            this.displayedHDR = null;
+            this.releaseHoldover();
+          }
+          // Do not hide the retained surface when this controller failed.
+          if (this.displayedHDR) {
+            document.body.dataset.hdrRecovering = 'true';
+            this.handlers.onFailure?.(reason || 'hdr_failed');
+            return;
+          }
           this.surface(false);
           this.handlers.onFailure?.(reason || 'hdr_failed');
         }
       },
-      onRecoveryRequest: () => this.seedHDR(),
       onMetric: (event, snapshot) => {
         if (generation !== this.generation) return;
-        if (event === 'presented' && snapshot.proofFresh && this.rendered &&
+        if (event !== 'presented' || !snapshot.displayConfirmed) return;
+        if (this.recovering) {
+          document.body.dataset.hdrRecoveryMillis = String(Math.round(performance.now() - this.recoveryStartedAt));
+        }
+        document.body.dataset.hdrColorSpace = controller.renderer.encodeOutput ? 'srgb' : 'srgb-linear';
+        this.displayedHDR = this.frozen?.metadata || this.rendered;
+        this.recovering = false;
+        this.releaseHoldover();
+        this.surface(true);
+        if (this.frozen?.displayed) {
+          this.elements.resultArea.dataset.presentation = 'exact-hdr';
+          this.elements.resultImage.hidden = true;
+        }
+        this.handlers.onHDRHealthy?.();
+        if (snapshot.proofFresh && this.rendered &&
           snapshot.epoch === this.rendered.epoch && snapshot.sequence === this.rendered.sequence) {
           this.handlers.onRendered(this.rendered, true);
-          this.handlers.onHDRHealthy?.();
         }
       }
     });
     this.controller = controller;
-    controller.setStreamRegionVisible(this.regionVisible);
     controller.start({ canvas, width: canvas.width, height: canvas.height, boost: this.boost });
     this.seedHDR();
   }
 
   recoverHDR() {
+    if (!this.visible) return;
+    if (this.recovering && this.controller?.active) return;
     this.hdrBlocked = false;
     this.restartHDR();
   }
 
+  releaseHoldover() {
+    if (!this.holdover) return;
+    this.holdover.controller?.dispose();
+    this.holdover.canvas.remove();
+    this.holdover = null;
+  }
+
+  visiblePicture() {
+    if (this.enabled && this.recovering) return null;
+    return this.enabled && this.displayedHDR ? this.displayedHDR : this.rendered;
+  }
+
   seedHDR() {
-    if (this.frozen || !this.latest || this.handlers.age(this.latest.metadata) > MAX_PICTURE_AGE_MS) return;
+    if (this.frozen) {
+      if (this.frozen.displayed) {
+        const frozen = this.frozen;
+        this.controller?.offerFrame(frozen.frame, frozen.metadata, {
+          retainedResult: true,
+          commitSDR: () => this.frozen === frozen ? frozen.metadata : false
+        });
+      }
+      return;
+    }
+    if (!this.latest || this.handlers.age(this.latest.metadata) > MAX_PICTURE_AGE_MS) return;
     this.offer(this.latest.frame, this.latest.metadata);
   }
 
@@ -165,9 +240,9 @@ export class Presentation {
     const rendered = this.rendered;
     const generation = this.generation;
     void paint().then(() => {
-      if (generation === this.generation && this.visible && this.regionVisible &&
+      if (generation === this.generation && this.visible &&
         samePicture(rendered, this.rendered) && this.handlers.age(rendered) <= MAX_PICTURE_AGE_MS &&
-        !this.controller?.snapshot().surfaceVisible) this.handlers.onRendered(rendered, true);
+        !this.holdover && !this.recovering && !this.controller?.snapshot().surfaceVisible) this.handlers.onRendered(rendered, true);
     });
     return this.rendered;
   }
@@ -179,7 +254,7 @@ export class Presentation {
     const captured = this.latest.frame.clone();
     const metadata = { ...this.latest.metadata };
     const frozen = { requestId: request.requestId, revision: request.resultMarkerRevision,
-      metadata, presenting: true, displayed: false };
+      metadata, frame: captured, presenting: true, displayed: false };
     this.frozen = frozen;
     const { canvas, resultArea, resultImage } = this.elements;
     try {
@@ -217,15 +292,16 @@ export class Presentation {
       frozen.displayed = true;
       frozen.presenting = false;
       this.handlers.onRendered(metadata, true);
-      this.controller?.holdLastPresentation('control_code_result');
+      this.controller?.holdLastPresentation();
       return true;
     } finally {
-      captured.close();
       if (!frozen.displayed && this.frozen === frozen) this.closeResult();
     }
   }
 
   closeResult() {
+    this.controller?.holdLastPresentation();
+    this.frozen?.frame.close();
     this.frozen = null;
     const { resultArea, resultImage } = this.elements;
     resultArea.hidden = true;
@@ -236,6 +312,14 @@ export class Presentation {
     if (this.latest && this.handlers.age(this.latest.metadata) <= MAX_PICTURE_AGE_MS) {
       this.draw(this.latest.frame, this.latest.metadata);
       this.seedHDR();
+    } else {
+      // A dismissed/expired result is not a live holdover. Erase it even when
+      // the source has not supplied a replacement picture yet.
+      this.displayedHDR = null;
+      this.releaseHoldover();
+      this.rendered = null;
+      this.context.clearRect(0, 0, this.elements.canvas.width, this.elements.canvas.height);
+      this.restartHDR();
     }
   }
 
@@ -243,6 +327,11 @@ export class Presentation {
     this.generation++;
     this.controller?.dispose();
     this.controller = null;
+    this.releaseHoldover();
+    this.frozen?.frame.close();
+    this.frozen = null;
+    this.displayedHDR = null;
+    this.recovering = false;
     this.latest?.frame.close();
     this.latest = null;
   }
