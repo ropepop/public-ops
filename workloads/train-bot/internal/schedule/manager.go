@@ -81,7 +81,7 @@ func (m *Manager) LoadToday(ctx context.Context, now time.Time) error {
 }
 
 func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error {
-	if existing, err := m.store.ListTrainInstancesByDate(ctx, serviceDate); err == nil && len(existing) > 0 {
+	if existing, err := m.store.ListTrainInstancesByDate(ctx, serviceDate); err == nil && usableCachedSchedule(existing) {
 		m.mu.Lock()
 		m.available = true
 		m.lastErr = nil
@@ -104,7 +104,7 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 		m.mu.Unlock()
 		return fmt.Errorf("load schedule %s failed: %w", serviceDate, err)
 	}
-	if err := m.store.UpsertTrainInstances(ctx, serviceDate, sourceVersion, trains); err != nil {
+	if err := store.ImportTrainData(ctx, m.store, serviceDate, sourceVersion, trains, stopsByTrain); err != nil {
 		if m.useExistingServiceDate(ctx, serviceDate, err) {
 			return nil
 		}
@@ -114,17 +114,6 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 		m.loadedServiceDate = ""
 		m.mu.Unlock()
 		return fmt.Errorf("persist schedule: %w", err)
-	}
-	if err := m.store.UpsertTrainStops(ctx, serviceDate, stopsByTrain); err != nil {
-		if m.useExistingServiceDate(ctx, serviceDate, err) {
-			return nil
-		}
-		m.mu.Lock()
-		m.available = false
-		m.lastErr = err
-		m.loadedServiceDate = ""
-		m.mu.Unlock()
-		return fmt.Errorf("persist stops: %w", err)
 	}
 	m.mu.Lock()
 	m.available = true
@@ -137,7 +126,7 @@ func (m *Manager) LoadServiceDate(ctx context.Context, serviceDate string) error
 
 func (m *Manager) useExistingServiceDate(ctx context.Context, serviceDate string, cause error) bool {
 	existing, listErr := m.store.ListTrainInstancesByDate(ctx, serviceDate)
-	if listErr != nil || len(existing) == 0 {
+	if listErr != nil || !usableCachedSchedule(existing) {
 		return false
 	}
 	m.mu.Lock()
@@ -147,6 +136,15 @@ func (m *Manager) useExistingServiceDate(ctx context.Context, serviceDate string
 	m.loadedServiceDate = serviceDate
 	m.mu.Unlock()
 	return true
+}
+
+func usableCachedSchedule(trains []domain.TrainInstance) bool {
+	for _, train := range trains {
+		if strings.Contains(train.SourceVersion, "vivi_pdf") {
+			return false
+		}
+	}
+	return len(trains) > 0
 }
 
 func (m *Manager) DeleteSnapshot(serviceDate string) error {

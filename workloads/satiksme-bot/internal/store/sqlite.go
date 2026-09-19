@@ -765,6 +765,12 @@ func (s *SQLiteStore) CleanupExpired(ctx context.Context, cutoff time.Time) (Cle
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM incident_vote_events WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
 		return result, err
 	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM incident_votes WHERE updated_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
+		return result, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM incident_comments WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
+		return result, err
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM report_dedupe_claims WHERE last_report_at < ?`, cutoff.UTC().Format(time.RFC3339)); err != nil {
 		return result, err
 	}

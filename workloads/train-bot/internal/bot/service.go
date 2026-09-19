@@ -150,16 +150,10 @@ func (s *Service) handleMessage(ctx context.Context, m *Message) error {
 
 	switch normalizedText {
 	case "/start":
-		if err := s.sendStart(ctx, m.Chat.ID, lang); err != nil {
-			return err
-		}
-		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
+		return s.sendStart(ctx, m.Chat.ID, lang)
 	case "/incidents":
 		return s.send(ctx, m.Chat.ID, s.catalog.T(lang, "incidents_unavailable"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)})
 	case "/menu":
-		if err := s.send(ctx, m.Chat.ID, s.catalog.T(lang, "main_prompt"), MessageOptions{ReplyMarkup: s.mainReplyKeyboard(lang)}); err != nil {
-			return err
-		}
 		return s.sendOpenAppPrompt(ctx, m.Chat.ID, lang)
 	case "/help":
 		if err := s.sendHelp(ctx, m.Chat.ID, lang); err != nil {
@@ -504,6 +498,9 @@ func (s *Service) sendStart(ctx context.Context, chatID int64, lang domain.Langu
 		rows = append(rows, row)
 	}
 	if row := s.openIncidentsButtonRow(lang); row != nil {
+		rows = append(rows, row)
+	}
+	if row := s.reportsChannelButtonRow(lang); row != nil {
 		rows = append(rows, row)
 	}
 	kb := InlineKeyboardAny(rows...)

@@ -313,16 +313,12 @@ func TestStartCommandBypassesActiveCheckInSession(t *testing.T) {
 			sendMessages = append(sendMessages, request)
 		}
 	}
-	if len(sendMessages) != 2 {
-		t.Fatalf("expected 2 sendMessage requests, got %d", len(sendMessages))
+	if len(sendMessages) != 1 {
+		t.Fatalf("expected one start message, got %d", len(sendMessages))
 	}
 	startText, _ := sendMessages[0].payload["text"].(string)
 	if !strings.Contains(startText, "This bot shares real-time alerts") {
 		t.Fatalf("expected start message, got %q", startText)
-	}
-	openAppText, _ := sendMessages[1].payload["text"].(string)
-	if !strings.Contains(openAppText, "Open the train app") {
-		t.Fatalf("expected open app prompt after start, got %q", openAppText)
 	}
 }
 

@@ -12,11 +12,6 @@ type Catalog struct {
 
 const reportsChannelURL = "https://t.me/vivi_kontrole_reports"
 
-// The bot exposes a Main Mini App. Main Mini Apps use the startapp query
-// form; a /<short-name> path is reserved for separately registered direct-link
-// apps and Telegram Web rejects an unregistered short name.
-const miniAppDeepLinkURL = "https://t.me/vivi_kontrole_bot?startapp"
-
 func NewCatalog() *Catalog {
 	return &Catalog{
 		messages: map[domain.Language]map[string]string{
@@ -54,7 +49,7 @@ func (c *Catalog) Messages(lang domain.Language) map[string]string {
 }
 
 var enMessages = map[string]string{
-	"start":                                        "This bot shares real-time alerts about ticket inspection activity for specific train departures.\nPrivacy: only anonymous counts and timestamps.\nDirect app link: " + miniAppDeepLinkURL,
+	"start":                                        "This bot shares real-time alerts about ticket inspection activity for specific train departures.\nPrivacy: only anonymous counts and timestamps.",
 	"how_it_works":                                 "1) Follow the live incidents feed in the web app.\n2) Report what you see on trains or platforms.\n3) Let Telegram deliver alerts and quick settings changes.",
 	"main_prompt":                                  "Open the app for incidents, departures, station search, map, and settings.",
 	"main_input_placeholder":                       "Open app or settings",
@@ -185,9 +180,9 @@ var enMessages = map[string]string{
 	"mute_requires_train":                          "Open a train card or My ride first to mute alerts for a departure.",
 	"favorite_routes_title":                        "Saved routes:",
 	"favorite_routes_empty":                        "No saved routes yet. Save one from route search.",
-	"help":                                         "This bot now works best through the web app. Use it for incidents, departures, station search, the live map, reporting, and alert settings.\nIf Telegram Web hides the launcher, open the app directly here: " + miniAppDeepLinkURL,
+	"help":                                         "This bot now works best through the web app. Use it for incidents, departures, station search, the live map, reporting, and alert settings.",
 	"info":                                         "Build info:",
-	"open_app_prompt":                              "Open the train app to follow incidents, browse departures, search stations, report sightings, and manage alert settings in one place.\nIf Telegram Web hides the launcher, open it directly here: " + miniAppDeepLinkURL,
+	"open_app_prompt":                              "Open the train app to follow incidents, browse departures, search stations, report sightings, and manage alert settings in one place.",
 	"incidents_prompt":                             "Open the main app for the live incidents feed, departures, station search, and alert settings.",
 	"incidents_unavailable":                        "Open the app for the live incidents feed, departures, station search, and reporting.",
 	"settings_title":                               "Settings",
@@ -338,6 +333,7 @@ var enMessages = map[string]string{
 	"app_report_cooldown":                          "You can report again in %s min.",
 	"app_station_report_success":                   "Controle sighting accepted.",
 	"app_location_report_title":                    "Report location",
+	"app_incident_area_title":                      "Inspection near this location",
 	"app_location_report_description_label":        "What is the location?",
 	"app_location_report_description_placeholder":  "Short description",
 	"app_location_report_radius_label":             "Radius",
@@ -383,9 +379,13 @@ var enMessages = map[string]string{
 	"app_public_incidents_vote_ongoing":            "Still there",
 	"app_public_incidents_vote_cleared":            "Not present",
 	"app_public_incidents_comment_label":           "Comment anonymously",
+	"app_incident_platform_sighting":               "Platform sighting",
+	"app_incident_platform_sighting_to":            "Platform sighting to %s",
+	"app_incident_anonymous":                       "Anonymous",
 	"app_public_incidents_comment_placeholder":     "Add a short anonymous update",
 	"app_public_incidents_comment_submit":          "Post comment",
 	"app_public_incidents_vote_saved":              "Vote saved.",
+	"app_public_incidents_vote_cooldown":           "Wait before changing this vote again.",
 	"app_public_incidents_comment_saved":           "Comment posted.",
 	"app_public_incidents_auth_hint":               "Open from Telegram or an active app session to vote and comment.",
 	"app_public_incidents_activity":                "Activity",
@@ -403,7 +403,9 @@ var enMessages = map[string]string{
 	"app_public_station_selected":                  "Selected station",
 	"app_public_station_last":                      "Last departure",
 	"app_public_station_upcoming":                  "Upcoming departures",
-	"app_public_station_empty":                     "No departures found for this station today.",
+	"app_station_window_title":                     "Nearby departures",
+	"app_station_window_note":                      "Showing departures from two hours ago through the next two hours.",
+	"app_station_window_empty":                     "No departures within two hours before or after now.",
 	"app_public_station_last_empty":                "No earlier departures today.",
 	"app_public_station_upcoming_empty":            "No upcoming departures today.",
 	"app_public_station_search_success":            "Station results updated.",
@@ -485,7 +487,7 @@ var enMessages = map[string]string{
 }
 
 var lvMessages = map[string]string{
-	"start":                                        "Šis bots dalās ar reāllaika paziņojumiem par biļešu pārbaudēm konkrētiem vilciena reisiem.\nPrivātums: tikai anonīmi skaiti un laika zīmogi.\nTiešā lietotnes saite: " + miniAppDeepLinkURL,
+	"start":                                        "Šis bots dalās ar reāllaika paziņojumiem par biļešu pārbaudēm konkrētiem vilciena reisiem.\nPrivātums: tikai anonīmi skaiti un laika zīmogi.",
 	"how_it_works":                                 "1) Seko aktuālajam situāciju plūsmas skatam tīmekļa lietotnē.\n2) Ziņo par redzēto vilcienos vai uz platformām.\n3) Ļauj Telegram piegādāt brīdinājumus un ātras iestatījumu izmaiņas.",
 	"main_prompt":                                  "Atver lietotni aktuālajām situācijām, reisiem, staciju meklēšanai, kartei un iestatījumiem.",
 	"main_input_placeholder":                       "Lietotne vai iestatījumi",
@@ -616,9 +618,9 @@ var lvMessages = map[string]string{
 	"mute_requires_train":                          "Vispirms atver reisa kartīti vai Mans brauciens, lai izslēgtu paziņojumus šim reisam.",
 	"favorite_routes_title":                        "Saglabātie maršruti:",
 	"favorite_routes_empty":                        "Saglabātu maršrutu vēl nav. Saglabā maršrutu meklēšanas laikā.",
-	"help":                                         "Šis bots tagad vislabāk darbojas caur tīmekļa lietotni. Izmanto to aktuālajām situācijām, reisiem, staciju meklēšanai, tiešsaistes kartei, ziņošanai un brīdinājumu iestatījumiem.\nJa Telegram Web paslēpj palaidēju, atver lietotni tieši šeit: " + miniAppDeepLinkURL,
+	"help":                                         "Šis bots tagad vislabāk darbojas caur tīmekļa lietotni. Izmanto to aktuālajām situācijām, reisiem, staciju meklēšanai, tiešsaistes kartei, ziņošanai un brīdinājumu iestatījumiem.",
 	"info":                                         "Būvējuma informācija:",
-	"open_app_prompt":                              "Atver vilcienu lietotni, lai vienuviet sekotu aktuālajām situācijām, pārlūkotu reisus, meklētu stacijas, ziņotu par novērojumiem un pārvaldītu brīdinājumu iestatījumus.\nJa Telegram Web paslēpj palaidēju, atver lietotni tieši šeit: " + miniAppDeepLinkURL,
+	"open_app_prompt":                              "Atver vilcienu lietotni, lai vienuviet sekotu aktuālajām situācijām, pārlūkotu reisus, meklētu stacijas, ziņotu par novērojumiem un pārvaldītu brīdinājumu iestatījumus.",
 	"incidents_prompt":                             "Atver galveno lietotni aktuālajām situācijām, reisiem, staciju meklēšanai un brīdinājumu iestatījumiem.",
 	"incidents_unavailable":                        "Atver lietotni aktuālo situāciju plūsmai, reisiem, staciju meklēšanai un ziņošanai.",
 	"settings_title":                               "Iestatījumi",
@@ -769,6 +771,7 @@ var lvMessages = map[string]string{
 	"app_report_cooldown":                          "Par šo reisu vari ziņot atkal pēc %s min.",
 	"app_station_report_success":                   "Kontroles novērojums pieņemts.",
 	"app_location_report_title":                    "Ziņot par vietu",
+	"app_incident_area_title":                      "Kontrole šīs vietas tuvumā",
 	"app_location_report_description_label":        "Kur tieši tas ir?",
 	"app_location_report_description_placeholder":  "Īss apraksts",
 	"app_location_report_radius_label":             "Rādiuss",
@@ -814,9 +817,13 @@ var lvMessages = map[string]string{
 	"app_public_incidents_vote_ongoing":            "Joprojām tur ir",
 	"app_public_incidents_vote_cleared":            "Nav klāt",
 	"app_public_incidents_comment_label":           "Komentēt anonīmi",
+	"app_incident_platform_sighting":               "Perona novērojums",
+	"app_incident_platform_sighting_to":            "Perona novērojums; galamērķis: %s",
+	"app_incident_anonymous":                       "Anonīms",
 	"app_public_incidents_comment_placeholder":     "Pievieno īsu anonīmu atjauninājumu",
 	"app_public_incidents_comment_submit":          "Publicēt komentāru",
 	"app_public_incidents_vote_saved":              "Balsojums saglabāts.",
+	"app_public_incidents_vote_cooldown":           "Uzgaidi, pirms vēlreiz maini šo balsojumu.",
 	"app_public_incidents_comment_saved":           "Komentārs publicēts.",
 	"app_public_incidents_auth_hint":               "Atver no Telegram vai aktīvas lietotnes sesijas, lai balsotu un komentētu.",
 	"app_public_incidents_activity":                "Aktivitāte",
@@ -834,7 +841,9 @@ var lvMessages = map[string]string{
 	"app_public_station_selected":                  "Izvēlētā stacija",
 	"app_public_station_last":                      "Pēdējais reiss",
 	"app_public_station_upcoming":                  "Nākamie reisi",
-	"app_public_station_empty":                     "Šai stacijai šodien reisi nav atrasti.",
+	"app_station_window_title":                     "Tuvākie reisi",
+	"app_station_window_note":                      "Redzami reisi no pēdējām divām stundām un nākamajām divām stundām.",
+	"app_station_window_empty":                     "Divas stundas pirms un pēc pašreizējā laika reisu nav.",
 	"app_public_station_last_empty":                "Šodien agrāku reisu nav.",
 	"app_public_station_upcoming_empty":            "Šodien vairs nav nākamo reisu.",
 	"app_public_station_search_success":            "Staciju rezultāti atjaunināti.",

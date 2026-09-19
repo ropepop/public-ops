@@ -70,6 +70,16 @@ func (s *RoutedStore) UpsertTrainInstances(ctx context.Context, serviceDate stri
 	)
 }
 
+func (s *RoutedStore) ImportTrainData(ctx context.Context, serviceDate string, sourceVersion string, trains []domain.TrainInstance, stopsByTrain map[string][]domain.TrainStop) error {
+	if err := ImportTrainData(ctx, s.state, serviceDate, sourceVersion, trains, stopsByTrain); err != nil {
+		return err
+	}
+	if s.schedule == s.state {
+		return nil
+	}
+	return ImportTrainData(ctx, s.schedule, serviceDate, sourceVersion, trains, stopsByTrain)
+}
+
 func (s *RoutedStore) UpsertTrainStops(ctx context.Context, serviceDate string, stopsByTrain map[string][]domain.TrainStop) error {
 	if s.schedule == s.state {
 		return s.schedule.UpsertTrainStops(ctx, serviceDate, stopsByTrain)

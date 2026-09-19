@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"sort"
 	"strings"
@@ -306,13 +305,9 @@ func StationIncidentID(stationID string, dayKey string, contextKey string) strin
 	return fmt.Sprintf("station:%s:%s", strings.TrimSpace(stationID), sanitizeIncidentKey(dayKey+"-"+contextKey))
 }
 
-func AreaIncidentID(subjectID string, dayKey string) string {
-	return publicStableID("area:pub", strings.TrimSpace(subjectID)+"|"+strings.TrimSpace(dayKey))
-}
-
 func LocationIncidentID(item domain.LocationReport, dayKey string) string {
 	if strings.TrimSpace(item.Scope) == "area" {
-		return AreaIncidentID(item.SubjectID, dayKey)
+		return domain.AreaIncidentID(item.SubjectID, dayKey)
 	}
 	return StationIncidentID(item.SubjectID, dayKey, "report")
 }
@@ -849,16 +844,6 @@ func locationReportIncidentDetail(item domain.LocationReport) string {
 		return ""
 	}
 	return ""
-}
-
-func publicStableID(prefix string, value string) string {
-	clean := strings.TrimSpace(value)
-	if clean == "" {
-		clean = "unknown"
-	}
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(clean))
-	return fmt.Sprintf("%s-%08x", strings.TrimSpace(prefix), hash.Sum32())
 }
 
 func publicAreaCoordinate(value *float64) *float64 {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func (s *cleanupFailingStore) CleanupExpired(ctx context.Context, now time.Time,
 }
 
 type scriptedProvider struct {
-	calls    int
+	calls    atomic.Int64
 	outcomes []error
 }
 
@@ -56,7 +57,7 @@ func (p *scriptedProvider) Name() string {
 }
 
 func (p *scriptedProvider) Fetch(_ context.Context, serviceDate time.Time) (scrape.RawSchedule, error) {
-	p.calls++
+	p.calls.Add(1)
 	if len(p.outcomes) > 0 {
 		err := p.outcomes[0]
 		p.outcomes = p.outcomes[1:]
@@ -105,8 +106,8 @@ func TestRunnerTriggersDailyCatchupAfterCutoff(t *testing.T) {
 
 	runner.tick(ctx, now)
 
-	if provider.calls != 1 {
-		t.Fatalf("expected 1 scrape call, got %d", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected 1 scrape call, got %d", provider.calls.Load())
 	}
 	if !reader.IsFreshFor(now) {
 		t.Fatalf("expected read model to be fresh after catch-up scrape")
@@ -145,8 +146,8 @@ func TestRunnerRetriesDailyCatchupAfterFailure(t *testing.T) {
 
 	runner.tick(ctx, firstAttempt)
 
-	if provider.calls != 1 {
-		t.Fatalf("expected 1 scrape call after initial failure, got %d", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected 1 scrape call after initial failure, got %d", provider.calls.Load())
 	}
 	if reader.IsFreshFor(firstAttempt) {
 		t.Fatalf("expected read model to remain stale after failed catch-up")
@@ -162,13 +163,13 @@ func TestRunnerRetriesDailyCatchupAfterFailure(t *testing.T) {
 	}
 
 	runner.tick(ctx, beforeRetry)
-	if provider.calls != 1 {
-		t.Fatalf("expected no retry before backoff deadline, got %d calls", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected no retry before backoff deadline, got %d calls", provider.calls.Load())
 	}
 
 	runner.tick(ctx, retryAt)
-	if provider.calls != 2 {
-		t.Fatalf("expected retry at backoff deadline, got %d calls", provider.calls)
+	if provider.calls.Load() != 2 {
+		t.Fatalf("expected retry at backoff deadline, got %d calls", provider.calls.Load())
 	}
 	if !reader.IsFreshFor(retryAt) {
 		t.Fatalf("expected read model to be fresh after successful retry")
@@ -214,8 +215,8 @@ func TestRunnerCapsDailyRetryBackoffAtSixtyMinutes(t *testing.T) {
 
 	nextExpected := fourthAttempt.Add(60 * time.Minute)
 	runner.tick(ctx, fourthAttempt)
-	if provider.calls != 4 {
-		t.Fatalf("expected 4 scrape attempts, got %d", provider.calls)
+	if provider.calls.Load() != 4 {
+		t.Fatalf("expected 4 scrape attempts, got %d", provider.calls.Load())
 	}
 	if runner.dailyRetryBackoff != 60*time.Minute {
 		t.Fatalf("expected backoff cap to remain 60m, got %s", runner.dailyRetryBackoff)
@@ -232,16 +233,16 @@ func TestRunnerDoesNotRescrapeWhileScheduleIsFresh(t *testing.T) {
 	laterSameDay := mustLoadLocationTime(t, "Europe/Riga", 2026, 2, 28, 4, 5)
 
 	runner.tick(ctx, firstAttempt)
-	if provider.calls != 1 {
-		t.Fatalf("expected initial catch-up scrape, got %d calls", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected initial catch-up scrape, got %d calls", provider.calls.Load())
 	}
 	if !reader.IsFreshFor(laterSameDay) {
 		t.Fatalf("expected read model to stay fresh later the same day")
 	}
 
 	runner.tick(ctx, laterSameDay)
-	if provider.calls != 1 {
-		t.Fatalf("expected no extra scrape while fresh, got %d calls", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected no extra scrape while fresh, got %d calls", provider.calls.Load())
 	}
 }
 
@@ -252,8 +253,8 @@ func TestRunnerPublishesTrainStopsCleanupMetric(t *testing.T) {
 
 	runner.tick(ctx, now)
 
-	if provider.calls != 0 {
-		t.Fatalf("expected no scrape before daily cutoff, got %d calls", provider.calls)
+	if provider.calls.Load() != 0 {
+		t.Fatalf("expected no scrape before daily cutoff, got %d calls", provider.calls.Load())
 	}
 	if got := queryDailyMetric(t, dbPath, now.Format("2006-01-02"), "cleanup_train_stops_deleted"); got != 0 {
 		t.Fatalf("expected cleanup_train_stops_deleted=0 before successful same-day load, got %d", got)
@@ -349,15 +350,15 @@ func TestRunnerRunSuccessfulStartupScrapeSkipsFollowupLoad(t *testing.T) {
 		errCh <- runner.Run(ctx)
 	}()
 	waitForRunnerStartup(t, func() bool {
-		return provider.calls == 1
+		return provider.calls.Load() == 1
 	})
 	cancel()
 	if err := <-errCh; err != nil {
 		t.Fatalf("runner run: %v", err)
 	}
 
-	if provider.calls != 1 {
-		t.Fatalf("expected one startup scrape, got %d", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected one startup scrape, got %d", provider.calls.Load())
 	}
 	if counting.upsertTrainInstancesCalls != 1 {
 		t.Fatalf("expected one train instance import, got %d", counting.upsertTrainInstancesCalls)
@@ -403,15 +404,15 @@ func TestRunnerRunDoesNotFallbackToSnapshotLoadAfterStartupScrapeFailure(t *test
 		errCh <- runner.Run(ctx)
 	}()
 	waitForRunnerStartup(t, func() bool {
-		return provider.calls == 1
+		return provider.calls.Load() == 1
 	})
 	cancel()
 	if err := <-errCh; err != nil {
 		t.Fatalf("runner run: %v", err)
 	}
 
-	if provider.calls != 1 {
-		t.Fatalf("expected one failed startup scrape, got %d", provider.calls)
+	if provider.calls.Load() != 1 {
+		t.Fatalf("expected one failed startup scrape, got %d", provider.calls.Load())
 	}
 	if counting.upsertTrainInstancesCalls != 0 {
 		t.Fatalf("expected no fallback train import from snapshot file, got %d", counting.upsertTrainInstancesCalls)

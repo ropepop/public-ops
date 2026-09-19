@@ -600,7 +600,8 @@ export class ClientHDRRenderer {
     this.prepared = false;
     try {
       await this.submitAndWait((device) => {
-        this.context.configure(this.context.getConfiguration());
+        // Reconfiguring clears the visible canvas. Keep its HDR surface intact
+        // while the next picture is prepared, then copy into the existing context.
         const encoder = device.createCommandEncoder();
         encoder.copyTextureToTexture(
           { texture: this.stagingTexture }, { texture: this.context.getCurrentTexture() },

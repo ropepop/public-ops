@@ -116,16 +116,9 @@ type staticBundleStore struct {
 }
 
 type staticBundleData struct {
-	manifest      *staticBundleManifest
-	stations      []domain.Station
-	trains        []domain.TrainInstance
-	stops         []domain.TrainStop
-	stationPasses []staticBundleStationPass
-
-	stationByID     map[string]domain.Station
-	trainsByID      map[string]domain.TrainInstance
-	stopsByTrain    map[string][]domain.TrainStop
-	passesByStation map[string][]staticBundleStationPass
+	manifest   *staticBundleManifest
+	stations   []domain.Station
+	trainsByID map[string]domain.TrainInstance
 }
 
 func newStaticBundlePublisher(dir string, appSvc *trainapp.Service, loc *time.Location, syncer activeBundleSync) *staticBundlePublisher {
@@ -370,64 +363,27 @@ func (s *staticBundleStore) loadData() (*staticBundleData, error) {
 	}
 	var stations []domain.Station
 	var trains []domain.TrainInstance
-	var stops []domain.TrainStop
-	var stationPasses []staticBundleStationPass
 	if err := loadSlice(manifest.Slices.Stations, &stations); err != nil {
 		return nil, err
 	}
 	if err := loadSlice(manifest.Slices.Trains, &trains); err != nil {
 		return nil, err
 	}
-	if err := loadSlice(manifest.Slices.Stops, &stops); err != nil {
-		return nil, err
-	}
-	if err := loadSlice(manifest.Slices.StationPasses, &stationPasses); err != nil {
-		return nil, err
-	}
-	data := newStaticBundleData(manifest, stations, trains, stops, stationPasses)
+	data := newStaticBundleData(manifest, stations, trains)
 	s.mu.Lock()
 	s.cachedData = data
 	s.mu.Unlock()
 	return data, nil
 }
 
-func newStaticBundleData(manifest *staticBundleManifest, stations []domain.Station, trains []domain.TrainInstance, stops []domain.TrainStop, stationPasses []staticBundleStationPass) *staticBundleData {
+func newStaticBundleData(manifest *staticBundleManifest, stations []domain.Station, trains []domain.TrainInstance) *staticBundleData {
 	data := &staticBundleData{
-		manifest:        manifest,
-		stations:        append([]domain.Station(nil), stations...),
-		trains:          append([]domain.TrainInstance(nil), trains...),
-		stops:           append([]domain.TrainStop(nil), stops...),
-		stationPasses:   append([]staticBundleStationPass(nil), stationPasses...),
-		stationByID:     make(map[string]domain.Station, len(stations)),
-		trainsByID:      make(map[string]domain.TrainInstance, len(trains)),
-		stopsByTrain:    make(map[string][]domain.TrainStop, len(trains)),
-		passesByStation: make(map[string][]staticBundleStationPass),
+		manifest:   manifest,
+		stations:   append([]domain.Station(nil), stations...),
+		trainsByID: make(map[string]domain.TrainInstance, len(trains)),
 	}
-	for _, station := range data.stations {
-		data.stationByID[strings.TrimSpace(station.ID)] = station
-	}
-	for _, train := range data.trains {
+	for _, train := range trains {
 		data.trainsByID[strings.TrimSpace(train.ID)] = train
-	}
-	for _, stop := range data.stops {
-		trainID := strings.TrimSpace(stop.TrainInstanceID)
-		data.stopsByTrain[trainID] = append(data.stopsByTrain[trainID], stop)
-	}
-	for trainID := range data.stopsByTrain {
-		sort.SliceStable(data.stopsByTrain[trainID], func(i, j int) bool {
-			return data.stopsByTrain[trainID][i].Seq < data.stopsByTrain[trainID][j].Seq
-		})
-	}
-	for _, pass := range data.stationPasses {
-		stationID := strings.TrimSpace(pass.StationID)
-		data.passesByStation[stationID] = append(data.passesByStation[stationID], pass)
-	}
-	for stationID := range data.passesByStation {
-		sort.SliceStable(data.passesByStation[stationID], func(i, j int) bool {
-			left := parseBundleTime(data.passesByStation[stationID][i].PassAt)
-			right := parseBundleTime(data.passesByStation[stationID][j].PassAt)
-			return left.Before(right)
-		})
 	}
 	return data
 }
@@ -455,129 +411,12 @@ func (d *staticBundleData) withSchedule(payload map[string]any, now time.Time) m
 	return payload
 }
 
-func (d *staticBundleData) defaultTrainStatus() domain.TrainStatus {
-	return domain.TrainStatus{
-		State:           domain.StatusNoReports,
-		Confidence:      domain.ConfidenceLow,
-		UniqueReporters: 0,
-	}
-}
-
-func (d *staticBundleData) defaultTrainCard(train domain.TrainInstance) trainapp.TrainCard {
-	return trainapp.TrainCard{
-		Train:  train,
-		Status: d.defaultTrainStatus(),
-		Riders: 0,
-	}
-}
-
-func (d *staticBundleData) trainsByWindow(now time.Time, windowID string) []domain.TrainInstance {
-	localNow := now
-	start := localNow
-	end := localNow
-	switch strings.TrimSpace(windowID) {
-	case "now":
-		start = localNow.Add(-15 * time.Minute)
-		end = localNow.Add(15 * time.Minute)
-	case "next_hour":
-		start = localNow
-		end = localNow.Add(1 * time.Hour)
-	case "today":
-		start = localNow.Add(-30 * time.Minute)
-		end = time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 23, 59, 59, 0, localNow.Location())
-	default:
-		return nil
-	}
-	items := make([]domain.TrainInstance, 0)
-	for _, train := range d.trains {
-		if train.DepartureAt.Before(start) || train.DepartureAt.After(end) {
-			continue
-		}
-		items = append(items, train)
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].DepartureAt.Before(items[j].DepartureAt)
-	})
-	return items
-}
-
-func (d *staticBundleData) publicDashboard(now time.Time, limit int) map[string]any {
-	items := d.trainsByWindow(now, "today")
-	if limit > 0 && len(items) > limit {
-		items = items[:limit]
-	}
-	out := make([]trainapp.PublicTrainView, 0, len(items))
-	for _, train := range items {
-		card := d.defaultTrainCard(train)
-		out = append(out, trainapp.PublicTrainView{
-			Train:            trainapp.PublicTrainInstanceFor(card.Train),
-			Status:           card.Status,
-			Riders:           card.Riders,
-			Timeline:         nil,
-			StationSightings: nil,
-		})
-	}
-	return d.withSchedule(map[string]any{
-		"generatedAt": now.UTC(),
-		"trains":      out,
-	}, now)
-}
-
-func (d *staticBundleData) publicServiceDayTrains(now time.Time) map[string]any {
-	items := append([]domain.TrainInstance(nil), d.trains...)
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].DepartureAt.Before(items[j].DepartureAt)
-	})
-	out := make([]trainapp.PublicTrainView, 0, len(items))
-	for _, train := range items {
-		card := d.defaultTrainCard(train)
-		out = append(out, trainapp.PublicTrainView{
-			Train:            trainapp.PublicTrainInstanceFor(card.Train),
-			Status:           card.Status,
-			Riders:           card.Riders,
-			Timeline:         nil,
-			StationSightings: nil,
-		})
-	}
-	return d.withSchedule(map[string]any{
-		"generatedAt": now.UTC(),
-		"trains":      out,
-	}, now)
-}
-
 func publicStaticBundleTrains(trains []domain.TrainInstance) []trainapp.PublicTrainInstance {
 	out := make([]trainapp.PublicTrainInstance, 0, len(trains))
 	for _, train := range trains {
 		out = append(out, trainapp.PublicTrainInstanceFor(train))
 	}
 	return out
-}
-
-func (d *staticBundleData) publicTrain(now time.Time, trainID string) map[string]any {
-	train, ok := d.trainsByID[strings.TrimSpace(trainID)]
-	if !ok {
-		return nil
-	}
-	return d.withSchedule(map[string]any{
-		"train":            train,
-		"status":           d.defaultTrainStatus(),
-		"riders":           d.defaultTrainCard(train).Riders,
-		"timeline":         []any{},
-		"stationSightings": []any{},
-	}, now)
-}
-
-func (d *staticBundleData) trainStops(now time.Time, trainID string) map[string]any {
-	train, ok := d.trainsByID[strings.TrimSpace(trainID)]
-	if !ok {
-		return nil
-	}
-	return d.withSchedule(map[string]any{
-		"trainCard":        d.defaultTrainCard(train),
-		"train":            train,
-		"stops":            d.stopsByTrain[strings.TrimSpace(trainID)],
-		"stationSightings": []any{},
-	}, now)
 }
 
 func (d *staticBundleData) publicNetworkMap(now time.Time) map[string]any {
@@ -599,53 +438,6 @@ func (d *staticBundleData) searchStations(now time.Time, query string) map[strin
 	return d.withSchedule(map[string]any{
 		"stations": filterBundleStations(d.stations, query),
 	}, now)
-}
-
-func (d *staticBundleData) publicStationDepartures(now time.Time, stationID string, limit int) map[string]any {
-	station, ok := d.stationByID[strings.TrimSpace(stationID)]
-	if !ok {
-		return nil
-	}
-	passes := d.passesByStation[strings.TrimSpace(stationID)]
-	localNow := now
-	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
-	dayEnd := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), localNow.Location())
-	var lastDeparture *trainapp.StationTrainCard
-	upcoming := make([]trainapp.StationTrainCard, 0)
-	for _, pass := range passes {
-		passAt := parseBundleTime(pass.PassAt)
-		if passAt.Before(dayStart) || passAt.After(dayEnd) {
-			continue
-		}
-		card := d.stationTrainCard(pass, passAt)
-		if passAt.Before(localNow) {
-			copyCard := card
-			lastDeparture = &copyCard
-			continue
-		}
-		upcoming = append(upcoming, card)
-	}
-	if limit > 0 && len(upcoming) > limit {
-		upcoming = upcoming[:limit]
-	}
-	return d.withSchedule(map[string]any{
-		"station":         station,
-		"lastDeparture":   lastDeparture,
-		"upcoming":        upcoming,
-		"recentSightings": []any{},
-	}, now)
-}
-
-func (d *staticBundleData) stationTrainCard(pass staticBundleStationPass, passAt time.Time) trainapp.StationTrainCard {
-	train := d.trainsByID[strings.TrimSpace(pass.TrainID)]
-	return trainapp.StationTrainCard{
-		TrainCard:       d.defaultTrainCard(train),
-		StationID:       strings.TrimSpace(pass.StationID),
-		StationName:     pass.StationName,
-		PassAt:          passAt,
-		SightingCount:   0,
-		SightingContext: nil,
-	}
 }
 
 func filterBundleStations(stations []domain.Station, query string) []domain.Station {

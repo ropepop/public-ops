@@ -2,6 +2,7 @@ package spacetime
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -191,6 +192,21 @@ func TestServiceProceduresRequireServiceRoleBeforeReads(t *testing.T) {
 			name:   "serviceGetSchedule",
 			anchor: "export const serviceGetSchedule = spacetimedb.procedure",
 			read:   "serviceGetSchedulePayload(",
+		},
+		{
+			name:   "serviceGetTrip",
+			anchor: "export const serviceGetTrip = spacetimedb.procedure",
+			read:   "trainById(",
+		},
+		{
+			name:   "serviceGetRider",
+			anchor: "export const serviceGetRider = spacetimedb.procedure",
+			read:   "tx.db.trainbot_rider.stableId.find(",
+		},
+		{
+			name:   "serviceListRiders",
+			anchor: "export const serviceListRiders = spacetimedb.procedure",
+			read:   "tx.db.trainbot_rider.iter(",
 		},
 		{
 			name:   "serviceListActivities",
@@ -508,6 +524,45 @@ func TestCleanupExpiredStateRemovesEmptyAnonymousViewerRows(t *testing.T) {
 	}
 }
 
+func TestRetentionRemovesExpiredLocationReports(t *testing.T) {
+	source := readSpacetimeSource(t)
+	start := strings.Index(source, "function pruneActivityForRetention(")
+	if start < 0 {
+		t.Fatal("retention function not found")
+	}
+	end := strings.Index(source[start:], "\nfunction refreshScheduleProjection(")
+	if end < 0 {
+		t.Fatal("retention function not found")
+	}
+	cmd := exec.Command("node", "--disable-warning=ExperimentalWarning", "-e", `
+const assert = require('node:assert/strict');
+const source = require('node:module').stripTypeScriptTypes(require('node:fs').readFileSync(0, 'utf8'));
+let deleted, saved;
+const scope = {
+  asString: String, parseISO: value => new Date(value),
+  deleteActivity: (_, id) => { deleted = id; },
+  putActivityRow: (_, row) => { saved = row; return row; },
+  refreshActivityProjection() {}, scheduleActivityRefreshJobs() {},
+};
+require('node:vm').runInNewContext(source, scope);
+const expired = {kind: 'location_report', createdAt: '2026-09-15T00:00:00Z'};
+const current = {kind: 'location_report', createdAt: '2026-09-16T00:00:00Z'};
+const cutoff = Date.parse(current.createdAt);
+for (const timeline of [[expired], [expired, current], [current]]) {
+  deleted = saved = undefined;
+  const result = scope.pruneActivityForRetention({}, {id: 'qa', timeline}, cutoff);
+  assert.equal(result.reportsDeleted, timeline.includes(expired) ? 1 : 0);
+  assert.equal(result.stationSightingsDeleted, 0);
+  if (timeline.length === 2) assert.equal(JSON.stringify(saved.timeline), JSON.stringify([current]));
+  else assert.equal(deleted, timeline[0] === expired ? 'qa' : undefined);
+}
+`)
+	cmd.Stdin = strings.NewReader(source[start : start+end])
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("location report retention: %v\n%s", err, output)
+	}
+}
+
 func TestPublicIncidentActionsHaveGlobalLimitsAndAnonymousActors(t *testing.T) {
 	t.Parallel()
 
@@ -708,6 +763,49 @@ func TestPersistedPublicProjectionSchemaRemainsBackwardCompatible(t *testing.T) 
 	apiTimeline := sourceSnippet(t, source, "function publicTimelinePayload", 420)
 	if !strings.Contains(apiTimeline, "eventLabel: publicTimelineEventLabel(bucket)") {
 		t.Fatalf("public API timeline must keep the eventLabel presentation field:\n%s", apiTimeline)
+	}
+}
+
+func TestLocationReportReducerPreservesBothScopes(t *testing.T) {
+	source := readSpacetimeSource(t)
+	start := strings.Index(source, "export const serviceSubmitLocationReport =")
+	end := strings.Index(source, "export const serviceSubmitIncidentVote =")
+	if start < 0 || end <= start {
+		t.Fatal("location report reducer not found")
+	}
+	cmd := exec.Command("node", "--disable-warning=ExperimentalWarning", "-e", `
+const assert = require('node:assert/strict');
+const source = require('node:module').stripTypeScriptTypes(require('node:fs').readFileSync(0, 'utf8'));
+let reducer, submitted;
+const context = {
+  spacetimedb: {reducer: (_, __, fn) => { reducer = fn; }},
+  t: {string() {}}, named: String, SenderError: Error,
+  asString: value => String(value ?? ''), parseJSON: JSON.parse,
+  requireServiceRole: tx => { if (!tx.authorized) throw new Error('unauthorized'); },
+  activeServiceDate: () => '2026-09-17',
+  ensureAreaActivity: () => ({scope: 'area'}),
+  ensureStationActivity: () => ({scope: 'station'}),
+  submitReportActionAtomic: (_, activity, event) => { submitted = {activity, event}; },
+};
+require('node:vm').runInNewContext(source, context);
+for (const scope of ['area', 'station']) {
+  const report = {id: 'qa-report', stableId: 'qa-user', scope, subjectId: 'qa-place', subjectName: 'QA', latitude: 56.95, longitude: 24.1, radiusMeters: 100, description: 'QA test'};
+  const args = {reportJson: JSON.stringify(report)};
+  assert.throws(() => reducer({}, args), /unauthorized/);
+  reducer({authorized: true}, args);
+  assert.equal(submitted.activity.scope, scope);
+  const event = submitted.event;
+  assert.equal(event.name, scope === 'area' ? 'Inspection near this location' : 'Inspection at station');
+  assert.equal(event.kind, 'location_report');
+  for (const key of ['id', 'stableId', 'latitude', 'longitude', 'radiusMeters']) assert.equal(event[key], report[key]);
+  assert.equal(event.locationDescription, report.description);
+  assert.equal(event.detail, report.description);
+  assert.equal(event.stationId, scope === 'station' ? report.subjectId : '');
+}
+`)
+	cmd.Stdin = strings.NewReader(strings.TrimPrefix(source[start:end], "export "))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("location report reducer: %v\n%s", err, output)
 	}
 }
 

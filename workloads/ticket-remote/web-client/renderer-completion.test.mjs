@@ -33,19 +33,18 @@ function rendererWith(queue, validation) {
   return { renderer, failures, pops: () => pops };
 }
 
-test('every frame configures and submits the prepared picture without yielding or replacing resources', async () => {
+test('every frame preserves the configured surface and submits without yielding or replacing resources', async () => {
   const { renderer } = rendererWith({ promise: Promise.resolve() }, { promise: Promise.resolve(null) });
-  const events = [], configuration = { device: renderer.device }, texture = {};
+  const events = [], texture = {};
   renderer.canvas = { width: 10, height: 20 };
   renderer.stagingTexture = { destroy() { events.push('release'); } };
   renderer.context = {
-    getConfiguration: () => configuration,
-    configure(value) {
-      assert.equal(value, configuration);
-      events.push('configure');
+    configure() { assert.fail('ordinary presentation must not clear the configured surface'); },
+    getCurrentTexture() {
+      events.push('texture');
       queueMicrotask(() => events.push('yield'));
+      return texture;
     },
-    getCurrentTexture() { events.push('texture'); return texture; },
     unconfigure() { events.push('unconfigure'); }
   };
   renderer.device.createCommandEncoder = () => ({
@@ -62,7 +61,7 @@ test('every frame configures and submits the prepared picture without yielding o
     events.length = 0;
     renderer.prepared = true;
     await renderer.present();
-    assert.deepEqual(events, ['configure', 'texture', 'copy', 'submit', 'yield']);
+    assert.deepEqual(events, ['texture', 'copy', 'submit', 'yield']);
     assert.equal(renderer.device, device);
     assert.equal(renderer.stagingTexture, staging);
   }

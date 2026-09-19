@@ -24,7 +24,7 @@ function picture() {
   finally { frame.close(); }
 }
 function check(condition, message) { if (!condition) throw Error(message); }
-async function verifyCanvasReset() {
+async function verifyStableCanvas() {
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'width:248px;height:511px;dynamic-range-limit:no-limit';
   document.body.append(canvas);
@@ -37,6 +37,9 @@ async function verifyCanvasReset() {
     await renderer.initialize({ canvas, width: source.width, height: source.height, boost: 4 });
     // Test-only read access: capture the actual presented texture before expiry.
     renderer.context.configure({ ...renderer.context.getConfiguration(), usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
+    const configure = renderer.context.configure.bind(renderer.context);
+    let reconfigurations = 0;
+    renderer.context.configure = configuration => { reconfigurations++; configure(configuration); };
     readback = renderer.device.createBuffer({ size: 6 * 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const resources = ['device', 'pipeline', 'paramsBuffer', 'stagingTexture'].map(key => renderer[key]);
     for (let round = 0; round < 3; round++) {
@@ -61,19 +64,20 @@ async function verifyCanvasReset() {
           readback.unmap();
           check(actual.every((value, i) => i % 4 !== 3 || value === 0x3c00) && actual.some((value, i) => i % 4 !== 3 && value > 0x3c00), 'blank presented texture');
           if (!references.has(boost)) references.set(boost, actual);
-          check(actual.every((value, i) => Math.abs(value - references.get(boost)[i]) <= 1), 'reset changed canvas pixels');
-          check(['device', 'pipeline', 'paramsBuffer', 'stagingTexture'].every((key, i) => renderer[key] === resources[i]), 'reset replaced GPU resources');
+          check(actual.every((value, i) => Math.abs(value - references.get(boost)[i]) <= 1), 'update changed canvas pixels');
+          check(reconfigurations === 0, 'update reconfigured the visible canvas');
+          check(['device', 'pipeline', 'paramsBuffer', 'stagingTexture'].every((key, i) => renderer[key] === resources[i]), 'update replaced GPU resources');
         }
       }
       rounds.push(percentile(samples, 0.5));
     }
     return { samples: timings.length, rounds,
       medianMillis: percentile(timings, 0.5), p95Millis: percentile(timings, 0.95),
-      identicalPresentedTexturePixels: true, resourcesReused: true };
+      identicalPresentedTexturePixels: true, resourcesReused: true, reconfigurations };
   } finally {
     const context = renderer.context;
     readback?.destroy(); renderer.dispose(); frame.close(); canvas.remove();
-    check(!renderer.device && !renderer.stagingTexture && !context?.getConfiguration(), 'reset resources leaked');
+    check(!renderer.device && !renderer.stagingTexture && !context?.getConfiguration(), 'presentation resources leaked');
   }
 }
 async function settled() {
@@ -88,7 +92,7 @@ document.getElementById('run').addEventListener('click', async event => {
   failures.length = 0;
   const timings = [];
   try {
-    const canvasReset = await verifyCanvasReset();
+    const stableCanvas = await verifyStableCanvas();
     presentation.setPreference(true, 4); picture(); await settled();
     const openingMillis = Number(document.body.dataset.hdrRecoveryMillis);
     for (let i = 0; i < 10; i++) {
@@ -116,7 +120,7 @@ document.getElementById('run').addEventListener('click', async event => {
     presentation.closeResult(); picture(); await settled();
     check(failures.length === 0, failures.join(','));
     const sorted = [...timings].sort((a, b) => a - b);
-    result.textContent = JSON.stringify({ passed: true, canvasReset, openingMillis, returns: timings.length,
+    result.textContent = JSON.stringify({ passed: true, stableCanvas, openingMillis, returns: timings.length,
       medianMillis: sorted[4], p95Millis: sorted[9], timings, frozenResult: 'passed',
       colorSpace: document.body.dataset.hdrColorSpace }, null, 2);
   } catch (error) { result.textContent = JSON.stringify({ passed: false, error: String(error), failures }); }

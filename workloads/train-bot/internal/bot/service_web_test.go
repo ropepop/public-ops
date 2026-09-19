@@ -177,8 +177,8 @@ func TestHandleMessageSupportsAddressedCommandVariantsAndIncidentsNotice(t *test
 			sendMessages = append(sendMessages, request)
 		}
 	}
-	if len(sendMessages) != 6 {
-		t.Fatalf("expected 6 sendMessage requests, got %d", len(sendMessages))
+	if len(sendMessages) != 4 {
+		t.Fatalf("expected one reply per command, got %d", len(sendMessages))
 	}
 
 	for i := 0; i < 2; i++ {
@@ -211,18 +211,28 @@ func TestHandleMessageSupportsAddressedCommandVariantsAndIncidentsNotice(t *test
 	if startText != i18n.NewCatalog().T(domain.LanguageEN, "start") {
 		t.Fatalf("start text = %q", startText)
 	}
-	startPromptText, _ := sendMessages[3].payload["text"].(string)
-	if startPromptText != i18n.NewCatalog().T(domain.LanguageEN, "open_app_prompt") {
-		t.Fatalf("start prompt text = %q", startPromptText)
+	channelURL := i18n.NewCatalog().T(domain.LanguageEN, "link_reports_channel")
+	startMarkup := sendMessages[2].payload["reply_markup"].(map[string]any)
+	startRows := startMarkup["inline_keyboard"].([]any)
+	channelButton := startRows[len(startRows)-1].([]any)[0].(map[string]any)
+	if channelButton["url"] != channelURL {
+		t.Fatalf("start must retain the reports channel button: %v", channelButton)
 	}
-
-	menuText, _ := sendMessages[4].payload["text"].(string)
-	if menuText != i18n.NewCatalog().T(domain.LanguageEN, "main_prompt") {
-		t.Fatalf("menu text = %q", menuText)
-	}
-	menuPromptText, _ := sendMessages[5].payload["text"].(string)
+	menuPromptText, _ := sendMessages[3].payload["text"].(string)
 	if menuPromptText != i18n.NewCatalog().T(domain.LanguageEN, "open_app_prompt") {
 		t.Fatalf("menu prompt text = %q", menuPromptText)
+	}
+	menuMarkup := sendMessages[3].payload["reply_markup"].(map[string]any)
+	menuRows, ok := menuMarkup["inline_keyboard"].([]any)
+	if !ok || len(menuRows) != 2 {
+		t.Fatalf("menu must provide inline app and reports channel buttons: %v", menuMarkup)
+	}
+	appButton := menuRows[0].([]any)[0].(map[string]any)
+	if appButton["web_app"].(map[string]any)["url"] != "https://vilciens.kontrole.info/app" {
+		t.Fatalf("menu must use the configured web app directly: %v", appButton)
+	}
+	if menuRows[1].([]any)[0].(map[string]any)["url"] != channelURL {
+		t.Fatal("menu must retain the reports channel button")
 	}
 }
 
@@ -263,52 +273,15 @@ func TestHandleMessageHelpSendsHelpAndOpenAppPrompt(t *testing.T) {
 	}
 }
 
-func TestOpenAppPromptAndHelpMentionTelegramDeepLink(t *testing.T) {
+func TestAppEntryMessagesDoNotAdvertiseUnconfiguredMiniApp(t *testing.T) {
 	t.Parallel()
-
-	recorder, client, closeFn := newTelegramRecorder(t)
-	defer closeFn()
-
-	service := NewService(
-		client,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		i18n.NewCatalog(),
-		time.UTC,
-		1,
-		true,
-		"https://vilciens.kontrole.info",
-	)
-
-	if err := service.sendOpenAppPrompt(context.Background(), 42, domain.LanguageEN); err != nil {
-		t.Fatalf("sendOpenAppPrompt error = %v", err)
-	}
-	if err := service.sendHelp(context.Background(), 42, domain.LanguageEN); err != nil {
-		t.Fatalf("sendHelp error = %v", err)
-	}
-
-	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-	sendMessages := make([]recordedRequest, 0)
-	for _, request := range recorder.requests {
-		if request.path == "/sendMessage" {
-			sendMessages = append(sendMessages, request)
-		}
-	}
-	if len(sendMessages) != 2 {
-		t.Fatalf("expected 2 sendMessage requests, got %d", len(sendMessages))
-	}
-
-	for i, request := range sendMessages {
-		text, _ := request.payload["text"].(string)
-		if !strings.Contains(text, "https://t.me/vivi_kontrole_bot?startapp") {
-			t.Fatalf("message[%d] missing Telegram deep link: %q", i, text)
-		}
-		if strings.Contains(text, "https://t.me/vivi_kontrole_bot/app") {
-			t.Fatalf("message[%d] still contains the unregistered direct-app short name: %q", i, text)
+	catalog := i18n.NewCatalog()
+	for _, lang := range []domain.Language{domain.LanguageEN, domain.LanguageLV} {
+		for _, key := range []string{"start", "help", "open_app_prompt"} {
+			text := catalog.T(lang, key)
+			if strings.Contains(text, "?startapp") || strings.Contains(text, "vivi_kontrole_bot/app") {
+				t.Fatalf("%s/%s advertises an unconfigured mini app: %q", lang, key, text)
+			}
 		}
 	}
 }

@@ -408,9 +408,9 @@ func loadCommon() (Config, error) {
 		CatalogRefreshHours:                       refreshHours,
 		CleanupIntervalMinutes:                    cleanupIntervalMinutes,
 		LiveVehiclesSourceURL:                     strings.TrimSpace(envOr("SATIKSME_LIVE_VEHICLES_SOURCE_URL", "https://www.saraksti.lv/gpsdata.ashx?gps")),
-		SourceStopsURL:                            envOr("SATIKSME_SOURCE_STOPS_URL", "https://saraksti.rigassatiksme.lv/riga/stops.txt"),
-		SourceRoutesURL:                           envOr("SATIKSME_SOURCE_ROUTES_URL", "https://saraksti.rigassatiksme.lv/riga/routes.txt"),
-		SourceGTFSURL:                             envOr("SATIKSME_SOURCE_GTFS_URL", "https://data.gov.lv/dati/dataset/6d78358a-0095-4ce3-b119-6cde5d0ac54f/resource/c576c770-a01b-49b0-bdc4-0005a1ec5838/download/marsrutusaraksti02_2026.zip"),
+		SourceStopsURL:                            envOr("SATIKSME_SOURCE_STOPS_URL", "https://www.saraksti.lv/riga/stops.txt"),
+		SourceRoutesURL:                           envOr("SATIKSME_SOURCE_ROUTES_URL", "https://www.saraksti.lv/riga/routes.txt"),
+		SourceGTFSURL:                             envOr("SATIKSME_SOURCE_GTFS_URL", "https://data.gov.lv/dati/dataset/6d78358a-0095-4ce3-b119-6cde5d0ac54f/resource/2e9922e8-d863-41d3-9ff4-9a97ec9031a3/download/marsrutusaraksti08_2026.zip"),
 	}
 
 	if cfg.HTTPTimeoutSec <= cfg.LongPollTimeout {

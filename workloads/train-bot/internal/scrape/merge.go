@@ -32,6 +32,13 @@ func BuildSnapshotFile(serviceDate time.Time, schedules []RawSchedule) (Snapshot
 		stats.ProvidersSucceeded++
 		sourceNames = append(sourceNames, sched.SourceName)
 		for _, t := range sched.Trains {
+			seenSequences := make(map[int]bool, len(t.Stops))
+			for _, stop := range t.Stops {
+				if seenSequences[stop.Seq] {
+					return SnapshotFile{}, stats, fmt.Errorf("train %s has duplicate stop sequence %d", trainID(t), stop.Seq)
+				}
+				seenSequences[stop.Seq] = true
+			}
 			if t.ServiceDate != targetDate {
 				stats.TrainsDropped++
 				continue
@@ -188,10 +195,15 @@ func SnapshotToDomain(snapshot SnapshotFile) ([]domain.TrainInstance, map[string
 			SourceVersion: strings.TrimSpace(snapshot.SourceVersion),
 		})
 		trainStops := make([]domain.TrainStop, 0, len(t.Stops))
+		seenSequences := make(map[int]bool, len(t.Stops))
 		for _, s := range t.Stops {
 			if strings.TrimSpace(s.StationName) == "" {
 				continue
 			}
+			if seenSequences[s.Seq] {
+				return nil, nil, fmt.Errorf("train %s has duplicate stop sequence %d", t.ID, s.Seq)
+			}
+			seenSequences[s.Seq] = true
 			stop := domain.TrainStop{
 				TrainInstanceID: strings.TrimSpace(t.ID),
 				StationName:     strings.TrimSpace(s.StationName),

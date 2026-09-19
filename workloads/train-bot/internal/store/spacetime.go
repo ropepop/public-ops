@@ -17,6 +17,7 @@ import (
 
 type SpacetimeStore struct {
 	client *spacetime.Syncer
+	loc    *time.Location
 
 	mu      sync.Mutex
 	pending map[string]pendingScheduleSnapshot
@@ -28,9 +29,10 @@ type pendingScheduleSnapshot struct {
 	trains        []domain.TrainInstance
 }
 
-func NewSpacetimeStore(client *spacetime.Syncer) *SpacetimeStore {
+func NewSpacetimeStore(client *spacetime.Syncer, loc *time.Location) *SpacetimeStore {
 	return &SpacetimeStore{
 		client:  client,
+		loc:     loc,
 		pending: map[string]pendingScheduleSnapshot{},
 	}
 }
@@ -107,8 +109,8 @@ func (s *SpacetimeStore) importTrainData(ctx context.Context, serviceDate string
 		countScheduleBatchStops(tripBatches),
 		len(payloadBytes),
 	)
-	if err := s.client.ServiceReplaceScheduleBatch(ctx, serviceDate, sourceVersion, stationList, tripBatches, true, true); err != nil {
-		log.Printf("spacetime schedule import failed importId=%s serviceDate=%s stage=replace-batch: %v", importID, serviceDate, err)
+	if err := s.client.ServiceReplaceSchedule(ctx, serviceDate, sourceVersion, stationList, tripBatches); err != nil {
+		log.Printf("spacetime schedule import failed importId=%s serviceDate=%s: %v", importID, serviceDate, err)
 		return err
 	}
 	log.Printf("spacetime schedule import committed importId=%s serviceDate=%s trips=%d", importID, serviceDate, len(tripBatches))
@@ -263,8 +265,6 @@ func (s *SpacetimeStore) ScheduleCounts(ctx context.Context, serviceDate string)
 		return 0, 0, 0, nil
 	}
 	// Recovery only needs to know whether the day already exists in Spacetime.
-	// Avoid the heavier schedule reconstruction path here because some live SQL
-	// backends do not support the richer trip tables consistently.
 	return 0, 1, 0, nil
 }
 
@@ -290,7 +290,7 @@ func (s *SpacetimeStore) ReplaceScheduleSnapshot(ctx context.Context, serviceDat
 		countScheduleBatchStops(tripBatches),
 		len(payloadBytes),
 	)
-	if err := s.client.ServiceReplaceScheduleBatch(ctx, serviceDate, sourceVersion, stationList, tripBatches, true, true); err != nil {
+	if err := s.client.ServiceReplaceSchedule(ctx, serviceDate, sourceVersion, stationList, tripBatches); err != nil {
 		log.Printf("spacetime schedule replace failed serviceDate=%s: %v", serviceDate, err)
 		return 0, 0, 0, err
 	}
@@ -783,30 +783,7 @@ func (s *SpacetimeStore) CountActiveCheckins(ctx context.Context, trainID string
 
 func (s *SpacetimeStore) ListActiveCheckinUsers(ctx context.Context, trainID string, now time.Time) ([]int64, error) {
 	userIDs, err := s.client.ServiceListActiveCheckinUsers(ctx, trainID, now)
-	if err == nil {
-		return parseServiceUserIDs(userIDs), nil
-	}
-	riders, err := s.client.ServiceListRiders(ctx)
-	if err != nil {
-		if isSpacetimePrivateRiderTableError(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	out := make([]int64, 0)
-	for _, rider := range riders {
-		if rider.CurrentRide == nil || strings.TrimSpace(rider.CurrentRide.TrainInstanceID) != strings.TrimSpace(trainID) {
-			continue
-		}
-		autoCheckoutAt, err := time.Parse(time.RFC3339, rider.CurrentRide.AutoCheckoutAt)
-		if err != nil || autoCheckoutAt.Before(now.UTC()) {
-			continue
-		}
-		if userID, ok := spacetime.TelegramUserIDFromStableID(rider.StableID); ok {
-			out = append(out, userID)
-		}
-	}
-	return out, nil
+	return parseServiceUserIDs(userIDs), err
 }
 
 func (s *SpacetimeStore) UpsertRouteCheckIn(ctx context.Context, userID int64, routeID string, routeName string, stationIDs []string, checkedInAt, expiresAt time.Time) error {
@@ -859,9 +836,6 @@ func (s *SpacetimeStore) ListActiveRouteCheckIns(ctx context.Context, now time.T
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
 		return out, nil
-	}
-	if isSpacetimePrivateRiderTableError(err) {
-		return nil, nil
 	}
 	return nil, err
 }
@@ -921,33 +895,7 @@ func (s *SpacetimeStore) HasActiveSubscription(ctx context.Context, userID int64
 
 func (s *SpacetimeStore) ListActiveSubscriptionUsers(ctx context.Context, trainID string, now time.Time) ([]int64, error) {
 	userIDs, err := s.client.ServiceListActiveSubscriptionUsers(ctx, trainID, now)
-	if err == nil {
-		return parseServiceUserIDs(userIDs), nil
-	}
-	riders, err := s.client.ServiceListRiders(ctx)
-	if err != nil {
-		if isSpacetimePrivateRiderTableError(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	out := make([]int64, 0)
-	for _, rider := range riders {
-		for _, subscription := range rider.Subscriptions {
-			if strings.TrimSpace(subscription.TrainInstanceID) != strings.TrimSpace(trainID) || !subscription.IsActive {
-				continue
-			}
-			expiresAt, err := time.Parse(time.RFC3339, subscription.ExpiresAt)
-			if err != nil || expiresAt.Before(now.UTC()) {
-				continue
-			}
-			if userID, ok := spacetime.TelegramUserIDFromStableID(rider.StableID); ok {
-				out = append(out, userID)
-			}
-			break
-		}
-	}
-	return out, nil
+	return parseServiceUserIDs(userIDs), err
 }
 
 func (s *SpacetimeStore) UpsertFavoriteRoute(ctx context.Context, userID int64, fromStationID string, toStationID string) error {
@@ -1009,9 +957,6 @@ func (s *SpacetimeStore) ListFavoriteRoutes(ctx context.Context, userID int64) (
 func (s *SpacetimeStore) ListAllFavoriteRoutes(ctx context.Context) ([]domain.FavoriteRoute, error) {
 	riders, err := s.client.ServiceListRiders(ctx)
 	if err != nil {
-		if isSpacetimePrivateRiderTableError(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	out := make([]domain.FavoriteRoute, 0)
@@ -1282,10 +1227,17 @@ func (s *SpacetimeStore) InsertIncidentVoteEvent(ctx context.Context, event doma
 }
 
 func (s *SpacetimeStore) SubmitIncidentVote(ctx context.Context, vote domain.IncidentVote, event domain.IncidentVoteEvent, policy VoteMutationPolicy) error {
-	err := s.client.ServiceSubmitIncidentVote(
+	activity, err := s.findIncidentActivity(ctx, vote.IncidentID, nil)
+	if err != nil {
+		return err
+	}
+	if activity == nil {
+		return fmt.Errorf("incident not found")
+	}
+	err = s.client.ServiceSubmitIncidentVote(
 		ctx,
 		event.ID,
-		vote.IncidentID,
+		activity.ID,
 		spacetime.StableIDForTelegramUser(vote.UserID),
 		firstNonEmpty(strings.TrimSpace(vote.Nickname), domain.GenericNickname(vote.UserID)),
 		string(vote.Value),
@@ -1344,10 +1296,17 @@ func (s *SpacetimeStore) InsertIncidentComment(ctx context.Context, comment doma
 }
 
 func (s *SpacetimeStore) SubmitIncidentComment(ctx context.Context, comment domain.IncidentComment, policy CommentMutationPolicy) error {
-	err := s.client.ServiceSubmitIncidentComment(
+	activity, err := s.findIncidentActivity(ctx, comment.IncidentID, nil)
+	if err != nil {
+		return err
+	}
+	if activity == nil {
+		return fmt.Errorf("incident not found")
+	}
+	err = s.client.ServiceSubmitIncidentComment(
 		ctx,
 		comment.ID,
-		comment.IncidentID,
+		activity.ID,
 		spacetime.StableIDForTelegramUser(comment.UserID),
 		firstNonEmpty(strings.TrimSpace(comment.Nickname), domain.GenericNickname(comment.UserID)),
 		comment.Body,
@@ -1566,20 +1525,7 @@ func (s *SpacetimeStore) ensureRider(ctx context.Context, userID int64) (spaceti
 }
 
 func (s *SpacetimeStore) loadRider(ctx context.Context, userID int64) (*spacetime.TrainbotRiderRow, error) {
-	rider, err := s.client.ServiceGetRider(ctx, spacetime.StableIDForTelegramUser(userID))
-	if err != nil && isSpacetimePrivateRiderTableError(err) {
-		return nil, nil
-	}
-	return rider, err
-}
-
-func isSpacetimePrivateRiderTableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "trainbot_rider") &&
-		(strings.Contains(message, "no such table") || strings.Contains(message, "marked private"))
+	return s.client.ServiceGetRider(ctx, spacetime.StableIDForTelegramUser(userID))
 }
 
 func (s *SpacetimeStore) ensureTrainActivity(ctx context.Context, trainID string, at time.Time) (*spacetime.TrainbotActivityRow, error) {
@@ -1744,6 +1690,27 @@ func (s *SpacetimeStore) findIncidentActivity(ctx context.Context, incidentID st
 	case "station":
 		return s.findStationActivity(ctx, subjectID, at)
 	case "area":
+		if strings.HasPrefix(subjectID, "pub-") {
+			activities, err := s.client.ServiceListActivities(ctx, spacetime.ListActivitiesFilter{ScopeType: "area"})
+			if err != nil {
+				return nil, err
+			}
+			for _, activity := range activities {
+				for _, event := range activity.Timeline {
+					if event.Kind != "location_report" {
+						continue
+					}
+					createdAt, err := time.Parse(time.RFC3339, event.CreatedAt)
+					if err != nil {
+						return nil, err
+					}
+					if domain.AreaIncidentID(activity.SubjectID, createdAt.In(s.loc).Format("2006-01-02")) == strings.TrimSpace(incidentID) {
+						return &activity, nil
+					}
+				}
+			}
+			return nil, nil
+		}
 		return s.findLocationActivity(ctx, "area", subjectID, at)
 	}
 	return nil, nil

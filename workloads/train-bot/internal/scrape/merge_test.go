@@ -105,6 +105,19 @@ func TestBuildSnapshotFileMergesByTrainNumberAcrossSources(t *testing.T) {
 	}
 }
 
+func TestBuildSnapshotFileRejectsConflictingStopSequences(t *testing.T) {
+	date := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
+	train := RawTrain{
+		TrainNumber: "6103", ServiceDate: "2026-09-17", FromStation: "Skulte", ToStation: "Rīga",
+		DepartureAt: date.Add(6 * time.Hour), ArrivalAt: date.Add(8 * time.Hour),
+		Stops: []RawStop{{StationName: "Skulte", Seq: 1}, {StationName: "Saulkrasti", Seq: 1}},
+	}
+	_, _, err := BuildSnapshotFile(date, []RawSchedule{{SourceName: "test", Trains: []RawTrain{train}}})
+	if err == nil || !strings.Contains(err.Error(), "duplicate stop sequence 1") {
+		t.Fatalf("conflicting itinerary must be rejected before publishing: %v", err)
+	}
+}
+
 func TestSnapshotToDomainPreservesTrainStopsByTrain(t *testing.T) {
 	snapshot := SnapshotFile{
 		SourceVersion: "snapshot-test",

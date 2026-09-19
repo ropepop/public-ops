@@ -1,0 +1,17 @@
+{
+  "id": "/",
+  "name": "Ticket",
+  "short_name": "Ticket",
+  "description": "Your live ticket, directly from your home screen.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "background_color": "#020304",
+  "theme_color": "#020304",
+  "icons": [
+    { "src": "/pwa/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

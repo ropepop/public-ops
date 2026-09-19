@@ -108,8 +108,8 @@ func main() {
 
 	var scraperJob *scrape.Orchestrator
 	timeout := time.Duration(cfg.HTTPTimeoutSec) * time.Second
-	if strings.TrimSpace(cfg.ScraperViviPageURL) == "" || strings.TrimSpace(cfg.ScraperViviGTFSURL) == "" {
-		log.Printf("vivi scraper URLs are empty; runtime scraper disabled")
+	if strings.TrimSpace(cfg.ScraperViviGTFSURL) == "" {
+		log.Printf("vivi GTFS URL is empty; runtime scraper disabled")
 	} else {
 		scraperOutputDir := strings.TrimSpace(cfg.ScraperOutputDir)
 		if scraperOutputDir == "" {
@@ -117,7 +117,6 @@ func main() {
 		}
 		providers := []scrape.Provider{
 			scrape.NewViviGTFSProvider("vivi_gtfs", cfg.ScraperViviGTFSURL, cfg.ScraperUserAgent, timeout),
-			scrape.NewViviPDFProvider("vivi_pdf", cfg.ScraperViviPageURL, cfg.ScraperUserAgent, timeout),
 		}
 		scraperJob = scrape.NewOrchestrator(providers, scraperOutputDir, cfg.ScraperMinTrains)
 	}
@@ -273,7 +272,7 @@ func openRuntime(cfg config.Config, loc *time.Location) (runtimeComponents, erro
 	if err != nil {
 		return runtimeComponents{}, err
 	}
-	stateStore := store.NewSpacetimeStore(client)
+	stateStore := store.NewSpacetimeStore(client, loc)
 	scheduleCachePath, err := prepareRuntimeCachePath(cfg.TrainRuntimeCachePath)
 	if err != nil {
 		return runtimeComponents{}, err

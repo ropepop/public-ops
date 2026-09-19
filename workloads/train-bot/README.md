@@ -8,7 +8,7 @@ For agent-specific context, test-login rules, and public verification pitfalls, 
 
 The active production runtime is Docker on kitty-gration:
 
-1. A daily importer writes validated schedule snapshots.
+1. A daily importer writes validated schedule snapshots from ViVi's official GTFS feed. PDF timetables are not merged into live journeys.
 2. The Go runtime serves the web app and Telegram bot.
 3. Persistent state and snapshots live under `/srv/arbuzas/train-bot`.
 

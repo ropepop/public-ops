@@ -9,6 +9,12 @@ import (
 
 type IncidentVoteValue string
 
+func AreaIncidentID(subjectID string, dayKey string) string {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(strings.TrimSpace(subjectID) + "|" + strings.TrimSpace(dayKey)))
+	return fmt.Sprintf("area:pub-%08x", hash.Sum32())
+}
+
 const (
 	IncidentVoteOngoing IncidentVoteValue = "ONGOING"
 	IncidentVoteCleared IncidentVoteValue = "CLEARED"

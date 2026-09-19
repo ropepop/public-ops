@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -278,6 +279,24 @@ func decodeBrowserClientLog(data []byte) (string, map[string]any, string, bool) 
 			if value, ok := inputDetail[key].(string); ok {
 				detail[key] = redactOperationalLogText(value)
 			}
+		}
+		for key, allowed := range map[string][]string{
+			"hdrStage":      {"capability", "initialize", "render", "present", "device", "unknown"},
+			"hdrReason":     {"unsupported", "initialization_failed", "initialization_timeout", "render_failed", "present_failed", "device_lost", "gpu_error", "display_timeout", "unknown"},
+			"browserFamily": {"safari", "chromium", "firefox", "other"},
+			"visibility":    {"visible", "hidden"},
+		} {
+			if value, ok := inputDetail[key].(string); ok && slices.Contains(allowed, value) {
+				detail[key] = value
+			}
+		}
+		for key, bounds := range map[string][2]float64{"hdrBoost": {2, 6}, "mediaAgeMillis": {0, 120000}} {
+			if value, ok := inputDetail[key].(float64); ok && value >= bounds[0] && value <= bounds[1] && value == float64(int64(value)) {
+				detail[key] = value
+			}
+		}
+		if value, ok := inputDetail["hdrRecovering"].(bool); ok {
+			detail["hdrRecovering"] = value
 		}
 	}
 	body, err := json.Marshal(detail)

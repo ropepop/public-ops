@@ -10,6 +10,20 @@ import (
 
 var ErrCleanupUnsupported = errors.New("cleanup unsupported")
 
+type trainDataImporter interface {
+	ImportTrainData(ctx context.Context, serviceDate string, sourceVersion string, trains []domain.TrainInstance, stopsByTrain map[string][]domain.TrainStop) error
+}
+
+func ImportTrainData(ctx context.Context, st Store, serviceDate string, sourceVersion string, trains []domain.TrainInstance, stopsByTrain map[string][]domain.TrainStop) error {
+	if importer, ok := st.(trainDataImporter); ok {
+		return importer.ImportTrainData(ctx, serviceDate, sourceVersion, trains, stopsByTrain)
+	}
+	if err := st.UpsertTrainInstances(ctx, serviceDate, sourceVersion, trains); err != nil {
+		return err
+	}
+	return st.UpsertTrainStops(ctx, serviceDate, stopsByTrain)
+}
+
 type MutationRejectionReason string
 
 const (

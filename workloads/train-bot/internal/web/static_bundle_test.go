@@ -262,6 +262,38 @@ func TestStaticBundlePublisherWritesVersionedBundleAndFeedsServer(t *testing.T) 
 	}
 }
 
+func TestStaticBundleDoesNotMaskLiveReports(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Riga")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.February, 26, 7, 15, 0, 0, loc)
+	appSvc, st := newStaticBundleTestServiceWithStore(t, now, loc)
+	bundleDir := filepath.Join(t.TempDir(), "bundles")
+	if _, err := NewStaticBundlePublisher(bundleDir, appSvc, loc, nil).PublishManifest(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	seedPublicReporters(t, st, "t1", now, 1)
+	destinationID, trainID := "jelgava", "t1"
+	if err := st.InsertStationSighting(context.Background(), storeStationSighting("live-after-bundle", "riga", &destinationID, &trainID, 77, now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	server := newStaticBundleTestServer(t, appSvc, bundleDir)
+	server.now = func() time.Time { return now }
+	for _, path := range []string{"dashboard", "service-day-trains", "trains/t1", "stations/riga/departures"} {
+		t.Run(path, func(t *testing.T) {
+			res := httptest.NewRecorder()
+			server.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/"+path, nil))
+			if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"state":"LAST_SIGHTING"`) {
+				t.Fatalf("expected live report after bundle publication, status=%d body=%s", res.Code, res.Body.String())
+			}
+			if path == "stations/riga/departures" && !strings.Contains(res.Body.String(), `"recentSightings":[{`) {
+				t.Fatalf("expected live station sighting after bundle publication, body=%s", res.Body.String())
+			}
+		})
+	}
+}
+
 func TestStaticBundlePublisherRemovesOldPublicBundleVersions(t *testing.T) {
 	t.Parallel()
 
@@ -335,7 +367,7 @@ func TestStaticBundlePublisherDoesNotMutateImmutableManifestForSameVersion(t *te
 	}
 }
 
-func TestStaticBundleServerBucketsRiderCountWhenTrainStopsFallbackUsesBundle(t *testing.T) {
+func TestStaticBundleDoesNotMaskUnavailableTrainStops(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -362,9 +394,6 @@ func TestStaticBundleServerBucketsRiderCountWhenTrainStopsFallbackUsesBundle(t *
 	if err := fallbackStore.Migrate(ctx); err != nil {
 		t.Fatalf("migrate fallback store: %v", err)
 	}
-	if err := fallbackStore.CheckInUser(ctx, 44, "t1", now.Add(-2*time.Minute), now.Add(30*time.Minute)); err != nil {
-		t.Fatalf("seed fallback active checkin: %v", err)
-	}
 	emptyScheduleDir := filepath.Join(t.TempDir(), "empty-schedules")
 	if err := os.MkdirAll(emptyScheduleDir, 0o755); err != nil {
 		t.Fatalf("create empty schedule dir: %v", err)
@@ -384,20 +413,8 @@ func TestStaticBundleServerBucketsRiderCountWhenTrainStopsFallbackUsesBundle(t *
 	req := httptest.NewRequest(http.MethodGet, "/pixel-stack/train/api/v1/public/trains/t1/stops", nil)
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
+	if res.Code != http.StatusNotFound {
 		t.Fatalf("unexpected train stops status: got %d body=%s", res.Code, res.Body.String())
-	}
-
-	var payload struct {
-		TrainCard struct {
-			Riders int `json:"riders"`
-		} `json:"trainCard"`
-	}
-	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode train stops payload: %v", err)
-	}
-	if payload.TrainCard.Riders != 0 {
-		t.Fatalf("expected single rider hidden in public train stops payload, got %d", payload.TrainCard.Riders)
 	}
 }
 

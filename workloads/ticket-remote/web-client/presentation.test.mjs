@@ -73,17 +73,24 @@ test('return retains HDR until boosted replacement settles; repeated return crea
   assert.equal(p.visiblePicture().sequence, 1);
 });
 
-test('HDR failure holds the surface and fresh underlying video never renews its authority', async t => {
+test('HDR failure silently reveals fresh SDR and stays there until the user retries', async t => {
   const f = fixture(t), p = f.presentation;
   p.setPreference(true, 4); f.receive(1); await drain();
   const original = p.elements.hdrCanvas;
   p.controller.fail('render_failed'); f.advance(3001); f.receive(2); await drain();
-  assert.equal(original.dataset.clientHdrSurface, 'visible');
-  assert.equal(p.visiblePicture(), null);
+  assert.equal(original.dataset.clientHdrSurface, 'standby');
+  assert.equal(p.visiblePicture().sequence, 2);
   assert.equal(p.rendered.sequence, 2);
   assert.equal(p.enabled, true);
+  assert.equal(p.recovering, false);
+  assert.equal(p.failure, 'render_failed');
+  assert.equal(document.body.dataset.experimentalMedia, 'fallback-sdr');
   p.recoverHDR(); await drain();
+  p.setVisible(false); p.setVisible(true); await drain();
+  assert.equal(f.renderers.length, 1, 'background return does not retry a failed HDR device');
+  p.setPreference(false, 4); p.setPreference(true, 4); await drain();
   assert.equal(p.visiblePicture().sequence, 2);
+  assert.equal(p.failure, '');
   assert.equal(p.holdover, null);
 });
 
@@ -94,7 +101,7 @@ test('device loss and disabling release surfaces without restoring late work', a
   assert.equal(p.elements.hdrCanvas.dataset.clientHdrSurface, 'standby');
   const wait = deferred();
   t.mock.method(ClientHDRRenderer.prototype, 'render', () => wait.promise);
-  p.recoverHDR(); await drain();
+  p.setPreference(false, 4); p.setPreference(true, 4); await drain();
   p.setPreference(false, 4);
   wait.resolve(); await drain();
   assert.equal(p.controller, null);
@@ -145,24 +152,72 @@ test('presentResult retains and releases exactly its accepted frame', async t =>
   assert.equal(f.frames.has(captured), false);
 });
 
-test('repeated failed replacements keep only one holdover and disposal releases both owners', async t => {
+test('failed background replacement releases both HDR owners and shows SDR', async t => {
   const f = fixture(t), p = f.presentation;
   p.setPreference(true, 4); f.receive(1); await drain();
   const original = p.elements.hdrCanvas, renderer = p.controller.renderer;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    p.controller.fail('test_failure');
-    const previous = p.controller.renderer;
-    const wait = deferred();
-    t.mock.method(ClientHDRRenderer.prototype, 'render', () => wait.promise);
-    p.recoverHDR(); await drain();
-    assert.equal(p.holdover.canvas, original);
-    assert.equal(f.canvases.size, 3); // ordinary + held + replacement
-    if (previous !== renderer) assert.equal(previous.disposed, true);
-    p.controller.fail('test_failure'); wait.resolve(); await drain();
-  }
-  p.setPreference(false, 4);
+  const wait = deferred();
+  t.mock.method(ClientHDRRenderer.prototype, 'render', () => wait.promise);
+  p.setVisible(false); p.setVisible(true); await drain();
+  assert.equal(p.holdover.canvas, original);
+  assert.equal(f.canvases.size, 3);
+  const replacement = p.controller.renderer;
+  p.controller.fail('test_failure'); wait.resolve(); await drain();
+  assert.equal(p.holdover, null);
+  assert.equal(p.controller, null);
   assert.equal(renderer.disposed, true);
+  assert.equal(replacement.disposed, true);
+  assert.equal(p.visiblePicture().sequence, 1);
+  assert.equal(p.recovering, false);
   assert.equal(f.canvases.size, 2);
+});
+
+test('unsupported HDR uses ordinary pictures without a retry spinner', async t => {
+  const f = fixture(t), p = f.presentation;
+  navigator.gpu = null;
+  p.setPreference(true, 4); f.receive(1); await drain();
+  assert.equal(p.visiblePicture().sequence, 1);
+  assert.equal(p.recovering, false);
+  assert.equal(p.failure, 'hdr_unsupported');
+  assert.deepEqual(f.failures, ['hdr_unsupported']);
+  p.recoverHDR(); p.size(20, 40); f.receive(2); await drain();
+  assert.equal(f.renderers.length, 0);
+  assert.equal(p.visiblePicture().sequence, 2);
+});
+
+test('failure shows the exact SDR code and never substitutes a newer live picture', async t => {
+  const f = fixture(t), p = f.presentation;
+  p.setPreference(true, 4); f.receive(1); await drain();
+  const request = { requestId: 'test', status: 'succeeded', captureRequired: true,
+    resultFrameEpoch: '1', resultMinFrameSequence: '1', resultMarkerRevision: '1:1' };
+  assert.equal(await p.presentResult(request, () => true), true);
+  f.receive(2);
+  p.controller.fail('device_lost'); await drain();
+  assert.equal(p.elements.resultArea.dataset.presentation, 'sdr');
+  assert.equal(p.elements.resultImage.hidden, false);
+  assert.equal(p.frozen.metadata.sequence, 1);
+  assert.equal(p.recovering, false);
+});
+
+test('failure during final code paint reveals its prepared SDR image before acknowledgement', async t => {
+  const f = fixture(t), p = f.presentation;
+  p.setPreference(true, 4); f.receive(1); await drain();
+  let failed = false;
+  t.mock.method(globalThis, 'requestAnimationFrame', callback => {
+    if (!failed && p.frozen?.presenting && p.elements.resultArea.dataset.presentation === 'exact-hdr') {
+      failed = true;
+      p.controller.fail('device_lost');
+    }
+    return setImmediate(callback);
+  });
+  const request = { requestId: 'test', status: 'succeeded', captureRequired: true,
+    resultFrameEpoch: '1', resultMinFrameSequence: '1', resultMarkerRevision: '1:1' };
+  assert.equal(await p.presentResult(request, () => true), true);
+  assert.equal(failed, true);
+  p.size(20, 40);
+  assert.equal(p.elements.resultArea.dataset.presentation, 'sdr');
+  assert.equal(p.elements.resultImage.hidden, false);
+  assert.equal(p.frozen.metadata.sequence, 1);
 });
 
 test('changing boost reprocesses the same retained result without restarting', async t => {

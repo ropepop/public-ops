@@ -78,11 +78,12 @@ func TestStaticFilesRequireCurrentMembership(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Denial checks must go beyond the generic HTML opening shared by error pages.
 		if want == http.StatusOK && method == http.MethodGet {
 			if !bytes.Equal(response.Body.Bytes(), body) {
 				t.Fatal("approved member did not receive the exact asset")
 			}
-		} else if bytes.Contains(response.Body.Bytes(), body[:min(32, len(body))]) {
+		} else if bytes.Contains(response.Body.Bytes(), body[:min(256, len(body))]) {
 			t.Fatal("denied request disclosed asset bytes")
 		}
 	}

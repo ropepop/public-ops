@@ -117,6 +117,27 @@ func TestRoutedStoreMirrorsScheduleImportsIntoStateStore(t *testing.T) {
 	}
 }
 
+func TestRoutedImportKeepsLocalCacheUnchangedUntilDurableCommit(t *testing.T) {
+	ctx := context.Background()
+	cache := &recordingStore{}
+	commitErr := errors.New("durable import failed")
+	state := &recordingStore{upsertTrainStopsErr: commitErr}
+	routed := NewRoutedStore(cache, state)
+	if err := routed.ImportTrainData(ctx, "2026-09-17", "vivi_gtfs", nil, nil); !errors.Is(err, commitErr) {
+		t.Fatalf("expected durable commit failure: %v", err)
+	}
+	if len(cache.upsertTrainInstancesCalls) != 0 || len(cache.upsertTrainStopsCalls) != 0 {
+		t.Fatal("failed durable import must not make the local schedule appear fresh")
+	}
+	state.upsertTrainStopsErr = nil
+	if err := routed.ImportTrainData(ctx, "2026-09-17", "vivi_gtfs", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(cache.upsertTrainInstancesCalls) != 1 || len(cache.upsertTrainStopsCalls) != 1 {
+		t.Fatal("successful durable retry must update the local schedule")
+	}
+}
+
 func TestRoutedStoreDeleteTrainDataByServiceDateMirrorsStateCleanup(t *testing.T) {
 	t.Parallel()
 

@@ -21,7 +21,6 @@ func main() {
 	outDirFlag := flag.String("out-dir", envOr("SCRAPER_OUTPUT_DIR", "./data/schedules"), "optional output directory for debug snapshot files")
 	minTrainsFlag := flag.Int("min-trains", envOrInt("SCRAPER_MIN_TRAINS", 1), "minimum merged trains required for success")
 	timeoutFlag := flag.Int("timeout-sec", 20, "HTTP timeout seconds per provider")
-	viviPageURLFlag := flag.String("vivi-page-url", envOr("SCRAPER_VIVI_PAGE_URL", "https://www.vivi.lv/lv/informacija-pasazieriem/"), "Vivi passenger info page URL")
 	viviGTFSURLFlag := flag.String("vivi-gtfs-url", envOr("SCRAPER_VIVI_GTFS_URL", "https://www.vivi.lv/uploads/GTFS.zip"), "Vivi GTFS zip URL")
 	flag.Parse()
 
@@ -34,11 +33,7 @@ func main() {
 		log.Fatalf("invalid date: %v", err)
 	}
 
-	viviPageURL := strings.TrimSpace(*viviPageURLFlag)
 	viviGTFSURL := strings.TrimSpace(*viviGTFSURLFlag)
-	if viviPageURL == "" {
-		log.Fatalf("SCRAPER_VIVI_PAGE_URL is required")
-	}
 	if viviGTFSURL == "" {
 		log.Fatalf("SCRAPER_VIVI_GTFS_URL is required")
 	}
@@ -47,7 +42,6 @@ func main() {
 
 	providers := []scrape.Provider{
 		scrape.NewViviGTFSProvider("vivi_gtfs", viviGTFSURL, ua, timeout),
-		scrape.NewViviPDFProvider("vivi_pdf", viviPageURL, ua, timeout),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

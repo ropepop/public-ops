@@ -30,9 +30,11 @@ spacetime-install:
 	cd ./spacetimedb && npm install
 
 spacetime-build:
+	cd ./spacetimedb && npm run check
 	$(SPACETIME) build
 
 spacetime-publish-local:
+	cd ./spacetimedb && npm run check
 	$(SPACETIME) publish --server $(SPACETIME_SERVER) --yes --env $(SPACETIME_ENV)
 
 web-client-install:

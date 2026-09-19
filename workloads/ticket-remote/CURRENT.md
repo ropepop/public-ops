@@ -2,6 +2,131 @@
 
 This is the first file to read for Ticket work.
 
+## September 19 steady HDR and local ViVi slider
+
+v206 keeps the WebGPU canvas configured while completed pictures replace its
+contents. Ordinary updates reuse the same visible HDR surface. Background-return
+replacement still retains the previous picture until the replacement is ready.
+An unsupported or failed HDR renderer now reveals the latest ordinary picture
+without an error overlay or retry spinner; the saved HDR preference remains on
+and the explanation appears beneath that setting. It stays in SDR until an
+explicit preference change or a new page opening, avoiding repeated failed
+activation. A frozen control-code result uses its already-prepared exact SDR
+image on failure.
+
+The browser renders the ViVi orange slider, label and arrow locally in the
+existing phone-proved rectangle. Swipes may start anywhere, follow the pointer,
+and finish outside the track. The existing eight-pixel directional threshold,
+scroll/cancel protections, keyboard activation and separate action buttons remain.
+The three-second wave and reduced-motion preference remain in both display modes.
+
+HDR failures now use the existing authenticated browser event route to the shared
+operational log. Fixed failure stage, category, browser family, brightness and
+picture-age fields are bounded and sanitized; unsent events wait in a bounded
+in-memory queue. Ticket retention remains six hours. No phone or database schema
+change is required. Physical iPhone contrast and blinking acceptance require
+target-device observation after deployment.
+
+Deployed `ticket-steady-hdr-slider-20260919-v206` from `71351bab` on September 19
+at 13:35 UTC. Standard release validation, the full test suite, the final 120-check
+browser interruption/gesture journey, and real-GPU presentation checks passed.
+The signed-in production viewer kept one HDR canvas across seven fresh pictures
+with zero reconfigurations. A one-shot presentation failure in the verification
+tab switched quietly to fresh SDR, showed only the settings error, and did not
+retry during subsequent frames; toggling HDR off/on restored it. Its sanitized
+production log event at 13:36:37 UTC expires at 19:36:37 UTC (`ticket_6h`).
+
+A native browser drag starting in the middle of the live slider registered the
+ticket once. The visible success matched the durable `activation_proven` result
+(13:39:00.814–13:39:05.128 UTC). A real background-tab return restored the live HDR
+view with the saved 4× preference and no settings error. Verification tabs were
+closed; the relay returned to zero viewers/idle and there were no pending ticket
+actions. These checks prove the desktop browser and phone outcome; physical
+iPhone brightness, flicker and finger-gesture acceptance remain unobserved.
+
+## September 19 mobile error pages
+
+v205 gives the shared error page a mobile viewport, system font, matching heading
+and message sizes, safe-area padding and long-text wrapping. Zoom remains enabled.
+The styles use the existing nonce-based security policy and need no authenticated
+assets. The server version advances so active viewers pick up this release.
+
+Deployed as `ticket-mobile-errors-20260919-v205` from `0d9aa86e`. All test
+components and both builds passed; the static-access test now compares beyond
+the generic HTML opening shared with error pages. A real loopback browser rendered
+the actual error response at 320, 390 and 1440 px, with matching 16 px text and no
+overflow at 200% text size. Standard deployment validation and the public version
+and shared error-response checks passed. Physical-phone and signed-in visual
+verification remain unobserved.
+
+## September 19 ticket assignment message
+
+v204 bumps the server version so connected viewers reload through the existing
+version check. The access-denied message now explains that no ticket has been
+assigned to the account and asks the user to contact the owner or an administrator.
+The existing membership checks and HTTP 403 response remain unchanged.
+
+Deployed as `ticket-assignment-20260919-v204` from `2eb7db03`. Full tests,
+both required builds, standard deployment validation and the public live-version
+check passed. The deployed source contains the new message in all three denial
+paths. Signed-in visual and automatic-refresh observation remain unverified:
+the browser runtime is not initialized, the installed plugin has no skill file,
+and Chrome is not running; extension and native-host diagnostics passed.
+
+## September 18 idle-refresh recovery
+
+Pixel v390 (`e6b8fd1`) gives post-restart ticket restoration the same bounded
+visual convergence and capture recovery as ordinary navigation. A failed refresh
+using the earlier five-second-only check left ViVi on Home; later
+refreshes could no longer identify a ticket. Non-activating re-detection restored
+the detail, and subsequent ordinary registrations succeeded. No physical attempt
+is replayed by the change. Both 508-test app variants, standard Pixel deployment,
+and production service validation passed. The corrected local monitor passes
+49 tests and reports healthy warmth. A post-change automatic refresh and independent
+signed-in browser paint remain unverified; browser inspection was URL-policy blocked.
+See the [incident and prevention report](../../ops/reports/2026-09/2026-09-18-ticket-idle-refresh-recovery.md).
+
+## September 18 localized installation screenshots
+
+v203 makes the invitation and guide Latvian by default, with an English/Latviski
+button that preserves the selected platform and translates live prompt status.
+The schematic controls are replaced by viewport crops of real Apple/WebKit,
+Google, Mozilla and MacRumors screenshots, with visible source links and an
+example-label explanation. Source URLs are recorded in
+`web-client/install-guide-sources.md`. Screenshots stay member-only static assets.
+The invitation remains hidden when already running as a home-screen app.
+
+The guide browser test passes 43 checks at each of 320, 390 and 1440 px,
+including image decoding, language switching, focus and native-prompt lifecycle.
+Deployed as `ticket-home-screen-20260918-v203` from `62c9eee5`. Full tests,
+both required builds, standard deployment validation and the public live version
+check passed. Physical-device and signed-in visual acceptance remain unverified;
+the interactive browser connection had no available Ticket tab.
+
+## September 18 home-screen installation
+
+v202 adds one English "Add Ticket to Home Screen" button beneath the viewers
+list. The Arrow guide always asks for iPhone/iPad Safari, Android Chrome, or
+Android Firefox first. Chrome uses a single-use browser installation prompt
+when available; all three paths include illustrated manual steps. The invitation
+is hidden in app display mode. The app name is Ticket, with a dark ticket icon,
+root launch URL and fullscreen display with browser-controlled fallback.
+
+Only `/manifest.webmanifest` and four explicitly named `/pwa/` icon files are
+public. Existing `/static/` membership gates remain intact. No service worker,
+offline ticket cache, database change or phone update is involved. Guide source
+is `web-client/install-guide.mjs`; its browser test covers the journeys and
+prompt lifecycle. Physical iOS/Android installation and launch require separate
+device acceptance; simulated prompts are not installation proof.
+
+Deployed as `ticket-home-screen-20260918-v202b` from `a6583c95`. Ticket tests,
+both required builds, 31 guide checks at each of 320/390/1440 px, standard
+production validation and public manifest/icon byte comparisons passed. The
+initial release rolled back because an old guard rejected any `showModal` use;
+the guard now checks only retired claim-specific markers. Signed-in visual and
+physical mobile-install acceptance remain unverified after task-created browser
+tabs crashed. See the [release report](../../ops/reports/2026-09/2026-09-18-ticket-home-screen.md).
+
 ## September 16 HDR reset in the normal viewer
 
 The owner authorized production adoption of the v200 diagnostic candidate.

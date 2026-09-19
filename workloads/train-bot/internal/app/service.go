@@ -146,6 +146,14 @@ func (s *Service) StationCheckinEnabled() bool {
 	return s.stationCheckinEnabled
 }
 
+func (s *Service) ReadSpacetimeView(ctx context.Context, userID int64, procedure string, args []any) (map[string]any, bool, error) {
+	payload, available, err := store.ReadSpacetimeView(ctx, s.store, userID, procedure, args)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
+		err = ErrNotFound
+	}
+	return payload, available, err
+}
+
 func (s *Service) ScheduleAvailability() (bool, error) {
 	if s == nil || s.schedules == nil {
 		return false, schedule.ErrUnavailable

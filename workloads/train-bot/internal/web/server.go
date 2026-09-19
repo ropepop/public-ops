@@ -1045,11 +1045,7 @@ func (s *Server) handlePublicDashboard(w http.ResponseWriter, r *http.Request, n
 	if handled {
 		return
 	}
-	if payload, ok, err := s.bundlePublicDashboard(now, limit); err != nil {
-		s.writeAppError(w, err)
-		return
-	} else if ok {
-		s.writePublicJSON(w, http.StatusOK, payload, decision)
+	if s.serveSpacetimeView(w, r, 0, "get_public_dashboard", []any{limit}, decision) {
 		return
 	}
 	payload, err := s.app.PublicDashboardPayload(r.Context(), now, limit)
@@ -1068,11 +1064,7 @@ func (s *Server) handlePublicServiceDayTrains(w http.ResponseWriter, r *http.Req
 	if handled {
 		return
 	}
-	if payload, ok, err := s.bundlePublicServiceDayTrains(now); err != nil {
-		s.writeAppError(w, err)
-		return
-	} else if ok {
-		s.writePublicJSON(w, http.StatusOK, payload, decision)
+	if s.serveSpacetimeView(w, r, 0, "get_public_service_day_trains", []any{}, decision) {
 		return
 	}
 	payload, err := s.app.PublicServiceDayPayload(r.Context(), now)
@@ -1089,6 +1081,9 @@ func (s *Server) handlePublicMap(w http.ResponseWriter, r *http.Request, now tim
 	}
 	decision, handled := s.beginPublicEdgeCache(w, r, now, publicEdgeCacheNetworkMapRoute())
 	if handled {
+		return
+	}
+	if s.serveSpacetimeView(w, r, 0, "get_public_network_map", []any{}, decision) {
 		return
 	}
 	if payload, ok, err := s.bundlePublicNetworkMap(r.Context(), now); err != nil {
@@ -1140,11 +1135,7 @@ func (s *Server) handlePublicStationDepartures(w http.ResponseWriter, r *http.Re
 	if handled {
 		return
 	}
-	if payload, ok, err := s.bundlePublicStationDepartures(now, stationID); err != nil {
-		s.writeAppError(w, err)
-		return
-	} else if ok {
-		s.writePublicJSON(w, http.StatusOK, payload, decision)
+	if s.serveSpacetimeView(w, r, 0, "get_public_station_departures", []any{stationID}, decision) {
 		return
 	}
 	item, err := s.app.PublicStationDepartures(r.Context(), now, stationID, 8)
@@ -1163,11 +1154,7 @@ func (s *Server) handlePublicTrain(w http.ResponseWriter, r *http.Request, train
 	if handled {
 		return
 	}
-	if payload, ok, err := s.bundlePublicTrain(now, trainID); err != nil {
-		s.writeAppError(w, err)
-		return
-	} else if ok {
-		s.writePublicJSON(w, http.StatusOK, payload, decision)
+	if s.serveSpacetimeView(w, r, 0, "get_public_train", []any{trainID}, decision) {
 		return
 	}
 	item, err := s.app.PublicTrain(r.Context(), trainID, now)
@@ -1186,20 +1173,15 @@ func (s *Server) handlePublicTrainStops(w http.ResponseWriter, r *http.Request, 
 	if handled {
 		return
 	}
+	if s.serveSpacetimeView(w, r, 0, "get_public_train_stops", []any{trainID}, decision) {
+		return
+	}
 	item, err := s.app.TrainStops(r.Context(), 0, now, trainID)
-	if err == nil {
-		s.writePublicJSON(w, http.StatusOK, s.withSchedulePayload(item, now), decision)
+	if err != nil {
+		s.writeAppError(w, err)
 		return
 	}
-	if payload, ok, bundleErr := s.bundlePublicTrainStops(now, trainID); bundleErr != nil {
-		s.writeAppError(w, bundleErr)
-		return
-	} else if ok {
-		s.applyBundleTrainCardRiderCount(r.Context(), payload, trainID, now)
-		s.writePublicJSON(w, http.StatusOK, payload, decision)
-		return
-	}
-	s.writeAppError(w, err)
+	s.writePublicJSON(w, http.StatusOK, s.withSchedulePayload(item, now), decision)
 }
 
 func (s *Server) handlePublicRouteCheckInRoutes(w http.ResponseWriter, r *http.Request, now time.Time) {
@@ -1751,6 +1733,9 @@ func (s *Server) handleWindowTrains(w http.ResponseWriter, r *http.Request, clai
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.serveSpacetimeView(w, r, claims.UserID, "list_window_trains", []any{strings.TrimSpace(windowID)}, nil) {
+		return
+	}
 	items, err := s.app.WindowTrains(r.Context(), claims.UserID, now, strings.TrimSpace(windowID))
 	if err != nil {
 		s.writeAppError(w, err)
@@ -1811,6 +1796,9 @@ func (s *Server) handleStationDepartures(w http.ResponseWriter, r *http.Request,
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.serveSpacetimeView(w, r, claims.UserID, "get_station_departures", []any{stationID}, nil) {
+		return
+	}
 	items, err := s.app.StationDepartures(r.Context(), claims.UserID, now, stationID, 2*time.Hour, 2*time.Hour)
 	if err != nil {
 		s.writeAppError(w, err)
@@ -1853,8 +1841,7 @@ func (s *Server) handleStationSighting(w http.ResponseWriter, r *http.Request, c
 	}
 	if result.Accepted && result.Event != nil && s.notifier != nil {
 		if err := s.notifier.NotifyStationSighting(r.Context(), *result.Event, now); err != nil {
-			s.writeAppError(w, err)
-			return
+			log.Printf("notify station sighting failed after report accepted: %v", err)
 		}
 	}
 	s.writeJSON(w, http.StatusOK, result)
@@ -1983,6 +1970,9 @@ func (s *Server) handleTrainStops(w http.ResponseWriter, r *http.Request, claims
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if s.serveSpacetimeView(w, r, claims.UserID, "get_train_stops", []any{trainID}, nil) {
+		return
+	}
 	item, err := s.app.TrainStops(r.Context(), claims.UserID, now, trainID)
 	if err != nil {
 		s.writeAppError(w, err)
@@ -2033,8 +2023,7 @@ func (s *Server) handleTrainReport(w http.ResponseWriter, r *http.Request, claim
 	}
 	if result.Accepted && s.notifier != nil {
 		if err := s.notifier.NotifyRideUsers(r.Context(), claims.UserID, trainID, signal, now); err != nil {
-			s.writeAppError(w, err)
-			return
+			log.Printf("notify ride users failed after report accepted: %v", err)
 		}
 	}
 	s.writeJSON(w, http.StatusOK, result)
@@ -2174,6 +2163,21 @@ func (s *Server) requireJSONContentType(w http.ResponseWriter, r *http.Request) 
 	}
 	s.writeError(w, http.StatusUnsupportedMediaType, "unsupported media type")
 	return false
+}
+
+func (s *Server) serveSpacetimeView(w http.ResponseWriter, r *http.Request, userID int64, procedure string, args []any, cache *publicEdgeCacheDecision) bool {
+	payload, available, err := s.app.ReadSpacetimeView(r.Context(), userID, procedure, args)
+	if !available {
+		return false
+	}
+	if err != nil {
+		s.writeAppError(w, err)
+	} else if userID > 0 {
+		s.writeJSON(w, http.StatusOK, payload)
+	} else {
+		s.writePublicJSON(w, http.StatusOK, payload, cache)
+	}
+	return true
 }
 
 func (s *Server) writeAppError(w http.ResponseWriter, err error) {
@@ -2368,6 +2372,7 @@ func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 
 func (s *Server) setShellSecurityHeaders(w http.ResponseWriter, scriptNonce string, allowTelegramScript bool) {
 	s.setSecurityHeaders(w)
+	w.Header().Set("Referrer-Policy", "strict-origin")
 	if allowTelegramScript {
 		w.Header().Del("X-Frame-Options")
 	}
@@ -2400,7 +2405,7 @@ func (s *Server) contentSecurityPolicy(scriptNonce string, allowTelegramScript b
 		"form-action 'self'",
 		"script-src " + strings.Join(scriptSources, " "),
 		"style-src 'self'",
-		"img-src 'self' data: https://*.tile.openstreetmap.org",
+		"img-src 'self' data: https://tile.openstreetmap.org",
 		"connect-src " + strings.Join(connectSources, " "),
 		"frame-src " + strings.Join(frameSources, " "),
 	}, "; ")
@@ -2489,22 +2494,6 @@ func (s *Server) bundleData() (*staticBundleData, bool, error) {
 	return data, true, nil
 }
 
-func (s *Server) bundlePublicDashboard(now time.Time, limit int) (map[string]any, bool, error) {
-	data, ok, err := s.bundleData()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	return data.publicDashboard(now, limit), true, nil
-}
-
-func (s *Server) bundlePublicServiceDayTrains(now time.Time) (map[string]any, bool, error) {
-	data, ok, err := s.bundleData()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	return data.publicServiceDayTrains(now), true, nil
-}
-
 func (s *Server) bundlePublicNetworkMap(ctx context.Context, now time.Time) (map[string]any, bool, error) {
 	data, ok, err := s.bundleData()
 	if err != nil || !ok {
@@ -2544,42 +2533,6 @@ func (s *Server) bundlePublicStations(now time.Time, query string) (map[string]a
 	return data.searchStations(now, query), true, nil
 }
 
-func (s *Server) bundlePublicStationDepartures(now time.Time, stationID string) (map[string]any, bool, error) {
-	data, ok, err := s.bundleData()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	payload := data.publicStationDepartures(now, stationID, 8)
-	if payload == nil {
-		return nil, false, nil
-	}
-	return payload, true, nil
-}
-
-func (s *Server) bundlePublicTrain(now time.Time, trainID string) (map[string]any, bool, error) {
-	data, ok, err := s.bundleData()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	payload := data.publicTrain(now, trainID)
-	if payload == nil {
-		return nil, false, nil
-	}
-	return payload, true, nil
-}
-
-func (s *Server) bundlePublicTrainStops(now time.Time, trainID string) (map[string]any, bool, error) {
-	data, ok, err := s.bundleData()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	payload := data.trainStops(now, trainID)
-	if payload == nil {
-		return nil, false, nil
-	}
-	return payload, true, nil
-}
-
 func (s *Server) appScheduleAvailability() (bool, error) {
 	return s.app.ScheduleAvailability()
 }
@@ -2611,25 +2564,6 @@ func (s *Server) withSchedulePayload(item any, now time.Time) map[string]any {
 	}
 	payload["schedule"] = s.appScheduleContext(now)
 	return payload
-}
-
-func (s *Server) applyBundleTrainCardRiderCount(ctx context.Context, payload map[string]any, trainID string, now time.Time) {
-	if s == nil || s.app == nil || payload == nil {
-		return
-	}
-	users, err := s.app.ListActiveCheckinUsers(ctx, strings.TrimSpace(trainID), now)
-	if err != nil {
-		return
-	}
-	switch card := payload["trainCard"].(type) {
-	case map[string]any:
-		if card != nil {
-			card["riders"] = trainapp.PublicRiderCount(len(users))
-		}
-	case trainapp.TrainCard:
-		card.Riders = trainapp.PublicRiderCount(len(users))
-		payload["trainCard"] = card
-	}
 }
 
 func (s *Server) healthPayload(now time.Time, liveness bool) map[string]any {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -138,6 +139,48 @@ func TestServeHTTPStationSightingSubmissionAcceptsDirectSignedInReports(t *testi
 	}
 	if !payload.Accepted {
 		t.Fatalf("expected accepted station sighting payload, got %+v", payload)
+	}
+}
+
+type failedReportNotifier struct{ calls int }
+
+func (n *failedReportNotifier) NotifyRideUsers(context.Context, int64, string, domain.SignalType, time.Time) error {
+	n.calls++
+	return errors.New("notification lookup unavailable")
+}
+
+func (n *failedReportNotifier) NotifyStationSighting(context.Context, domain.StationSighting, time.Time) error {
+	n.calls++
+	return errors.New("notification lookup unavailable")
+}
+
+func TestServeHTTPAcceptedReportsSurviveNotificationFailure(t *testing.T) {
+	for _, route := range []string{"trains/train-next-0/reports", "stations/riga/sightings"} {
+		t.Run(route, func(t *testing.T) {
+			server, _, now := newPublicDataServerWithStore(t, "https://example.test/pixel-stack/train")
+			notifier := &failedReportNotifier{}
+			server.SetNotifier(notifier)
+			req := httptest.NewRequest(http.MethodPost, "/pixel-stack/train/api/v1/"+route, strings.NewReader(`{"signal":"INSPECTION_STARTED","trainId":"train-next-0"}`))
+			req.AddCookie(testSessionCookie(t, server, 77, "en", now))
+			res := httptest.NewRecorder()
+			server.ServeHTTP(res, req)
+			if res.Code != http.StatusOK {
+				t.Fatalf("saved report returned %d: %s", res.Code, res.Body.String())
+			}
+			var payload struct {
+				Accepted   bool   `json:"accepted"`
+				IncidentID string `json:"incidentId"`
+			}
+			if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if !payload.Accepted || notifier.calls != 1 {
+				t.Fatalf("accepted=%t notification attempts=%d", payload.Accepted, notifier.calls)
+			}
+			if _, err := server.app.IncidentDetail(context.Background(), payload.IncidentID, now, 77); err != nil {
+				t.Fatalf("accepted report is not readable: %v", err)
+			}
+		})
 	}
 }
 

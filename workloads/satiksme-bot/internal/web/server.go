@@ -1999,6 +1999,10 @@ func (s *Server) handleIncidentComment(w http.ResponseWriter, r *http.Request, c
 	}
 	comment, err := s.reports.AddIncidentComment(r.Context(), catalog, incidentID, claims.UserID, payload.Body, now)
 	if err != nil {
+		if errors.Is(err, reports.ErrCommentRequired) || errors.Is(err, reports.ErrCommentTooLong) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		var rateErr *reports.RateLimitError
 		if errors.As(err, &rateErr) {
 			writeError(w, http.StatusTooManyRequests, rateErr.Error())

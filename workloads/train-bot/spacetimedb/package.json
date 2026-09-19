@@ -4,8 +4,9 @@
   "private": true,
   "description": "SpacetimeDB module for train-bot",
   "scripts": {
-    "build": "spacetime build",
-    "publish": "spacetime publish"
+    "check": "tsc --noEmit",
+    "build": "npm run check && spacetime build",
+    "publish": "npm run check && spacetime publish"
   },
   "license": "UNLICENSED",
   "dependencies": {

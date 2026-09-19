@@ -344,17 +344,6 @@ type TrainbotServiceDayRow struct {
 	Stations      []TrainbotStation `json:"stations"`
 }
 
-type trainbotTripStopRow struct {
-	TrainID     string   `json:"trainId"`
-	StationID   string   `json:"stationId"`
-	StationName string   `json:"stationName"`
-	Seq         int      `json:"seq"`
-	ArrivalAt   string   `json:"arrivalAt,omitempty"`
-	DepartureAt string   `json:"departureAt,omitempty"`
-	Latitude    *float64 `json:"latitude,omitempty"`
-	Longitude   *float64 `json:"longitude,omitempty"`
-}
-
 type TrainbotSettings struct {
 	AlertsEnabled bool   `json:"alertsEnabled"`
 	AlertStyle    string `json:"alertStyle"`
@@ -497,19 +486,6 @@ type TrainbotActivityRow struct {
 	Votes          []TrainbotActivityVote    `json:"votes"`
 }
 
-type SQLStatementStats struct {
-	RowsInserted int64 `json:"rows_inserted"`
-	RowsDeleted  int64 `json:"rows_deleted"`
-	RowsUpdated  int64 `json:"rows_updated"`
-}
-
-type SQLStatementResult struct {
-	Schema              map[string]any    `json:"schema"`
-	Rows                [][]any           `json:"rows"`
-	TotalDurationMicros int64             `json:"total_duration_micros"`
-	Stats               SQLStatementStats `json:"stats"`
-}
-
 type SyncConfig struct {
 	Host              string
 	Database          string
@@ -637,78 +613,6 @@ func NewSyncer(cfg SyncConfig) (*Syncer, error) {
 	}, nil
 }
 
-func (s *Syncer) SyncScheduleSnapshot(ctx context.Context, snapshot ScheduleSnapshot) error {
-	return s.SyncScheduleSnapshotWithImportID(ctx, "schedule-"+randomTokenID(), snapshot)
-}
-
-func (s *Syncer) SyncScheduleSnapshotWithImportID(ctx context.Context, importID string, snapshot ScheduleSnapshot) error {
-	importID = strings.TrimSpace(importID)
-	if importID == "" {
-		importID = "schedule-" + randomTokenID()
-	}
-
-	byServiceDate := map[string]ScheduleSnapshot{}
-	stationByID := map[string]ScheduleStation{}
-	trainServiceDates := map[string]string{}
-	for _, station := range snapshot.Stations {
-		if id := strings.TrimSpace(station.ID); id != "" {
-			stationByID[id] = station
-		}
-	}
-	for _, train := range snapshot.Trains {
-		serviceDate := strings.TrimSpace(train.ServiceDate)
-		trainID := strings.TrimSpace(train.ID)
-		if serviceDate == "" || trainID == "" {
-			continue
-		}
-		group := byServiceDate[serviceDate]
-		group.Trains = append(group.Trains, train)
-		byServiceDate[serviceDate] = group
-		trainServiceDates[trainID] = serviceDate
-	}
-	for _, stop := range snapshot.Stops {
-		trainID := strings.TrimSpace(stop.TrainInstanceID)
-		serviceDate := trainServiceDates[trainID]
-		if serviceDate == "" || trainID == "" {
-			continue
-		}
-		group := byServiceDate[serviceDate]
-		group.Stops = append(group.Stops, stop)
-		byServiceDate[serviceDate] = group
-		stationID := strings.TrimSpace(stop.StationID)
-		if stationID == "" {
-			continue
-		}
-		if _, ok := stationByID[stationID]; ok {
-			continue
-		}
-		stationByID[stationID] = ScheduleStation{
-			ID:            stationID,
-			Name:          strings.TrimSpace(stop.StationName),
-			NormalizedKey: normalizeStationKey(stop.StationName),
-			Latitude:      stop.Latitude,
-			Longitude:     stop.Longitude,
-		}
-	}
-
-	for serviceDate, group := range byServiceDate {
-		stationSet := map[string]struct{}{}
-		for _, stop := range group.Stops {
-			if stationID := strings.TrimSpace(stop.StationID); stationID != "" {
-				stationSet[stationID] = struct{}{}
-			}
-		}
-		group.Stations = make([]ScheduleStation, 0, len(stationSet))
-		for stationID := range stationSet {
-			group.Stations = append(group.Stations, stationByID[stationID])
-		}
-		if err := s.syncSingleServiceDate(ctx, importID+"-"+serviceDate, serviceDate, group); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *Syncer) SyncUserSnapshot(ctx context.Context, snapshot UserSnapshot, schedule ScheduleSnapshot) error {
 	riders, activities := transformUserSnapshot(snapshot, schedule)
 	for _, batch := range batchTrainbotRiders(riders, 100) {
@@ -738,150 +642,32 @@ func (s *Syncer) CleanupExpiredState(ctx context.Context, now time.Time, retenti
 }
 
 func (s *Syncer) ServiceSchedulePresent(ctx context.Context, serviceDate string) (bool, error) {
-	cleanDate := strings.TrimSpace(serviceDate)
-	results, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT serviceDate FROM trainbot_service_day WHERE serviceDate = %s LIMIT 1",
-		sqlQuote(cleanDate),
-	))
+	payload, err := s.CallProcedure(ctx, "service_get_schedule", []any{strings.TrimSpace(serviceDate)})
 	if err != nil {
 		return false, err
 	}
-	rows, err := sqlRows(results)
-	if err != nil {
+	var raw struct {
+		ServiceDay *TrainbotServiceDayRow `json:"serviceDay"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return false, err
 	}
-	return len(rows) > 0, nil
+	return raw.ServiceDay != nil, nil
 }
 
 func (s *Syncer) ServiceGetSchedule(ctx context.Context, serviceDate string) (*TrainbotServiceDayRow, []TrainbotTripRow, error) {
-	cleanDate := strings.TrimSpace(serviceDate)
-	payload, err := s.CallProcedure(ctx, "service_get_schedule", []any{cleanDate})
-	if err == nil {
-		var raw struct {
-			ServiceDay *TrainbotServiceDayRow `json:"serviceDay"`
-			Trips      []TrainbotTripRow      `json:"trips"`
-		}
-		if err := decodeInto(payload, &raw); err != nil {
-			return nil, nil, err
-		}
-		return raw.ServiceDay, raw.Trips, nil
-	}
-	if !errors.Is(err, ErrLiveSchemaOutdated) {
-		return nil, nil, err
-	}
-	serviceDayResults, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT serviceDate, sourceVersion, importedAt FROM trainbot_service_day WHERE serviceDate = %s LIMIT 1",
-		sqlQuote(cleanDate),
-	))
+	payload, err := s.CallProcedure(ctx, "service_get_schedule", []any{strings.TrimSpace(serviceDate)})
 	if err != nil {
 		return nil, nil, err
 	}
-	serviceDayRows := make([]TrainbotServiceDayRow, 0, 1)
-	serviceDayRowsRaw, err := sqlRows(serviceDayResults)
-	if err != nil {
+	var raw struct {
+		ServiceDay *TrainbotServiceDayRow `json:"serviceDay"`
+		Trips      []TrainbotTripRow      `json:"trips"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return nil, nil, err
 	}
-	if err := decodeSQLRowsInto(serviceDayRowsRaw, &serviceDayRows); err != nil {
-		return nil, nil, err
-	}
-	tripResults, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt FROM trainbot_trip_public WHERE serviceDate = %s",
-		sqlQuote(cleanDate),
-	))
-	if err != nil {
-		return nil, nil, err
-	}
-	tripRows := make([]TrainbotTripRow, 0)
-	tripRowsRaw, err := sqlRows(tripResults)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := decodeSQLRowsInto(tripRowsRaw, &tripRows); err != nil {
-		return nil, nil, err
-	}
-	if len(serviceDayRows) > 0 {
-		applyTripSourceVersion(tripRows, serviceDayRows[0].SourceVersion)
-	}
-	sortTripRows(tripRows)
-	stopResults, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT trainId, stationId, stationName, seq, arrivalAt, departureAt, latitude, longitude FROM trainbot_trip_stop WHERE serviceDate = %s",
-		sqlQuote(cleanDate),
-	))
-	if err != nil {
-		return nil, nil, err
-	}
-	stopRows := make([]trainbotTripStopRow, 0)
-	stopRowsRaw, err := sqlRows(stopResults)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := decodeSQLRowsInto(stopRowsRaw, &stopRows); err != nil {
-		return nil, nil, err
-	}
-	attachStopsToTrips(tripRows, stopRows)
-	stations := stationsFromTripRows(tripRows)
-	if len(serviceDayRows) == 0 {
-		if len(tripRows) == 0 {
-			return nil, nil, nil
-		}
-		return &TrainbotServiceDayRow{
-			ServiceDate: cleanDate,
-			Stations:    stations,
-		}, tripRows, nil
-	}
-	serviceDayRows[0].Stations = stations
-	return &serviceDayRows[0], tripRows, nil
-}
-
-func attachStopsToTrips(trips []TrainbotTripRow, stopRows []trainbotTripStopRow) {
-	if len(trips) == 0 {
-		return
-	}
-	sortTripStopRows(stopRows)
-	byID := make(map[string]*TrainbotTripRow, len(trips))
-	for index := range trips {
-		trips[index].Stops = nil
-		byID[strings.TrimSpace(trips[index].ID)] = &trips[index]
-	}
-	for _, stop := range stopRows {
-		trip := byID[strings.TrimSpace(stop.TrainID)]
-		if trip == nil {
-			continue
-		}
-		trip.Stops = append(trip.Stops, TrainbotStop{
-			StationID:   strings.TrimSpace(stop.StationID),
-			StationName: strings.TrimSpace(stop.StationName),
-			Seq:         stop.Seq,
-			ArrivalAt:   strings.TrimSpace(stop.ArrivalAt),
-			DepartureAt: strings.TrimSpace(stop.DepartureAt),
-			Latitude:    stop.Latitude,
-			Longitude:   stop.Longitude,
-		})
-	}
-	for index := range trips {
-		sortTripStops(trips[index].Stops)
-	}
-}
-
-func sortTripRows(trips []TrainbotTripRow) {
-	sort.SliceStable(trips, func(i, j int) bool {
-		if trips[i].DepartureAt == trips[j].DepartureAt {
-			return trips[i].ID < trips[j].ID
-		}
-		return trips[i].DepartureAt < trips[j].DepartureAt
-	})
-}
-
-func sortTripStopRows(stops []trainbotTripStopRow) {
-	sort.SliceStable(stops, func(i, j int) bool {
-		if stops[i].TrainID == stops[j].TrainID {
-			if stops[i].Seq == stops[j].Seq {
-				return stops[i].StationID < stops[j].StationID
-			}
-			return stops[i].Seq < stops[j].Seq
-		}
-		return stops[i].TrainID < stops[j].TrainID
-	})
+	return raw.ServiceDay, raw.Trips, nil
 }
 
 func sortTripStops(stops []TrainbotStop) {
@@ -893,172 +679,52 @@ func sortTripStops(stops []TrainbotStop) {
 	})
 }
 
-func stationsFromTripRows(trips []TrainbotTripRow) []TrainbotStation {
-	byID := make(map[string]TrainbotStation)
-	record := func(id string, name string, latitude *float64, longitude *float64) {
-		cleanID := strings.TrimSpace(id)
-		cleanName := strings.TrimSpace(name)
-		if cleanID == "" || cleanName == "" {
-			return
-		}
-		next := byID[cleanID]
-		next.ID = cleanID
-		if strings.TrimSpace(next.Name) == "" {
-			next.Name = cleanName
-		}
-		if strings.TrimSpace(next.NormalizedKey) == "" {
-			next.NormalizedKey = normalizeStationKey(cleanName)
-		}
-		if latitude != nil {
-			next.Latitude = latitude
-		}
-		if longitude != nil {
-			next.Longitude = longitude
-		}
-		byID[cleanID] = next
-	}
-
-	for _, trip := range trips {
-		record(trip.FromStationID, trip.FromStationName, nil, nil)
-		record(trip.ToStationID, trip.ToStationName, nil, nil)
-		for _, stop := range trip.Stops {
-			record(stop.StationID, stop.StationName, stop.Latitude, stop.Longitude)
-		}
-	}
-
-	out := make([]TrainbotStation, 0, len(byID))
-	for _, station := range byID {
-		out = append(out, station)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name == out[j].Name {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out
-}
-
-func applyTripSourceVersion(trips []TrainbotTripRow, sourceVersion string) {
-	clean := strings.TrimSpace(sourceVersion)
-	if clean == "" {
-		return
-	}
-	for index := range trips {
-		trips[index].SourceVersion = clean
-	}
-}
-
 func (s *Syncer) ServiceGetTrip(ctx context.Context, trainID string) (*TrainbotTripRow, error) {
-	results, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT id, serviceDate, fromStationId, fromStationName, toStationId, toStationName, departureAt, arrivalAt FROM trainbot_trip_public WHERE id = %s LIMIT 1",
-		sqlQuote(trainID),
-	))
+	payload, err := s.CallProcedure(ctx, "service_get_trip", []any{strings.TrimSpace(trainID)})
 	if err != nil {
 		return nil, err
 	}
-	rows, err := sqlRows(results)
-	if err != nil {
+	var raw struct {
+		Trip *TrainbotTripRow `json:"trip"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return nil, err
 	}
-	items := make([]TrainbotTripRow, 0, 1)
-	if err := decodeSQLRowsInto(rows, &items); err != nil {
-		return nil, err
+	if raw.Trip != nil {
+		sortTripStops(raw.Trip.Stops)
 	}
-	if len(items) == 0 {
-		return nil, nil
-	}
-	sourceVersion, err := s.serviceDaySourceVersion(ctx, items[0].ServiceDate)
-	if err != nil {
-		return nil, err
-	}
-	items[0].SourceVersion = sourceVersion
-	stopResults, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT trainId, stationId, stationName, seq, arrivalAt, departureAt, latitude, longitude FROM trainbot_trip_stop WHERE trainId = %s",
-		sqlQuote(trainID),
-	))
-	if err != nil {
-		return nil, err
-	}
-	stopRows := make([]trainbotTripStopRow, 0)
-	stopRowsRaw, err := sqlRows(stopResults)
-	if err != nil {
-		return nil, err
-	}
-	if err := decodeSQLRowsInto(stopRowsRaw, &stopRows); err != nil {
-		return nil, err
-	}
-	attachStopsToTrips(items, stopRows)
-	return &items[0], nil
-}
-
-func (s *Syncer) serviceDaySourceVersion(ctx context.Context, serviceDate string) (string, error) {
-	cleanDate := strings.TrimSpace(serviceDate)
-	if cleanDate == "" {
-		return "", nil
-	}
-	results, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT sourceVersion FROM trainbot_service_day WHERE serviceDate = %s LIMIT 1",
-		sqlQuote(cleanDate),
-	))
-	if err != nil {
-		return "", err
-	}
-	rows, err := sqlRows(results)
-	if err != nil {
-		return "", err
-	}
-	var items []struct {
-		SourceVersion string `json:"sourceVersion"`
-	}
-	if err := decodeSQLRowsInto(rows, &items); err != nil {
-		return "", err
-	}
-	if len(items) == 0 {
-		return "", nil
-	}
-	return strings.TrimSpace(items[0].SourceVersion), nil
+	return raw.Trip, nil
 }
 
 func (s *Syncer) ServiceGetRider(ctx context.Context, stableID string) (*TrainbotRiderRow, error) {
-	results, err := s.SQL(ctx, fmt.Sprintf(
-		"SELECT * FROM trainbot_rider WHERE stableId = %s LIMIT 1",
-		sqlQuote(stableID),
-	))
+	payload, err := s.CallProcedure(ctx, "service_get_rider", []any{strings.TrimSpace(stableID)})
 	if err != nil {
 		return nil, err
 	}
-	rows, err := sqlRows(results)
-	if err != nil {
+	var raw struct {
+		Rider *TrainbotRiderRow `json:"rider"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return nil, err
 	}
-	items := make([]TrainbotRiderRow, 0, 1)
-	if err := decodeSQLRowsInto(rows, &items); err != nil {
-		return nil, err
-	}
-	if len(items) == 0 {
-		return nil, nil
-	}
-	return &items[0], nil
+	return raw.Rider, nil
 }
 
 func (s *Syncer) ServiceListRiders(ctx context.Context) ([]TrainbotRiderRow, error) {
-	results, err := s.SQL(ctx, "SELECT * FROM trainbot_rider")
+	payload, err := s.CallProcedure(ctx, "service_list_riders", []any{})
 	if err != nil {
 		return nil, err
 	}
-	rows, err := sqlRows(results)
-	if err != nil {
+	var raw struct {
+		Riders []TrainbotRiderRow `json:"riders"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return nil, err
 	}
-	items := make([]TrainbotRiderRow, 0, len(rows))
-	if err := decodeSQLRowsInto(rows, &items); err != nil {
-		return nil, err
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].StableID < items[j].StableID
+	sort.SliceStable(raw.Riders, func(i, j int) bool {
+		return raw.Riders[i].StableID < raw.Riders[j].StableID
 	})
-	return items, nil
+	return raw.Riders, nil
 }
 
 func (s *Syncer) ServiceListActivities(ctx context.Context, filter ListActivitiesFilter) ([]TrainbotActivityRow, error) {
@@ -1072,60 +738,19 @@ func (s *Syncer) ServiceListActivities(ctx context.Context, filter ListActivitie
 		strings.TrimSpace(filter.SubjectID),
 		strings.TrimSpace(filter.ServiceDate),
 	})
-	if err == nil {
-		var raw struct {
-			Activities []TrainbotActivityRow `json:"activities"`
-		}
-		if err := decodeInto(payload, &raw); err != nil {
-			return nil, err
-		}
-		for index := range raw.Activities {
-			normalizeActivity(&raw.Activities[index])
-		}
-		return raw.Activities, nil
-	}
-	if !errors.Is(err, ErrLiveSchemaOutdated) {
-		return nil, err
-	}
-	clauses := make([]string, 0, 4)
-	if filter.Since != nil {
-		clauses = append(clauses, fmt.Sprintf("lastActivityAt >= %s", sqlQuote(filter.Since.UTC().Format(time.RFC3339))))
-	}
-	if scopeType := strings.TrimSpace(filter.ScopeType); scopeType != "" {
-		clauses = append(clauses, fmt.Sprintf("scopeType = %s", sqlQuote(scopeType)))
-	}
-	if subjectID := strings.TrimSpace(filter.SubjectID); subjectID != "" {
-		clauses = append(clauses, fmt.Sprintf("subjectId = %s", sqlQuote(subjectID)))
-	}
-	if serviceDate := strings.TrimSpace(filter.ServiceDate); serviceDate != "" {
-		clauses = append(clauses, fmt.Sprintf("serviceDate = %s", sqlQuote(serviceDate)))
-	}
-	query := "SELECT * FROM trainbot_activity"
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
-	}
-	results, err := s.SQL(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := sqlRows(results)
-	if err != nil {
+	var raw struct {
+		Activities []TrainbotActivityRow `json:"activities"`
+	}
+	if err := decodeInto(payload, &raw); err != nil {
 		return nil, err
 	}
-	items := make([]TrainbotActivityRow, 0, len(rows))
-	if err := decodeSQLRowsInto(rows, &items); err != nil {
-		return nil, err
+	for index := range raw.Activities {
+		normalizeActivity(&raw.Activities[index])
 	}
-	for index := range items {
-		normalizeActivity(&items[index])
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].LastActivityAt == items[j].LastActivityAt {
-			return items[i].ID < items[j].ID
-		}
-		return items[i].LastActivityAt > items[j].LastActivityAt
-	})
-	return items, nil
+	return raw.Activities, nil
 }
 
 func (s *Syncer) ServiceListWindowTrains(ctx context.Context, windowID string) ([]TrainbotTripRow, error) {
@@ -1385,16 +1010,16 @@ func (s *Syncer) ServiceDeleteServiceDay(ctx context.Context, serviceDate string
 	}, nil
 }
 
-func (s *Syncer) ServiceReplaceScheduleBatch(ctx context.Context, serviceDate string, sourceVersion string, stations []ScheduleStation, trips []ScheduleTripBatchItem, reset bool, finalize bool) error {
-	_, err := s.CallReducer(ctx, "service_replace_schedule_batch", []any{
-		strings.TrimSpace(serviceDate),
-		strings.TrimSpace(sourceVersion),
-		mustJSON(stations),
-		mustJSON(trips),
-		reset,
-		finalize,
-	})
-	return err
+func (s *Syncer) ServiceReplaceSchedule(ctx context.Context, serviceDate string, sourceVersion string, stations []ScheduleStation, trips []ScheduleTripBatchItem) error {
+	snapshot := ScheduleSnapshot{Stations: stations, Trains: make([]ScheduleTrain, 0, len(trips))}
+	for _, trip := range trips {
+		snapshot.Trains = append(snapshot.Trains, ScheduleTrain{
+			ID: trip.ID, ServiceDate: trip.ServiceDate, FromStation: trip.FromStation, ToStation: trip.ToStation,
+			DepartureAt: trip.DepartureAt, ArrivalAt: trip.ArrivalAt, SourceVersion: trip.SourceVersion,
+		})
+		snapshot.Stops = append(snapshot.Stops, trip.Stops...)
+	}
+	return s.syncSingleServiceDate(ctx, "schedule-"+randomTokenID(), strings.TrimSpace(serviceDate), strings.TrimSpace(sourceVersion), snapshot)
 }
 
 func (s *Syncer) PublishActiveBundle(ctx context.Context, version string, serviceDate string, generatedAt time.Time, sourceVersion string) error {
@@ -1437,48 +1062,6 @@ func (s *Syncer) CallProcedure(ctx context.Context, name string, args []any) (an
 
 func (s *Syncer) CallProcedureWithToken(ctx context.Context, name string, args []any, token string) (any, error) {
 	return s.callJSONProcedureWithToken(ctx, name, args, token)
-}
-
-func (s *Syncer) SQL(ctx context.Context, query string) ([]SQLStatementResult, error) {
-	token, err := s.IssueToken(time.Now().UTC(), TokenOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return s.SQLWithToken(ctx, query, token)
-}
-
-func (s *Syncer) SQLWithToken(ctx context.Context, query string, token string) ([]SQLStatementResult, error) {
-	requestURL := fmt.Sprintf("%s/v1/database/%s/sql", s.baseURL, url.PathEscape(s.database))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, strings.NewReader(strings.TrimSpace(query)))
-	if err != nil {
-		return nil, fmt.Errorf("build spacetime sql request: %w", err)
-	}
-	req.Header.Set("Content-Type", "text/plain")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("call spacetime sql: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read spacetime sql response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("spacetime sql failed: %s", strings.TrimSpace(string(body)))
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, nil
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	var payload []SQLStatementResult
-	if err := decoder.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode spacetime sql response: %w", err)
-	}
-	return payload, nil
 }
 
 func (s *Syncer) IssueToken(now time.Time, opts TokenOptions) (string, error) {
@@ -1579,14 +1162,7 @@ func (s *Syncer) callJSONModuleActionExactWithToken(ctx context.Context, kind st
 	return payload, nil, false
 }
 
-func (s *Syncer) syncSingleServiceDate(ctx context.Context, importID string, serviceDate string, snapshot ScheduleSnapshot) error {
-	sourceVersion := ""
-	for _, train := range snapshot.Trains {
-		if trimmed := strings.TrimSpace(train.SourceVersion); trimmed != "" {
-			sourceVersion = trimmed
-			break
-		}
-	}
+func (s *Syncer) syncSingleServiceDate(ctx context.Context, importID string, serviceDate string, sourceVersion string, snapshot ScheduleSnapshot) error {
 	if _, err := s.CallProcedure(ctx, "begin_service_day_import", []any{importID, strings.TrimSpace(serviceDate), sourceVersion}); err != nil {
 		return err
 	}
@@ -2240,189 +1816,6 @@ func boolToInt64(value bool) int64 {
 	return 0
 }
 
-func sqlQuote(value string) string {
-	return "'" + strings.ReplaceAll(strings.TrimSpace(value), "'", "''") + "'"
-}
-
-func sqlRows(results []SQLStatementResult) ([]map[string]any, error) {
-	out := make([]map[string]any, 0)
-	for _, result := range results {
-		rows, err := sqlStatementRows(result)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rows...)
-	}
-	return out, nil
-}
-
-func sqlStatementRows(result SQLStatementResult) ([]map[string]any, error) {
-	names, err := sqlColumnNames(result.Schema)
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]map[string]any, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		item := make(map[string]any, len(names))
-		for index, name := range names {
-			if index < len(row) {
-				item[name] = normalizeSQLRowValue(name, row[index])
-				continue
-			}
-			item[name] = nil
-		}
-		rows = append(rows, item)
-	}
-	return rows, nil
-}
-
-func sqlColumnNames(schema map[string]any) ([]string, error) {
-	if len(schema) == 0 {
-		return nil, nil
-	}
-	rawElements, ok := schema["elements"]
-	if !ok {
-		return nil, nil
-	}
-	elements, ok := rawElements.([]any)
-	if !ok {
-		return nil, fmt.Errorf("decode spacetime sql schema: unexpected elements payload %T", rawElements)
-	}
-	names := make([]string, 0, len(elements))
-	for index, rawElement := range elements {
-		element, ok := rawElement.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("decode spacetime sql schema element: unexpected element payload %T", rawElement)
-		}
-		name := fmt.Sprintf("col_%d", index)
-		switch rawName := element["name"].(type) {
-		case string:
-			if strings.TrimSpace(rawName) != "" {
-				name = strings.TrimSpace(rawName)
-			}
-		case map[string]any:
-			if rawSome, ok := rawName["some"].(string); ok && strings.TrimSpace(rawSome) != "" {
-				name = strings.TrimSpace(rawSome)
-			}
-		}
-		names = append(names, name)
-	}
-	return names, nil
-}
-
-func normalizeSQLRowValue(name string, value any) any {
-	if !isSQLOptionColumn(name) {
-		return value
-	}
-	if unwrapped, ok := unwrapSQLOptionValue(value); ok {
-		return unwrapped
-	}
-	return value
-}
-
-func isSQLOptionColumn(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "arrivalat",
-		"departureat",
-		"latitude",
-		"longitude",
-		"boardingstationid",
-		"currentride",
-		"undoride",
-		"recentactionstate",
-		"destinationstationid",
-		"matchedtraininstanceid":
-		return true
-	default:
-		return false
-	}
-}
-
-func unwrapSQLOptionValue(value any) (any, bool) {
-	switch typed := value.(type) {
-	case nil:
-		return nil, true
-	case []any:
-		switch len(typed) {
-		case 0:
-			return nil, true
-		case 1:
-			return normalizeSQLOptionPayload(typed[0]), true
-		case 2:
-			tag := strings.ToLower(strings.TrimSpace(fmt.Sprint(typed[0])))
-			switch tag {
-			case "0":
-				return nil, true
-			case "1":
-				return normalizeSQLOptionPayload(typed[1]), true
-			case "none":
-				return nil, true
-			case "some":
-				return normalizeSQLOptionPayload(typed[1]), true
-			}
-		}
-	case map[string]any:
-		for _, key := range []string{"some", "Some"} {
-			if raw, ok := typed[key]; ok {
-				return normalizeSQLOptionPayload(raw), true
-			}
-		}
-		for _, key := range []string{"none", "None"} {
-			if _, ok := typed[key]; ok {
-				return nil, true
-			}
-		}
-		tag := strings.ToLower(strings.TrimSpace(fmt.Sprint(typed["tag"])))
-		switch tag {
-		case "none":
-			return nil, true
-		case "some":
-			if raw, ok := typed["value"]; ok {
-				return normalizeSQLOptionPayload(raw), true
-			}
-			if raw, ok := typed["values"]; ok {
-				return normalizeSQLOptionPayload(raw), true
-			}
-		}
-	}
-	return nil, false
-}
-
-func normalizeSQLOptionPayload(value any) any {
-	if unwrapped, ok := unwrapSQLOptionValue(value); ok {
-		return unwrapped
-	}
-	switch typed := value.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, raw := range typed {
-			out[key] = normalizeSQLRowValue(key, raw)
-		}
-		return out
-	case []any:
-		out := make([]any, 0, len(typed))
-		for _, raw := range typed {
-			out = append(out, normalizeSQLOptionPayload(raw))
-		}
-		return out
-	}
-	return value
-}
-
-func decodeSQLRowsInto(rows []map[string]any, out any) error {
-	body, err := json.Marshal(rows)
-	if err != nil {
-		return fmt.Errorf("marshal spacetime sql rows: %w", err)
-	}
-	if len(bytes.TrimSpace(body)) == 0 || string(bytes.TrimSpace(body)) == "null" {
-		return nil
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("decode spacetime sql rows: %w", err)
-	}
-	return nil
-}
-
 func decodeInto(payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -2614,26 +2007,6 @@ func normalizeAlertStyle(value string) string {
 	default:
 		return "DETAILED"
 	}
-}
-
-func normalizeStationKey(value string) string {
-	normalized := strings.ToLower(strings.TrimSpace(value))
-	replacer := strings.NewReplacer(
-		"ā", "a",
-		"č", "c",
-		"ē", "e",
-		"ģ", "g",
-		"ī", "i",
-		"ķ", "k",
-		"ļ", "l",
-		"ņ", "n",
-		"š", "s",
-		"ū", "u",
-		"ž", "z",
-		"-", " ",
-	)
-	normalized = replacer.Replace(normalized)
-	return strings.Join(strings.Fields(normalized), " ")
 }
 
 func genericNickname(stableID string) string {

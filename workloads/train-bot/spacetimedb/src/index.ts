@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   CaseConversionPolicy,
   SenderError,
@@ -879,12 +878,18 @@ function isBeforeScheduleCutoff(date: Date, cutoffHour: number): boolean {
   return parts.hour < cutoffHour;
 }
 
-function utcDayStart(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0));
+function rigaDayStart(date: Date): Date {
+  const { year, month, day } = rigaDateParts(date);
+  const midnight = Date.UTC(Number(year), Number(month) - 1, Number(day));
+  // Riga changes its UTC offset at 01:00 UTC, after this midnight probe.
+  const offsetHours = rigaDateParts(new Date(midnight)).hour;
+  return new Date(midnight - offsetHours * 60 * 60 * 1000);
 }
 
-function utcDayEnd(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999));
+function rigaDayEnd(date: Date): Date {
+  const { year, month, day } = rigaDateParts(date);
+  const nextDay = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day) + 1));
+  return new Date(rigaDayStart(nextDay).getTime() - 1);
 }
 
 function genericNickname(stableId: string): string {
@@ -916,6 +921,36 @@ function publicOpaqueId(prefix: string, ...parts: unknown[]): string {
     hash = Math.imul(hash, 16777619) >>> 0;
   }
   return `${prefix}:${hash.toString(16).padStart(8, '0')}`;
+}
+
+function publicIncidentId(activity: any, createdAt?: string): string {
+  if (asString(activity?.scopeType).trim() !== 'area') {
+    return asString(activity?.id).trim();
+  }
+  const reportAt = createdAt || latestReportEvent(activity)?.createdAt;
+  const day = reportAt ? formatServiceDateFor(new Date(reportAt)) : asString(activity.serviceDate).trim();
+  const input = `${asString(activity.subjectId).trim()}|${day}`;
+  let hash = 2166136261 >>> 0;
+  for (const byte of new TextEncoder().encode(input)) {
+    hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+  }
+  return `area:pub-${hash.toString(16).padStart(8, '0')}`;
+}
+
+function findIncidentActivity(tx: any, incidentId: string): any | null {
+  const cleanId = asString(incidentId).trim();
+  const existing = tx.db.trainbot_activity.id.find(cleanId);
+  if (existing || !cleanId.startsWith('area:pub-')) {
+    return existing || null;
+  }
+  for (const activity of tx.db.trainbot_activity.scopeType.filter('area')) {
+    for (const event of activity.timeline || []) {
+      if (event.kind === 'location_report' && publicIncidentId(activity, event.createdAt) === cleanId) {
+        return activity;
+      }
+    }
+  }
+  return null;
 }
 
 function publicStationSightingID(event: any): string {
@@ -2141,7 +2176,7 @@ function incidentMapTargetPayload(activity: any): any | undefined {
     return subjectId ? { type: 'station', stationId: subjectId } : undefined;
   }
   if (scopeType === 'area') {
-    const incidentId = asString(activity?.id).trim();
+    const incidentId = publicIncidentId(activity);
     return incidentId ? { type: 'area', incidentId } : undefined;
   }
   return undefined;
@@ -2462,7 +2497,7 @@ function trainsByWindow(tx: any, windowId: string): any[] {
     case 'today':
     default:
       start = new Date(now.getTime() - 30 * 60 * 1000);
-      end = utcDayEnd(now);
+      end = rigaDayEnd(now);
       break;
   }
   const startMs = start.getTime();
@@ -2646,7 +2681,7 @@ function trainStopPayload(tx: any, stableId: string, trainId: string) {
 function publicDashboardPayload(tx: any, limit: number) {
   const now = nowDate(tx);
   const startMs = now.getTime() - 30 * 60 * 1000;
-  const endMs = utcDayEnd(now).getTime();
+  const endMs = rigaDayEnd(now).getTime();
   const serviceDate = activeServiceDate(tx);
   const projected = listTripPublicRowsForServiceDate(tx, serviceDate);
   const source = projected.length
@@ -2721,8 +2756,8 @@ function publicStationDeparturesPayload(tx: any, stationId: string, limit: numbe
     throw new SenderError('not found');
   }
   const now = nowDate(tx);
-  const recent = stationWindowTrains(tx, stationId, utcDayStart(now).getTime(), now.getTime() - 1);
-  const upcoming = stationWindowTrains(tx, stationId, now.getTime(), utcDayEnd(now).getTime());
+  const recent = stationWindowTrains(tx, stationId, rigaDayStart(now).getTime(), now.getTime() - 1);
+  const upcoming = stationWindowTrains(tx, stationId, now.getTime(), rigaDayEnd(now).getTime());
   const lastDeparture = recent.length
     ? buildStationTrainCards(tx, '', recent.slice(-1), now.getTime(), [])[0]
     : null;
@@ -2754,7 +2789,7 @@ function stationDeparturesPayload(tx: any, stableId: string, stationId: string) 
 function networkMapPayload(tx: any) {
   const stations = listStationsForServiceDate(tx, activeServiceDate(tx)).filter((item) => item.latitude != null && item.longitude != null);
   const now = nowDate(tx);
-  const sameDaySightings = stationSightingsSince(tx, utcDayStart(now).getTime(), 500);
+  const sameDaySightings = stationSightingsSince(tx, rigaDayStart(now).getTime(), 500);
   const visibleTrainIds = new Set(publicDashboardPayload(tx, 0).map((item) => asString(item.train.id)));
   const recentSightings = sameDaySightings.filter((item) => {
     const createdMs = parseISO(item.createdAt)?.getTime() || 0;
@@ -2771,7 +2806,7 @@ function networkMapPayload(tx: any) {
 
 function incidentSummaryPayload(tx: any, activity: any, viewerStableId: string) {
   return {
-    id: activity.id,
+    id: publicIncidentId(activity),
     scope: activity.scopeType,
     subjectId: publicIncidentSubjectId(activity),
     subjectName: publicIncidentSubjectName(activity),
@@ -2811,7 +2846,7 @@ function listIncidentSummariesPayload(tx: any, limit: number) {
 }
 
 function incidentDetailPayload(tx: any, incidentId: string) {
-  const activity = tx.db.trainbot_activity.id.find(incidentId);
+  const activity = findIncidentActivity(tx, incidentId);
   if (!activity) {
     throw new SenderError('not found');
   }
@@ -3037,11 +3072,11 @@ function submitIncidentVoteAtomic(tx: any, raw: any): any {
   if (!incidentId || !stableId || (value !== 'ONGOING' && value !== 'CLEARED')) {
     throw new SenderError('invalid incident vote');
   }
-  const activity = tx.db.trainbot_activity.id.find(incidentId);
+  const activity = findIncidentActivity(tx, incidentId);
   if (!activity) {
     throw new SenderError('not found');
   }
-  const voteCooldown = voteChangeCooldownSeconds(tx, incidentId, stableId);
+  const voteCooldown = voteChangeCooldownSeconds(tx, activity.id, stableId);
   if (voteCooldown > 0) {
     throw new SenderError(`vote cooldown active for ${voteCooldown}s`);
   }
@@ -3062,7 +3097,7 @@ function submitIncidentVoteAtomic(tx: any, raw: any): any {
   const nextActivity = putActivityRow(tx, { ...activity, votes: nextVotes });
   tx.db.trainbot_incident_vote_event.insert({
     id: asString(raw?.eventId).trim() || `${stableId}|${tx.newUuidV7().toString()}`,
-    incidentId,
+    incidentId: activity.id,
     stableId,
     value,
     createdAt: currentAt,
@@ -3085,7 +3120,7 @@ function submitIncidentCommentAtomic(tx: any, raw: any): any {
   if (Array.from(body).length > 280) {
     throw new SenderError('comment body is too long');
   }
-  const activity = tx.db.trainbot_activity.id.find(incidentId);
+  const activity = findIncidentActivity(tx, incidentId);
   if (!activity) {
     throw new SenderError('not found');
   }
@@ -3705,15 +3740,32 @@ function clearScheduleProjectionRows(tx: any, serviceDate: string): void {
   clearRowsByServiceDate(tx.db.trainbot_trip_public, serviceDate);
 }
 
+function clearIncidentPublicProjections(tx: any, incidentId: string, activity: any): void {
+  const ids = new Set([incidentId]);
+  if (activity) {
+    ids.add(publicIncidentId(activity));
+    if (activity.scopeType === 'area') {
+      for (const event of activity.timeline || []) {
+        if (event.kind === 'location_report') {
+          ids.add(publicIncidentId(activity, event.createdAt));
+        }
+      }
+    }
+  }
+  for (const id of ids) {
+    clearRowsByIncident(tx.db.trainbot_incident_event, id);
+    clearRowsByIncident(tx.db.trainbot_incident_comment, id);
+    clearRowsByIncident(tx.db.trainbot_public_sighting, id);
+    tx.db.trainbot_incident_summary.id.delete(id);
+  }
+}
+
 function deleteActivity(tx: any, incidentId: string): boolean {
   const existing = tx.db.trainbot_activity.id.find(incidentId);
   deleteJobsWithPrefix(tx, `activity:${incidentId}|`);
-  clearRowsByIncident(tx.db.trainbot_incident_event, incidentId);
-  clearRowsByIncident(tx.db.trainbot_incident_comment, incidentId);
-  clearRowsByIncident(tx.db.trainbot_public_sighting, incidentId);
+  clearIncidentPublicProjections(tx, incidentId, existing);
   clearRowsByIncident(tx.db.trainbot_incident_vote, incidentId);
   clearRowsByIncident(tx.db.trainbot_incident_vote_event, incidentId);
-  tx.db.trainbot_incident_summary.id.delete(incidentId);
   tx.db.trainbot_activity.id.delete(incidentId);
   if (existing && asString(existing.scopeType).trim() === 'train') {
     refreshTripProjection(tx, asString(existing.subjectId).trim());
@@ -3806,7 +3858,7 @@ function pruneActivityForRetention(tx: any, activity: any, retentionCutoffMs: nu
     if (createdMs > 0 && createdMs < retentionCutoffMs) {
       if (item.kind === 'station_sighting') {
         stationSightingsDeleted += 1;
-      } else if (item.kind === 'report') {
+      } else if (item.kind === 'report' || item.kind === 'location_report') {
         reportsDeleted += 1;
       }
       continue;
@@ -3933,12 +3985,8 @@ function refreshTripProjection(tx: any, trainId: string): void {
 }
 
 function refreshActivityProjection(tx: any, incidentId: string): void {
-  clearRowsByIncident(tx.db.trainbot_incident_event, incidentId);
-  clearRowsByIncident(tx.db.trainbot_incident_comment, incidentId);
-  clearRowsByIncident(tx.db.trainbot_public_sighting, incidentId);
-  tx.db.trainbot_incident_summary.id.delete(incidentId);
-
   const activity = tx.db.trainbot_activity.id.find(incidentId);
+  clearIncidentPublicProjections(tx, incidentId, activity);
   if (!activity) {
     return;
   }
@@ -3948,7 +3996,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   const location = summary.location || {};
   const mapTarget = summary.mapTarget || {};
   tx.db.trainbot_incident_summary.insert({
-    id: incidentId,
+    id: summary.id,
     scopeType: activity.scopeType,
     subjectId: summary.subjectId,
     subjectName: summary.subjectName,
@@ -3977,7 +4025,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   for (const [index, event] of (activity.timeline || []).entries()) {
     tx.db.trainbot_incident_event.insert({
       id: publicOpaqueId('event', incidentId, event.createdAt, event.kind, index),
-      incidentId,
+      incidentId: summary.id,
       serviceDate: activity.serviceDate,
       kind: event.kind === 'station_sighting' || event.kind === 'location_report' ? 'report' : event.kind,
       name: event.name,
@@ -3990,7 +4038,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
       const createdMs = parseISO(event.createdAt)?.getTime() || 0;
       tx.db.trainbot_public_sighting.insert({
         id: publicStationSightingID(event),
-        incidentId,
+        incidentId: summary.id,
         serviceDate: activity.serviceDate,
         stationId: event.stationId,
         stationName: event.stationName,
@@ -4006,7 +4054,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
   for (const [index, comment] of (activity.comments || []).entries()) {
     tx.db.trainbot_incident_comment.insert({
       id: publicOpaqueId('comment', incidentId, comment.createdAt, index),
-      incidentId,
+      incidentId: summary.id,
       serviceDate: activity.serviceDate,
       nickname: PUBLIC_INCIDENT_ACTOR_LABEL,
       body: comment.body,
@@ -4020,7 +4068,7 @@ function refreshActivityProjection(tx: any, incidentId: string): void {
     }
     tx.db.trainbot_incident_event.insert({
       id: publicOpaqueId('vote-event', incidentId, vote.updatedAt, index),
-      incidentId,
+      incidentId: summary.id,
       serviceDate: activity.serviceDate,
       kind: 'vote',
       name: incidentVoteEventLabel(vote.value),
@@ -4292,10 +4340,13 @@ export const myIncidentVotes = spacetimedb.view(
       return [];
     }
     const stableId = asString(rider.stableId).trim();
-    return rowsFrom(ctx.db.trainbot_incident_vote.stableId.filter(stableId)).map((vote: any) => ({
-      incidentId: asString(vote.incidentId).trim(),
-      value: asString(vote.value).trim().toUpperCase(),
-    }));
+    return rowsFrom(ctx.db.trainbot_incident_vote.stableId.filter(stableId)).flatMap((vote: any) => {
+      const activity = ctx.db.trainbot_activity.id.find(asString(vote.incidentId).trim());
+      return activity ? [{
+        incidentId: publicIncidentId(activity),
+        value: asString(vote.value).trim().toUpperCase(),
+      }] : [];
+    });
   }
 );
 
@@ -4424,7 +4475,7 @@ export const publicNetworkMapLive = spacetimedb.anonymousView(
     const currentTime = nowDate(ctx).getTime();
     const sightings = projectedSightings.length || !serviceDate
       ? projectedSightings
-      : stationSightingsSince(ctx, utcDayStart(nowDate(ctx)).getTime(), 500).map((item) => ({
+      : stationSightingsSince(ctx, rigaDayStart(nowDate(ctx)).getTime(), 500).map((item) => ({
         id: publicStationSightingID(item),
         incidentId: '',
         serviceDate,
@@ -5071,6 +5122,35 @@ export const serviceGetSchedule = spacetimedb.procedure(
   })
 );
 
+export const serviceGetTrip = spacetimedb.procedure(
+  { name: named('service_get_trip') },
+  { trainId: t.string() },
+  t.string(),
+  (ctx, { trainId }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize({ trip: trainById(tx, asString(trainId).trim()) });
+  })
+);
+
+export const serviceGetRider = spacetimedb.procedure(
+  { name: named('service_get_rider') },
+  { stableId: t.string() },
+  t.string(),
+  (ctx, { stableId }) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize({ rider: tx.db.trainbot_rider.stableId.find(asString(stableId).trim()) || null });
+  })
+);
+
+export const serviceListRiders = spacetimedb.procedure(
+  { name: named('service_list_riders') },
+  t.string(),
+  (ctx) => ctx.withTx((tx) => {
+    requireServiceRole(tx);
+    return serialize({ riders: rowsFrom(tx.db.trainbot_rider.iter()) });
+  })
+);
+
 export const serviceListActivities = spacetimedb.procedure(
   { name: named('service_list_activities') },
   {
@@ -5152,7 +5232,7 @@ export const serviceListActiveRouteCheckins = spacetimedb.procedure(
     requireServiceRole(tx);
     const nowAt = parseISO(asString(nowIso).trim()) || nowDate(tx);
     const nowMs = nowAt.getTime();
-    const routeCheckIns = [];
+    const routeCheckIns: any[] = [];
     for (const row of rowsFrom(tx.db.trainbot_route_checkin.iter())) {
       const expiresAt = parseISO(asString(row.expiresAt).trim());
       if (!expiresAt || expiresAt.getTime() < nowMs) {
@@ -5509,7 +5589,7 @@ function cleanupExpiredRider(tx: any, rider: any, nowAt: Date): any {
     changed = true;
   }
 
-  const nextSubscriptions = [];
+  const nextSubscriptions: any[] = [];
   for (const subscription of Array.isArray(rider.subscriptions) ? rider.subscriptions : []) {
     const expiresMs = parseISO(asString(subscription?.expiresAt).trim())?.getTime() || 0;
     const active = subscription?.isActive !== false;
@@ -5521,7 +5601,7 @@ function cleanupExpiredRider(tx: any, rider: any, nowAt: Date): any {
     nextSubscriptions.push(subscription);
   }
 
-  const nextMutes = [];
+  const nextMutes: any[] = [];
   for (const mute of Array.isArray(rider.mutes) ? rider.mutes : []) {
     const mutedUntilMs = parseISO(asString(mute?.mutedUntil).trim())?.getTime() || 0;
     if (mutedUntilMs > 0 && mutedUntilMs <= nowMs) {
@@ -5998,7 +6078,12 @@ export const servicePutActivity = spacetimedb.reducer(
   { activityJson: t.string() },
   (ctx, { activityJson }) => {
     requireServiceRole(ctx);
-    const activity = putActivityRow(ctx, parseJSON(activityJson, 'invalid activity JSON'));
+    const activity = sanitizeActivityRow(ctx, parseJSON(activityJson, 'invalid activity JSON'));
+    if (!activity.timeline.length && !activity.comments.length && !activity.votes.length) {
+      deleteActivity(ctx, activity.id);
+      return;
+    }
+    putActivityRow(ctx, activity);
     refreshActivityProjection(ctx, activity.id);
     scheduleActivityRefreshJobs(ctx, activity);
   }
@@ -6105,7 +6190,7 @@ export const serviceSubmitLocationReport = spacetimedb.reducer(
       kind: 'location_report',
       stableId: report?.stableId,
       nickname: report?.nickname,
-      name: locationReportName(scope),
+      name: scope === 'area' ? 'Inspection near this location' : 'Inspection at station',
       detail: description,
       signal: '',
       trainInstanceId: '',

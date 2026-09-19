@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"math/rand"
-	"net/url"
 	"strings"
 	"time"
 
@@ -29,25 +28,16 @@ type Service struct {
 	client       MessageClient
 	pollTimeout  int
 	appURL       string
-	publicURL    string
-	incidentsURL string
-	reportsURL   string
 	runtimeState *runtime.State
 	replyMarkup  telegram.ReplyKeyboardMarkup
 	inlineMarkup telegram.InlineKeyboardMarkup
 }
 
 const (
-	mapCommand             = "/karte"
-	incidentsCommand       = "/notiek"
-	legacyIncidentsCommand = "/incidents"
-	legacyPublicSite       = "Publiskā mape"
-	mainOpenMap            = "Atvērt Kontroli"
-	mainIncidents          = "Kontroles plūsma"
-	mainReportsFeed        = "Ziņojumu kanāls"
-	botName                = "Kontrole"
-	botShortDescription    = "Satiksmes karte un kontroles ziņojumi Rīgā."
-	botDescription         = "Kontrole parāda Rīgas satiksmes karti, aktīvo transportu un kontroles ziņojumus. Telegram sesija ļauj anonīmi ziņot, balsot un komentēt."
+	mainOpenMap         = "Atvērt Kontroli"
+	botName             = "Kontrole"
+	botShortDescription = "Satiksmes karte un kontroles ziņojumi Rīgā."
+	botDescription      = "Kontrole parāda Rīgas satiksmes karti, aktīvo transportu un kontroles ziņojumus. Telegram sesija ļauj anonīmi ziņot, balsot un komentēt."
 )
 
 type menuDestination struct {
@@ -58,13 +48,11 @@ type menuDestination struct {
 	webApp      bool
 }
 
-func NewService(client MessageClient, pollTimeout int, appURL, publicURL, reportsURL string, runtimeState *runtime.State) *Service {
+func NewService(client MessageClient, pollTimeout int, appURL string, runtimeState *runtime.State) *Service {
 	service := &Service{
 		client:       client,
 		pollTimeout:  pollTimeout,
 		appURL:       strings.TrimSpace(appURL),
-		publicURL:    strings.TrimSpace(publicURL),
-		reportsURL:   strings.TrimSpace(reportsURL),
 		runtimeState: runtimeState,
 	}
 	service.replyMarkup = service.newReplyKeyboard()
@@ -113,13 +101,7 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) handleMessage(ctx context.Context, message telegram.Message) error {
-	text := normalizeTelegramMessageText(message.Text)
-	switch text {
-	case "/start", "/menu", "", mapCommand, incidentsCommand, legacyIncidentsCommand, "/-incidents", mainOpenMap, mainIncidents, legacyPublicSite, mainReportsFeed:
-		return s.sendWelcome(ctx, message.Chat.ID)
-	default:
-		return s.sendWelcome(ctx, message.Chat.ID)
-	}
+	return s.sendWelcome(ctx, message.Chat.ID)
 }
 
 func (s *Service) sendWelcome(ctx context.Context, chatID int64) error {
@@ -128,10 +110,6 @@ func (s *Service) sendWelcome(ctx context.Context, chatID int64) error {
 		"Atver Kontroli, lai redzētu pieturas, aktīvo transportu un ziņojumus vienuviet.",
 	}
 	return s.sendMenuMessage(ctx, chatID, lines...)
-}
-
-func (s *Service) sendIncidents(ctx context.Context, chatID int64) error {
-	return s.sendWelcome(ctx, chatID)
 }
 
 func (s *Service) configureBot(ctx context.Context) {
@@ -286,47 +264,6 @@ func (s *Service) menuDestination(action string) (menuDestination, bool) {
 	default:
 		return menuDestination{}, false
 	}
-}
-
-func normalizeTelegramMessageText(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-	fields := strings.Fields(text)
-	if len(fields) == 0 {
-		return ""
-	}
-	command := fields[0]
-	if !strings.HasPrefix(command, "/") {
-		return text
-	}
-	if at := strings.Index(command, "@"); at >= 0 {
-		command = command[:at]
-	}
-	return command
-}
-
-func resolveIncidentsURL(appURL, publicURL string) string {
-	publicURL = strings.TrimSpace(publicURL)
-	if publicURL != "" {
-		return strings.TrimRight(publicURL, "/") + "/incidents"
-	}
-	appURL = strings.TrimSpace(appURL)
-	if appURL == "" {
-		return ""
-	}
-	parsed, err := url.Parse(appURL)
-	if err != nil {
-		return ""
-	}
-	if !strings.HasSuffix(parsed.Path, "/app") {
-		return ""
-	}
-	parsed.Path = strings.TrimSuffix(parsed.Path, "/app") + "/incidents"
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String()
 }
 
 func nextTelegramBackoff(current time.Duration) time.Duration {

@@ -662,6 +662,113 @@ func TestPublicCannotSubmitAndAuthenticatedSessionCan(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedIncidentCommentsValidateAndAppearPublicly(t *testing.T) {
+	server := newHardeningTestServer(t)
+	now := time.Now().UTC()
+	if _, _, err := server.reports.SubmitStopSighting(context.Background(), 42, "3012", now); err != nil {
+		t.Fatal(err)
+	}
+	cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{User: telegramUser{ID: 99}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{" \n\t", http.StatusBadRequest},
+		{strings.Repeat("ā", 281), http.StatusBadRequest},
+		{"  Pārbaudes komentārs  ", http.StatusOK},
+	} {
+		payload, _ := json.Marshal(map[string]string{"body": tc.body})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/incidents/stop:3012/comments", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("comment of %d characters: status = %d, want %d; body=%s", len([]rune(tc.body)), rec.Code, tc.want, rec.Body.String())
+		}
+	}
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/public/incidents/stop:3012", nil))
+	var detail model.IncidentDetail
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || len(detail.Comments) != 1 || detail.Comments[0].Body != "Pārbaudes komentārs" || detail.Comments[0].UserID != 0 {
+		t.Fatalf("public comments must contain only the valid anonymous comment: status=%d detail=%+v", rec.Code, detail)
+	}
+}
+
+func TestAuthenticatedReportVoteCommentJourney(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		body string
+	}{
+		{"stop", `{"stopId":"3012"}`},
+		{"vehicle", `{"mode":"tram","routeLabel":"1","direction":"b-a","liveRowId":"private-vehicle-row"}`},
+		{"area", `{"latitude":56.95,"longitude":24.11,"radiusMeters":100,"description":"Pārbaudes vieta"}`},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			server := newHardeningTestServer(t)
+			server.dump = bot.NewDumpDispatcher(nil, server.store, nil, "test", time.Second, time.UTC)
+			request := func(method, path, body string, userID int64, want int, dest any) {
+				t.Helper()
+				req := httptest.NewRequest(method, path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				if userID != 0 {
+					cookie, err := issueSessionCookie(server.sessionSecret, telegramAuth{User: telegramUser{ID: userID}}, time.Now().UTC())
+					if err != nil {
+						t.Fatal(err)
+					}
+					req.AddCookie(cookie)
+				}
+				rec := httptest.NewRecorder()
+				server.ServeHTTP(rec, req)
+				if rec.Code != want {
+					t.Fatalf("%s %s: status=%d want=%d body=%s", method, path, rec.Code, want, rec.Body.String())
+				}
+				if dest != nil {
+					if err := json.Unmarshal(rec.Body.Bytes(), dest); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			path := "/api/v1/reports/" + tc.kind
+			request(http.MethodPost, path, tc.body, 0, http.StatusUnauthorized, nil)
+			var report model.ReportResult
+			request(http.MethodPost, path, tc.body, 42, http.StatusOK, &report)
+			if !report.Accepted || report.IncidentID == "" {
+				t.Fatalf("report = %+v", report)
+			}
+			pending, err := server.store.PendingReportDumpCount(context.Background())
+			if err != nil || pending != 1 {
+				t.Fatalf("Telegram delivery queue = %d, err=%v", pending, err)
+			}
+			incidentPath := "/api/v1/incidents/" + report.IncidentID
+			request(http.MethodPost, incidentPath+"/votes", `{"value":"CLEARED"}`, 0, http.StatusUnauthorized, nil)
+			request(http.MethodPost, incidentPath+"/comments", `{"body":"Test"}`, 0, http.StatusUnauthorized, nil)
+			request(http.MethodPost, incidentPath+"/votes", `{"value":"CLEARED"}`, 99, http.StatusOK, nil)
+			request(http.MethodPost, incidentPath+"/votes", `{"value":"CLEARED"}`, 99, http.StatusTooManyRequests, nil)
+			request(http.MethodPost, incidentPath+"/comments", `{"body":"  Pārbaudes komentārs  "}`, 99, http.StatusOK, nil)
+			var detail model.IncidentDetail
+			request(http.MethodGet, "/api/v1/public/incidents/"+report.IncidentID, "", 0, http.StatusOK, &detail)
+			if len(detail.Comments) != 1 || detail.Comments[0].Body != "Pārbaudes komentārs" || detail.Comments[0].Nickname != "anonīmi" || detail.Summary.CommentCount != 1 || detail.Summary.Votes.Ongoing != 1 || detail.Summary.Votes.Cleared != 1 || detail.Summary.Resolved {
+				t.Fatalf("public report/vote/comment readback = %+v", detail)
+			}
+			if detail.Summary.Vehicle != nil && detail.Summary.Vehicle.LiveRowID != "" {
+				t.Fatal("public detail exposes the private vehicle row")
+			}
+			request(http.MethodPost, incidentPath+"/votes", `{"value":"CLEARED"}`, 100, http.StatusOK, nil)
+			request(http.MethodGet, "/api/v1/public/incidents/"+report.IncidentID, "", 0, http.StatusOK, &detail)
+			if !detail.Summary.Resolved || detail.Summary.Votes.Cleared != 2 {
+				t.Fatalf("second cleared vote did not resolve incident: %+v", detail.Summary)
+			}
+		})
+	}
+}
+
 func TestPublicReportEndpointsIgnoreSmokeHeader(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "satiksme.db"))

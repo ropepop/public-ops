@@ -54,7 +54,6 @@ type Config struct {
 	ExternalTrainMapBaseURL                string
 	ExternalTrainMapWsURL                  string
 	FeatureStationCheckin                  bool
-	ScraperViviPageURL                     string
 	ScraperViviGTFSURL                     string
 	ScraperDailyHour                       int
 	ScraperMinTrains                       int
@@ -199,7 +198,6 @@ func Load() (Config, error) {
 		ExternalTrainMapBaseURL:                strings.TrimRight(strings.TrimSpace(envOr("EXTERNAL_TRAINMAP_BASE_URL", "https://trainmap.vivi.lv")), "/"),
 		ExternalTrainMapWsURL:                  strings.TrimSpace(envOr("EXTERNAL_TRAINMAP_WS_URL", "wss://trainmap.pv.lv/ws")),
 		FeatureStationCheckin:                  featureStationCheckin,
-		ScraperViviPageURL:                     envOr("SCRAPER_VIVI_PAGE_URL", "https://www.vivi.lv/lv/informacija-pasazieriem/"),
 		ScraperViviGTFSURL:                     envOr("SCRAPER_VIVI_GTFS_URL", "https://www.vivi.lv/uploads/GTFS.zip"),
 		ScraperDailyHour:                       scraperDailyHour,
 		ScraperMinTrains:                       scraperMinTrains,

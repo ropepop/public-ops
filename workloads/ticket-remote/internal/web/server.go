@@ -29,7 +29,7 @@ import (
 	"ticketremote/internal/state"
 )
 
-//go:embed static/* diagnostic/*
+//go:embed static/* diagnostic/* pwa/*
 var staticFS embed.FS
 
 type Server struct {
@@ -163,7 +163,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-16-hdr-frame-reset-v201"
+	serverVersion                 = "ticket-remote-2026-09-19-steady-hdr-slider-v206"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -271,6 +271,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case path == "/manifest.webmanifest" || path == "/pwa/icon-192.png" || path == "/pwa/icon-512.png" || path == "/pwa/icon-maskable.png" || path == "/pwa/apple-touch-icon.png":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(path, "/")
+		contentType := "image/png"
+		if path == "/manifest.webmanifest" {
+			name = "pwa/manifest.webmanifest"
+			contentType = "application/manifest+json"
+		}
+		body, err := staticFS.ReadFile(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(body)
+		}
 	case path == "/api/v1/livez":
 		setReleaseHeaders(w)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "serverVersion": serverVersion, "assetVersion": assetVersion()})
@@ -870,7 +893,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	snapshot = s.withActivePhoneBackend(snapshot, s.relay.Snapshot())
 	s.cacheSnapshot(snapshot)
 	if _, ok := snapshot.Member(id.Email); !ok {
-		writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email))
+		writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("No ticket has been assigned to your account (%s). Ask the ticket owner or an administrator to give you access.", id.Email))
 		return
 	}
 	sessionToken, _, err := s.auth.IssueServerSession(id, s.cfg.CookieTTL, time.Now())
@@ -983,7 +1006,7 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, apiResponse{
 				OK:      false,
 				Error:   "not_member",
-				Message: fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email),
+				Message: fmt.Sprintf("No ticket has been assigned to your account (%s). Ask the ticket owner or an administrator to give you access.", id.Email),
 			})
 			return
 		}
@@ -1708,7 +1731,7 @@ func (s *Server) identifyMemberFromRequest(w http.ResponseWriter, r *http.Reques
 	}
 	if _, ok := snapshot.Member(id.Email); !ok {
 		if !opts.optional {
-			writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("The signed-in email %s is not linked to this ticket.", id.Email))
+			writeErrorPage(w, http.StatusForbidden, fmt.Sprintf("No ticket has been assigned to your account (%s). Ask the ticket owner or an administrator to give you access.", id.Email))
 		}
 		return auth.Identity{}, "", snapshot, false
 	}

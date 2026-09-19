@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"telegramtrainapp/internal/domain"
 	"telegramtrainapp/internal/schedule"
 	"telegramtrainapp/internal/scrape"
 	"telegramtrainapp/internal/spacetime"
@@ -254,7 +253,7 @@ func (r *Runner) runScrape(ctx context.Context, now time.Time, metricPrefix stri
 		_ = r.store.UpsertDailyMetric(ctx, date, "scrape_warning", 1)
 		return false, nil
 	}
-	if err := r.importTrainData(ctx, date, result.Snapshot.SourceVersion, trains, stopsByTrain); err != nil {
+	if err := store.ImportTrainData(ctx, r.store, date, result.Snapshot.SourceVersion, trains, stopsByTrain); err != nil {
 		log.Printf("%s import failed: %v", metricPrefix, err)
 		_ = r.store.UpsertDailyMetric(ctx, date, metricPrefix+"_success", 0)
 		_ = r.store.UpsertDailyMetric(ctx, date, "scrape_warning", 1)
@@ -322,20 +321,6 @@ func (r *Runner) cleanupPreviousServiceDate(ctx context.Context, localNow time.T
 		return err
 	}
 	return nil
-}
-
-type trainDataImporter interface {
-	ImportTrainData(ctx context.Context, serviceDate string, sourceVersion string, trains []domain.TrainInstance, stopsByTrain map[string][]domain.TrainStop) error
-}
-
-func (r *Runner) importTrainData(ctx context.Context, serviceDate string, sourceVersion string, trains []domain.TrainInstance, stopsByTrain map[string][]domain.TrainStop) error {
-	if importer, ok := r.store.(trainDataImporter); ok {
-		return importer.ImportTrainData(ctx, serviceDate, sourceVersion, trains, stopsByTrain)
-	}
-	if err := r.store.UpsertTrainInstances(ctx, serviceDate, sourceVersion, trains); err != nil {
-		return err
-	}
-	return r.store.UpsertTrainStops(ctx, serviceDate, stopsByTrain)
 }
 
 func isFatalRuntimeSchemaError(err error) bool {

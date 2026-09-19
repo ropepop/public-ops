@@ -193,6 +193,7 @@
   const MAP_DETAIL_DISMISS_SUPPRESS_WINDOW_MS = 450;
   const MAP_USER_PAN_TOLERANCE_PX = 8;
   const MAP_DEFAULT_VIEW_ZOOM = 13;
+  const MAP_EVENT_WAVE_FRESH_MS = 15 * 60 * 1000;
   const INCIDENT_MOBILE_BREAKPOINT_PX = 980;
   const INCIDENT_OVERLAY_HISTORY_KEY = "__trainIncidentOverlay";
   const CHECKIN_RIDE_SETTLE_RETRIES = 4;
@@ -499,7 +500,7 @@
     const target = incidentMapTargetInfo(summary || id);
     if (target && target.type === "train") {
       return {
-        href: publicNetworkMapRoot(),
+        href: publicTrainMapRoot(target.trainInstanceId),
         markerKey: "",
       };
     }
@@ -572,9 +573,7 @@
     if (existingMarkerKey) {
       return existingMarkerKey;
     }
-    const parts = incidentIdParts((summary && summary.id) || nextIncidentId);
-    const subjectId = String((summary && summary.subjectId) || parts.subjectId || "").trim();
-    if (parts.scope === "train" && usesPublicTrainMap() && subjectId && state.mapData && state.mapData.train && state.mapData.train.id === subjectId) {
+    if (targetInfo && targetInfo.type === "train" && usesPublicTrainMap() && state.mapData && state.mapData.train && state.mapData.train.id === targetInfo.trainInstanceId) {
       const trainMarker = Array.from(mapController.trainMarkerKeys || [])[0] || "";
       if (trainMarker) {
         return trainMarker;
@@ -680,18 +679,11 @@
       return staticBundleState.indexes;
     }
     const stations = Array.isArray(staticBundleState.slices.stations) ? staticBundleState.slices.stations : [];
-    const trains = Array.isArray(staticBundleState.slices.trains) ? staticBundleState.slices.trains : [];
     const stops = Array.isArray(staticBundleState.slices.stops) ? staticBundleState.slices.stops : [];
-    const stationPasses = Array.isArray(staticBundleState.slices.stationPasses) ? staticBundleState.slices.stationPasses : [];
     const stationById = new Map();
-    const trainById = new Map();
     const stopsByTrain = new Map();
-    const passesByStation = new Map();
     stations.forEach((station) => {
       stationById.set(String(station.id || "").trim(), station);
-    });
-    trains.forEach((train) => {
-      trainById.set(String(train.id || "").trim(), train);
     });
     stops.forEach((stop) => {
       const trainId = String(stop.trainInstanceId || "").trim();
@@ -703,38 +695,14 @@
     Array.from(stopsByTrain.values()).forEach((items) => {
       items.sort((left, right) => Number(left.seq || 0) - Number(right.seq || 0));
     });
-    stationPasses.forEach((pass) => {
-      const stationId = String(pass.stationId || "").trim();
-      if (!passesByStation.has(stationId)) {
-        passesByStation.set(stationId, []);
-      }
-      passesByStation.get(stationId).push(pass);
-    });
-    Array.from(passesByStation.values()).forEach((items) => {
-      items.sort((left, right) => new Date(left.passAt || "").getTime() - new Date(right.passAt || "").getTime());
-    });
     staticBundleState.indexes = {
       manifest,
       stations,
-      trains,
       stops,
-      stationPasses,
       stationById,
-      trainById,
       stopsByTrain,
-      passesByStation,
     };
     return staticBundleState.indexes;
-  }
-
-  function bundleFreshnessGeneratedAt() {
-    if (cfg.bundleFreshness && cfg.bundleFreshness.generatedAt) {
-      return cfg.bundleFreshness.generatedAt;
-    }
-    if (staticBundleState.manifest && staticBundleState.manifest.generatedAt) {
-      return staticBundleState.manifest.generatedAt;
-    }
-    return "";
   }
 
   function currentBundleIdentity() {
@@ -766,46 +734,6 @@
 
   function resolvedScheduleMeta() {
     return withBundleSchedule(state.scheduleMeta || cfg.schedule || null);
-  }
-
-  function bundleDefaultStatus() {
-    return {
-      state: "NO_REPORTS",
-      confidence: "LOW",
-      uniqueReporters: 0,
-    };
-  }
-
-  function bundleDefaultTrainCard(train) {
-    return {
-      train: train,
-      status: bundleDefaultStatus(),
-      riders: 0,
-    };
-  }
-
-  function bundlePassAt(stop) {
-    return stop && (stop.departureAt || stop.arrivalAt) ? new Date(stop.departureAt || stop.arrivalAt) : null;
-  }
-
-  function bundleTrainsByWindow(trains, windowId, nowDate) {
-    const current = nowDate || new Date();
-    let start = new Date(current.getTime());
-    let end = new Date(current.getTime());
-    if (windowId === "now") {
-      start = new Date(current.getTime() - (15 * 60 * 1000));
-      end = new Date(current.getTime() + (15 * 60 * 1000));
-    } else if (windowId === "next_hour") {
-      end = new Date(current.getTime() + (60 * 60 * 1000));
-    } else {
-      start = new Date(current.getTime() - (30 * 60 * 1000));
-      end = new Date(current.getTime());
-      end.setHours(23, 59, 59, 0);
-    }
-    return (Array.isArray(trains) ? trains : []).filter((train) => {
-      const departureAt = new Date(train && train.departureAt || "");
-      return !Number.isNaN(departureAt.getTime()) && departureAt >= start && departureAt <= end;
-    }).slice().sort((left, right) => new Date(left.departureAt).getTime() - new Date(right.departureAt).getTime());
   }
 
   function normalizeStationQueryValue(value) {
@@ -845,22 +773,6 @@
     });
   }
 
-  function bundleStationTrainCard(indexes, pass) {
-    const train = indexes.trainById.get(String(pass.trainId || "").trim()) || null;
-    if (!train) {
-      return null;
-    }
-    const passAt = new Date(pass.passAt || "");
-    return {
-      trainCard: bundleDefaultTrainCard(train),
-      stationId: String(pass.stationId || "").trim(),
-      stationName: pass.stationName || "",
-      passAt: Number.isNaN(passAt.getTime()) ? "" : passAt.toISOString(),
-      sightingCount: 0,
-      sightingContext: [],
-    };
-  }
-
   function bundleRouteDestinations(indexes, originStationId, query) {
     const destinations = new Map();
     indexes.stopsByTrain.forEach((stops) => {
@@ -888,50 +800,6 @@
     return filterBundleStations(Array.from(destinations.values()), query);
   }
 
-  function bundleRouteTrainCards(indexes, originStationId, destinationStationId, nowDate) {
-    const current = nowDate || new Date();
-    const startTime = current.getTime() - (30 * 60 * 1000);
-    const endTime = current.getTime() + (18 * 60 * 60 * 1000);
-    const items = [];
-    indexes.stopsByTrain.forEach((stops, trainId) => {
-      let fromStop = null;
-      let toStop = null;
-      stops.forEach((stop) => {
-        const stationId = String(stop.stationId || "").trim();
-        if (!fromStop && stationId === originStationId) {
-          fromStop = stop;
-          return;
-        }
-        if (fromStop && !toStop && stationId === destinationStationId && Number(stop.seq || 0) > Number(fromStop.seq || 0)) {
-          toStop = stop;
-        }
-      });
-      if (!fromStop || !toStop) {
-        return;
-      }
-      const fromPassAt = bundlePassAt(fromStop);
-      const toPassAt = bundlePassAt(toStop);
-      if (!fromPassAt || Number.isNaN(fromPassAt.getTime()) || fromPassAt.getTime() < startTime || fromPassAt.getTime() > endTime) {
-        return;
-      }
-      const train = indexes.trainById.get(trainId) || null;
-      if (!train) {
-        return;
-      }
-      items.push({
-        trainCard: bundleDefaultTrainCard(train),
-        fromStationId: String(fromStop.stationId || "").trim(),
-        fromStationName: fromStop.stationName || "",
-        toStationId: String(toStop.stationId || "").trim(),
-        toStationName: toStop.stationName || "",
-        fromPassAt: fromPassAt.toISOString(),
-        toPassAt: toPassAt && !Number.isNaN(toPassAt.getTime()) ? toPassAt.toISOString() : "",
-      });
-    });
-    items.sort((left, right) => new Date(left.fromPassAt).getTime() - new Date(right.fromPassAt).getTime());
-    return items;
-  }
-
   async function resolveBundlePath(path, options) {
     if (!bundleEnabled()) {
       return null;
@@ -940,74 +808,7 @@
     if (!spec) {
       return null;
     }
-    const nowDate = new Date();
     const schedule = resolvedScheduleMeta();
-    if (spec.kind === "public_dashboard") {
-      const indexes = await ensureBundleIndexes(["trains"]);
-      if (!indexes) return null;
-      const items = bundleTrainsByWindow(indexes.trains, "today", nowDate).map((train) => ({
-        train: train,
-        status: bundleDefaultStatus(),
-        timeline: [],
-        stationSightings: [],
-      }));
-      return {
-        generatedAt: bundleFreshnessGeneratedAt(),
-        trains: spec.limit > 0 ? items.slice(0, spec.limit) : items,
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "public_service_day_trains") {
-      const indexes = await ensureBundleIndexes(["trains"]);
-      if (!indexes) return null;
-      const items = indexes.trains.slice().sort((left, right) => {
-        return new Date(left.departureAt).getTime() - new Date(right.departureAt).getTime();
-      }).map((train) => ({
-        train: train,
-        status: bundleDefaultStatus(),
-        timeline: [],
-        stationSightings: [],
-      }));
-      return {
-        generatedAt: bundleFreshnessGeneratedAt(),
-        trains: items,
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "public_network_map") {
-      const indexes = await ensureBundleIndexes(["stations"]);
-      if (!indexes) return null;
-      return {
-        stations: indexes.stations.filter((station) => typeof station.latitude === "number" && typeof station.longitude === "number"),
-        recentSightings: [],
-        sameDaySightings: [],
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "public_train" || spec.kind === "train_stops" || spec.kind === "public_train_stops") {
-      const indexes = await ensureBundleIndexes(["trains", "stops"]);
-      if (!indexes) return null;
-      const train = indexes.trainById.get(String(spec.trainId || "").trim()) || null;
-      if (!train) {
-        return null;
-      }
-      if (spec.kind === "public_train") {
-        return {
-          train: train,
-          status: bundleDefaultStatus(),
-          timeline: [],
-          stationSightings: [],
-          schedule: schedule,
-        };
-      }
-      return {
-        trainCard: bundleDefaultTrainCard(train),
-        train: train,
-        stops: indexes.stopsByTrain.get(String(spec.trainId || "").trim()) || [],
-        stationSightings: [],
-        schedule: schedule,
-      };
-    }
     if (spec.kind === "public_station_search" || spec.kind === "station_search") {
       const indexes = await ensureBundleIndexes(["stations"]);
       if (!indexes) return null;
@@ -1016,88 +817,11 @@
         schedule: schedule,
       };
     }
-    if (spec.kind === "public_station_departures" || spec.kind === "station_departures" || spec.kind === "station_sighting_destinations") {
-      const indexes = await ensureBundleIndexes(["stations", "trains", "stops", "stationPasses"]);
-      if (!indexes) return null;
-      const stationId = String(spec.stationId || "").trim();
-      const station = indexes.stationById.get(stationId) || null;
-      if (!station) {
-        return null;
-      }
-      if (spec.kind === "station_sighting_destinations") {
-        return {
-          stations: bundleRouteDestinations(indexes, stationId, ""),
-          schedule: schedule,
-        };
-      }
-      const passes = indexes.passesByStation.get(stationId) || [];
-      if (spec.kind === "public_station_departures") {
-        let lastDeparture = null;
-        const upcoming = [];
-        const startOfDay = new Date(nowDate.getTime());
-        startOfDay.setHours(0, 0, 0, 0);
-        const endOfDay = new Date(nowDate.getTime());
-        endOfDay.setHours(23, 59, 59, 999);
-        passes.forEach((pass) => {
-          const passAt = new Date(pass.passAt || "");
-          if (Number.isNaN(passAt.getTime()) || passAt < startOfDay || passAt > endOfDay) {
-            return;
-          }
-          const card = bundleStationTrainCard(indexes, pass);
-          if (!card) {
-            return;
-          }
-          if (passAt < nowDate) {
-            lastDeparture = card;
-            return;
-          }
-          upcoming.push(card);
-        });
-        return {
-          station: station,
-          lastDeparture: lastDeparture,
-          upcoming: upcoming.slice(0, 8),
-          recentSightings: [],
-          schedule: schedule,
-        };
-      }
-      const start = nowDate.getTime() - (2 * 60 * 60 * 1000);
-      const end = nowDate.getTime() + (2 * 60 * 60 * 1000);
-      const trains = passes.map((pass) => {
-        const passAt = new Date(pass.passAt || "");
-        if (Number.isNaN(passAt.getTime()) || passAt.getTime() < start || passAt.getTime() > end) {
-          return null;
-        }
-        return bundleStationTrainCard(indexes, pass);
-      }).filter(Boolean);
-      return {
-        station: station,
-        trains: trains,
-        recentSightings: [],
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "window_trains") {
-      const indexes = await ensureBundleIndexes(["trains"]);
-      if (!indexes) return null;
-      return {
-        trains: bundleTrainsByWindow(indexes.trains, spec.windowId, nowDate).map((train) => bundleDefaultTrainCard(train)),
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "route_destinations") {
+    if (spec.kind === "station_sighting_destinations" || spec.kind === "route_destinations") {
       const indexes = await ensureBundleIndexes(["stations", "stops"]);
       if (!indexes) return null;
       return {
-        stations: bundleRouteDestinations(indexes, String(spec.originStationId || "").trim(), spec.query),
-        schedule: schedule,
-      };
-    }
-    if (spec.kind === "route_trains") {
-      const indexes = await ensureBundleIndexes(["stations", "trains", "stops"]);
-      if (!indexes) return null;
-      return {
-        trains: bundleRouteTrainCards(indexes, String(spec.originStationId || "").trim(), String(spec.destinationStationId || "").trim(), nowDate),
+        stations: bundleRouteDestinations(indexes, String(spec.stationId || spec.originStationId || "").trim(), spec.query),
         schedule: schedule,
       };
     }
@@ -1705,6 +1429,7 @@
 	    app_station_report_action: "Controle sighted",
 	    app_station_report_success: "Controle sighting accepted.",
     app_location_report_title: "Report location",
+    app_incident_area_title: "Inspection near this location",
     app_location_report_description_label: "What is the location?",
     app_location_report_description_placeholder: "Short description",
     app_location_report_radius_label: "Radius",
@@ -1753,9 +1478,13 @@
     app_public_incidents_vote_ongoing: "Still there",
     app_public_incidents_vote_cleared: "Not present",
     app_public_incidents_comment_label: "Comment anonymously",
+    app_incident_platform_sighting: "Platform sighting",
+    app_incident_platform_sighting_to: "Platform sighting to %s",
+    app_incident_anonymous: "Anonymous",
     app_public_incidents_comment_placeholder: "Add a short anonymous update",
     app_public_incidents_comment_submit: "Post comment",
     app_public_incidents_vote_saved: "Vote saved.",
+    app_public_incidents_vote_cooldown: "Wait before changing this vote again.",
     app_public_incidents_comment_saved: "Comment posted.",
     app_public_incidents_auth_hint: "Open from Telegram or an active app session to vote and comment.",
     app_public_incidents_activity: "Activity",
@@ -1773,7 +1502,9 @@
     app_public_station_selected: "Selected station",
     app_public_station_last: "Last departure",
     app_public_station_upcoming: "Upcoming departures",
-    app_public_station_empty: "No departures found for this station today.",
+    app_station_window_title: "Nearby departures",
+    app_station_window_note: "Showing departures from two hours ago through the next two hours.",
+    app_station_window_empty: "No departures within two hours before or after now.",
     app_public_station_last_empty: "No earlier departures today.",
     app_public_station_upcoming_empty: "No upcoming departures today.",
     app_public_station_search_success: "Station results updated.",
@@ -2127,7 +1858,6 @@
   }
 
 		  async function bootMiniAppAnonymousFallback(options = {}) {
-	    await ensurePublicSession();
 	    state.miniAppPublicMapFallback = true;
 	    return bootPublicNetworkMapSurface(options);
 	  }
@@ -2287,11 +2017,6 @@
         state.publicIncidentsLoading = true;
         renderPublicIncidents();
         await refreshPublicIncidents();
-        if (state.publicIncidentSelectedId) {
-          await refreshPublicIncidentDetail(state.publicIncidentSelectedId);
-        } else if (state.publicIncidents[0] && !state.publicIncidentMobileLayout) {
-          await refreshPublicIncidentDetail(state.publicIncidents[0].id);
-        }
         handleCurrentViewLoadSuccess();
       } catch (err) {
         if (handleInitialLoadError(err)) {
@@ -2526,8 +2251,7 @@
     const tg = telegramWebApp();
     const initData = telegramInitData();
     if (!initData) {
-      state.authenticated = false;
-      return;
+      return ensurePublicSession();
     }
     if (tg) {
       tg.ready();
@@ -3510,7 +3234,9 @@
         state.publicIncidentDetail = null;
         state.publicIncidentDetailOpen = false;
       }
-      if (!state.publicIncidentSelectedId && nextFirstId && !state.publicIncidentMobileLayout) {
+      if (state.publicIncidentSelectedId && (!state.publicIncidentDetail || state.publicIncidentDetail.summary?.id !== state.publicIncidentSelectedId)) {
+        await refreshPublicIncidentDetail(state.publicIncidentSelectedId);
+      } else if (!state.publicIncidentSelectedId && nextFirstId && !state.publicIncidentMobileLayout) {
         await refreshPublicIncidentDetail(nextFirstId);
       }
       if (!nextIncidents.length) {
@@ -3879,14 +3605,17 @@
     const payload = await api(`/stations/${encodeURIComponent(stationId)}/departures`);
     state.selectedStation = payload && payload.station ? payload.station : null;
     state.stationDepartures = Array.isArray(payload.trains) ? payload.trains : [];
-    state.checkInDropdownOpen = false;
     state.stationRecentSightings = Array.isArray(payload.recentSightings) ? payload.recentSightings : [];
-    state.stationSightingDestinations = [];
     const sameStation = Boolean(state.selectedStation && state.selectedStation.id === previousStationId);
-    state.stationSightingDestinationId = "";
-    state.selectedSightingTrainId = "";
-    state.selectedCheckInTrainId = sameStation ? state.selectedCheckInTrainId : "";
-    state.expandedStationContextTrainId = "";
+    const trainIds = new Set(state.stationDepartures.map((item) => item.trainCard.train.id));
+    ["selectedSightingTrainId", "selectedCheckInTrainId", "expandedStationContextTrainId"].forEach((key) => {
+      if (!sameStation || !trainIds.has(state[key])) state[key] = "";
+    });
+    if (!sameStation) {
+      state.checkInDropdownOpen = false;
+      state.stationSightingDestinationId = "";
+      state.stationSightingDestinations = [];
+    }
     if (state.authenticated && state.selectedStation && state.selectedStation.id) {
       try {
         await fetchStationSightingDestinations(state.selectedStation.id);
@@ -4753,14 +4482,11 @@
     }
 
     await fetchStationDepartures(state.selectedStation.id);
-    await refreshNetworkMapData(true);
+    await refreshAfterLocationReport();
     if (payload.event && payload.event.matchedTrainInstanceId) {
       const matchedTrainId = payload.event.matchedTrainInstanceId;
       if (state.selectedTrain && state.selectedTrain.trainCard && state.selectedTrain.trainCard.train.id === matchedTrainId) {
         state.selectedTrain = await api(`/trains/${encodeURIComponent(matchedTrainId)}/status`);
-      }
-      if (state.mapTrainId === matchedTrainId) {
-        await refreshMapData(matchedTrainId);
       }
     }
     state.statusText = message;
@@ -5210,7 +4936,10 @@
       payload = {};
     }
     if (!response.ok) {
-      const err = new Error(payload.error || t("app_status_error_with_code", response.status));
+      const message = payload.error === "wait before changing this vote again"
+        ? t("app_public_incidents_vote_cooldown")
+        : payload.error || t("app_status_error_with_code", response.status);
+      const err = new Error(message);
       err.status = response.status;
       throw err;
     }
@@ -5653,6 +5382,12 @@
     return 1 - Math.pow(-2 * progress + 2, 3) / 2;
   }
 
+  function eventWaveExpiry(timestamps) {
+    const now = Date.now();
+    const latest = Math.max(0, ...timestamps.map((value) => Date.parse(value)).filter((at) => Number.isFinite(at) && at <= now));
+    return latest ? latest + MAP_EVENT_WAVE_FRESH_MS : 0;
+  }
+
   function createMapController() {
     return {
       map: null,
@@ -5695,6 +5430,53 @@
       pendingDocumentTap: null,
       lastTapProxyAt: 0,
       lastMarkerInteractionAt: 0,
+      eventWaveTimer: 0,
+      eventWaveVisibilityHandler: null,
+
+      stopEventWaves() {
+        clearTimeout(this.eventWaveTimer);
+        this.eventWaveTimer = 0;
+        if (this.eventWaveVisibilityHandler) {
+          document.removeEventListener("visibilitychange", this.eventWaveVisibilityHandler);
+          this.eventWaveVisibilityHandler = null;
+        }
+      },
+
+      syncEventWaves() {
+        clearTimeout(this.eventWaveTimer);
+        this.eventWaveTimer = 0;
+        if (!this.map || !this.containerId) return;
+        if (!this.eventWaveVisibilityHandler) {
+          this.eventWaveVisibilityHandler = () => this.syncEventWaves();
+          document.addEventListener("visibilitychange", this.eventWaveVisibilityHandler);
+        }
+        const now = Date.now();
+        const visible = document.visibilityState !== "hidden";
+        const seen = new Set();
+        let nextExpiry = Infinity;
+        this.markerState.forEach((entry) => {
+          const item = entry.item;
+          const element = entry.marker && typeof entry.marker.getElement === "function" ? entry.marker.getElement() : null;
+          if (!element) return;
+          const active = Boolean(visible && item.eventWaveKey && item.eventWaveUntil > now && !seen.has(item.eventWaveKey));
+          if (active && !entry.eventWaveActive) {
+            element.style.setProperty("--event-wave-delay", `-${now % 5000}ms`);
+          }
+          entry.eventWaveActive = active;
+          element.classList.toggle("map-event-wave", active);
+          if (!active) return;
+          seen.add(item.eventWaveKey);
+          const anchor = item.kind === "tag"
+            ? [28 - (item.pixelOffset || [0, 0])[0], 17 - (item.pixelOffset || [0, 0])[1]]
+            : item.iconAnchor || [60, 27];
+          element.style.setProperty("--event-wave-x", `${anchor[0]}px`);
+          element.style.setProperty("--event-wave-y", `${anchor[1]}px`);
+          nextExpiry = Math.min(nextExpiry, item.eventWaveUntil);
+        });
+        if (Number.isFinite(nextExpiry)) {
+          this.eventWaveTimer = setTimeout(() => this.syncEventWaves(), nextExpiry - now);
+        }
+      },
 
       clearScheduledLayout() {
         if (this.layoutFrame && typeof window.cancelAnimationFrame === "function") {
@@ -6253,8 +6035,8 @@
           zoomControl: true,
           closePopupOnClick: true,
         });
-        this.tileLayer = window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-          attribution: "&copy; OpenStreetMap contributors",
+        this.tileLayer = window.L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
           maxZoom: 19,
         }).addTo(map);
         this.baseLayer = window.L.layerGroup().addTo(map);
@@ -6315,6 +6097,7 @@
       },
 
       detach() {
+        this.stopEventWaves();
         this.clearScheduledLayout();
         this.disconnectResizeObserver();
         this.containerEl = null;
@@ -6441,6 +6224,7 @@
       },
 
       reset() {
+        this.stopEventWaves();
         this.clearScheduledLayout();
         this.disconnectResizeObserver();
         if (this.map && typeof this.map.remove === "function") {
@@ -6542,6 +6326,7 @@
         this.modelKey = nextModelKey;
         this.viewKey = config.viewKey;
         if (!viewChanged && !modelChanged) {
+          this.syncEventWaves();
           this.scheduleLayout({
             shouldFit: false,
             shouldRestore: false,
@@ -6654,6 +6439,7 @@
         } finally {
           this.syncingLayers = false;
         }
+        this.syncEventWaves();
         if (this.focusedEntityKey && !this.markerEntryByEntityKey(this.focusedEntityKey)) {
           this.focusedEntityKey = "";
         }
@@ -6819,7 +6605,7 @@
           }
         }
         if ((item.kind === "html" || item.kind === "tag") && typeof marker.setIcon === "function") {
-          marker.setIcon(this.buildMarkerIcon(item));
+          marker.setIcon(this.buildMarkerIcon(item, entry.eventWaveActive));
           applyTrainMarkerStateTransition(marker, previousItem, item);
         }
         if (item.kind === "circle") {
@@ -7031,10 +6817,11 @@
         marker.on("touchend", triggerInteraction);
       },
 
-      buildMarkerIcon(item) {
+      buildMarkerIcon(item, eventWaveActive) {
+        const waveClass = eventWaveActive ? " map-event-wave" : "";
         if (item.kind === "html") {
           return window.L.divIcon({
-            className: item.className || "map-html-marker",
+            className: (item.className || "map-html-marker") + waveClass,
             html: item.html || "",
             iconSize: item.iconSize || [120, 54],
             iconAnchor: item.iconAnchor || [60, 27],
@@ -7044,7 +6831,7 @@
         if (item.kind === "tag") {
           const tagOffset = item.pixelOffset || [0, 0];
           return window.L.divIcon({
-            className: "map-tag-marker",
+            className: "map-tag-marker" + waveClass,
             html: `<span class="map-tag ${escapeAttr(item.bucketClass)}">${escapeHtml(item.tagText)}</span>`,
             iconSize: [56, 34],
             iconAnchor: [28 - tagOffset[0], 17 - tagOffset[1]],
@@ -7188,6 +6975,7 @@
       const popupHTML = buildTrainStopPopupHTML(stop, entry.index, mapData, stopLiveItems, hasLiveTrainMarker);
       return buildStationMarkerConfig({
         markerKey,
+        stationId: stop.stationId,
         name: stop.stationName || stop.stationId || "",
         latLng: entry.latLng,
         sightings: stopSightings(stop, mapData),
@@ -7213,6 +7001,7 @@
       });
       return buildStationMarkerConfig({
         markerKey: networkStationMarkerKey(station),
+        stationId: station.id,
         name: station.name || station.id || "",
         latLng: entry.latLng,
         sightings: bucket.sightings,
@@ -7671,6 +7460,8 @@
       kind: "html",
       className: "map-html-marker",
       markerKey: markerKey,
+      eventWaveKey: `station:${options.stationId || stationKeyValue(options.name)}`,
+      eventWaveUntil: eventWaveExpiry(sightings.map((item) => item.createdAt).concat(incidents.map((item) => item.lastReportAt))),
       latLng: options.latLng,
       html: buildStationMarkerHTML(options.name, sightings.length, liveItems, profile, incidents.length),
       incidentIds: incidents.map((item) => item.id).filter(Boolean),
@@ -7697,6 +7488,9 @@
       kind: "html",
       className: "map-html-marker",
       markerKey: item.markerKey || "",
+      eventWaveKey: `train:${item.trainId || item.markerKey}`,
+      eventWaveUntil: eventWaveExpiry([item.status && item.status.lastReportAt]
+        .concat(incidents.map((incident) => incident.lastReportAt), (item.sightings || []).map((sighting) => sighting.createdAt))),
       gpsClass: gpsClass,
       crewActive: crewActive,
       latLng: pointToLatLng(item.external.position),
@@ -8084,7 +7878,7 @@
       ? `${statusSummary(item.status)}${typeof item.status.uniqueReporters === "number" && item.status.uniqueReporters > 0 ? ` • ${item.status.uniqueReporters} crew` : ""}`
       : "";
     const recentReports = Array.isArray(item.timeline) && item.timeline.length
-      ? item.timeline.slice(0, 3).map((entry) => `${clockLabel(entry.at)} ${signalLabel(entry.eventLabel || entry.signal)}`)
+      ? item.timeline.slice(0, 3).map((entry) => `${clockLabel(entry.at)} ${localizedIncidentActivityName(signalLabel(entry.eventLabel || entry.signal))}`)
       : [];
     const recentSightings = Array.isArray(item.sightings) && item.sightings.length
       ? item.sightings.slice(0, 3).map((entry) => `${entry.stationName || entry.stationId} • ${relativeAgo(entry.createdAt)}`)
@@ -8462,7 +8256,7 @@
   }
 
   function incidentActivityLabel(item) {
-    const title = String((item && item.subjectName) || (item && item.lastActivityName) || (item && item.lastReportName) || t("app_section_incidents")).trim();
+    const title = String(incidentSubjectName(item) || (item && item.lastActivityName) || (item && item.lastReportName) || t("app_section_incidents")).trim();
     const at = (item && (item.lastActivityAt || item.lastReportAt)) || "";
     return at ? `${title} • ${relativeAgo(at)}` : title;
   }
@@ -8575,6 +8369,8 @@
         kind: "tag",
         latLng: [latitude, longitude],
         markerKey,
+        eventWaveKey: `area:${item.id}`,
+        eventWaveUntil: eventWaveExpiry([item.lastReportAt]),
         incidentIds: [item.id],
         pixelOffset: sightingPixelOffset(index),
         zIndexOffset: 900 - index,
@@ -8624,23 +8420,26 @@
   }
 
   function sightingPopupHTML(item) {
-    const details = [
-      `<strong>${escapeHtml(item.stationName || item.stationId || "")}</strong>`,
-    ];
+    const details = [];
     if (item.destinationStationName) {
       details.push(`${escapeHtml(t("app_map_popup_destination"))}: ${escapeHtml(item.destinationStationName)}`);
     }
     details.push(`${escapeHtml(t("app_map_popup_status"))}: ${escapeHtml(item.matchedTrainInstanceId ? t("app_station_sighting_matched") : t("app_station_sighting_unmatched"))}`);
     details.push(`${escapeHtml(t("app_map_popup_age"))}: ${escapeHtml(relativeAgo(item.createdAt))}`);
     details.push(`${escapeHtml(t("app_map_popup_seen_at"))}: ${escapeHtml(formatDateTime(item.createdAt))}`);
-    return details.join("<br>");
+    return buildPopupCard({
+      title: item.stationName || item.stationId || "",
+      sections: [details.join("<br>")],
+      actionsHTML: renderPopupActionButton(stationPopupReportAction(null, item))
+        + incidentPopupActionsHTML(activeStationIncidentsFor(null, item)),
+    });
   }
 
   function areaIncidentPopupHTML(item) {
     const location = item && item.location ? item.location : {};
     const radius = Math.max(0, Math.round(Number(location.radiusMeters) || 0));
     const details = [
-      `<strong>${escapeHtml(item.subjectName || location.description || t("app_location_report_title"))}</strong>`,
+      `<strong>${escapeHtml(incidentSubjectName(item))}</strong>`,
     ];
     if (radius > 0) {
       details.push(`${escapeHtml(t("app_map_popup_status"))}: ${escapeHtml(radius + " m")}`);
@@ -9655,6 +9454,8 @@
   }
 
   function localizedIncidentActivityName(name) {
+    const destination = String(name || "").trim().match(/^platform sighting to (.+)$/i);
+    if (destination) return t("app_incident_platform_sighting_to", destination[1]);
     switch (String(name || "").trim().toLowerCase()) {
       case "inspection started":
         return signalLabel("INSPECTION_STARTED");
@@ -9662,9 +9463,31 @@
         return signalLabel("INSPECTION_IN_MY_CAR");
       case "inspection ended":
         return signalLabel("INSPECTION_ENDED");
+      case "inspection near this location":
+        return t("app_incident_area_title");
+      case "inspection at station":
+        return t("app_station_report_action");
+      case "platform sighting":
+        return t("app_incident_platform_sighting");
+      case "comment":
+        return t("app_public_incidents_comment_label");
+      case "still there":
+        return t("app_public_incidents_vote_ongoing");
+      case "cleared":
+      case "not present":
+      case "no longer there":
+        return t("app_public_incidents_vote_cleared");
       default:
         return name || "";
     }
+  }
+
+  function incidentSubjectName(item) {
+    return item && item.scope === "area" ? t("app_incident_area_title") : (item && item.subjectName) || "";
+  }
+
+  function localizedIncidentActorName(name) {
+    return name === "Anonymous" ? t("app_incident_anonymous") : name || "";
   }
 
   function renderIncidentQuickVoteButtons(item) {
@@ -9684,12 +9507,12 @@
     const active = state.publicIncidentSelectedId === item.id;
     const activityAt = item.lastActivityAt || item.lastReportAt;
     const activityName = localizedIncidentActivityName(item.lastActivityName || item.lastReportName || "");
-    const activityActor = item.lastActivityActor || item.lastReporter || "";
+    const activityActor = localizedIncidentActorName(item.lastActivityActor || item.lastReporter);
     return `
       <article class="detail-card incident-card ${active ? "selected-train-card" : ""}">
         <button class="incident-summary-button" data-action="open-incident" data-incident-id="${escapeAttr(item.id)}">
           <div class="station-card-header">
-            <h3>${escapeHtml(item.subjectName || "Incident")}</h3>
+            <h3>${escapeHtml(incidentSubjectName(item) || t("app_section_incidents"))}</h3>
             <span class="station-selected-pill">${escapeHtml(activityAt ? relativeAgo(activityAt) : "")}</span>
           </div>
           <div class="meta">
@@ -9711,7 +9534,7 @@
       <article class="favorite-card">
         <h3>${escapeHtml(localizedIncidentActivityName(item.name || ""))}</h3>
         <div class="meta">
-          <span>${escapeHtml(item.nickname || "")}</span>
+          <span>${escapeHtml(localizedIncidentActorName(item.nickname))}</span>
           <span>${escapeHtml(relativeAgo(item.createdAt))}</span>
         </div>
         ${item.detail ? `<p>${escapeHtml(item.detail)}</p>` : ""}
@@ -9722,7 +9545,7 @@
   function renderIncidentComment(item) {
     return `
       <article class="favorite-card">
-        <h3>${escapeHtml(item.nickname || "")}</h3>
+        <h3>${escapeHtml(localizedIncidentActorName(item.nickname))}</h3>
         <div class="meta">
           <span>${escapeHtml(relativeAgo(item.createdAt))}</span>
         </div>
@@ -9747,13 +9570,13 @@
     const events = Array.isArray(detail.events) ? detail.events : [];
     const activityAt = detail.summary.lastActivityAt || detail.summary.lastReportAt;
     const activityName = localizedIncidentActivityName(detail.summary.lastActivityName || detail.summary.lastReportName || "");
-    const activityActor = detail.summary.lastActivityActor || detail.summary.lastReporter || "";
+    const activityActor = localizedIncidentActorName(detail.summary.lastActivityActor || detail.summary.lastReporter);
     const voteValue = votes.userValue || "";
     const draft = incidentCommentDraft(detail.summary.id);
     return `
       <div class="stack">
         ${mobileClose}
-        <div class="badge">${escapeHtml(detail.summary.subjectName || "")}</div>
+        <div class="badge">${escapeHtml(incidentSubjectName(detail.summary))}</div>
         <section class="detail-card">
           <h3>${escapeHtml(activityName)}</h3>
           <div class="meta">
@@ -10191,7 +10014,7 @@
     if (state.tab === "stations") {
       return renderStationsTab();
     }
-    return renderProfileTab(settings);
+    return renderSettingsTab(settings);
   }
 
   function selectedTrainSidebarIncludesActions() {
@@ -10386,12 +10209,12 @@
       ? `${t("app_public_station_selected")}: ${state.selectedStation.name || state.selectedStation.id}`
       : t("app_public_station_prompt");
     const departuresEmptyText = state.selectedStation
-      ? t("app_public_station_empty")
+      ? t("app_station_window_empty")
       : t("app_public_station_prompt");
     return `
       <div class="stack">
         <h2>${escapeHtml(t("app_open_station_search"))}</h2>
-        <p class="panel-subtitle">${escapeHtml(t("app_public_station_note"))}</p>
+        <p class="panel-subtitle">${escapeHtml(t("app_station_window_note"))}</p>
         <section class="detail-card">
           <div class="form-grid">
             <div class="field">
@@ -10409,7 +10232,7 @@
         <section class="detail-card">
           <div class="badge">${escapeHtml(selectedLabel)}</div>
           <div class="divider"></div>
-          <h3>${escapeHtml(t("app_public_station_upcoming"))}</h3>
+          <h3>${escapeHtml(t("app_station_window_title"))}</h3>
           <div class="card-list">${departures.length ? departures.map((item) => renderStationDepartureCard(item, "browse")).join("") : `<div class="empty">${escapeHtml(departuresEmptyText)}</div>`}</div>
         </section>
         ${renderStationSightingComposer()}
@@ -10670,7 +10493,7 @@
         <h2>${escapeHtml(t("settings_title"))}</h2>
         <div class="form-grid">
           <div class="field">
-            <label>${escapeHtml(t("settings_alerts_label"))}</label>
+            <label for="settings-alerts">${escapeHtml(t("settings_alerts_label"))}</label>
             <input id="settings-alerts" type="checkbox" ${settings.alertsEnabled ? "checked" : ""}>
           </div>
           <div class="field">
@@ -10680,14 +10503,14 @@
             </div>
           </div>
           <div class="field">
-            <label>${escapeHtml(t("settings_alert_style_label"))}</label>
+            <label for="settings-style">${escapeHtml(t("settings_alert_style_label"))}</label>
             <select id="settings-style">
               <option value="DETAILED" ${settings.alertStyle === "DETAILED" ? "selected" : ""}>${escapeHtml(t("settings_style_detailed_option"))}</option>
               <option value="DISCREET" ${settings.alertStyle === "DISCREET" ? "selected" : ""}>${escapeHtml(t("settings_style_discreet_option"))}</option>
             </select>
           </div>
           <div class="field">
-            <label>${escapeHtml(t("settings_language_label"))}</label>
+            <label for="settings-language">${escapeHtml(t("settings_language_label"))}</label>
             <select id="settings-language">
               <option value="EN" ${settings.language === "EN" ? "selected" : ""}>EN</option>
               <option value="LV" ${settings.language === "LV" ? "selected" : ""}>LV</option>
@@ -10697,15 +10520,6 @@
             <button class="primary" id="save-settings">${escapeHtml(t("btn_confirm"))}</button>
           </div>
         </div>
-      </div>
-    `;
-  }
-
-  function renderProfileTab(settings) {
-    return `
-      <div class="stack">
-        <h2>${escapeHtml(t("settings_title"))}</h2>
-        ${renderSettingsTab(settings)}
       </div>
     `;
   }
@@ -12132,6 +11946,7 @@
         shouldShowSightingTags,
         buildStationMarkerHTML,
         buildLiveTrainMarkerHTML,
+        buildLiveTrainMarkerConfig,
         buildTrainPopupHTML,
         liveTrainGpsClass,
         mapReportsEnabled,
@@ -12256,10 +12071,7 @@
           }
           return renderMiniNetworkMapContent();
         },
-        renderSettingsTab(settings, messages) {
-          state.messages = Object.assign({}, fallbackMessages, messages || {});
-          return renderSettingsTab(settings || {});
-        },
+        renderMiniMain,
         resolveTrainPopupAction,
         handleMapPopupAction,
         showToast,
@@ -12268,6 +12080,7 @@
         setActionButtonBusy,
         submitReport,
         submitStationReport,
+        submitStationSighting,
         submitLocationReport,
         submitIncidentVote,
         submitIncidentComment,
@@ -12275,6 +12088,7 @@
         checkoutRouteCheckIn,
         renderRouteCheckInMenuHTML,
         api,
+        fetchStationDepartures,
         publicApi,
         fetchSpacetimePath,
         usesStrictSpacetimePath,

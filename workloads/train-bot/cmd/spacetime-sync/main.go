@@ -111,7 +111,7 @@ func run(ctx context.Context, stdout io.Writer, cfg syncConfig, loc *time.Locati
 		loc,
 		false,
 	)
-	stateStore := store.NewSpacetimeStore(syncer)
+	stateStore := store.NewSpacetimeStore(syncer, loc)
 	if err := stateStore.PublishRuntimeConfig(ctx, cfg.scraperDailyHour); err != nil {
 		return fmt.Errorf("publish runtime config: %w", err)
 	}

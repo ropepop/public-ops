@@ -46,6 +46,7 @@
       publicIncidentListScrollY: 0,
       publicIncidentMobileLayout: false,
       publicIncidentCommentDrafts: {},
+      publicIncidentCommentPending: false,
       publicIncidentVoteSelections: {},
       authenticated: false,
       authState: "unknown",
@@ -68,6 +69,8 @@
       markers: new Map(),
       vehicleMarkers: new Map(),
       areaLayers: new Map(),
+      areaWaveMarkers: new Map(),
+      eventWaveTimer: null,
       areaDraftLayer: null,
       pendingAreaReport: null,
       areaCreateSuggestion: null,
@@ -96,6 +99,7 @@
   }
 
   function resetStateForTest(overrides) {
+    stopEventWaveTimer();
     if (state.liveTransportHeartbeatTimer) {
       clearInterval(state.liveTransportHeartbeatTimer);
     }
@@ -957,6 +961,7 @@
 
   function handleLiveTransportPageHidden(options) {
     var client = state.liveTransportClient;
+    stopEventWaveTimer();
     stopLiveTransportHeartbeat();
     stopLiveMapRefreshTimer();
     stopIncidentFeedRefreshTimer();
@@ -971,6 +976,7 @@
     if (!documentVisible()) {
       return Promise.resolve(null);
     }
+    refreshEventWaves();
     if (!liveTransportRealtimeEnabled()) {
       if (liveTransportPageEnabled()) {
         startLiveTransportHeartbeat();
@@ -2363,6 +2369,10 @@
       element = marker._icon;
     }
     applyMapIconStyles(element);
+    if (element && typeof element.setAttribute === "function" && marker.options.title) {
+      element.setAttribute("aria-label", marker.options.title);
+      element.setAttribute("title", marker.options.title);
+    }
   }
 
   function buildMapMarkerIcon(spec) {
@@ -2414,7 +2424,7 @@
     return null;
   }
 
-  function setMarkerIconSpec(marker, spec) {
+  function setMarkerIconSpec(marker, spec, label) {
     if (!marker || !spec) {
       return;
     }
@@ -2425,6 +2435,7 @@
       marker.options = {};
     }
     marker.options.mapIconMetrics = spec.metrics || null;
+    marker.options.title = label;
     applyMarkerIconStyles(marker);
   }
 
@@ -3562,6 +3573,11 @@
       return;
     }
     state.map = root.L.map("map", { zoomControl: true }).setView([defaultCenter.lat, defaultCenter.lng], defaultCenter.zoom);
+    state.map.on("unload", function () {
+      stopEventWaveTimer();
+      state.areaWaveMarkers.clear();
+      state.map = null;
+    });
     root.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: '&copy; OpenStreetMap contributors',
       maxZoom: 19,
@@ -5155,6 +5171,7 @@
           visibleHeightMeters: visibleHeightMeters,
         });
         var iconState = cachedMapMarkerIcon(spec, state.stopIconCache);
+        var label = "Pietura: " + displayStopName(stop);
         if (!marker) {
           if (!root.L || typeof root.L.marker !== "function") {
             return;
@@ -5168,7 +5185,7 @@
             }
             handleMapEntityClick(stopMapEntity(stop.id));
           });
-          setMarkerIconSpec(marker, spec);
+          setMarkerIconSpec(marker, spec, label);
           marker.addTo(state.map);
           applyMarkerIconStyles(marker);
           state.markers.set(stop.id, marker);
@@ -5179,7 +5196,7 @@
           if (typeof marker.setIcon === "function" && iconState.icon && marker.__satiksmeRenderKey !== iconState.key) {
             marker.setIcon(iconState.icon);
           }
-          setMarkerIconSpec(marker, spec);
+          setMarkerIconSpec(marker, spec, label);
         }
         nextVisibleStopIDs.add(stop.id);
       }
@@ -5203,6 +5220,7 @@
     if (selectedStopRemoved) {
       state.selectedStop = null;
     }
+    refreshEventWaves();
     renderMapDetailOverlay();
   }
 
@@ -5390,6 +5408,7 @@
         return;
       }
       nextIds.add(vehicle.id);
+      var label = modeAndRouteLabel(vehicle.mode, vehicle.routeLabel) + (vehicle.destination ? ", " + vehicle.destination : "");
       if (!state.vehicleMarkers.has(vehicle.id)) {
         var createSpec = buildVehicleMarkerSpec(vehicle, {
           zoom: zoom,
@@ -5405,7 +5424,7 @@
           }
           handleMapEntityClick(vehicleMapEntity(vehicle.id));
         });
-        setMarkerIconSpec(marker, createSpec);
+        setMarkerIconSpec(marker, createSpec, label);
         marker.addTo(state.map);
         applyMarkerIconStyles(marker);
         state.vehicleMarkers.set(vehicle.id, {
@@ -5433,7 +5452,7 @@
       if (typeof entry.marker.setIcon === "function" && entry.marker.__satiksmeRenderKey !== iconState.key) {
         entry.marker.setIcon(iconState.icon);
       }
-      setMarkerIconSpec(entry.marker, spec);
+      setMarkerIconSpec(entry.marker, spec, label);
       animateVehicleMarkerTo(entry, vehicle);
     });
     state.vehicleMarkers.forEach(function (_, vehicleId) {
@@ -5441,7 +5460,93 @@
         removeVehicleMarkerEntry(vehicleId);
       }
     });
+    refreshEventWaves();
     renderMapDetailOverlay();
+  }
+
+  function eventWaveExpiresAt(reportAt, now) {
+    var reportedMs = typeof reportAt === "number" ? reportAt : Date.parse(reportAt);
+    return Number.isFinite(reportedMs) && reportedMs > 0 && reportedMs <= now && now < reportedMs + 900000
+      ? reportedMs + 900000 : 0;
+  }
+
+  function stopEventWaveTimer() {
+    if (state.eventWaveTimer !== null) {
+      clearTimeout(state.eventWaveTimer);
+      state.eventWaveTimer = null;
+    }
+  }
+
+  function updateMarkerEventWave(marker, expiresAt, now) {
+    var element = marker && typeof marker.getElement === "function" ? marker.getElement() : null;
+    if (!element || typeof element.querySelector !== "function") {
+      return;
+    }
+    var wave = element.querySelector(".map-event-wave");
+    if (!expiresAt) {
+      if (wave) { wave.remove(); }
+      return;
+    }
+    if (!wave) {
+      wave = root.document.createElement("span");
+      wave.className = "map-event-wave";
+      wave.setAttribute("aria-hidden", "true");
+      wave.style.animationDelay = "-" + (now % 5000) + "ms";
+      element.prepend(wave);
+    }
+    var anchor = marker.options.icon.options.iconAnchor || [0, 0];
+    wave.style.left = anchor[0] + "px";
+    wave.style.top = anchor[1] + "px";
+  }
+
+  function refreshEventWaves() {
+    stopEventWaveTimer();
+    if (!state.map || !documentVisible()) {
+      return;
+    }
+    var now = Date.now();
+    var nextExpiry = Infinity;
+    function update(marker, reportAt) {
+      var expiresAt = eventWaveExpiresAt(reportAt, now);
+      updateMarkerEventWave(marker, expiresAt, now);
+      if (expiresAt) { nextExpiry = Math.min(nextExpiry, expiresAt); }
+    }
+    state.markers.forEach(function (marker, stopId) {
+      update(marker, stopActivityCount(stopId) > 0 ? latestReportTimestampForStop(stopId, state.sightings, state.stopIncidents) : 0);
+    });
+    state.vehicleMarkers.forEach(function (entry) {
+      update(entry.marker, vehicleMarkerCount(entry.vehicle) > 0 ? latestReportTimestampForVehicle(entry.vehicle, state.sightings) : 0);
+    });
+    var areaIds = new Set();
+    (state.areaIncidents || []).forEach(function (incident) {
+      if (!state.areaLayers.has(incident.id) || !eventWaveExpiresAt(incident.lastReportAt, now)) {
+        return;
+      }
+      var marker = state.areaWaveMarkers.get(incident.id);
+      var latLng = areaIncidentLatLng(incident.area);
+      if (!marker && root.L && typeof root.L.marker === "function") {
+        marker = root.L.marker(latLng, {
+          interactive: false,
+          keyboard: false,
+          icon: root.L.divIcon({ className: "map-event-wave-anchor", iconSize: [0, 0], iconAnchor: [0, 0], html: "" }),
+        }).addTo(state.map);
+        state.areaWaveMarkers.set(incident.id, marker);
+      }
+      if (marker) {
+        areaIds.add(incident.id);
+        marker.setLatLng(latLng);
+        update(marker, incident.lastReportAt);
+      }
+    });
+    state.areaWaveMarkers.forEach(function (marker, id) {
+      if (!areaIds.has(id)) {
+        state.map.removeLayer(marker);
+        state.areaWaveMarkers.delete(id);
+      }
+    });
+    if (Number.isFinite(nextExpiry)) {
+      state.eventWaveTimer = setTimeout(refreshEventWaves, nextExpiry - now);
+    }
   }
 
   function areaCircleStyle(kind) {
@@ -5556,6 +5661,7 @@
       }
     });
     renderAreaDraftLayer();
+    refreshEventWaves();
     renderMapDetailOverlay();
   }
 
@@ -6436,7 +6542,7 @@
         : "") +
       '<p class="report-note">' + escapeHTML(incidentVoteSummaryLabel(detail.summary.votes)) + "</p>" +
       (state.authenticated
-        ? '<div class="field"><label for="incident-comment-body">Anonīms komentārs</label><textarea id="incident-comment-body" data-incident-id="' + escapeAttr(detail.summary.id) + '" rows="3" placeholder="Pievieno īsu komentāru">' + escapeHTML(draft) + '</textarea></div><div class="button-row"><button class="action action-primary action-compact" data-action="submit-incident-comment" data-incident-id="' + escapeAttr(detail.summary.id) + '">Publicēt komentāru</button></div>'
+        ? '<div class="field"><label for="incident-comment-body">Anonīms komentārs (līdz 280 rakstzīmēm)</label><textarea id="incident-comment-body" data-incident-id="' + escapeAttr(detail.summary.id) + '" rows="3"' + (state.publicIncidentCommentPending ? ' disabled' : '') + ' placeholder="Pievieno īsu komentāru">' + escapeHTML(draft) + '</textarea></div><div class="button-row"><button class="action action-primary action-compact" data-action="submit-incident-comment" data-incident-id="' + escapeAttr(detail.summary.id) + '"' + (state.publicIncidentCommentPending ? ' disabled' : '') + '>Publicēt komentāru</button></div>'
         : '<p class="report-note">Pieslēdzies ar Telegram, lai balsotu un komentētu anonīmi.</p>') +
       "</section>" +
       '<section class="detail-card"><h3>Aktivitāte</h3><div class="card-list">' + eventsHtml + "</div></section>" +
@@ -6649,16 +6755,23 @@
   }
 
   function submitIncidentComment(incidentId) {
+    if (state.publicIncidentCommentPending) {
+      return Promise.resolve(null);
+    }
     var input = document.getElementById("incident-comment-body");
-    var body = input ? String(input.value || "") : "";
-    var request = spacetimeEnabled() && String(incidentId || "").indexOf("area:") !== 0
-      ? callSpacetimeProcedure("satiksmebot_comment_incident", [incidentId, body], {})
-      : fetchJSON(pathFor("/api/v1/incidents/" + encodeURIComponent(incidentId) + "/comments"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: body }),
-          credentials: "same-origin",
-        });
+    var body = input ? String(input.value || "").trim() : "";
+    if (!body || Array.from(body).length > 280) {
+      setStatus(!body ? "Pievieno komentāru" : "Komentārs ir pārāk garš (līdz 280 rakstzīmēm)");
+      return Promise.resolve(null);
+    }
+    state.publicIncidentCommentPending = true;
+    renderIncidentFeed();
+    var request = fetchJSON(pathFor("/api/v1/incidents/" + encodeURIComponent(incidentId) + "/comments"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body: body }),
+      credentials: "same-origin",
+    });
     return request
       .then(function (comment) {
         clearIncidentCommentDraft(incidentId);
@@ -6667,10 +6780,13 @@
       })
       .then(function () {
         setStatus("Komentārs publicēts");
-        renderIncidentFeed();
       })
       .catch(function (error) {
         setStatus((error && error.message) || "Neizdevās publicēt komentāru");
+      })
+      .finally(function () {
+        state.publicIncidentCommentPending = false;
+        renderIncidentFeed();
       });
   }
 
@@ -6895,6 +7011,9 @@
       applySelectedVehicleFollow: applySelectedVehicleFollow,
       animateVehicleMarkerTo: animateVehicleMarkerTo,
       renderLiveVehicles: renderLiveVehicles,
+      eventWaveExpiresAt: eventWaveExpiresAt,
+      refreshEventWaves: refreshEventWaves,
+      updateMarkerEventWave: updateMarkerEventWave,
       renderAreaIncidents: renderAreaIncidents,
       beginAreaDraftReportAt: beginAreaDraftReportAt,
       handleAreaIncidentMapClick: handleAreaIncidentMapClick,
@@ -6968,6 +7087,7 @@
           vehicleIncidents: state.vehicleIncidents,
           areaIncidents: state.areaIncidents,
           pendingAreaReport: state.pendingAreaReport,
+          eventWaveTimerActive: state.eventWaveTimer !== null,
           areaCreateSuggestion: state.areaCreateSuggestion,
           liveTransportVersion: state.liveTransportVersion,
           currentPosition: state.currentPosition,

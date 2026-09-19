@@ -1053,6 +1053,32 @@ input[type="checkbox"] {
   border: 0;
 }
 
+.map-event-wave::before {
+  content: "";
+  position: absolute;
+  left: var(--event-wave-x);
+  top: var(--event-wave-y);
+  width: 100px;
+  height: 100px;
+  margin: -50px;
+  border-radius: 50%;
+  background: radial-gradient(circle closest-side, transparent calc(100% - 3px), #d94b48 calc(100% - 2px), transparent 100%);
+  pointer-events: none;
+  z-index: -1;
+  animation: map-event-wave 5s linear infinite;
+  animation-delay: var(--event-wave-delay, 0ms);
+}
+
+@keyframes map-event-wave {
+  0% { transform: scale(0.4); opacity: 0.3; }
+  60% { transform: scale(1); opacity: 0.1; }
+  70%, 100% { transform: scale(1); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-event-wave::before { display: none; }
+}
+
 .map-station-marker,
 .map-train-marker {
   position: relative;

@@ -63,8 +63,6 @@ func TestSendWelcomePrefersInlineWebAppMarkup(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
@@ -106,8 +104,6 @@ func TestConfigureBotSetsCommandsMenuButtonAndMetadata(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
@@ -145,8 +141,6 @@ func TestHandleMessageRoutesLegacyCommandsToWebsiteWrapper(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
@@ -179,8 +173,6 @@ func TestHandleMessageAcceptsAddressedStartAndMenuCommands(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
@@ -213,12 +205,10 @@ func TestHandleMessageShortcutButtonsReuseUnifiedMenu(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
-	for _, text := range []string{mainOpenMap, legacyPublicSite, mainReportsFeed, mainIncidents} {
+	for _, text := range []string{mainOpenMap, "Publiskā mape", "Ziņojumu kanāls", "Kontroles plūsma"} {
 		err := service.handleMessage(context.Background(), telegram.Message{
 			Text: text,
 			Chat: telegram.Chat{ID: 42},
@@ -235,7 +225,7 @@ func TestHandleMessageShortcutButtonsReuseUnifiedMenu(t *testing.T) {
 		if !strings.Contains(message.text, "https://kontrole.info/app") {
 			t.Fatalf("message[%d] missing mini app url: %q", i, message.text)
 		}
-		for _, forbidden := range []string{incidentsCommand, mapCommand, "https://kontrole.info/incidents", "https://t.me/satiksme_bot_reports"} {
+		for _, forbidden := range []string{"/notiek", "/karte", "https://kontrole.info/incidents", "https://t.me/satiksme_bot_reports"} {
 			if strings.Contains(message.text, forbidden) {
 				t.Fatalf("message[%d] should be a minimal wrapper, found %q in %q", i, forbidden, message.text)
 			}
@@ -249,8 +239,6 @@ func TestReplyKeyboardOnlyOpensMiniApp(t *testing.T) {
 		client,
 		30,
 		"https://kontrole.info/app",
-		"https://kontrole.info",
-		"",
 		nil,
 	)
 
@@ -268,19 +256,10 @@ func TestReplyKeyboardIsNotPersistent(t *testing.T) {
 		&fakeMessageClient{},
 		30,
 		"https://kontrole.info",
-		"https://kontrole.info",
-		"https://t.me/satiksme_bot_reports",
 		nil,
 	)
 
 	if service.replyMarkup.IsPersistent {
 		t.Fatal("reply keyboard is persistent, want normal non-pinned keyboard")
-	}
-}
-
-func TestResolveIncidentsURLFallsBackToLegacyAppBase(t *testing.T) {
-	got := resolveIncidentsURL("https://kontrole.info/prefix/app", "")
-	if got != "https://kontrole.info/prefix/incidents" {
-		t.Fatalf("resolveIncidentsURL() = %q", got)
 	}
 }

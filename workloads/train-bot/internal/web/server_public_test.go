@@ -331,8 +331,11 @@ func TestPublicShellUsesSpecificConnectSources(t *testing.T) {
 	if !strings.Contains(csp, want) {
 		t.Fatalf("public shell CSP connect-src = %q, want to contain %q", csp, want)
 	}
-	if !strings.Contains(csp, "img-src 'self' data: https://*.tile.openstreetmap.org") {
+	if !strings.Contains(csp, "img-src 'self' data: https://tile.openstreetmap.org") {
 		t.Fatalf("public shell CSP image sources = %q, want OpenStreetMap tiles only", csp)
+	}
+	if got := res.Header().Get("Referrer-Policy"); got != "strict-origin" {
+		t.Fatalf("map must send its origin to the tile provider without URL paths or query strings: %q", got)
 	}
 }
 

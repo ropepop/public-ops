@@ -2,12 +2,18 @@ package reports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"satiksmebot/internal/model"
+)
+
+var (
+	ErrCommentRequired = errors.New("comment is required")
+	ErrCommentTooLong  = errors.New("comment is too long")
 )
 
 const (
@@ -232,10 +238,10 @@ func (s *Service) AddIncidentComment(ctx context.Context, catalog *model.Catalog
 	}
 	body = strings.TrimSpace(body)
 	if body == "" {
-		return nil, fmt.Errorf("comment is required")
+		return nil, ErrCommentRequired
 	}
 	if len([]rune(body)) > 280 {
-		return nil, fmt.Errorf("comment is too long")
+		return nil, ErrCommentTooLong
 	}
 	if err := s.enforceCommentActionLimit(ctx, incidentID, userID, now); err != nil {
 		return nil, err

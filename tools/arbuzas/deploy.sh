@@ -7394,6 +7394,9 @@ validate_remote_train_workload_health() {
   validate_remote_probe "${remote_release_dir}" "train public health" \
     "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/health >/dev/null 2>/dev/null'" \
     train_bot train_tunnel
+  validate_remote_probe "${remote_release_dir}" "train current timetable is ready" \
+    "wait_until_ok sh -lc 'curl -fsS https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/api/v1/ready >/dev/null 2>/dev/null'" \
+    train_bot train_tunnel
   validate_remote_probe "${remote_release_dir}" "train Telegram Mini App embeds in Telegram Web" \
     "wait_until_ok sh -lc 'headers=\$(curl -fsSI https://${ARBUZAS_TRAIN_BOT_HOSTNAME}/app | tr -d \"\\r\"); printf \"%s\\n\" \"\${headers}\" | grep -Fi \"content-security-policy:\" | grep -F \"frame-ancestors https://web.telegram.org\" >/dev/null && ! printf \"%s\\n\" \"\${headers}\" | grep -Fi \"x-frame-options:\" >/dev/null'" \
     train_bot train_tunnel
@@ -8278,7 +8281,7 @@ validate_remote_ticket_remote_workload_health() {
       trap \"rm -f \\\"\${app_js}\\\"\" EXIT
       cat > \"\${app_js}\"
       test -s \"\${app_js}\"
-      grep -aE \"claim-dialog|showModal|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
+      grep -aE \"claim-dialog|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"localStorage|ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1

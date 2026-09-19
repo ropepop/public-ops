@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"telegramtrainapp/internal/domain"
+	"telegramtrainapp/internal/scrape"
 	"telegramtrainapp/internal/store"
 )
 
@@ -22,6 +24,69 @@ func setupScheduleStore(t *testing.T) *store.SQLiteStore {
 		t.Fatalf("migrate: %v", err)
 	}
 	return st
+}
+
+func TestManagerRejectsRetiredPDFCacheUntilCleanSnapshotArrives(t *testing.T) {
+	ctx := context.Background()
+	st := setupScheduleStore(t)
+	defer st.Close()
+	now := time.Date(2026, 9, 17, 2, 0, 0, 0, time.UTC)
+	date := now.Format("2006-01-02")
+	oldSource := "agg-2026-09-17-vivi_gtfs+vivi_pdf"
+	train := domain.TrainInstance{ID: "train-6103", ServiceDate: date, FromStation: "Skulte", ToStation: "Rīga", DepartureAt: now, ArrivalAt: now.Add(time.Hour), SourceVersion: oldSource}
+	if err := st.UpsertTrainInstances(ctx, date, oldSource, []domain.TrainInstance{train}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	durable := &failingScheduleStore{SQLiteStore: setupScheduleStore(t), failStops: errors.New("durable commit failed")}
+	defer durable.Close()
+	manager := NewManager(store.NewRoutedStore(st, durable), dir, time.UTC, 3)
+	snapshot := scrape.SnapshotFile{SourceVersion: oldSource, Trains: []scrape.SnapshotTrain{{
+		ID: train.ID, ServiceDate: date, FromStation: train.FromStation, ToStation: train.ToStation,
+		DepartureAt: train.DepartureAt.Format(time.RFC3339), ArrivalAt: train.ArrivalAt.Format(time.RFC3339),
+		Stops: []scrape.SnapshotStop{{StationName: "Skulte", Seq: 1}, {StationName: "Skulte", Seq: 2}},
+	}}}
+	writeSnapshot := func() {
+		t.Helper()
+		body, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, date+".json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSnapshot()
+	if err := manager.LoadToday(ctx, now); err == nil || manager.IsFreshFor(now) {
+		t.Fatalf("retired PDF snapshot/cache must not become available: %v", err)
+	}
+	snapshot.SourceVersion = "agg-2026-09-17-vivi_gtfs"
+	snapshot.Trains[0].Stops[1].Seq = 1
+	writeSnapshot()
+	if err := manager.LoadToday(ctx, now); err == nil {
+		t.Fatal("duplicate stop sequences must not be loaded or fall back to retired cache")
+	}
+	snapshot.Trains[0].Stops[1].Seq = 2
+	writeSnapshot()
+	if err := manager.LoadToday(ctx, now); err == nil || manager.IsFreshFor(now) {
+		t.Fatalf("failed durable commit must not mark cache fresh: %v", err)
+	}
+	cached, err := st.GetTrainInstanceByID(ctx, train.ID)
+	if err != nil || cached.SourceVersion != oldSource {
+		t.Fatalf("failed durable commit changed cache: train=%+v err=%v", cached, err)
+	}
+	durable.failStops = nil
+	if err := manager.LoadToday(ctx, now); err != nil || !manager.IsFreshFor(now) {
+		t.Fatalf("clean replacement did not restore current schedule: %v", err)
+	}
+	stored, err := st.GetTrainInstanceByID(ctx, train.ID)
+	if err != nil || stored.SourceVersion != snapshot.SourceVersion {
+		t.Fatalf("old cache not replaced: train=%+v err=%v", stored, err)
+	}
+	stops, err := st.ListTrainStops(ctx, train.ID)
+	if err != nil || len(stops) != 2 {
+		t.Fatalf("valid repeated visits with different sequences must survive: stops=%v err=%v", stops, err)
+	}
 }
 
 type failingScheduleStore struct {

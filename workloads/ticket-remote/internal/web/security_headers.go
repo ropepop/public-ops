@@ -17,10 +17,24 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeErrorPage(w http.ResponseWriter, status int, message string) {
+	nonce := randomID()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writeHTMLHeaders(w, "")
+	writeHTMLHeaders(w, nonce)
 	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, "<!doctype html><title>Ticket</title><body><h1>%d</h1><p>%s</p></body>", status, template.HTMLEscapeString(message))
+	_, _ = fmt.Fprintf(w, `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#020304">
+<title>Ticket</title>
+<style nonce="%s">
+html { background: #020304; color: #eef3f8; -webkit-text-size-adjust: 100%%; text-size-adjust: 100%%; }
+body { margin: 0; padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); font: 1rem/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 36rem; margin: 10vh auto 0; overflow-wrap: anywhere; }
+h1 { margin: 0 0 1rem; font: inherit; font-weight: 600; }
+p { margin: 0; }
+</style></head>
+<body><main><h1>Ticket · %d</h1><p>%s</p></main></body></html>`, nonce, status, template.HTMLEscapeString(message))
 }
 
 func writeNoStoreHeaders(w http.ResponseWriter) {

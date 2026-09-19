@@ -21,6 +21,7 @@ export class Presentation {
     this.ordinal = 0;
     this.generation = 0;
     this.hdrBlocked = false;
+    this.failure = '';
     this.holdover = null;
     this.displayedHDR = null;
     this.recovering = false;
@@ -49,11 +50,21 @@ export class Presentation {
       this.releaseHoldover();
       this.displayedHDR = null;
       this.recovering = false;
+      this.hdrBlocked = false;
+      this.failure = '';
+      delete document.body.dataset.hdrFailure;
       this.surface(false);
     } else if (changed) {
       this.hdrBlocked = false;
+      this.failure = '';
+      delete document.body.dataset.hdrFailure;
       this.restartHDR();
     } else if (boostChanged) {
+      if (this.hdrBlocked) {
+        this.hdrBlocked = false;
+        this.restartHDR();
+        return;
+      }
       this.controller?.setDisplayBoost(this.boost);
       this.seedHDR();
     }
@@ -75,14 +86,14 @@ export class Presentation {
     document.body.dataset.experimentalMedia = (visible || this.holdover) && this.enabled
       ? 'hdr-client-webgpu-preview' : this.recovering ? 'hdr-recovering' : 'fallback-sdr';
     document.body.dataset.hdrRecovering = String(this.recovering);
-    if (!visible && !this.holdover && this.frozen?.displayed) {
+    if (!visible && !this.holdover && (this.frozen?.displayed || (this.frozen?.presenting && !resultArea.hidden))) {
       resultArea.dataset.presentation = this.recovering ? 'recovering' : 'sdr';
       resultImage.hidden = this.recovering;
     }
   }
 
   restartHDR() {
-    if (!this.enabled) return;
+    if (!this.enabled || this.hdrBlocked) return;
     this.generation++;
     if (this.displayedHDR && !this.holdover) {
       this.controller?.suspend();
@@ -105,9 +116,8 @@ export class Presentation {
     else old.replaceWith(canvas);
     this.elements.hdrCanvas = canvas;
     this.surface(false);
-    if (!this.enabled || !clientHDRCapability().supported) {
-      this.recovering = Boolean(this.holdover);
-      this.surface(false);
+    if (!clientHDRCapability().supported) {
+      this.fallbackHDR('hdr_unsupported');
       return;
     }
     if (!this.visible || this.hdrBlocked) return;
@@ -125,21 +135,7 @@ export class Presentation {
         if (reason) document.body.dataset.hdrFailure = reason;
         if (status === 'ready') this.seedHDR();
         if (status === 'failed') {
-          this.hdrBlocked = true;
-          this.recovering = true;
-          // Lost devices cannot retain a trustworthy surface.
-          if (reason === 'device_lost') {
-            this.displayedHDR = null;
-            this.releaseHoldover();
-          }
-          // Do not hide the retained surface when this controller failed.
-          if (this.displayedHDR) {
-            document.body.dataset.hdrRecovering = 'true';
-            this.handlers.onFailure?.(reason || 'hdr_failed');
-            return;
-          }
-          this.surface(false);
-          this.handlers.onFailure?.(reason || 'hdr_failed');
+          this.fallbackHDR(reason || 'hdr_failed');
         }
       },
       onMetric: (event, snapshot) => {
@@ -151,6 +147,8 @@ export class Presentation {
         document.body.dataset.hdrColorSpace = controller.renderer.encodeOutput ? 'srgb' : 'srgb-linear';
         this.displayedHDR = this.frozen?.metadata || this.rendered;
         this.recovering = false;
+        this.failure = '';
+        delete document.body.dataset.hdrFailure;
         this.releaseHoldover();
         this.surface(true);
         if (this.frozen?.displayed) {
@@ -170,10 +168,27 @@ export class Presentation {
   }
 
   recoverHDR() {
-    if (!this.visible) return;
+    if (!this.visible || this.hdrBlocked) return;
     if (this.recovering && this.controller?.active) return;
-    this.hdrBlocked = false;
     this.restartHDR();
+  }
+
+  fallbackHDR(reason) {
+    this.generation++;
+    this.hdrBlocked = true;
+    this.failure = reason;
+    this.recovering = false;
+    this.displayedHDR = null;
+    this.controller?.dispose();
+    this.controller = null;
+    this.releaseHoldover();
+    // Prepare the latest ordinary picture before revealing it. A frozen code
+    // already has its exact SDR image; never replace it with the live stream.
+    if (!this.frozen && this.latest) this.draw(this.latest.frame, this.latest.metadata);
+    document.body.dataset.hdrStatus = 'failed';
+    document.body.dataset.hdrFailure = reason;
+    this.surface(false);
+    this.handlers.onFailure?.(reason);
   }
 
   releaseHoldover() {

@@ -774,13 +774,22 @@ body {
   text-shadow: 0 1px 2px rgba(87, 16, 16, 0.38);
 }
 
-.map-icon-badge::after {
-  animation: sighting-badge-ring 1.9s ease-out infinite;
-  border: 2px solid rgba(255, 149, 105, 0.46);
+.map-event-wave {
+  animation: map-event-wave 5s linear infinite;
+  background: radial-gradient(circle closest-side, transparent calc(100% - 3px), #d94b48 calc(100% - 2px), transparent 100%);
   border-radius: 999px;
-  content: "";
-  inset: -0.28rem;
+  height: 100px;
+  width: 100px;
+  margin: -50px;
+  opacity: 0;
+  pointer-events: none;
   position: absolute;
+  z-index: -1;
+}
+
+.map-event-wave-anchor {
+  pointer-events: none;
+  overflow: visible;
 }
 
 .map-icon-stop-badge-anchor {
@@ -1090,15 +1099,18 @@ body {
   }
 }
 
-@keyframes sighting-badge-ring {
+@keyframes map-event-wave {
   0% {
-    opacity: 0.78;
-    transform: scale(0.92);
+    opacity: 0.3;
+    transform: scale(0.4);
   }
-
-  100% {
+  60% {
+    opacity: 0.1;
+    transform: scale(1);
+  }
+  70%, 100% {
     opacity: 0;
-    transform: scale(1.5);
+    transform: scale(1);
   }
 }
 
@@ -1196,9 +1208,13 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .map-user-location-marker,
   .map-icon-badge,
-  .map-icon-badge::after,
   .quick-loading-bar::before,
   .pill-loading::after {
+    animation: none;
+  }
+
+  .map-event-wave {
+    display: none;
     animation: none;
   }
 

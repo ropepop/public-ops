@@ -79,6 +79,15 @@ func TestSQLiteStoreRoundTripAndCleanup(t *testing.T) {
 	if len(areaItems) != 1 || areaItems[0].RadiusMeters != 500 {
 		t.Fatalf("areaItems = %+v, want one 500 m report", areaItems)
 	}
+	for index, at := range []time.Time{now, now.Add(time.Minute)} {
+		userID := int64(index + 11)
+		if err := st.UpsertIncidentVote(ctx, model.IncidentVote{IncidentID: "stop:3012", UserID: userID, Value: model.IncidentVoteOngoing, CreatedAt: now, UpdatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.InsertIncidentComment(ctx, model.IncidentComment{ID: at.Format(time.RFC3339), IncidentID: "stop:3012", UserID: userID, Body: "test", CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	result, err := st.CleanupExpired(ctx, now.Add(time.Minute))
 	if err != nil {
@@ -86,6 +95,14 @@ func TestSQLiteStoreRoundTripAndCleanup(t *testing.T) {
 	}
 	if result.StopSightingsDeleted != 1 || result.VehicleSightingsDeleted != 1 || result.AreaReportsDeleted != 1 {
 		t.Fatalf("CleanupExpired() = %+v", result)
+	}
+	comments, err := st.ListIncidentComments(ctx, "stop:3012", 100)
+	if err != nil || len(comments) != 1 || comments[0].UserID != 12 {
+		t.Fatalf("cleanup must remove expired comments and preserve the cutoff: comments=%+v err=%v", comments, err)
+	}
+	votes, err := st.ListIncidentVotes(ctx, "stop:3012")
+	if err != nil || len(votes) != 1 || votes[0].UserID != 12 {
+		t.Fatalf("cleanup must expire votes by last update: votes=%+v err=%v", votes, err)
 	}
 }
 
