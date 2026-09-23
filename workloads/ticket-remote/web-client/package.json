@@ -9,7 +9,7 @@
     "test:client-hdr-real-gpu:serve": "python3 -m http.server 4173 --bind 127.0.0.1",
     "test:statistics-browser": "node --test ./admin-statistics.browser.test.mjs",
     "test:hdr": "node --test ./client-hdr.browser.test.mjs",
-    "test": "node --test ./spacetime-client.test.mjs ./connection-recovery.test.mjs ./ticket-recovery.test.mjs ./phone-control-core.test.mjs ./exact-result.test.mjs ./renderer-completion.test.mjs ./presentation.test.mjs ./slider-hdr-wave.test.mjs ./cold-restart.test.mjs ./startup-measurement.test.mjs ./admin-statistics.test.mjs ./install-guide.browser.test.mjs",
+    "test": "node --test ./train-checkin.browser.test.mjs ./notifications.test.mjs ./page-activity.test.mjs ./page-activity.browser.test.mjs ./spacetime-client.test.mjs ./connection-recovery.test.mjs ./ticket-recovery.test.mjs ./phone-control-core.test.mjs ./exact-result.test.mjs ./renderer-completion.test.mjs ./presentation.test.mjs ./ticket-slider.browser.test.mjs ./cold-restart.test.mjs ./startup-measurement.test.mjs ./admin-statistics.test.mjs ./admin-schedule.browser.test.mjs ./install-guide.browser.test.mjs ./welcome.browser.test.mjs ./invitation.browser.test.mjs",
     "check:spacetime-sdk": "node ./check-spacetime-sdk.mjs"
   },
   "dependencies": {

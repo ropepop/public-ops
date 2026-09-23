@@ -1,7 +1,9 @@
 package web
 
 import (
+	"net/http"
 	"strings"
+	"ticketremote/internal/auth"
 	"ticketremote/internal/state"
 )
 
@@ -22,4 +24,13 @@ func adminStatisticsPayload(snapshot state.Snapshot) map[string]any {
 		"days":                      30,
 		"secondsPerTick":            5,
 	}
+}
+
+func (s *Server) handleAdminStatistics(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, snapshot state.Snapshot) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, adminStatisticsPayload(snapshot))
 }

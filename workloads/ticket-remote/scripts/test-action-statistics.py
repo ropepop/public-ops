@@ -82,7 +82,7 @@ def main():
                 run(["spacetime", "publish", *args, "--bin-path", str(baseline_wasm), "--delete-data=never", "statistics-fixture"], cwd=directory)
                 run(["spacetime", "call", *args, "statistics-fixture", "fixture_migration_seed"], cwd=directory)
                 run(["spacetime", "publish", *args, "--bin-path", str(current_wasm), "--delete-data=never", "statistics-fixture"], cwd=directory)
-                for case in ["row-reuse", "migration", "registration", "queued", "queued-rejected", "rejected", "menu", "code", "queued-code", "original-hour", "expired", "rollback", "assert-rollback"]:
+                for case in ["row-reuse", "migration", "activity", "registration", "queued", "queued-rejected", "queued-menu", "queued-latest", "rejected", "menu", "menu-latest", "code", "queued-code", "original-hour", "expired", "rollback", "assert-rollback"]:
                     run(["spacetime", "call", *args, "statistics-fixture", "fixture_statistics_case", case], cwd=directory,
                         expected_error="fixture_expected_rollback" if case == "rollback" else None)
                     print(f"PASS {case}", flush=True)
@@ -91,8 +91,9 @@ def main():
                 public = run(["spacetime", "sql", *args, "--anonymous", "statistics-fixture", "SELECT * FROM ticketremote_service_member_daily_actions"], cwd=directory)
                 scope = hashlib.sha256(b"fixture@example.test").hexdigest()
                 assert scope not in public, public
-                private = subprocess.run(["spacetime", "sql", *args, "--anonymous", "statistics-fixture", "SELECT * FROM ticketremote_member_daily_actions"], cwd=directory, capture_output=True, text=True)
-                assert private.returncode != 0, "anonymous reader could query the private action table"
+                for table in ["ticketremote_member_daily_actions", "ticketremote_member_daily_activity"]:
+                    private = subprocess.run(["spacetime", "sql", *args, "--anonymous", "statistics-fixture", f"SELECT * FROM {table}"], cwd=directory, capture_output=True, text=True)
+                    assert private.returncode != 0, f"anonymous reader could query private table {table}"
                 print("PASS private storage and service-only projection", flush=True)
             except Exception:
                 logs = subprocess.run(["spacetime", "logs", "--server", server_url, "--no-config", "--num-lines", "12", "statistics-fixture"], cwd=directory, capture_output=True, text=True)

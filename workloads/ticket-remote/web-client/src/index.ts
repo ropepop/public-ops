@@ -17,6 +17,7 @@ type TicketClientConfig = {
   ticketId: string;
   sessionId: string;
   email: string;
+  actorId?: string;
   accountScopeId: string;
   backendId?: string;
   ownerViviAuth?: boolean;
@@ -289,18 +290,23 @@ class TicketSpacetimeClient {
     }, beforeSubmit);
   }
 
-  async recordActivityTick(): Promise<void> {
-    // Viewing samples must never wait for a later connection or hidden page.
-    return this.callReducerOnConnection(this.requireConnection(), "memberRecordActivityTick", {
-      ticketId: this.cfg.ticketId,
-    });
-  }
-
   setLimitPreference(obeyLimits: boolean): Promise<void> {
     return this.callReducer("memberSetLimitPreference", {
       ticketId: this.cfg.ticketId,
       obeyLimits: Boolean(obeyLimits),
     });
+  }
+
+  checkIn(requestId: string, expectedRevision: string, direction: string, carriage: number): Promise<void> {
+    return this.callReducer("memberCheckIn", { ticketId: this.cfg.ticketId, requestId, expectedRevision, direction, carriage });
+  }
+
+  checkOut(expectedRevision: string): Promise<void> {
+    return this.callReducer("memberCheckOut", { ticketId: this.cfg.ticketId, expectedRevision });
+  }
+
+  claimCheckinNotice(pageId: string): Promise<void> {
+    return this.callReducer("memberClaimCheckinNotice", { ticketId: this.cfg.ticketId, pageId });
   }
 
   saveViviCredentials(email: string, password: string, expectedRevision: string, revision: string): Promise<void> {
@@ -382,7 +388,7 @@ class TicketSpacetimeClient {
       if (connection !== this.conn || generation !== this.connectionGeneration || !connection) return;
       const row = tableRows(tableAccessor(connection.db, "member_limit_state"))
         .find((candidate) => rowTicketId(candidate) === this.cfg.ticketId &&
-          candidate.ownerPublicId === accountPublicId(this.cfg.email));
+          candidate.ownerPublicId === accountPublicId(this.cfg.actorId || this.cfg.email));
       const received = performance.now();
       const server = Date.parse(String(row && row.serverAt || ""));
       if (!Number.isFinite(server) || received - started > 2000) return;
@@ -489,15 +495,17 @@ class TicketSpacetimeClient {
     const ticket = sqlString(this.cfg.ticketId);
     const backendRow = sqlString(`${this.cfg.ticketId}:${this.backendId()}`);
     const backendId = sqlString(this.backendId());
-    const ownerPublicId = sqlString(accountPublicId(this.cfg.email));
+    const ownerPublicId = sqlString(accountPublicId(this.cfg.actorId || this.cfg.email));
     const accountScopeId = sqlString(validAccountScopeId(this.cfg.accountScopeId));
     let applied = false;
     const queries = [
-      `SELECT * FROM ticketremote_stream_desired_state WHERE id = ${backendRow}`,
-      `SELECT * FROM ticketremote_phone_current_report WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_member_stream_state WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_service_phone_current_report WHERE id = ${backendRow}`,
       `SELECT * FROM ticketremote_phone_control_state WHERE id = ${backendRow}`,
-      `SELECT * FROM ticketremote_relay_current_report WHERE id = ${backendRow}`,
-      `SELECT * FROM ticketremote_stream_viewer_focus WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+      `SELECT * FROM ticketremote_privileged_relay_report WHERE id = ${backendRow}`,
+      `SELECT * FROM ticketremote_privileged_viewers WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
+      `SELECT * FROM ticketremote_member_checkin`,
+      `SELECT * FROM ticketremote_member_checkin_groups`,
       `SELECT * FROM ticketremote_control_code_request WHERE ticketId = ${ticket} AND ownerPublicId = ${ownerPublicId}`,
       `SELECT * FROM ticketremote_member_ticket_switch WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
       `SELECT * FROM ticketremote_ticket_action_v3 WHERE ticketId = ${ticket} AND backendId = ${backendId}`,
@@ -557,21 +565,21 @@ class TicketSpacetimeClient {
     const db = this.requireConnection().db;
     const ticketId = this.cfg.ticketId, backendId = this.backendId();
     const backendRow = `${ticketId}:${backendId}`;
-    const ownerPublicId = accountPublicId(this.cfg.email);
+    const ownerPublicId = accountPublicId(this.cfg.actorId || this.cfg.email);
     const accountScopeId = validAccountScopeId(this.cfg.accountScopeId);
     const rows = (name: string) => tableRows(tableAccessor(db, name));
     const backend = (name: string) => rows(name).find(row => row.id === backendRow) || null;
     const account = (name: string) => rows(name).find(row => row.ticketId === ticketId && row.accountScopeId === accountScopeId) || null;
-    const desired = backend("stream_desired_state");
-    const phoneReport = backend("phone_current_report");
+    const desired = backend("member_stream_state");
+    const phoneReport = backend("service_phone_current_report");
     const phoneControlState = backend("phone_control_state");
-    const relayReport = backend("relay_current_report");
+    const relayReport = backend("privileged_relay_report");
     const memberLimits = rows("member_limit_state").find(row => row.ticketId === ticketId && row.ownerPublicId === ownerPublicId) || null;
     const memberHDR = account("member_hdr_state");
     const hdrBoost = account("member_hdr_boost_state");
     const ticketActions = ticketActionV3ActionsByAuthority(rows("ticket_action_v3")
       .filter(row => row.ticketId === ticketId && row.backendId === backendId));
-    const viewerFocusRows = activeViewerFocusRows(rows("stream_viewer_focus"), ticketId, backendId);
+    const viewerFocusRows = activeViewerFocusRows(rows("privileged_viewers"), ticketId, backendId);
     this.scheduleViewerPresenceExpiry(viewerFocusRows);
     const viewerPresence = viewerFocusRows.map(row => ({
       publicId: row.publicId, label: row.publicId, connected: true,
@@ -589,6 +597,8 @@ class TicketSpacetimeClient {
       ticket: { id: ticketId, displayName: "ViVi timed ticket", updatedAt },
       viewerCount: viewerPresence.length,
       viewerPresence,
+      checkin: rows("member_checkin")[0] || null,
+      checkinGroups: rows("member_checkin_groups"),
       phone: {
         id: backendId, attachName: backendId,
         desiredState: desired?.desiredActive ? "streaming" : "idle",
@@ -625,7 +635,7 @@ class TicketSpacetimeClient {
   }
 
   private focusedStateTables(source: any): any[] {
-    const names = ["stream_desired_state", "phone_current_report", "phone_control_state", "relay_current_report", "stream_viewer_focus", "control_code_request", "ticket_action_v3", "member_ticket_switch", "member_hdr_state", "member_hdr_boost_state", "member_limit_state"];
+    const names = ["member_stream_state", "service_phone_current_report", "phone_control_state", "privileged_relay_report", "privileged_viewers", "member_checkin", "member_checkin_groups", "control_code_request", "ticket_action_v3", "member_ticket_switch", "member_hdr_state", "member_hdr_boost_state", "member_limit_state"];
     if (this.cfg.ownerViviAuth) {
       names.push("vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials");
     }

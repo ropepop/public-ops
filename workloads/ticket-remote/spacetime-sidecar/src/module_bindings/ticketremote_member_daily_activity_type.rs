@@ -17,6 +17,8 @@ pub struct TicketremoteMemberDailyActivity {
     pub last_tick_at: String,
     pub updated_at: String,
     pub expires_at: String,
+    pub coverage_floor_slot: Option<i64>,
+    pub slot_coverage: Option<Vec<u8>>,
 }
 
 impl __sdk::InModule for TicketremoteMemberDailyActivity {
@@ -37,6 +39,10 @@ pub struct TicketremoteMemberDailyActivityCols {
     pub last_tick_at: __sdk::__query_builder::Col<TicketremoteMemberDailyActivity, String>,
     pub updated_at: __sdk::__query_builder::Col<TicketremoteMemberDailyActivity, String>,
     pub expires_at: __sdk::__query_builder::Col<TicketremoteMemberDailyActivity, String>,
+    pub coverage_floor_slot:
+        __sdk::__query_builder::Col<TicketremoteMemberDailyActivity, Option<i64>>,
+    pub slot_coverage:
+        __sdk::__query_builder::Col<TicketremoteMemberDailyActivity, Option<Vec<u8>>>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteMemberDailyActivity {
@@ -53,6 +59,11 @@ impl __sdk::__query_builder::HasCols for TicketremoteMemberDailyActivity {
             last_tick_at: __sdk::__query_builder::Col::new(table_name, "last_tick_at"),
             updated_at: __sdk::__query_builder::Col::new(table_name, "updated_at"),
             expires_at: __sdk::__query_builder::Col::new(table_name, "expires_at"),
+            coverage_floor_slot: __sdk::__query_builder::Col::new(
+                table_name,
+                "coverage_floor_slot",
+            ),
+            slot_coverage: __sdk::__query_builder::Col::new(table_name, "slot_coverage"),
         }
     }
 }

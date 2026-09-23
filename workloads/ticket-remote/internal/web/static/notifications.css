@@ -1,0 +1,10 @@
+.ticket-notifications { border: 1px solid #253246; border-radius: 8px; padding: 16px; background: #0b1119; color: #eef3f8; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.ticket-notifications h2 { margin: 0; font-size: 18px; }
+.ticket-notifications p { margin: 10px 0; color: #b5c2d1; }
+.ticket-notifications p:empty { display: none; }
+.ticket-monitoring-toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 700; }
+.ticket-monitoring-toggle[hidden] { display: none; }
+.ticket-monitoring-toggle input { width: 20px; height: 20px; margin: 0; }
+.ticket-notification-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ticket-notification-actions button { min-height: 44px; max-width: 100%; padding: 8px 12px; text-align: left; white-space: normal; }
+.ticket-notifications :is(button,input):focus-visible { outline: 2px solid #9dccff; outline-offset: 3px; }

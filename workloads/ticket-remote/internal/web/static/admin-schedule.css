@@ -60,6 +60,12 @@
   overflow-wrap: anywhere;
 }
 
+.admin-schedule-details summary {
+  padding: 8px 0;
+  color: #bcd4ff;
+  cursor: pointer;
+}
+
 .admin-toggle {
   display: inline-flex;
   align-items: center;
@@ -70,6 +76,7 @@
 }
 
 .admin-toggle input {
+  flex: 0 0 22px;
   width: 22px;
   height: 22px;
   margin: 0;
@@ -148,9 +155,20 @@
 }
 
 .admin-vivi-auth-full-reset {
+  display: block;
   border-color: #9e3547;
   background: #2a1017;
   box-shadow: inset 3px 0 #d65a6c;
+}
+
+.admin-vivi-auth-full-reset summary {
+  padding: 4px 0;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.admin-vivi-auth-full-reset button {
+  margin-top: 12px;
 }
 
 .admin-vivi-auth-confirm[hidden] {

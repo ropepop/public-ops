@@ -1,6 +1,7 @@
 // Minimal old storage contract used only for a data-preserving migration test.
 #![allow(non_snake_case)]
 use spacetimedb::{CaseConversionPolicy, ReducerContext, Table};
+use sha2::Digest;
 #[spacetimedb::settings]
 const CASE_CONVERSION_POLICY: CaseConversionPolicy = CaseConversionPolicy::None;
 
@@ -50,15 +51,19 @@ pub fn fixture_migration_seed(ctx: &ReducerContext) -> Result<(), String> {
             createdAt: clock.clone(),
             expiresAt: "2100-01-01T00:00:00Z".into(),
         });
+    let scope = format!("{:x}", sha2::Sha256::digest(b"fixture@example.test"));
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ctx.timestamp.to_micros_since_unix_epoch()).unwrap() - chrono::Duration::days(1);
+    let utc = utc.date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc();
+    let day = utc.with_timezone(&chrono_tz::Europe::Riga).format("%Y-%m-%d").to_string();
     ctx.db
         .ticketremote_member_daily_activity()
         .insert(TicketremoteMemberDailyActivity {
-            id: "pre-statistics-activity".into(),
+            id: format!("stats-migration:{scope}:{day}"),
             ticketId: "stats-migration".into(),
-            accountScopeId: "old-account-scope".into(),
-            day: "2026-09-09".into(),
+            accountScopeId: scope,
+            day,
             hourlyTicks: vec![1],
-            lastTickSlot: 1,
+            lastTickSlot: utc.timestamp_micros().div_euclid(5_000_000),
             firstTickAt: clock.clone(),
             lastTickAt: clock.clone(),
             updatedAt: clock,

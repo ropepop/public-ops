@@ -81,7 +81,7 @@ func writeSecurityHeadersWithConnect(w http.ResponseWriter, nonce string, connec
 	w.Header().Set("Content-Security-Policy", strings.Join([]string{
 		"default-src 'self'",
 		scriptSrc,
-		"worker-src 'none'",
+		"worker-src 'self'",
 		styleSrc,
 		"img-src 'self' data: blob:",
 		"font-src 'self'",

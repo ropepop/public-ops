@@ -309,3 +309,14 @@ func accountPublicID(email string) string {
 	}
 	return string(out[:])
 }
+
+func (s *MemoryStore) RecordMemberActivitySlots(ctx context.Context, ticketID, email string, slots []int64) error {
+	snapshot, err := s.Snapshot(ctx, ticketID, time.Now())
+	if err != nil {
+		return err
+	}
+	if _, ok := snapshot.Member(email); !ok {
+		return ErrNotMember
+	}
+	return nil
+}

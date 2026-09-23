@@ -12,4 +12,5 @@ import {
 
 export default {
   ticketId: __t.string(),
+  expectedRevision: __t.string(),
 };

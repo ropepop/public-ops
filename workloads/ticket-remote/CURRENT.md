@@ -2,6 +2,687 @@
 
 This is the first file to read for Ticket work.
 
+## September 22 invitation trials
+
+Web v232 adds one shared trial and one eventual member per invitation.
+Members contains People and Invitations, with 1/3/5-day or custom deadlines,
+5/15/30 viewing minutes, five successful activations and five successful control
+codes. Unused expired links remain registration-only until revoked or redeemed.
+The complete 32-character bearer link is shown only at creation; private database
+records retain its SHA-256 fingerprint. Custom duration is 1..525600 minutes.
+
+`spacetimedb/src/invitations.rs` owns private invitation, guest identity, action
+reservation and member-source state. `spacetime-sidecar/src/invitations.rs`
+exposes scoped service operations; `internal/web/invitations.go` owns token
+exchange, separate signed guest cookies, install context and verified-email
+redemption. Guest JWT subjects include both invitation and session. Takeover,
+revocation and redemption fence database views/reducers and close media. Existing
+members keep their role/source; removed members cannot regain access this way.
+Unknown historical membership remains labelled Existing member.
+
+The media writer reserves at most five seconds before delivering fresh frames.
+Hidden, disconnected or stale delivery refunds unelapsed time; interrupted
+reservations can retain at most five seconds. Each gateway permits one current
+page/socket per invitation, matching the single deployed Ticket gateway. New
+commands reserve allowance before dispatch; typed no-effect failures refund it,
+success settles once, and uncertain outcomes retain it. Accepted actions receive
+bounded result delivery after trial expiry, without admitting new actions.
+
+Invitation welcome, trial summary and installation context support LV/EN/RU.
+The uncached personalized manifest keeps the existing app ID and an invitation
+launch URL. Native Alpha and browser-switching guides copy the same invitation;
+installed apps have manual link entry. Opening a fresh link or instructions
+starts no trial/media work. Verified existing SpacetimeAuth sign-in atomically
+redeems the invitation and issues the normal remembered session in that browser.
+Cross-app email returns never bypass the existing browser/PKCE check.
+
+Run `make invitation-test` for disposable real-database journeys, browser
+onboarding/admin checks and focused Go authority tests. Publish the additive
+module with `--delete-data=never` before the compatible gateway/sidecar/browser.
+Rollback the web release first and retain invitation tables and consumed state.
+Candidate validation passed: both required builds, 87 client/browser tests,
+39 module tests, all Go packages and 20 sidecar tests; the 30 focused Go guest,
+invitation and streaming tests also passed with the race detector. The disposable
+invitation database fixture passed seven journey groups, plus the existing
+check-in and action-statistics fixtures. Installation checks cover 94 invitation,
+117 welcome and 895 ordinary-guide assertions. The deployment contract and
+pre-release mirror audit passed. Interactive local welcome, install and admin
+previews were inspected.
+
+Published the additive module without deleting data and deployed `b39b21f0`
+as `ticket-invitations-20260922-v232`. Standard deployment validation passed;
+the local mirror was refreshed and audited clean. The saved owner browser
+verified People/Invitations, creation, copy-once display, copy action and
+revocation. An existing-member invitation visit went directly to Ticket without
+consumption, source/role changes or a guest trial; its unused test invitation was
+revoked afterward. The live viewer mounted Arrow, served v232 assets, showed
+LIVE_FRESH HDR with unchanged 994x2046 source dimensions and the unused-ticket
+slider, with no captured browser warnings/errors. No ticket action was submitted.
+
+The anonymous production HTTP check also verified clean landing, unchanged
+allowances before start, personalized uncached manifest, no analytics injection,
+guest tokens without verified email, start/resume, explicit takeover and old
+HTTP/database-token denial, guest admin/asset denial and fresh binary media.
+Closing the stream released its reservation; 280ms was charged and both action
+allowances stayed intact. The controlled guest invitation is revoked and further
+guest-token issuance is denied. A smoke-script assertion expected zero rather
+than the stored release timestamp; a separate read proved cleanup. Live
+post-consumption resume and revoked-link HTTP redirect were not reached; their
+local coverage is not claimed as live proof. No member was created for testing.
+
+Release acceptance remains incomplete in two areas. Physical iPhone PWA and
+Android Native Alpha installation, email return and remembered relaunch checks
+require the target devices and an authorized test email. Separately, the public
+edge still adds Cloudflare NEL reporting headers; HTTP error reports can carry
+query strings even though application analytics and logs omit invitation tokens.
+The Ticket-only clearing rule is prepared in
+[`infra/arbuzas/cloudflare`](../../infra/arbuzas/cloudflare/README.md), but the
+existing API token lacks rule access and the browser requires Cloudflare sign-in.
+Do not treat the complete error-report privacy requirement as verified until
+that rule is applied and checked. Unrelated local notification edits were
+restored and their bundle regenerated after deployment.
+
+## September 22 first-visit welcome and Android installation alternatives
+
+Signed-out mobile visitors see a small welcome before authorization. Either
+button saves `ticket.welcomeAcknowledged` in browser storage; subsequent visits
+skip it even after logout or session expiry. Installed standalone/fullscreen
+PWAs (including iOS standalone), desktop browsers and approved signed-in
+members bypass the welcome. Storage failure cannot block sign-in, and a normal
+authorization link remains usable without JavaScript. Authentication lifetime
+and membership authority are unchanged.
+
+The welcome uses the saved LV/EN/RU language or the first supported browser
+language, falling back to English. Its guide opens at the detected iPhone/iPad
+or Android page with device switching and a sign-in link. The shared guide
+styles and six illustration URLs are explicitly public; other private assets
+remain protected. The public shell starts no viewer, database or phone work.
+
+The Native Alpha guide now presents GitHub as the free immersive option and
+Google Play as the easier installation, with separate free and paid Plus links.
+Latvian, English and Russian explain the edition differences. Expandable GitHub
+instructions identify the exact v1.5.2 APK, installation permission and browser
+fallback; no GitHub account or app is required. One shared setup follows both
+choices, with immersive settings limited to GitHub/Plus and link editing in a
+separate disclosure.
+
+Deployed from `e7b056b6` as `ticket-welcome-20260922-v231`. Both required
+builds passed, alongside the full suite (86 client/browser
+tests, 33 module tests, Go packages and 18 sidecar tests), and the deployment
+contract. Welcome tests cover 108 checks across ten journeys; the shared guide
+covers 895 checks across 320, 390 and 1440px and standalone/fullscreen modes.
+Interactive preview verified the welcome layout, translations, direct Android
+instructions, public iPhone illustrations, sign-in and repeat-visit bypass.
+Standard deployment validation and mirror audit passed. Anonymous production
+serves the welcome with no private viewer configuration; all eight public guide
+assets match the release, private assets remain gated, and admin authorization
+preserves the requested destination. The saved signed-in browser session opens
+the viewer directly with v231 assets, fresh HDR and the unused-ticket control.
+The shared Android alternatives passed live Latvian, English and Russian checks
+with no captured warnings/errors. Latvian was restored and verification tabs
+closed; no physical ticket action was submitted. Physical PWA launch/install
+and Native Alpha sign-in/playback remain unverified.
+
+## September 22 compact check-in and viewer languages
+
+The check-in list item opens one sheet directly. Each direction appears once,
+with occupied carriages, active counts and the latest check-in time (including
+renewals). Only the existing 40-minute active window appears; expired and
+checked-out history is hidden. Existing private retention, notice cooldown,
+account revision fences and phone isolation remain unchanged. Confirmation
+stays in the sheet, with change/renew and checkout available from the summary.
+
+The viewer language control sits beside Admin, or alone for regular members.
+Latvian, English and Russian cover ordinary viewer menus, statuses, accessible
+labels, check-in and installation instructions. One browser-local preference
+updates these in place; the installation selector shares it. Admin management
+and the streamed ViVi picture retain their own language. No schema or phone
+deployment is needed.
+
+Deployed from `a3cdd388` as `ticket-checkin-languages-20260922-v230`.
+Both required builds and the full suite passed (85 client/browser tests,
+33 module tests, Go packages and 18 sidecar tests), plus the real-database
+check-in fixture and deployment contract. The signed-in page confirmed a live
+check-in, persistence through reload, checkout returning the active count to
+zero, shared Russian installation copy, all three viewer languages, matching
+v230 assets and fresh HDR. Browser language was restored to Latvian and the
+verification tab closed. No physical ticket action was submitted.
+
+The first release rolled back because the old deployment probe rejected all
+localStorage use. The probe now rejects the retired authentication-storage keys
+while allowing the non-secret language preference; standard deployment
+validation passed. Admin management copy remains outside viewer localization.
+
+## September 22 right-edge trim
+
+The shared picture clip removes one displayed pixel from the right edge, as
+well as the existing 15px bottom strip. Ordinary, HDR, retained HDR and frozen
+pictures expose the matching background at the edge without resizing the
+canvas, changing picture proportions or moving the registration control.
+
+Deployed from `7878f747` as `ticket-right-edge-20260922-v228`. Required builds
+and the full suite passed (85 client/browser tests including responsive crop
+checks, 33 module tests, Go packages and 18 sidecar tests). Signed-in production
+showed fresh HDR with a clean right edge, the new shared clip and unchanged
+994×2046 source / 415×856 fitted dimensions. Assets, standard deployment
+validation and mirror audit passed. Unrelated local edits were restored unchanged.
+
+## September 22 responsive picture background
+
+The space around the fitted ticket picture now uses its sampled lower-left
+background color, including the 15px cropped strip. A one-pixel sampling canvas
+reads only accepted source updates, not slider animation. The fill follows the
+actually displayed SDR/HDR gain and retains the frozen/held picture's color.
+Sampling failure cannot interrupt the stream. Cold clear releases the sampler
+and removes the color. The fill is for the dark ticket background; CSS colors
+clamp highlights above SDR white.
+
+The page and supported browser chrome share that color. Installed iOS pages
+request a translucent status area; picture fitting reserves reported safe-area
+insets. Portrait, landscape and wide screens retain the source aspect ratio,
+canvas dimensions, shared picture bounds and registration geometry.
+
+Deployed from `d0424dd2` as `ticket-background-fill-20260922-v227`. Required
+builds, the full suite (85 client/browser tests, 33 module tests, Go packages,
+18 sidecar tests) and real-GPU HDR verification passed. The 57 new browser
+checks cover portrait, landscape, wide screens and simulated safe-area insets;
+presentation tests cover HDR gain, frozen/held color, fallback and sampler
+cleanup. Signed-in production verified fresh HDR and filled side/bottom space
+at 390×844, 844×390 and 1440×900, with source dimensions still 994×2046 and v227
+assets. The current live ticket was already registered, so no live registration
+gesture was submitted; unused-ticket hit geometry passed in the local fixture.
+Standard deploy validation and mirror audit passed. Physical iPhone status-area
+appearance remains unverified. Unrelated local notification edits were restored
+and their generated bundle rebuilt after this isolated release.
+
+## September 22 picture bottom crop
+
+The viewer clips 15 displayed CSS pixels from the bottom of the ordinary, HDR,
+retained HDR and frozen control-code pictures. Frozen images share the existing
+stream bounds so the crop stays picture-relative with letterboxing. Canvas and
+source dimensions, picture scaling, registration coordinates and phone capture
+remain unchanged. The amount is display-relative, not 15 Android source pixels.
+
+Deployed from `abf51898` as `ticket-bottom-crop-20260922-v226`. Required builds
+and the full suite passed (84 client/browser, 33 module and 18 sidecar tests,
+plus Go packages). Signed-in previews checked ordinary/HDR pictures and phone
+width; the deployed page showed fresh HDR, its registration control, the 15px
+crop and no white Android bar or captured browser errors. Source dimensions
+remain 994×2046. Public and signed-in assets match v226, standard deployment
+validation and mirror audit passed, and unrelated local notification edits were
+restored unchanged. No real ticket action was submitted.
+
+## September 22 administration navigation
+
+The admin interface now has task-focused pages at `/admin?tab=…`: Overview
+for health and notifications, Tickets for the latest ticket and schedules,
+Members for access, Statistics for activity, and Settings for testing limits,
+device selection and collapsed diagnostics. Owners also have a separate ViVi
+account page; credentials are no longer loaded on Overview. Stream sleep stays
+on Tickets, and its state connection works independently of Settings. Successful
+forms return to their own section. Emergency account reset and detailed schedule
+records use native disclosures. All destinations remain visible on small screens.
+
+The regular ticket viewer keeps its existing structure and controls. This is a
+navigation change; account authority, ticket actions and physical phone behavior
+retain their existing owners and confirmations.
+
+Deployed from `ea63cec3` as `ticket-admin-navigation-20260922-v225`. Both
+required builds, the full suite (84 client/browser tests, 33 module tests, Go
+packages and 18 sidecar tests), and the separate responsive Statistics checks
+passed. Focused checks cover role-specific navigation, page-data isolation,
+section-preserving form results and 35 independent sleep/limits state checks.
+The local browser verified all six pages at 320px, keyboard navigation,
+disclosures, member add/remove and contained diagnostic scrolling. Signed-in
+production verified all six destinations, live owner/settings controls and
+monitoring, compact Statistics, matching v225 assets and a fresh ticket picture,
+with no captured browser warnings/errors. Overview fell from 4,046px to 856px
+at the same saved browser size. No real ticket action or credential change was
+submitted. Standard deployment validation and mirror audit passed. Existing
+local notification edits were restored exactly and excluded from this release.
+
+## September 22 Russian installation instructions
+
+The complete installation guide now includes Russian alongside Latvian and
+English. A native language selector retains the current guide and covers all
+menus, Safari/Chrome/Firefox/Native Alpha steps, prompt and clipboard messages,
+screenshot descriptions and accessible labels. Original third-party screenshots
+remain unchanged, with a translated explanation that they show English examples.
+
+Deployed from `965236d6` as `ticket-install-russian-20260922-v224`. Required
+builds and the full suite passed: 83 client/browser tests, including 815 guide
+checks across 320, 390 and 1440px plus standalone/fullscreen launch; module, Go
+and 18 sidecar tests also passed. Standard production validation, public and
+signed-in v224 asset versions, all four Russian guides and language switching
+passed. The live page showed the unused ticket and its registration oval with
+Arrow mounted and no captured browser warnings/errors. No ticket action was
+submitted. Mirror audit was clean; local notification edits were preserved and
+excluded. Native Alpha acceptance on a separate Android device remains open.
+
+## September 22 installation options
+
+Web v223 groups Chrome and Firefox under Android → Browser installation and adds
+Android → Full-screen viewer with Native Alpha setup and editable-link
+instructions. Installed apps retain access to these options. Both Latvian and
+English preserve the current menu when switching language; Back moves one level.
+Ticket link copying excludes query parameters and fragments.
+
+Deployed from `9af82aa0` as `ticket-install-options-20260922-v223`. Required
+builds and the full suite passed, including 83 client/browser tests (428 focused
+guide checks), database and Go checks, and 18 sidecar tests. Production standard
+validation, public and signed-in asset versions, live Android menu navigation,
+both languages, link copying, the live ticket picture and final mirror audit
+passed. The page mounted Arrow and produced no captured browser warnings/errors.
+
+The user explicitly authorized deployment before separate Android acceptance.
+Native Alpha sign-in and live playback remain unverified on Android. The source
+Pixel was not repurposed for viewer testing, and no APK was downloaded or
+installed. This release retains v222 HDR recovery; unrelated local notification
+removal was excluded and its original source edits restored after deployment.
+See the [release and acceptance report](../../ops/reports/2026-09/2026-09-22-ticket-installation-options.md)
+for the remaining device checks.
+
+## September 22 two-stage HDR recovery
+
+Web v222 starts HDR recovery immediately on opening or returning, then performs
+one follow-up after one second. A usable renderer keeps its canvas, device and
+brightness and reconfigures only while submitting a prepared boosted picture,
+without repeating the ordinary-brightness activation frame. Slow initial work
+finishes before the follow-up; a failed initial attempt receives one full retry.
+Departure, HDR-off and disposal cancel pending work. The existing page check and
+focus handler detect wall-clock gaps over one second when departure events are
+missed. Frozen results retain their exact picture and freshness rules.
+
+Deployed from `16198e71` as `ticket-hdr-two-stage-20260922-v222`. Required builds,
+83 browser/client tests, 33 database tests, Go tests and 18 sidecar tests passed
+before release. The isolated HDR-only release passed 37 focused/page tests and Go
+checks. Real-GPU opening and frozen-result follow-ups each configured once,
+emitted no identity frame, preserved sampled pixels and reused their resources.
+Production validation, the signed-in live page, authenticated bundle hash and
+final mirror audit passed. The page loaded v222 with Arrow mounted, live video,
+HDR ready, no HDR error, a usable slider and no stream spinner or console errors.
+
+Physical iPhone brightness, flicker and native sleep/return remain unverified.
+The browser-tab check did not produce a genuine hidden transition, so it is not
+claimed as native-return proof. Separate installation-guide and notification
+changes were excluded from that release. See the
+[release report](../../ops/reports/2026-09/2026-09-22-ticket-hdr-two-stage.md).
+
+## September 22 live viewer-role revocation
+
+Web v221 hides the viewer section, Admin link and notification controls when the
+existing live account state no longer grants owner/admin privileges. It clears
+the displayed viewer identities and count at the same time, without reloading
+the page or submitting any ticket action. Admins who choose ordinary action
+quotas retain access. The database privacy restrictions are unchanged.
+
+The real-page browser regression covers demotion, restored privileges and unknown
+role state; the HTTP test retains owner/admin access and excludes ordinary users
+from both viewer markup and detailed health. Deployed from `58e5f146` as
+`ticket-viewer-role-20260922-v221`. Required builds, the full test suite, production
+validation and the deployed bundle check passed. A signed-in administrator who
+obeyed ordinary quotas retained viewer access; demotion in that same open page
+then immediately removed all privileged controls while viewing and check-in
+history stayed available. The three independent live test accounts also completed
+eight phone actions with matching saved results and returned browser pictures.
+See the [verification report](../../ops/reports/2026-09/2026-09-22-ticket-three-user-test.md)
+for coverage, isolated timing/queue checks, exclusions and cleanup.
+
+## September 22 quiet HDR foreground recovery
+
+Web v220 remembers window focus loss, hidden visibility and page exit immediately.
+The first visible return consumes that marker and rebuilds HDR once, including
+after a previous renderer failure. Overlapping focus, visibility and cached-page
+return events do not repeat the attempt. Focus changes between page controls do
+not count; focus-only returns leave the media connections alone. The marker is
+page-local, with no background timer or persistent storage.
+
+Recovery retains the completed HDR picture until a fresh replacement is ready,
+or leaves the ordinary picture visible if HDR had already failed. HDR preparation
+alone no longer shows the stream spinner. A failed attempt falls back quietly and
+waits for the next foreground return or an explicit preference change. Saved HDR
+off and brightness choices, frame freshness and exact control-code results remain
+unchanged. Browser events cannot guarantee a one-second notification if iOS has
+already suspended execution; physical iPhone brightness still needs observation.
+
+Deployed from `f55f782f` as `ticket-hdr-foreground-20260922-v220` on September 22.
+Both required builds, the full test-suite rerun, focused recovery checks and real-GPU
+checks passed. Standard production validation, public version, deployed bundle
+hash and the final mirror audit passed. The first full suite had a notification
+fixture browser-launch timeout; that test passed alone and in the full rerun.
+Signed-in native return and physical iPhone brightness remain unverified. See the
+[release report](../../ops/reports/2026-09/2026-09-22-ticket-hdr-foreground.md).
+
+## September 22 check-in diagram refresh
+
+Web v219 fixes history/notice miniatures retaining an earlier carriage or count
+after the report text updated. Nested miniature rendering is now reactive when
+Arrow reuses a group row. The selection form's top-to-bottom order was already
+correct. Browser coverage now checks actual visual positions for all four
+carriages in both directions, replacement from fourth to first, count changes,
+and history/form dismissal and focus return. Check-in data and timing are unchanged.
+
+Deployed from `1155aa55` as `ticket-checkin-view-20260922-v219`. The regression
+failed before the fix and now passes 45 checks at each of 320, 390 and 1440px;
+history and form previews were visually inspected. Required builds and the full
+test suite passed. One unrelated slider pixel check failed in the first combined
+run, then passed both alone and in the full rerun without source changes.
+Production validation, live version, deployed bundle hash and connected sidecar
+passed. Signed-in browser verification remains blocked by the existing URL policy.
+
+## September 22 compact check-in entry
+
+Web v218 puts the check-in section inside a native disclosure, collapsed by
+default. Its blue entry is 88px tall (twice the 44px action buttons), shows a
+brief current status, and is the only highlighted main control. The control-code
+button and expanded check-in actions use the ordinary dark style. Check-in
+dialogs, notice timing, database behavior and ticket operations are unchanged.
+
+Deployed from `0e8671c5` as `ticket-checkin-button-20260922-v218`. Required
+builds/tests and standard production validation passed; deployed script, CSS
+and template hashes match. The local mobile preview and 33 check-in checks at
+each of 320, 390 and 1440px passed. Signed-in live verification remains blocked
+by the browser URL policy already encountered in this thread.
+
+## September 22 voluntary train check-in and private viewers
+
+Web v217 adds a Latvian Arrow check-in island above the ticket actions: two
+directions, four carriages counted from the front, explicit confirmation,
+replacement and early check-out. It never creates a phone command or registers
+a ViVi ticket. Spacetime owns one latest report per account, 40-minute activity,
+120-minute history, anonymous grouped views, and one opening notice per account
+per 120 minutes only when another active member has a fresh report. Existing
+policy-boundary timers expire and remove reports without browser polling.
+An account revision remains after report removal to fence delayed retries.
+
+Raw viewer, desired-stream, phone-report and relay-report tables are private.
+Current owners/admins retain viewer access; ordinary members receive only the
+cold-restart fields they need. Detailed HTTP health is admin-only. Pixel v394
+and the sidecar subscribe to the restricted service views. The release order is
+additive views, compatible Pixel and sidecar/web, then private-table cutover;
+all publications use `--delete-data=never`. Do not downgrade those consumers
+to raw-table subscribers after the cutover.
+
+Checks: `make test`, `make spacetime-build`, `make web-client-build`, and
+`make checkin-test`. The last command uses only a disposable loopback database
+and synthetic browser pages, including the data-preserving public-to-private
+migration. Never publish its fixture module to production.
+
+Deployed from `51895693` as `ticket-checkin-20260922-v217`, with Pixel
+`f3550a3` / v394. Compatible publication, scoped client deployments, final
+private-table publication, and post-cutover production validation all passed.
+Live schema confirms the six source/account tables are private; sidecar and
+phone remain healthy. Signed-in browser acceptance is still blocked by Browser
+Use URL policy. See the [release report](../../ops/reports/2026-09/2026-09-22-ticket-checkin.md)
+for the tested behavior, production evidence, and remaining acceptance gap.
+
+## September 22 false monitoring alerts
+
+Pixel v393 keeps a successfully requested asynchronous monitoring capture pending
+until the classifier reports its real result. Previously, a warm stream with no
+viewer demand immediately reported capture unavailable; that artificial timestamp
+could also reject the real result as older, causing repeated problem/recovery
+notification pairs. Failed dispatch and overdue observations retain their existing
+alerts. No phone action, additional capture loop, or server change was added.
+See the [incident report](../../ops/reports/2026-09/2026-09-22-ticket-monitoring-false-alerts.md)
+for deployment and live verification. The owner's enabled Monitoring setting and
+private device subscription are preserved.
+
+## September 22 slider input-service repair
+
+Pixel v392 requires a connected input service before publishing action readiness
+or reusing registration evidence. Connection changes invalidate the old context
+and fence earlier captures. Recognized-screen monitoring remains independent.
+Ticket-scoped SSH deployment restores the existing accessibility component and
+checks that Android actually bound it after app replacement. Notification
+listeners and other services are preserved. Web v216 reports missing phone
+control accurately without changing slider gestures, retries or ticket identity
+checks. See the [incident report](../../ops/reports/2026-09/2026-09-22-slider-input-service-repair.md)
+for the three pre-dispatch failures and remaining signed-in acceptance.
+
+## September 22 optional readiness monitoring
+
+v215 and Pixel v391 add an owner-controlled monitoring switch, off by default,
+and per-device Web Push subscriptions for active owners and administrators.
+The existing Pixel classifier supplies active observations; an idle check every
+five minutes takes one bounded capture through the same helper before any encoder
+is constructed. Cold shutdown is allowed to settle first; asleep mode still
+permits monitoring. Checks never navigate, tap, or renew three-second action
+readiness. Observation timestamps use the existing database clock anchor.
+
+SpacetimeDB owns current health, the five-minute incident threshold, subscriptions,
+and bounded delivery receipts. Missing checks are reported as unable to verify,
+not as a known blocked ticket. Idle detection normally takes five to ten minutes.
+The existing server sends one problem notification and one verified recovery;
+roles, monitoring epoch, phone session, observation age, and delivery claims are
+checked before accepting work. Disable cancels pending delivery. No new automatic
+recovery actions are added. The worker caches no private page or ticket content.
+
+Routine healthy checks update current state only. Transitions and delivery
+outcomes use the shared operational log with unchanged six-hour Ticket retention.
+The logging/resource audit is in
+`ops/reports/2026-09/2026-09-22-ticket-monitoring-audit.md` at repo root.
+The compatible releases are deployed. Initial idle checks and restart persistence
+passed; the owner subsequently enabled Monitoring and subscribed a device. The
+September 22 iPhone screenshot confirms problem and recovery delivery, although
+it does not establish whether the app was closed on arrival. The signed-in journey
+remains unverified by browser automation. See the
+[rollout report](../../ops/reports/2026-09/2026-09-22-ticket-monitoring-rollout.md)
+for evidence and the remaining device/browser acceptance steps; source and
+fixture tests alone do not establish notification delivery.
+
+## September 21 continuous slider drag
+
+v214 keeps an established horizontal drag active when the finger returns to or
+past its starting position, including slight vertical drift. The thumb clamps
+at the start and follows the same finger forward again until release. Initial
+vertical scrolling still cancels; release still requires the existing rightward
+travel and angle, and all phone-context, layout, capture and lifecycle checks
+remain active. The shrinking picture, HDR treatment and three-second cover are
+unchanged.
+
+Deployed from `8113dd6c` as `ticket-slider-drag-20260921-v214`. All local checks
+and standard production validation passed; runtime version and the release
+bundle hash match. The real-page browser fixture passed 174 checks, including
+the 12-check reversible-drag regression. Signed-in live touch verification
+remains blocked by browser URL policy. See the
+[release report](../../ops/reports/2026-09/2026-09-21-ticket-slider-drag.md).
+
+## September 20 independent statistics and shrinking slider
+
+v213 loads `page-activity.js` separately before the viewer. It immediately samples
+visible viewing time and repeats every five seconds, independently of media,
+phone readiness and the browser database subscription. Samples are saved to an
+account/ticket-scoped IndexedDB outbox and delivered asynchronously through the
+signed-in `POST /api/v1/activity` route. Hidden or suspended intervals are never
+backfilled. Offline visible samples remain queued for the current and previous
+29 Riga calendar days; unavailable browser storage uses a diagnosed in-memory
+fallback that cannot survive closing the page.
+
+The HTTP handler derives account and ticket from the signed-in session/config.
+Its narrow sidecar reducer rechecks membership atomically, writes private daily
+aggregates, and deduplicates UTC five-second slots across retries, tabs and
+out-of-order deliveries. The existing hourly display and registration accepted /
+confirmed-successful counts remain unchanged. Defaulted coverage fields preserve
+historical totals; missing historical samples cannot be reconstructed. Existing
+37-day database row retention remains unchanged.
+
+One tracker owns version refresh from both activity responses and media notices.
+It persists the current sample before reloading and never resubmits an action.
+The old member tick reducer remains only for already-open pre-v213 pages; remove
+it after those deployed callers have drained. Publish the additive database
+module with `--delete-data=never`, then deploy sidecar and web together.
+
+Deployed from `503a8df6` as `ticket-async-statistics-20260920-v213` on
+20 September. The data-preserving module publication, scoped web/sidecar deploy
+and standard Ticket production validation passed. Runtime version and release
+asset hashes match; no phone command remains pending. The combined browser
+fixture proved an actual reload preserves queued activity without replaying a
+running registration. Signed-in production visual/counting verification is
+still blocked by browser URL policy. See the
+[verification report](../../ops/reports/2026-09/2026-09-20-ticket-async-statistics.md).
+
+The orange slider now shortens behind its moving black thumb, keeping its right
+edge fixed and reaching a circle at full travel. Cancellation regrows the track.
+The full input region, swipe threshold, text fade, HDR path and three-second
+registration cover are unchanged. Edit sources and regenerate all browser assets.
+
+## September 20 registration transition cover
+
+v211 retains the validated slider region for 3,000 ms after a local
+`register_current` trigger. The existing painter draws only the sampled card
+background during that interval, hiding both slider versions and the native
+activation motion while new phone pictures continue through the same SDR/HDR
+path. Swipe, keyboard, assistive activation and the registration button use the
+same submission path. Invalid gestures never start a cover. This local cover
+does not report success or delay, retry or change the phone action.
+
+The deadline starts before sending the request and is never extended by phone
+updates or an early result. Input stays hidden while covered. Expiry reveals
+the actual current picture, including an unfinished action if the phone needs
+longer. Hidden time counts and resume checks expiry before restoring the
+picture. A known rejection clears the cover with the rejected request; uncertain
+delivery retains existing request ownership. Frozen control-code results bypass
+composition, and the existing source-freshness rules remain intact.
+
+Validation passed all 56 web tests, including 149 normal browser journey checks
+and eight font-failure checks, all 44 slider pixel/animation checks, Go tests,
+24 module tests, 17 sidecar tests, bindings validation and both builds. The
+journey verifies cover at 2,999 ms and removal at 3,000 ms, early activation,
+incoming registered pictures, stale-frame restoration and expired background
+return. The real-GPU probe matches covered card pixels, accepts new source
+updates and restores their raw pixels while preserving freshness, exact-result
+safeguards and the same HDR resources with zero reconfigurations.
+
+Deployed `ticket-slider-transition-20260920-v211` from `6bcd96df` at 00:58
+Europe/Riga on September 20. Standard release validation and public v211
+identity checks passed. No Ticket action remained pending. The host mirror
+was pulled after deployment and its audit is clean; local outputs remain
+accessible to the workspace user. The Chrome control tool is not available in
+this session and its documented diagnostic reports Chrome is not running;
+the existing signed-in fallback is URL-policy blocked. No physical iPhone
+acceptance, Pixel action or browser recording is claimed for this release.
+
+## September 19 slider border polish
+
+v210 fixes the dark rectangle shown in the user's v209 screenshots. WebKit's
+`VideoFrame` drawing path ignores its source crop, so the backing strip contained
+the whole phone picture squeezed behind the pill. The painter now samples the
+card from the frame already drawn on its reusable canvas. The approved slider
+appearance, wave, gestures and HDR presentation are unchanged. The relevant
+[WebKit implementation](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/html/canvas/CanvasRenderingContext2DBase.cpp#L1597-L1617)
+was verified on September 19.
+
+The regression reproduces the old border by emulating that WebKit behavior and
+passes with the fix for native-size and cropped/scaled video frames. All 38
+slider pixel/animation checks, all 56 web tests, Go tests, 24 module tests,
+17 sidecar tests, bindings validation and both builds passed. Generic white,
+gray and dark card previews have clean borders. Real-GPU checks preserve the
+same resources, raw exact results and numeric colors, with zero canvas
+reconfigurations. These checks do not establish physical iPhone acceptance.
+
+Deployed `ticket-slider-border-20260919-v210` from `63bf3edc` at 20:22 UTC.
+Standard release validation passed and public liveness reports v210. No Ticket
+action remained pending. The host mirror was pulled after deployment and its
+final audit is clean; modified files remain accessible to the workspace user.
+The signed-in visual check remains blocked by the browser URL policy. No phone
+action or browser recording was performed for this border-only correction.
+
+## September 19 picture-composed registration slider
+
+v209 replaces v208's separate white backing after the user's screenshot showed
+its visible rectangular seam. The local slider, sampled card backing and wave
+are drawn into one reusable picture canvas and receive the same HDR treatment
+as the rest of the frame. The transparent browser button keeps the existing
+eight-pixel swipe-anywhere trigger, pointer capture, keyboard and accessibility
+activation. A font download failure keeps those inputs available over native
+pixels. Native busy/result pictures still take over after command admission;
+the browser does not invent a successful phone outcome.
+
+Local animation uses the existing serialized graphics owner. It preserves the
+source timestamp and feedback, gives new source pictures priority, and stops
+when hidden, frozen or expired. Raw frames remain separate for exact control-code
+results. An HDR snapshot failure falls back silently to SDR with the settings
+error. There is no extra visible CSS backing or separate HDR wave canvas.
+
+Local pixel checks cover white, gray and dark cards, removal of native corners,
+typography, drag, return and reduced motion. The real-GPU 994 × 2046 probe kept
+the same canvas/resources with zero reconfigurations; eight BT.709 samples
+outside the slider were numerically identical before and after composition.
+Thirteen drag samples had a 16.6 ms median and 18.3 ms p95. Ten background-return
+simulations and raw exact-result checks passed. These are desktop software
+checks, not physical iPhone HDR acceptance or a high-frame-rate native gesture
+recording. Native release timing and text-fade matching remain unverified; the
+browser currently uses a 200 ms eased return and progress-based text fade.
+
+Deployed `ticket-picture-slider-20260919-v209` from `acdd5a52` at 19:27 UTC.
+Standard release validation passed and public liveness reports v209. All 56 web
+test cases passed, with the SDK case rerun after concurrent regeneration briefly
+removed its generated import. The font-failure browser mode passed five checks;
+the normal journey retained eight actions, one code request and one capture
+acknowledgement with no browser errors. Go, 24 module tests, 17 sidecar tests,
+bindings validation and both builds passed. No Ticket action remained pending.
+The host mirror was pulled after the release change and its final audit is clean.
+
+Signed-in visual acceptance remains blocked by the browser URL policy. Static
+assets also require authentication, so an unauthenticated asset request returned
+401; it was not retried through another access route. No Pixel input or recording
+was started for this correction. Exact native motion still needs a physical-user
+gesture recording: the installed custom ViVi widget does not expose its timing,
+and the phone has no external partial-drag command through its action owner.
+
+## September 19 single visible registration slider
+
+v208 covers the native streamed slider whenever the local browser slider is
+visible. A noninteractive white card backing sits above SDR, current HDR and
+retained HDR pictures, underneath the local rounded slider. It covers the rounded
+corners plus one sample from the phone's refined 192 × 288 edge probe, clamped
+inside the displayed picture. The backing shares the slider's proof, hidden,
+details-view and frozen-result visibility. Activation bounds, trigger and wave
+are unchanged; the media canvases and HDR renderer are not modified.
+
+Validation passed all 50 web tests, including 142 actual-browser journey checks
+with zero browser errors and unchanged action counts, plus Go, 24 module and 17
+sidecar tests and both builds. A loopback compositor probe with an intentionally
+visible stream marker behind all three picture layers showed zero marker pixels
+inside the cover. Signed-in live appearance and target-device HDR white matching
+remain unverified because the existing browser session was policy-blocked.
+
+Deployed `ticket-slider-cover-20260919-v208` from `79639f0f` at 18:13 UTC.
+Standard release validation passed, the public liveness response reports v208,
+and no Ticket action remained pending. No phone action or browser session change
+was performed for this release.
+
+## September 19 native ViVi slider appearance
+
+v207 replaces the v206 approximation using a direct Pixel reference: golden
+`#f7b500` track, `#262b2f` handle, narrow yellow rim, Material-style arrow and
+centred Roboto lettering. Geometry and spacing scale from the observed 932 × 147
+slider. Two preloaded, self-hosted Roboto subsets contain only these labels;
+their OFL notice is shipped beside them. The type weights are calibrated for
+the browser rendering. No proprietary ViVi font or ticket image is served.
+
+The eight-pixel rightward trigger, starting anywhere on the slider, pointer
+capture, scroll cancellation, keyboard/assistive activation and three-second
+HDR/SDR wave are unchanged. Handle travel now follows the measured rim geometry.
+HDR presentation, fallback and operational logging are unchanged from v206.
+
+Local validation passed the full test suite and both builds. A real loopback
+browser loaded both fonts and rendered the slider at 280, 332, 440 and 932 px;
+the existing 120-check browser journey retained its eight admitted commands and
+zero browser errors. Direct Pixel secure recording produced clear native pixels,
+but the quiet capture supplied only seven changed frames over 24.14 seconds:
+high-frame-rate drag/return motion and physical finger feel remain unverified.
+The signed-in browser harness blocked the task tab under its URL policy, so
+these local checks do not establish production visual acceptance.
+
+Deployed `ticket-native-vivi-slider-20260919-v207` from `1bf22b9a` at 16:16 UTC.
+Standard release validation and public `/api/v1/livez` identity checks passed.
+No Ticket action remained pending. No phone input was issued during the native
+reference capture; temporary recordings, full ticket pictures and the copied APK
+were removed. Only generic slider crops were retained for visual comparison.
+The task-created browser tab/group was closed without changing saved sessions.
+
 ## September 19 steady HDR and local ViVi slider
 
 v206 keeps the WebGPU canvas configured while completed pictures replace its
@@ -9,9 +690,10 @@ contents. Ordinary updates reuse the same visible HDR surface. Background-return
 replacement still retains the previous picture until the replacement is ready.
 An unsupported or failed HDR renderer now reveals the latest ordinary picture
 without an error overlay or retry spinner; the saved HDR preference remains on
-and the explanation appears beneath that setting. It stays in SDR until an
-explicit preference change or a new page opening, avoiding repeated failed
-activation. A frozen control-code result uses its already-prepared exact SDR
+and the explanation appears beneath that setting. In v206 it stayed in SDR until
+an explicit preference change or a new page opening; v220 also permits one retry
+per foreground return, without a continuous retry loop. A frozen control-code
+result uses its already-prepared exact SDR
 image on failure.
 
 The browser renders the ViVi orange slider, label and arrow locally in the
@@ -425,10 +1107,16 @@ Generated copies such as `internal/web/static/app.js` and `internal/web/static/s
 
 ## Administrator statistics
 
+Initial action-count fixes deployed as `ticket-statistics-20260920-v212` on
+20 September 2026; v213 above replaces its viewer-driven sampling. Local tests,
+module publication, and standard production validation passed. Signed-in live
+browser acceptance remains blocked by browser URL policy. See the
+[release verification](../../ops/reports/2026-09/2026-09-20-ticket-statistics.md).
+
 `/admin?tab=statistics` shows the last 30 Europe/Riga calendar days of viewing
 time and accepted slider-registration/control-code requests. Each action count
-is successful/accepted. Only `register_current` from `browser_slider` contributes
-registration counts; menu actions do not. Code success means confirmed phone
+is successful/accepted. Both `register_current` and `open_latest_and_register` contribute
+registration counts, through the slider or menu. Older totals counted sliders only. Code success means confirmed phone
 generation, not browser presentation or inspector use. Queued requests count at
 acceptance, including later failures; blocked submissions do not count.
 
@@ -440,7 +1128,15 @@ and is retained across deployments. Receipts created before tracking have no
 counted kind, so delayed old results cannot create unpaired successes. Existing
 viewing history keeps its prior retention. The administrator snapshot receives
 these aggregates through service-only views; member and health responses exclude
-them. No code digits, tickets, new event log, browser request, or poller is added.
+them. No code digits, tickets, or new event log are stored.
+
+The Statistics page refreshes through the administrator-only
+`GET /api/v1/admin/statistics` every 15 seconds while visible, with one request
+in flight and a ten-second timeout. It preserves the chosen view and expanded
+day, marks retained figures stale after a failure, and stops on revoked access.
+Viewing samples now use the independent v213 outbox described above. A stalled
+delivery times out after ten seconds without reconnecting the viewer; only saved
+samples are retried. Physical actions are never replayed.
 
 Edit `web-client/admin-statistics-source.js` and rebuild. The same entry renderer
 serves compact and detailed views, with counts only where attempts exist. Run
@@ -530,6 +1226,6 @@ grace period while session checks continue. Owner cold completion resumes media
 in place after the existing proof barrier without replacing the command
 connection or renewing the page-opening warm lease.
 
-HDR failures keep receiving ordinary pictures while HDR retries, preserving the saved preference. Browser v190 retains the last completed HDR surface until its replacement finishes; retained pixels never renew live action authority. A lost display device shows recovery while a new surface is prepared. Hidden-page and cached-page returns share HDR recovery, and displayed control-code results retain their original frame only until dismissal or expiry so they can be reprocessed without a new phone request. Reconnects never resubmit phone commands; pending results retain their identity, and abandoned callbacks cannot affect replacement connections. Browser fault coverage lives in the loopback-only recovery test and uses simulated services and decoder output with the real page and canvas presentation.
+HDR failures keep receiving ordinary pictures, preserving the saved preference. A foreground return or explicit preference change permits another attempt; ordinary frames and transport reconnects do not retry a failed renderer. Recovery retains the last completed HDR surface until its replacement finishes; retained pixels never renew live action authority. Hidden-page, window-focus and cached-page returns share one HDR recovery path. Displayed control-code results retain their original frame only until dismissal or expiry so they can be reprocessed without a new phone request. Reconnects never resubmit phone commands; pending results retain their identity, and abandoned callbacks cannot affect replacement connections. Browser fault coverage lives in the loopback-only recovery test and uses simulated services and decoder output with the real page and canvas presentation.
 
 HDR recovery tests: `web-client/presentation.test.mjs` exercises the real controller with controlled GPU completion; `web-client/presentation-real-gpu.html` exercises ten replacements and exact-result restoration on the real GPU with synthetic pixels. The page exposes only the latest HDR recovery duration and selected color space for inspection. Physical iPhone contrast acceptance remains distinct from these checks.

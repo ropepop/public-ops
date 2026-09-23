@@ -313,12 +313,45 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 	if c.conn == nil {
 		return false
 	}
+	if item.frame != nil && c.trial != nil {
+		c.videoMu.Lock()
+		visible := c.videoV2Visibility == "visible"
+		c.videoMu.Unlock()
+		if !visible {
+			c.videoMu.Lock()
+			c.clearVideoFrameInFlightLocked(item.frame)
+			c.videoMu.Unlock()
+			c.trial.pause(false)
+			return true
+		}
+		if err := c.trial.admit(ctx); err != nil {
+			c.videoMu.Lock()
+			c.clearVideoFrameInFlightLocked(item.frame)
+			c.writerClosed = true
+			c.writerCloseReason = "trial_ended"
+			c.videoMu.Unlock()
+			_ = c.conn.Close(websocket.StatusPolicyViolation, "trial unavailable")
+			return false
+		}
+		if queuedFrameExpired(*item.frame, time.Now()) {
+			c.videoMu.Lock()
+			c.clearVideoFrameInFlightLocked(item.frame)
+			c.videoMu.Unlock()
+			c.trial.pause(false)
+			return true
+		}
+	}
 	var writeCtx context.Context
 	var cancel context.CancelFunc
 	if item.frame != nil {
 		// A slow-but-feasible link gets the picture's complete remaining source
 		// freshness budget. The global freshness window is the hard upper bound.
-		writeCtx, cancel = context.WithDeadline(ctx, videoFrameWriteDeadline(*item.frame, time.Now()))
+		deadline := videoFrameWriteDeadline(*item.frame, time.Now())
+		if c.trial != nil {
+			writeCtx, cancel = c.trial.writeContext(ctx, deadline)
+		} else {
+			writeCtx, cancel = context.WithDeadline(ctx, deadline)
+		}
 	} else {
 		writeCtx, cancel = context.WithTimeout(ctx, streamControlWriteTimeout)
 	}
@@ -336,6 +369,9 @@ func (c *client) writeNextVideoItem(ctx context.Context) bool {
 	}
 	if item.frame != nil {
 		c.noteVideoFrameWrittenAt(item.frame, time.Now())
+		if c.trial != nil {
+			c.trial.written(*item.frame)
+		}
 	} else if item.control != nil && item.control.config {
 		c.noteVideoConfigWritten(*item.control)
 	}

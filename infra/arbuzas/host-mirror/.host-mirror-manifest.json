@@ -27,8 +27,8 @@
     },
     "etc/arbuzas/current/release.env": {
       "mode": 384,
-      "sha256": "ead19821e6e4f7bd18a698a833591546d3977ce65fec2123b06b1cade350f82e",
-      "size": 2095
+      "sha256": "4d0fff0a290d66e8503582efd4ffbbc7e9a2bce95227a57928b582929705b72c",
+      "size": 2093
     },
     "etc/arbuzas/env/meshcentral-config.json": {
       "mode": 384,
@@ -115,6 +115,11 @@
       "sha256": "baddaa25139b7cd6ac5aa3e7361a808ed1f929eb6b1700af1e17b8da42cd8c6c",
       "size": 45
     },
+    "etc/arbuzas/secrets/ticket-remote/web-push.secret": {
+      "mode": 384,
+      "sha256": "53d9ff370bf9e155f2fc10bca5a1148e6d7b9e2a7937ab7872d8c3858efba57f",
+      "size": 163
+    },
     "etc/arbuzas/secrets/tiny-vless/capability.secret": {
       "mode": 384,
       "sha256": "7dd9269103332a7acd0e1da11b5b7ae6e0a660faff050287082240a182459ff2",
@@ -152,5 +157,5 @@
     }
   },
   "profile": "arbuzas",
-  "updatedEpochSeconds": 1789823325
+  "updatedEpochSeconds": 1790108375
 }

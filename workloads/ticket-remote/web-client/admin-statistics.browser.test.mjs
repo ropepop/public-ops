@@ -26,3 +26,18 @@ test('statistics remain readable and interactive across content and viewport siz
     }
   } finally { await fixture.close(); }
 });
+
+
+test('statistics refresh updates existing rows and survives outages without losing view state', { timeout: 30000 }, async () => {
+  const browser = await findBraveBrowser();
+  assert.ok(browser);
+  const fixture = await startStatisticsFixture();
+  try {
+    const rendered = await renderBraveDOM(browser, `${fixture.url}/?live=1`, { windowSize: '390,900' });
+    const match = rendered.stdout.match(/<pre id="fixtureResult" hidden="">([^<]+)<\/pre>/);
+    assert.ok(match, rendered.stdout);
+    const report = JSON.parse(match[1].replaceAll('&quot;', '"').replaceAll('&amp;', '&'));
+    assert.deepEqual(report.errors, []);
+    assert.equal(report.checks.length, 12);
+  } finally { await fixture.close(); }
+});

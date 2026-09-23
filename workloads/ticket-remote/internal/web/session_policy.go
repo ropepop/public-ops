@@ -138,7 +138,7 @@ func authFlowCookie(suffix string) string {
 }
 
 func (s *Server) clearAuthFlowCookies(w http.ResponseWriter) {
-	for _, name := range []string{authFlowCookie("verifier"), authFlowCookie("state"), authFlowCookie("return_to")} {
+	for _, name := range []string{authFlowCookie("verifier"), authFlowCookie("state"), authFlowCookie("return_to"), authFlowCookie("invite_hash")} {
 		s.setPrivateAuthCookie(w, name, "", -1)
 	}
 }
@@ -186,6 +186,9 @@ func safeReturnPath(value string) string {
 	if parsed.Path == "/auth/callback" {
 		return "/"
 	}
+	query := parsed.Query()
+	query.Del("invite")
+	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }
 

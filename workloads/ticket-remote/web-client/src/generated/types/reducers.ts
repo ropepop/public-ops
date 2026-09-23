@@ -7,10 +7,12 @@ import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
 import TicketremoteAdminScheduleTicketActionV3Reducer from "../ticketremote_admin_schedule_ticket_action_v_3_reducer";
+import TicketremoteMemberCheckInReducer from "../ticketremote_member_check_in_reducer";
+import TicketremoteMemberCheckOutReducer from "../ticketremote_member_check_out_reducer";
+import TicketremoteMemberClaimCheckinNoticeReducer from "../ticketremote_member_claim_checkin_notice_reducer";
 import TicketremoteMemberCloseControlCodeReducer from "../ticketremote_member_close_control_code_reducer";
 import TicketremoteMemberCommandReducer from "../ticketremote_member_command_reducer";
 import TicketremoteMemberConfirmControlCodeBrowserCaptureReducer from "../ticketremote_member_confirm_control_code_browser_capture_reducer";
-import TicketremoteMemberRecordActivityTickReducer from "../ticketremote_member_record_activity_tick_reducer";
 import TicketremoteMemberRefreshHdrBoostStateReducer from "../ticketremote_member_refresh_hdr_boost_state_reducer";
 import TicketremoteMemberRefreshHdrStateReducer from "../ticketremote_member_refresh_hdr_state_reducer";
 import TicketremoteMemberRefreshLimitStateReducer from "../ticketremote_member_refresh_limit_state_reducer";
@@ -23,10 +25,12 @@ import TicketremoteOwnerSaveViviCredentialsReducer from "../ticketremote_owner_s
 import TicketremoteOwnerSetHdrDisplayBoostReducer from "../ticketremote_owner_set_hdr_display_boost_reducer";
 
 export type TicketremoteAdminScheduleTicketActionV3Params = __Infer<typeof TicketremoteAdminScheduleTicketActionV3Reducer>;
+export type TicketremoteMemberCheckInParams = __Infer<typeof TicketremoteMemberCheckInReducer>;
+export type TicketremoteMemberCheckOutParams = __Infer<typeof TicketremoteMemberCheckOutReducer>;
+export type TicketremoteMemberClaimCheckinNoticeParams = __Infer<typeof TicketremoteMemberClaimCheckinNoticeReducer>;
 export type TicketremoteMemberCloseControlCodeParams = __Infer<typeof TicketremoteMemberCloseControlCodeReducer>;
 export type TicketremoteMemberCommandParams = __Infer<typeof TicketremoteMemberCommandReducer>;
 export type TicketremoteMemberConfirmControlCodeBrowserCaptureParams = __Infer<typeof TicketremoteMemberConfirmControlCodeBrowserCaptureReducer>;
-export type TicketremoteMemberRecordActivityTickParams = __Infer<typeof TicketremoteMemberRecordActivityTickReducer>;
 export type TicketremoteMemberRefreshHdrBoostStateParams = __Infer<typeof TicketremoteMemberRefreshHdrBoostStateReducer>;
 export type TicketremoteMemberRefreshHdrStateParams = __Infer<typeof TicketremoteMemberRefreshHdrStateReducer>;
 export type TicketremoteMemberRefreshLimitStateParams = __Infer<typeof TicketremoteMemberRefreshLimitStateReducer>;

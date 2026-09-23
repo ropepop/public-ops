@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { phoneControlNow, phoneControlReady, phoneRegistrationRegion, phoneRegistrationSnapshot, phoneRegistrationMatches } from './phone-control-core.mjs';
 
-import { ticketCurrentSwitchView, ticketActionV3SmartSwitchForView } from './ticket-action-v3-core.mjs';
+import { ticketCurrentSwitchView, ticketActionV3SmartSwitchForView, ticketActionV3ActivationTerminalMessage } from './ticket-action-v3-core.mjs';
 
 const now = Date.parse('2026-09-06T12:00:00Z');
 const observation = {
@@ -11,6 +11,16 @@ const observation = {
   observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3000).toISOString(),
   leftBasisPoints: 1000, topBasisPoints: 7000, rightBasisPoints: 9000, bottomBasisPoints: 8000,
 };
+
+test('unavailable phone control explains a stopped activation without blaming ticket identity', () => {
+  const action = { target: 'register_current', status: 'needs_attention', phase: 'not_dispatched' };
+  assert.equal(ticketActionV3ActivationTerminalMessage({ ...action, reason: 'ticket_action_accessibility_unavailable' }),
+    'Tālruņa vadība nav pieejama. Vilkšana netika nosūtīta; īpašniekam jāpārbauda tālrunis.');
+  assert.equal(ticketActionV3ActivationTerminalMessage({ ...action, reason: 'ticket_action_detail_identity_unproved' }),
+    'To pašu atvērto biļeti neizdevās apstiprināt; nekas netika pavilkts.');
+  assert.equal(ticketActionV3ActivationTerminalMessage({ ...action, phase: 'retry_not_dispatched', reason: 'ticket_action_accessibility_unavailable' }),
+    'Pirmā vilkšana biļeti nemainīja. Atkārtotās vilkšanas gatavību nevarēja droši apstiprināt, tāpēc otrā vilkšana netika nosūtīta.');
+});
 
 test('database clock ages monotonically and rejects suspend, wall-clock changes, and expired calibration', () => {
   const clock = { serverUpperAtReceipt: now, receivedMonotonic: 1000, receivedWall: now + 100000 };

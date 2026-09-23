@@ -8,6 +8,26 @@ For agent rules and live-page proof, use [AGENTS.md](./AGENTS.md). For start, st
 
 The service checks Ticket membership and relays the phone stream to signed-in browsers. Authenticated browsers write bounded Ticket actions directly to SpacetimeDB; the Pixel visually executes those durable rows. Browsers never receive direct phone control.
 
+## Train check-in and viewer privacy
+
+The voluntary check-in above ticket actions is independent of ViVi registration.
+Spacetime stores each account's latest direction and carriage for two hours,
+marks it inactive after forty minutes, and provides anonymous grouped summaries.
+Replacing a report resets its times; early check-out retains only its historical
+status. The existing scheduled policy boundary owns expiry, so pages do not poll.
+An atomic account-wide claim permits an opening notice at most once per two hours
+when another active member has a current report. Reconnects and later arrivals
+never reopen that notice within the same document.
+
+Viewer rows and raw stream reports are private. `ticketremote_privileged_viewers`
+is restricted to current owners/admins and registered services; ordinary members
+receive the minimal `ticketremote_member_stream_state` cold-restart view.
+The sidecar and Pixel use `ticketremote_service_stream_desired_state`; the sidecar
+also uses `ticketremote_service_phone_current_report`. The detailed HTTP health
+route requires admin access. Internal presence and stream-demand behavior remain
+unchanged. `make checkin-test` verifies real database privacy, migration, timing,
+retry and revocation behavior plus the synthetic mobile browser journeys.
+
 ## Local Development
 
 ```bash
@@ -20,7 +40,7 @@ The reusable real-GPU HDR check lives at `web-client/client-hdr-real-gpu.html`. 
 
 ## Runtime Model
 
-- Foreground viewing submits one sample every five seconds, independently of stream-presence refresh. The server owns the time slot, Riga day and account identity, and deduplicates concurrent tabs/devices. Hidden or disconnected pages never submit catch-up samples. Only one sample may be in flight per connection; reconnect discards its local pending state. An activity rejection does not interrupt the stream.
+- Foreground viewing submits one sample every five seconds, independently of stream-presence refresh. The server owns the time slot, Riga day and account identity, and deduplicates concurrent tabs/devices. Hidden or disconnected pages never submit catch-up samples. Only one sample may be in flight per connection; reconnect discards its local pending state. A sample still pending after ten seconds triggers existing database recovery without replay. An activity rejection does not interrupt the stream.
 - Browser failures retain their stage and a fixed error category; raw SDK errors never leave the browser. Reports use the existing authenticated video socket, at most once per reason every 30 seconds after a successful send. Delivery remains best-effort while that socket is unavailable. Statistics calculations live in `spacetimedb/src/member_activity.rs`, `spacetime-sidecar/src/statistics.rs`, and `internal/web/admin_statistics.go`; schemas and administrative access remain unchanged.
 
 - General mode: linked users can view the ViVi ticket stream together.
@@ -97,3 +117,24 @@ Production currently depends on one kitty-gration host and one physical Pixel. S
 - `TICKET_REMOTE_ACTIVE_PHONE_BACKEND_FILE`
 
 Cloudflare remains only the HTTPS tunnel. SpacetimeAuth is the public email-login front door, and SpacetimeDB remains the ticket membership and session state source of truth. There is still no public ADB, browser-direct phone access, Docker control, public media port, separate media service, broad `/etc/arbuzas/secrets` mount, Pixel ADB key mount, or extra ticket Docker unit.
+# Readiness notifications
+
+Monitoring starts off. Owners enable it independently of stream/cold mode;
+owners and administrators subscribe each browser/device separately. iPhone users
+must open the installed Home Screen app and tap the notification control.
+
+Set `TICKET_REMOTE_WEB_PUSH_KEY_FILE` to a private JSON file containing matching
+base64url P-256 `publicKey` and `privateKey` values. Production mounts
+`/etc/arbuzas/secrets/ticket-remote/web-push.secret` into the web container only.
+Keep that key stable: changing it requires devices to subscribe again. Without
+the file configured, health monitoring works but subscription is unavailable.
+The public service worker at `/ticket-notifications-sw.js` handles notifications
+only; it never caches authenticated assets or phone images. Push content contains
+only fixed status text and opens `/` through the ordinary sign-in gate.
+
+Publish the additive Ticket database module with `--delete-data=never` before
+deploying Pixel v391 and server/sidecar v215. Keep monitoring off during rollout.
+Rollback disables monitoring and restores the prior app/server; retain the
+additive database schema and private signing key. The health observation path is
+separate from registration/control-code authority. See `CURRENT.md` for the
+current behavior and the September 22 audit for measured limits.

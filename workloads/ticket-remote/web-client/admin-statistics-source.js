@@ -78,7 +78,7 @@ function normalizedTick(value) {
 }
 
 const ACTION_METRICS = [
-  { key: 'registration', shortLabel: 'Reg', label: 'Registrations', accessibleLabel: 'Slider registration' },
+  { key: 'registration', shortLabel: 'Reg', label: 'Registrations', accessibleLabel: 'Registration' },
   { key: 'controlCode', shortLabel: 'Code', label: 'Control codes', accessibleLabel: 'Control-code generation' }
 ];
 
@@ -246,9 +246,9 @@ export function buildActivityStatisticsModel(payload = {}) {
 function renderMetrics(metrics, fullLabels = false) {
   return metrics.length === 0 ? '' : html`
     <span class="admin-statistics-metrics">
-      ${metrics.map((metric) => html`
-        <span class="admin-statistics-metric" role="img" aria-label="${metric.description}">
-          <span aria-hidden="true">${fullLabels ? metric.label : metric.shortLabel} <span class="admin-statistics-ratio">${metric.text}</span></span>
+      ${() => metrics.map((metric) => html`
+        <span class="admin-statistics-metric" role="img" aria-label="${() => metric.description}">
+          <span aria-hidden="true">${() => fullLabels ? metric.label : metric.shortLabel} <span class="admin-statistics-ratio">${() => metric.text}</span></span>
         </span>
       `.key(metric.key))}
     </span>
@@ -257,12 +257,12 @@ function renderMetrics(metrics, fullLabels = false) {
 
 function renderEntry(entry) {
   return html`
-    <span class="${entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${`${entry.email || entry.shortId}${entry.active ? '' : ' · Inactive'}`}">
+    <span class="${() => entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${() => `${entry.email || entry.shortId}${entry.active ? '' : ' · Inactive'}`}">
       <span class="admin-statistics-entry-main">
-        <span class="admin-statistics-entry-id">${entry.shortId}</span>
-        ${entry.duration ? html`<span class="admin-statistics-entry-duration">${entry.duration}</span>` : ''}
+        <span class="admin-statistics-entry-id">${() => entry.shortId}</span>
+        ${() => entry.duration ? html`<span class="admin-statistics-entry-duration">${() => entry.duration}</span>` : ''}
       </span>
-      ${renderMetrics(entry.metrics)}
+      ${() => renderMetrics(entry.metrics)}
     </span>
   `.key(entry.accountScopeId);
 }
@@ -282,8 +282,7 @@ export function mountActivityStatistics(documentRef = document) {
   } catch (_) {
     payload = {};
   }
-  // This page is a snapshot. Only view selection/expansion changes after mount.
-  const model = buildActivityStatisticsModel(payload);
+  const statistics = reactive({ model: buildActivityStatisticsModel(payload) });
   const viewRef = documentRef.defaultView || (typeof window !== 'undefined' ? window : null);
   let compactViewQuery = null;
   try {
@@ -296,25 +295,28 @@ export function mountActivityStatistics(documentRef = document) {
   const viewState = reactive({
     mode: compactViewQuery && compactViewQuery.matches ? 'compact' : 'table',
     manuallySelected: false,
-    expandedDay: model.activeDays.length > 0 ? model.activeDays[0].day : ''
+    updatedAt: payload.serverTime || '',
+    refreshStatus: '',
+    expandedDay: statistics.model.activeDays.length > 0 ? statistics.model.activeDays[0].day : ''
   });
   mount.textContent = '';
 
   html`
     <div class="admin-statistics-view" data-view-mode="${() => viewState.mode}">
       <div class="admin-statistics-summary">
-        <span><strong>${() => model.dayCount}</strong> days</span>
+        <span><strong>${() => statistics.model.dayCount}</strong> days</span>
         <span>·</span>
-        <span><strong>${() => model.activeUserCount}</strong> user(s) with activity</span>
+        <span><strong>${() => statistics.model.activeUserCount}</strong> user(s) with activity</span>
         <span>·</span>
-        <span><strong>${() => model.totalDuration}</strong> measured use</span>
+        <span><strong>${() => statistics.model.totalDuration}</strong> measured use</span>
       </div>
-      <div class="admin-statistics-action-summary">${renderMetrics(model.metrics, true)}</div>
-      <p class="admin-statistics-count-key">Counts = successful / accepted requests. Reg = slider registration; Code = code generation.</p>
-      <p class="admin-statistics-tracking-note">${model.trackingStartLabel} Requests without success may be pending, failed, or unconfirmed.</p>
-      ${() => model.hasActiveActivity ? '' : html`
+      <div class="admin-statistics-action-summary">${() => renderMetrics(statistics.model.metrics, true)}</div>
+      <p class="admin-statistics-count-key">Counts = successful / accepted requests. Reg = registration; Code = code generation.</p>
+      <p class="admin-statistics-tracking-note">${() => statistics.model.trackingStartLabel} Earlier totals counted slider registrations only. Requests without success may be pending, failed, or unconfirmed.</p>
+      ${() => statistics.model.hasActiveActivity ? '' : html`
         <p class="admin-statistics-empty">No activity was recorded in this 30-day window.</p>
       `}
+      <p class="admin-statistics-refresh" role="status">${() => viewState.refreshStatus || `Updated ${viewState.updatedAt ? new Date(viewState.updatedAt).toLocaleTimeString('en-GB', { timeZone: statistics.model.timeZone }) : 'just now'} (${statistics.model.timeZone}). Updates every 15 seconds while visible.`}</p>
       <div class="admin-statistics-view-controls">
         <p class="admin-statistics-view-note">
           ${() => viewState.mode === 'compact'
@@ -337,23 +339,23 @@ export function mountActivityStatistics(documentRef = document) {
         hidden="${() => viewState.mode !== 'compact'}"
       >
         <div class="admin-statistics-day-list">
-          ${() => model.activeDays.map((day) => html`
+          ${() => statistics.model.activeDays.map((day) => html`
             <article class="admin-statistics-day-card">
               <h3 class="admin-statistics-day-heading">
                 <button
                   class="admin-statistics-day-toggle"
-                  id="${day.buttonId}"
+                  id="${() => day.buttonId}"
                   type="button"
                   data-statistics-day-toggle
-                  data-statistics-day="${day.day}"
-                  aria-controls="${day.panelId}"
+                  data-statistics-day="${() => day.day}"
+                  aria-controls="${() => day.panelId}"
                   aria-expanded="${() => viewState.expandedDay === day.day ? 'true' : 'false'}"
                 >
-                  <span class="admin-statistics-day-label">${day.displayLabel}</span>
+                  <span class="admin-statistics-day-label">${() => day.displayLabel}</span>
                   <span class="admin-statistics-day-meta">
                     <span class="admin-statistics-day-totals">
-                      ${day.totalDuration ? html`<span class="admin-statistics-day-duration">${day.totalDuration}</span>` : ''}
-                      ${renderMetrics(day.metrics)}
+                      ${() => day.totalDuration ? html`<span class="admin-statistics-day-duration">${() => day.totalDuration}</span>` : ''}
+                      ${() => renderMetrics(day.metrics)}
                     </span>
                     <span class="admin-statistics-day-chevron" aria-hidden="true"></span>
                   </span>
@@ -361,15 +363,15 @@ export function mountActivityStatistics(documentRef = document) {
               </h3>
               <div
                 class="admin-statistics-day-panel"
-                id="${day.panelId}"
+                id="${() => day.panelId}"
                 role="region"
-                aria-labelledby="${day.buttonId}"
+                aria-labelledby="${() => day.buttonId}"
                 hidden="${() => viewState.expandedDay !== day.day}"
               >
                 <ul class="admin-statistics-active-hour-list">
                   ${() => day.activeHours.map((hour) => html`
-                    <li class="admin-statistics-active-hour" data-statistics-active-hour="${hour.hour}">
-                      <span class="admin-statistics-active-hour-label">${hour.label}:00–${hour.label}:59</span>
+                    <li class="admin-statistics-active-hour" data-statistics-active-hour="${() => hour.hour}">
+                      <span class="admin-statistics-active-hour-label">${() => hour.label}:00–${() => hour.label}:59</span>
                       <div class="admin-statistics-entry-list admin-statistics-active-hour-entries">
                         ${() => hour.entries.map(renderEntry)}
                       </div>
@@ -380,7 +382,7 @@ export function mountActivityStatistics(documentRef = document) {
             </article>
           `.key(day.day))}
         </div>
-        ${() => model.activeDays.length === 1 ? html`
+        ${() => statistics.model.activeDays.length === 1 ? html`
           <p class="admin-statistics-no-other">No other activity in the last 30 days.</p>
         ` : ''}
       </section>
@@ -396,13 +398,13 @@ export function mountActivityStatistics(documentRef = document) {
           <thead>
             <tr>
               <th class="admin-statistics-day" scope="col">Date</th>
-              ${() => model.days[0].hours.map((hour) => html`<th scope="col">${hour.label}:00</th>`.key(hour.hour))}
+              ${() => statistics.model.days[0].hours.map((hour) => html`<th scope="col">${() => hour.label}:00</th>`)}
             </tr>
           </thead>
           <tbody>
-            ${() => model.days.map((day) => html`
+            ${() => statistics.model.days.map((day) => html`
               <tr>
-                <th class="admin-statistics-day" scope="row"><span>${day.day}</span>${renderMetrics(day.metrics)}</th>
+                <th class="admin-statistics-day" scope="row"><span>${() => day.day}</span>${() => renderMetrics(day.metrics)}</th>
                 ${() => day.hours.map((hour) => html`
                   <td class="admin-statistics-hour-cell">
                     <div class="admin-statistics-entry-list">
@@ -415,15 +417,15 @@ export function mountActivityStatistics(documentRef = document) {
           </tbody>
         </table>
       </div>
-      ${() => model.legend.length === 0 ? '' : html`
+      ${() => statistics.model.legend.length === 0 ? '' : html`
         <section class="admin-statistics-legend" aria-labelledby="adminStatisticsLegendTitle">
           <h3 id="adminStatisticsLegendTitle">User IDs</h3>
           <ul class="admin-statistics-legend-list">
-            ${() => model.legend.map((member) => html`
+            ${() => statistics.model.legend.map((member) => html`
               <li class="admin-statistics-legend-item">
-                <span class="admin-statistics-legend-id">${member.shortId}</span>
-                <span class="admin-statistics-legend-email">${member.email}</span>
-                ${member.active ? '' : html`<span class="admin-statistics-inactive">Inactive</span>`}
+                <span class="admin-statistics-legend-id">${() => member.shortId}</span>
+                <span class="admin-statistics-legend-email">${() => member.email}</span>
+                ${() => member.active ? '' : html`<span class="admin-statistics-inactive">Inactive</span>`}
               </li>
             `.key(member.accountScopeId))}
           </ul>
@@ -457,7 +459,65 @@ export function mountActivityStatistics(documentRef = document) {
   if (compactView) compactView.addEventListener('click', toggleDay);
   if (compactViewQuery) compactViewQuery.addEventListener('change', useResponsiveDefault);
 
+  let request = null;
+  let disposed = false;
+  let accessRevoked = false;
+  const refresh = async () => {
+    if (disposed || accessRevoked || documentRef.hidden || request) return;
+    const controller = new AbortController();
+    request = controller;
+    const timeout = viewRef.setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await viewRef.fetch('/api/v1/admin/statistics', {
+        signal: controller.signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error'
+      });
+      if (response.status === 401 || response.status === 403) {
+        accessRevoked = true;
+        viewRef.clearInterval(refreshTimer);
+        throw new Error('access revoked');
+      }
+      if (!response.ok) throw new Error('statistics unavailable');
+      const next = await response.json();
+      if (disposed || controller.signal.aborted) return;
+      if (!next.serverTime || !Array.isArray(next.members)) throw new Error('invalid statistics');
+      statistics.model = buildActivityStatisticsModel(next);
+      viewState.updatedAt = next.serverTime;
+      viewState.refreshStatus = '';
+    } catch (_) {
+      if (!disposed && !documentRef.hidden && request === controller) {
+        viewState.refreshStatus = accessRevoked ? 'Access expired. Sign in again to update statistics.'
+          : `Updates unavailable. Showing figures from ${viewState.updatedAt || 'page opening'}. Retrying automatically.`;
+      }
+    } finally {
+      viewRef.clearTimeout(timeout);
+      if (request === controller) request = null;
+    }
+  };
+  let refreshTimer = viewRef.setInterval(refresh, 15000);
+  const visibilityChanged = () => {
+    if (documentRef.hidden) { request?.abort(); request = null; }
+    else void refresh();
+  };
+  const pageHide = () => {
+    disposed = true;
+    request?.abort();
+    request = null;
+    viewRef.clearInterval(refreshTimer);
+  };
+  const pageShow = event => {
+    if (!event.persisted) return;
+    disposed = false;
+    if (!accessRevoked) refreshTimer = viewRef.setInterval(refresh, 15000);
+    void refresh();
+  };
+  documentRef.addEventListener('visibilitychange', visibilityChanged);
+  viewRef.addEventListener('pagehide', pageHide);
+  viewRef.addEventListener('pageshow', pageShow);
   const cleanup = () => {
+    pageHide();
+    documentRef.removeEventListener('visibilitychange', visibilityChanged);
+    viewRef.removeEventListener('pagehide', pageHide);
+    viewRef.removeEventListener('pageshow', pageShow);
     if (viewToggle) viewToggle.removeEventListener('click', toggleView);
     if (compactView) compactView.removeEventListener('click', toggleDay);
     if (compactViewQuery) compactViewQuery.removeEventListener('change', useResponsiveDefault);

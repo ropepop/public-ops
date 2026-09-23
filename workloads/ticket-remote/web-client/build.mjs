@@ -31,9 +31,9 @@ execFileSync(
 );
 
 const keptBindings = new Set([
-  ...["control_code_request", "member_ticket_switch", "member_hdr_state", "member_hdr_boost_state", "member_limit_state", "phone_current_report", "phone_control_state", "relay_current_report", "stream_desired_state", "stream_viewer_focus", "ticket_action_v_3", "vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials"]
+  ...["control_code_request", "member_ticket_switch", "member_hdr_state", "member_hdr_boost_state", "member_limit_state", "service_phone_current_report", "phone_control_state", "privileged_relay_report", "member_stream_state", "privileged_viewers", "member_checkin", "member_checkin_groups", "ticket_action_v_3", "vivi_credential_state", "vivi_reauth_attempt", "owner_vivi_credentials"]
     .map((name) => `ticketremote_${name}_table`),
-  ...["command", "close_control_code", "confirm_control_code_browser_capture", "record_activity_tick", "refresh_hdr_state", "refresh_hdr_boost_state", "refresh_limit_state", "set_hdr_preference", "set_limit_preference", "set_stream_focus"]
+  ...["check_in", "check_out", "claim_checkin_notice", "command", "close_control_code", "confirm_control_code_browser_capture", "refresh_hdr_state", "refresh_hdr_boost_state", "refresh_limit_state", "set_hdr_preference", "set_limit_preference", "set_stream_focus"]
     .map((name) => `ticketremote_member_${name}_reducer`),
   "ticketremote_owner_set_hdr_display_boost_reducer",
   "ticketremote_owner_prepare_vivi_credentials_reducer",

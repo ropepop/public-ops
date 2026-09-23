@@ -55,6 +55,7 @@ PROFILES: dict[str, list[Entry]] = {
         Entry("file", "etc/arbuzas/secrets/android-adb/adb_known_hosts.pb"),
         Entry("file", "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem"),
         Entry("file", "etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret"),
+        Entry("file", "etc/arbuzas/secrets/ticket-remote/web-push.secret"),
         Entry("file", "etc/arbuzas/secrets/ticket-remote/turn.secret"),
         Entry("file", "etc/arbuzas/secrets/train-bot-spacetime.key"),
         Entry("file", "etc/arbuzas/secrets/train-bot-web-session-secret"),
@@ -779,6 +780,8 @@ def affected_services_for_path(rel: str) -> set[str]:
         add_service(services, "ticket_remote")
     elif rel == "etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem":
         add_service(services, "ticket_remote_spacetime_sidecar")
+    elif rel == "etc/arbuzas/secrets/ticket-remote/web-push.secret":
+        add_service(services, "ticket_remote")
     elif rel.startswith("etc/arbuzas/secrets/ticket-remote/"):
         add_service(services, "ticket_remote_spacetime_sidecar")
         add_service(services, "ticket_remote")

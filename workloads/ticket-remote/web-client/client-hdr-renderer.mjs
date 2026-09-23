@@ -272,6 +272,7 @@ export class ClientHDRRenderer {
     this.failed = false;
     this.canvas = null;
     this.context = null;
+    this.canvasConfiguration = null;
     this.device = null;
     this.preparation = null;
     this.paramsBuffer = null;
@@ -338,18 +339,20 @@ export class ClientHDRRenderer {
     ];
     let configured = null;
     for (const candidate of candidates) {
+      const configuration = {
+        device: this.device,
+        format: CLIENT_HDR_CANVAS_FORMAT,
+        alphaMode: 'opaque',
+        colorSpace: candidate.colorSpace,
+        toneMapping: { mode: 'extended' },
+        usage: canvasUsage
+      };
       try {
         await withValidationScope(this.device, 'canvas_configuration_failed', async () => {
-          this.context.configure({
-            device: this.device,
-            format: CLIENT_HDR_CANVAS_FORMAT,
-            alphaMode: 'opaque',
-            colorSpace: candidate.colorSpace,
-            toneMapping: { mode: 'extended' },
-            usage: canvasUsage
-          });
+          this.context.configure(configuration);
         });
         if (!configurationMatches(this.context, candidate, canvasUsage)) throw new Error('configuration_mismatch');
+        this.canvasConfiguration = configuration;
         configured = candidate;
         break;
       } catch (_) {
@@ -592,17 +595,19 @@ export class ClientHDRRenderer {
     this.prepared = true;
   }
 
-  async present() {
+  async present({ reconfigure = false } = {}) {
     if (!this.prepared || this.presenting || !this.context || !this.stagingTexture) {
       throw new Error('renderer_frame_not_prepared');
     }
+    if (reconfigure && !this.canvasConfiguration) throw new Error('renderer_not_ready');
     this.presenting = true;
     this.prepared = false;
     try {
       await this.submitAndWait((device) => {
-        // Reconfiguring clears the visible canvas. Keep its HDR surface intact
-        // while the next picture is prepared, then copy into the existing context.
         const encoder = device.createCommandEncoder();
+        // Only the bounded foreground follow-up reasserts HDR. Configuration
+        // clears the canvas, so copy the prepared picture without yielding.
+        if (reconfigure) this.context.configure(this.canvasConfiguration);
         encoder.copyTextureToTexture(
           { texture: this.stagingTexture }, { texture: this.context.getCurrentTexture() },
           { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
@@ -638,6 +643,7 @@ export class ClientHDRRenderer {
     this.presenting = false;
     this.device = null;
     this.context = null;
+    this.canvasConfiguration = null;
     this.onUncapturedError = null;
   }
 

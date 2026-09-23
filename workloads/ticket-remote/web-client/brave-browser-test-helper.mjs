@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -222,6 +222,10 @@ export async function renderBraveDOM(browser, url, options = {}) {
       expression: 'document.documentElement.outerHTML',
       returnByValue: true
     }, sessionId);
+    if (options.screenshotPath) {
+      const capture = await client.send('Page.captureScreenshot', { format: 'png' }, sessionId);
+      await writeFile(options.screenshotPath, Buffer.from(capture.data, 'base64'));
+    }
     return { stdout: String(rendered.result?.value || ''), stderr };
   } finally {
     launchDeadline.cancel();

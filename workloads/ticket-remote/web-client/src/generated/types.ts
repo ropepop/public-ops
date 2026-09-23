@@ -82,6 +82,15 @@ export const TicketremoteMemberLimitState = __t.object("TicketremoteMemberLimitS
 });
 export type TicketremoteMemberLimitState = __Infer<typeof TicketremoteMemberLimitState>;
 
+export const TicketremoteMemberStreamState = __t.object("TicketremoteMemberStreamState", {
+  id: __t.string(),
+  coldRestartId: __t.option(__t.string()),
+  coldRestartPhase: __t.option(__t.string()),
+  coldRestartStartedAt: __t.option(__t.string()),
+  coldRestartError: __t.option(__t.string()),
+});
+export type TicketremoteMemberStreamState = __Infer<typeof TicketremoteMemberStreamState>;
+
 export const TicketremoteMemberTicketSwitch = __t.object("TicketremoteMemberTicketSwitch", {
   id: __t.string(),
   ticketId: __t.string(),
@@ -113,61 +122,6 @@ export const TicketremotePhoneControlState = __t.object("TicketremotePhoneContro
   clockAt: __t.string(),
 });
 export type TicketremotePhoneControlState = __Infer<typeof TicketremotePhoneControlState>;
-
-export const TicketremotePhoneCurrentReport = __t.object("TicketremotePhoneCurrentReport", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  streamState: __t.string(),
-  desiredActive: __t.bool(),
-  lastCommandId: __t.string(),
-  lastCommandRevision: __t.string(),
-  statusJson: __t.string(),
-  updatedAt: __t.string(),
-});
-export type TicketremotePhoneCurrentReport = __Infer<typeof TicketremotePhoneCurrentReport>;
-
-export const TicketremoteRelayCurrentReport = __t.object("TicketremoteRelayCurrentReport", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  videoClients: __t.u32(),
-  streamVerdict: __t.string(),
-  lastFrameAgoMillis: __t.u32(),
-  framesForwarded: __t.string(),
-  statusJson: __t.string(),
-  updatedAt: __t.string(),
-  lastFrameAt: __t.option(__t.string()),
-});
-export type TicketremoteRelayCurrentReport = __Infer<typeof TicketremoteRelayCurrentReport>;
-
-export const TicketremoteStreamDesiredState = __t.object("TicketremoteStreamDesiredState", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  desiredActive: __t.bool(),
-  viewerCount: __t.u32(),
-  reason: __t.string(),
-  revision: __t.string(),
-  updatedBy: __t.string(),
-  updatedAt: __t.string(),
-  coldRestartId: __t.option(__t.string()),
-  coldRestartPhase: __t.option(__t.string()),
-  coldRestartStartedAt: __t.option(__t.string()),
-  coldRestartError: __t.option(__t.string()),
-});
-export type TicketremoteStreamDesiredState = __Infer<typeof TicketremoteStreamDesiredState>;
-
-export const TicketremoteStreamViewerFocus = __t.object("TicketremoteStreamViewerFocus", {
-  id: __t.string(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  publicId: __t.string(),
-  active: __t.bool(),
-  lastSeenAt: __t.string(),
-  expiresAt: __t.string(),
-});
-export type TicketremoteStreamViewerFocus = __Infer<typeof TicketremoteStreamViewerFocus>;
 
 export const TicketremoteViviCredentialState = __t.object("TicketremoteViviCredentialState", {
   id: __t.string(),

@@ -41,10 +41,10 @@ pub(super) fn ensure_tracking(ctx: &ReducerContext, ticket: &str) {
     }
 }
 
-fn counted_kind(operation: &str, source: &str) -> Option<&'static str> {
-    match (operation, source) {
-        ("register_current", "browser_slider") => Some("registration"),
-        ("control_code", _) => Some("control_code"),
+fn counted_kind(operation: &str) -> Option<&'static str> {
+    match operation {
+        "register_current" | "open_latest_and_register" => Some("registration"),
+        "control_code" => Some("control_code"),
         _ => None,
     }
 }
@@ -111,9 +111,8 @@ pub(super) fn record_attempt(
     ticket: &str,
     email: &str,
     operation: &str,
-    source: &str,
 ) -> Option<String> {
-    let kind = counted_kind(operation, source)?;
+    let kind = counted_kind(operation)?;
     let bucket = bucket_at(&now(ctx))?;
     ensure_tracking(ctx, ticket);
     let table = ctx.db.ticketremote_member_daily_actions();
@@ -176,19 +175,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_slider_registration_and_control_codes_are_counted() {
-        assert_eq!(
-            counted_kind("register_current", "browser_slider"),
-            Some("registration")
-        );
-        assert_eq!(counted_kind("control_code", ""), Some("control_code"));
-        for (operation, source) in [
-            ("register_current", "browser_button"),
-            ("open_latest_and_register", "browser_slider"),
-            ("redetect_latest", "scheduled"),
-            ("", ""),
-        ] {
-            assert_eq!(counted_kind(operation, source), None);
+    fn all_registration_routes_and_control_codes_are_counted() {
+        for operation in ["register_current", "open_latest_and_register"] {
+            assert_eq!(counted_kind(operation), Some("registration"));
+        }
+        assert_eq!(counted_kind("control_code"), Some("control_code"));
+        for operation in ["open_latest_unactivated", "redetect_latest", ""] {
+            assert_eq!(counted_kind(operation), None);
         }
     }
 

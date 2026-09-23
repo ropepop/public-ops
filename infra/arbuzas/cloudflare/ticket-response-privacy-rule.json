@@ -1,0 +1,13 @@
+{
+  "ref": "ticket_invitation_report_privacy",
+  "description": "Keep Ticket invitation addresses out of browser network-error reports",
+  "expression": "http.host eq \"ticket.jolkins.id.lv\"",
+  "action": "rewrite",
+  "action_parameters": {
+    "headers": {
+      "nel": { "operation": "set", "value": "{\"max_age\":0}" },
+      "report-to": { "operation": "set", "value": "{\"group\":\"cf-nel\",\"max_age\":0,\"endpoints\":[]}" }
+    }
+  },
+  "enabled": true
+}

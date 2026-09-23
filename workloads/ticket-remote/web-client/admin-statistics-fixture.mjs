@@ -43,6 +43,7 @@ export async function startStatisticsFixture({ baselineDirectory = '' } = {}) {
         response.end(file.endsWith('.js') ? `window.statsRenderStart=performance.now();\n${source}\nwindow.statsRenderMs=performance.now()-window.statsRenderStart;` : source);
         return;
       }
+      if (url.pathname === '/api/v1/admin/statistics') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(statisticsFixturePayload())); return; }
       if (url.pathname !== '/') { response.writeHead(404); response.end(); return; }
       const payload = statisticsFixturePayload(url.searchParams.get('scenario') || 'mixed');
       if (baseline) { delete payload.actionActivityDaily; delete payload.actionStatisticsStartedAt; }
@@ -52,6 +53,18 @@ export async function startStatisticsFixture({ baselineDirectory = '' } = {}) {
         <title>Ticket statistics fixture</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/statistics.css${suffix}">
         ${url.searchParams.get('zoom') === '2' ? '<style>body{zoom:2}</style>' : ''}
         <script>window.statsErrors=[];addEventListener('error', e=>statsErrors.push(e.message));addEventListener('unhandledrejection', e=>statsErrors.push(String(e.reason)));</script>
+        ${url.searchParams.has('live') ? `<script>
+          addEventListener('unhandledrejection',e=>{document.getElementById('fixtureResult').textContent=JSON.stringify({errors:[String(e.reason)],checks:[]});document.documentElement.dataset.probeComplete='true';});
+          window.statsIntervals=new Map();window.statsTimeouts=new Map();window.statsSequence=0;
+          window.setInterval=(fn,ms)=>{const id=++statsSequence;statsIntervals.set(id,fn);return id;};
+          window.clearInterval=id=>statsIntervals.delete(id);
+          const realTimeout=window.setTimeout.bind(window),realClearTimeout=window.clearTimeout.bind(window);
+          window.setTimeout=(fn,ms)=>{if(ms!==10000)return realTimeout(fn,ms);const id=++statsSequence;statsTimeouts.set(id,fn);return id;};
+          window.clearTimeout=id=>{statsTimeouts.delete(id);realClearTimeout(id);};
+          window.statsHidden=false;Object.defineProperty(document,'hidden',{get:()=>statsHidden});
+          window.statsFetches=0;window.statsMode='ok';window.statsPayload=${JSON.stringify(payload)};
+          window.fetch=async (url,options)=>{statsFetches++;if(statsMode==='hang')return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Error('aborted'))));return {ok:statsMode==='ok',status:statsMode==='denied'?403:statsMode==='ok'?200:503,json:async()=>structuredClone(statsPayload)};};
+        </script>` : ''}
         <script defer src="/statistics.js${suffix}"></script></head><body class="admin-page admin-statistics-page">
         <main class="admin-shell"><header class="admin-header"><div><p class="admin-eyebrow">Ticket remote</p><h1>Admin</h1></div><a class="admin-stream-link" href="#">Stream</a></header>
         <nav class="admin-tabs"><a class="admin-tab" href="#">Overview</a><a class="admin-tab is-active" href="#">Statistics</a></nav>
@@ -64,6 +77,36 @@ export async function startStatisticsFixture({ baselineDirectory = '' } = {}) {
           const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
           await frame();
           const toggle=document.getElementById('adminStatisticsViewToggle');
+          if (${JSON.stringify(url.searchParams.has('live'))}) {
+            const checks=[];const check=(name,ok)=>{checks.push(name);if(!ok)throw Error(name);};
+            const flush=async()=>{await Promise.resolve();await frame();await frame();await frame();};
+            const refresh=async()=>{await [...statsIntervals.values()][0]?.();await flush();};
+            const first=document.querySelector('[data-statistics-day-toggle]');first.click();await frame();
+            const expanded=first.getAttribute('aria-expanded'),mode=document.querySelector('.admin-statistics-view').dataset.viewMode;
+            statsPayload.actionActivityDaily[0].registrationAttempts[14]=9;
+            statsPayload.actionActivityDaily[0].registrationSuccesses[14]=8;
+            statsPayload.pageActivityDaily[0].hourlyTicks[14]=120;
+            await refresh();
+            check('existing account counters and duration update',document.querySelector('.admin-statistics-compact').textContent.includes('8/9')&&document.querySelector('.admin-statistics-compact').textContent.includes('10m'));
+            check('view and expanded day preserved',document.querySelector('.admin-statistics-view').dataset.viewMode===mode&&document.querySelector('[data-statistics-day-toggle]').getAttribute('aria-expanded')===expanded);
+            check('detailed table updates too',document.querySelector('.admin-statistics-table').textContent.includes('8/9')&&document.querySelector('.admin-statistics-table').textContent.includes('10m'));
+            const before=document.querySelector('.admin-statistics-action-summary').textContent;
+            statsMode='failed';await refresh();check('failure retains figures and marks stale',document.querySelector('.admin-statistics-action-summary').textContent===before&&document.querySelector('[role=status]').textContent.includes('unavailable'));
+            statsMode='hang';const pending=[...statsIntervals.values()][0]();await flush();const calls=statsFetches;
+            await refresh();check('no overlapping refresh',statsFetches===calls);
+            for(const timeout of statsTimeouts.values())timeout();await pending;await flush();
+            statsMode='ok';await refresh();check('timeout recovers on next refresh',!document.querySelector('[role=status]').textContent.includes('unavailable'));
+            statsHidden=true;document.dispatchEvent(new Event('visibilitychange'));const hiddenCalls=statsFetches;await refresh();check('hidden page does not refresh',statsFetches===hiddenCalls);
+            statsHidden=false;document.dispatchEvent(new Event('visibilitychange'));await flush();check('return refreshes immediately',statsFetches===hiddenCalls+1);
+            window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true}));
+            window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}));await flush();
+            check('cached return refreshes without resetting view',statsIntervals.size===1&&document.querySelector('[data-statistics-day-toggle]').getAttribute('aria-expanded')===expanded);
+            statsPayload.serverTime='2026-09-09T21:00:01Z';await refresh();
+            check('Riga midnight advances the displayed day',document.querySelector('.admin-statistics-table tbody th').textContent.includes('2026-09-10'));
+            statsMode='denied';await refresh();check('access revocation stops refresh',statsIntervals.size===0&&document.querySelector('[role=status]').textContent.includes('Access expired'));
+            window.dispatchEvent(new PageTransitionEvent('pagehide'));check('cleanup clears requests and timers',statsIntervals.size===0&&statsTimeouts.size===0);
+            document.getElementById('fixtureResult').textContent=JSON.stringify({checks,errors:statsErrors});document.documentElement.dataset.probeComplete='true';return;
+          }
           const initialMode=document.querySelector('.admin-statistics-view')?.dataset.viewMode;
           if (${JSON.stringify(url.searchParams.get('probe') === '1')}) {
             if (initialMode==='table') toggle.click();

@@ -1,4 +1,7 @@
 .admin-tabs {
+  position: sticky;
+  top: max(8px, env(safe-area-inset-top));
+  z-index: 5;
   display: flex;
   gap: 6px;
   padding: 5px;
@@ -8,15 +11,18 @@
 }
 
 .admin-tab {
-  min-height: 40px;
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0 16px;
+  padding: 6px 10px;
   border-radius: 7px;
   color: #9cabbc;
   font-weight: 700;
   text-decoration: none;
+  text-align: center;
 }
 
 .admin-tab:hover,
@@ -29,6 +35,34 @@
   color: #eaf2ff;
   background: #17315a;
   box-shadow: inset 0 0 0 1px #31548f;
+}
+
+.admin-page .admin-status-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.admin-page .admin-section {
+  min-width: 0;
+}
+
+.admin-snapshot-note {
+  margin: -4px 0 0;
+}
+
+.admin-snapshot-note a {
+  display: inline-block;
+  padding: 8px 0;
+  color: #8bb5ff;
+}
+
+.admin-page :focus-visible {
+  outline: 2px solid #9ac7ff;
+  outline-offset: 3px;
+}
+
+.admin-page button,
+.admin-page .admin-stream-link {
+  min-height: 44px;
 }
 
 .admin-statistics-page .admin-shell {
@@ -474,7 +508,25 @@
 
   .admin-tabs {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .admin-tab {
+    font-size: 14px;
+    padding: 6px;
+  }
+
+  .admin-section-header {
+    flex-wrap: wrap;
+  }
+
+  .admin-redetect-form {
+    width: 100%;
+  }
+
+  .admin-redetect-form button {
+    width: 100%;
   }
 
   .admin-statistics-table-wrap {
@@ -515,5 +567,17 @@
 
   .admin-statistics-day-chevron {
     flex: 0 0 8px;
+  }
+}
+
+@media (max-width: 600px) {
+  .admin-page .admin-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-height: 480px) {
+  .admin-tabs {
+    position: static;
   }
 }

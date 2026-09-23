@@ -3587,6 +3587,7 @@ prepare_remote_ticket_runtime_permissions() {
     for path in \
       '/etc/arbuzas/env/ticket-remote.env' \
       '/etc/arbuzas/secrets/ticket-remote/spacetime-jwt-private-key.pem' \
+      '/etc/arbuzas/secrets/ticket-remote/web-push.secret' \
       '/etc/arbuzas/secrets/ticket-remote/sidecar-write-token.secret'; do
       secure_private_file \"\${path}\" '1001:1001'
     done
@@ -8274,6 +8275,7 @@ validate_remote_ticket_remote_workload_health() {
       printf %s \"\${jwks}\" | grep -F '\"keys\"' >/dev/null
     }; wait_until_ok runtime_oidc_ok" \
     ticket_remote
+  # The viewer stores only its language preference locally; retired auth-token keys remain forbidden.
   validate_remote_probe "${remote_release_dir}" "ticket-remote stale viewer code absent" \
     "compose exec -T ticket_remote sh -lc 'set -e
       binary=/usr/local/bin/ticket-remote
@@ -8283,7 +8285,7 @@ validate_remote_ticket_remote_workload_health() {
       test -s \"\${app_js}\"
       grep -aE \"claim-dialog|confirmClaim\" \"\${binary}\" >/dev/null && exit 1
       grep -aE \"mozBrightness|AmbientLightSensor|screen\\\\.brightness|setBrightness\" \"\${binary}\" >/dev/null && exit 1
-      grep -aE \"localStorage|ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
+      grep -aE \"ticket_remote_spacetime_token|ticket_remote_pkce\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"send({ type: '\\''tap'\\'', x: options.tap.x\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"snapTarget: '\\''control_code_button'\\''\" \"\${binary}\" >/dev/null && exit 1
       grep -aF \"type: '\\''quick_claim_tap'\\''\" \"\${binary}\" >/dev/null && exit 1

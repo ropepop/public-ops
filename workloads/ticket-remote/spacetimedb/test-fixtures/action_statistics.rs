@@ -89,13 +89,15 @@ fn fixture_counts(ctx: &ReducerContext, ticket: &str) -> [u32; 4] {
 }
 
 fn fixture_finish_registration(ctx: &ReducerContext, ticket: &str, id: &str, status: &str) {
+    let action = ctx.db.ticketremote_ticket_action_v3().id().find(ticket_action_v3_row_id(ticket, "pixel", id)).unwrap();
+    let revision = if action.target == "register_current" { "pc-fixture:1" } else { id };
     ticketremote_finalize_ticket_action_v3(
         ctx,
         ticket.into(),
         "pixel".into(),
         ticket_action_v3_command_id(ticket, "pixel", id),
         id.into(),
-        "register_current".into(),
+        action.target,
         status.into(),
         if status == "succeeded" {
             "activation_proven"
@@ -114,7 +116,7 @@ fn fixture_finish_registration(ctx: &ReducerContext, ticket: &str, id: &str, sta
         "fixture".into(),
         now(ctx),
         id.into(),
-        "pc-fixture:1".into(),
+        revision.into(),
         if status == "succeeded" {
             format!("activation-{id}")
         } else {
@@ -188,27 +190,29 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
             fixture_finish_registration(ctx, &ticket, "register-1", "succeeded");
             assert_eq!(fixture_counts(ctx, &ticket), [1, 1, 0, 0]);
         }
-        "queued" | "queued-rejected" => {
+        "queued" | "queued-rejected" | "queued-menu" | "queued-latest" => {
+            let operation = if case == "queued-latest" { "open_latest_and_register" } else { "register_current" };
+            let source = if case == "queued" || case == "queued-rejected" { "browser_slider" } else { "browser_button" };
             fixture_command(
                 ctx,
                 &ticket,
                 "queued-1",
-                "register_current",
-                "browser_slider",
+                operation,
+                source,
             )?;
             fixture_command(
                 ctx,
                 &ticket,
                 "queued-2",
-                "register_current",
-                "browser_slider",
+                operation,
+                source,
             )?;
             fixture_command(
                 ctx,
                 &ticket,
                 "queued-2",
-                "register_current",
-                "browser_slider",
+                operation,
+                source,
             )?;
             assert_eq!(fixture_counts(ctx, &ticket), [2, 0, 0, 0]);
             assert_eq!(
@@ -216,13 +220,13 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
                     ctx,
                     &ticket,
                     "queued-3",
-                    "register_current",
-                    "browser_slider"
+                    operation,
+                    source
                 ),
                 Err("ticket_action_queue_full".into())
             );
             assert_eq!(fixture_counts(ctx, &ticket), [2, 0, 0, 0]);
-            if case == "queued" {
+            if case != "queued-rejected" {
                 ticketremote_member_set_limit_preference(ctx, ticket.clone(), false)?;
             }
             fixture_finish_registration(ctx, &ticket, "queued-1", "failed");
@@ -232,7 +236,7 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
                 .id()
                 .find(ticket_action_v3_row_id(&ticket, "pixel", "queued-2"))
                 .unwrap();
-            if case == "queued" {
+            if case != "queued-rejected" {
                 assert_eq!(
                     queued.status, "pending",
                     "queued result: {} / {}",
@@ -263,16 +267,22 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
             assert!(fixture_command(ctx, &ticket, "blocked-code", "control_code", "").is_err());
             assert_eq!(fixture_counts(ctx, &ticket), [0, 0, 0, 0]);
         }
-        "menu" => {
+        "menu" | "menu-latest" => {
+            let operation = if case == "menu" { "register_current" } else { "open_latest_and_register" };
             fixture_command(
                 ctx,
                 &ticket,
                 "menu-register",
-                "register_current",
+                operation,
                 "browser_button",
             )?;
+            fixture_command(ctx, &ticket, "menu-register", operation, "browser_button")?;
+            assert_eq!(fixture_counts(ctx, &ticket), [1, 0, 0, 0]);
             fixture_finish_registration(ctx, &ticket, "menu-register", "succeeded");
-            assert_eq!(fixture_counts(ctx, &ticket), [0, 0, 0, 0]);
+            fixture_finish_registration(ctx, &ticket, "menu-register", "succeeded");
+            assert_eq!(fixture_counts(ctx, &ticket), [1, 1, 0, 0]);
+            fixture_command(ctx, &ticket, "menu-rate-limited", operation, "browser_button")?;
+            assert_eq!(fixture_counts(ctx, &ticket), [1, 1, 0, 0]);
         }
         "code" => {
             fixture_command(ctx, &ticket, "code-1", "control_code", "")?;
@@ -296,10 +306,10 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
                 "browser_button",
             )?;
             fixture_command(ctx, &ticket, "queued-code", "control_code", "")?;
-            assert_eq!(fixture_counts(ctx, &ticket), [0, 0, 1, 0]);
+            assert_eq!(fixture_counts(ctx, &ticket), [1, 0, 1, 0]);
             fixture_finish_registration(ctx, &ticket, "blocker", "failed");
             fixture_finish_code(ctx, &ticket, "queued-code", "succeeded");
-            assert_eq!(fixture_counts(ctx, &ticket), [0, 0, 1, 1]);
+            assert_eq!(fixture_counts(ctx, &ticket), [1, 0, 1, 1]);
         }
         "original-hour" | "expired" => {
             let command_id = format!("delayed-{case}");
@@ -381,8 +391,50 @@ pub fn fixture_statistics_case(ctx: &ReducerContext, case: String) -> Result<(),
                 .next()
                 .unwrap();
             assert_eq!(old.hourlyTicks.iter().sum::<u32>(), 1);
+            assert!(old.coverageFloorSlot.is_none());
+            assert!(old.slotCoverage.is_none());
+            ticketremote_record_member_activity_slots(ctx, "stats-migration".into(), "fixture@example.test".into(), vec![old.lastTickSlot, old.lastTickSlot + 1, old.lastTickSlot + 1])?;
+            let migrated = ctx.db.ticketremote_member_daily_activity().id().find(&old.id).unwrap();
+            assert_eq!(migrated.hourlyTicks.iter().sum::<u32>(), 2);
+            assert_eq!(migrated.coverageFloorSlot, Some(old.lastTickSlot + 1));
+            assert!(migrated.slotCoverage.is_some());
             action_statistics::record_success(ctx, "stats-migration", "pixel", "old");
             assert_eq!(fixture_counts(ctx, "stats-migration"), [0; 4]);
+        }
+        "activity" => {
+            let slot = ctx.timestamp.to_micros_since_unix_epoch().div_euclid(MEMBER_ACTIVITY_TICK_SLOT_MICROS);
+            let email = "fixture@example.test".to_string();
+            ticketremote_record_member_activity_slots(ctx, ticket.clone(), email.clone(), vec![])?;
+            assert!(ctx.db.ticketremote_member_daily_activity().ticketDay().filter((&ticket,)).next().is_none());
+            // These calls model overlapping tabs, lost acknowledgements, and
+            // offline samples arriving after a newer sample was committed.
+            ticketremote_record_member_activity_slots(ctx, ticket.clone(), email.clone(), vec![slot - 1, slot - 1])?;
+            ticketremote_record_member_activity_slots(ctx, ticket.clone(), email.clone(), vec![slot - 3, slot - 2, slot - 1])?;
+            ticketremote_member_record_activity_tick(ctx, ticket.clone())?;
+            ticketremote_record_member_activity_slots(ctx, ticket.clone(), email.clone(), vec![slot])?;
+            let counts = || ctx.db.ticketremote_member_daily_activity().ticketDay().filter((&ticket,)).map(|row| row.hourlyTicks.iter().sum::<u32>()).sum::<u32>();
+            assert_eq!(counts(), 4);
+            for (slots, expected) in [
+                (vec![slot - 4, slot + 1], "activity_slot_future"),
+                (vec![slot - 4, -1], "activity_slot_invalid"),
+                (vec![slot - 30 * 24 * 720], "activity_slot_expired"),
+                (vec![slot; 721], "activity_slots_too_many"),
+            ] {
+                assert_eq!(ticketremote_record_member_activity_slots(ctx, ticket.clone(), email.clone(), slots).unwrap_err(), expected);
+                assert_eq!(counts(), 4);
+            }
+            assert_eq!(ticketremote_record_member_activity_slots(ctx, ticket.clone(), "removed@example.test".into(), vec![slot]).unwrap_err(), "member_not_active");
+            assert_eq!(ticketremote_record_member_activity_slots(ctx, ticket.clone(), "removed@example.test".into(), vec![]).unwrap_err(), "member_not_active");
+            let midnight_ticket = format!("{ticket}-midnight");
+            fixture_setup(ctx, &midnight_ticket);
+            let utc = DateTime::<Utc>::from_timestamp_micros(ctx.timestamp.to_micros_since_unix_epoch()).unwrap();
+            let midnight = Riga.from_local_datetime(&utc.with_timezone(&Riga).date_naive().and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().timestamp_micros().div_euclid(MEMBER_ACTIVITY_TICK_SLOT_MICROS);
+            for _ in 0..2 {
+                ticketremote_record_member_activity_slots(ctx, midnight_ticket.clone(), email.clone(), vec![midnight, midnight - 1])?;
+            }
+            let days: Vec<_> = ctx.db.ticketremote_member_daily_activity().ticketDay().filter((&midnight_ticket,)).collect();
+            assert_eq!(days.len(), 2);
+            assert!(days.iter().all(|day| day.hourlyTicks.iter().sum::<u32>() == 1));
         }
         _ => return Err("unknown fixture case".into()),
     }

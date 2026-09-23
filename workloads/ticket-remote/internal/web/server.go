@@ -29,7 +29,7 @@ import (
 	"ticketremote/internal/state"
 )
 
-//go:embed static/* diagnostic/* pwa/*
+//go:embed static/* diagnostic/* pwa/* welcome/*
 var staticFS embed.FS
 
 type Server struct {
@@ -94,6 +94,7 @@ type Server struct {
 	streamDesiredReleaseTimer *time.Timer
 	streamDesiredReleaseSeq   uint64
 	startupRunMu              sync.Mutex
+	trialAdmissionMu          sync.Mutex
 	startupLeaseMu            sync.Mutex
 	streamLifecycleMu         sync.RWMutex
 	browserClientLogMu        sync.Mutex
@@ -101,6 +102,7 @@ type Server struct {
 	browserClientLogCount     int
 
 	backendMu sync.RWMutex
+	push      *ticketPush
 }
 
 var (
@@ -114,6 +116,8 @@ type client struct {
 	email                 string
 	startupTraceID        string
 	relayViewerGeneration uint64
+	trial                 *trialStreamMeter
+	trialPageID           string
 
 	clientLogMu          sync.Mutex
 	clientLogWindowStart time.Time
@@ -163,7 +167,7 @@ type apiResponse struct {
 }
 
 const (
-	serverVersion                 = "ticket-remote-2026-09-19-steady-hdr-slider-v206"
+	serverVersion                 = "ticket-remote-2026-09-22-invitations-v232"
 	stateLookupTimeout            = 1200 * time.Millisecond
 	stateCacheMaxAge              = 30 * time.Second
 	maxBrowserClientLogsPerMinute = 60
@@ -225,10 +229,18 @@ func NewServer(cfg config.Config, store state.Store, relay *phone.Relay) (*Serve
 	// and uses the direct bridge relay only for video transport.
 	go s.relayReportLoop(relayReportCtx)
 	go s.streamDesiredStateLoop(streamDesiredCtx)
+	if err := s.startTicketPush(); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
 func (s *Server) Close() {
+	if s.push != nil && s.push.cancel != nil {
+		s.push.cancel()
+		<-s.push.done
+	}
 	if s.coldRestartCancel != nil {
 		s.coldRestartCancel()
 		<-s.coldRestartDone
@@ -266,30 +278,44 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
+	if path == "/api/v1/activity" {
+		writeNoStoreHeaders(w)
+	}
 	if !s.requestOriginAllowed(r) {
 		writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "bad_origin", Message: "Request origin is not allowed."})
 		return
 	}
+	publicAsset, publicContentType := publicInstallationAsset(r.URL.Path)
 	switch {
-	case path == "/manifest.webmanifest" || path == "/pwa/icon-192.png" || path == "/pwa/icon-512.png" || path == "/pwa/icon-maskable.png" || path == "/pwa/apple-touch-icon.png":
+	case (path == "/" && r.URL.Query().Has("invite")) || path == "/invite":
+		s.handleInvitationLanding(w, r)
+	case path == "/manifest.webmanifest" && r.URL.Query().Has("invite"):
+		s.handleInvitationManifest(w, r)
+	case path == "/api/v1/invite/open":
+		s.handleInvitationOpen(w, r)
+	case path == "/api/v1/invite/start":
+		s.handleTrialStart(w, r)
+	case path == "/api/v1/invite/status":
+		s.handleTrialStatus(w, r)
+	case path == "/api/v1/admin/invitations":
+		s.withAdmin(w, r, s.handleAdminInvitations)
+	case path == "/api/v1/admin/invitations/revoke":
+		s.withAdmin(w, r, s.handleAdminInvitationRevoke)
+	case path == "/ticket-notifications-sw.js":
+		s.handleNotificationWorker(w, r)
+	case publicAsset != "":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		name := strings.TrimPrefix(path, "/")
-		contentType := "image/png"
-		if path == "/manifest.webmanifest" {
-			name = "pwa/manifest.webmanifest"
-			contentType = "application/manifest+json"
-		}
-		body, err := staticFS.ReadFile(name)
+		body, err := staticFS.ReadFile(publicAsset)
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		writeSecurityHeaders(w, "")
+		w.Header().Set("Content-Type", publicContentType)
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		if r.Method == http.MethodGet {
 			_, _ = w.Write(body)
@@ -306,11 +332,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/auth/logout":
 		s.handleAuthLogout(w, r)
 	case path == "/api/v1/health":
-		s.withMemberCachedFirst(w, r, func(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, snapshot state.Snapshot) {
+		s.withAdmin(w, r, func(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, snapshot state.Snapshot) {
 			s.handleHealth(w, r, snapshot)
 		})
 	case strings.HasPrefix(path, "/static/"):
 		writeNoStoreHeaders(w)
+		if s.serveGuestAsset(w, r) {
+			return
+		}
 		s.withMember(w, r, func(w http.ResponseWriter, r *http.Request, _ auth.Identity, _ string, _ state.Snapshot) {
 			http.StripPrefix("/static/", http.FileServer(http.FS(s.static))).ServeHTTP(w, r)
 		})
@@ -319,9 +348,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/stream":
 		s.handleBrowserSocket(w, r)
 	case path == "/api/v1/stream/prewarm":
+		if _, _, err := s.guestFromRequest(r); err == nil {
+			// Guest streaming begins at the socket, without the member page's
+			// long-lived prewarm lease.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
 		s.withMember(w, r, s.handleStreamPrewarmHTTP)
 	case path == "/api/v1/internal/service-events":
 		s.handleServiceEvent(w, r)
+	case path == "/api/v1/activity":
+		if _, _, err := s.guestFromRequest(r); err == nil {
+			// Trial usage has its own server-authorized stream meter. Offline
+			// member activity batches must never charge a trial.
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		s.handlePageActivity(w, r)
+	case path == "/api/v1/admin/statistics":
+		writeNoStoreHeaders(w)
+		s.withAdmin(w, r, s.handleAdminStatistics)
+	case path == "/api/v1/admin/monitoring":
+		writeNoStoreHeaders(w)
+		s.withAdmin(w, r, s.handleMonitoring)
+	case path == "/api/v1/admin/notifications":
+		writeNoStoreHeaders(w)
+		s.withAdmin(w, r, s.handleNotifications)
 	case path == "/api/v1/admin/state":
 		s.withAdmin(w, r, s.handleAdminState)
 	case path == "/api/v1/admin/stream/cold-restart":
@@ -346,6 +398,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleIndexShell(w, r)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func publicInstallationAsset(path string) (string, string) {
+	switch path {
+	case "/manifest.webmanifest":
+		return "pwa/manifest.webmanifest", "application/manifest+json"
+	case "/pwa/icon-192.png", "/pwa/icon-512.png", "/pwa/icon-maskable.png", "/pwa/apple-touch-icon.png":
+		return strings.TrimPrefix(path, "/"), "image/png"
+	case "/pwa/welcome.js":
+		return "pwa/welcome.js", "text/javascript; charset=utf-8"
+	case "/pwa/install-guide.css":
+		return "pwa/install-guide.css", "text/css; charset=utf-8"
+	case "/pwa/install-apple.png", "/pwa/install-firefox.png", "/pwa/install-chrome-choice.png", "/pwa/install-chrome-confirm.png":
+		return "static/" + strings.TrimPrefix(path, "/pwa/"), "image/png"
+	case "/pwa/install-safari-steps.jpg", "/pwa/install-safari-add.jpg":
+		return "static/" + strings.TrimPrefix(path, "/pwa/"), "image/jpeg"
+	default:
+		return "", ""
 	}
 }
 
@@ -415,6 +486,10 @@ func handleRetiredTicketRoute(w http.ResponseWriter) {
 }
 
 func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("enterInvite") == "1" {
+		s.handleWelcome(w, r)
+		return
+	}
 	startupRun := newStartupRunOrigin()
 	openedAt := time.Now()
 	if s.usesSpacetimeAuth() {
@@ -433,7 +508,14 @@ func (s *Server) handleIndexShell(w http.ResponseWriter, r *http.Request) {
 			s.handleIndex(w, r, id, sessionID, snapshot, startupRun)
 			return
 		}
-		s.handleUnauthIndex(w, r)
+		if s.handleGuestIndex(w, r) {
+			return
+		}
+		if invitationToken(cookieValue(r, invitationCookie)) != "" {
+			s.handleInvitationLanding(w, r)
+			return
+		}
+		s.handleWelcome(w, r)
 		return
 	}
 	id, sessionID, snapshot, ok := s.identifyMemberFromRequest(w, r, memberLookupOptions{
@@ -474,6 +556,27 @@ func (s *Server) handleUnauthIndex(w http.ResponseWriter, r *http.Request) {
 	writeNoStoreHeaders(w)
 	returnTo := safeReturnPath(r.URL.RequestURI())
 	http.Redirect(w, r, "/api/v1/auth/start?returnTo="+url.QueryEscape(returnTo), http.StatusFound)
+}
+
+func (s *Server) handleWelcome(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	nonce := randomID()
+	writeHTMLHeaders(w, nonce)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_ = welcomeTmpl.Execute(w, map[string]any{
+		"AssetVersion":    assetVersion(),
+		"AuthURL":         "/api/v1/auth/start?returnTo=" + url.QueryEscape(safeReturnPath(r.URL.RequestURI())),
+		"Nonce":           nonce,
+		"ManifestURL":     "/manifest.webmanifest",
+		"InvitationEntry": r.URL.Query().Get("enterInvite") == "1",
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, snapshot state.Snapshot) {
@@ -678,6 +781,7 @@ func (s *Server) snapshotWithCache(ctx context.Context, now time.Time, phoneHeal
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot, startupRun string) {
 	nonce := randomID()
 	config := s.publicBrowserConfig(id, sessionID, snapshot, true)
+	config["registrationComplete"] = r.URL.Query().Get("registered") == "1"
 	_, active := snapshot.Member(id.Email)
 	config["experimentalMediaCandidate"] = active
 	if active {
@@ -697,6 +801,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request, id auth.Ide
 		"ConfigJSON":   template.JS(mustJSON(config)),
 		"IsAdmin":      snapshot.IsAdmin(id.Email),
 		"Nonce":        nonce,
+		"ManifestURL":  "/manifest.webmanifest",
 	})
 }
 
@@ -717,6 +822,7 @@ func (s *Server) publicBrowserConfig(id auth.Identity, sessionID string, snapsho
 		"ticketId":       s.cfg.TicketID,
 		"backendId":      s.activePhoneBackend().ID,
 		"pageVersion":    serverVersion,
+		"serverTime":     time.Now().UTC().Format(time.RFC3339Nano),
 		"assetVersion":   assetVersion(),
 		"auth": map[string]any{
 			"mode":           authMode,
@@ -750,20 +856,44 @@ func ticketAccountScopeID(email string) string {
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth.Identity, sessionID string, snapshot state.Snapshot) {
 	nonce := randomID()
 	s.writeHTMLHeaders(w, nonce)
-	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("tab")), "statistics") {
-		_ = s.adminTmpl.Execute(w, map[string]any{
-			"AssetVersion":   assetVersion(),
-			"IsStatistics":   true,
-			"StatisticsJSON": template.JS(mustJSON(adminStatisticsPayload(snapshot))),
-			"Nonce":          nonce,
-		})
+	member, _ := snapshot.Member(id.Email)
+	isOwner := member.Role == state.RoleOwner
+	tab := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("tab")))
+	pageTitle := "Overview"
+	switch tab {
+	case "tickets":
+		pageTitle = "Tickets"
+	case "members":
+		pageTitle = "Members"
+	case "statistics":
+		pageTitle = "Statistics"
+	case "settings":
+		pageTitle = "Settings"
+	case "account":
+		if isOwner {
+			pageTitle = "ViVi account"
+		} else {
+			tab = "overview"
+		}
+	default:
+		tab = "overview"
+	}
+	pageData := map[string]any{
+		"AssetVersion": assetVersion(),
+		"Email":        id.Email,
+		"IsOwner":      isOwner,
+		"Tab":          tab,
+		"PageTitle":    pageTitle,
+		"IsStatistics": tab == "statistics",
+		"Nonce":        nonce,
+	}
+	if tab == "statistics" {
+		pageData["StatisticsJSON"] = template.JS(mustJSON(adminStatisticsPayload(snapshot)))
+		_ = s.adminTmpl.Execute(w, pageData)
 		return
 	}
-	member, _ := snapshot.Member(id.Email)
 	members := make([]adminMemberPageRow, 0, len(snapshot.Members))
-	viewers := 0
 	ownerCount := activeOwnerCount(snapshot)
-	isOwner := member.Role == state.RoleOwner
 	for _, item := range snapshot.Members {
 		if item.Active {
 			canRemove := isOwner || item.Role == state.RoleMember
@@ -773,44 +903,50 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 			members = append(members, adminMemberPageRow{Member: item, CanRemove: canRemove})
 		}
 	}
-	for _, viewer := range snapshot.Viewers {
-		if viewer.Connected {
-			viewers++
-		}
+	pageData["Members"] = members
+	if tab == "members" {
+		_ = s.adminTmpl.Execute(w, pageData)
+		return
 	}
-	phoneHealth := s.relay.Snapshot()
 	activeBackend := s.activePhoneBackend()
-	rawStateSnapshot := snapshot
-	rawStateSnapshot.PageActivityDaily = nil
-	rawStateSnapshot.ActionActivityDaily = nil
-	rawStateSnapshot.ActionStatisticsStartedAt = ""
-	rawStateSnapshot.Members = append([]state.Member(nil), snapshot.Members...)
-	for index := range rawStateSnapshot.Members {
-		rawStateSnapshot.Members[index].AccountScopeID = ""
-	}
-	pageData := map[string]any{
-		"AssetVersion":  assetVersion(),
-		"Email":         id.Email,
-		"IsOwner":       isOwner,
-		"Members":       members,
-		"ViewerCount":   viewers,
-		"Phone":         phoneHealth,
-		"Backends":      s.configuredPhoneBackends(),
-		"ActiveBackend": activeBackend.ID,
-		"RawState":      mustJSON(map[string]any{"state": rawStateSnapshot, "phone": phoneHealth}),
-		"Nonce":         nonce,
-		"AdminConfigJSON": template.JS(mustJSON(map[string]any{
+	if tab == "tickets" || tab == "settings" || tab == "account" {
+		pageData["AdminConfigJSON"] = template.JS(mustJSON(map[string]any{
 			"ticketId":  s.cfg.TicketID,
 			"backendId": activeBackend.ID,
 			"isOwner":   isOwner,
-		})),
+		}))
 	}
-	for key, value := range s.phoneSchedulePageData(snapshot, time.Now()) {
-		pageData[key] = value
+	if tab == "tickets" {
+		for key, value := range s.phoneSchedulePageData(snapshot, time.Now()) {
+			pageData[key] = value
+		}
+	}
+	if tab == "overview" || tab == "settings" {
+		phoneHealth := s.relay.Snapshot()
+		pageData["Phone"] = phoneHealth
+		pageData["ActiveBackend"] = activeBackend.ID
+		viewers := 0
+		for _, viewer := range snapshot.Viewers {
+			if viewer.Connected {
+				viewers++
+			}
+		}
+		pageData["ViewerCount"] = viewers
+		if tab == "settings" {
+			pageData["Backends"] = s.configuredPhoneBackends()
+			rawStateSnapshot := snapshot
+			rawStateSnapshot.PageActivityDaily = nil
+			rawStateSnapshot.ActionActivityDaily = nil
+			rawStateSnapshot.ActionStatisticsStartedAt = ""
+			rawStateSnapshot.Members = append([]state.Member(nil), snapshot.Members...)
+			for index := range rawStateSnapshot.Members {
+				rawStateSnapshot.Members[index].AccountScopeID = ""
+			}
+			pageData["RawState"] = mustJSON(map[string]any{"state": rawStateSnapshot, "phone": phoneHealth})
+		}
 	}
 	_ = s.adminTmpl.Execute(w, pageData)
 }
-
 
 type adminMemberPageRow struct {
 	state.Member
@@ -837,6 +973,15 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 	s.setPrivateAuthCookie(w, authFlowCookie("verifier"), verifier, maxAge)
 	s.setPrivateAuthCookie(w, authFlowCookie("state"), stateValue, maxAge)
 	s.setPrivateAuthCookie(w, authFlowCookie("return_to"), returnTo, maxAge)
+	s.setPrivateAuthCookie(w, authFlowCookie("invite_hash"), "", -1)
+	if r.URL.Query().Get("invite") == "1" {
+		if guest, err := s.auth.ValidateGuestSession(cookieValue(r, trialCookie), time.Now()); err == nil {
+			s.closeTrialClients(guest.InvitationID)
+		}
+		if invite, err := s.invitationFromRequest(r); err == nil && invite.RevokedAt == "" && invite.RedeemedAt == "" {
+			s.setPrivateAuthCookie(w, authFlowCookie("invite_hash"), invitationFingerprint(cookieValue(r, invitationCookie)), maxAge)
+		}
+	}
 
 	next, err := url.Parse(strings.TrimRight(s.cfg.Access.OIDCIssuer, "/") + "/auth")
 	if err != nil {
@@ -870,6 +1015,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	verifier := cookieValue(r, authFlowCookie("verifier"))
 	expectedState := cookieValue(r, authFlowCookie("state"))
 	returnTo := safeReturnPath(cookieValue(r, authFlowCookie("return_to")))
+	inviteHash := cookieValue(r, authFlowCookie("invite_hash"))
 	s.clearAuthFlowCookies(w)
 	if code == "" || verifier == "" || expectedState == "" || receivedState != expectedState {
 		writeErrorPage(w, http.StatusUnauthorized, "Login callback did not match this browser. Start sign-in again.")
@@ -884,6 +1030,12 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErrorPage(w, http.StatusUnauthorized, err.Error())
 		return
+	}
+	if inviteHash != "" {
+		if err := s.redeemInvitationHash(r.Context(), inviteHash, id); err != nil {
+			writeErrorPage(w, http.StatusForbidden, "This invitation cannot grant access. Sign in with an existing account or ask an administrator.")
+			return
+		}
 	}
 	snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, time.Now())
 	if err != nil {
@@ -902,6 +1054,11 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setAuthCookie(w, sessionToken, s.authCookieMaxAge())
+	if inviteHash != "" {
+		s.setPrivateAuthCookie(w, trialCookie, "", -1)
+		s.setPrivateAuthCookie(w, invitationCookie, "", -1)
+		returnTo = "/?registered=1"
+	}
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
@@ -960,6 +1117,9 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		id, sessionID, snapshot, ok := s.identifyMemberFromRequest(nil, r, memberLookupOptions{optional: true})
 		if !ok {
+			if s.handleGuestAuthSession(w, r) {
+				return
+			}
 			writeJSON(w, http.StatusUnauthorized, apiResponse{OK: false, Error: "auth_required", Message: "SpacetimeAuth login is required."})
 			return
 		}
@@ -995,6 +1155,13 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, apiResponse{OK: false, Error: "auth_invalid", Message: err.Error()})
 			return
 		}
+		inviteToken := invitationToken(cookieValue(r, invitationCookie))
+		if inviteToken != "" {
+			if err := s.redeemInvitationHash(r.Context(), invitationFingerprint(inviteToken), id); err != nil {
+				writeJSON(w, http.StatusForbidden, apiResponse{OK: false, Error: "invitation_unavailable", Message: "This invitation cannot grant access. Sign in with an existing account or ask an administrator."})
+				return
+			}
+		}
 		snapshot, err := s.store.Snapshot(r.Context(), s.cfg.TicketID, time.Now())
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, apiResponse{OK: false, Error: "state_unavailable", Message: "Ticket state is unavailable."})
@@ -1016,6 +1183,10 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.setAuthCookie(w, sessionToken, s.authCookieMaxAge())
+		if inviteToken != "" {
+			s.setPrivateAuthCookie(w, trialCookie, "", -1)
+			s.setPrivateAuthCookie(w, invitationCookie, "", -1)
+		}
 		sessionID := s.sessionID(w, r)
 		session := map[string]any{
 			"expires": !sessionExpiresAt.IsZero(),
@@ -1043,6 +1214,8 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setAuthCookie(w, "", -1)
+	s.setPrivateAuthCookie(w, trialCookie, "", -1)
+	s.setPrivateAuthCookie(w, invitationCookie, "", -1)
 	s.setPrivateAuthCookie(w, "ticket_remote_direct_spacetime", "", -1)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1203,9 +1376,51 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	// A video connection wakes the phone, so it must use a current membership
 	// lookup rather than the short-lived page cache.
-	id, sessionID, _, ok := s.identifyMember(w, r)
+	id, sessionID, _, ok := s.identifyMemberFromRequest(nil, r, memberLookupOptions{optional: true, requireFresh: true})
+	var trial *trialStreamMeter
+	trialAdmissionHeld := false
 	if !ok {
-		return
+		guest, invite, err := s.guestFromRequest(r)
+		if err != nil || invite.ActiveSessionID != guest.SessionID || (invite.Status != "trial_active" && invite.ResultDeliveryUntilMS <= time.Now().UnixMilli()) {
+			writeJSON(w, http.StatusUnauthorized, apiResponse{Error: "trial_or_member_required"})
+			return
+		}
+		s.trialAdmissionMu.Lock()
+		trialAdmissionHeld = true
+		defer func() {
+			if trialAdmissionHeld {
+				s.trialAdmissionMu.Unlock()
+			}
+		}()
+		store, _ := s.invitationStore()
+		invite, err = store.TrialStatus(r.Context(), s.cfg.TicketID, guest.InvitationID, guest.SessionID)
+		if err != nil || invite.ActiveSessionID != guest.SessionID || invite.RevokedAt != "" || invite.RedeemedAt != "" {
+			writeJSON(w, 403, apiResponse{Error: "trial_unavailable"})
+			return
+		}
+		pageID := r.URL.Query().Get("trial_page")
+		if len(pageID) != 32 {
+			writeJSON(w, 400, apiResponse{Error: "trial_page_required"})
+			return
+		}
+		for _, existing := range s.clientSnapshot() {
+			if existing.trial != nil && existing.trial.input.InvitationID == guest.InvitationID && existing.trialPageID != pageID {
+				writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "needsTakeover": true})
+				return
+			}
+		}
+		s.closeTrialClients(guest.InvitationID)
+		// Read the latest lease sequence after closing the previous socket.
+		invite, err = store.TrialStatus(r.Context(), s.cfg.TicketID, guest.InvitationID, guest.SessionID)
+		if err != nil {
+			writeJSON(w, 403, apiResponse{Error: "trial_unavailable"})
+			return
+		}
+		trial = newTrialStreamMeter(store, s.cfg.TicketID, guest, invite)
+		id = auth.Identity{Subject: guest.ActorID()}
+		sessionID = guest.SessionID
+	} else if sessionID == "" {
+		sessionID = s.sessionID(w, r)
 	}
 	startupRun := browserStartupRunOrigin(r)
 	openingClass := "cold"
@@ -1233,13 +1448,22 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	c := &client{
 		conn: conn, sessionID: sessionID, email: id.Email, videoV2Visibility: initialVisibility,
+		trial:       trial,
+		trialPageID: r.URL.Query().Get("trial_page"),
 		onVideoConfigWritten: func(uint64, uint64) {
 			s.requestOrdinaryCaptureIfUseful()
 		},
 	}
+	if trial != nil {
+		c.email = id.Subject
+	}
 	if !s.tryAddClient(c) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "connection limit reached")
 		return
+	}
+	if trialAdmissionHeld {
+		s.trialAdmissionMu.Unlock()
+		trialAdmissionHeld = false
 	}
 	s.startupRunMu.Lock()
 	traceID := safeRuntimeTraceID("browser", sessionID)
@@ -1255,7 +1479,9 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordRuntimeEventForSourceAsync("ticket_remote_relay", "info", "video_socket_open", traceID, detail)
 	c.relayViewerGeneration = s.addRelayViewer(sessionID)
-	s.retainRelayViewerForOpening(sessionID, publicOpenGraceHold, "public_open_grace", startupTraceID)
+	if trial == nil {
+		s.retainRelayViewerForOpening(sessionID, publicOpenGraceHold, "public_open_grace", startupTraceID)
+	}
 	s.cancelIdleStreamDesiredRelease()
 	s.direct.addVideoClient()
 
@@ -1285,6 +1511,9 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 	defer func() {
 		c.stopVideoWriter()
+		if c.trial != nil {
+			c.trial.pause(true)
+		}
 		closeReason := c.videoWriterCloseReason()
 		if closeReason == "" {
 			closeReason = "reader_closed"
@@ -1296,7 +1525,7 @@ func (s *Server) handleBrowserSocket(w http.ResponseWriter, r *http.Request) {
 			"activeVideoClients": s.direct.activeVideoClientCount(),
 			"reason":             closeReason,
 		})
-		if !c.firstVideoFrameRendered {
+		if !c.firstVideoFrameRendered && c.trial == nil {
 			s.retainRelayViewerForOpening(sessionID, publicOpenGraceHold, "public_open_grace", startupTraceID)
 		}
 		s.publishRelayCurrentReportAsync("video_socket_closed")
@@ -1432,6 +1661,14 @@ func (s *Server) handleStreamFeedback(c *client, data []byte) {
 		return
 	}
 	outcome := c.acceptStreamFeedbackOutcome(data)
+	if c.trial != nil {
+		c.videoMu.Lock()
+		hidden := c.videoV2Visibility != "visible"
+		c.videoMu.Unlock()
+		if hidden {
+			c.trial.pause(false)
+		}
+	}
 	if outcome.receiptReleased || outcome.becameVisible {
 		s.requestOrdinaryCaptureIfUseful()
 	}
@@ -1615,7 +1852,16 @@ func redirectAdminForm(w http.ResponseWriter, r *http.Request) bool {
 	if !adminFormRequest(r) {
 		return false
 	}
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	target := "/admin"
+	switch r.URL.Path {
+	case "/api/v1/admin/members":
+		target += "?tab=members"
+	case "/api/v1/admin/phone/backend":
+		target += "?tab=settings"
+	case "/api/v1/admin/ticket/reselect-latest/schedule":
+		target += "?tab=tickets"
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
 	return true
 }
 

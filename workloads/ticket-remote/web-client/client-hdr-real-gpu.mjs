@@ -6,49 +6,8 @@ import {
   CLIENT_HDR_LINEAR_COLOR_SPACE,
   CLIENT_HDR_SHADER
 } from './client-hdr-renderer.mjs';
-import { SLIDER_WAVE_SHADER } from './slider-hdr-wave.mjs';
+import { paintTicketSlider } from './ticket-slider-painter.mjs';
 import { drawHDRContrastFixture, HDR_CONTRAST_GRAYS } from './client-hdr-contrast-fixture.mjs';
-
-async function checkWave(device, path) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 3; canvas.height = 1;
-  const context = canvas.getContext('webgpu');
-  const buffers = [];
-  try {
-    context.configure({ device, format: CLIENT_HDR_CANVAS_FORMAT, colorSpace: path.colorSpace,
-      alphaMode: 'premultiplied', toneMapping: { mode: 'extended' },
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-    if (context.getConfiguration().alphaMode !== 'premultiplied') throw new Error('wave_alpha_mode');
-    const module = device.createShaderModule({ code: SLIDER_WAVE_SHADER });
-    const pipeline = await device.createRenderPipelineAsync({ layout: 'auto',
-      vertex: { module, entryPoint: 'vertexMain' },
-      fragment: { module, entryPoint: 'fragmentMain', targets: [{ format: CLIENT_HDR_CANVAS_FORMAT }] } });
-    const output = [];
-    for (const boost of CLIENT_HDR_ALLOWED_BOOSTS) {
-      const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      const readback = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      buffers.push(uniform, readback);
-      device.queue.writeBuffer(uniform, 0, new Float32Array([boost, 3, 1, path.encoded ? 1 : 0]));
-      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniform } }] });
-      const texture = context.getCurrentTexture(), commands = device.createCommandEncoder();
-      const pass = commands.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
-      pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
-      commands.copyTextureToBuffer({ texture }, { buffer: readback, bytesPerRow: 256 }, [3, 1]);
-      device.queue.submit([commands.finish()]);
-      await readback.mapAsync(GPUMapMode.READ);
-      const values = Array.from(new Uint16Array(readback.getMappedRange()).slice(0, 12), halfToFloat);
-      readback.unmap();
-      const alpha = values[7], white = values[4] / alpha;
-      if (!closeEnough(alpha, 0.19, 0.001) || !closeEnough(white, path.encoded ? extendedSrgb(boost) : boost) ||
-          values[3] !== 0 || values[11] !== 0) throw new Error('wave_gradient_readback');
-      output.push({ boost, alpha, white });
-    }
-    return output;
-  } finally {
-    for (const buffer of buffers) buffer.destroy();
-    context.unconfigure();
-  }
-}
 
 const LEVELS = Object.freeze([CLIENT_HDR_INTERNAL_IDENTITY_BOOST, ...CLIENT_HDR_ALLOWED_BOOSTS]);
 const SOURCE_WIDTH = 360;
@@ -143,6 +102,12 @@ function makeSampleFrame() {
   drawHDRContrastFixture(source);
   const context = source.getContext('2d', { alpha: false, colorSpace: 'srgb' });
   if (!context) throw new UnsupportedPathError('source_canvas_unavailable');
+  // The slider and wave now belong to the source picture. Include both in the
+  // per-pixel contrast oracle rather than testing the removed wave renderer.
+  paintTicketSlider(context, source, SOURCE_WIDTH, SOURCE_HEIGHT, {
+    region: { leftBasisPoints: 1000, topBasisPoints: 9400, rightBasisPoints: 9000, bottomBasisPoints: 9900 },
+    state: 'ready', offset: 0.35, reducedMotion: false
+  }, 1125);
   const pixels = context.createImageData(SOURCE_SAMPLES.length, 1);
   SOURCE_SAMPLES.forEach((sample, index) => {
     const offset = index * 4;
@@ -342,7 +307,6 @@ async function runPath(path) {
       result: 'passed',
       colorSpace: path.colorSpace,
       encoding: path.encoded ? 'extended-srgb' : 'linear-light',
-      hdrWave: await checkWave(device, path),
       levels: Array.from(LEVELS),
       contrast: { pixelsChecked: SOURCE_WIDTH * SOURCE_HEIGHT * LEVELS.length, maxRelativeError, maxSourceByteError, smallestTextPixels: 12 },
       samples: SOURCE_SAMPLES.map((sample) => sample.label),

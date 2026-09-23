@@ -99,6 +99,9 @@ export function ticketActionV3ActivationTerminalMessage(action) {
   if (!['failed', 'needs_attention'].includes(String(action.status || ''))) return '';
   switch (String(action.phase || '')) {
     case 'not_dispatched':
+      if (action.reason === 'ticket_action_accessibility_unavailable') {
+        return 'Tālruņa vadība nav pieejama. Vilkšana netika nosūtīta; īpašniekam jāpārbauda tālrunis.';
+      }
       return 'To pašu atvērto biļeti neizdevās apstiprināt; nekas netika pavilkts.';
     case 'retry_not_dispatched':
       return 'Pirmā vilkšana biļeti nemainīja. Atkārtotās vilkšanas gatavību nevarēja droši apstiprināt, tāpēc otrā vilkšana netika nosūtīta.';
@@ -168,15 +171,15 @@ export function ticketMemberLimitBlocks(limits, kind) {
   return true;
 }
 
-export function ticketMemberLimitCountdown(targetAt, now = Date.now()) {
+export function ticketMemberLimitCountdown(targetAt, now = Date.now(), translate = (text, values = {}) => text.replace(/\{(\w+)\}/g, (match, key) => values[key] ?? match)) {
   const target = Date.parse(String(targetAt || ''));
   if (!Number.isFinite(target)) return '';
   const remainingSeconds = Math.max(0, Math.ceil((target - Number(now)) / 1000));
-  if (remainingSeconds <= 0) return 'gaida SpaceTime atjauninājumu';
-  if (remainingSeconds < 60) return `pēc ${remainingSeconds} s`;
+  if (remainingSeconds <= 0) return translate('gaida SpaceTime atjauninājumu');
+  if (remainingSeconds < 60) return translate('pēc {n} s', { n: remainingSeconds });
   const minutes = Math.floor(remainingSeconds / 60);
   const seconds = remainingSeconds % 60;
-  return seconds ? `pēc ${minutes} min ${seconds} s` : `pēc ${minutes} min`;
+  return translate(seconds ? 'pēc {n} min {s} s' : 'pēc {n} min', { n: minutes, s: seconds });
 }
 
 

@@ -19,10 +19,12 @@ mod maintenance;
 use maintenance::{maintenance_paused, require_new_phone_admission};
 mod cold_restart;
 mod idle_refresh;
+mod monitoring;
 mod member_activity;
 use member_activity::*;
 mod action_statistics;
 use action_statistics::*;
+mod viewer_privacy;
 
 fn account_scope_id(email: &str) -> String {
     let normalized = email.trim().to_ascii_lowercase();
@@ -119,6 +121,9 @@ macro_rules! apply_changes {
         $(if let Some(value) = $changes.$field { $row.$field = value; })+
     };
 }
+
+mod checkin;
+mod invitations;
 
 macro_rules! purge_control_code_rows {
     ($ctx:expr, $table:ident, $paired:ident, $ticket:expr, $bound:expr, $limit:expr, $deleted:expr) => {{
@@ -254,7 +259,11 @@ macro_rules! member_reducers {
         ) -> Result<(), String> {
             let $clock = now($ctx);
             let $ticket = ensure_ticket($ctx, &$ticket_arg, "", &$clock);
-            let $email = client_email_from_auth($ctx, &$ticket.id)?;
+            let $email = match stringify!($name) {
+                "ticketremote_member_set_stream_focus" => invitations::viewer_actor($ctx, &$ticket.id)?,
+                "ticketremote_member_confirm_control_code_browser_capture" | "ticketremote_member_close_control_code" => invitations::result_actor($ctx, &$ticket.id)?,
+                _ => client_email_from_auth($ctx, &$ticket.id)?,
+            };
             $body;
             Ok(())
         }
@@ -334,6 +343,12 @@ pub struct TicketremoteMemberDailyActivity {
     pub lastTickAt: String,
     pub updatedAt: String,
     pub expiresAt: String,
+    // Old totals contain no slot history. Their first new write establishes
+    // a coverage floor after lastTickSlot, preserving counts without guessing.
+    #[default(None::<i64>)]
+    pub coverageFloorSlot: Option<i64>,
+    #[default(None::<Vec<u8>>)]
+    pub slotCoverage: Option<Vec<u8>>,
 }
 
 #[spacetimedb::table(accessor = ticketremote_phone_backend)]
@@ -355,7 +370,7 @@ pub struct TicketremotePhoneBackend {
     pub lastSeenAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_stream_desired_state, public,
+#[spacetimedb::table(accessor = ticketremote_stream_desired_state,
     index(accessor = ticketBackend, btree(columns = [ticketId, backendId]))
 )]
 #[derive(Clone)]
@@ -380,7 +395,7 @@ pub struct TicketremoteStreamDesiredState {
     pub coldRestartError: Option<String>,
 }
 
-#[spacetimedb::table(accessor = ticketremote_stream_viewer_focus, public,
+#[spacetimedb::table(accessor = ticketremote_stream_viewer_focus,
     index(accessor = ticketBackend, btree(columns = [ticketId, backendId])),
     index(accessor = ticketExpiresAt, btree(columns = [ticketId, expiresAt]))
 )]
@@ -494,7 +509,7 @@ pub struct TicketremoteStreamCommandSignal {
     pub updatedAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_phone_current_report, public)]
+#[spacetimedb::table(accessor = ticketremote_phone_current_report)]
 #[derive(Clone)]
 pub struct TicketremotePhoneCurrentReport {
     #[primary_key]
@@ -1181,7 +1196,7 @@ pub struct TicketremoteLatencyLinkV1 {
     pub expiresAt: String,
 }
 
-#[spacetimedb::table(accessor = ticketremote_relay_current_report, public)]
+#[spacetimedb::table(accessor = ticketremote_relay_current_report)]
 #[derive(Clone)]
 pub struct TicketremoteRelayCurrentReport {
     #[primary_key]
@@ -1459,6 +1474,9 @@ pub fn ticketremote_owner_vivi_credentials_view(
 }
 
 fn member_view_binding(ctx: &ViewContext, owner_only: bool) -> Option<TicketremoteMemberIdentity> {
+    if !owner_only {
+        if let Some(guest) = invitations::guest_view_binding(ctx) { return Some(guest); }
+    }
     let binding = ctx
         .db
         .ticketremote_member_identity()
@@ -2046,6 +2064,7 @@ fn ticket_action_v3_finish_without_command(
     reason: &str,
     now: &str,
 ) {
+    invitations::settle_action(ctx, &row.ticketId, &row.actionId, false, true);
     let (status, phase, projected_reason, emit_command) = ticket_action_v3_rejection_plan(reason);
     debug_assert!(!emit_command);
     ctx.db
@@ -2504,6 +2523,7 @@ fn finish_queued_control_code_request(
     reason: &str,
     now: &str,
 ) {
+    invitations::settle_action(ctx, ticket_id, request_id, false, true);
     insert_control_code_public_request(
         ctx,
         ticket_id,
@@ -2639,7 +2659,8 @@ fn promote_ticket_action_v3_queue(
     }
     let rejection = if parse_time_ms(&intent.expiresAt) <= parse_time_ms(now) {
         Some("command_expired")
-    } else if !is_member(ctx, ticket_id, &intent.requestedEmail) {
+    } else if !is_member(ctx, ticket_id, &intent.requestedEmail)
+        && !invitations::is_guest_actor(ctx, ticket_id, &intent.requestedEmail) {
         Some("membership_required")
     } else {
         None
@@ -3029,7 +3050,7 @@ macro_rules! hdr_preference {
             let ticket_id = clean_ticket_id(ticket_id);
             let email = clean_email(email);
             let id = $state_id(&ticket_id, &email);
-            if !is_member(ctx, &ticket_id, &email) {
+            if !is_member(ctx, &ticket_id, &email) && !invitations::is_guest_actor(ctx, &ticket_id, &email) {
                 ctx.db.$state().id().delete(id);
                 return;
             }
@@ -3062,7 +3083,7 @@ macro_rules! hdr_preference {
         ) -> Result<(), String> {
             let now = now(ctx);
             let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-            let email = client_email_from_auth(ctx, &ticket.id)?;
+            let email = invitations::viewer_actor(ctx, &ticket.id)?;
             let id = member_id(&ticket.id, &email);
             let table = ctx.db.$preference();
             let $field = $normalize($field);
@@ -3090,7 +3111,7 @@ macro_rules! hdr_preference {
         pub fn $refresher(ctx: &ReducerContext, ticketId: String) -> Result<(), String> {
             let now = now(ctx);
             let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-            let email = client_email_from_auth(ctx, &ticket.id)?;
+            let email = invitations::viewer_actor(ctx, &ticket.id)?;
             $refresh(ctx, &ticket.id, &email, &now);
             Ok(())
         }
@@ -4116,6 +4137,7 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
     if has_valid_service_identity(ctx) || operator_identity_is_valid(&ctx.sender().to_string()) {
         return Ok(());
     }
+    if invitations::connect_guest(ctx)? { return Ok(()); }
     let email = client_email_from_auth(ctx, DEFAULT_TICKET_ID)?;
     let now = now(ctx);
     upsert_member_identity(ctx, DEFAULT_TICKET_ID, &email, &now);
@@ -4129,6 +4151,7 @@ pub fn identity_connected(ctx: &ReducerContext) -> Result<(), String> {
 #[spacetimedb::reducer(client_disconnected)]
 pub fn identity_disconnected(_ctx: &ReducerContext) {}
 
+// Retained for open pre-v213 pages; remove after those deployed callers drain.
 #[spacetimedb::reducer]
 pub fn ticketremote_member_record_activity_tick(
     ctx: &ReducerContext,
@@ -4139,6 +4162,26 @@ pub fn ticketremote_member_record_activity_tick(
     let email = client_email_from_auth(ctx, &ticket.id)?;
     let bucket = member_activity_bucket(ctx.timestamp)?;
     upsert_member_activity_tick(ctx, &ticket.id, &email, &observed_at, &bucket);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn ticketremote_record_member_activity_slots(
+    ctx: &ReducerContext,
+    ticketId: String,
+    email: String,
+    slots: Vec<i64>,
+) -> Result<(), String> {
+    require_service(ctx)?;
+    let ticket_id = clean_ticket_id(&ticketId);
+    let email = clean_email(&email);
+    if email.is_empty() || !is_member(ctx, &ticket_id, &email) {
+        return Err("member_not_active".into());
+    }
+    // Validate the whole batch before changing any day. Reducer transactions
+    // also make a lost acknowledgement safe to retry without counting twice.
+    let buckets = member_activity_slots(ctx.timestamp, &slots)?;
+    upsert_member_activity_slots(ctx, &ticket_id, &email, &now(ctx), &buckets);
     Ok(())
 }
 
@@ -4181,7 +4224,7 @@ pub fn ticketremote_member_refresh_limit_state(
 ) -> Result<(), String> {
     let now = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &now);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let email = invitations::result_actor(ctx, &ticket.id)?;
     refresh_member_limit_state(ctx, &ticket.id, &email, &now);
     Ok(())
 }
@@ -4239,6 +4282,7 @@ pub fn ticketremote_scheduled_policy_boundary(
         "switch" => {
             expire_ticket_switch_anchor(ctx, &arg.ticketId, &arg.subjectId, &arg.boundaryAt, &now)
         }
+        "checkin" => checkin::expire(ctx, &arg.ticketId, &arg.subjectId),
         _ => return Err("invalid_policy_boundary_subject".into()),
     }
     Ok(())
@@ -5024,6 +5068,7 @@ pub fn ticketremote_scheduled_cleanup_expired(
     };
     cleanup_expired(ctx, &arg.ticketId, &now, batch_size);
     idle_refresh::reconcile_ticket(ctx, &arg.ticketId, &now);
+    monitoring::check_due(ctx, &arg.ticketId, parse_time_ms(&now));
     Ok(())
 }
 
@@ -5848,6 +5893,8 @@ pub fn ticketremote_finalize_ticket_action_v3(
         finalize_ticket_action_v3_scheduled_result(ctx, &command, &action, &facts, &now)?;
     }
 
+    invitations::settle_action(ctx, &ticket.id, action_id, facts.status == "succeeded",
+        invitations::conclusive_activation_failure(&facts.status, &facts.phase, &facts.reason));
     if facts.status == "succeeded" {
         action_statistics::record_success(ctx, &ticket.id, &backend_id, action_id);
     }
@@ -6012,6 +6059,8 @@ pub fn ticketremote_update_control_code_request(
     );
     let terminal_failure = control_code_terminal_failure_status(&clean_status);
     let succeeded = clean_status == "succeeded";
+    invitations::settle_action(ctx, &ticket.id, requestId.trim(), succeeded,
+        invitations::conclusive_code_failure(&clean_status, &incoming_reason));
     let clean_result_proof = clean_control_code_result_proof(&resultProof);
     let clean_result_proof_at = bounded_text(resultProofAt.trim(), 80);
     if succeeded {
@@ -7374,6 +7423,7 @@ fn authorize_and_upsert_member(
         active_owner_count(ctx, ticket_id),
     )?;
     let owner_revoked = target_role.as_deref() == Some("owner") && role != "owner";
+    invitations::record_manual_source(ctx, ticket_id, target_email, actor_email, now);
     upsert_member_row(ctx, ticket_id, target_email, &role, now);
     if owner_revoked {
         cancel_unstarted_vivi_reauth_for_owner(ctx, ticket_id, target_email, now);

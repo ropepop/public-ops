@@ -105,7 +105,7 @@ pub fn ticketremote_member_command(
     require_current_command(version)?;
     let clock = now(ctx);
     let ticket = ensure_ticket(ctx, &ticketId, "", &clock);
-    let email = client_email_from_auth(ctx, &ticket.id)?;
+    let email = invitations::result_actor(ctx, &ticket.id)?;
     let backend = canonical_activation_backend(ctx, &ticket.id, &backendId)?;
     if !valid_schedule_identifier(&commandId) {
         return Err("invalid_ticket_command_id".into());
@@ -123,6 +123,7 @@ pub fn ticketremote_member_command(
             Err("ticket_command_id_reused".into())
         };
     }
+    invitations::reserve_action(ctx, &ticket.id, &backend, &commandId, &email, &operation)?;
     require_new_phone_admission(ctx, &ticket.id)?;
     // Expired envelopes cannot execute again after receipt retention ends.
     if !command_time_valid(&issuedAt, &clock) {
@@ -223,10 +224,10 @@ pub fn ticketremote_member_command(
     }
     // Some ticket rejections intentionally commit a visible terminal row and
     // return Ok. Only a real dispatched/queued command is an accepted attempt.
-    let accepted = operation != "register_current" || ctx.db.ticketremote_stream_command().id()
+    let accepted = !ticket_action_v3_is_activation(&operation) || ctx.db.ticketremote_stream_command().id()
         .find(ticket_action_v3_command_id(&ticket.id, &backend, &commandId)).is_some();
     let statistics_kind = if accepted {
-        action_statistics::record_attempt(ctx, &ticket.id, &email, &operation, field("source"))
+        action_statistics::record_attempt(ctx, &ticket.id, &email, &operation)
     } else { None };
     ctx.db
         .ticketremote_command_receipt()

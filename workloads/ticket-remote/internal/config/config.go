@@ -34,6 +34,7 @@ type Config struct {
 	State               state.StoreConfig
 	Phone               PhoneConfig
 	ServiceEvents       ServiceEventsConfig
+	WebPushKeyFile      string
 }
 
 type ServiceEventsConfig struct {
@@ -146,6 +147,7 @@ func Load() (Config, error) {
 		ServiceEvents: ServiceEventsConfig{
 			Token: getenv("TICKET_REMOTE_SERVICE_EVENT_TOKEN", ""),
 		},
+		WebPushKeyFile: getenv("TICKET_REMOTE_WEB_PUSH_KEY_FILE", ""),
 	}
 	if cfg.Port <= 0 || cfg.Port > 65535 {
 		return Config{}, fmt.Errorf("TICKET_REMOTE_PORT out of range: %d", cfg.Port)

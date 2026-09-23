@@ -12,16 +12,9 @@ import {
 
 export default __t.row({
   id: __t.string().primaryKey(),
-  ticketId: __t.string(),
-  backendId: __t.string(),
-  desiredActive: __t.bool(),
-  viewerCount: __t.u32(),
-  reason: __t.string(),
-  revision: __t.string(),
-  updatedBy: __t.string(),
-  updatedAt: __t.string(),
-  coldRestartId: __t.option(__t.string()),
-  coldRestartPhase: __t.option(__t.string()),
-  coldRestartStartedAt: __t.option(__t.string()),
-  coldRestartError: __t.option(__t.string()),
+  direction: __t.string(),
+  carriage: __t.u8(),
+  status: __t.string(),
+  count: __t.u32(),
+  latestAtMs: __t.i64(),
 });

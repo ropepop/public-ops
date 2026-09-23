@@ -1,6 +1,7 @@
 import { ClientHDRController, clientHDRCapability, normalizeClientHDRDisplayBoost } from './client-hdr-core.mjs';
 import { exactResultMatches } from './exact-result.mjs';
 import { MAX_PICTURE_AGE_MS } from './media-session.mjs';
+import { paintTicketSlider } from './ticket-slider-painter.mjs';
 
 const paint = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 const samePicture = (left, right) => left && right && left.epoch === right.epoch &&
@@ -26,6 +27,93 @@ export class Presentation {
     this.displayedHDR = null;
     this.recovering = false;
     this.recoveryStartedAt = 0;
+    this.hdrFollowupTimer = null;
+    this.hdrFollowupDue = false;
+    this.slider = null;
+    this.sliderAnimation = null;
+    this.composition = null;
+    this.backgroundCanvas = null;
+    this.backgroundRGB = null;
+  }
+
+  sampleBackground() {
+    try {
+      const { canvas } = this.elements;
+      if (!this.backgroundCanvas) {
+        this.backgroundCanvas = document.createElement('canvas');
+        this.backgroundCanvas.width = this.backgroundCanvas.height = 1;
+      }
+      const context = this.backgroundCanvas.getContext('2d', { willReadFrequently: true });
+      // Sample the quiet lower-left edge, outside both the ticket and Android bar.
+      // Crop the SDR canvas, not VideoFrame (whose source crop WebKit ignores).
+      context.drawImage(canvas, Math.floor(canvas.width * 0.01), Math.floor(canvas.height * 0.98), 1, 1, 0, 0, 1, 1);
+      this.backgroundRGB = [...context.getImageData(0, 0, 1, 1).data].slice(0, 3);
+      if (!this.controller?.surfaceVisible && !this.holdover) this.updateBackground(1);
+    } catch { /* A cosmetic fill must not interrupt ticket presentation. */ }
+  }
+
+  updateBackground(boost) {
+    if (!this.backgroundRGB) return;
+    const channels = this.backgroundRGB.map(byte => {
+      const encoded = byte / 255;
+      const linear = (encoded <= 0.04045 ? encoded / 12.92 : ((encoded + 0.055) / 1.055) ** 2.4) * boost;
+      return Math.round(255 * Math.min(1, linear <= 0.0031308 ? linear * 12.92 : 1.055 * linear ** (1 / 2.4) - 0.055));
+    });
+    const color = `rgb(${channels.join(' ')})`;
+    document.documentElement.style.setProperty('--ticket-picture-background', color);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', color);
+  }
+
+  setSlider(slider) {
+    const regionKeys = ['leftBasisPoints', 'topBasisPoints', 'rightBasisPoints', 'bottomBasisPoints',
+      'sessionId', 'sessionGeneration', 'contextRevision'];
+    const next = slider ? { ...slider, region: Object.fromEntries(regionKeys
+      .filter(key => slider.region[key] !== undefined).map(key => [key, slider.region[key]])),
+      offset: Math.max(0, Math.min(1, Number(slider.offset) || 0)) } : null;
+    if (JSON.stringify(next) === JSON.stringify(this.slider)) return;
+    const context = value => value ? JSON.stringify(value.region) : '';
+    const contextChanged = context(next) !== context(this.slider);
+    if (!this.frozen && contextChanged) this.controller?.holdLastPresentation({ keepProof: true });
+    this.slider = next;
+    this.stopSliderAnimation();
+    // A changed control can invalidate an unfinished source presentation. That
+    // source still needs its ordinary proof before animation can use the surface.
+    if (contextChanged && this.controller?.active && this.latest && !this.frozen &&
+      (!this.controller.confirmed || !samePicture(this.latest.metadata, this.controller.presented)) &&
+      this.handlers.age(this.latest.metadata) <= MAX_PICTURE_AGE_MS) this.offer(this.latest.frame, this.latest.metadata);
+    else this.repaintSlider();
+    this.animateSlider();
+  }
+
+  stopSliderAnimation() {
+    if (this.sliderAnimation !== null) cancelAnimationFrame(this.sliderAnimation);
+    this.sliderAnimation = null;
+  }
+
+  animateSlider() {
+    if (this.sliderAnimation !== null || !this.slider || this.slider.reducedMotion || !this.visible ||
+      this.frozen || !this.latest || this.handlers.age(this.latest.metadata) > MAX_PICTURE_AGE_MS) return;
+    this.sliderAnimation = requestAnimationFrame(() => {
+      this.sliderAnimation = null;
+      this.repaintSlider();
+      this.animateSlider();
+    });
+  }
+
+  repaintSlider() {
+    if (!this.visible || this.frozen || !this.latest || !samePicture(this.latest.metadata, this.rendered)) return;
+    this.offer(this.latest.frame, this.latest.metadata, { visualOnly: true, restoreRaw: !this.slider });
+  }
+
+  compose(frame) {
+    if (!this.slider || this.frozen) return frame;
+    const { width, height } = this.elements.canvas;
+    this.composition ||= document.createElement('canvas');
+    if (this.composition.width !== width) this.composition.width = width;
+    if (this.composition.height !== height) this.composition.height = height;
+    paintTicketSlider(this.composition.getContext('2d', { alpha: false }), frame,
+      width, height, this.slider, performance.now());
+    return this.composition;
   }
 
   size(width, height) {
@@ -44,6 +132,7 @@ export class Presentation {
     this.enabled = Boolean(enabled);
     this.boost = normalizeClientHDRDisplayBoost(boost);
     if (!this.enabled) {
+      this.cancelHDRRecovery();
       this.generation++;
       this.controller?.dispose();
       this.controller = null;
@@ -58,7 +147,8 @@ export class Presentation {
       this.hdrBlocked = false;
       this.failure = '';
       delete document.body.dataset.hdrFailure;
-      this.restartHDR();
+      if (this.visible) this.recoverHDR({ foregroundReturn: true });
+      else this.restartHDR();
     } else if (boostChanged) {
       if (this.hdrBlocked) {
         this.hdrBlocked = false;
@@ -70,15 +160,23 @@ export class Presentation {
     }
   }
 
-  setVisible(visible) {
+  setVisible(visible, { foregroundReturn = false } = {}) {
     const returning = visible && !this.visible;
     this.visible = visible;
     this.controller?.setDocumentVisible(visible);
-    if (!visible) this.controller?.suspend();
-    if (returning) this.recoverHDR();
+    if (!visible) {
+      this.cancelHDRRecovery();
+      this.stopSliderAnimation();
+      this.controller?.suspend();
+    }
+    if (visible && (returning || foregroundReturn)) {
+      this.recoverHDR({ foregroundReturn: true });
+      this.repaintSlider();
+      this.animateSlider();
+    }
   }
 
-  surface(visible) {
+  surface(visible, boost = this.controller?.surfaceBoost || 1) {
     const { hdrCanvas, resultArea, resultImage } = this.elements;
     hdrCanvas.hidden = !this.enabled;
     hdrCanvas.dataset.clientHdrSurface = visible && this.enabled ? 'visible' : 'standby';
@@ -86,6 +184,7 @@ export class Presentation {
     document.body.dataset.experimentalMedia = (visible || this.holdover) && this.enabled
       ? 'hdr-client-webgpu-preview' : this.recovering ? 'hdr-recovering' : 'fallback-sdr';
     document.body.dataset.hdrRecovering = String(this.recovering);
+    if (!this.holdover) this.updateBackground(visible && this.enabled ? boost : 1);
     if (!visible && !this.holdover && (this.frozen?.displayed || (this.frozen?.presenting && !resultArea.hidden))) {
       resultArea.dataset.presentation = this.recovering ? 'recovering' : 'sdr';
       resultImage.hidden = this.recovering;
@@ -124,11 +223,14 @@ export class Presentation {
     const generation = this.generation;
     const controller = new ClientHDRController({
       canRevealSurface: () => this.enabled && this.visible,
-      canReleaseHoldover: (candidate) => Boolean(candidate.retainedResult
+      canReleaseHoldover: (candidate) => Boolean(candidate.visualOnly
+        ? !this.frozen && !this.holdover && samePicture(candidate, this.rendered) &&
+          (candidate.restoreRaw || this.handlers.age(candidate) <= MAX_PICTURE_AGE_MS)
+        : candidate.retainedResult
         ? this.frozen?.displayed && samePicture(this.frozen.metadata, candidate)
         : this.handlers.age(candidate) <= MAX_PICTURE_AGE_MS &&
           (!this.frozen || (this.frozen.presenting && samePicture(this.frozen.metadata, candidate)))),
-      onSurface: (visible) => { if (generation === this.generation) this.surface(visible); },
+      onSurface: (visible, boost) => { if (generation === this.generation) this.surface(visible, boost); },
       onStatus: (status, reason) => {
         if (generation !== this.generation) return;
         document.body.dataset.hdrStatus = status;
@@ -160,6 +262,10 @@ export class Presentation {
           snapshot.epoch === this.rendered.epoch && snapshot.sequence === this.rendered.sequence) {
           this.handlers.onRendered(this.rendered, true);
         }
+        // Input received during activation cannot animate the surface yet. Apply
+        // its latest state now without submitting the source for another proof.
+        if (this.slider) this.repaintSlider();
+        this.followupHDR();
       }
     });
     this.controller = controller;
@@ -167,10 +273,43 @@ export class Presentation {
     this.seedHDR();
   }
 
-  recoverHDR() {
-    if (!this.visible || this.hdrBlocked) return;
-    if (this.recovering && this.controller?.active) return;
+  recoverHDR({ foregroundReturn = false } = {}) {
+    if (!this.visible || !this.enabled) return;
+    if (foregroundReturn) {
+      this.cancelHDRRecovery();
+      this.hdrFollowupTimer = setTimeout(() => {
+        this.hdrFollowupTimer = null;
+        this.hdrFollowupDue = true;
+        this.followupHDR();
+      }, 1000);
+      this.hdrBlocked = false;
+      this.failure = '';
+      delete document.body.dataset.hdrFailure;
+    } else if (this.hdrBlocked || (this.recovering && this.controller?.active)) return;
     this.restartHDR();
+  }
+
+  cancelHDRRecovery() {
+    clearTimeout(this.hdrFollowupTimer);
+    this.hdrFollowupTimer = null;
+    this.hdrFollowupDue = false;
+    if (this.controller) this.controller.reassertPending = false;
+  }
+
+  followupHDR() {
+    if (!this.hdrFollowupDue || !this.visible || !this.enabled) return;
+    // A slow initial activation owns the surface until it settles or fails.
+    if (this.recovering && this.controller?.active) return;
+    this.hdrFollowupDue = false;
+    if (this.controller?.active && this.controller.activated) {
+      this.controller.reassertHDR();
+      this.seedHDR();
+    } else {
+      this.hdrBlocked = false;
+      this.failure = '';
+      delete document.body.dataset.hdrFailure;
+      this.restartHDR();
+    }
   }
 
   fallbackHDR(reason) {
@@ -184,11 +323,13 @@ export class Presentation {
     this.releaseHoldover();
     // Prepare the latest ordinary picture before revealing it. A frozen code
     // already has its exact SDR image; never replace it with the live stream.
-    if (!this.frozen && this.latest) this.draw(this.latest.frame, this.latest.metadata);
+    if (!this.frozen && this.latest) this.draw(this.compose(this.latest.frame), this.latest.metadata,
+      { visualOnly: samePicture(this.latest.metadata, this.rendered) });
     document.body.dataset.hdrStatus = 'failed';
     document.body.dataset.hdrFailure = reason;
     this.surface(false);
     this.handlers.onFailure?.(reason);
+    this.followupHDR();
   }
 
   releaseHoldover() {
@@ -223,32 +364,53 @@ export class Presentation {
     this.latest = { frame: frame.clone(), metadata };
     if (this.frozen) return;
     this.offer(frame, metadata);
+    this.animateSlider();
   }
 
-  offer(frame, metadata) {
-    if (!this.visible || this.handlers.age(metadata) > MAX_PICTURE_AGE_MS) return false;
+  offer(frame, metadata, { visualOnly = false, restoreRaw = false } = {}) {
+    if (!this.visible || (!restoreRaw && this.handlers.age(metadata) > MAX_PICTURE_AGE_MS)) return false;
     const generation = this.generation;
     const candidate = { ...metadata, offeredAt: performance.now(),
       visualAgeMillis: this.handlers.age(metadata), presentationOrdinal: this.ordinal + 1 };
     const commit = (ownedFrame) => {
       if (generation !== this.generation || (this.frozen && !samePicture(this.frozen.metadata, metadata))) return false;
-      return this.draw(ownedFrame, metadata);
+      return this.draw(ownedFrame, metadata, { visualOnly, restoreRaw });
     };
-    if (this.controller?.snapshot().ready && this.controller.offerFrame(frame, candidate, { commitSDR: commit })) return true;
-    const rendered = this.draw(frame, metadata);
-    if (rendered && this.controller) {
-      this.controller.noteSDRFrame(rendered);
-      this.controller.offerFrame(frame, { ...candidate, ...rendered });
+    const source = this.compose(frame);
+    const decorated = source !== frame;
+    // A canvas is reused for SDR composition; only HDR needs an immutable frame
+    // snapshot while its asynchronous rendering owns a clone.
+    let hdrFrame = frame;
+    try {
+      if (source !== frame && this.controller?.active) {
+        try { hdrFrame = new VideoFrame(source, { timestamp: frame.timestamp || 0 }); }
+        catch {
+          this.controller.fail('slider_frame_conversion_failed');
+          return false;
+        }
+      }
+      const options = { commitSDR: commit, visualOnly, restoreRaw, decorated };
+      if (this.controller?.snapshot().ready && this.controller.offerFrame(hdrFrame, candidate, options)) return true;
+      const rendered = this.draw(source, metadata, { visualOnly, restoreRaw });
+      if (rendered && this.controller && !visualOnly) {
+        this.controller.noteSDRFrame(rendered);
+        this.controller.offerFrame(hdrFrame, { ...candidate, ...rendered }, { decorated });
+      }
+      return Boolean(rendered);
+    } finally {
+      if (hdrFrame !== frame) hdrFrame.close();
     }
-    return Boolean(rendered);
   }
 
-  draw(frame, metadata) {
-    if (!this.visible || this.handlers.age(metadata) > MAX_PICTURE_AGE_MS) return false;
+  draw(frame, metadata, { visualOnly = false, restoreRaw = false } = {}) {
+    if (!this.visible || (!restoreRaw && this.handlers.age(metadata) > MAX_PICTURE_AGE_MS)) return false;
+    if (visualOnly && (this.frozen || !samePicture(metadata, this.rendered))) return false;
     if (this.rendered && this.rendered.epoch === metadata.epoch &&
       this.rendered.configGeneration === metadata.configGeneration && this.rendered.sequence > metadata.sequence) return false;
     const { canvas } = this.elements;
     this.context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    if (visualOnly) return this.rendered;
+    this.sampleBackground();
     this.rendered = { ...metadata, visualAgeMillis: this.handlers.age(metadata),
       renderedAt: performance.now(), presentationOrdinal: ++this.ordinal };
     this.handlers.onRendered(this.rendered);
@@ -271,6 +433,10 @@ export class Presentation {
     const frozen = { requestId: request.requestId, revision: request.resultMarkerRevision,
       metadata, frame: captured, presenting: true, displayed: false };
     this.frozen = frozen;
+    this.stopSliderAnimation();
+    // A decorated stream frame can have the same sequence as the requested
+    // raw result. Fence it before asking for proof of the exact captured pixels.
+    this.controller?.holdLastPresentation();
     const { canvas, resultArea, resultImage } = this.elements;
     try {
       const image = document.createElement('canvas');
@@ -287,7 +453,7 @@ export class Presentation {
       let exactHDR = false;
       while (this.enabled && this.controller?.snapshot().active && performance.now() < deadline) {
         const snapshot = this.controller.snapshot();
-        if (snapshot.proofFresh && snapshot.epoch === metadata.epoch && snapshot.sequence === metadata.sequence) {
+        if (snapshot.proofFresh && !snapshot.decorated && snapshot.epoch === metadata.epoch && snapshot.sequence === metadata.sequence) {
           exactHDR = this.controller.ensureExactProof(metadata.epoch, metadata.sequence);
           break;
         }
@@ -325,8 +491,9 @@ export class Presentation {
     delete resultArea.dataset.presentation;
     document.body.classList.remove('control-code-result-visible');
     if (this.latest && this.handlers.age(this.latest.metadata) <= MAX_PICTURE_AGE_MS) {
-      this.draw(this.latest.frame, this.latest.metadata);
+      this.draw(this.compose(this.latest.frame), this.latest.metadata);
       this.seedHDR();
+      this.animateSlider();
     } else {
       // A dismissed/expired result is not a live holdover. Erase it even when
       // the source has not supplied a replacement picture yet.
@@ -339,7 +506,9 @@ export class Presentation {
   }
 
   dispose() {
+    this.cancelHDRRecovery();
     this.generation++;
+    this.stopSliderAnimation();
     this.controller?.dispose();
     this.controller = null;
     this.releaseHoldover();
@@ -349,12 +518,19 @@ export class Presentation {
     this.recovering = false;
     this.latest?.frame.close();
     this.latest = null;
+    this.composition?.remove();
+    this.composition = null;
+    this.backgroundCanvas?.remove();
+    this.backgroundCanvas = null;
   }
 
   clearForColdRestart() {
     this.dispose();
     this.rendered = null;
     this.context.clearRect(0, 0, this.elements.canvas.width, this.elements.canvas.height);
+    this.backgroundRGB = null;
+    document.documentElement.style.removeProperty('--ticket-picture-background');
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#020304');
     this.surface(false);
   }
 }

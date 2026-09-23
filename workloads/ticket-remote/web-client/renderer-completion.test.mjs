@@ -69,6 +69,76 @@ test('every frame preserves the configured surface and submits without yielding 
   assert.deepEqual(events.slice(-2), ['release', 'unconfigure']);
 });
 
+test('HDR reassertion reuses the accepted configuration and copies the prepared frame before yielding', async () => {
+  const { renderer, failures } = rendererWith({ promise: Promise.resolve() }, { promise: Promise.resolve(null) });
+  const events = [], configurations = [], texture = {}, staging = { destroy() {} };
+  const device = renderer.device;
+  let acceptedConfiguration;
+  renderer.environment = { GPUTextureUsage: { RENDER_ATTACHMENT: 16, COPY_DST: 2, COPY_SRC: 1 } };
+  renderer.prepare = async () => {};
+  renderer.writeParameters = () => {};
+  const context = {
+    configure(configuration) {
+      configurations.push(configuration);
+      if (configuration.colorSpace === 'srgb-linear') throw new Error('unsupported');
+      acceptedConfiguration = configuration;
+      events.push('configure');
+      queueMicrotask(() => events.push('yield'));
+    },
+    getConfiguration: () => acceptedConfiguration,
+    getCurrentTexture() { events.push('texture'); return texture; },
+    unconfigure() {}
+  };
+  const canvas = { width: 10, height: 20, getContext: () => context };
+  device.createTexture = () => staging;
+  device.createCommandEncoder = () => ({
+    copyTextureToTexture(source, target) {
+      assert.equal(source.texture, staging);
+      assert.equal(target.texture, texture);
+      events.push('copy');
+    },
+    finish: () => ({})
+  });
+  device.queue.submit = () => events.push('submit');
+  await renderer.initialize({ canvas, width: 10, height: 20, boost: 5 });
+  assert.equal(configurations.length, 2, 'initialization falls back to accepted encoded sRGB');
+  assert.equal(renderer.encodeOutput, true);
+  const configuration = acceptedConfiguration;
+  events.length = 0;
+  renderer.prepared = true;
+  await renderer.present({ reconfigure: true });
+  assert.deepEqual(events, ['configure', 'texture', 'copy', 'submit', 'yield']);
+  assert.equal(configurations[2], configuration);
+  assert.equal(renderer.device, device);
+  assert.equal(renderer.context, context);
+  assert.equal(renderer.stagingTexture, staging);
+  assert.equal(renderer.boost, 5);
+  assert.equal(renderer.encodeOutput, true);
+  assert.deepEqual(failures, []);
+  renderer.dispose();
+  assert.equal(renderer.canvasConfiguration, null);
+});
+
+test('HDR reassertion reports configuration validation failures through the presentation failure path', async () => {
+  const { renderer, failures } = rendererWith(
+    { promise: Promise.resolve() }, { promise: Promise.resolve({ message: 'invalid configuration' }) }
+  );
+  renderer.prepared = true;
+  renderer.canvas = { width: 10, height: 20 };
+  renderer.stagingTexture = {};
+  renderer.canvasConfiguration = {};
+  renderer.context = { configure() {}, getCurrentTexture: () => ({}), unconfigure() {} };
+  renderer.device.createCommandEncoder = () => ({ copyTextureToTexture() {}, finish: () => ({}) });
+  renderer.device.queue.submit = () => {};
+  await assert.rejects(renderer.present({ reconfigure: true }), /invalid_configuration/);
+  assert.equal(renderer.presenting, false);
+  assert.equal(renderer.prepared, false);
+  assert.equal(renderer.failed, true);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /^present_failed:/);
+  renderer.dispose();
+});
+
 test('GPU submission waits for queue completion and validation, and rejects invalid work', async () => {
   const queue = deferred(), validation = deferred();
   const { renderer, failures, pops } = rendererWith(queue, validation);

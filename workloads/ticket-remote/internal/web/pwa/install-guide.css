@@ -1,0 +1,58 @@
+.install-ticket-button { width: 100%; margin-top: 20px; display: flex; justify-content: space-between; gap: 12px; text-align: left; }
+.install-ticket-button[hidden] { display: none; }
+.install-dialog { box-sizing: border-box; width: min(540px, calc(100% - 24px)); max-height: calc(100dvh - 32px); padding: 24px; border: 1px solid #35445a; border-radius: 20px; background: #0b111a; color: #eef3f8; overflow-y: auto; overscroll-behavior: contain; }
+.install-dialog::backdrop { background: rgb(0 0 0 / 70%); }
+.install-dialog button { min-height: 44px; cursor: pointer; }
+.install-dialog button:focus-visible, .install-language:focus-visible { outline: 2px solid #9dccff; outline-offset: 3px; }
+.install-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; color: #a9b8c9; }
+.install-header button { font-size: 25px; padding: 0 12px; }
+.install-heading { margin: 18px 0 12px; font-size: 26px; line-height: 1.15; letter-spacing: -.5px; }
+.install-intro, .install-dialog p { font-size: 14px; line-height: 1.55; color: #b5c2d1; }
+.install-question { margin-top: 24px; color: #eef3f8 !important; }
+.install-choices { display: grid; gap: 10px; }
+.install-choices[hidden] { display: none; }
+.install-choices button { display: grid; gap: 6px; text-align: left; padding: 16px; border-radius: 12px; }
+.install-choices span { color: #a9b8c9; font-size: 12px; font-weight: normal; }
+.install-choices .install-choice-icon { font-size: 20px; margin-right: 10px; }
+.install-download { display: inline-flex; align-items: center; min-height: 44px; color: #a9d1ff; }
+.install-option { margin-top: 16px; padding: 16px; border: 1px solid #35445a; border-radius: 12px; }
+.install-dialog .install-option h3 { margin: 0 0 8px; }
+.install-recommended { display: block; margin-bottom: 8px; color: #a9d1ff; font-size: 12px; }
+.install-store-links { display: flex; flex-wrap: wrap; column-gap: 20px; }
+.install-dialog summary { padding: 12px 0; cursor: pointer; font-size: 14px; }
+.install-dialog summary:focus-visible, .install-download:focus-visible { outline: 2px solid #9dccff; outline-offset: 3px; }
+.install-apk { overflow-wrap: anywhere; }
+.install-url-label { display: block; font-size: 13px; margin: 16px 0 6px; }
+.install-url { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; font-size: 14px; }
+.install-copy { margin-top: 10px; }
+.install-back { margin-top: 10px; }
+.install-dialog h3 { font-size: 16px; margin: 24px 0 14px; }
+.install-steps { list-style: none; padding: 0; display: grid; gap: 22px; }
+.install-step-heading { display: flex; align-items: center; gap: 10px; font-size: 15px; }
+.install-step-heading > span { display: grid; place-items: center; flex: 0 0 26px; height: 26px; border-radius: 50%; background: #263b52; color: #c6e2ff; }
+.install-picture { margin: 12px 0 0; padding: 0; }
+.install-picture svg { display: block; width: 100%; height: auto; overflow: hidden; border: 1px solid #35445a; border-radius: 12px; box-sizing: border-box; background: #111b29; }
+.install-picture figcaption { margin-top: 6px; font-size: 11px; color: #a9b8c9; }
+.install-picture a { color: #a9d1ff; }
+.install-header .install-language { flex-shrink: 0; min-height: 44px; width: auto; font-size: 12px; margin-left: auto; padding: 0 8px; }
+.install-header > span { min-width: 0; }
+.install-dialog .install-example { font-size: 12px; }
+.install-note { margin-top: 24px; padding: 16px; border-radius: 12px; background: #111b29; }
+.install-note p:last-child { margin-bottom: 0; }
+.install-done { width: 100%; margin-top: 18px; }
+@media (max-width: 360px) { .install-dialog { padding: 16px; } .install-heading { font-size: 23px; } }
+.welcome-actions .welcome-secondary { color: #d5e0ed; background: #111b29; border-color: #35445a; }
+.welcome-actions .welcome-primary { color: #07111b; background: #b8d9ff; border-color: #b8d9ff; }
+.welcome-actions .welcome-quiet { color: #a9d1ff; background: transparent; border-color: transparent; font-weight: 400; }
+.welcome-invitation-link { display: block; margin-top: 20px; text-align: center; padding: 10px; }
+.welcome-feedback { color: #bac8d9; line-height: 1.5; }
+.invitation-entry { display: grid; gap: 12px; margin: 24px 0; }
+.invitation-entry input { box-sizing: border-box; width: 100%; min-width: 0; }
+.invitation-entry button { min-height: 48px; }
+.ticket-trial { padding: 16px; margin: 12px 0; background: #111b29; border: 1px solid #35445a; border-radius: 14px; color: #d5e0ed; font-size: 14px; line-height: 1.5; }
+.ticket-trial strong { display: block; font-weight: 500; }
+.ticket-trial-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+.ticket-trial-actions a { color: #a9d1ff; padding: 10px 0; }
+.ticket-trial details { margin-top: 8px; color: #a9b8c9; }
+.ticket-trial summary { cursor: pointer; min-height: 32px; }
+.ticket-trial p { margin: 8px 0 0; }

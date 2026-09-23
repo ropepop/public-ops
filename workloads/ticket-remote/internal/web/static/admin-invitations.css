@@ -1,0 +1,20 @@
+.invitation-tabs { display: flex; gap: 8px; margin-bottom: 24px; }
+.invitation-tabs button[aria-pressed="true"] { background: #20344b; border-color: #668dbb; color: #eef3f8; }
+.invitation-create { display: grid; gap: 16px; }
+.invitation-create h2, .invitation-create p { margin: 0; }
+.invitation-create label { display: grid; gap: 8px; font-size: 14px; }
+.invitation-create input, .invitation-create select, .invitation-created input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; }
+.invitation-fields { display: flex; gap: 16px; flex-wrap: wrap; }
+.invitation-fields label { flex: 1 1 180px; }
+.invitation-create > button { justify-self: start; }
+.invitation-created { margin: 24px 0; border: 1px solid #668dbb; padding: 18px; border-radius: 14px; background: #142438; }
+.invitation-created h3 { margin-top: 0; }
+.invitation-link-actions { display: flex; gap: 10px; margin-top: 12px; }
+.invitation-list-heading, .invitation-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.invitation-list-heading { margin-top: 32px; }
+.invitation-list { display: grid; gap: 12px; }
+.invitation-row { border: 1px solid #35445a; border-radius: 12px; padding: 16px; overflow-wrap: anywhere; }
+.invitation-row p { font-size: 14px; line-height: 1.5; margin: 8px 0; }
+.invitation-error { color: #ffbcac; line-height: 1.5; }
+[data-member-source-email] { font-size: 12px; line-height: 1.5; }
+.invitation-create [hidden], .invitation-created[hidden], #adminInvitations [hidden], #adminPeople[hidden] { display: none !important; }

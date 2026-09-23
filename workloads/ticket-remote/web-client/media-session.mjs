@@ -87,6 +87,7 @@ export class MediaSession {
     url.searchParams.set('page_version', this.page.pageVersion);
     url.searchParams.set('asset_version', this.page.assetVersion);
     url.searchParams.set('visibility', document.visibilityState);
+    if (this.page.trial?.pageId) url.searchParams.set('trial_page', this.page.trial.pageId);
     const protocols = ['ticket.video.v1'];
     if (/^ticket\.startup\.[0-9a-f]{32}$/.test(this.page.startupRunOrigin || '')) protocols.push(this.page.startupRunOrigin);
     const socket = early?.socket && early.socket.readyState < 2 ? early.socket : new WebSocket(url, protocols);
