@@ -15,6 +15,9 @@ function setup(mode) {
   Object.defineProperty(navigator, 'clipboard', { value: { async writeText(value) { window.fixtureClipboard = value; } } });
   if (mode === 'installed') Object.defineProperty(navigator, 'standalone', { value: true });
   if (mode === 'remembered') localStorage.setItem('ticket.invitation.fixture', '1');
+  if (mode === 'admin-invalid') localStorage.setItem('ticket.invitationCreatorSettings', '{broken');
+  if (mode === 'admin-invalid-values') localStorage.setItem('ticket.invitationCreatorSettings', JSON.stringify({ duration: '999', streamMinutes: '999', customDuration: '-3' }));
+  if (mode === 'admin-blocked') Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw Error('Storage blocked'); } });
   window.fixtureTrial = { id: 'fixture', status: mode === 'expired' ? 'registration_only' : 'not_started', streamSecondsRemaining: 900, activationsRemaining: 5, controlCodesRemaining: 5, authUrl: '/api/v1/auth/start?invite=1&returnTo=%2F', inviteUrl: location.origin + '/?invite=0123456789abcdefghijklmnopqrstuv' };
   let revoked = false;
   window.fetch = async (url, options = {}) => {
@@ -40,23 +43,64 @@ function probe() {
   const button = label => [...document.querySelectorAll('button')].find(node => node.textContent.trim() === label);
   async function run() {
     await pause(); const mode = window.fixtureMode;
-    if (mode === 'admin') {
+    if (mode.startsWith('admin')) {
       check(document.documentElement.dataset.ticketInvitationsUi === 'arrow', 'administrator island mounted');
       check(text('[data-member-source-email]').includes('Invited through For Mira'), 'member source is attributed');
       button('Invitations').click(); await pause();
       check(document.querySelector('#adminPeople').hidden, 'People view closes when Invitations opens');
-      check(document.querySelector('[name="duration"]').value === '4320', 'three-day default');
-      check(document.querySelector('[name="streamMinutes"]').value === '15', '15-minute default');
-      await change(document.querySelector('[name="duration"]'), 'custom');
-      check(!document.querySelector('[name="customDuration"]').disabled, 'custom minutes can be edited');
-      document.querySelector('[name="customDuration"]').value = '90'; document.querySelector('[name="label"]').value = 'For Mira';
+      if (mode !== 'admin' || !sessionStorage.getItem('invitationAdminReloaded')) {
+        check(document.querySelector('[name="duration"]').value === '', 'no trial duration is preselected');
+        check(document.querySelector('[name="streamMinutes"]').value === '', 'no viewing allowance is preselected');
+      }
+      if (mode === 'admin' && !sessionStorage.getItem('invitationAdminReloaded')) {
+        await change(document.querySelector('[name="duration"]'), 'custom');
+        check(!document.querySelector('[name="customDuration"]').disabled, 'custom minutes can be edited');
+        const custom = document.querySelector('[name="customDuration"]');
+        custom.value = '90'; custom.dispatchEvent(new Event('input', { bubbles: true })); await pause();
+        await change(document.querySelector('[name="streamMinutes"]'), '30');
+        document.querySelector('[name="label"]').value = 'For Mira';
+        check(!!localStorage.getItem('ticket.invitationCreatorSettings'), 'creator preferences saved in this browser');
+        sessionStorage.setItem('invitationAdminReloaded', '1');
+        window.fixtureSkipResult = true; location.reload(); return;
+      }
+      if (mode === 'admin') {
+        check(document.querySelector('[name="duration"]').value === 'custom', 'last trial duration survives refresh');
+        check(document.querySelector('[name="customDuration"]').value === '90' && !document.querySelector('[name="customDuration"]').disabled, 'last custom minutes survive refresh');
+        check(document.querySelector('[name="streamMinutes"]').value === '30', 'last viewing allowance survives refresh');
+        check(document.querySelector('[name="label"]').value === '', 'private label is not remembered');
+      } else {
+        check(document.querySelector('[name="label"]').value === '', 'invalid or blocked storage leaves private label blank');
+        await change(document.querySelector('[name="duration"]'), 'custom');
+        const custom = document.querySelector('[name="customDuration"]');
+        custom.value = '90'; custom.dispatchEvent(new Event('input', { bubbles: true })); await pause();
+        await change(document.querySelector('[name="streamMinutes"]'), '30');
+      }
+      document.querySelector('[name="label"]').value = 'For Mira';
       document.querySelector('.invitation-create').requestSubmit(); await pause();
       const created = window.fixtureCalls.find(call => call.body?.label);
-      check(created.body.durationMinutes === 90 && created.body.streamMinutes === 15, 'create sends exact selected allowances');
+      check(created.body.durationMinutes === 90 && created.body.streamMinutes === 30, 'create sends exact selected allowances');
+      check(document.querySelector('[name="label"]').value === '', 'successful creation clears private label');
+      check(document.querySelector('[name="duration"]').value === 'custom' && document.querySelector('[name="streamMinutes"]').value === '30', 'successful creation keeps chosen allowances');
       check(document.querySelector('#createdInvitationLink').value === window.fixtureTrial.inviteUrl, 'complete link shown once');
+      const qr = document.querySelector('#createdInvitationQR');
+      check(qr?.getAttribute('src')?.startsWith('data:image/png;base64,') && !qr.closest('.invitation-created').hidden, 'created invitation shows a local QR image');
+      await qr.decode();
+      check(qr.naturalWidth >= 256 && qr.naturalHeight === qr.naturalWidth, 'QR image renders at scanning size');
+      if (typeof BarcodeDetector === 'function' && (await BarcodeDetector.getSupportedFormats()).includes('qr_code')) {
+        const detected = await new BarcodeDetector({ formats: ['qr_code'] }).detect(qr);
+        check(detected.length === 1 && detected[0].rawValue === window.fixtureTrial.inviteUrl, 'QR decodes to the exact invitation link');
+      }
+      const firstQR = qr.src;
       button('Copy link').click(); await pause();
       check(window.fixtureClipboard === window.fixtureTrial.inviteUrl && button('Copied'), 'copy returns complete invitation');
       button('Close').click(); await pause(); check(document.querySelector('#createdInvitationLink').value === '', 'closing removes raw link');
+      check(!document.querySelector('#createdInvitationQR'), 'closing removes QR image');
+      window.fixtureTrial.inviteUrl = location.origin + '/?invite=' + 'a'.repeat(32);
+      document.querySelector('[name="label"]').value = 'For Kai';
+      document.querySelector('.invitation-create').requestSubmit(); await pause();
+      check(document.querySelector('#createdInvitationLink').value === window.fixtureTrial.inviteUrl, 'new invitation shows its own link');
+      check(document.querySelector('#createdInvitationQR')?.src.startsWith('data:image/png;base64,') && document.querySelector('#createdInvitationQR').src !== firstQR, 'new invitation gets a different QR image');
+      button('Close').click(); await pause();
       button('Revoke invitation').click(); await pause(); check(text('.invitation-list').includes('Revoked'), 'revocation refreshes status');
       button('People').click(); await pause(); check(!document.querySelector('#adminPeople').hidden, 'People view remains available');
     } else if (mode === 'complete') {
@@ -65,10 +109,13 @@ function probe() {
       button('Close').click(); await pause(); check(!document.querySelector('[role="status"]'), 'confirmation can be dismissed');
     } else if (mode === 'trial') {
       check(text('.ticket-trial').includes('15:00'), 'compact trial time visible');
+      check(text('.ticket-trial strong').includes('Guest trial'), 'trial card names its purpose');
+      check(!document.querySelector('.ticket-trial-remaining').hidden, 'remaining allowance is visibly shown');
       window.fixtureTrial.status = 'registration_only'; window.fixtureTrial.resultDeliveryAllowed = true;
       await window.fixtureTrialUI.refresh(); await pause(); check(!document.querySelector('#trialEndDialog').open, 'accepted result delivery stays uncovered');
       window.fixtureTrial.resultDeliveryAllowed = false;
       await window.fixtureTrialUI.refresh(); await pause(); check(document.querySelector('#trialEndDialog').open, 'ending trial presents registration');
+      check(getComputedStyle(document.querySelector('.trial-register')).backgroundColor === 'rgb(184, 217, 255)', 'registration is the clear next step after trial');
       check(window.fixtureChanges.at(-1).status === 'registration_only', 'viewer receives server entitlement');
       window.fixtureTrial.status = 'trial_active'; window.fixtureTrial.needsTakeover = true;
       await window.fixtureTrialUI.refresh(); await pause(); check(text('#trialEndDialog').includes('Continue here'), 'other-device trial offers explicit transfer');
@@ -77,6 +124,7 @@ function probe() {
       check(!document.querySelector('#trialEndDialog').open, 'successful transfer dismisses prompt');
     } else if (mode === 'entry') {
       const form = document.querySelector('.invitation-entry'), input = document.querySelector('#invitationLink');
+      check(text('label[for="invitationLink"]') === 'Invitation link or code' && text('#invitationLinkHint').includes('32-character code'), 'entry explains both accepted formats');
       input.value = 'https://other.example/?invite=0123456789abcdefghijklmnopqrstuv'; form.requestSubmit(); await pause();
       check(window.fixtureCalls.length === 0 && text('[role="status"]').includes('32-character'), 'other-origin links rejected');
       input.value = window.fixtureTrial.inviteUrl; form.requestSubmit(); await pause();
@@ -94,7 +142,22 @@ function probe() {
       const icon = document.querySelector('.welcome-icon'); await icon.decode(); check(icon.naturalWidth === 192, 'public welcome icon loads');
       check(window.fixtureCalls.length === 0, 'first link view starts no guest work');
       check(!document.querySelector('#welcomeInstructions'), 'ordinary welcome is not repeated');
-      for (const language of ['ru', 'lv', 'en']) { await change(document.querySelector('#viewerLanguage'), language); check(document.documentElement.lang === language && text('h1').length > 5, language + ' invitation translated'); }
+      const actions = document.querySelector('.welcome-actions');
+      check([...actions.children].map(node => node.id).join(',') === 'inviteTry,inviteSetup,inviteRegister', 'try is first and setup remains available');
+      const tryButton = document.querySelector('#inviteTry'), setupButton = document.querySelector('#inviteSetup');
+      check(getComputedStyle(tryButton).backgroundColor === 'rgb(184, 217, 255)' && getComputedStyle(setupButton).backgroundColor !== getComputedStyle(tryButton).backgroundColor, 'try is visually primary and setup is secondary');
+      for (const [language, noAccount, tryLabel, setupLabel, later] of [
+        ['ru', 'без регистрации', 'Попробовать Ticket сейчас', 'Настроить Ticket сейчас', 'Установить Ticket можно и позже'],
+        ['lv', 'bez reģistrēšanās', 'Izmēģināt Ticket tagad', 'Iestatīt Ticket tagad', 'Ticket vari instalēt arī vēlāk'],
+        ['en', 'without an account', 'Try Ticket now', 'Set up Ticket now', 'You can install Ticket later']
+      ]) {
+        await change(document.querySelector('#viewerLanguage'), language);
+        check(document.documentElement.lang === language && text('h1').length > 5, language + ' invitation translated');
+        check(text('.welcome-message').includes(noAccount), language + ' invite offers trial without registration');
+        check(text('#inviteTry').includes(tryLabel) && text('#inviteSetup').includes(setupLabel), language + ' try-first actions translated');
+        check(text('.welcome-allowance').includes('15') && text('.welcome-allowance').includes('5'), language + ' allowance remains visible');
+        check(text('.welcome-setup-later').includes(later), language + ' gives concise later-installation guidance');
+      }
       document.querySelector('#inviteSetup').click(); await pause();
       const dialog = document.querySelector('#installTicketDialog');
       check(dialog.open && dialog.dataset.installPage === 'native', 'Android opens Native Alpha options directly');
@@ -120,7 +183,7 @@ function probe() {
     }
     check(document.documentElement.scrollWidth <= innerWidth, 'page fits viewport');
   }
-  run().catch(error => errors.push(error.message)).finally(() => { const node = document.createElement('pre'); node.id = 'fixtureResult'; node.hidden = true; node.textContent = JSON.stringify({ checks, errors }); document.body.append(node); });
+  run().catch(error => errors.push(error.message)).finally(() => { if (window.fixtureSkipResult) return; const node = document.createElement('pre'); node.id = 'fixtureResult'; node.hidden = true; node.textContent = JSON.stringify({ checks, errors }); document.body.append(node); });
 }
 
 async function startFixture() {
@@ -143,7 +206,7 @@ async function startFixture() {
     const mode = url.searchParams.get('mode') || 'welcome';
     const before = `<script>(${setup})(${JSON.stringify(mode)});</script>`, after = url.searchParams.has('preview') ? '' : `<script>addEventListener('DOMContentLoaded',()=>(${probe})());</script>`;
     let page;
-    if (mode === 'admin') page = `<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/admin-invitations.css"></head><body class="admin-page"><main class="admin-shell"><section class="admin-section"><div id="adminInvitations"></div><div id="adminPeople"><span data-member-source-email="member@example.test"></span></div></section></main>${before}<script defer src="/admin.js"></script>${after}</body></html>`;
+    if (mode.startsWith('admin')) page = `<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/admin-invitations.css"></head><body class="admin-page"><main class="admin-shell"><section class="admin-section"><div id="adminInvitations"></div><div id="adminPeople"><span data-member-source-email="member@example.test"></span></div></section></main>${before}<script defer src="/admin.js"></script>${after}</body></html>`;
     else if (mode === 'trial' || mode === 'complete') page = `<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/pwa/install-guide.css"></head><body><div id="trial"></div>${before}<script defer src="/trial.js"></script>${after}</body></html>`;
     else {
       const trial = { id: 'fixture', status: mode === 'expired' ? 'registration_only' : 'not_started', streamSecondsRemaining: 900, activationsRemaining: 5, controlCodesRemaining: 5, authUrl: '/api/v1/auth/start?invite=1&returnTo=%2F', inviteUrl: `http://127.0.0.1:${server.address().port}/?invite=0123456789abcdefghijklmnopqrstuv` };
@@ -160,7 +223,7 @@ if (process.argv.includes('--serve')) {
 } else test('invitation onboarding, transfer, registration boundary and administrator journey', { timeout: 120000 }, async () => {
   const {server, browser} = await startFixture();
   try {
-    for (const mode of ['welcome', 'takeover', 'expired', 'installed', 'remembered', 'entry', 'trial', 'complete', 'admin']) {
+    for (const mode of ['welcome', 'takeover', 'expired', 'installed', 'remembered', 'entry', 'trial', 'complete', 'admin', 'admin-invalid', 'admin-invalid-values', 'admin-blocked']) {
       const result = await renderBraveDOM(browser, `http://127.0.0.1:${server.address().port}/?mode=${mode}${mode === 'complete' ? '&registered=1' : ''}`, { windowSize: '390,850', waitExpression: '!!document.querySelector("#fixtureResult")' });
       const match = result.stdout.match(/<pre id="fixtureResult" hidden="">([^<]+)<\/pre>/); assert.ok(match, mode + ': missing report');
       const report = JSON.parse(match[1].replaceAll('&quot;', '"').replaceAll('&amp;', '&'));

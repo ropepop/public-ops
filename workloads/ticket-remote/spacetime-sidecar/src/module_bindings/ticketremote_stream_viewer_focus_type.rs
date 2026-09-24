@@ -14,6 +14,7 @@ pub struct TicketremoteStreamViewerFocus {
     pub active: bool,
     pub last_seen_at: String,
     pub expires_at: String,
+    pub email: Option<String>,
 }
 
 impl __sdk::InModule for TicketremoteStreamViewerFocus {
@@ -31,6 +32,7 @@ pub struct TicketremoteStreamViewerFocusCols {
     pub active: __sdk::__query_builder::Col<TicketremoteStreamViewerFocus, bool>,
     pub last_seen_at: __sdk::__query_builder::Col<TicketremoteStreamViewerFocus, String>,
     pub expires_at: __sdk::__query_builder::Col<TicketremoteStreamViewerFocus, String>,
+    pub email: __sdk::__query_builder::Col<TicketremoteStreamViewerFocus, Option<String>>,
 }
 
 impl __sdk::__query_builder::HasCols for TicketremoteStreamViewerFocus {
@@ -44,6 +46,7 @@ impl __sdk::__query_builder::HasCols for TicketremoteStreamViewerFocus {
             active: __sdk::__query_builder::Col::new(table_name, "active"),
             last_seen_at: __sdk::__query_builder::Col::new(table_name, "last_seen_at"),
             expires_at: __sdk::__query_builder::Col::new(table_name, "expires_at"),
+            email: __sdk::__query_builder::Col::new(table_name, "email"),
         }
     }
 }

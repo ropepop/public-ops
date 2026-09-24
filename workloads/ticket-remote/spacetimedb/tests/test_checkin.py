@@ -123,7 +123,11 @@ def main():
             shutil.copy2(Path(env['CARGO_TARGET_DIR']) / 'wasm32-unknown-unknown/release/ticket_remote_spacetimedb.wasm', output)
             return output
         current = build(source, 'private.wasm')
-        public_source = source
+        # Publish the previous focus-row shape first, then prove the new email
+        # column preserves its rows before the next authenticated focus update.
+        public_source = source.replace('    #[default(None::<String>)]\n    pub email: Option<String>,\n', '')
+        public_source = public_source.replace('            expiresAt: stream_viewer_focus_expires_at(now),\n            email: Some(clean_email(email)),',
+                                              '            expiresAt: stream_viewer_focus_expires_at(now),')
         for table in PRIVATE:
             public_source = public_source.replace(f'accessor = ticketremote_{table},', f'accessor = ticketremote_{table}, public,').replace(f'accessor = ticketremote_{table})', f'accessor = ticketremote_{table}, public)')
         before = build(public_source, 'compatibility.wasm')
@@ -179,7 +183,11 @@ def main():
                     assert sql(token, 'ticketremote_service_stream_desired_state') == []
                     assert sql(token, 'ticketremote_privileged_relay_report') == []
                     assert sql(token, 'ticketremote_service_phone_current_report') == []
-                assert len(sql(admin, 'ticketremote_privileged_viewers')) == 1
+                viewer = sql(admin, 'ticketremote_privileged_viewers')
+                assert len(viewer) == 1 and viewer[0][7] == [1, []], viewer
+                call(admin, 'fixture_seed')
+                viewer = sql(admin, 'ticketremote_privileged_viewers')
+                assert len(viewer) == 1 and viewer[0][7] == [0, 'private@example.test'], viewer
                 assert sql(admin, 'ticketremote_service_stream_desired_state')[0][4] == 7
                 for table in ('train_checkin', 'train_checkin_account'):
                     rejects(lambda: sql(admin, 'ticketremote_' + table))

@@ -1,9 +1,25 @@
 import { html, reactive } from '@arrow-js/core';
+import QRCode from 'qrcode';
 
 const mount = document.querySelector('#adminInvitations');
 const people = document.querySelector('#adminPeople');
+const settingsKey = 'ticket.invitationCreatorSettings';
+const validCustom = value => typeof value === 'string' && /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= 525600;
+const savedSettings = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(settingsKey) || '{}');
+    return {
+      duration: ['1440', '4320', '7200', 'custom'].includes(saved?.duration) ? saved.duration : '',
+      streamMinutes: ['5', '15', '30'].includes(saved?.streamMinutes) ? saved.streamMinutes : '',
+      customDuration: validCustom(saved?.customDuration) ? saved.customDuration : ''
+    };
+  } catch { return { duration: '', streamMinutes: '', customDuration: '' }; }
+})();
 const state = reactive({ view: new URL(location.href).searchParams.get('view') === 'invitations' ? 'invitations' : 'people',
-  rows: [], loading: false, loaded: false, busy: false, duration: '4320', error: '', inviteUrl: '', copied: false, revoking: '' });
+  rows: [], loading: false, loaded: false, busy: false, ...savedSettings, error: '', inviteUrl: '', qrDataUrl: '', qrError: '', copied: false, revoking: '' });
+const rememberSettings = () => {
+  try { localStorage.setItem(settingsKey, JSON.stringify({ duration: state.duration, streamMinutes: state.streamMinutes, customDuration: state.customDuration })); } catch {}
+};
 const statuses = { not_started: 'Not started', trial_active: 'Trial active', registration_only: 'Registration only', registered: 'Registered', revoked: 'Revoked' };
 const date = value => value ? new Date(value).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
 const time = value => `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
@@ -38,27 +54,34 @@ html`<nav class="invitation-tabs" aria-label="Member views"><button type="button
   <div hidden="${() => state.view !== 'invitations'}">
     <form class="invitation-create" @submit="${async event => {
       event.preventDefault(); if (state.busy) return;
-      const fields = new FormData(event.currentTarget);
-      state.busy = true; state.error = ''; state.inviteUrl = ''; state.copied = false;
+      const form = event.currentTarget, fields = new FormData(form);
+      state.busy = true; state.error = ''; state.inviteUrl = ''; state.qrDataUrl = ''; state.qrError = ''; state.copied = false;
       try {
         const durationMinutes = state.duration === 'custom' ? Number(fields.get('customDuration')) : Number(state.duration);
         const result = await api({ label: String(fields.get('label') || '').trim(), durationMinutes, streamMinutes: Number(fields.get('streamMinutes')) });
-        state.inviteUrl = result.inviteUrl; await load();
+        form.elements.namedItem('label').value = '';
+        state.inviteUrl = result.inviteUrl;
+        QRCode.toDataURL(result.inviteUrl, { width: 256, margin: 4 }).then(image => {
+          if (state.inviteUrl === result.inviteUrl) state.qrDataUrl = image;
+        }).catch(() => {
+          if (state.inviteUrl === result.inviteUrl) state.qrError = 'QR code unavailable. Copy the link instead.';
+        });
+        await load();
         queueMicrotask(() => document.querySelector('#createdInvitationLink')?.focus());
       } catch (error) { state.error = error.message; }
       finally { state.busy = false; }
     }}">
       <h2>Create invitation</h2><p class="admin-muted">One shared trial and one new member. After the trial ends, the link still lets them register until you revoke it.</p>
       <label><span>Private label <span class="admin-muted">(optional)</span></span><input name="label" type="text" maxlength="120" autocomplete="off" placeholder="For a friend"></label>
-      <div class="invitation-fields"><label><span>Trial duration</span><select name="duration" value="${() => state.duration}" @change="${event => { state.duration = event.target.value; }}"><option value="1440">1 day</option><option value="4320">3 days</option><option value="7200">5 days</option><option value="custom">Custom</option></select></label>
-        <label hidden="${() => state.duration !== 'custom'}"><span>Custom duration, minutes</span><input name="customDuration" type="number" min="1" max="525600" step="1" value="60" required="${() => state.duration === 'custom'}" disabled="${() => state.duration !== 'custom'}"></label>
-        <label><span>Viewing allowance</span><select name="streamMinutes"><option value="5">5 minutes</option><option value="15" selected>15 minutes</option><option value="30">30 minutes</option></select></label></div>
-      <p class="admin-muted">Five successful activations · Five successful control codes</p><button class="primary" type="submit" disabled="${() => state.busy}">${() => state.busy ? 'Creating…' : 'Create invitation'}</button>
+      <div class="invitation-fields"><label><span>Trial duration</span><select name="duration" value="${() => state.duration}" required @change="${event => { state.duration = event.target.value; rememberSettings(); }}"><option value="">Choose duration</option><option value="1440">1 day</option><option value="4320">3 days</option><option value="7200">5 days</option><option value="custom">Custom</option></select></label>
+        <label hidden="${() => state.duration !== 'custom'}"><span>Custom duration, minutes</span><input name="customDuration" type="number" min="1" max="525600" step="1" value="${() => state.customDuration}" required="${() => state.duration === 'custom'}" disabled="${() => state.duration !== 'custom'}" @input="${event => { state.customDuration = event.target.value; rememberSettings(); }}"></label>
+        <label><span>Viewing allowance</span><select name="streamMinutes" value="${() => state.streamMinutes}" required @change="${event => { state.streamMinutes = event.target.value; rememberSettings(); }}"><option value="">Choose allowance</option><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option></select></label></div>
+      <p class="admin-muted">5 successful activations · 5 successful control codes</p><button class="primary" type="submit" disabled="${() => state.busy}">${() => state.busy ? 'Creating…' : 'Create invitation'}</button>
     </form>
-    <section class="invitation-created" hidden="${() => !state.inviteUrl}" aria-label="New invitation"><h3>Your invitation is ready</h3><p>Copy this link now. It is shown only here and cannot be retrieved later.</p><input id="createdInvitationLink" type="url" readonly value="${() => state.inviteUrl}" aria-label="Invitation link"><div class="invitation-link-actions"><button class="primary" type="button" @click="${async () => { try { await navigator.clipboard.writeText(state.inviteUrl); state.copied = true; } catch { const input = document.querySelector('#createdInvitationLink'); input.focus(); input.select(); state.error = 'Select and copy the link above.'; } }}">${() => state.copied ? 'Copied' : 'Copy link'}</button><button type="button" @click="${() => { state.inviteUrl = ''; state.copied = false; }}">Close</button></div></section>
+    <section class="invitation-created" hidden="${() => !state.inviteUrl}" aria-label="New invitation"><h3>Your invitation is ready</h3><p>Copy this link now. It is shown only here and cannot be retrieved later.</p><input id="createdInvitationLink" type="url" readonly value="${() => state.inviteUrl}" aria-label="Invitation link"><div class="invitation-link-actions"><button class="primary" type="button" @click="${async () => { try { await navigator.clipboard.writeText(state.inviteUrl); state.copied = true; } catch { const input = document.querySelector('#createdInvitationLink'); input.focus(); input.select(); state.error = 'Select and copy the link above.'; } }}">${() => state.copied ? 'Copied' : 'Copy link'}</button><button type="button" @click="${() => { state.inviteUrl = ''; state.qrDataUrl = ''; state.qrError = ''; state.copied = false; }}">Close</button></div>${() => state.qrDataUrl ? html`<figure class="invitation-qr"><img id="createdInvitationQR" src="${state.qrDataUrl}" width="256" height="256" alt="QR code for the invitation link"><figcaption>Scan to open on your phone</figcaption></figure>` : ''}<p class="invitation-error" role="status">${() => state.qrError}</p></section>
     <div class="invitation-list-heading"><h2>Invitations</h2><button type="button" disabled="${() => state.loading}" @click="${load}">${() => state.loading ? 'Refreshing…' : 'Refresh'}</button></div>
     <p class="admin-muted" hidden="${() => !state.loaded || state.rows.length > 0}">No invitations yet. Create one above.</p>
-    <div class="invitation-list">${() => state.rows.map(row => html`<article class="invitation-row"><div class="invitation-row-heading"><strong>${row.label || 'Invitation ' + row.id.slice(0, 8)}</strong><span class="admin-pill">${statuses[row.status] || 'Unavailable'}</span></div><p class="admin-muted">Created ${date(row.createdAt)} by ${row.createdBy}</p><p>Trial deadline: ${date(row.trialExpiresAt)}</p><p>${time(Math.max(0, row.streamSecondsRemaining))} viewing · ${row.activationsRemaining} activations · ${row.controlCodesRemaining} codes remaining</p>${row.registeredEmail ? html`<p>Registered: ${row.registeredEmail}</p>` : ''}<button type="button" hidden="${row.status === 'revoked' || row.status === 'registered'}" disabled="${() => state.revoking === row.id}" @click="${async () => { if (state.revoking) return; state.revoking = row.id; state.error = ''; try { await api({ id: row.id }, '/api/v1/admin/invitations/revoke'); await load(); } catch (error) { state.error = error.message; } finally { state.revoking = ''; } }}">${() => state.revoking === row.id ? 'Revoking…' : 'Revoke invitation'}</button></article>`.key(row.id))}</div>
+    <div class="invitation-list">${() => state.rows.map(row => html`<article class="invitation-row" data-status="${row.status}"><div class="invitation-row-heading"><strong>${row.label || 'Invitation ' + row.id.slice(0, 8)}</strong><span class="admin-pill">${statuses[row.status] || 'Unavailable'}</span></div><p class="admin-muted">Trial deadline: ${date(row.trialExpiresAt)}</p><p>${time(Math.max(0, row.streamSecondsRemaining))} viewing · ${row.activationsRemaining} activations · ${row.controlCodesRemaining} codes remaining</p>${row.registeredEmail ? html`<p>Registered: ${row.registeredEmail}</p>` : ''}<details class="invitation-history"><summary>Creation history</summary><p class="admin-muted">Created ${date(row.createdAt)} by ${row.createdBy}</p></details><button type="button" class="invitation-revoke" aria-label="${'Revoke invitation for ' + (row.label || 'invitation ' + row.id.slice(0, 8)) + '. Trial and registration access will end.'}" hidden="${row.status === 'revoked' || row.status === 'registered'}" disabled="${() => state.revoking === row.id}" @click="${async () => { if (state.revoking) return; state.revoking = row.id; state.error = ''; try { await api({ id: row.id }, '/api/v1/admin/invitations/revoke'); await load(); } catch (error) { state.error = error.message; } finally { state.revoking = ''; } }}">${() => state.revoking === row.id ? 'Revoking…' : 'Revoke invitation'}</button></article>`.key(row.id))}</div>
   </div><p class="invitation-error" role="status">${() => state.error}</p>`(mount);
 select(state.view);
 document.documentElement.dataset.ticketInvitationsUi = 'arrow';

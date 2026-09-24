@@ -3,6 +3,7 @@
 /* Voluntary train reports share the action panel and native dialog behavior. */
 
 .presence[hidden]{display:none}
+.presence-viewer{min-width:0;overflow-wrap:anywhere}
 /* One sheet, one summary per direction. */
 .viewer-menu{display:flex;align-items:center;gap:12px;margin-left:auto}.viewer-menu select{min-height:44px;max-width:140px;padding:0 8px}.viewer-menu a{min-height:44px;display:inline-flex;align-items:center}.viewer-menu a[hidden]{display:none}
 #trainCheckinMount{grid-column:1/-1}.checkin-toggle{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;width:100%;min-height:88px;padding:12px 32px;font:inherit;font-weight:650;border:1px solid #4f8cff;border-radius:10px;text-align:center}.checkin-toggle small{font-size:13px;font-weight:400;line-height:1.35}.checkin-chevron{position:absolute;right:14px;font-size:28px}

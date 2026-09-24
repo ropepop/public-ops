@@ -18,4 +18,5 @@ export default __t.row({
   active: __t.bool(),
   lastSeenAt: __t.string(),
   expiresAt: __t.string(),
+  email: __t.option(__t.string()),
 });

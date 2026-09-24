@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +27,10 @@ func TestViewerListAndDetailedHealthRequireAdmin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	store.mu.Lock()
+	store.tickets["privacy"].presence["owner-session"] = state.Viewer{SessionID: "owner-session", Email: owner, Connected: true, LastSeenAt: time.Now().UTC().Format(time.RFC3339)}
+	store.tickets["privacy"].presence["member-session"] = state.Viewer{SessionID: "member-session", Email: member, Connected: true, LastSeenAt: time.Now().UTC().Format(time.RFC3339)}
+	store.mu.Unlock()
 	access := auth.AccessConfig{Mode: "spacetime", AuthCookieName: "test_auth", SessionSigningKey: "privacy-fixture-only"}
 	relay := phone.NewRelay(phone.RelayConfig{})
 	t.Cleanup(relay.Close)
@@ -61,6 +66,39 @@ func TestViewerListAndDetailedHealthRequireAdmin(t *testing.T) {
 		}
 		if response.Code != want {
 			t.Fatalf("health for %s = %d, want %d", email, response.Code, want)
+		}
+		req = httptest.NewRequest("GET", "/api/v1/auth/session", nil)
+		req.AddCookie(&http.Cookie{Name: access.AuthCookieName, Value: token})
+		response = httptest.NewRecorder()
+		server.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("session for %s = %d: %s", email, response.Code, response.Body.String())
+		}
+		var session struct {
+			State map[string]json.RawMessage `json:"state"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &session); err != nil {
+			t.Fatal(err)
+		}
+		count, hasCount := session.State["viewerCount"]
+		presence, hasPresence := session.State["viewerPresence"]
+		if !privileged {
+			if hasCount || hasPresence || strings.Contains(response.Body.String(), owner) {
+				t.Fatalf("member session exposed viewer details: %s", response.Body.String())
+			}
+			continue
+		}
+		if string(count) != "2" || !hasCount || !hasPresence {
+			t.Fatalf("privileged session missing viewer details: %s", response.Body.String())
+		}
+		var viewers []struct {
+			Label string `json:"label"`
+		}
+		if err := json.Unmarshal(presence, &viewers); err != nil {
+			t.Fatal(err)
+		}
+		if len(viewers) != 2 || viewers[0].Label != member || viewers[1].Label != owner || strings.Contains(string(presence), `"publicId"`) {
+			t.Fatalf("privileged session has wrong viewer labels: %s", presence)
 		}
 	}
 }

@@ -8,7 +8,7 @@ test('statistics remain readable and interactive across content and viewport siz
   assert.ok(browser, 'Brave is required for statistics layout verification');
   const fixture = await startStatisticsFixture();
   try {
-    for (const [width, scenario, zoom] of [[320,'mixed'],[390,'actions'],[780,'crowded'],[1440,'representative'],[320,'empty'],[320,'large'],[390,'viewing'],[780,'mixed',2]]) {
+    for (const [width, scenario, zoom] of [[320,'mixed'],[390,'actions'],[780,'crowded'],[1440,'representative'],[320,'empty'],[320,'large'],[320,'missing'],[390,'viewing'],[780,'mixed',2]]) {
       const rendered = await renderBraveDOM(browser, `${fixture.url}/?probe=1&scenario=${scenario}&zoom=${zoom || 1}`, { windowSize: `${width},900` });
       const match = rendered.stdout.match(/<pre id="fixtureResult" hidden="">([^<]+)<\/pre>/);
       assert.ok(match, `missing browser report: ${width}/${scenario}`);
@@ -16,10 +16,20 @@ test('statistics remain readable and interactive across content and viewport siz
       const label = `${width}/${scenario}/zoom=${zoom || 1}`;
       assert.deepEqual(result.errors, [], label);
       assert.equal(result.compactOverflow, false, label);
+      assert.equal(result.chartOverflow, false, label);
+      assert.equal(result.chartHoursValid, true, label);
+      assert.equal(result.chartPeaksValid, true, label);
+      assert.equal(result.chartCount, scenario === 'empty' ? 0 : scenario === 'representative' ? 8 : scenario === 'actions' ? 1 : 2, label);
       assert.equal(result.metricClips, 0, label);
+      assert.equal(result.emailClips, 0, label);
+      assert.equal(result.legendPresent, false, label);
+      if (scenario !== 'empty') assert.ok(result.entryLabels.includes(scenario === 'large'
+        ? 'very.long.email.address.with.many.parts.and.delivery.alias+ticket.viewer@example.test' : 'member0@example.test'), label);
+      if (scenario === 'missing') assert.ok(result.entryLabels.includes('Unknown account'), label);
+      assert.ok(!result.entryLabels.includes('AB12'), label);
       assert.equal(result.dayWorks, true, label);
       assert.equal(result.tableWorks, true, label);
-      assert.equal(result.initialMode, width <= 780 ? 'compact' : 'table', label);
+      assert.equal(result.initialMode, 'compact', label);
       assert.equal(result.resources.length, 3, 'only two existing stylesheets and the statistics script');
       if (!['viewing','empty'].includes(scenario)) assert.ok(result.countDescriptions.every(text => /successful, \d+ accepted requests/.test(text)), label);
       console.log(`${label}: render=${result.renderMs.toFixed(1)}ms, payload=${result.payloadBytes}B, entry heights=${[...new Set(result.entryHeights)].join(',')}`);
@@ -38,6 +48,6 @@ test('statistics refresh updates existing rows and survives outages without losi
     assert.ok(match, rendered.stdout);
     const report = JSON.parse(match[1].replaceAll('&quot;', '"').replaceAll('&amp;', '&'));
     assert.deepEqual(report.errors, []);
-    assert.equal(report.checks.length, 12);
+    assert.equal(report.checks.length, 14);
   } finally { await fixture.close(); }
 });

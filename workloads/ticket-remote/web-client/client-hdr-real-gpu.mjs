@@ -171,11 +171,17 @@ async function runPath(path) {
     const externalTexture = device.importExternalTexture({ source: frame, colorSpace: CLIENT_HDR_FALLBACK_COLOR_SPACE });
     const bindGroups = LEVELS.map((level) => {
       const paramsBuffer = device.createBuffer({
-        size: 16,
+        size: 48,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
       });
       paramsBuffers.push(paramsBuffer);
-      device.queue.writeBuffer(paramsBuffer, 0, new Float32Array([level, path.encoded ? 1 : 0, 0, 0]));
+      device.queue.writeBuffer(paramsBuffer, 0, new Float32Array([
+        level, path.encoded ? 1 : 0, 0, 0,
+        0, 0, 1, 1,
+        1, 1,
+        (Math.floor(SOURCE_WIDTH * 0.01) + 0.5) / SOURCE_WIDTH,
+        (Math.floor(SOURCE_HEIGHT * 0.98) + 0.5) / SOURCE_HEIGHT
+      ]));
       return device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries: [

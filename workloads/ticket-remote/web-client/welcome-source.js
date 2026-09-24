@@ -15,9 +15,9 @@ const remember = () => { try { localStorage.setItem(acknowledgementKey, '1'); } 
 const supported = language => ['lv', 'en', 'ru'].includes(language);
 setLanguage(supported(saved) ? saved : (navigator.languages || [navigator.language]).map(language => language.toLowerCase().split('-')[0]).find(supported) || 'en');
 const COPY = {
-  en: { title: 'Welcome to Ticket.', message: 'Add it to your home screen for a cleaner, one-tap experience.', continue: 'Continue in browser', guide: 'Show me how', language: 'Language' },
-  lv: { title: 'Laipni lūgts Ticket.', message: 'Pievieno to sākuma ekrānam un atver ar vienu pieskārienu, bez pārlūka joslas.', continue: 'Turpināt pārlūkā', guide: 'Parādi, kā', language: 'Valoda' },
-  ru: { title: 'Добро пожаловать в Ticket.', message: 'Добавьте его на главный экран — открывайте в одно касание, без панели браузера.', continue: 'Продолжить в браузере', guide: 'Показать, как', language: 'Язык' }
+  en: { title: 'Welcome to Ticket.', message: 'Add Ticket to your home screen for one-tap access.', continue: 'Sign in to Ticket', guide: 'See installation steps', language: 'Language' },
+  lv: { title: 'Laipni lūgts Ticket.', message: 'Pievieno Ticket sākuma ekrānam, lai atvērtu ar vienu pieskārienu.', continue: 'Pierakstīties Ticket', guide: 'Skatīt instalēšanas soļus', language: 'Valoda' },
+  ru: { title: 'Добро пожаловать в Ticket.', message: 'Добавьте Ticket на главный экран, чтобы открывать его одним касанием.', continue: 'Войти в Ticket', guide: 'Посмотреть шаги установки', language: 'Язык' }
 };
 const entry = page.dataset.invitationEntry === 'true';
 const installed = isInstalledApp();
@@ -30,9 +30,9 @@ if (!invitation && !entry && !installed && (!platform || acknowledged)) {
   const journey = content.querySelector('#welcomeJourney');
   if (entry) mountInvitationEntry(journey, authURL);
   else if (invitation) mountInvitationWelcome(journey, invitation, platform);
-  else if (installed) html`<img class="welcome-icon" src="/pwa/icon-192.png" alt="" width="76" height="76"><h1>${() => copy().title}</h1><div class="welcome-actions"><a id="continueToAuth" class="welcome-primary" href="${authURL}">${() => invitationCopy().signIn}</a><a class="welcome-quiet" href="/?enterInvite=1">${() => invitationCopy().haveInvite}</a></div>`(journey);
+  else if (installed) html`<img class="welcome-icon" src="/pwa/icon-192.png" alt="" width="76" height="76"><h1>${() => copy().title}</h1><div class="welcome-actions"><a id="continueToAuth" class="welcome-primary" href="${authURL}">${() => copy().continue}</a><a class="welcome-quiet" href="/?enterInvite=1">${() => invitationCopy().haveInvite}</a></div>`(journey);
   else {
-    html`<img class="welcome-icon" src="/pwa/icon-192.png" alt="" width="76" height="76"><h1>${() => copy().title}</h1><p id="welcomeMessage" class="welcome-message">${() => copy().message}</p><div class="welcome-actions"><a id="continueToAuth" href="${authURL}" @click="${event => { event.preventDefault(); remember(); location.replace(authURL); }}">${() => copy().continue}</a><button id="welcomeInstructions" type="button">${() => copy().guide}</button></div><a class="welcome-invitation-link" href="/?enterInvite=1">${() => invitationCopy().haveInvite}</a><div id="installTicketMount"></div>`(journey);
+    html`<img class="welcome-icon" src="/pwa/icon-192.png" alt="" width="76" height="76"><h1>${() => copy().title}</h1><p id="welcomeMessage" class="welcome-message">${() => copy().message}</p><div class="welcome-actions"><a id="continueToAuth" class="welcome-primary" href="${authURL}" @click="${event => { event.preventDefault(); remember(); location.replace(authURL); }}">${() => copy().continue}</a><button id="welcomeInstructions" class="welcome-secondary" type="button">${() => copy().guide}</button></div><a class="welcome-invitation-link" href="/?enterInvite=1">${() => invitationCopy().haveInvite}</a><div id="installTicketMount"></div>`(journey);
     mountInstallGuide(journey.querySelector('#installTicketMount'), { initialPlatform: platform, opener: journey.querySelector('#welcomeInstructions'), onOpen: remember, continueURL: authURL });
   }
   document.querySelector('#welcomeFallback').hidden = true;

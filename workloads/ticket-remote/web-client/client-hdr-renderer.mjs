@@ -15,6 +15,9 @@ struct VertexOutput {
 
 struct HDRParams {
   options: vec4<f32>,
+  picture: vec4<f32>,
+  // Visible right/bottom bounds, then the source pixel used outside the picture.
+  fill: vec4<f32>,
 }
 
 @group(0) @binding(0) var sourceFrame: texture_external;
@@ -54,8 +57,12 @@ fn encodeCanvas(linear: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fragmentMain(fragmentIn: VertexOutput) -> @location(0) vec4<f32> {
+  let inside = fragmentIn.uv.x >= hdr.picture.x && fragmentIn.uv.y >= hdr.picture.y &&
+    fragmentIn.uv.x < hdr.fill.x && fragmentIn.uv.y < hdr.fill.y;
+  let pictureUV = (fragmentIn.uv - hdr.picture.xy) / hdr.picture.zw;
+  let sourceUV = select(hdr.fill.zw, pictureUV, inside);
   let encodedRGB = clamp(
-    textureSampleBaseClampToEdge(sourceFrame, sourceSampler, fragmentIn.uv).rgb,
+    textureSampleBaseClampToEdge(sourceFrame, sourceSampler, sourceUV).rgb,
     vec3<f32>(0.0),
     vec3<f32>(1.0)
   );
@@ -64,8 +71,8 @@ fn fragmentMain(fragmentIn: VertexOutput) -> @location(0) vec4<f32> {
   // The external texture is sRGB encoded; decode once before applying gain.
   let mappedLinearRGB = linearRGB * hdr.options.x;
   let edrRequestSample = hdr.options.z > 0.5 &&
-    fragmentIn.uv.x >= 0.0 && fragmentIn.uv.x < 0.002 &&
-    fragmentIn.uv.y >= 0.0 && fragmentIn.uv.y < 0.002;
+    inside && pictureUV.x >= 0.0 && pictureUV.x < 0.002 &&
+    pictureUV.y >= 0.0 && pictureUV.y < 0.002;
   let finalLinearRGB = select(mappedLinearRGB, vec3<f32>(1.25), edrRequestSample);
   return vec4<f32>(encodeCanvas(finalLinearRGB), 1.0);
 }
@@ -280,6 +287,7 @@ export class ClientHDRRenderer {
     this.prepared = false;
     this.presenting = false;
     this.boost = CLIENT_HDR_DEFAULT_BOOST;
+    this.picture = { left: 0, top: 0, width: 1, height: 1, right: 1, bottom: 1 };
     this.encodeOutput = false;
     this.onUncapturedError = null;
     this.completionWaits = new Set();
@@ -308,10 +316,11 @@ export class ClientHDRRenderer {
     return this.preparation;
   }
 
-  async initialize({ canvas, width, height, boost = CLIENT_HDR_DEFAULT_BOOST }) {
+  async initialize({ canvas, width, height, boost = CLIENT_HDR_DEFAULT_BOOST, picture }) {
     if (this.disposed) throw new Error('renderer_disposed');
     if (!canvas || typeof canvas.getContext !== 'function') throw new Error('webgpu_canvas_unavailable');
     this.boost = requireClientHDRBoost(boost);
+    if (picture) this.picture = picture;
     this.canvas = canvas;
     this.canvas.width = Math.max(1, Math.round(finiteNumber(width, canvas.width || 1)));
     this.canvas.height = Math.max(1, Math.round(finiteNumber(height, canvas.height || 1)));
@@ -401,7 +410,7 @@ export class ClientHDRRenderer {
           : this.device.createRenderPipeline(descriptor);
         const sourceSampler = this.device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
         paramsBuffer = this.device.createBuffer({
-          size: 16,
+          size: 48,
           usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST
         });
         return { module, pipeline, sourceSampler, paramsBuffer };
@@ -522,10 +531,17 @@ export class ClientHDRRenderer {
     this.compositorSettlementWaits.clear();
   }
 
-  writeParameters(boost = this.boost, requestPatch = false) {
+  writeParameters(boost = this.boost, requestPatch = false, frame = null) {
     if (!this.device || !this.paramsBuffer) throw new Error('renderer_not_ready');
+    const { left, top, width, height, right, bottom } = this.picture;
+    const sourceWidth = frame?.displayWidth || frame?.codedWidth || frame?.width || 1;
+    const sourceHeight = frame?.displayHeight || frame?.codedHeight || frame?.height || 1;
     this.device.queue.writeBuffer(this.paramsBuffer, 0, new Float32Array([
-      boost, this.encodeOutput ? 1 : 0, requestPatch === true ? 1 : 0, 0
+      boost, this.encodeOutput ? 1 : 0, requestPatch === true ? 1 : 0, 0,
+      left, top, width, height,
+      right, bottom,
+      (Math.floor(sourceWidth * 0.01) + 0.5) / sourceWidth,
+      (Math.floor(sourceHeight * 0.98) + 0.5) / sourceHeight
     ]));
   }
 
@@ -586,7 +602,7 @@ export class ClientHDRRenderer {
     if (!this.context || this.prepared || this.presenting) throw new Error('renderer_present_required');
     const activationFrame = options.activationFrame === true;
     this.writeParameters(activationFrame ? CLIENT_HDR_INTERNAL_IDENTITY_BOOST : this.boost,
-      options.requestPatch === true && this.boost > 1);
+      options.requestPatch === true && this.boost > 1, frame);
     await this.submitAndWait((device) => {
       const encoder = device.createCommandEncoder();
       this.beginPass(encoder, this.stagingTexture.createView(), this.createSourceBindGroup(frame));

@@ -1,5 +1,101 @@
 # Current Ticket
 
+## September 23 owner/admin viewer emails
+
+Owners and admins now see members' verified email addresses in the live viewer
+list and directly in Statistics activity rows. The Statistics code legend and
+People code badges are gone. Historical activity without a matching member is
+labelled Unknown account. Ordinary members receive neither viewer identities
+nor the real viewer count from the authenticated session response or database
+viewer view. Four-character account identifiers remain internal where existing
+controls still depend on them; invitation links and ViVi control codes are
+unchanged.
+
+Published the additive viewer-email column to `ticket-remote-prod-v3` without
+deleting data, then deployed `00969df9` as
+`ticket-viewer-emails-20260923-00969df9`. The full Ticket suite passed (89
+browser/client tests, module and Go tests, 20 sidecar tests); the disposable
+database privacy/migration check and Statistics browser layout journeys passed.
+Standard deployment validation and the public release identity check passed.
+The signed-in owner page showed a live 994x2046 ticket picture and email-labelled
+viewers; Statistics and Members showed emails without code badges. A freshly
+loaded page had no browser warnings or errors. Separate signed-in regular-member
+production proof was not available; ordinary-member privacy passed the local
+HTTP and database checks.
+
+## September 23 two matching notification checks
+
+Monitoring sends a problem notification only when two distinct consecutive
+checks report the same issue. A different issue resets an unalerted streak;
+two missed scheduled checks count as one unavailable issue. After a warning has
+been sent, a fresh ready check sends one recovery. The five-minute phone check
+cadence, owner settings, and device subscriptions remain in place. The existing
+Pixel publisher already spaces repeated checks and needs no phone redeploy.
+
+Published the compatible module to `ticket-remote-prod-v3` without deleting
+data, then deployed `a332192c` as
+`ticket-monitor-two-checks-20260923-a332192c`. The sent `busy` warning and
+its receipt survived the module update. The full Ticket suite passed (88
+browser/client tests, module tests, Go packages, and 20 sidecar tests), the
+focused Pixel monitoring test passed, and both required builds succeeded.
+Targeted deployment validation and mirror audit passed. The signed-in owner
+Settings page showed the new copy and enabled monitoring; the live page showed
+an Arrow-backed unused-ticket picture. The next ready report produced one
+recorded sent recovery and left no pending push delivery. No stream command or
+queued action intent remained. A deliberately triggered warning and physical
+iPhone push were not part of production verification.
+
+## September 23 invitation creator choices
+
+The signed-in invitation creator starts with no trial duration or viewing
+allowance selected in a browser that has not used it. Choosing either saves it
+in that browser, and a custom duration is saved too. The choices survive a
+reload and stay selected after creating an invitation. The private label is
+never remembered and clears after a successful creation. Invalid or unavailable
+browser storage leaves the creator usable with empty required choices.
+
+Deployed `00df0c9e` as `ticket-invite-memory-20260923-00df0c9e` from a clean
+checkout. The full Ticket suite passed (88 browser/client tests); the focused
+browser journey covered reload, custom duration, creation, and unavailable or
+invalid storage. A local visual preview showed restored selections. Deployment
+validation passed, and the signed-in admin page showed the new empty choices.
+The signed-in viewer returned to a live ticket stream, and the public health
+endpoint reported the matching asset version. No production invitation was
+created for this check.
+
+## September 23 try-first invitation welcome
+
+The invitation landing now puts the guest trial first, with a prominent
+"Try Ticket now" button, secondary setup, and registration still available.
+Latvian, English and Russian copy says the trial needs no account and points
+to the installation options at the bottom of the registered Ticket page for
+later setup. Trial, takeover, registration and install behavior are unchanged.
+
+Deployed `d8077874` as `ticket-invite-try-20260923-d8077874` from a clean
+checkout so unrelated invitation-admin edits stayed local. The web and
+database builds and full Ticket suite passed (88 browser/client tests); the
+clean-release invitation fixture passed all nine journeys. A phone-sized
+preview showed the new button order and note. Deployment validation passed;
+the signed-in live page showed a connected stream, Arrow UI, matching assets,
+and the installation link as the final control. No live invitation was created
+or redeemed for this copy change.
+
+## September 23 HDR picture background
+
+The HDR stream now renders its fitted ticket and surrounding fill on one
+WebGPU surface. Both regions use the same source pixel, color space, and display
+boost; the ordinary page background remains an unboosted SDR fallback and
+browser theme tint. The 1px right and 15px bottom picture trims are applied
+inside the HDR renderer. A stage resize shows the fitted SDR picture while a
+new HDR surface is prepared, including for an exact frozen result; an unchanged
+foreground return still retains its completed HDR picture. No phone action or
+stored data changes are involved.
+
+The real-GPU fixture checks matching edge, side and cropped-strip pixels at
+identity, 2x, 4x and 6x, as well as slider, result and return behavior. The
+browser page fixture checks portrait, landscape, wide and safe-area layouts.
+Physical iPhone appearance remains a separate verification layer.
+
 This is the first file to read for Ticket work.
 
 ## September 22 invitation trials
@@ -1077,7 +1173,7 @@ The phone shows ViVi. The page shows that picture and exposes one durable visual
 
 1. Open the signed-in page and get a live ticket picture quickly.
 2. Use **Atvērt jaunāko nereģistrēto biļeti** to visually select and prove the newest current-or-upcoming unused ticket.
-3. Use **Atvērt jaunāko biļeti un reģistrēt** for the same selection followed by one bounded activation action, or use **Reģistrēt atvērto biļeti** after a fresh slider proof. One action may make an initial 400 ms phone drag and one final retry only after fresh proof that the completed first drag left the exact same ticket unactivated.
+3. Use **Atvērt jaunāko biļeti un reģistrēt** for the same selection followed by one bounded activation action, or use **Reģistrēt atvērto biļeti** after a fresh slider proof. One action may make an initial 400 ms phone drag and one final retry only after fresh proof that the completed first drag left the exact same ticket unactivated. The phone waits one second after that proof before preparing the second drag.
 4. The browser slider is a visible local authorization control aligned directly over ViVi's visible slider. It submits that same register action once at completion and does not maintain its own phone-control protocol.
 5. For 15 minutes after a proven registration, and only after a newer unused ticket is visually proven, use the context-aware button to move directly between the two Aztec-detail views. The ticket list is a transitional phone view, never a successful resting state.
 6. Request a control code when needed from the visible button or the invisible top-left start corner, which covers the left 50% of the first 25% of the viewport. The corner only opens the existing numeric request dialog; it does not prewarm the phone path, dismiss a result, or add a stream-wide gesture. When HDR is enabled, the same HDR view continues through the dialog and phone execution. The requester page freezes the exact generated frame in HDR only after that matching browser presentation completes; otherwise it shows the already-prepared local SDR freeze. The phone must not send a screenshot of that result.

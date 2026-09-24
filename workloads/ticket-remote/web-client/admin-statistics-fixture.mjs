@@ -11,10 +11,10 @@ const hourly = (hour, value) => Array.from({ length: 24 }, (_, index) => index =
 export function statisticsFixturePayload(scenario = 'mixed') {
   const members = Array.from({ length: scenario === 'crowded' ? 12 : 3 }, (_, index) => ({
     accountScopeId: `scope-${index}`, publicId: index === 0 && scenario === 'large' ? 'LONGUSER1234' : ['AB12', 'CD34', 'EF56'][index] || `U${index}`,
-    email: `member${index}@example.test`, active: index !== 2
+    email: index === 0 && scenario === 'large' ? 'very.long.email.address.with.many.parts.and.delivery.alias+ticket.viewer@example.test' : `member${index}@example.test`, active: index !== 2
   }));
   const payload = { serverTime: '2026-09-09T18:00:00Z', days: 30, timeZone: 'Europe/Riga', secondsPerTick: 5,
-    actionStatisticsStartedAt: '2026-09-09T08:00:00Z', members, pageActivityDaily: [], actionActivityDaily: [] };
+    actionStatisticsStartedAt: '2026-09-09T08:00:00Z', members: scenario === 'missing' ? members.slice(0, 2) : members, pageActivityDaily: [], actionActivityDaily: [] };
   if (scenario === 'empty') return payload;
   for (let day = 0; day < (scenario === 'representative' ? 8 : 2); day += 1) {
     for (const [index, member] of members.entries()) {
@@ -86,8 +86,11 @@ export async function startStatisticsFixture({ baselineDirectory = '' } = {}) {
             statsPayload.actionActivityDaily[0].registrationAttempts[14]=9;
             statsPayload.actionActivityDaily[0].registrationSuccesses[14]=8;
             statsPayload.pageActivityDaily[0].hourlyTicks[14]=120;
+            statsPayload.pageActivityDaily[0].hourlyTicks[10]=200;
             await refresh();
             check('existing account counters and duration update',document.querySelector('.admin-statistics-compact').textContent.includes('8/9')&&document.querySelector('.admin-statistics-compact').textContent.includes('10m'));
+            check('hourly bars update with activity',document.querySelector('.admin-statistics-bars li:nth-child(15)').textContent.includes('14m 20s'));
+            check('new daily peak reaches full height',document.querySelector('.admin-statistics-bars li:nth-child(11) .admin-statistics-bar').classList.contains('level-10')&&!document.querySelector('.admin-statistics-bars li:nth-child(15) .admin-statistics-bar').classList.contains('level-10'));
             check('view and expanded day preserved',document.querySelector('.admin-statistics-view').dataset.viewMode===mode&&document.querySelector('[data-statistics-day-toggle]').getAttribute('aria-expanded')===expanded);
             check('detailed table updates too',document.querySelector('.admin-statistics-table').textContent.includes('8/9')&&document.querySelector('.admin-statistics-table').textContent.includes('10m'));
             const before=document.querySelector('.admin-statistics-action-summary').textContent;
@@ -120,7 +123,14 @@ export async function startStatisticsFixture({ baselineDirectory = '' } = {}) {
             toggle.click();await frame();
             const tableWorks=document.querySelector('.admin-statistics-view').dataset.viewMode==='table';
             toggle.click();await frame();
-            const result={initialMode,compactOverflow,metricClips,dayWorks,tableWorks,entryHeights,errors:window.statsErrors,renderMs:window.statsRenderMs,
+            const emails=[...document.querySelectorAll('.admin-statistics-compact .admin-statistics-entry-email')];
+            const charts=[...document.querySelectorAll('.admin-statistics-chart')];
+            const result={initialMode,compactOverflow,metricClips,dayWorks,tableWorks,entryHeights,
+              chartCount:charts.length,chartHoursValid:charts.every(chart=>chart.querySelectorAll('.admin-statistics-bars li').length===24),
+              chartPeaksValid:charts.every(chart=>!chart.querySelector('.admin-statistics-bar.is-active')||!!chart.querySelector('.admin-statistics-bar.level-10')),
+              chartOverflow:charts.some(chart=>chart.scrollWidth>chart.clientWidth+1),
+              entryLabels:emails.map(el=>el.textContent),emailClips:emails.filter(el=>el.getClientRects().length&&el.scrollWidth>el.clientWidth+1).length,
+              legendPresent:!!document.querySelector('.admin-statistics-legend'),errors:window.statsErrors,renderMs:window.statsRenderMs,
               resources:performance.getEntriesByType('resource').map(e=>({name:new URL(e.name).pathname,bytes:e.encodedBodySize})),payloadBytes:document.getElementById('ticketActivityStatisticsData').textContent.length,
               countDescriptions:[...document.querySelectorAll('.admin-statistics-metric')].map(el=>el.getAttribute('aria-label'))};
             document.getElementById('fixtureResult').textContent=JSON.stringify(result);

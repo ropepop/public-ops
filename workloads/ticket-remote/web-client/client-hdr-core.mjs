@@ -47,7 +47,7 @@ export class ClientHDRController {
     this.reassertPending = false;
   }
 
-  start({ canvas, width, height, boost = 4 }) {
+  start({ canvas, width, height, boost = 4, picture }) {
     this.dispose();
     this.active = true;
     this.boost = normalizeClientHDRDisplayBoost(boost);
@@ -59,7 +59,7 @@ export class ClientHDRController {
     this.initTimer = setTimeout(() => {
       if (generation === this.generation) this.fail('renderer_init_timeout');
     }, 8000);
-    renderer.initialize({ canvas, width, height, boost: this.boost }).then(() => {
+    renderer.initialize({ canvas, width, height, boost: this.boost, picture }).then(() => {
       if (generation !== this.generation) return;
       clearTimeout(this.initTimer);
       this.initTimer = null;

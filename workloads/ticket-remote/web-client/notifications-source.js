@@ -133,19 +133,21 @@ export function mountNotifications(mount) {
   }
 
   html`<h2 id="ticketNotificationsTitle">Ticket notifications</h2>
-    <p>Get one alert when the ticket needs attention or cannot be checked, then one when it is ready again. Problems must last five minutes. Idle checks run every five minutes, even while the stream sleeps, so an alert can take five to ten minutes.</p>
+    <div class="ticket-monitoring-setting"><h3>Owner monitoring</h3>
+    <p>Checks the phone every five minutes. Two matching problems send one alert; a fresh ready check sends one recovery.</p>
     <label class="ticket-monitoring-toggle" hidden="${() => !model.canManage}">
       <input id="ticketMonitoring" type="checkbox" checked="${() => model.enabled}"
         disabled="${() => model.busy || !model.loaded || !model.allowed}" @change="${setMonitoring}">Monitoring
     </label>
-    <p id="ticketMonitoringStatus">${() => model.status} ${() => model.checked}</p>
+    <p id="ticketMonitoringStatus">${() => model.status} ${() => model.checked}</p></div>
+    <div class="ticket-device-setting"><h3>This device’s alerts</h3>
     <p id="ticketDeviceNotificationStatus">${() => !model.loaded ? '' : model.subscribed ? 'This device is subscribed.' : 'This device is not subscribed.'}</p>
     <p id="ticketNotificationSupport">${() => model.support || (model.loaded && !model.available ? 'Push notifications are not configured on the server yet.' : '')}</p>
     <div class="ticket-notification-actions">
       <button id="ticketNotificationToggle" type="button" disabled="${() => model.busy || !model.loaded || !model.allowed || (!model.subscribed && (Boolean(model.support) || !model.available))}"
         @click="${toggleNotifications}">${() => model.subscribed ? 'Disable notifications on this device' : 'Enable notifications on this device'}</button>
       <button id="ticketNotificationRefresh" type="button" disabled="${() => model.busy}" @click="${refresh}">Refresh status</button>
-    </div>
+    </div></div>
     <p id="ticketNotificationMessage" role="status" aria-live="polite">${() => model.message}</p>`(mount);
   doc.documentElement.dataset.ticketNotificationsUi = 'arrow';
   const visible = () => { if (!doc.hidden) void refresh(); };

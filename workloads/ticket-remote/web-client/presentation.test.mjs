@@ -56,7 +56,7 @@ function fixture(t) {
     Object.defineProperty(globalThis, key, { configurable: true, value });
     t.after(() => descriptor ? Object.defineProperty(globalThis, key, descriptor) : delete globalThis[key]);
   }
-  t.mock.method(ClientHDRRenderer.prototype, 'initialize', async function() { renderers.push(this); });
+  t.mock.method(ClientHDRRenderer.prototype, 'initialize', async function(options) { this.initializeOptions = options; renderers.push(this); });
   t.mock.method(ClientHDRRenderer.prototype, 'setBoost', function(boost) { this.boost = boost; });
   t.mock.method(ClientHDRRenderer.prototype, 'render', async function() {});
   t.mock.method(ClientHDRRenderer.prototype, 'present', async function() {});
@@ -78,7 +78,7 @@ function fixture(t) {
     setSourceRGB: rgb => { sourceRGB = rgb; }, failReadback: fail => { readbackFailure = fail; }, advance: value => now += value };
 }
 
-test('edge background follows the displayed SDR, HDR and frozen picture without interfering with rendering', async t => {
+test('SDR fallback color stays unboosted while HDR owns the picture and fill', async t => {
   const f = fixture(t), p = f.presentation;
   const color = () => f.styles.get('--ticket-picture-background');
   const assertColor = expected => {
@@ -94,15 +94,20 @@ test('edge background follows the displayed SDR, HDR and frozen picture without 
   const reads = f.samples.length;
   p.draw(p.latest.frame, p.latest.metadata, { visualOnly: true });
   assert.equal(f.samples.length, reads, 'local animation does not cause readbacks');
+  p.setLayout({ stageWidth: 20, stageHeight: 40, left: 5, top: 5, width: 10, height: 30 });
   p.setPreference(true, 4); await drain();
-  assertColor([96, 116, 120]);
+  assertColor([48, 59, 61]);
+  assert.deepEqual(f.renderers.at(-1).initializeOptions.picture,
+    { left: 0.25, top: 0.125, width: 0.5, height: 0.75, right: 0.7, bottom: 0.5 });
+  assert.equal(f.elements.hdrCanvas.width, 20);
+  assert.equal(f.elements.hdrCanvas.height, 40);
   p.setPreference(true, 6); await drain();
-  assertColor([117, 140, 144]);
+  assertColor([48, 59, 61]);
   const request = { requestId: 'background', status: 'succeeded', captureRequired: true,
     resultFrameEpoch: '1', resultMinFrameSequence: '1', resultMarkerRevision: '1:1' };
   assert.equal(await p.presentResult(request, () => true), true);
   f.setSourceRGB([20, 30, 40]); f.receive(2); await drain();
-  assertColor([117, 140, 144]);
+  assertColor([48, 59, 61]);
   assert.equal(p.frozen.metadata.sequence, 1, 'new live pictures cannot recolor a frozen result');
   p.controller.fail('fixture_frozen_fallback'); await drain();
   assertColor([48, 59, 61]);
@@ -128,6 +133,37 @@ test('edge background follows the displayed SDR, HDR and frozen picture without 
   assert.equal(color(), undefined, 'cold clear removes stale sampled color');
   assert.equal(f.theme.content, '#020304');
   assert.equal(f.canvases.has(sample), false, 'sampling canvas is released with its owner');
+});
+
+test('stage resize shows fitted SDR until HDR is rebuilt, including a frozen result', async t => {
+  const f = fixture(t), p = f.presentation;
+  f.receive(1);
+  p.setLayout({ stageWidth: 20, stageHeight: 40, left: 5, top: 5, width: 10, height: 30 });
+  p.setPreference(true, 4); await drain();
+  const old = p.controller.renderer;
+  assert.equal(p.controller.surfaceVisible, true);
+  p.setLayout({ stageWidth: 40, stageHeight: 80, left: 15, top: 10, width: 10, height: 60 });
+  assert.equal(old.disposed, true);
+  assert.equal(p.holdover, null, 'old geometry cannot stretch into the new stage');
+  assert.equal(document.body.dataset.hdrRecovering, 'true');
+  assert.equal(document.body.dataset.hdrLayoutFallback, 'true');
+  assert.equal(p.visiblePicture().sequence, 1, 'fresh SDR remains usable during geometry recovery');
+  const interrupted = p.controller.renderer;
+  p.setLayout({ stageWidth: 30, stageHeight: 60, left: 10, top: 5, width: 10, height: 45 });
+  assert.equal(interrupted.disposed, true, 'a rapid second resize discards the obsolete surface');
+  assert.equal(p.holdover, null);
+  f.receive(2); await drain();
+  assert.equal(p.controller.surfaceVisible, true);
+  assert.equal(document.body.dataset.hdrLayoutFallback, 'false');
+  const request = { requestId: 'resize-result', status: 'succeeded', captureRequired: true,
+    resultFrameEpoch: '1', resultMinFrameSequence: '2', resultMarkerRevision: '1:2' };
+  assert.equal(await p.presentResult(request, () => true), true);
+  p.setLayout({ stageWidth: 40, stageHeight: 80, left: 15, top: 10, width: 10, height: 60 });
+  assert.equal(f.elements.resultArea.dataset.presentation, 'sdr');
+  assert.equal(f.elements.resultImage.hidden, false, 'exact frozen picture remains visible during resize');
+  await drain();
+  assert.equal(f.elements.resultArea.dataset.presentation, 'exact-hdr');
+  assert.equal(f.elements.resultImage.hidden, true);
 });
 
 test('return retains HDR until boosted replacement settles; repeated return creates one attempt', async t => {

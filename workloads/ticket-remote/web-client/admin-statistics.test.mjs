@@ -25,19 +25,31 @@ test('viewing and action entries share accurate user, day and window totals', ()
   }
   assert.equal(model.activeUserCount, 1);
   assert.equal(model.totalSeconds, 255);
-  assert.equal(model.legend[0].shortId, 'AB12');
+  assert.equal(day.hours[23].totalSeconds, 255);
+  assert.equal(day.maxHourSeconds, 255);
+  assert.equal(entry.email, 'member@example.test');
+  assert.equal('shortId' in entry, false);
+  assert.equal('legend' in model, false);
   assert.equal(model.trackingStartLabel, 'Action counts since 2026-09-09 at 13:30 (Europe/Riga).');
 });
 
-test('action-only hours and inactive users remain visible without zero-duration noise', () => {
+test('action-only hours without a member remain visible without invented identity or zero-duration noise', () => {
   const model = buildActivityStatisticsModel({ ...base, members: [], actionActivityDaily: [actions()] });
   assert.equal(model.hasActiveActivity, true);
   assert.equal(model.activeUserCount, 1);
   assert.equal(model.activeDays[0].totalDuration, '');
+  assert.equal(model.activeDays[0].maxHourSeconds, 0);
   const entry = model.activeDays[0].activeHours[0].entries[0];
   assert.equal(entry.duration, '');
+  assert.equal(entry.email, '');
   assert.equal(entry.active, false);
-  assert.equal(model.legend.length, 1);
+});
+
+test('inactive members retain their known email', () => {
+  const model = buildActivityStatisticsModel({ ...base, members: [{ ...member, active: false }], actionActivityDaily: [actions()] });
+  const entry = model.activeDays[0].activeHours[0].entries[0];
+  assert.equal(entry.email, 'member@example.test');
+  assert.equal(entry.active, false);
 });
 
 test('viewing-only entries and empty periods carry no action metrics', () => {
@@ -49,6 +61,20 @@ test('viewing-only entries and empty periods carry no action metrics', () => {
   assert.deepEqual(model.activeDays[0].activeHours[0].entries[0].metrics, []);
   assert.equal(model.totalSeconds, 5);
   assert.equal(buildActivityStatisticsModel({}).trackingStartLabel, 'Action tracking has not started yet.');
+});
+
+test('each day scales to its own busiest hour, including tied peaks', () => {
+  const todayTicks = hourly(8, 12);
+  todayTicks[10] = 12;
+  const model = buildActivityStatisticsModel({ ...base, pageActivityDaily: [
+    { accountScopeId: member.accountScopeId, day: '2026-09-09', hourlyTicks: todayTicks },
+    { accountScopeId: member.accountScopeId, day: '2026-09-08', hourlyTicks: hourly(9, 2) }
+  ] });
+  assert.equal(model.activeDays[0].maxHourSeconds, 60);
+  assert.equal(model.activeDays[0].hours[8].totalSeconds, 60);
+  assert.equal(model.activeDays[0].hours[10].totalSeconds, 60);
+  assert.equal(model.activeDays[1].maxHourSeconds, 10);
+  assert.equal(model.activeDays[1].hours[9].totalSeconds, 10);
 });
 
 test('only the 30 visible Riga days contribute and old successes stay in their original hour', () => {

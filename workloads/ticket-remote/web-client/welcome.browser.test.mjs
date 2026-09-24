@@ -81,6 +81,8 @@ function probe() {
     const continueLink = document.querySelector('#continueToAuth');
     check(continueLink && new URL(continueLink.href).pathname === '/api/v1/auth/start', 'continue uses existing authorization');
     check(new URL(continueLink.href).searchParams.get('returnTo') === config.returnTo, 'authorization preserves return destination');
+    check(continueLink.textContent.trim() === (config.expectedLanguage === 'lv' ? 'Pierakstīties Ticket' : config.expectedLanguage === 'ru' ? 'Войти в Ticket' : 'Sign in to Ticket'), 'first action names sign-in');
+    check(getComputedStyle(continueLink).backgroundColor !== getComputedStyle(document.querySelector('#welcomeInstructions')).backgroundColor, 'sign-in is visually primary');
     for (const node of [continueLink, document.querySelector('#welcomeInstructions'), document.querySelector('#viewerLanguage')]) {
       check(node.getBoundingClientRect().height >= 44, 'welcome control has touch target');
     }

@@ -81,6 +81,55 @@ async function verifyStableCanvas() {
     check(!renderer.device && !renderer.stagingTexture && !context?.getConfiguration(), 'presentation resources leaked');
   }
 }
+async function verifyBackfill() {
+  const stage = document.createElement('canvas');
+  stage.style.cssText = 'width:300px;height:600px;dynamic-range-limit:no-limit';
+  document.body.append(stage);
+  const sample = document.createElement('canvas');
+  sample.width = 100; sample.height = 200;
+  const context = sample.getContext('2d', { alpha: false });
+  context.fillStyle = '#30393b'; context.fillRect(0, 0, 100, 200);
+  context.fillStyle = '#ff4646'; context.fillRect(10, 20, 80, 140);
+  context.fillStyle = '#00ff00'; context.fillRect(99, 0, 1, 200); context.fillRect(0, 194, 100, 2);
+  const frame = new VideoFrame(sample, { timestamp: 0 });
+  const renderer = new ClientHDRRenderer();
+  const points = [[20, 300], [280, 300], [150, 580], [239, 300], [150, 526], [68, 495], [150, 250]];
+  let readback;
+  try {
+    await renderer.initialize({ canvas: stage, width: 300, height: 600, boost: 4,
+      picture: { left: 0.2, top: 0.1, width: 0.6, height: 0.8,
+        right: 239 / 300, bottom: 525 / 600 } });
+    renderer.context.configure({ ...renderer.context.getConfiguration(),
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
+    readback = renderer.device.createBuffer({ size: points.length * 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const samples = [];
+    for (const boost of [1, 2, 4, 6]) {
+      if (boost !== 1) renderer.setBoost(boost);
+      await renderer.render(frame, { activationFrame: boost === 1, requestPatch: boost === 1 });
+      const presented = renderer.present();
+      const texture = renderer.context.getCurrentTexture(), commands = renderer.device.createCommandEncoder();
+      points.forEach(([x, y], index) => commands.copyTextureToBuffer(
+        { texture, origin: [x, y, 0] },
+        { buffer: readback, offset: index * 256, bytesPerRow: 256 }, [1, 1]));
+      renderer.device.queue.submit([commands.finish()]);
+      await presented;
+      await readback.mapAsync(GPUMapMode.READ);
+      const bits = new Uint16Array(readback.getMappedRange());
+      const colors = points.map((_, index) => Array.from(bits.slice(index * 128, index * 128 + 4)));
+      readback.unmap();
+      const matches = (left, right) => left.every((value, index) => Math.abs(value - right[index]) <= 1);
+      check(colors.slice(1, 6).every(color => matches(color, colors[0])), `HDR ${boost}x fill or crop differs from the ticket edge`);
+      check(!matches(colors[6], colors[0]), `HDR ${boost}x ticket picture was replaced by fill`);
+      samples.push({ boost, fill: colors[0] });
+    }
+    check(samples[0].fill[0] < samples[2].fill[0] && samples[2].fill[0] < samples[3].fill[0],
+      'backfill did not follow HDR boost');
+    return { modes: samples.map(sample => sample.boost), matchingSidesAndCrop: true };
+  } finally {
+    readback?.destroy(); renderer.dispose(); frame.close(); stage.remove();
+  }
+}
 async function settled() {
   const deadline = performance.now() + 4000;
   while (presentation.recovering || !presentation.controller?.snapshot().displayConfirmed) {
@@ -305,6 +354,7 @@ document.getElementById('run').addEventListener('click', async event => {
   const timings = [];
   try {
     const stableCanvas = await verifyStableCanvas();
+    const backfill = await verifyBackfill();
     presentation.setPreference(true, 4); picture(); await settled();
     const openingMillis = Number(document.body.dataset.hdrRecoveryMillis);
     const quietFollowup = await verifyQuietFollowup();
@@ -335,7 +385,7 @@ document.getElementById('run').addEventListener('click', async event => {
     presentation.closeResult(); picture(); await settled();
     check(failures.length === 0, failures.join(','));
     const sorted = [...timings].sort((a, b) => a - b);
-    result.textContent = JSON.stringify({ passed: true, stableCanvas, sliderComposition, quietFollowup, frozenFollowup, openingMillis, returns: timings.length,
+    result.textContent = JSON.stringify({ passed: true, stableCanvas, backfill, sliderComposition, quietFollowup, frozenFollowup, openingMillis, returns: timings.length,
       medianMillis: sorted[4], p95Millis: sorted[9], timings, frozenResult: 'passed',
       colorSpace: document.body.dataset.hdrColorSpace }, null, 2);
   } catch (error) { result.textContent = JSON.stringify({ passed: false, error: String(error), failures }); }

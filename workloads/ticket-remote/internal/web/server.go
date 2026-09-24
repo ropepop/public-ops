@@ -887,6 +887,13 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request, id auth
 		"IsStatistics": tab == "statistics",
 		"Nonce":        nonce,
 	}
+	if tab == "overview" {
+		zone, err := time.LoadLocation("Europe/Riga")
+		if err != nil {
+			zone = time.UTC
+		}
+		pageData["PageOpenedAt"] = time.Now().In(zone).Format("15:04 MST")
+	}
 	if tab == "statistics" {
 		pageData["StatisticsJSON"] = template.JS(mustJSON(adminStatisticsPayload(snapshot)))
 		_ = s.adminTmpl.Execute(w, pageData)

@@ -412,6 +412,8 @@ pub struct TicketremoteStreamViewerFocus {
     pub active: bool,
     pub lastSeenAt: String,
     pub expiresAt: String,
+    #[default(None::<String>)]
+    pub email: Option<String>,
 }
 
 #[spacetimedb::table(accessor = ticketremote_stream_command,
@@ -8446,6 +8448,7 @@ fn upsert_stream_viewer_focus(
             active: true,
             lastSeenAt: now.into(),
             expiresAt: stream_viewer_focus_expires_at(now),
+            email: Some(clean_email(email)),
         }
     );
     idle_refresh::reconcile(ctx, &ticket_id, &backend_id, now);

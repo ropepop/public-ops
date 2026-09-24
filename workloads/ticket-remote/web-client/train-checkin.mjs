@@ -66,8 +66,8 @@ export function mountTrainCheckin(mount, getClient) {
     } catch { view.error = 'Neizdevās apstiprināt izrakstīšanos. Pārbaudi savienojumu un mēģini vēlreiz.'; }
     finally { view.busy = false; }
   }
-  html`<button type="button" class="checkin-toggle primary" @click="${event => open('summary', event)}"><span>${() => t('Reģistrēšanās vilcienā')}</span>
-    <small>${() => ownSummary() || t('Aktīvas reģistrēšanās: {n}', { n: activeCount() })}</small><span class="checkin-chevron" aria-hidden="true">›</span></button>
+  html`<button type="button" class="checkin-toggle" @click="${event => open('summary', event)}"><span>${() => t('Reģistrēšanās vilcienā')}</span>
+    <small>${() => ownSummary() || t('Atsevišķi no ViVi biļetes reģistrācijas.')}</small><span class="checkin-chevron" aria-hidden="true">›</span></button>
   <dialog class="checkin-dialog" aria-labelledby="checkinTitle" lang="${() => locale.language}">
     <div class="checkin-heading"><div><h2 id="checkinTitle" tabindex="-1">${() => t('Reģistrēšanās vilcienā')}</h2><p class="checkin-muted">${() => t('Pēdējās 40 minūtes')}</p></div>
       <button type="button" aria-label="${() => t('Aizvērt')}" @click="${close}">×</button></div>

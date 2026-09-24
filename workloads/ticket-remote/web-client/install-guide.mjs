@@ -38,15 +38,14 @@ async function install() {
 const COPY = {
   lv: {
     open: 'Ticket instalēšanas iespējas', header: 'Ticket · Instalēšanas iespējas', close: 'Aizvērt pamācību', language: 'Pamācības valoda',
-    title: 'Tava biļete. Viena pieskāriena attālumā.',
-    intro: 'Atver Ticket tieši no sākuma ekrāna bez pārlūka adreses joslas. Tiešraidei joprojām nepieciešams internets.',
+    intro: 'Pievieno Ticket sākuma ekrānam. Tiešraidei joprojām nepieciešams internets.',
     question: 'Kādu tālruni tu izmanto?', visual: 'Pamācība ar attēliem', chrome: 'Instalē vai seko norādēm',
     back: '← Atpakaļ', install: 'Instalēt Ticket', continueSignIn: 'Turpināt un pierakstīties',
     continueInvitation: 'Reģistrējies, kad esi gatavs', invitationOpen: 'Kopē uzaicinājuma saiti un atver to šajā pārlūkā. Izmēģinājumam konts nav vajadzīgs.',
     invitationNote: 'Atverot jauno ikonu, sāc savu izmēģinājumu. Ja redzi pierakstīšanās lapu, izvēlies “Tev ir uzaicinājums?” un ielīmē uzaicinājuma saiti. Reģistrējies, kad esi gatavs.',
     invitationStep: ['Pievieno ikonu un sāc izmēģinājumu', 'Izveido Ticket sākuma ekrāna ikonu un atver to. Uzaicinājums ļauj sākt izmēģinājumu bez konta; e-pastu vari apstiprināt vēlāk.'],
     androidChoice: 'Izvēlies, kā atvērt Ticket Android tālrunī.', browserChoice: 'Izvēlies pārlūku.',
-    browsers: 'Instalēšana pārlūkā', browsersDetail: 'Chrome vai Firefox',
+    browsers: 'Instalēšana pārlūkā', browsersDetail: 'Chrome vai Firefox', browserBenefit: 'Sākuma ekrāna ikona · Chrome vai Firefox',
     viewer: 'Pilnekrāna skatītājs', viewerDetail: 'Native Alpha · Atsevišķa lietotne',
     viewerIntro: 'Native Alpha atver Ticket bez pārlūka adreses joslas. Izvēlies instalēšanas veidu.',
     installed: 'Ticket jau ir atvērta kā lietotne vai tās instalēšana šajā pārlūkā ir apstiprināta. Atkārtota instalēšana nav vajadzīga. Citas iespējas ir pieejamas izvēlnē Atpakaļ.',
@@ -94,15 +93,14 @@ const COPY = {
   },
   en: {
     open: 'Ticket installation options', header: 'Ticket · Installation options', close: 'Close installation guide', language: 'Instruction language',
-    title: 'Your ticket. One tap away.',
-    intro: 'Open Ticket directly from your home screen, without the browser address bar. The live stream still needs an internet connection.',
+    intro: 'Add Ticket to your home screen. The live picture still needs internet.',
     question: 'Which phone are you using?', visual: 'Visual guide', chrome: 'Install or follow the menu steps',
     back: '← Back', install: 'Install Ticket', continueSignIn: 'Continue to sign-in', launch: 'Launch the new Ticket icon to get started.',
     continueInvitation: 'Register when you’re ready', invitationOpen: 'Copy the invitation link and open it in this browser. You do not need an account to try Ticket.',
     invitationNote: 'Open the new icon to start your trial. If it shows sign-in, choose “Have an invitation?” and paste your invitation link. Register whenever you’re ready.',
     invitationStep: ['Add the icon and start your trial', 'Create a Ticket home-screen shortcut and open it. Your invitation lets you start without an account; you can verify your email later.'],
     androidChoice: 'Choose how to open Ticket on your Android phone.', browserChoice: 'Choose your browser.',
-    browsers: 'Browser installation', browsersDetail: 'Chrome or Firefox',
+    browsers: 'Browser installation', browsersDetail: 'Chrome or Firefox', browserBenefit: 'Home-screen icon · Chrome or Firefox',
     viewer: 'Full-screen viewer', viewerDetail: 'Native Alpha · Separate app',
     viewerIntro: 'Native Alpha opens Ticket without the browser address bar. Choose how to install it.',
     installed: 'Ticket is already open as an app, or installation in this browser has been confirmed. You do not need to install it again. Use Back to explore other options.',
@@ -150,15 +148,14 @@ const COPY = {
   },
   ru: {
     open: 'Способы установки Ticket', header: 'Ticket · Способы установки', close: 'Закрыть инструкцию', language: 'Язык инструкции',
-    title: 'Ваш билет. В одно касание.',
-    intro: 'Открывайте Ticket прямо с главного экрана без адресной строки браузера. Для прямой трансляции по-прежнему нужен интернет.',
+    intro: 'Добавьте Ticket на главный экран. Для прямой трансляции по-прежнему нужен интернет.',
     question: 'Каким телефоном вы пользуетесь?', visual: 'Инструкция с изображениями', chrome: 'Установите или следуйте инструкции',
     back: '← Назад', install: 'Установить Ticket', continueSignIn: 'Перейти ко входу', launch: 'Чтобы начать, нажмите на новый значок Ticket.',
     continueInvitation: 'Регистрируйтесь, когда будете готовы', invitationOpen: 'Скопируйте ссылку-приглашение и откройте её в этом браузере. Для пробного доступа аккаунт не нужен.',
     invitationNote: 'Откройте новый значок, чтобы начать пробный просмотр. Если появится вход, выберите «Есть приглашение?» и вставьте ссылку-приглашение. Регистрируйтесь, когда будете готовы.',
     invitationStep: ['Добавьте значок и начните пробный просмотр', 'Создайте значок Ticket на главном экране и откройте его. Приглашение позволяет начать без аккаунта; подтвердить почту можно позже.'],
     androidChoice: 'Выберите, как открывать Ticket на телефоне Android.', browserChoice: 'Выберите браузер.',
-    browsers: 'Установка через браузер', browsersDetail: 'Chrome или Firefox',
+    browsers: 'Установка через браузер', browsersDetail: 'Chrome или Firefox', browserBenefit: 'Значок на главном экране · Chrome или Firefox',
     viewer: 'Полноэкранный просмотр', viewerDetail: 'Native Alpha · Отдельное приложение',
     viewerIntro: 'Native Alpha открывает Ticket без адресной строки браузера. Выберите способ установки.',
     installed: 'Ticket уже работает как приложение или установка в этом браузере подтверждена. Повторная установка не нужна. Нажмите «Назад», чтобы посмотреть другие варианты.',
@@ -235,7 +232,7 @@ export function mountInstallGuide(mount, { initialPlatform = '', opener: externa
   const alreadyInstalled = () => state.appMode || installation.installed;
   const browserGuide = () => ['ios', 'chrome', 'firefox'].includes(state.platform);
   const title = () => ({ ios: 'iPhone / iPad · Safari', android: 'Android', browsers: copy().browsers,
-    native: copy().viewer, chrome: 'Android · Chrome', firefox: 'Android · Firefox' })[state.platform] || copy().title;
+    native: copy().viewer, chrome: 'Android · Chrome', firefox: 'Android · Firefox' })[state.platform] || copy().question;
   const menuPage = () => ['', 'android', 'browsers'].includes(state.platform);
   const displayMode = window.matchMedia('(display-mode: standalone), (display-mode: fullscreen)');
   const updateMode = () => { state.appMode = isInstalledApp(); };
@@ -269,15 +266,15 @@ export function mountInstallGuide(mount, { initialPlatform = '', opener: externa
       @close="${() => { onClose?.(); opener.focus({ preventScroll: true }); }}">
       <div class="install-header"><span>${() => copy().header}</span><select class="install-language" aria-label="${() => copy().language}" value="${() => locale.language}" @change="${event => { setLanguage(event.target.value); }}"><option value="lv" lang="lv">Latviski</option><option value="en" lang="en">English</option><option value="ru" lang="ru">Русский</option></select><button type="button" aria-label="${() => copy().close}" @click="${() => dialog.close()}">×</button></div>
       <h2 id="installTicketTitle" class="install-heading" tabindex="-1">${title}</h2>
-      <p class="install-intro">${() => state.platform === 'native' ? copy().viewerIntro : copy().intro}</p>
+      ${() => state.platform === '' ? html`<p class="install-intro">${() => copy().intro}</p>` : state.platform === 'native' ? html`<p class="install-intro">${() => copy().viewerIntro}</p>` : ''}
       ${() => state.platform ? html`<button class="install-back" type="button" @click="${() => select(parents[state.platform])}">${() => copy().back}</button>` : ''}
-      <p class="install-question" hidden="${() => !menuPage()}">${() => state.platform === 'android' ? copy().androidChoice : state.platform === 'browsers' ? copy().browserChoice : copy().question}</p>
+      <p class="install-question" hidden="${() => !['android', 'browsers'].includes(state.platform)}">${() => state.platform === 'android' ? copy().androidChoice : copy().browserChoice}</p>
       <div class="install-choices" hidden="${() => state.platform !== ''}">
         <button type="button" @click="${() => select('ios')}"><strong>iPhone / iPad</strong><span>Safari · ${() => copy().visual}</span></button>
         <button type="button" @click="${() => select('android')}"><strong>Android</strong><span>${() => copy().browsersDetail} · Native Alpha</span></button>
       </div>
       <div class="install-choices" hidden="${() => state.platform !== 'android'}">
-        <button type="button" @click="${() => select('browsers')}"><strong><span class="install-choice-icon" aria-hidden="true">🌐</span>${() => copy().browsers}</strong><span>${() => copy().browsersDetail}</span></button>
+        <button type="button" @click="${() => select('browsers')}"><strong><span class="install-choice-icon" aria-hidden="true">🌐</span>${() => copy().browsers}</strong><span>${() => copy().browserBenefit}</span></button>
         <button type="button" @click="${() => select('native')}"><strong><span class="install-choice-icon" aria-hidden="true">📱</span>${() => copy().viewer}</strong><span>${() => copy().viewerDetail}</span></button>
       </div>
       <div class="install-choices" hidden="${() => state.platform !== 'browsers'}">

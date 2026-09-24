@@ -199,7 +199,16 @@ fn valid_observation(status: &str, reason: &str) -> bool {
     }
 }
 
-fn observe(row: &mut TicketremoteMonitoringHealth, status: &str, reason: &str, clock: i64) {
+fn observe(
+    row: &mut TicketremoteMonitoringHealth,
+    status: &str,
+    reason: &str,
+    clock: i64,
+    same_session: bool,
+    preserve_incident: bool,
+) {
+    let same_issue = same_session && row.status == status && row.reason == reason;
+    let previous_check = row.lastCheckedAtMs;
     row.lastCheckedAtMs = clock;
     row.status = status.into();
     row.reason = reason.into();
@@ -208,13 +217,41 @@ fn observe(row: &mut TicketremoteMonitoringHealth, status: &str, reason: &str, c
         row.incidentId.clear();
         row.alertSent = false;
     } else {
-        if row.problemStartedAtMs == 0 {
+        if !same_issue || row.problemStartedAtMs == 0 {
             row.problemStartedAtMs = clock;
+            if !preserve_incident {
+                row.incidentId.clear();
+                row.alertSent = false;
+            }
         }
-        if row.incidentId.is_empty() && clock.saturating_sub(row.problemStartedAtMs) >= CHECK_MS {
+        if same_issue
+            && row.incidentId.is_empty()
+            && clock.saturating_sub(previous_check) >= CHECK_MS
+        {
             row.incidentId = format!("{}:{}", row.epoch, row.problemStartedAtMs);
         }
     }
+}
+
+fn attempted_problem_delivery(ctx: &ReducerContext, row: &TicketremoteMonitoringHealth) -> bool {
+    !row.incidentId.is_empty()
+        && ctx
+            .db
+            .ticketremote_push_delivery()
+            .ticketId()
+            .filter(&row.ticketId)
+            .any(|delivery| {
+                delivery.incidentId == row.incidentId
+                    && delivery.kind == "problem"
+                    && (delivery.status == "sent"
+                        || delivery.status == "sending"
+                        || delivery.attempts > 0)
+            })
+}
+
+fn incident_matches_current_issue(row: &TicketremoteMonitoringHealth) -> bool {
+    !row.incidentId.is_empty()
+        && row.incidentId == format!("{}:{}", row.epoch, row.problemStartedAtMs)
 }
 
 fn accept_observation(
@@ -290,10 +327,19 @@ pub fn ticketremote_report_monitoring(
     if !fresh_observation(&row, observedAtMs, clock) {
         return Err("monitoring_observation_stale".into());
     }
+    let same_session = row.sessionId == sessionId;
+    let preserve_incident = row.alertSent || attempted_problem_delivery(ctx, &row);
     row.sessionId = sessionId;
     row.sequence = sequence;
     let observed = observation_time(&row, observedAtMs, clock);
-    observe(&mut row, &status, &reason, observed);
+    observe(
+        &mut row,
+        &status,
+        &reason,
+        observed,
+        same_session,
+        preserve_incident,
+    );
     reconcile_deliveries(ctx, &row, clock);
     store_health(ctx, row);
     Ok(())
@@ -416,6 +462,17 @@ fn reconcile_deliveries(ctx: &ReducerContext, health: &TicketremoteMonitoringHea
         if row.kind != "problem" {
             continue;
         }
+        if health.status != "ready"
+            && (row.incidentId != health.incidentId || row.reason != health.reason)
+        {
+            if row.status == "pending" && row.attempts == 0 {
+                table.id().delete(row.id);
+            } else if row.status == "pending" {
+                row.status = "failed".into();
+                table.id().update(row);
+            }
+            continue;
+        }
         if health.status == "ready" {
             if row.status == "sent" {
                 queue_recovery(&mut row, clock);
@@ -426,6 +483,18 @@ fn reconcile_deliveries(ctx: &ReducerContext, health: &TicketremoteMonitoringHea
         }
     }
     if health.incidentId.is_empty() {
+        return;
+    }
+    // A newly subscribed device may receive the current confirmed warning,
+    // but a changed issue cannot reuse an earlier incident's confirmation.
+    if !incident_matches_current_issue(health)
+        || table.ticketId().filter(&health.ticketId).any(|delivery| {
+            delivery.incidentId == health.incidentId
+                && delivery.kind == "problem"
+                && delivery.reason != health.reason
+                && (delivery.status == "sending" || delivery.attempts > 0)
+        })
+    {
         return;
     }
     for subscription in ctx
@@ -468,7 +537,11 @@ fn delivery_claimable(row: &TicketremotePushDelivery, clock: i64) -> bool {
 fn delivery_current(row: &TicketremotePushDelivery, health: &TicketremoteMonitoringHealth) -> bool {
     health.enabled
         && match row.kind.as_str() {
-            "problem" => health.incidentId == row.incidentId && health.status != "ready",
+            "problem" => {
+                health.incidentId == row.incidentId
+                    && health.status != "ready"
+                    && health.reason == row.reason
+            }
             "recovery" => health.status == "ready",
             _ => false,
         }
@@ -588,20 +661,24 @@ pub fn ticketremote_finish_push_delivery(
     Ok(())
 }
 
-fn mark_overdue(row: &mut TicketremoteMonitoringHealth, clock: i64) -> bool {
+fn mark_overdue(
+    row: &mut TicketremoteMonitoringHealth,
+    clock: i64,
+    preserve_incident: bool,
+) -> bool {
     let due = if row.lastCheckedAtMs == 0 {
         row.enabledAtMs
     } else {
         row.lastCheckedAtMs + CHECK_MS
     };
+    // The due slot and the following five-minute slot must both be missed.
     if row.enabled && clock.saturating_sub(due) >= CHECK_MS && row.reason != "observation_overdue" {
         row.status = "unavailable".into();
         row.reason = "observation_overdue".into();
-        if row.problemStartedAtMs == 0 {
-            row.problemStartedAtMs = due;
-        }
-        if row.incidentId.is_empty() {
-            row.incidentId = format!("{}:{}", row.epoch, row.problemStartedAtMs);
+        row.problemStartedAtMs = due;
+        if !preserve_incident {
+            row.incidentId = format!("{}:{}", row.epoch, due);
+            row.alertSent = false;
         }
         return true;
     }
@@ -615,7 +692,8 @@ pub(super) fn check_due(ctx: &ReducerContext, ticket: &str, clock: i64) {
         .id()
         .find(phone_row_id(ticket, "pixel"))
     {
-        if mark_overdue(&mut row, clock) {
+        let preserve_incident = row.alertSent || attempted_problem_delivery(ctx, &row);
+        if mark_overdue(&mut row, clock, preserve_incident) {
             reconcile_deliveries(ctx, &row, clock);
             store_health(ctx, row);
         }
@@ -656,24 +734,72 @@ pub(super) fn check_due(ctx: &ReducerContext, ticket: &str, clock: i64) {
 mod tests {
     use super::*;
     #[test]
-    fn sustained_observation_requires_fresh_five_minute_confirmation_and_resets() {
+    fn only_matching_checks_five_minutes_apart_confirm_an_issue() {
         let mut row = empty_health("test", 1_000);
         row.enabled = true;
-        observe(&mut row, "not_ready", "blocked", 1_000);
-        observe(&mut row, "not_ready", "unknown", 300_999);
+        observe(&mut row, "not_ready", "blocked", 1_000, true, false);
+        observe(&mut row, "not_ready", "unknown", 301_000, true, false);
         assert!(row.incidentId.is_empty());
-        observe(&mut row, "not_ready", "blocked", 301_000);
-        let incident = row.incidentId.clone();
-        assert!(!incident.is_empty());
-        observe(&mut row, "unavailable", "capture_unavailable", 400_000);
-        assert_eq!(row.incidentId, incident);
-        observe(&mut row, "ready", "ticket_detail_unused", 500_000);
+        observe(&mut row, "not_ready", "blocked", 601_000, true, false);
+        assert!(row.incidentId.is_empty(), "a return to blocked starts a new streak");
+        observe(&mut row, "not_ready", "blocked", 900_999, true, false);
+        assert!(row.incidentId.is_empty(), "the matching check must be five minutes later");
+        observe(&mut row, "not_ready", "blocked", 901_000, true, false);
+        assert!(row.incidentId.is_empty(), "a one millisecond repeat is not a second check");
+        observe(&mut row, "not_ready", "blocked", 1_201_000, true, false);
+        assert!(!row.incidentId.is_empty());
+        observe(&mut row, "ready", "ticket_detail_unused", 1_202_000, true, false);
         assert_eq!(row.problemStartedAtMs, 0);
         assert!(row.incidentId.is_empty());
-        observe(&mut row, "not_ready", "busy", 600_000);
+        observe(&mut row, "not_ready", "busy", 1_203_000, true, false);
         assert!(row.incidentId.is_empty());
         assert!(valid_observation("ready", "ticket_detail_activated"));
         assert!(!valid_observation("ready", "unknown"));
+    }
+    #[test]
+    fn new_session_cannot_complete_a_previous_issues_streak() {
+        let mut row = empty_health("test", 1_000);
+        row.enabled = true;
+        observe(&mut row, "not_ready", "busy", 1_000, true, false);
+        observe(&mut row, "not_ready", "busy", 301_000, false, false);
+        assert!(row.incidentId.is_empty());
+        observe(&mut row, "not_ready", "busy", 601_000, true, false);
+        assert!(!row.incidentId.is_empty());
+        let incident = row.incidentId.clone();
+        observe(&mut row, "unavailable", "capture_unavailable", 602_000, true, true);
+        assert_eq!(row.incidentId, incident, "an attempted alert owns the incident until ready");
+        observe(&mut row, "ready", "ticket_detail_activated", 603_000, true, true);
+        assert!(row.incidentId.is_empty());
+    }
+    #[test]
+    fn already_sent_warning_keeps_its_incident_until_ready() {
+        let mut row = empty_health("test", 1_000);
+        row.enabled = true;
+        row.status = "not_ready".into();
+        row.reason = "busy".into();
+        row.lastCheckedAtMs = 301_000;
+        row.problemStartedAtMs = 1_000;
+        row.incidentId = "existing-busy-incident".into();
+        row.alertSent = true;
+
+        observe(&mut row, "not_ready", "unknown", 601_000, true, true);
+        assert_eq!(row.incidentId, "existing-busy-incident");
+        assert!(row.alertSent);
+        observe(&mut row, "ready", "ticket_detail_activated", 602_000, true, true);
+        assert!(row.incidentId.is_empty());
+        assert!(!row.alertSent);
+    }
+    #[test]
+    fn current_incident_can_alert_a_new_device_but_changed_issue_cannot() {
+        let mut row = empty_health("test", 1_000);
+        row.enabled = true;
+        observe(&mut row, "not_ready", "busy", 1_000, true, false);
+        observe(&mut row, "not_ready", "busy", 301_000, true, false);
+        assert!(incident_matches_current_issue(&row));
+        row.alertSent = true;
+        assert!(incident_matches_current_issue(&row), "a sent warning does not block another device");
+        observe(&mut row, "not_ready", "unknown", 601_000, true, true);
+        assert!(!incident_matches_current_issue(&row));
     }
     #[test]
     fn claims_are_leased_bounded_and_recovery_starts_a_new_budget() {
@@ -706,8 +832,12 @@ mod tests {
         health.status = "not_ready".into();
         assert!(!delivery_current(&row, &health));
         row.kind = "problem".into();
+        row.reason = "blocked".into();
         health.incidentId = row.incidentId.clone();
+        health.reason = "blocked".into();
         assert!(delivery_current(&row, &health));
+        health.reason = "busy".into();
+        assert!(!delivery_current(&row, &health));
         health.incidentId = "new-incident".into();
         assert!(!delivery_current(&row, &health));
         health.enabled = false;
@@ -733,17 +863,20 @@ mod tests {
     fn missing_checks_alert_five_minutes_after_their_due_time_once() {
         let mut row = empty_health("test", 1_000);
         row.enabled = true;
-        assert!(!mark_overdue(&mut row, 300_999));
-        assert!(mark_overdue(&mut row, 301_000));
-        assert!(!mark_overdue(&mut row, 401_000));
-        observe(&mut row, "ready", "ticket_detail_activated", 500_000);
-        assert!(!mark_overdue(&mut row, 1_099_999));
-        assert!(mark_overdue(&mut row, 1_100_000));
+        assert!(!mark_overdue(&mut row, 300_999, false));
+        assert!(mark_overdue(&mut row, 301_000, false));
+        let incident = row.incidentId.clone();
+        assert!(!incident.is_empty());
+        assert!(!mark_overdue(&mut row, 401_000, false));
+        assert_eq!(row.incidentId, incident, "repeated cleanup must not count more misses");
+        observe(&mut row, "ready", "ticket_detail_activated", 500_000, true, false);
+        assert!(!mark_overdue(&mut row, 1_099_999, false));
+        assert!(mark_overdue(&mut row, 1_100_000, false));
         assert_eq!(row.status, "unavailable");
         assert_eq!(row.lastCheckedAtMs, 500_000);
         row.enabled = false;
         row.reason.clear();
-        assert!(!mark_overdue(&mut row, 2_000_000));
+        assert!(!mark_overdue(&mut row, 2_000_000, false));
     }
     #[test]
     fn transport_delay_and_reordered_evidence_cannot_restore_readiness() {
@@ -767,7 +900,7 @@ mod tests {
         row.lastCheckedAtMs = 120_000;
         assert!(fresh_observation(&row, 119_500, 121_000));
         let observed = observation_time(&row, 119_500, 121_000);
-        observe(&mut row, "ready", "ticket_detail_unused", observed);
+        observe(&mut row, "ready", "ticket_detail_unused", observed, true, false);
         assert_eq!(row.lastCheckedAtMs, 120_000);
         assert_eq!(row.status, "ready");
         assert_eq!(observation_time(&row, 125_000, 121_000), 121_000);

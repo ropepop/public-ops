@@ -17,6 +17,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeErrorPage(w http.ResponseWriter, status int, message string) {
+	title, action := "Ticket could not complete this request", ""
+	switch status {
+	case http.StatusUnauthorized:
+		title, action = "Sign-in needs to restart", `<a href="/api/v1/auth/start">Start sign-in again</a>`
+	case http.StatusForbidden:
+		title = "Ticket access required"
+		if message == "Admin access is required." {
+			title, action = "Admin access required", `<a href="/">Back to Ticket</a>`
+		}
+	case http.StatusServiceUnavailable:
+		title, action = "Ticket is temporarily unavailable", `<a href="/">Try Ticket again</a>`
+	case http.StatusInternalServerError:
+		title, action = "Ticket could not finish signing in", `<a href="/api/v1/auth/start">Start sign-in again</a>`
+	}
 	nonce := randomID()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writeHTMLHeaders(w, nonce)
@@ -30,11 +44,14 @@ func writeErrorPage(w http.ResponseWriter, status int, message string) {
 <style nonce="%s">
 html { background: #020304; color: #eef3f8; -webkit-text-size-adjust: 100%%; text-size-adjust: 100%%; }
 body { margin: 0; padding: max(24px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); font: 1rem/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-main { max-width: 36rem; margin: 10vh auto 0; overflow-wrap: anywhere; }
-h1 { margin: 0 0 1rem; font: inherit; font-weight: 600; }
-p { margin: 0; }
+main { box-sizing: border-box; max-width: 36rem; min-height: calc(100svh - 48px); margin: auto; display: grid; place-content: center; justify-items: center; gap: 16px; text-align: center; overflow-wrap: anywhere; }
+.error-status { margin: 0; color: #9cabbc; font-size: .875rem; }
+h1 { margin: 0; font-size: clamp(1.75rem, 6vw, 2.25rem); line-height: 1.2; }
+.error-message { margin: 0; color: #bac8d9; }
+a { display: inline-grid; place-items: center; box-sizing: border-box; min-height: 48px; margin-top: 12px; border: 1px solid #b8d9ff; border-radius: 12px; padding: 10px 22px; background: #b8d9ff; color: #07111b; font-weight: 650; text-decoration: none; }
+a:focus-visible { outline: 2px solid #9dccff; outline-offset: 4px; }
 </style></head>
-<body><main><h1>Ticket · %d</h1><p>%s</p></main></body></html>`, nonce, status, template.HTMLEscapeString(message))
+<body><main><p class="error-status">Ticket · %d</p><h1>%s</h1><p class="error-message">%s</p>%s</main></body></html>`, nonce, status, template.HTMLEscapeString(title), template.HTMLEscapeString(message), action)
 }
 
 func writeNoStoreHeaders(w http.ResponseWriter) {

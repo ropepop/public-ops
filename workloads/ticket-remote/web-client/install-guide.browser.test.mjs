@@ -46,12 +46,15 @@ function probe() {
     check(dialog.querySelectorAll('.install-choices:not([hidden]) button').length === 2, 'only OS choices at root');
     await language('en');
     check(dialog.lang === 'en', 'English translation');
+    check(dialog.querySelector('h2').textContent === 'Which phone are you using?' && dialog.querySelectorAll('.install-intro').length === 1, 'one clear phone choice and concise introduction');
+    check([...dialog.querySelectorAll('.install-choices:not([hidden]) button')].every(node => node.getBoundingClientRect().height >= 80 && getComputedStyle(node).borderStyle === 'solid'), 'phone choices are distinct touch cards');
     check([...dialog.querySelector('.install-language').options].map(option => option.value + ':' + option.lang).join(',') === 'lv:lv,en:en,ru:ru', 'three self-labelled language choices');
     await language('ru');
     check(/[А-Яа-яЁё]/.test(opener.textContent) && /[А-Яа-яЁё]/.test(dialog.querySelector('h2').textContent), 'Russian opener and root title');
     russian('OS menu');
     await go('Android'); page('android'); russian('Android menu');
     check([...dialog.querySelectorAll('.install-choices:not([hidden]) button')].every(node => /[А-Яа-яЁё]/.test(node.textContent)), 'both Android options translated');
+    check(dialog.querySelectorAll('.install-intro').length === 0 && dialog.textContent.includes('Значок на главном экране') && dialog.textContent.includes('Отдельное приложение'), 'Android methods explain their difference without repeating the introduction');
     dialog.querySelector('.install-choices:not([hidden]) button').click(); await pause(); page('browsers'); russian('browser menu');
     check([...dialog.querySelectorAll('.install-choices:not([hidden]) button span')].every(node => /[А-Яа-яЁё]/.test(node.textContent)), 'both browser descriptions translated');
     await language('en'); await back(); await back(); page('os');

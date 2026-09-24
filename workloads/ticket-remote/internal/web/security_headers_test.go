@@ -22,3 +22,31 @@ func TestErrorPageStylesRemainAuthorizedAndMessageEscaped(t *testing.T) {
 		t.Fatal("error message must remain plain escaped text")
 	}
 }
+
+func TestErrorPageRecoveryDoesNotLoopDeniedMembers(t *testing.T) {
+	for _, tc := range []struct {
+		name, message, heading, action string
+		status                         int
+	}{
+		{"sign-in", "Login callback did not match this browser.", "Sign-in needs to restart", `href="/api/v1/auth/start"`, http.StatusUnauthorized},
+		{"admin", "Admin access is required.", "Admin access required", `href="/"`, http.StatusForbidden},
+		{"membership", "No ticket has been assigned to your account.", "Ticket access required", "", http.StatusForbidden},
+		{"outage", "Ticket state is unavailable.", "Ticket is temporarily unavailable", `href="/"`, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			writeErrorPage(response, tc.status, tc.message)
+			body := response.Body.String()
+			if response.Code != tc.status || !strings.Contains(body, tc.heading) || !strings.Contains(body, tc.message) {
+				t.Fatal("error page lost its status or explanation")
+			}
+			if tc.action == "" {
+				if strings.Contains(body, "<a ") {
+					t.Fatal("denied account must not be sent back into the denial")
+				}
+			} else if !strings.Contains(body, tc.action) {
+				t.Fatalf("missing safe recovery action %q", tc.action)
+			}
+		})
+	}
+}

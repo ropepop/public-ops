@@ -41,10 +41,10 @@ export function mountColdRestart(mount) {
     }
     finally { model.sending = false; }
   };
-  html`<div class="admin-section-header"><div><h2>Stream sleep</h2>
-    <p class="admin-muted">Briefly interrupts viewers, cancels the warm timer, fully stops capture, then reconnects open viewer pages from cold.</p></div>
+  html`<div class="admin-section-header"><div><h2>Cold stream reset</h2>
+    <p class="admin-muted">Stops phone capture. Open Ticket pages reconnect; without viewers, it stays asleep until someone opens Ticket.</p></div>
     <button class="primary" type="button" disabled="${() => !model.ready || model.sending || model.busy || running()}"
-      @click="${begin}">Sleep / cold mode</button></div>
+      @click="${begin}">Run cold reset</button></div>
     <p class="admin-muted admin-action-status" role="status" aria-live="polite">${() => model.message}</p>`(mount);
   return {
     update(state) {
@@ -56,7 +56,7 @@ export function mountColdRestart(mount) {
       mount.dataset.coldRestartPhase = phase;
       mount.dataset.coldRestartId = row?.coldRestartId || '';
       if (row?.coldRestartId === sentOperationId) requestNotice = '';
-      if (!model.sending) model.message = requestNotice || (model.busy ? 'Wait for the current phone action to finish.' : messages[phase] || 'Ready to test a fully cold opening.');
+      if (!model.sending) model.message = requestNotice || (model.busy ? 'Wait for the current phone action to finish.' : messages[phase] || 'Ready for a cold reset.');
       if (phase === 'live' && sentAt && row?.coldRestartId === sentOperationId) { mount.dataset.coldRestartElapsedMs = String(Math.round(performance.now() - sentAt)); sentAt = 0; }
     },
     unavailable() { model.ready = false; model.message = 'Stream state is temporarily unavailable.'; }

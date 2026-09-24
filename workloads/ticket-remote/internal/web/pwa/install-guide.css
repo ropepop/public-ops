@@ -1,18 +1,22 @@
 .install-ticket-button { width: 100%; margin-top: 20px; display: flex; justify-content: space-between; gap: 12px; text-align: left; }
 .install-ticket-button[hidden] { display: none; }
 .install-dialog { box-sizing: border-box; width: min(540px, calc(100% - 24px)); max-height: calc(100dvh - 32px); padding: 24px; border: 1px solid #35445a; border-radius: 20px; background: #0b111a; color: #eef3f8; overflow-y: auto; overscroll-behavior: contain; }
+#installTicketDialog { padding: 20px; }
 .install-dialog::backdrop { background: rgb(0 0 0 / 70%); }
 .install-dialog button { min-height: 44px; cursor: pointer; }
 .install-dialog button:focus-visible, .install-language:focus-visible { outline: 2px solid #9dccff; outline-offset: 3px; }
-.install-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; color: #a9b8c9; }
+.install-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; font-weight: 600; color: #d5e0ed; }
 .install-header button { font-size: 25px; padding: 0 12px; }
-.install-heading { margin: 18px 0 12px; font-size: 26px; line-height: 1.15; letter-spacing: -.5px; }
+.install-heading { margin: 16px 0 12px; font-size: 26px; line-height: 1.15; letter-spacing: -.5px; }
 .install-intro, .install-dialog p { font-size: 14px; line-height: 1.55; color: #b5c2d1; }
-.install-question { margin-top: 24px; color: #eef3f8 !important; }
+.install-intro { margin: 0 0 18px; }
+.install-question { margin: 12px 0 16px; color: #eef3f8 !important; font-weight: 600; }
 .install-choices { display: grid; gap: 10px; }
 .install-choices[hidden] { display: none; }
-.install-choices button { display: grid; gap: 6px; text-align: left; padding: 16px; border-radius: 12px; }
-.install-choices span { color: #a9b8c9; font-size: 12px; font-weight: normal; }
+.install-choices button { position: relative; display: grid; gap: 5px; min-height: 82px; text-align: left; padding: 14px 42px 14px 16px; border: 1px solid #35445a; border-radius: 12px; background: #111b29; color: #eef3f8; }
+.install-choices button::after { content: '›'; position: absolute; right: 16px; top: 50%; transform: translateY(-50%); color: #c6e2ff; font-size: 26px; line-height: 1; }
+.install-choices button:hover { border-color: #7897b8; }
+.install-choices span { color: #b5c2d1; font-size: 12px; font-weight: normal; }
 .install-choices .install-choice-icon { font-size: 20px; margin-right: 10px; }
 .install-download { display: inline-flex; align-items: center; min-height: 44px; color: #a9d1ff; }
 .install-option { margin-top: 16px; padding: 16px; border: 1px solid #35445a; border-radius: 12px; }
@@ -40,7 +44,7 @@
 .install-note { margin-top: 24px; padding: 16px; border-radius: 12px; background: #111b29; }
 .install-note p:last-child { margin-bottom: 0; }
 .install-done { width: 100%; margin-top: 18px; }
-@media (max-width: 360px) { .install-dialog { padding: 16px; } .install-heading { font-size: 23px; } }
+@media (max-width: 360px) { #installTicketDialog { padding: 16px; } .install-heading { font-size: 23px; } }
 .welcome-actions .welcome-secondary { color: #d5e0ed; background: #111b29; border-color: #35445a; }
 .welcome-actions .welcome-primary { color: #07111b; background: #b8d9ff; border-color: #b8d9ff; }
 .welcome-actions .welcome-quiet { color: #a9d1ff; background: transparent; border-color: transparent; font-weight: 400; }
@@ -51,8 +55,16 @@
 .invitation-entry button { min-height: 48px; }
 .ticket-trial { padding: 16px; margin: 12px 0; background: #111b29; border: 1px solid #35445a; border-radius: 14px; color: #d5e0ed; font-size: 14px; line-height: 1.5; }
 .ticket-trial strong { display: block; font-weight: 500; }
+.ticket-trial-remaining { display: block; margin-top: 4px; color: #d5e0ed; font-variant-numeric: tabular-nums; }
+.ticket-trial-remaining[hidden] { display: none; }
 .ticket-trial-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
 .ticket-trial-actions a { color: #a9d1ff; padding: 10px 0; }
-.ticket-trial details { margin-top: 8px; color: #a9b8c9; }
+.ticket-trial details { margin-top: 10px; border-top: 1px solid #35445a; padding-top: 8px; color: #a9b8c9; }
 .ticket-trial summary { cursor: pointer; min-height: 32px; }
 .ticket-trial p { margin: 8px 0 0; }
+#trialEndDialog h2 { margin: 0 0 12px; font-size: 24px; line-height: 1.2; }
+#trialEndDialog .primary, #trialEndDialog .trial-register, #trialEndDialog .trial-close { box-sizing: border-box; width: 100%; min-height: 48px; margin-top: 18px; border-radius: 12px; padding: 12px 16px; text-align: center; font: inherit; font-weight: 650; }
+#trialEndDialog .primary[hidden] { display: none; }
+#trialEndDialog .trial-register { display: grid; place-items: center; background: #b8d9ff; border: 1px solid #b8d9ff; color: #07111b; text-decoration: none; }
+#trialEndDialog .primary:not([hidden]) + .trial-register { background: #111b29; border-color: #35445a; color: #a9d1ff; }
+#trialEndDialog .trial-close { margin-top: 8px; border: 0; background: transparent; color: #a9d1ff; font-weight: 400; }

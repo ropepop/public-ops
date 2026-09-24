@@ -1,10 +1,9 @@
 .admin-phone-clock {
-  display: grid;
-  gap: 5px;
-  border: 1px solid #1d2837;
-  border-radius: 8px;
-  padding: 12px;
-  background: #0b1119;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
 }
 
 .admin-phone-clock strong,
@@ -13,11 +12,18 @@
 }
 
 .admin-schedule-form {
-  margin-top: 12px;
+  margin-top: 10px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 10px;
   align-items: end;
+}
+
+.admin-schedule-title {
+  margin: 18px 0 0;
+  border-top: 1px solid #26364b;
+  padding-top: 18px;
+  font-size: 15px;
 }
 
 .admin-schedule-form label {
@@ -112,6 +118,31 @@
   color: #9cabbc;
   font-size: 12px;
   font-weight: 700;
+}
+
+.admin-vivi-password {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.admin-vivi-password-field {
+  display: flex;
+  min-width: 0;
+}
+
+.admin-vivi-password-field input {
+  min-width: 0;
+  width: 100%;
+  border-radius: 6px 0 0 6px;
+}
+
+.admin-vivi-password-field button {
+  flex: 0 0 auto;
+  min-height: 44px;
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  color: #a9caff;
 }
 
 .admin-vivi-auth-form input {

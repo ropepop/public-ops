@@ -1,6 +1,7 @@
-.invitation-tabs { display: flex; gap: 8px; margin-bottom: 24px; }
-.invitation-tabs button[aria-pressed="true"] { background: #20344b; border-color: #668dbb; color: #eef3f8; }
-.invitation-create { display: grid; gap: 16px; }
+.invitation-tabs { display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid #304158; }
+.invitation-tabs button { min-width: 110px; border: 0; border-radius: 6px 6px 0 0; background: transparent; }
+.invitation-tabs button[aria-pressed="true"] { background: #17315a; box-shadow: inset 0 -3px #4f8cff; color: #eef3f8; }
+.invitation-create { display: grid; gap: 12px; border: 1px solid #304158; border-radius: 10px; padding: 16px; background: #101720; }
 .invitation-create h2, .invitation-create p { margin: 0; }
 .invitation-create label { display: grid; gap: 8px; font-size: 14px; }
 .invitation-create input, .invitation-create select, .invitation-created input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; }
@@ -10,11 +11,23 @@
 .invitation-created { margin: 24px 0; border: 1px solid #668dbb; padding: 18px; border-radius: 14px; background: #142438; }
 .invitation-created h3 { margin-top: 0; }
 .invitation-link-actions { display: flex; gap: 10px; margin-top: 12px; }
+.invitation-qr { margin: 20px 0 0; width: 256px; max-width: 100%; }
+.invitation-qr img { display: block; width: 100%; height: auto; background: white; }
+.invitation-qr figcaption { margin-top: 8px; font-size: 14px; }
 .invitation-list-heading, .invitation-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.invitation-list-heading { margin-top: 32px; }
+.invitation-list-heading { margin-top: 24px; }
 .invitation-list { display: grid; gap: 12px; }
-.invitation-row { border: 1px solid #35445a; border-radius: 12px; padding: 16px; overflow-wrap: anywhere; }
-.invitation-row p { font-size: 14px; line-height: 1.5; margin: 8px 0; }
+.invitation-row { border: 1px solid #35445a; border-radius: 10px; padding: 14px; background: #101720; overflow-wrap: anywhere; }
+.invitation-row p { font-size: 14px; line-height: 1.45; margin: 7px 0; }
+.invitation-row[data-status="trial_active"] .admin-pill { border-color: #426a4f; color: #a9efbf; background: #0e2115; }
+.invitation-history { margin-top: 8px; }
+.invitation-history summary { width: fit-content; color: #8bb5ff; font-size: 13px; cursor: pointer; }
+.invitation-revoke { margin-top: 12px; border-color: #87434e; color: #ffc8d1; }
 .invitation-error { color: #ffbcac; line-height: 1.5; }
 [data-member-source-email] { font-size: 12px; line-height: 1.5; }
 .invitation-create [hidden], .invitation-created[hidden], #adminInvitations [hidden], #adminPeople[hidden] { display: none !important; }
+
+@media (max-width: 600px) {
+  .invitation-tabs button { flex: 1; }
+  .invitation-create > button, .invitation-revoke { width: 100%; }
+}

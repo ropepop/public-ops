@@ -188,9 +188,11 @@ func TestNotificationBodyDistinguishesMissingProofAndContainsNoPrivateData(t *te
 	for _, tc := range []struct {
 		kind, reason, want string
 	}{
-		{"problem", "capture_unavailable", "Ticket readiness could not be checked. Open Ticket to review it."},
-		{"problem", "observation_overdue", "Ticket readiness could not be checked. Open Ticket to review it."},
-		{"problem", "blocked", "Ticket has not been ready for at least five minutes. Open Ticket to check it."},
+		{"problem", "capture_unavailable", "Ticket could not be checked twice in a row. Open Ticket to review it."},
+		{"problem", "observation_overdue", "Ticket could not be checked twice in a row. Open Ticket to review it."},
+		{"problem", "busy", "Ticket could not be checked twice in a row. Open Ticket to review it."},
+		{"problem", "unknown", "Ticket could not be checked twice in a row. Open Ticket to review it."},
+		{"problem", "blocked", "Two checks in a row found the same ticket problem. Open Ticket to check it."},
 		{"recovery", "ticket_ready", "Ticket is ready again."},
 	} {
 		delivery := state.PushDelivery{Kind: tc.kind, Reason: tc.reason, IncidentID: "private-incident", Endpoint: "private-endpoint", P256dh: "private-key", Auth: "private-auth"}

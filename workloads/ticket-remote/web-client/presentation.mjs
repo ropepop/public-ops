@@ -34,6 +34,8 @@ export class Presentation {
     this.composition = null;
     this.backgroundCanvas = null;
     this.backgroundRGB = null;
+    this.layout = null;
+    this.layoutFallback = false;
   }
 
   sampleBackground() {
@@ -48,20 +50,32 @@ export class Presentation {
       // Crop the SDR canvas, not VideoFrame (whose source crop WebKit ignores).
       context.drawImage(canvas, Math.floor(canvas.width * 0.01), Math.floor(canvas.height * 0.98), 1, 1, 0, 0, 1, 1);
       this.backgroundRGB = [...context.getImageData(0, 0, 1, 1).data].slice(0, 3);
-      if (!this.controller?.surfaceVisible && !this.holdover) this.updateBackground(1);
+      if (!this.controller?.surfaceVisible && !this.holdover) this.updateBackground();
     } catch { /* A cosmetic fill must not interrupt ticket presentation. */ }
   }
 
-  updateBackground(boost) {
+  updateBackground() {
     if (!this.backgroundRGB) return;
-    const channels = this.backgroundRGB.map(byte => {
-      const encoded = byte / 255;
-      const linear = (encoded <= 0.04045 ? encoded / 12.92 : ((encoded + 0.055) / 1.055) ** 2.4) * boost;
-      return Math.round(255 * Math.min(1, linear <= 0.0031308 ? linear * 12.92 : 1.055 * linear ** (1 / 2.4) - 0.055));
-    });
-    const color = `rgb(${channels.join(' ')})`;
+    const color = `rgb(${this.backgroundRGB.join(' ')})`;
     document.documentElement.style.setProperty('--ticket-picture-background', color);
     document.querySelector('meta[name="theme-color"]')?.setAttribute('content', color);
+  }
+
+  setLayout({ stageWidth, stageHeight, left, top, width, height }) {
+    const scale = Math.min(Math.max(1, window.devicePixelRatio || 1), 4096 / stageWidth, 4096 / stageHeight);
+    const next = {
+      width: Math.max(1, Math.round(stageWidth * scale)),
+      height: Math.max(1, Math.round(stageHeight * scale)),
+      picture: {
+        left: left / stageWidth, top: top / stageHeight,
+        width: width / stageWidth, height: height / stageHeight,
+        right: (left + Math.max(0, width - 1)) / stageWidth,
+        bottom: (top + Math.max(0, height - 15)) / stageHeight
+      }
+    };
+    if (JSON.stringify(next) === JSON.stringify(this.layout)) return;
+    this.layout = next;
+    this.restartHDR({ layoutChanged: true });
   }
 
   setSlider(slider) {
@@ -122,8 +136,9 @@ export class Presentation {
     canvas.width = width;
     canvas.height = height;
     this.rendered = null;
-    this.restartHDR();
+    const generation = this.generation;
     this.handlers.onLayout?.();
+    if (this.generation === generation) this.restartHDR();
   }
 
   setPreference(enabled, boost) {
@@ -139,6 +154,7 @@ export class Presentation {
       this.releaseHoldover();
       this.displayedHDR = null;
       this.recovering = false;
+      this.layoutFallback = false;
       this.hdrBlocked = false;
       this.failure = '';
       delete document.body.dataset.hdrFailure;
@@ -176,25 +192,31 @@ export class Presentation {
     }
   }
 
-  surface(visible, boost = this.controller?.surfaceBoost || 1) {
+  surface(visible) {
     const { hdrCanvas, resultArea, resultImage } = this.elements;
+    if (visible) this.layoutFallback = false;
     hdrCanvas.hidden = !this.enabled;
     hdrCanvas.dataset.clientHdrSurface = visible && this.enabled ? 'visible' : 'standby';
     hdrCanvas.setAttribute('aria-hidden', visible && this.enabled ? 'false' : 'true');
     document.body.dataset.experimentalMedia = (visible || this.holdover) && this.enabled
       ? 'hdr-client-webgpu-preview' : this.recovering ? 'hdr-recovering' : 'fallback-sdr';
     document.body.dataset.hdrRecovering = String(this.recovering);
-    if (!this.holdover) this.updateBackground(visible && this.enabled ? boost : 1);
+    document.body.dataset.hdrLayoutFallback = String(this.layoutFallback);
+    if (!this.holdover) this.updateBackground();
     if (!visible && !this.holdover && (this.frozen?.displayed || (this.frozen?.presenting && !resultArea.hidden))) {
-      resultArea.dataset.presentation = this.recovering ? 'recovering' : 'sdr';
-      resultImage.hidden = this.recovering;
+      resultArea.dataset.presentation = this.recovering && !this.layoutFallback ? 'recovering' : 'sdr';
+      resultImage.hidden = this.recovering && !this.layoutFallback;
     }
   }
 
-  restartHDR() {
+  restartHDR({ layoutChanged = false } = {}) {
     if (!this.enabled || this.hdrBlocked) return;
     this.generation++;
-    if (this.displayedHDR && !this.holdover) {
+    if (layoutChanged) {
+      this.layoutFallback = true;
+      this.controller?.dispose();
+      this.releaseHoldover();
+    } else if (this.displayedHDR && !this.holdover) {
       this.controller?.suspend();
       this.holdover = { canvas: this.elements.hdrCanvas, controller: this.controller };
       this.holdover.canvas.id = 'experimentalMediaHoldover';
@@ -209,8 +231,8 @@ export class Presentation {
     canvas.id = 'experimentalMediaCanvas';
     canvas.dataset.clientHdrSurface = 'standby';
     canvas.setAttribute('aria-hidden', 'true');
-    canvas.width = this.elements.canvas.width;
-    canvas.height = this.elements.canvas.height;
+    canvas.width = this.layout?.width || this.elements.canvas.width;
+    canvas.height = this.layout?.height || this.elements.canvas.height;
     if (old === this.holdover?.canvas) old.before(canvas);
     else old.replaceWith(canvas);
     this.elements.hdrCanvas = canvas;
@@ -269,7 +291,8 @@ export class Presentation {
       }
     });
     this.controller = controller;
-    controller.start({ canvas, width: canvas.width, height: canvas.height, boost: this.boost });
+    controller.start({ canvas, width: canvas.width, height: canvas.height, boost: this.boost,
+      picture: this.layout?.picture });
     this.seedHDR();
   }
 
@@ -340,7 +363,7 @@ export class Presentation {
   }
 
   visiblePicture() {
-    if (this.enabled && this.recovering) return null;
+    if (this.enabled && this.recovering && !this.layoutFallback) return null;
     return this.enabled && this.displayedHDR ? this.displayedHDR : this.rendered;
   }
 

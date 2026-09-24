@@ -16,6 +16,7 @@ function probe() {
     const dialog = document.querySelector('.checkin-dialog'), toggle = document.querySelector('.checkin-toggle');
     const lang = async value => { const select = document.querySelector('#viewerLanguage'); select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); await pause(); };
     fixture.update(); await pause();
+    check(toggle.querySelector('span').textContent === 'Reģistrēšanās vilcienā' && document.querySelector('#activateTicket').textContent === 'Reģistrēt atvērto biļeti tagad', 'Latvian menu labels');
     check(fixture.claims.length === 1 && !dialog.open, 'one opening claim without display');
     check(!document.querySelector('details.checkin-disclosure'), 'no intermediate disclosure');
     toggle.click(); await pause();
@@ -33,11 +34,13 @@ function probe() {
     }
     check(fixture.submissions.length === 0, 'selection does not submit');
     await lang('ru');
+    check(toggle.querySelector('span').textContent === 'Отметка в поезде' && document.querySelector('#activateTicket').textContent === 'Зарегистрировать открытый билет сейчас', 'Russian menu labels');
     check(dialog.querySelector('h2').textContent === 'Отметка в поезде' && dialog.lang === 'ru', 'Russian dialog');
     check(dialog.querySelector('input[name=checkinCarriage]:checked').value === '4', 'language preserves selections');
     check(dialog.scrollWidth <= dialog.clientWidth, 'Russian fits narrow screen');
     check(localStorage.getItem('ticket.language') === 'ru', 'language remembered');
     await lang('en');
+    check(toggle.querySelector('span').textContent === 'Train check-in' && document.querySelector('#activateTicket').textContent === 'Register open ticket now', 'English menu labels');
     check(button('Confirm check-in') && document.documentElement.lang === 'en', 'English dialog and document language');
     fixture.fail = true; button('Confirm check-in').click(); await pause();
     check(dialog.open && dialog.querySelector('[role=alert]').textContent.includes('Could not confirm'), 'failure keeps form with translated error');
@@ -84,7 +87,7 @@ function probe() {
     check(dialog.open && dialog.querySelectorAll('.checkin-group').length === 1, 'granted reminder uses grouped sheet');
     button('View ticket').click(); await pause(); fixture.update(); await pause();
     check(!dialog.open, 'reminder does not reopen');
-    toggle.click(); await pause(); button('Check in').click(); await pause();
+    toggle.click(); await pause(); dialog.querySelector('.checkin-actions .primary').click(); await pause();
     fixture.ready = false; fixture.update(); await pause();
     dialog.querySelector('input[value="towards_riga"]').click(); dialog.querySelector('input[name=checkinCarriage][value="1"]').click(); await pause();
     check(button('Confirm check-in').disabled, 'offline submission disabled');
@@ -109,9 +112,9 @@ async function startFixture() {
   const style = await readFile(new URL('../internal/web/static/app.css', import.meta.url), 'utf8');
   const template = await readFile(new URL('../internal/web/static/index.html.tmpl', import.meta.url), 'utf8');
   const pageStyle = template.match(/<style[^>]*>([\s\S]*?)<\/style>/)[1];
-  const actions = template.match(/<div class="ticket-reset-row">[\s\S]*?<\/div>/)[0];
-  const bundle = await build({ stdin: { contents: `import { mountTrainCheckin } from './train-checkin.mjs'; import { mountLanguage, setLanguage } from './viewer-language.mjs';
-    mountLanguage(document.querySelector('#viewerLanguageMount')); window.setLanguage=setLanguage;
+  const actions = template.match(/<section class="ticket-reset-row"[\s\S]*?<\/section>/)[0];
+  const bundle = await build({ stdin: { contents: `import { mountTrainCheckin } from './train-checkin.mjs'; import { mountLanguage, setLanguage, translatePage } from './viewer-language.mjs';
+    mountLanguage(document.querySelector('#viewerLanguageMount')); translatePage(); document.addEventListener('ticket:language', () => translatePage()); window.setLanguage=setLanguage;
     const fixture = window.fixture = { now:Date.now(), ready:true, claims:[], submissions:[], checkouts:[], state:{checkin:{id:'self',revision:''},checkinGroups:[]} };
     const island=mountTrainCheckin(document.querySelector('#trainCheckinMount'),()=>({
       claimCheckinNotice:async id=>{fixture.claims.push(id)}, checkIn:async (...args)=>{fixture.submissions.push(args); if(fixture.conflict) throw Error('checkin_changed'); if(fixture.fail) throw Error('offline');},checkOut:async id=>{fixture.checkouts.push(id)}

@@ -339,10 +339,10 @@ func notificationBody(delivery state.PushDelivery) string {
 	if delivery.Kind == "recovery" {
 		return "Ticket is ready again."
 	}
-	if delivery.Reason == "capture_unavailable" || delivery.Reason == "observation_overdue" {
-		return "Ticket readiness could not be checked. Open Ticket to review it."
+	if delivery.Reason == "capture_unavailable" || delivery.Reason == "observation_overdue" || delivery.Reason == "busy" || delivery.Reason == "unknown" {
+		return "Ticket could not be checked twice in a row. Open Ticket to review it."
 	}
-	return "Ticket has not been ready for at least five minutes. Open Ticket to check it."
+	return "Two checks in a row found the same ticket problem. Open Ticket to check it."
 }
 
 func (s *Server) sendTicketPush(ctx context.Context, delivery state.PushDelivery) string {

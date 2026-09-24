@@ -301,7 +301,7 @@ pub fn fixture_idle_case(ctx: &ReducerContext, case: String) -> Result<(), Strin
             // Insert directly to prove the claim independently rechecks focus.
             ctx.db.ticketremote_stream_viewer_focus().insert(TicketremoteStreamViewerFocus {
                 id: "claim-focus".into(), ticketId: ticket.clone(), backendId: "pixel".into(), publicId: "passive".into(),
-                active: true, lastSeenAt: clock.clone(), expiresAt: add_ms(&clock, 30_000),
+                active: true, lastSeenAt: clock.clone(), expiresAt: add_ms(&clock, 30_000), email: None,
             });
             assert_eq!(idle_fixture_claim(ctx, &ticket, &action, "pc-fixture").unwrap_err(), "idle_refresh_viewer_returned");
             ctx.db.ticketremote_stream_viewer_focus().id().delete("claim-focus".to_string());

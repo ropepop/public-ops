@@ -4,7 +4,6 @@ const DEFAULT_TIME_ZONE = 'Europe/Riga';
 const DEFAULT_DAY_COUNT = 30;
 const DEFAULT_SECONDS_PER_TICK = 5;
 const MILLIS_PER_DAY = 24 * 60 * 60 * 1000;
-const COMPACT_VIEW_QUERY = '(max-width: 780px)';
 
 function integerInRange(value, fallback, minimum, maximum) {
   const parsed = Math.floor(Number(value));
@@ -64,13 +63,6 @@ export function formatActivityDuration(value) {
   return parts.join(' ');
 }
 
-function shortActivityID(member, accountScopeID) {
-  const publicID = String(member && member.publicId || '').trim().toUpperCase();
-  if (publicID) return publicID.slice(0, 12);
-  const fallback = String(accountScopeID || '').trim().slice(0, 4).toUpperCase();
-  return fallback || 'USER';
-}
-
 function normalizedTick(value) {
   const tick = Math.floor(Number(value));
   if (!Number.isFinite(tick) || tick <= 0) return 0;
@@ -121,7 +113,6 @@ export function buildActivityStatisticsModel(payload = {}) {
   const secondsPerTick = integerInRange(payload.secondsPerTick, DEFAULT_SECONDS_PER_TICK, 1, 3600);
   const dayKeys = activityDayKeys(payload.serverTime || Date.now(), timeZone, dayCount);
   const visibleDays = new Set(dayKeys);
-  const members = [];
   const memberByScope = new Map();
 
   for (const rawMember of Array.isArray(payload.members) ? payload.members : []) {
@@ -129,15 +120,12 @@ export function buildActivityStatisticsModel(payload = {}) {
     if (!accountScopeId) continue;
     const member = {
       accountScopeId,
-      shortId: shortActivityID(rawMember, accountScopeId),
       email: String(rawMember && rawMember.email || '').trim(),
       active: rawMember && rawMember.active === true
     };
     const previous = memberByScope.get(accountScopeId);
     if (previous && previous.active && !member.active) continue;
-    if (previous) members.splice(members.indexOf(previous), 1);
     memberByScope.set(accountScopeId, member);
-    members.push(member);
   }
 
   const cells = new Map();
@@ -177,8 +165,7 @@ export function buildActivityStatisticsModel(payload = {}) {
   for (const cell of cells.values()) {
     let member = memberByScope.get(cell.accountScopeId);
     if (!member) {
-      member = { accountScopeId: cell.accountScopeId, shortId: shortActivityID(null, cell.accountScopeId), email: '', active: false };
-      members.push(member);
+      member = { accountScopeId: cell.accountScopeId, email: '', active: false };
       memberByScope.set(cell.accountScopeId, member);
     }
     const seconds = cell.ticks * secondsPerTick;
@@ -195,17 +182,20 @@ export function buildActivityStatisticsModel(payload = {}) {
     const dayTotals = emptyCounts();
     const hours = Array.from({ length: 24 }, (_, hour) => {
       const entries = entriesByHour.get(`${day}|${hour}`) || [];
+      let hourSeconds = 0;
       for (const entry of entries) {
+        hourSeconds += entry.seconds;
         dayTotalSeconds += entry.seconds;
         totalSeconds += entry.seconds;
         activeScopes.add(entry.accountScopeId);
         addCounts(dayTotals, entry);
         addCounts(totals, entry);
       }
-      entries.sort((left, right) => left.shortId.localeCompare(right.shortId));
-      return { hour, label: String(hour).padStart(2, '0'), entries };
+      entries.sort((left, right) => left.email.localeCompare(right.email) || left.accountScopeId.localeCompare(right.accountScopeId));
+      return { hour, label: String(hour).padStart(2, '0'), entries, totalSeconds: hourSeconds };
     });
     const activeHours = hours.filter((hour) => hour.entries.length > 0);
+    const maxHourSeconds = Math.max(0, ...hours.map((hour) => hour.totalSeconds));
     const relativeLabel = dayIndex === 0 ? 'Today' : dayIndex === 1 ? 'Yesterday' : '';
     return {
       day,
@@ -214,6 +204,7 @@ export function buildActivityStatisticsModel(payload = {}) {
       panelId: `adminStatisticsDayPanel${day.replace(/-/g, '')}`,
       hours,
       activeHours,
+      maxHourSeconds,
       ...dayTotals,
       metrics: metricsFor(dayTotals),
       totalSeconds: dayTotalSeconds,
@@ -222,17 +213,12 @@ export function buildActivityStatisticsModel(payload = {}) {
   });
   const activeDays = days.filter((day) => day.activeHours.length > 0);
 
-  const legend = members
-    .filter((member) => activeScopes.has(member.accountScopeId))
-    .sort((left, right) => left.shortId.localeCompare(right.shortId) || left.email.localeCompare(right.email));
-
   return {
     timeZone,
     dayCount,
     secondsPerTick,
     days,
     activeDays,
-    legend,
     hasActiveActivity: activeDays.length > 0,
     ...totals,
     metrics: metricsFor(totals),
@@ -257,9 +243,9 @@ function renderMetrics(metrics, fullLabels = false) {
 
 function renderEntry(entry) {
   return html`
-    <span class="${() => entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${() => `${entry.email || entry.shortId}${entry.active ? '' : ' · Inactive'}`}">
+    <span class="${() => entry.active ? 'admin-statistics-entry' : 'admin-statistics-entry is-inactive'}" title="${() => entry.email ? `${entry.email}${entry.active ? '' : ' · Inactive'}` : 'Unknown account'}">
       <span class="admin-statistics-entry-main">
-        <span class="admin-statistics-entry-id">${() => entry.shortId}</span>
+        <span class="admin-statistics-entry-email">${() => entry.email || 'Unknown account'}</span>
         ${() => entry.duration ? html`<span class="admin-statistics-entry-duration">${() => entry.duration}</span>` : ''}
       </span>
       ${() => renderMetrics(entry.metrics)}
@@ -284,17 +270,8 @@ export function mountActivityStatistics(documentRef = document) {
   }
   const statistics = reactive({ model: buildActivityStatisticsModel(payload) });
   const viewRef = documentRef.defaultView || (typeof window !== 'undefined' ? window : null);
-  let compactViewQuery = null;
-  try {
-    compactViewQuery = viewRef && typeof viewRef.matchMedia === 'function'
-      ? viewRef.matchMedia(COMPACT_VIEW_QUERY)
-      : null;
-  } catch (_) {
-    compactViewQuery = null;
-  }
   const viewState = reactive({
-    mode: compactViewQuery && compactViewQuery.matches ? 'compact' : 'table',
-    manuallySelected: false,
+    mode: 'compact',
     updatedAt: payload.serverTime || '',
     refreshStatus: '',
     expandedDay: statistics.model.activeDays.length > 0 ? statistics.model.activeDays[0].day : ''
@@ -304,15 +281,12 @@ export function mountActivityStatistics(documentRef = document) {
   html`
     <div class="admin-statistics-view" data-view-mode="${() => viewState.mode}">
       <div class="admin-statistics-summary">
-        <span><strong>${() => statistics.model.dayCount}</strong> days</span>
+        <span><strong>${() => statistics.model.activeDays.length}</strong> active ${() => statistics.model.activeDays.length === 1 ? 'day' : 'days'} in the last ${() => statistics.model.dayCount}</span>
         <span>·</span>
         <span><strong>${() => statistics.model.activeUserCount}</strong> user(s) with activity</span>
         <span>·</span>
         <span><strong>${() => statistics.model.totalDuration}</strong> measured use</span>
       </div>
-      <div class="admin-statistics-action-summary">${() => renderMetrics(statistics.model.metrics, true)}</div>
-      <p class="admin-statistics-count-key">Counts = successful / accepted requests. Reg = registration; Code = code generation.</p>
-      <p class="admin-statistics-tracking-note">${() => statistics.model.trackingStartLabel} Earlier totals counted slider registrations only. Requests without success may be pending, failed, or unconfirmed.</p>
       ${() => statistics.model.hasActiveActivity ? '' : html`
         <p class="admin-statistics-empty">No activity was recorded in this 30-day window.</p>
       `}
@@ -320,7 +294,7 @@ export function mountActivityStatistics(documentRef = document) {
       <div class="admin-statistics-view-controls">
         <p class="admin-statistics-view-note">
           ${() => viewState.mode === 'compact'
-            ? 'Only active days and hours are shown.'
+            ? 'Each day is scaled to its busiest hour; details show exact times.'
             : 'All 30 days and 24 hours are shown.'}
         </p>
         <button
@@ -361,6 +335,18 @@ export function mountActivityStatistics(documentRef = document) {
                   </span>
                 </button>
               </h3>
+              <div class="admin-statistics-chart" role="group" aria-label="Measured viewing time by hour">
+                <ol class="admin-statistics-bars">
+                  ${() => day.hours.map((hour) => html`
+                    <li>
+                      <span class="${() => hour.totalSeconds ? `admin-statistics-bar is-active level-${Math.max(1, Math.ceil(10 * hour.totalSeconds / day.maxHourSeconds))}` : 'admin-statistics-bar'}" aria-hidden="true"></span>
+                      <span class="admin-statistics-bar-label">${() => `${hour.label}:00–${hour.label}:59: ${formatActivityDuration(hour.totalSeconds)} measured viewing time`}</span>
+                    </li>
+                  `.key(hour.hour))}
+                </ol>
+                <div class="admin-statistics-chart-hours" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+                ${() => day.totalSeconds ? '' : html`<p class="admin-statistics-chart-empty">Actions recorded; no measured viewing time.</p>`}
+              </div>
               <div
                 class="admin-statistics-day-panel"
                 id="${() => day.panelId}"
@@ -417,27 +403,17 @@ export function mountActivityStatistics(documentRef = document) {
           </tbody>
         </table>
       </div>
-      ${() => statistics.model.legend.length === 0 ? '' : html`
-        <section class="admin-statistics-legend" aria-labelledby="adminStatisticsLegendTitle">
-          <h3 id="adminStatisticsLegendTitle">User IDs</h3>
-          <ul class="admin-statistics-legend-list">
-            ${() => statistics.model.legend.map((member) => html`
-              <li class="admin-statistics-legend-item">
-                <span class="admin-statistics-legend-id">${() => member.shortId}</span>
-                <span class="admin-statistics-legend-email">${() => member.email}</span>
-                ${() => member.active ? '' : html`<span class="admin-statistics-inactive">Inactive</span>`}
-              </li>
-            `.key(member.accountScopeId))}
-          </ul>
-        </section>
-      `}
+      <details class="admin-statistics-count-details"><summary>How activity is counted</summary>
+        <div class="admin-statistics-action-summary">${() => renderMetrics(statistics.model.metrics, true)}</div>
+        <p class="admin-statistics-count-key">Counts = successful / accepted requests. Reg = registration; Code = code generation.</p>
+        <p class="admin-statistics-tracking-note">${() => statistics.model.trackingStartLabel} Earlier totals counted slider registrations only. Requests without success may be pending, failed, or unconfirmed. Viewing time is measured in five-second intervals.</p>
+      </details>
     </div>
   `(mount);
 
   const viewToggle = documentRef.getElementById('adminStatisticsViewToggle');
   const compactView = documentRef.getElementById('adminStatisticsCompactView');
   const toggleView = () => {
-    viewState.manuallySelected = true;
     viewState.mode = viewState.mode === 'compact' ? 'table' : 'compact';
   };
   const toggleDay = (event) => {
@@ -450,14 +426,8 @@ export function mountActivityStatistics(documentRef = document) {
     if (!day) return;
     viewState.expandedDay = viewState.expandedDay === day ? '' : day;
   };
-  const useResponsiveDefault = (event) => {
-    if (viewState.manuallySelected) return;
-    viewState.mode = event && event.matches ? 'compact' : 'table';
-  };
-
   if (viewToggle) viewToggle.addEventListener('click', toggleView);
   if (compactView) compactView.addEventListener('click', toggleDay);
-  if (compactViewQuery) compactViewQuery.addEventListener('change', useResponsiveDefault);
 
   let request = null;
   let disposed = false;
@@ -520,7 +490,6 @@ export function mountActivityStatistics(documentRef = document) {
     viewRef.removeEventListener('pageshow', pageShow);
     if (viewToggle) viewToggle.removeEventListener('click', toggleView);
     if (compactView) compactView.removeEventListener('click', toggleDay);
-    if (compactViewQuery) compactViewQuery.removeEventListener('change', useResponsiveDefault);
     mount.ticketActivityStatisticsCleanup = null;
   };
   mount.ticketActivityStatisticsCleanup = cleanup;

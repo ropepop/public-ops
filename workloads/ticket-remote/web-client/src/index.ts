@@ -8,6 +8,16 @@ import {
 import { relayLastFrameAgeMillis } from "./relay-current-report";
 import { phoneControlNow } from "../phone-control-core.mjs";
 
+// SpacetimeDB 2.6.1 uses this method for reducer calls; iOS 16 lacks it.
+if (typeof (Promise as any).withResolvers !== "function") {
+  (Promise as any).withResolvers = () => {
+    let resolve!: (value?: unknown) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  };
+}
+
 installCspSafeSpacetimeCodecs();
 
 type TicketClientConfig = {
@@ -114,8 +124,8 @@ function activeViewerFocusRows(rows: any[], ticketId: string, backendId: string)
       return !expiresAt || expiresAt > now;
     })
     .sort((left, right) => {
-      const publicSort = String(left.publicId || left.public_id || "").localeCompare(String(right.publicId || right.public_id || ""));
-      if (publicSort) return publicSort;
+      const emailSort = String(left.email || "").localeCompare(String(right.email || ""));
+      if (emailSort) return emailSort;
       return rowId(left).localeCompare(rowId(right));
     });
 }
@@ -160,6 +170,7 @@ class TicketSpacetimeClient {
         .withUri(this.websocketURL())
         .withDatabaseName(this.cfg.database)
         .withToken(this.cfg.token)
+        .withCompression("none")
         .onConnect((connection) => {
           if (generation !== this.connectionGeneration) {
             try { connection.disconnect(); } catch (_) {}
@@ -582,7 +593,7 @@ class TicketSpacetimeClient {
     const viewerFocusRows = activeViewerFocusRows(rows("privileged_viewers"), ticketId, backendId);
     this.scheduleViewerPresenceExpiry(viewerFocusRows);
     const viewerPresence = viewerFocusRows.map(row => ({
-      publicId: row.publicId, label: row.publicId, connected: true,
+      email: String(row.email || "").trim() || "Unknown account", connected: true,
       lastSeenAt: row.lastSeenAt, expiresAt: row.expiresAt,
     }));
     const controlCodeRequests = rows("control_code_request")

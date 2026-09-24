@@ -1,5 +1,8 @@
 .ticket-notifications { border: 1px solid #253246; border-radius: 8px; padding: 16px; background: #0b1119; color: #eef3f8; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
 .ticket-notifications h2 { margin: 0; font-size: 18px; }
+.ticket-notifications h3 { margin: 0; font-size: 15px; }
+.ticket-monitoring-setting, .ticket-device-setting { padding-top: 12px; }
+.ticket-device-setting { margin-top: 12px; border-top: 1px solid #2b3a4e; }
 .ticket-notifications p { margin: 10px 0; color: #b5c2d1; }
 .ticket-notifications p:empty { display: none; }
 .ticket-monitoring-toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 700; }
